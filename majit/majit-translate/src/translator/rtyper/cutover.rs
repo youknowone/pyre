@@ -6168,9 +6168,15 @@ fn insert_candidate_function_desc_jit_graphs(
 /// candidate. Upstream annotate-then-`find_all_graphs` follows those
 /// specialized `direct_call`s; here BFS ran first and may have inlined
 /// or missed the MIR call (`warmspot.py check_access_directly_sanity`).
+///
+/// An AccessDirect callee is exempt only when its function is itself a
+/// `find_all_graphs` candidate (`call.py CallControl.find_all_graphs`
+/// `is_candidate`). A callee of a non-candidate (`dont_look_inside`,
+/// elidable, never admitted by the BFS) stays outside `jit_graphs`.
 fn close_access_directly_callees_of_candidates(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
+    function_graphs: &crate::codewriter::call::GraphStore,
     translator: &TranslationContext,
     candidate_flow_graphs: &[GraphRef],
     jit_graphs: &mut HashSet<*const PyGraph>,
@@ -6211,11 +6217,32 @@ fn close_access_directly_callees_of_candidates(
     if callee_keys.is_empty() {
         return;
     }
+    let mut candidate_descs = HashSet::new();
+    for path in candidate_graphs {
+        let origin = if crate::codewriter::call::is_access_directly_path(path) {
+            function_graphs.access_directly_desc_origin(path)
+        } else {
+            path.clone()
+        };
+        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
+        {
+            candidate_descs.insert(Rc::as_ptr(&entry.function_desc));
+        }
+        if let Some(origin) = split_portal_origin_path(path)
+            && let Some(entry) =
+                lookup_function_desc_for_path(call_registry, function_graphs, &origin)
+        {
+            candidate_descs.insert(Rc::as_ptr(&entry.function_desc));
+        }
+    }
     for entry in call_registry.bookkeeper().descs.borrow().values() {
         let crate::annotator::description::DescEntry::Func(func) = entry else {
             continue;
         };
         let desc = func.func();
+        if !candidate_descs.contains(&Rc::as_ptr(&desc)) {
+            continue;
+        }
         let desc = desc.borrow();
         for graph in desc.cache.borrow().values() {
             if graph.access_directly.get() && callee_keys.contains(&GraphKey::of(&graph.graph)) {
@@ -6256,6 +6283,7 @@ fn check_access_directly_sanity(
     close_access_directly_callees_of_candidates(
         call_registry,
         candidate_graphs,
+        function_graphs,
         translator.as_ref(),
         &candidate_flow_graphs,
         &mut jit_graphs,
@@ -9387,16 +9415,17 @@ mod tests {
         check_access_directly_sanity(&registry, &HashSet::from([portal]), &graphs);
     }
 
-    /// A candidate subject's `recursivecall` edge to another function's
-    /// AccessDirect cache graph is a JIT graph. `eval_loop_jit_portal`
-    /// pycalls `PyFrame::anchor` with the hinted frame; BFS may not
-    /// have that MIR call (`warmspot.py check_access_directly_sanity`).
-    #[test]
-    fn an_access_direct_callee_of_a_candidate_subject_is_a_jit_graph() {
-        use crate::flowspace::model::BlockKey;
+    /// Candidate subject `eval_loop_jit_portal` with a `recursivecall`
+    /// edge to `owner::flagged`'s AccessDirect cache graph.
+    fn candidate_subject_calling_flagged_access_direct() -> (
+        std::rc::Rc<CallRegistry>,
+        crate::parse::CallPath,
+        crate::parse::CallPath,
+        crate::codewriter::call::GraphStore,
+    ) {
         use crate::translator::translator::{CallGraphEdge, CallGraphKey};
 
-        let (registry, _, graphs) = registry_with_a_flagged_graph();
+        let (registry, path, graphs) = registry_with_a_flagged_graph();
         let ad = flagged_access_direct_cache_graph(&registry);
         assert!(ad.access_directly.get());
         let caller_path = crate::parse::CallPath::from_segments(["eval", "eval_loop_jit_portal"]);
@@ -9436,6 +9465,27 @@ mod tests {
             },
         );
         install_entry_point_calling(&registry, &ad.graph);
+        (registry, path, caller_path, graphs)
+    }
+
+    /// A candidate subject's `recursivecall` edge to another function's
+    /// AccessDirect cache graph is a JIT graph. `eval_loop_jit_portal`
+    /// pycalls `PyFrame::anchor` with the hinted frame; BFS may not
+    /// have that MIR call (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn an_access_direct_callee_of_a_candidate_subject_is_a_jit_graph() {
+        let (registry, path, caller_path, graphs) =
+            candidate_subject_calling_flagged_access_direct();
+        check_access_directly_sanity(&registry, &HashSet::from([caller_path, path]), &graphs);
+    }
+
+    /// An AccessDirect callee of a function that is not a
+    /// `find_all_graphs` candidate stays outside `jit_graphs`
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn an_access_direct_callee_of_a_non_candidate_function_fails_sanity() {
+        let (registry, _, caller_path, graphs) = candidate_subject_calling_flagged_access_direct();
         check_access_directly_sanity(&registry, &HashSet::from([caller_path]), &graphs);
     }
 
