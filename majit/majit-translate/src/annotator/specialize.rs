@@ -674,13 +674,23 @@ fn py_number(value: &ConstValue) -> Option<PyNumber> {
                 Some(PyNumber::UInt(*v))
             }
         }
-        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, *v) {
+        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, v) {
             crate::rlib::rarithmetic::RIntValue::Signed(x) => Some(PyNumber::Int(x)),
             crate::rlib::rarithmetic::RIntValue::Unsigned(x) => {
                 if x <= i128::MAX as u128 {
                     Some(PyNumber::Int(x as i128))
                 } else {
                     Some(PyNumber::UInt(x))
+                }
+            }
+            crate::rlib::rarithmetic::RIntValue::SignedBig(x) => {
+                i128::try_from(&x).ok().map(PyNumber::Int)
+            }
+            crate::rlib::rarithmetic::RIntValue::UnsignedBig(x) => {
+                if let Ok(n) = i128::try_from(&x) {
+                    Some(PyNumber::Int(n))
+                } else {
+                    u128::try_from(&x).ok().map(PyNumber::UInt)
                 }
             }
         },
