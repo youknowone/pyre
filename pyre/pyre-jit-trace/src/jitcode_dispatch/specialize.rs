@@ -11503,7 +11503,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     if !(3..=5).contains(&r_args.len()) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let mut arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
     else {
@@ -11517,26 +11517,33 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // The bounds are pinned from the moment they are read because the fold
+    // records guards before it runs the constructor, and a minor collection
+    // in any of them moves the bound; an RPython trace keeps each argument
+    // in a GC-visible box (`history.py` `FrontendOp.value`, `pyjitpl.py`
+    // `MIFrame.registers_r`), so the value the constructor sees is the
+    // forwarded one.
+    let arg_pins = residual_call::owner_roots_for_concretes(&arg_concretes);
+
     let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     enum BoundPlan {
-        Exact {
-            op: OpRef,
-            concrete: pyre_object::PyObjectRef,
-        },
-        UserIndex(IndexInlineCandidate),
+        Exact { op: OpRef, arg_index: usize },
+        UserIndex { arg_index: usize },
     }
     let mut plans = Vec::with_capacity(r_args.len() - 2);
-    for (&arg_op, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
-        let ConcreteValue::Ref(arg_obj) = *concrete else {
+    for i in 2..r_args.len().min(arg_concretes.len()) {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let ConcreteValue::Ref(arg_obj) = arg_concretes[i] else {
             return Ok(None);
         };
+        let arg_op = r_args[i];
         if walker_is_exact_machine_int_concrete(arg_obj) {
             plans.push(BoundPlan::Exact {
                 op: arg_op,
-                concrete: arg_obj,
+                arg_index: i,
             });
-        } else if let Some(candidate) = prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-            plans.push(BoundPlan::UserIndex(candidate));
+        } else if prepare_walker_inline_index(ctx, arg_op, arg_obj).is_some() {
+            plans.push(BoundPlan::UserIndex { arg_index: i });
         } else {
             return Ok(None);
         }
@@ -11551,30 +11558,38 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let mut concrete_args = Vec::with_capacity(plans.len());
-    let mut arg_pins = Vec::with_capacity(plans.len());
+    let mut exact_indices = Vec::with_capacity(plans.len());
+    let mut user_pins = Vec::with_capacity(plans.len());
     let mut concrete_values = Vec::with_capacity(plans.len());
     let mut raw_args = Vec::with_capacity(plans.len());
     for plan in plans {
-        let (arg_op, arg_obj) = match plan {
-            BoundPlan::Exact { op, concrete } => (op, concrete),
-            BoundPlan::UserIndex(candidate) => {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let (arg_op, exact_index, user_pin, arg_obj) = match plan {
+            BoundPlan::Exact { op, arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold Exact bound is a Ref");
+                };
+                (op, Some(arg_index), None, arg_obj)
+            }
+            BoundPlan::UserIndex { arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold UserIndex bound is a Ref");
+                };
+                let Some(candidate) = prepare_walker_inline_index(ctx, r_args[arg_index], arg_obj)
+                else {
+                    return walker_range_decline(ctx, pre_emit_pos);
+                };
                 let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
                     ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
                 )?
                 else {
                     return walker_range_decline(ctx, pre_emit_pos);
                 };
-                (result, concrete)
+                let user_pin = residual_call::owner_root_if_gc(concrete as usize);
+                let arg_obj = pinned_obj(&user_pin, concrete);
+                (result, None, user_pin, arg_obj)
             }
         };
-        // `walker_guard_class` / `opimpl_getfield_gc_i` append to
-        // `opencoder.py Trace._ops`. Pin the bound so
-        // `call_function_impl_result` receives the forwarded object.
-        let arg_pin = residual_call::owner_root_if_gc(arg_obj as usize);
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
         // A trace-constant bound carries its class in the constant itself, so
         // record the class as known without proving it: `walker_guard_class`
         // would emit a `GuardClass` that can never fail plus the tagged-operand
@@ -11587,10 +11602,15 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
             walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
         }
         walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let arg_obj = if let Some(arg_index) = exact_index {
+            let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            arg_obj
+        } else {
+            pinned_obj(&user_pin, arg_obj)
+        };
         let concrete_value = unsafe { pyre_object::w_int_get_value(arg_obj) };
         let raw = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
@@ -11600,13 +11620,24 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
         concrete_args.push(arg_obj);
-        arg_pins.push(arg_pin);
+        exact_indices.push(exact_index);
+        user_pins.push(user_pin);
         concrete_values.push(concrete_value);
         raw_args.push(raw);
     }
-    for (arg, pin) in concrete_args.iter_mut().zip(arg_pins.iter()) {
-        if let Some(pin) = pin {
-            *arg = pin.get().0 as pyre_object::PyObjectRef;
+    residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+    for ((arg, exact_index), user_pin) in concrete_args
+        .iter_mut()
+        .zip(exact_indices.iter())
+        .zip(user_pins.iter())
+    {
+        if let Some(arg_index) = *exact_index {
+            let ConcreteValue::Ref(obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            *arg = obj;
+        } else {
+            *arg = pinned_obj(user_pin, *arg);
         }
     }
 
