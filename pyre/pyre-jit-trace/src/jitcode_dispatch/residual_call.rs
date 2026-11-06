@@ -132,6 +132,26 @@ static CURRENT_GC_REF_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64
         })
     });
 
+fn residual_leaf_is(name: &str, leaf: &str) -> bool {
+    let last = name.rsplit("::").next().unwrap_or(name);
+    let last = last.strip_prefix("__majit_call_target_").unwrap_or(last);
+    last == leaf
+}
+
+/// `W_ListObject::sync_allocated`'s `jit.conditional_call` target.
+static LIST_RESYNC_ALLOCATED_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| residual_leaf_is(name, "w_list_resync_allocated"))
+    });
+
+/// Integer `newlist(length)` (`rlist.py ll_newlist` / `int_ll_newlist`).
+static INT_LL_NEWLIST_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| residual_leaf_is(name, "int_ll_newlist")));
+
+/// Float twin of [`INT_LL_NEWLIST_FNADDRS`].
+static FLOAT_LL_NEWLIST_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| residual_leaf_is(name, "float_ll_newlist")));
+
 /// `frame_locals_proxy::proxy_list_append`, identified by leaf. The slot
 /// scan records this wrapper; the append descent substitutes
 /// `w_list_append_inner` when the address matches.
@@ -165,8 +185,9 @@ fn residual_funcptr_addr<Sym: WalkSym>(
 
 /// `record_list_write_barrier_residual` may emit `GetfieldGc` while it
 /// decides the rewrite, and those reads consult the heapcache. Invalidate
-/// only after that record when the funcptr is one of the three rewrite
-/// targets; every other residual invalidates first
+/// only after that record when the funcptr is a rewrite target that reads
+/// the cache (`list_write_barrier` strategy, `w_list_resync_allocated`
+/// allocated); every other residual invalidates first
 /// (`_record_helper_varargs`).
 fn list_wb_records_before_invalidate<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
@@ -179,6 +200,7 @@ fn list_wb_records_before_invalidate<Sym: WalkSym>(
     VOID_LIST_WRITE_BARRIER_FNADDRS.contains(&addr_i)
         || PREPARE_LIST_REF_STORE_FNADDRS.contains(&addr_i)
         || CURRENT_GC_REF_FNADDRS.contains(&addr_i)
+        || is_w_list_resync_allocated_addr(addr_i)
 }
 
 /// `rewrite.py` `gen_write_barrier` on the list (`SETFIELD_GC` of that
@@ -223,6 +245,29 @@ fn record_list_and_items_cond_call_gc_wb<Sym: WalkSym>(
     wb
 }
 
+/// Proven `ConstInt` or executed Int of `list.strategy`.
+fn list_strategy_const<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    list_op: OpRef,
+) -> Option<i64> {
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    residual_const_i64(ctx, strategy)
+}
+
+fn residual_const_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opref: OpRef) -> Option<i64> {
+    match ctx.trace_ctx.const_typed_value(opref) {
+        Some(majit_ir::Value::Int(n)) => Some(n),
+        _ => match ctx.trace_ctx.box_value(opref) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
+            _ => None,
+        },
+    }
+}
+
 /// True when this residual is on the Object arm: a proven `ConstInt`
 /// (`rewrite.rs` `is_null_constant` / `history.py` ConstInt) equal to
 /// `ListStrategy::Object`, or the same Int the strategy Getfield holds
@@ -233,19 +278,81 @@ fn list_strategy_is_object<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     list_op: OpRef,
 ) -> bool {
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let object = pyre_object::listobject::ListStrategy::Object as i64;
-    match ctx.trace_ctx.const_typed_value(strategy) {
-        Some(majit_ir::Value::Int(n)) => n == object,
-        _ => match ctx.trace_ctx.box_value(strategy) {
-            Some(majit_ir::Value::Int(n)) => n == object,
-            _ => false,
-        },
+    list_strategy_const(ctx, list_op) == Some(pyre_object::listobject::ListStrategy::Object as i64)
+}
+
+fn list_strategy_is_unboxed_numeric(n: i64) -> bool {
+    n == pyre_object::listobject::ListStrategy::Integer as i64
+        || n == pyre_object::listobject::ListStrategy::Float as i64
+        || n == pyre_object::listobject::ListStrategy::IntOrFloat as i64
+}
+
+/// `W_ListObject::resized_allocation` arithmetic on constant sizes.
+fn resized_allocation_const(allocated: i64, old_size: i64, new_size: i64) -> i64 {
+    let allocated = if allocated < 0 { 0 } else { allocated as usize };
+    let old_size = old_size.max(0) as usize;
+    let new_size = new_size.max(0) as usize;
+    if allocated >= new_size && new_size >= (allocated >> 1) {
+        return allocated as i64;
     }
+    let mut new_allocated = (new_size + (new_size >> 3) + 6) & !3;
+    if new_size > old_size && new_size - old_size > new_allocated.saturating_sub(new_size) {
+        new_allocated = (new_size + 3) & !3;
+    }
+    if new_size == 0 {
+        new_allocated = 0;
+    }
+    new_allocated as i64
+}
+
+fn residual_addr_matches(
+    addr: i64,
+    set: &std::collections::HashSet<i64>,
+    paths: &[&'static str],
+    raw: i64,
+) -> bool {
+    set.contains(&addr) || addr == walker_published_fnaddr(paths, raw) || addr == raw
+}
+
+/// Address of a residual fn through `*const ()` (`function_casts_as_integer`).
+fn residual_fnaddr_raw(f: *const ()) -> i64 {
+    f as usize as i64
+}
+
+fn is_w_list_resync_allocated_addr(addr: i64) -> bool {
+    residual_addr_matches(
+        addr,
+        &LIST_RESYNC_ALLOCATED_FNADDRS,
+        &[
+            "pyre_object::listobject::w_list_resync_allocated",
+            "pyre_object::w_list_resync_allocated",
+        ],
+        residual_fnaddr_raw(pyre_object::listobject::w_list_resync_allocated as *const ()),
+    )
+}
+
+fn is_int_ll_newlist_addr(addr: i64) -> bool {
+    residual_addr_matches(
+        addr,
+        &INT_LL_NEWLIST_FNADDRS,
+        &[
+            "pyre_object::listobject::int_ll_newlist",
+            "pyre_object::int_ll_newlist",
+        ],
+        residual_fnaddr_raw(pyre_object::listobject::int_ll_newlist as *const ()),
+    )
+}
+
+fn is_float_ll_newlist_addr(addr: i64) -> bool {
+    residual_addr_matches(
+        addr,
+        &FLOAT_LL_NEWLIST_FNADDRS,
+        &[
+            "pyre_object::listobject::float_ll_newlist",
+            "pyre_object::float_ll_newlist",
+        ],
+        residual_fnaddr_raw(pyre_object::listobject::float_ll_newlist as *const ()),
+    )
 }
 
 /// Record the list write-barrier residual as `rewrite.py gen_write_barrier`
@@ -296,17 +403,33 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
         // those arms cannot grow a `Getfield` + `CondCallGcWb`. Keep the
         // residual Call: the helper is `is_list_write_barrier` (not a
         // body effect) and runs Phase L2, including the null check.
-        if list_strategy_is_object(ctx, list_op) {
-            return (
-                record_list_and_items_cond_call_gc_wb(ctx, list_op, true),
-                true,
-            );
+        //
+        // Integer/Float/IntOrFloat storage is a typed non-GCREF block, so
+        // the array half is the list header only (`gen_write_barrier` on
+        // the SETFIELD of that pointer). `rewrite.py` inserts that after
+        // optimize; recording `CondCallGcWb` here lets OptVirtualize drop
+        // it on a still-virtual list instead of `CallN` forcing it.
+        match list_strategy_const(ctx, list_op) {
+            Some(n) if n == pyre_object::listobject::ListStrategy::Object as i64 => {
+                return (
+                    record_list_and_items_cond_call_gc_wb(ctx, list_op, true),
+                    true,
+                );
+            }
+            Some(n) if list_strategy_is_unboxed_numeric(n) => {
+                return (
+                    record_list_and_items_cond_call_gc_wb(ctx, list_op, false),
+                    true,
+                );
+            }
+            _ => {
+                return (
+                    ctx.trace_ctx
+                        .record_op_with_descr_value(call_opcode, allboxes, descr, value),
+                    false,
+                );
+            }
         }
-        return (
-            ctx.trace_ctx
-                .record_op_with_descr_value(call_opcode, allboxes, descr, value),
-            false,
-        );
     }
     if PREPARE_LIST_REF_STORE_FNADDRS.contains(&addr_i) {
         let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
@@ -321,11 +444,90 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
         let obj_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
         return (obj_op, true);
     }
+    if is_w_list_resync_allocated_addr(addr_i) {
+        if let Some(recorded) = record_list_resync_allocated_setfield(ctx, allboxes) {
+            return (recorded, true);
+        }
+    }
+    if is_int_ll_newlist_addr(addr_i) {
+        if let Some(recorded) = record_typed_ll_newlist_as_new_array(
+            ctx,
+            allboxes,
+            value,
+            crate::state::int_gcarray_descr(),
+        ) {
+            return (recorded, true);
+        }
+    }
+    if is_float_ll_newlist_addr(addr_i) {
+        if let Some(recorded) = record_typed_ll_newlist_as_new_array(
+            ctx,
+            allboxes,
+            value,
+            crate::state::float_gcarray_descr(),
+        ) {
+            return (recorded, true);
+        }
+    }
     (
         ctx.trace_ctx
             .record_op_with_descr_value(call_opcode, allboxes, descr, value),
         false,
     )
+}
+
+/// `w_list_resync_allocated` is `dont_look_inside_cannot_raise` and stores
+/// only `allocated`. When the list, old size, new size, and current
+/// `allocated` are constants, record that store as `SetfieldGc` so a virtual
+/// list is not forced by residual `CallN`.
+fn record_list_resync_allocated_setfield<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<OpRef> {
+    let list_op = *allboxes.get(1)?;
+    let old_size = residual_const_i64(ctx, *allboxes.get(2)?)?;
+    let new_size = residual_const_i64(ctx, *allboxes.get(3)?)?;
+    let allocated_op = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_allocated_descr(),
+    );
+    let allocated = residual_const_i64(ctx, allocated_op)?;
+    let new_allocated = resized_allocation_const(allocated, old_size, new_size);
+    let allocated_descr = crate::descr::list_allocated_descr();
+    let allocated_val = ctx.trace_ctx.const_int(new_allocated);
+    let recorded = ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[list_op, allocated_val],
+        allocated_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(list_op, allocated_descr.index(), allocated_val);
+    Some(recorded)
+}
+
+/// `int_ll_newlist` / `float_ll_newlist` oopspec `newlist(length)`:
+/// `do_fixed_newlist` emits `new_array` for Signed/Float. A constant length
+/// in the virtualize bound becomes `NewArray` so OptVirtualize can make a
+/// `VArray` instead of residual `CallR` + `GuardNoException`.
+fn record_typed_ll_newlist_as_new_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    value: Option<Value>,
+    array_descr: DescrRef,
+) -> Option<OpRef> {
+    let length = *allboxes.get(1)?;
+    let n = residual_const_i64(ctx, length)?;
+    if !majit_ir::ptr_info::reasonable_array_index(n) {
+        return None;
+    }
+    let recorded =
+        ctx.trace_ctx
+            .record_op_with_descr_value(OpCode::NewArray, &[length], array_descr, value);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(recorded, length, true);
+    Some(recorded)
 }
 
 /// `CondCallGcWb` cannot raise, but the residual it replaced may have been
@@ -14221,20 +14423,38 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
         !ei.check_forces_virtual_or_virtualizable(),
         "conditional_call target must not force virtualizable"
     );
-    ctx.trace_ctx
-        .profiler()
-        .count_ops(OpCode::CondCallN, majit_metainterp::counters::OPS);
-    ctx.trace_ctx
-        .profiler()
-        .count_ops(OpCode::CondCallN, majit_metainterp::counters::RECORDED_OPS);
-    let _recorded = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::CondCallN, &allboxes, descr);
-    // `_record_helper_varargs` runs `heapcache.invalidate_caches_varargs`
-    // before it appends. `record_op_with_descr` does not, so do it here
-    // the same way residual_call does.
-    ctx.trace_ctx
-        .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
+    // `W_ListObject::sync_allocated` uses `jit.conditional_call3`, which
+    // this dispatcher records as CondCallN. The keep-band test is bitwise
+    // `&` of Getfields (`sync_allocated`), so `cond` is an IntOp whose
+    // executed value is 1, not a ConstInt. OptRewrite later turns
+    // CondCallN(1, f, args) into CallN, which forces a virtual list.
+    // When allocated/old/new are known, record the allocated SetfieldGc
+    // here so OptVirtualize can keep the list virtual (`rlist.py
+    // _ll_list_resize_ge` looks inside when both lengths are constant).
+    // CondCallN allboxes are `[cond, funcptr, list, old, new]`; the
+    // residual rewrite takes `[funcptr, list, old, new]`. ConstInt(0)
+    // already returned above.
+    let resync_addr = residual_funcptr_addr(ctx, funcptr)
+        .is_some_and(|addr| is_w_list_resync_allocated_addr(addr as i64));
+    let rewrote_resync = resync_addr
+        && allboxes.len() >= 2
+        && record_list_resync_allocated_setfield(ctx, &allboxes[1..]).is_some();
+    if !rewrote_resync {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::CondCallN, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::CondCallN, majit_metainterp::counters::RECORDED_OPS);
+        let _recorded = ctx
+            .trace_ctx
+            .record_op_with_descr(OpCode::CondCallN, &allboxes, descr);
+        // `_record_helper_varargs` runs `heapcache.invalidate_caches_varargs`
+        // before it appends. `record_op_with_descr` does not, so do it here
+        // the same way residual_call does.
+        ctx.trace_ctx
+            .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
+    }
     let cond_concrete: Option<bool> = match ctx.trace_ctx.box_value(cond) {
         Some(majit_ir::Value::Int(n)) => Some(n != 0),
         _ => match read_int_reg_concrete(code, op, 0, ctx) {

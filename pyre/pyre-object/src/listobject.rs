@@ -4114,7 +4114,7 @@ pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) ->
 /// (`binary_slice_values` / `ll_listslice`) or the JIT gcmap.
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+pub unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     let count = count as usize;
     if count == 0 {
         return std::ptr::null_mut();
@@ -4141,7 +4141,7 @@ unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
 /// [`int_ll_newlist`] for FloatListStrategy storage (`GcArray(Float)`).
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+pub unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     let count = count as usize;
     if count == 0 {
         return std::ptr::null_mut();
