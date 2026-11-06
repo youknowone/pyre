@@ -1867,6 +1867,13 @@ def llbc_store_entry_dir(store: Path, fields: dict[str, str]) -> Path:
     )
 
 
+def sibling_staging(path: Path, kind: str) -> Path:
+    """Unique sibling of `path` for one writer to fill and `os.replace` onto it."""
+    return path.with_name(
+        f".{path.name}.{kind}-{os.getpid()}-{os.urandom(4).hex()}"
+    )
+
+
 def clone_file(src: Path, dst: Path) -> None:
     """Copy `src` onto `dst`, cloning/reflinking when the filesystem allows it.
 
@@ -1877,7 +1884,7 @@ def clone_file(src: Path, dst: Path) -> None:
     src = Path(src)
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f".{dst.name}.clone-{os.getpid()}-{os.urandom(4).hex()}")
+    tmp = sibling_staging(dst, "clone")
     try:
         cloned = False
         system = platform.system()
@@ -2618,7 +2625,13 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
             "fun_decls": [],
         },
     }
-    dest.write_text(json.dumps(slim), encoding="utf-8")
+    staging = sibling_staging(dest, "tmp")
+    try:
+        staging.write_text(json.dumps(slim), encoding="utf-8")
+        os.replace(staging, dest)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
 
 
 def charon_toolchain_path(charon_bin: Path, root: Path) -> Path:
@@ -2813,7 +2826,17 @@ def finish_charon_pass(
             "  the crate compiled but produced no MIR — "
             "inspect the Charon output above"
         )
-    os.replace(partial, dest)
+    try:
+        os.replace(partial, dest)
+    except PermissionError as exc:
+        # Windows refuses to replace a destination a reader still maps.
+        # Extract and cargo-test are separate CI jobs, so this is a local
+        # overlap: drop the mapping and retry rather than rewrite in place.
+        raise SystemExit(
+            f"extract-llbc.py: cannot replace {dest} while a reader still maps it\n"
+            f"  {exc}\n"
+            "  drop the mapping (end the cargo / translator process) and retry"
+        ) from exc
 
 
 def physical_memory_bytes() -> int | None:
@@ -3084,7 +3107,9 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         invalidate_cargo_unit(target_dir, charon_host, package)
 
         host_env = {**env, **host_config_env}
-        partial = dest.with_suffix(dest.suffix + ".partial")
+        # A leftover from an earlier run that used dest.ullbc.partial.
+        dest.with_suffix(dest.suffix + ".partial").unlink(missing_ok=True)
+        partial = sibling_staging(dest, "partial")
         command = [
             str(charon_bin),
             "cargo",
@@ -3106,7 +3131,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # lands with one timestamp and the figures in the text are the only
         # record of where the minutes went.
         phase_started = time.monotonic()
-        partial.unlink(missing_ok=True)
         host_pass = subprocess.Popen(command, cwd=path, env=host_env)
         try:
             # One extra extraction per cross target, reduced to its type
