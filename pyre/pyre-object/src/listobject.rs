@@ -2010,6 +2010,25 @@ pub fn w_list_make_empty() -> PyObjectRef {
     crate::lltype::malloc_typed_managed(full) as PyObjectRef
 }
 
+/// `rlist.py ll_newlist` `malloc(LIST)`: `incminimark.py malloc_fixedsize`
+/// raises MemoryError when `collect_and_reserve` cannot satisfy the
+/// request. `GcAllocOutcome::Failed` is that raise;
+/// `interp_exceptions::publish_memory_error` is the residual / interpreter
+/// carrier (`rstr.py` `LLHelpers.ll_str_mul` / `mallocstr`). `NoRoute` is
+/// the missing-hook bootstrap that still uses `malloc_typed`.
+fn list_header_from_hook(
+    raw: Option<crate::gc_hook::GCREF>,
+) -> Result<Option<crate::gc_hook::GCREF>, ()> {
+    match crate::gc_hook::GcAllocOutcome::from_hook(raw) {
+        crate::gc_hook::GcAllocOutcome::Allocated(ptr) => Ok(Some(ptr)),
+        crate::gc_hook::GcAllocOutcome::NoRoute => Ok(None),
+        crate::gc_hook::GcAllocOutcome::Failed => {
+            crate::interp_exceptions::publish_memory_error();
+            Err(())
+        }
+    }
+}
+
 /// Allocate a new W_ListObject from a Vec of items.
 ///
 /// Residualized: the storage construction below
@@ -2086,9 +2105,10 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
             &mut needs_write_barrier,
         )
     };
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_USER_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut());
+    let raw = match list_header_from_hook(raw) {
+        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
+        Err(()) => return std::ptr::null_mut(),
+    };
     let body = W_ListObjectUser {
         base: W_ListObject {
             ob_header: PyObject {
@@ -2462,9 +2482,10 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     // The `malloc_typed` header below is the answer for a missing hook, not
     // for a GC that owns the heap and refused: that one would leave the list's
     // managed edges untraced behind a header the collector never walks.
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut());
+    let raw = match list_header_from_hook(raw) {
+        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
+        Err(()) => return std::ptr::null_mut(),
+    };
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
     storage.reload_typed_blocks();
@@ -2609,9 +2630,10 @@ unsafe fn w_list_from_storage_and_strategy(
         &mut allocation_root,
         &mut needs_write_barrier,
     );
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut());
+    let raw = match list_header_from_hook(raw) {
+        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
+        Err(()) => return std::ptr::null_mut(),
+    };
     int_items.reload_block(int_slot);
     float_items.reload_block(float_slot);
     bytes_items.reload_block(bytes_slot);

@@ -7402,122 +7402,6 @@ fn record_tdc_cuts_for_subjects(
     call_registry.two_phase().tdc_plans = plans;
 }
 
-/// Clone `legacy` and apply the recorded `transform_dead_code` cut so
-/// the dual-gate comparer sees the same operations flatten would after
-/// `rtyper.py` `specialize` (`annotator.simplify()` before
-/// `specialize_block`) and `transform.py` `transform_graph`
-/// (`transform_dead_code` first). The live GraphStore stays uncut on
-/// Skip and is cut by [`apply_tdc_cut_on_publish_accept`] on Match.
-/// Returns `Some(cut clone)` only when a cut was applied.
-fn tdc_cut_snapshot_for_compare(
-    call_registry: &CallRegistry,
-    function_graphs: &crate::codewriter::call::GraphStore,
-    path: &crate::parse::CallPath,
-    legacy: &LegacyGraph,
-) -> Option<LegacyGraph> {
-    let (cuts, value_to_var) = {
-        let tp = call_registry.two_phase();
-        let store_key = function_graphs.key_for(path)?;
-        if tp.tdc_cut_applied.contains(&store_key) {
-            return None;
-        }
-        let plan = tp.tdc_plans.get(&store_key)?;
-        if !tdc_plan_has_work(plan) {
-            return None;
-        }
-        (plan.cuts.clone(), plan.value_to_var.clone())
-    };
-    let mut snapshot = legacy.clone();
-    let mut unmapped = 0usize;
-    let mut removed = 0usize;
-    if apply_transform_dead_code_cut_to_legacy(
-        &mut snapshot,
-        &cuts,
-        &value_to_var,
-        &mut unmapped,
-        &mut removed,
-    ) {
-        Some(snapshot)
-    } else {
-        None
-    }
-}
-
-/// Apply the recorded `transform_dead_code` cut to this GraphStore
-/// graph. Call only from the dual-gate Match arm: the comparer ran on
-/// a cut snapshot (`tdc_cut_snapshot_for_compare`;
-/// `compare_real_against_legacy` `excluded_legacy` from
-/// `annotator_unfollowed_legacy_vars`). A Skip (simplify / rtype /
-/// comparer) leaves the uncut GraphStore.
-pub(crate) fn apply_tdc_cut_on_publish_accept(
-    call_registry: &CallRegistry,
-    function_graphs: &crate::codewriter::call::GraphStore,
-    path: &crate::parse::CallPath,
-) {
-    let (store_key, cuts, value_to_var, cutoff_callees) = {
-        let tp = call_registry.two_phase();
-        let Some(subj) = tp.subjects.get(path) else {
-            return;
-        };
-        if tp.rtype_skipped.contains(&subj.graph_key) {
-            return;
-        }
-        let Some(store_key) = function_graphs.key_for(path) else {
-            return;
-        };
-        if tp.tdc_cut_applied.contains(&store_key) {
-            return;
-        }
-        let Some(plan) = tp.tdc_plans.get(&store_key) else {
-            return;
-        };
-        if !tdc_plan_has_work(plan) {
-            return;
-        }
-        (
-            store_key,
-            plan.cuts.clone(),
-            plan.value_to_var.clone(),
-            plan.cutoff_callees.clone(),
-        )
-    };
-    // Defence: `dual_gate_outcome_from_cache` Skips this plan
-    // (`annrpython.py RPythonAnnotator.complete` blocked-block
-    // AnnotatorError stand-in; `RPythonAnnotator.simplify` /
-    // Phase-A `annotate_skipped` the same refusal). Only Match
-    // reaches here.
-    if let Some((annotator, _)) = call_registry.session_if_started()
-        && cutoff_callees
-            .iter()
-            .any(|callee| cutoff_callee_annotation_incomplete(&annotator, call_registry, callee))
-    {
-        return;
-    }
-    let mut unmapped = 0usize;
-    let mut removed = 0usize;
-    let did = function_graphs.with_built_mut(path, |legacy| {
-        apply_transform_dead_code_cut_to_legacy(
-            legacy,
-            &cuts,
-            &value_to_var,
-            &mut unmapped,
-            &mut removed,
-        )
-    });
-    match did {
-        Some(true) => {
-            let mut tp = call_registry.two_phase();
-            tp.tdc_cut_applied.insert(store_key);
-            tp.tdc_cut_links_removed += removed;
-        }
-        Some(false) => {
-            let mut tp = call_registry.two_phase();
-            tp.tdc_cut_unresolved += 1;
-        }
-        None => {}
-    }
-}
-
 /// A skip-tolerant analog of `annrpython.py` `RPythonAnnotator.complete`:
 /// `blocked_blocks` is an `AnnotatorError` there, so no graph whose
 /// annotation depends on an incomplete callee is rtyped. The prepass
@@ -7780,6 +7664,7 @@ fn apply_tdc_cuts_to_graphstore(
         crate::model::GraphKey,
         Vec<GraphStoreTdcCut>,
         LegacyToTyped,
+        Vec<crate::flowspace::model::GraphRef>,
     )> = {
         let tp = call_registry.two_phase();
         let mut subjects: Vec<_> = tp.subjects.iter().collect();
@@ -7810,11 +7695,22 @@ fn apply_tdc_cuts_to_graphstore(
                 store_key,
                 plan.cuts.clone(),
                 plan.value_to_var.clone(),
+                plan.cutoff_callees.clone(),
             ));
         }
         jobs
     };
-    for (path, store_key, cuts, value_to_var) in jobs {
+    for (path, store_key, cuts, value_to_var, cutoff_callees) in jobs {
+        // `annrpython.py RPythonAnnotator.complete` refuses blocked
+        // blocks before `transform.py transform_dead_code`. A cutoff
+        // whose callee annotation is incomplete is that refusal.
+        if let Some((annotator, _)) = call_registry.session_if_started()
+            && cutoff_callees.iter().any(|callee| {
+                cutoff_callee_annotation_incomplete(&annotator, call_registry, callee)
+            })
+        {
+            continue;
+        }
         let mut unmapped = 0usize;
         let mut removed = 0usize;
         let did = function_graphs.with_built_mut(&path, |legacy| {
@@ -8713,6 +8609,33 @@ pub(crate) fn dual_gate_outcome_from_cache(
         }
     }
 
+    // `annrpython.py RPythonAnnotator.complete` raises AnnotatorError
+    // on blocked blocks before `rtyper.py RPythonTyper.specialize` and
+    // `transform.py transform_dead_code`. A cutoff that follows a call
+    // whose callee annotation is incomplete is that blocked-block
+    // error: Skip rather than run the specialize-time baseline.
+    // `RPythonAnnotator.simplify` (`rtype_skipped`) and Phase-A
+    // `annotate_skipped` are the same program-level refusal.
+    if let Some((annotator, _)) = call_registry.session_if_started() {
+        let callees = {
+            let tp = call_registry.two_phase();
+            function_graphs
+                .key_for(path)
+                .and_then(|store_key| tp.tdc_plans.get(&store_key))
+                .map(|plan| plan.cutoff_callees.clone())
+        };
+        if let Some(callees) = callees
+            && callees.iter().any(|callee| {
+                cutoff_callee_annotation_incomplete(&annotator, call_registry, callee)
+            })
+        {
+            return Ok(DualGateOutcome::Skip(
+                "two-phase: transform_dead_code cutoff follows an incomplete callee annotation"
+                    .to_string(),
+            ));
+        }
+    }
+
     // Legacy-baseline comparison oracle (the `dual_gate_check_with_registry`
     // pattern): the real path is trusted only when it agrees with the proven
     // legacy walker at `ConcreteType` granularity.
@@ -8739,41 +8662,15 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let excluded_legacy = followed_legacy
         .as_ref()
         .map(|followed| annotator_unfollowed_legacy_vars(&value_to_var, followed));
-    // `annrpython.py RPythonAnnotator.complete` raises AnnotatorError
-    // on blocked blocks before `transform.py transform_dead_code` runs.
-    // A cutoff that follows a call whose callee annotation is
-    // incomplete is that blocked-block error: Skip rather than publish
-    // the cut. `RPythonAnnotator.simplify` (`rtype_skipped`) and
-    // Phase-A `annotate_skipped` are the same program-level refusal.
-    if let Some((annotator, _)) = call_registry.session_if_started() {
-        let callees = {
-            let tp = call_registry.two_phase();
-            function_graphs
-                .key_for(path)
-                .and_then(|store_key| tp.tdc_plans.get(&store_key))
-                .map(|plan| plan.cutoff_callees.clone())
-        };
-        if let Some(callees) = callees
-            && callees.iter().any(|callee| {
-                cutoff_callee_annotation_incomplete(&annotator, call_registry, callee)
-            })
-        {
-            return Ok(DualGateOutcome::Skip(
-                "two-phase: transform_dead_code cutoff follows an incomplete callee annotation"
-                    .to_string(),
-            ));
-        }
-    }
     // Flatten sees the post-`transform_dead_code` graph (`rtyper.py`
-    // `specialize` runs `annotator.simplify()` first). Compare on that
-    // snapshot; the live GraphStore stays uncut until Match.
-    let compare_graph = tdc_cut_snapshot_for_compare(call_registry, function_graphs, path, legacy);
-    if let Some(divergence) = compare_real_against_legacy(
-        &value_to_var,
-        &constants,
-        compare_graph.as_ref().unwrap_or(legacy),
-        excluded_legacy.as_ref(),
-    ) {
+    // `specialize` runs `annotator.simplify()` first). Phase B already
+    // cut the live GraphStore (`apply_tdc_cuts_to_graphstore`).
+    // `transform.py transform_dead_code` deletes the unfollowed link
+    // object and records generated errlinks as followed, so a second
+    // positional replay is not idempotent.
+    if let Some(divergence) =
+        compare_real_against_legacy(&value_to_var, &constants, legacy, excluded_legacy.as_ref())
+    {
         return Ok(DualGateOutcome::Skip(format!(
             "two-phase divergence: {divergence}"
         )));

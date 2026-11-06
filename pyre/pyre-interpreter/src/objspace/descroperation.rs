@@ -2685,7 +2685,7 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
         a,
         b => pyre_object::listobject::w_list_add_unwrapped(a, b)
     ) {
-        return Ok(sum);
+        return crate::runtime_ops::obj_or_memory_error(sum);
     }
     // `w_list_getitem` boxes on the Range/Integer/Float strategies, and
     // `w_list_new` itself allocates, so a copy already made would sit
@@ -2713,7 +2713,7 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
     for i in 0..fetched {
         items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
-    Ok(w_list_new(items))
+    crate::runtime_ops::obj_or_memory_error(w_list_new(items))
 }
 
 pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -2766,7 +2766,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     if let Some(repeated) = pyre_object::with_roots!(
         list => pyre_object::listobject::w_list_repeat_unwrapped(list, count)
     ) {
-        return Ok(repeated);
+        return crate::runtime_ops::obj_or_memory_error(repeated);
     }
     // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
     // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
@@ -2798,7 +2798,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     for i in 0..pinned.len() {
         items.push(pinned[i]);
     }
-    Ok(w_list_new(items))
+    crate::runtime_ops::obj_or_memory_error(w_list_new(items))
 }
 
 /// listobject.py descr_inplace_mul — repeat the list in place; the

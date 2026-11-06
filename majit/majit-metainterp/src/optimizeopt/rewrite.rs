@@ -1125,27 +1125,33 @@ impl OptRewrite {
                 return false;
             }
             // rewrite.py: copy interior fields element by element.
-            // `getinteriorfield_virtual` returns the stored field box.
+            // `ArrayStructInfo.getinteriorfield_virtual` returns the stored
+            // box, including `None` for a cleared slot, and
+            // `setinteriorfield_virtual` writes that value so a later
+            // `GETINTERIORFIELD` raises `InvalidLoop` on the dest the way
+            // it would on the source (`virtualize.py
+            // optimize_GETINTERIORFIELD_GC_I`).
             for index in 0..length_int {
                 for &fdescr_idx in &all_fdescr_indices {
-                    let val = ctx.peek_ptr_info(&source_b).and_then(|info| match info {
-                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
-                            let ei = (index + source_start) as usize;
-                            v.element_fields.get(ei).and_then(|fields| {
-                                fields
-                                    .iter()
-                                    .find(|(fdidx, _)| *fdidx == fdescr_idx)
-                                    .map(|(_, b)| b.clone())
-                            })
-                        }
-                        _ => None,
+                    let val = ctx
+                        .peek_ptr_info(&source_b)
+                        .and_then(|info| match info {
+                            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                                let ei = (index + source_start) as usize;
+                                v.element_fields.get(ei).and_then(|fields| {
+                                    fields
+                                        .iter()
+                                        .find(|(fdidx, _)| *fdidx == fdescr_idx)
+                                        .map(|(_, b)| b.clone())
+                                })
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(Operand::None);
+                    let idx = (index + dest_start) as usize;
+                    ctx.with_ptr_info_mut(&dest_b, |info| {
+                        info.setinteriorfield_virtual(idx, fdescr_idx, val);
                     });
-                    if let Some(val) = val {
-                        let idx = (index + dest_start) as usize;
-                        ctx.with_ptr_info_mut(&dest_b, |info| {
-                            info.setinteriorfield_virtual(idx, fdescr_idx, val);
-                        });
-                    }
                 }
             }
             return true;

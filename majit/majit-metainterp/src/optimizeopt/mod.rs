@@ -6325,14 +6325,21 @@ impl OptContext {
     ///     side-effect at line 111.
     pub fn getintbound_handle(&self, op: &Operand) -> IntBoundHandle {
         use crate::optimizeopt::info::OpInfo;
+        // optimizer.py Optimization.getintbound: `assert op.type == 'i'` on
+        // the incoming box, then `op = get_box_replacement(op)`. Void is the
+        // untyped placeholder `setintbound` also admits.
+        assert!(
+            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "getintbound_handle: expected 'i'-typed operand, got {:?}",
+            op.type_()
+        );
         self.with_resolved_operand(op, |resolved| {
             let (tp, const_val) = resolved.with_view(|v| (v.type_(), v.const_value()));
-            // optimizer.py Optimizer.getintbound `assert op.type == 'i'` on the replacement
-            // terminal. Void is the untyped placeholder `setintbound` also
-            // admits.
+            // optimizer.py Optimization.getintbound: the same `'i'` assert
+            // on the replacement before the lazy `set_forwarded` install.
             assert!(
                 matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void),
-                "getintbound_handle: expected 'i'-typed operand, got {tp:?}"
+                "getintbound_handle: expected 'i'-typed replacement, got {tp:?}"
             );
             if let Some(Value::Int(v)) = const_val {
                 return IntBoundHandle::const_(
@@ -6439,15 +6446,21 @@ impl OptContext {
     {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
+        // optimizer.py Optimization.getintbound: `assert op.type == 'i'`
+        // before `get_box_replacement`.
+        assert!(
+            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
+            "with_intbound_mut: expected 'i'-typed operand, got {:?}",
+            op.type_()
+        );
         self.with_resolved_operand(op, |resolved| {
             let (tp, const_val, is_const) =
                 resolved.with_view(|v| (v.type_(), v.const_value(), v.is_constant()));
-            // optimizer.py getintbound: assert op.type == 'i'. Void-typed
-            // placeholders are accepted; their chain may still terminate at
-            // an int-typed Const/InputArg.
+            // optimizer.py Optimization.getintbound: the same `'i'` assert
+            // on the replacement before the lazy `set_forwarded` install.
             assert!(
                 matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void),
-                "with_intbound_mut: expected 'i'-typed operand, got {tp:?}"
+                "with_intbound_mut: expected 'i'-typed replacement, got {tp:?}"
             );
             // optimizer.py Optimizer.getintbound: ConstInt → IntBound.from_constant(...).
             // RPython's getintbound returns a fresh bound; intersect on it is
@@ -8428,21 +8441,20 @@ impl OptContext {
     pub fn getptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
+        // info.py getptrinfo: branch on the incoming box, then
+        // `op = get_box_replacement(op)` only on the Ref arm.
+        match op.type_() {
+            majit_ir::Type::Int => return self.getrawptrinfo_handle(op),
+            majit_ir::Type::Float => return None,
+            majit_ir::Type::Ref => {}
+            majit_ir::Type::Void => panic!(
+                "getptrinfo_handle: op.type == 'v' (info.py getptrinfo `assert op.type == 'r'`); \
+                 caller must guard on a typed box (Int/Ref/Float) — Void boxes \
+                 carry no PtrInfo upstream",
+            ),
+        }
         self.with_resolved_operand(op, |terminal| {
             let (tp, const_val) = terminal.with_view(|v| (v.type_(), v.const_value()));
-            match tp {
-                // info.py — `if op.type == 'i': return getrawptrinfo(op)`.
-                majit_ir::Type::Int => return self.getrawptrinfo_handle(terminal),
-                // info.py getptrinfo — `elif op.type == 'f': return None`.
-                majit_ir::Type::Float => return None,
-                // info.py getptrinfo — `assert op.type == 'r'`.
-                majit_ir::Type::Ref => {}
-                majit_ir::Type::Void => panic!(
-                    "getptrinfo_handle: op.type == 'v' (info.py:885 `assert op.type == 'r'`); \
-                     caller must guard on a typed box (Int/Ref/Float) — Void boxes \
-                     carry no PtrInfo upstream",
-                ),
-            }
             debug_assert_eq!(
                 tp,
                 majit_ir::Type::Ref,
