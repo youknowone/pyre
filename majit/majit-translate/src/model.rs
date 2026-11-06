@@ -10081,6 +10081,27 @@ impl FunctionGraph {
         res
     }
 
+    /// `core::ptr::null_mut::<T>()` of a GC pointee `T`, spelled with `T`'s
+    /// class root so `annotator/builtin.rs ptr_null_constant` annotates the
+    /// `None` of that class (`rclass.py InstanceRepr.convert_const(None)`).
+    pub fn push_null_gc_ptr_with_spelling(
+        &mut self,
+        block: BlockId,
+        spelling: &str,
+        result_ty: ValueType,
+    ) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var();
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "null_mut"]),
+                args: vec![LinkArg::from(ConstValue::byte_str(spelling))],
+                result_ty,
+            },
+        });
+        res
+    }
+
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython
