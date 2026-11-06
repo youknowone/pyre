@@ -7551,9 +7551,24 @@ pub(in crate::front::mir) fn raw_u8_ccharp_bank(ty: &TyRef, llbc: &Llbc) -> Opti
 }
 
 /// Stamp a raw `*u8` cell `CCHARP`. The producing op must be Int-banked.
+/// Dest `*mut c_void` / `*mut *mut c_void` is `VOIDP` / `VOIDPP`
+/// (`rffi.py`); the walker rebuilds `SomePtr` from that stamp so an
+/// `ann_cast_int_to_ptr` arm can union with an extern return.
 pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llbc: &Llbc) {
     if tyref_is_raw_u8_ptr(ty, llbc) {
         stamp_as_ccharp(var);
+        return;
+    }
+    stamp_raw_c_void_ptr(var, ty, llbc);
+}
+
+/// Stamp a raw `void *` / `void **` cell (`rffi.py` `VOIDP` / `VOIDPP`).
+pub(in crate::front::mir) fn stamp_raw_c_void_ptr(var: &Variable, ty: &TyRef, llbc: &Llbc) {
+    use crate::translator::rtyper::lltypesystem::rffi::{VOIDP, VOIDPP};
+    if tyref_is_raw_c_void_pp(ty, llbc) {
+        var.set_concretetype(Some((*VOIDPP).clone()));
+    } else if tyref_is_raw_c_void_ptr(ty, llbc) {
+        var.set_concretetype(Some((*VOIDP).clone()));
     }
 }
 
