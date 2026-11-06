@@ -10044,6 +10044,11 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
 /// `getindex_w`) for an exact `str` and an exact `int` index.
 /// A missing jitcode declines to the generic residual.
 ///
+/// `descr_getitem` returns `_getitem_result`, so the helper return is
+/// the subscript. `HelperReturn::CallResult` numbers that `MIFrame`
+/// (`capture_resumedata` / `_setup_return_value_*`) and keeps
+/// start/end/utf8/strlen in the guard failargs.
+///
 /// The boxed index is not frozen: a loop over `s[i]` must keep the
 /// live key so the generated length test stays in the body.
 /// Specialised-tuple descent freezes because that reader is a
@@ -10099,7 +10104,8 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
 

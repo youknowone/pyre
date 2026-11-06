@@ -28,6 +28,11 @@ use crate::pyobject::*;
 /// Mortal strings allocate through the registered low-level STR GC tid;
 /// immortal holders keep an off-heap `STR` stamped `init_gc_object_immortal`
 /// (`rstr.py` `GcStruct('rpy_string')`).
+///
+/// `length` is `len(s.chars)` (`LLHelpers.ll_strlen`).  The chars array
+/// is `hints={'immutable': True}`; the length word is the same slot
+/// STRLEN reads and is never rewritten after malloc.
+#[majit_macros::jit_immutable_fields("length")]
 #[repr(C)]
 pub struct Utf8Str {
     pub hash: isize,
@@ -1483,13 +1488,17 @@ pub unsafe fn w_str_byte_len(obj: PyObjectRef) -> usize {
 /// len(self._utf8)`.  One byte per code point means a code point index is
 /// already a byte offset.
 ///
+/// `len(_utf8)` is STRLEN of the payload (`ll_strlen` / `Utf8Str.length`),
+/// the same load `ll_stringslice_startstop` uses for the slice bound, so
+/// the compact guard and that bound share it.
+///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
     unsafe {
         let str_obj = obj as *const W_UnicodeObject;
-        (*str_obj).len == (*str_obj).byte_len
+        (*str_obj).len == (*(*str_obj).value).length
     }
 }
 
@@ -2075,16 +2084,34 @@ pub extern "C" fn jit_int_str(v: i64) -> PyObjectRef {
     w_str_from_storage_and_length(payload, length)
 }
 
+/// `unicodeobject.py MAX_UNROLL_NEXT_CODEPOINT_POS`.
+const MAX_UNROLL_NEXT_CODEPOINT_POS: i64 = 4;
+
 /// `unicodeobject.py next_codepoint_pos_dont_look_inside` — `@jit.elidable`.
 /// `_getitem_result` must not inline `rutf8.next_codepoint_pos` or it
 /// produces a guard.
-#[majit_macros::elidable]
+///
+/// `@jit.elidable` with `_canraise` false — `EF_ELIDABLE_CANNOT_RAISE`:
+/// `rstr.py rtype_getitem` is `exception_cannot_occur` (`ll_stritem_nonneg`).
+/// The residual is `call_i` without `GUARD_NO_EXCEPTION`
+/// (`test_unicode_indexing_small_constant_indices`).
+#[majit_macros::elidable_cannot_raise]
 pub fn next_codepoint_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> usize {
     unsafe { crate::rutf8::next_codepoint_pos(utf8_payload_wtf8(utf8), p) }
 }
 
+/// `unicodeobject.py prev_codepoint_pos_dont_look_inside` — `@jit.elidable`.
+/// Same `EF_ELIDABLE_CANNOT_RAISE` stamp as
+/// `next_codepoint_pos_dont_look_inside`.
+#[majit_macros::elidable_cannot_raise]
+pub fn prev_codepoint_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> usize {
+    unsafe { crate::rutf8::prev_codepoint_pos(utf8_payload_wtf8(utf8), p) }
+}
+
 /// `unicodeobject.py codepoint_at_pos_dont_look_inside` — `@jit.elidable`.
-#[majit_macros::elidable]
+/// Same `EF_ELIDABLE_CANNOT_RAISE` stamp as
+/// `next_codepoint_pos_dont_look_inside`.
+#[majit_macros::elidable_cannot_raise]
 pub fn codepoint_at_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> i64 {
     unsafe { crate::rutf8::codepoint_at_pos(utf8_payload_wtf8(utf8), p) }
 }
@@ -2115,13 +2142,74 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
     }
 }
 
+/// `W_UnicodeObject.prev_codepoint_pos_dont_look_inside`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `pos` must be a
+/// code-point boundary inside it. `pos` must not be zero.
+pub unsafe fn w_str_prev_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: usize) -> usize {
+    if unsafe { w_str_is_ascii(obj) } {
+        pos - 1
+    } else {
+        prev_codepoint_pos_dont_look_inside(unsafe { w_str_storage(obj) }, pos)
+    }
+}
+
+/// `unicodeobject.py _getitem_result_constant_index_jit`.  Small known
+/// indices walk `next`/`prev_codepoint_pos` instead of building index
+/// storage.  Out of range is `None` so the caller raises `IndexError`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[majit_macros::unroll_safe]
+pub unsafe fn w_str_getitem_result_constant_index_jit(
+    obj: PyObjectRef,
+    index: i64,
+) -> Option<PyObjectRef> {
+    let (start, end) = if index < 0 {
+        let posindex = index + unsafe { w_str_len(obj) } as i64;
+        if posindex < 0 {
+            return None;
+        }
+        // `end = len(self._utf8)` — STRLEN of the payload, not the
+        // header `byte_len` slot.
+        let mut end = unsafe { (*w_str_storage(obj)).length };
+        let mut start = unsafe { w_str_prev_codepoint_pos_dont_look_inside(obj, end) };
+        let n = (-index - 1) as usize;
+        for _ in 0..n {
+            end = start;
+            start = unsafe { w_str_prev_codepoint_pos_dont_look_inside(obj, start) };
+        }
+        (start, end)
+    } else {
+        if index >= unsafe { w_str_len(obj) } as i64 {
+            return None;
+        }
+        let mut start = 0usize;
+        let mut end = unsafe { w_str_next_codepoint_pos_dont_look_inside(obj, start) };
+        let n = index as usize;
+        for _ in 0..n {
+            start = end;
+            end = unsafe { w_str_next_codepoint_pos_dont_look_inside(obj, end) };
+        }
+        (start, end)
+    };
+    debug_assert!(start as i64 >= 0);
+    debug_assert!(end as i64 >= 0);
+    let utf8 = unsafe { w_str_storage(obj) };
+    let sliced = crate::lowlevel_string::ll_stringslice_startstop(utf8, start as i64, end as i64);
+    Some(w_str_from_storage_and_length(sliced, 1))
+}
+
 /// Scalar arm of `descr_getitem` (`unicodeobject.py`): `_getitem_result`
 /// after `getindex_w`.  Negative indices remap against `_len()`; out of
 /// range is `None` so the caller raises `IndexError` — the same nullable
 /// ref `w_tuple_getitem` uses.
 ///
-/// `_getitem_result` is `_index_to_byte` + `next_codepoint_pos_dont_look_inside`
-/// + `W_UnicodeObject(self._utf8[start:end], 1)`.  The slice is
+/// `_getitem_result` records `is_ascii` (`we_are_jitted` and
+/// `not self.is_ascii()`) before the bounds tests, then `_index_to_byte` +
+/// `next_codepoint_pos_dont_look_inside` +
+/// `W_UnicodeObject(self._utf8[start:end], 1)`.  The slice is
 /// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
 /// wrap is `space.newutf8`.
 ///
@@ -2129,6 +2217,17 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
 /// `obj` must point to a valid `W_UnicodeObject`.
 #[inline(never)]
 pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    // unicodeobject.py `_getitem_result`: `we_are_jitted and not
+    // is_ascii and isconstant` in that order.  An ASCII `s[i]` records
+    // the compact `is_ascii` guard before the bounds guards.
+    if majit_rlib::jit::we_are_jitted()
+        && !unsafe { w_str_is_ascii(obj) }
+        && majit_rlib::jit::isconstant(&index)
+        && -MAX_UNROLL_NEXT_CODEPOINT_POS <= index
+        && index <= MAX_UNROLL_NEXT_CODEPOINT_POS
+    {
+        return unsafe { w_str_getitem_result_constant_index_jit(obj, index) };
+    }
     let len = unsafe { w_str_len(obj) } as i64;
     let idx = if index < 0 { index + len } else { index };
     if idx < 0 || idx >= len {
@@ -2329,6 +2428,24 @@ mod tests {
             assert_eq!(w_str_get_wtf8(w_str_getitem(wide, 1).unwrap()), "é");
             assert_eq!(w_str_get_wtf8(w_str_getitem(wide, 2).unwrap()), "中");
             assert_eq!(w_str_get_wtf8(w_str_getitem(wide, -1).unwrap()), "中");
+
+            // unicodeobject.py `_getitem_result_constant_index_jit`: the
+            // residual `we_are_jitted` arm is false, so call the helper
+            // directly.
+            assert_eq!(
+                w_str_get_wtf8(w_str_getitem_result_constant_index_jit(wide, 0).unwrap()),
+                "a"
+            );
+            assert_eq!(
+                w_str_get_wtf8(w_str_getitem_result_constant_index_jit(wide, 1).unwrap()),
+                "é"
+            );
+            assert_eq!(
+                w_str_get_wtf8(w_str_getitem_result_constant_index_jit(wide, -1).unwrap()),
+                "中"
+            );
+            assert!(w_str_getitem_result_constant_index_jit(wide, 3).is_none());
+            assert!(w_str_getitem_result_constant_index_jit(wide, -4).is_none());
         }
     }
 
