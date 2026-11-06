@@ -11871,7 +11871,7 @@ mod tests {
         gs.block_mut(start).operations = vec![hint_op(&v, &r0)];
         crate::model::FunctionGraph::set_concretetype_of_inline(&v, ConcreteType::GcRef);
 
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let path = crate::parse::CallPath::for_impl_method("TdcCut", "exc_exit");
         let mut store = crate::codewriter::call::GraphStore::default();
         store.insert(path.clone(), gs);
@@ -11898,6 +11898,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -11937,7 +11938,7 @@ mod tests {
         GraphRef,
     ) {
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -12016,6 +12017,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -12116,7 +12118,7 @@ mod tests {
     #[test]
     fn somenone_impossible_call_does_not_skip_caller() {
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "somenone_caller");
         let mut store = crate::codewriter::call::GraphStore::default();
         store.insert(caller_path.clone(), gs);
@@ -12155,6 +12157,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -12175,7 +12178,7 @@ mod tests {
         use crate::annotator::model::SomePBC;
 
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "pbc_caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "missing_callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -12225,6 +12228,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -12245,7 +12249,7 @@ mod tests {
         use crate::annotator::description::GraphCacheKey;
 
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "spec_caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "spec_callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -12340,6 +12344,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -13508,7 +13513,7 @@ mod tests {
         seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
         follow_link(&ann, &copied_handler);
 
-        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
+        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0).0;
         let keep: HashSet<(crate::model::BlockId, usize)> = cuts
             .iter()
             .flat_map(|cut| cut.keep_exits.iter().copied())
@@ -13643,6 +13648,7 @@ mod tests {
                         },
                     ],
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
