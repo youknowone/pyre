@@ -7491,7 +7491,12 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py MetaInterp._interpret` keeps all three on the metainterp;
     /// passing the disjoint fields preserves that owner while allowing the
     /// recursive-call resolver to borrow warmstate during a frame step.
-    fn with_trace_ctx_and_framestack<R>(
+    ///
+    /// Unique look-inside of an extracted portal (`trace_jitcode_from_merge_point`)
+    /// must use this seam so inlined `MIFrame`s sit on `self.framestack`.
+    /// `walk_active_trace_refs` walks those registers (`walk_framestack_ref_regs`);
+    /// a `StandaloneFrameStack` is invisible to that walk.
+    pub fn with_trace_ctx_and_framestack<R>(
         &mut self,
         f: impl FnOnce(
             &mut TraceCtx,

@@ -8574,6 +8574,8 @@ impl<'a> Lowering<'a> {
     /// over `u32`, so the result's bits equal `u32::from(arg)` — the
     /// argument's own integer value.  Returning `arg` (`args[1]`) directly
     /// is the identity the marker `self` is dropped around.
+    /// The leaf is compared through [`crate::front::clause_spec::unspecialized_leaf`]
+    /// so a `get__spec_*` copy (`FunctionDesc.cachedgraph`) aliases the same way.
     ///
     /// Without this the `.get` method call lowers to `getattr(Integer,
     /// "get")` on the integer `self` marker — an attribute the annotator
@@ -8593,7 +8595,8 @@ impl<'a> Lowering<'a> {
         args: &[Variable],
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        if segments.last().map(String::as_str) != Some("get") {
+        let leaf = segments.last().map(String::as_str)?;
+        if crate::front::clause_spec::unspecialized_leaf(leaf) != "get" {
             return None;
         }
         let CallKind::Fun(FunId::Regular { id }) = kind else {
@@ -8621,6 +8624,82 @@ impl<'a> Lowering<'a> {
             return None;
         }
         args.get(1).cloned()
+    }
+
+    /// `Arg::<T>::try_get` is `T::try_from(u32::from(arg))` with `T` a
+    /// `newtype_oparg!` wrapper. The blanket `From` impl is always-`Ok`
+    /// identity on that integer (`objectmodel` has no such call; RPython
+    /// opcode dispatch reads the operand word). Unique look-inside of the
+    /// spec copy residualizes `CallKind::Trait` `TryFrom::try_from` until
+    /// this rewrite materializes `Ok(arg)`.
+    pub(in crate::front::mir) fn try_lower_oparg_try_from(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        if crate::front::clause_spec::unspecialized_leaf(leaf) != "try_from" {
+            return Ok(false);
+        }
+        let is_trait_try_from = matches!(
+            segments,
+            [trait_leaf, method]
+                if crate::front::clause_spec::unspecialized_leaf(trait_leaf) == "TryFrom"
+                    && crate::front::clause_spec::unspecialized_leaf(method) == "try_from"
+        );
+        let is_core_try_from = segments.first().is_some_and(|s| s == "core");
+        if !is_trait_try_from && !is_core_try_from {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(ok_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !tyref_is_oparg(&ok_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
+        );
+        let bb_id = self.emit_bb(mir_bb);
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            dest_local,
+            target,
+        )?;
+        Ok(true)
     }
 
     /// Alias the transparent `OpArgType` conversions to their single

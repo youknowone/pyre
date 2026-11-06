@@ -81,6 +81,7 @@ impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
+impl ResidualRet for crate::PyError {}
 
 /// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
 /// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
@@ -3991,6 +3992,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::clear_references",
         crate::pyframe::PyFrame::clear_references,
+    );
+    // Unique look-inside of the portal residualizes `PyFrame::_load_fast_failed`
+    // (`pyopcode.py PyFrame._load_fast_failed`, `@dont_inline`). The leftover
+    // CallPath is the impl-method key; arg classes `ri` (frame + varindex).
+    p2!(
+        &mut entries,
+        "pyframe::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
+    );
+    p2!(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
+    );
+    p2!(
+        &mut entries,
+        "pyre_interpreter::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
     );
     p1!(
         &mut entries,
@@ -10007,6 +10026,22 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::PyFrame::clear_references"],
             clear_references
+        );
+
+        let load_fast_failed: fn(&crate::pyframe::PyFrame, usize) -> crate::PyError =
+            crate::pyframe::PyFrame::_load_fast_failed;
+        let load_fast_failed = load_fast_failed as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyframe::PyFrame::_load_fast_failed"],
+            load_fast_failed
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyframe::PyFrame::_load_fast_failed"],
+            load_fast_failed
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::PyFrame::_load_fast_failed"],
+            load_fast_failed
         );
 
         let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;

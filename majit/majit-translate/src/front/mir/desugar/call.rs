@@ -6085,6 +6085,16 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_oparg_try_from(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_i64_to_i32_try_from(
                     mir_bb,
                     &reg.kind,

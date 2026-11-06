@@ -931,11 +931,19 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
 /// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing it
 /// to its argument would leave a trace carrying the pre-move word, and nothing
 /// else forwards a value the trace holds.
+///
+/// Unique look-inside of leftover residuals runs this body without
+/// `gc_enter_roots_frame` (`shadowstack.py`) having published the portal red.
+/// An empty stack then answers `root`, the `ExtRegistryEntry::GcRootReload`
+/// identity (`nonconst.py` `EntryNonConstant.specialize_call`). The portal
+/// red is a `FrameBox` (young-nonmoving), so that word is the live frame.
 #[inline]
 #[must_use = "a top root may have moved; use the reloaded live word"]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
-    let _ = root;
+    if majit_gc::shadow_stack::depth() == 0 {
+        return root;
+    }
     majit_gc::shadow_stack::top_ref().0 as PyObjectRef
 }
 
@@ -955,7 +963,9 @@ pub fn reload_top_root_at(
     root: PyObjectRef,
     slot: majit_gc::shadow_stack::ShadowStackSlot,
 ) -> PyObjectRef {
-    let _ = root;
+    if slot.depth() == 0 {
+        return root;
+    }
     unsafe { majit_gc::shadow_stack::slot_top_ref(slot).0 as PyObjectRef }
 }
 
@@ -1651,6 +1661,36 @@ mod tests {
 
     fn dummy(addr: usize) -> PyObjectRef {
         addr as PyObjectRef
+    }
+
+    /// Unique look-inside of leftover residuals runs this body without
+    /// `gc_enter_roots_frame`. An empty stack answers `root`, matching
+    /// `ExtRegistryEntry::GcRootReload` (`nonconst.py`
+    /// `EntryNonConstant.specialize_call`).
+    #[test]
+    fn reload_top_root_empty_stack_is_the_extregistry_identity() {
+        std::thread::spawn(|| {
+            assert_eq!(majit_gc::shadow_stack::depth(), 0);
+            let root = dummy(0x1111);
+            assert_eq!(reload_top_root(root), root);
+            let slot = majit_gc::shadow_stack::shadow_stack_slot();
+            assert_eq!(reload_top_root_at(root, slot), root);
+            assert_eq!(reload_top_root_jit_abi(root), root);
+            assert_eq!(reload_top_root_at_jit_abi(root, slot.as_raw()), root);
+        })
+        .join()
+        .expect("empty-stack reload thread");
+    }
+
+    /// A live top slot is the forwarded word; the argument is ignored.
+    #[test]
+    fn reload_top_root_reads_the_live_slot() {
+        let depth = majit_gc::shadow_stack::depth();
+        majit_gc::shadow_stack::push(majit_ir::GcRef(0x2222));
+        assert_eq!(reload_top_root(dummy(0x3333)) as usize, 0x2222);
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        assert_eq!(reload_top_root_at(dummy(0x3333), slot) as usize, 0x2222);
+        majit_gc::shadow_stack::pop_to(depth);
     }
 
     #[test]

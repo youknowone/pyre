@@ -8876,8 +8876,9 @@ fn drive_generatorentry_trace(
         use majit_metainterp::JitCodeSym;
         sym.loop_header_pc()
     };
-    let drove = meta.with_trace_ctx_and_token_resolver(
+    let drove = meta.with_trace_ctx_and_framestack(
         |ctx,
+         framestack,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -8895,6 +8896,7 @@ fn drive_generatorentry_trace(
             );
             majit_metainterp::trace_jitcode_from_merge_point(
                 ctx,
+                framestack,
                 &mut sym,
                 &jitcode,
                 header_pc,
@@ -9733,8 +9735,9 @@ fn drive_unpack_iterable_trace(
     // production resolver runtime (the same closures jd0's live dispatch uses)
     // so any CALL_ASSEMBLER / recursive-portal op resolves against real
     // compiled-loop / warmstate state.
-    let drove = meta.with_trace_ctx_and_token_resolver(
+    let drove = meta.with_trace_ctx_and_framestack(
         |ctx,
+         framestack,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -9752,6 +9755,7 @@ fn drive_unpack_iterable_trace(
             );
             majit_metainterp::trace_jitcode_from_merge_point(
                 ctx,
+                framestack,
                 &mut sym,
                 &jitcode,
                 header_pc,
@@ -10017,8 +10021,9 @@ fn drive_sortkey_trace(
         use majit_metainterp::JitCodeSym;
         sym.loop_header_pc()
     };
-    let drove = meta.with_trace_ctx_and_token_resolver(
+    let drove = meta.with_trace_ctx_and_framestack(
         |ctx,
+         framestack,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -10036,6 +10041,7 @@ fn drive_sortkey_trace(
             );
             majit_metainterp::trace_jitcode_from_merge_point(
                 ctx,
+                framestack,
                 &mut sym,
                 &jitcode,
                 header_pc,

@@ -7372,22 +7372,29 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
     // A user `__getattr__` may collect, so the receiver is pinned across
     // both the lookup and the AttributeError enrichment.
+    // Own RootScope and `shadow_stack_len` captured before each pin
+    // (`zip_two_tuple_next` / `load_attr`) so `shadow_stack_erase`
+    // can scalar-replace the pins. `map_err` is a stack-sensitive
+    // callee that pass refuses (`calls-stack-sensitive-fn`).
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    getattr_str_impl(
+    match getattr_str_impl(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         name,
         true,
         false,
-    )
-    .map_err(|mut err| {
-        // PyPy 9883bb2a9d `DescrOperation.getattr`: enrich an AttributeError
-        // only after the complete `__getattribute__` / `__getattr__` chain has
-        // failed, preserving a more specific inner lookup's existing context.
-        err.enrich_attribute_error_str(pyre_object::gc_roots::shadow_stack_get(obj_slot), name);
-        err
-    })
+    ) {
+        Ok(value) => Ok(value),
+        Err(mut err) => {
+            // `DescrOperation.getattr`: enrich an AttributeError only
+            // after the complete `__getattribute__` / `__getattr__`
+            // chain has failed, preserving a more specific inner
+            // lookup's existing context.
+            err.enrich_attribute_error_str(pyre_object::gc_roots::shadow_stack_get(obj_slot), name);
+            Err(err)
+        }
+    }
 }
 
 /// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
@@ -7400,9 +7407,9 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `__getattribute__` still runs (`space.findattr` = `getattr` + catch
 /// AttributeError). A terminal module miss also skips the `__spec__`
 /// shadowing diagnosis that exists only to phrase the surfaced message.
-/// The caller must have an active `push_roots()` scope. `StdObjSpace.getattr`
-/// keeps `w_obj` in that one bracket
-/// (`ShadowStackFrameworkGCTransformer.push_roots`).
+/// Own `push_roots()` so the lookup is depth-neutral; callers that still
+/// hold `w_obj` across this return (`DescrOperation.getattr` enrichment)
+/// keep their own bracket (`ShadowStackFrameworkGCTransformer.push_roots`).
 pub fn getattr_str_impl(
     obj: PyObjectRef,
     name: &str,
@@ -7426,12 +7433,16 @@ pub fn getattr_str_impl(
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Pin into the
-    // caller's `push_roots` (`ShadowStackFrameworkGCTransformer.push_roots`).
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Own
+    // RootScope so this body is depth-neutral (`zip_two_tuple_next`):
+    // pinning into the caller without Open is LeavesAbove and
+    // `shadow_stack_erase` of `getattr_str` refuses
+    // (`calls-stack-sensitive-fn`).
+    let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
-    // unbracketed `PyObjectRef`. The caller opened the bracket; pin into it.
+    // unbracketed `PyObjectRef`.
 
     if name == "__dict__"
         && let Some(obj_type) =

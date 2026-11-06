@@ -5752,8 +5752,13 @@ where
 /// extracted `unpackiterable_portal` merge point carries a red Int
 /// (`root_base`) plus three red Refs, so the caller must pass that shape
 /// rather than assuming every red is a Ref.
+///
+/// `frames` is `MetaInterp.framestack` (`pyjitpl.py` `_interpret`). Unique
+/// look-inside of an inlined portal pushes `MIFrame`s here so
+/// `walk_active_trace_refs` / `walk_framestack_ref_regs` can mark them.
 pub fn trace_jitcode_from_merge_point<S, R>(
     ctx: &mut TraceCtx,
+    frames: &mut MIFrameStack,
     sym: &mut S,
     jitcode: &JitCode,
     header_pc: usize,
@@ -5768,21 +5773,36 @@ where
     if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
-    let mut standalone = StandaloneFrameStack::new();
+    // `pyjitpl.py` `MetaInterp._interpret` walks `self.framestack`. A
+    // `StandaloneFrameStack` is invisible to `walk_active_trace_refs`, so
+    // unique look-inside of this portal would leave inlined reds unrooted.
+    let start_len = frames.frames.len();
     let frame = setup_frame_from_merge_point(
         ctx,
-        &mut standalone.frames,
+        frames,
         Arc::new(jitcode.clone()),
         header_pc,
         green_args,
         red_args,
     );
-    standalone.frames.push(frame);
-    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
-    machine.set_outer_program_pc(header_pc);
-    let action = machine.run_to_end(ctx, sym, runtime);
-    drop(machine);
-    publish_walk_abort_handoff(ctx, &action, &mut standalone);
+    frames.push(frame);
+    let action = {
+        let mut machine = JitCodeMachine::<S, _>::with_framestack(frames, &[], &[]);
+        machine.set_outer_program_pc(header_pc);
+        machine.run_to_end(ctx, sym, runtime)
+    };
+    // The walk's own frames sit above `start_len`, root first; an abort
+    // hands exactly those to the blackhole (`pyjitpl.py`
+    // `run_blackhole_interp_to_cancel_tracing`). Frames it does not take go
+    // back to `free_frames_list` (`MetaInterp.popframe`).
+    let mut walked = StandaloneFrameStack {
+        frames: MIFrameStack::empty(),
+    };
+    walked.frames.frames = frames.frames.split_off(start_len);
+    publish_walk_abort_handoff(ctx, &action, &mut walked);
+    while let Some(frame) = walked.frames.pop() {
+        frames.recycle_frame(frame);
+    }
     action
 }
 

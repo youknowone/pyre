@@ -3077,19 +3077,29 @@ impl SharedOpcodeHandler for PyFrame {
         // The receiver is already off the value stack, so this local is the
         // only thing keeping it reachable while `getattr_str` runs arbitrary
         // Python — and the failing branch below still has to read its type.
-        let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
-        let obj = roots.pin_root(obj);
+        // Own RootScope and `shadow_stack_len` captured before each pin
+        // (`zip_two_tuple_next` / `getattr_str`) so `shadow_stack_erase`
+        // can scalar-replace the pins. `inspect_err` is a stack-sensitive
+        // callee that pass refuses (`calls-stack-sensitive-fn`).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let anchor = FrameAnchor::new(self);
-        getattr_str(obj, name).inspect_err(|error| {
-            if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                // Keep this write on the live virtualizable red frame.  The
-                // opaque helper only answers the semantic type question;
-                // writing `frame.flags` inside it would race the JIT's
-                // register-resident copy of the same field.
-                unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+        match getattr_str(pyre_object::gc_roots::shadow_stack_get(obj_slot), name) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if finalize_failed_attr_receiver_now(pyre_object::gc_roots::shadow_stack_get(
+                    obj_slot,
+                )) {
+                    // Keep this write on the live virtualizable red frame.
+                    // The opaque helper only answers the semantic type
+                    // question; writing `frame.flags` inside it would race
+                    // the JIT's register-resident copy of the same field.
+                    unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+                }
+                Err(error)
             }
-        })
+        }
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
@@ -3116,19 +3126,10 @@ impl LocalOpcodeHandler for PyFrame {
     fn load_local_checked_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         let value = locals_w!(self)[idx];
         if value.is_null() {
-            // Name resolution stays on the failure path only
-            // (pyopcode.py LOAD_FAST -> _load_fast_failed), keeping the
-            // varnames read out of the non-raising path.
-            // `pyopcode.py getlocalvarname`: `self.getcode().co_varnames[index]`.
-            let code = self.getcode();
-            let name = if idx < code.varnames.len() {
-                code.varnames[idx].as_str()
-            } else {
-                "<cell>"
-            };
-            return Err(PyError::unbound_local_error(format!(
-                "cannot access local variable '{name}' where it is not associated with a value"
-            )));
+            // `pyopcode.py LOAD_FAST` → `_load_fast_failed`. Name resolution
+            // stays on the failure path only so the varnames read stays out
+            // of the non-raising path.
+            return Err(self._load_fast_failed(idx));
         }
         // Cell objects are valid even if their contents are PY_NULL
         // (needed for __class__ cell during class body execution).

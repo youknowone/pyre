@@ -3278,6 +3278,137 @@ fn core_impl_call_count(graph: &crate::model::FunctionGraph, leaf: &str, owner_s
         .count()
 }
 
+/// Residual `usize::try_from` shells unique look-inside still executes:
+/// `ptr_try_from_impls::<Impl>::try_from`, `convert::num::<Impl>::try_from`,
+/// and the 2-segment `CallKind::Trait` path `TryFrom::try_from`.
+fn leftover_core_try_from_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| {
+                crate::front::clause_spec::unspecialized_leaf(leaf) == "try_from"
+            }) =>
+            {
+                Some(segments.join("::"))
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } if crate::front::clause_spec::unspecialized_leaf(name) == "try_from" => Some(
+                format!("Method({name}, path={resolved_path:?}, recv={receiver_root:?})"),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `Arg::<T>::get` / `try_get` that unique look-inside residualizes when
+/// `oparg_arg_get_alias` misses a `__spec_` leaf.
+fn leftover_oparg_get_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str)?;
+                let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+                (base == "get").then(|| segments.join("::"))
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => {
+                let base = crate::front::clause_spec::unspecialized_leaf(name);
+                (base == "get").then(|| format!("Method({name})"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Residual `gc_roots::push_roots` unique look-inside still executes.
+/// `gctransform` inserts the native bracket after `make_jitcodes`; pyre
+/// writes it in source, so lowering must erase it from jitcode
+/// (`shadow_stack_erase` / `zip_two_tuple_next`).
+fn leftover_push_roots_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str)?;
+                let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+                (base == "push_roots" && segments.iter().any(|s| s == "gc_roots"))
+                    .then(|| segments.join("::"))
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    },
+                ..
+            } => {
+                let base = crate::front::clause_spec::unspecialized_leaf(name);
+                (base == "push_roots").then(|| format!("Method({name}, path={resolved_path:?})"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// RED dump: leftover residual of unique look-inside is a Call whose
+/// fnaddr never rebinds. List FunctionPath and Method so a leftover
+/// `push_roots` assertion names the combinator (`map_err` / `inspect_err`)
+/// `shadow_stack_erase` refused on (`calls-stack-sensitive-fn`).
+fn leftover_call_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!("FunctionPath({})", segments.join("::"))),
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    },
+                ..
+            } => Some(format!("Method({name}, path={resolved_path:?})")),
+            _ => None,
+        })
+        .collect()
+}
+
 fn core_option_impl_expect_call_count(graph: &crate::model::FunctionGraph) -> usize {
     core_impl_call_count(graph, "expect", "option")
 }
@@ -10452,6 +10583,309 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
         "range_list_length must not keep a live AssertionError raise after simplify"
     );
     assert_extracted_core_body_lowers(llbc, "::result::<Impl>::unwrap");
+}
+
+/// `range_list_length` is `usize::try_from(i64).unwrap()`. The opaque core
+/// `TryFrom` shell must decompose (`try_lower_usize_try_from`) rather than
+/// survive as leftover `TryFrom::try_from` unique look-inside residualizes.
+#[test]
+fn range_list_length_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller = crate::test_support::lower_function(llbc, "range_list_length")
+        .expect("lower range_list_length");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "range_list_length leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// `pyopcode.rs` `u32_as_usize` is `usize::try_from(u32).expect(...)`. Unique
+/// look-inside of the portal residualizes an unbound `TryFrom::try_from`
+/// (`arg classes "i"`) when the MIR front keeps the trait-method CallPath.
+#[test]
+fn u32_as_usize_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller =
+        crate::test_support::lower_function(llbc, "u32_as_usize").expect("lower u32_as_usize");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "u32_as_usize leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// `execute_opcode_step` is generic over `OpcodeStepExecutor`. Charon
+/// leaves `usize::try_from(u32)` as `CallKind::Trait` (`TryFrom::try_from`)
+/// inside that body; unique look-inside of the portal residualizes the
+/// 2-segment path. Decompose it the same way the monomorph `u32_as_usize`
+/// already does.
+#[test]
+fn execute_opcode_step_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller = crate::test_support::lower_function(llbc, "execute_opcode_step")
+        .expect("lower execute_opcode_step");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "execute_opcode_step leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// Unique look-inside residual of the split portal is leftover
+/// `TryFrom::try_from` (`arg classes "i"`). The portal graph is
+/// `eval_loop_jit` after `split_graph_and_record_jitdriver`.
+#[test]
+fn eval_loop_jit_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::JIT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller =
+        crate::test_support::lower_function(llbc, "eval_loop_jit").expect("lower eval_loop_jit");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "eval_loop_jit leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// Census: every extracted body that names `TryFrom` in its MIR must
+/// decompose the integer shell. Unique look-inside leftover
+/// `TryFrom::try_from` (`arg classes "i"`) is a caller the isolated
+/// `u32_as_usize` / `execute_opcode_step` / `eval_loop_jit` graphs do
+/// not contain.
+#[test]
+fn extracted_try_from_callers_decompose_core_try_from() {
+    let mut hits: Vec<(String, String, Vec<String>)> = Vec::new();
+    for (label, path) in [
+        ("object", crate::runtime_names::artifacts::OBJECT_ULLBC),
+        (
+            "interpreter",
+            crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+        ),
+        ("jit", crate::runtime_names::artifacts::JIT_ULLBC),
+    ] {
+        let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+            continue;
+        };
+        crate::test_support::with_lowering(llbc, |ctx| {
+            for fd in llbc.iter_fun_decls() {
+                if !fd.has_unstructured_body() {
+                    continue;
+                }
+                let name_path = fd.item_meta.name_path();
+                if name_path.contains("ptr_try_from_impls")
+                    || name_path.contains("convert::num")
+                    || name_path.contains("convert::TryFrom")
+                {
+                    continue;
+                }
+                let Some(body) = fd.body.as_ref() else {
+                    continue;
+                };
+                if !body.get().contains("TryFrom") {
+                    continue;
+                }
+                let Ok(graph) = crate::front::mir::lower_fun_decl(ctx, fd) else {
+                    continue;
+                };
+                let leftovers = leftover_core_try_from_paths(&graph);
+                if !leftovers.is_empty() {
+                    hits.push((label.to_string(), name_path, leftovers));
+                }
+            }
+        });
+    }
+    assert!(
+        hits.is_empty(),
+        "leftover TryFrom after lowering: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of LOAD_ATTR walks the harvested
+/// `execute_load_attr` graph into `Arg::<LoadAttr>::get`. Isolated
+/// `lower_fun_decl` already aliases that call; harvest with the spec
+/// queue is what unique look-inside residualizes.
+#[test]
+fn harvested_execute_load_attr_aliases_arg_get() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["execute_load_attr"],
+    )
+    .expect("harvest execute_load_attr");
+    let mut hits: Vec<String> = Vec::new();
+    let mut load_attr_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        let get_leftovers = leftover_oparg_get_paths(graph);
+        let try_from_leftovers = leftover_core_try_from_paths(graph);
+        if base == "execute_load_attr" {
+            load_attr_found += 1;
+        }
+        if !get_leftovers.is_empty() || !try_from_leftovers.is_empty() {
+            hits.push(format!(
+                "{} get={get_leftovers:?} try_from={try_from_leftovers:?}",
+                f.name
+            ));
+        }
+    }
+    assert!(
+        load_attr_found >= 1,
+        "harvested execute_load_attr, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover Arg::get/TryFrom: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of `load_attr__AccessDirect_None` residualizes
+/// leftover `pyre_object::gc_roots::push_roots` (`arg classes ""`).
+/// PyPy `LOAD_ATTR` has no source bracket (`pyopcode.py LOAD_ATTR` is
+/// `space.getattr`); `gctransform` inserts `push_roots` after
+/// `make_jitcodes`. Isolated Regular `eval::<Impl>::load_attr` is the
+/// origin `copygraph` clones into the AccessDirect copy.
+#[test]
+fn eval_load_attr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr")
+        .expect("lower eval::<Impl>::load_attr");
+    let leftovers = leftover_push_roots_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "eval::<Impl>::load_attr leftover push_roots: {leftovers:?}"
+    );
+}
+
+/// Harvest of `load_attr` is the unique-look-inside graph, including
+/// spec copies. Isolated Regular must already erase; harvest keeps the
+/// same leftover out of every copy unique look-inside can enter.
+#[test]
+fn harvested_load_attr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["load_attr"],
+    )
+    .expect("harvest load_attr");
+    let mut hits: Vec<String> = Vec::new();
+    let mut load_attr_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "load_attr" {
+            load_attr_found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!("{} leftover={leftovers:?}", f.name));
+        }
+    }
+    assert!(
+        load_attr_found >= 1,
+        "harvested load_attr, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+/// Unique look-inside of `getattr_str` residualizes leftover
+/// `pyre_object::gc_roots::push_roots` (`arg classes ""`). PyPy
+/// `DescrOperation.getattr` has no source bracket; `gctransform`
+/// inserts `push_roots` after `make_jitcodes`. Isolated Regular
+/// `getattr_str` is the unique-look-inside graph after load_attr
+/// inlines (`jitcode=getattr_str` cursor leftover).
+#[test]
+fn eval_getattr_str_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let caller =
+        crate::test_support::lower_function(llbc, "pyre_interpreter::baseobjspace::getattr_str")
+            .expect("lower getattr_str");
+    let leftovers = leftover_push_roots_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "getattr_str leftover push_roots: {leftovers:?} calls={:?}",
+        leftover_call_summaries(&caller)
+    );
+}
+
+/// Harvest of `getattr_str` is the unique-look-inside graph, including
+/// spec copies. Isolated Regular must already erase; harvest keeps the
+/// same leftover out of every copy unique look-inside can enter.
+#[test]
+fn harvested_getattr_str_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["getattr_str"],
+    )
+    .expect("harvest getattr_str");
+    let mut hits: Vec<String> = Vec::new();
+    let mut getattr_str_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "getattr_str" {
+            getattr_str_found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!(
+                "{} leftover={leftovers:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        getattr_str_found >= 1,
+        "harvested getattr_str, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
 }
 
 /// A plain Result dest stays a regular call of the extracted core body
