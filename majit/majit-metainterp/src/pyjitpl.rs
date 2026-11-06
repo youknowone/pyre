@@ -34375,13 +34375,17 @@ mod tests {
         let frame = Value::Ref(majit_ir::GcRef(obj_ptr as usize));
         let jd1_desc = meta.staticdata.jitdrivers_sd[idx1].clone();
         let key = gk(781);
-        let action = meta.force_start_tracing(
-            key.get_uhash(),
-            (0, 0),
-            Some((&key.values, &key.types)),
-            Some(jd1_desc),
-            &[frame],
-        );
+        let action = {
+            let _zbh_pin = crate::warmstate::GreenRefPin::pin_slices(&key.values, &key.types);
+            meta.force_start_tracing(
+                key.get_uhash(),
+                _zbh_pin.save(),
+                0,
+                Some((&key.values, &key.types)),
+                Some(std::sync::Arc::new(jd1_desc)),
+                &[frame],
+            )
+        };
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         {
