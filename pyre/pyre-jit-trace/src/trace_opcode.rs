@@ -244,6 +244,27 @@ pub(crate) fn mirror_vable_static_to_boxes(
     }
 }
 
+/// Snapshot-only write of a STANDARD static: update the boxes the snapshot
+/// copies, and do not write the live `PyFrame`. `pyjitpl.py`
+/// `capture_resumedata` overrides `frame.pc` for the snapshot and restores
+/// it; the heap `pushvalue`/`popvalue` depth stays the walk's.
+pub(crate) fn mirror_vable_static_to_boxes_nosync(
+    ctx: &mut TraceCtx,
+    static_field_name: &str,
+    opref: OpRef,
+    concrete: Value,
+) {
+    if !ctx.has_virtualizable_shadow() {
+        return;
+    }
+    let idx = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(static_field_name));
+    if let Some(idx) = idx {
+        ctx.set_virtualizable_entry_at(idx, opref, concrete);
+    }
+}
+
 /// `pyframe.py popvalue_maybe_none` leaves `locals_cells_stack_w[i] is None`
 /// for every `i >= valuestackdepth`. During tracing that store is
 /// `MIFrame._opimpl_setarrayitem_vable`: `virtualizable_boxes[index] = valuebox`
