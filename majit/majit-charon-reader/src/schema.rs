@@ -116,16 +116,16 @@ pub struct TargetInformation {
     pub is_little_endian: bool,
 }
 
-fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+pub(crate) fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Value::deserialize(d).map(Some)
 }
 
-enum Nullable<T> {
+pub(crate) enum Nullable<T> {
     Null,
     Some(T),
 }
 
-fn present_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn present_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> Result<Option<Nullable<T>>, D::Error> {
     Ok(Some(match Option::<T>::deserialize(d)? {
@@ -135,7 +135,7 @@ fn present_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 impl<T> Nullable<T> {
-    fn into_value(self, f: impl FnOnce(T) -> Value) -> Value {
+    pub(crate) fn into_value(self, f: impl FnOnce(T) -> Value) -> Value {
         match self {
             Nullable::Null => Value::Null,
             Nullable::Some(t) => f(t),
@@ -143,7 +143,7 @@ impl<T> Nullable<T> {
     }
 }
 
-fn insert_present(
+pub(crate) fn insert_present(
     map: &mut serde_json::Map<String, Value>,
     key: &'static str,
     value: Option<Value>,
@@ -153,7 +153,7 @@ fn insert_present(
     }
 }
 
-fn option_array_into_value<T>(entries: Vec<Option<T>>, f: impl Fn(T) -> Value) -> Value {
+pub(crate) fn option_array_into_value<T>(entries: Vec<Option<T>>, f: impl Fn(T) -> Value) -> Value {
     Value::Array(
         entries
             .into_iter()
