@@ -14,7 +14,8 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::{FrameBox, PyFrame};
 use pyre_interpreter::{
-    PyError, PyResult, StepResult, decode_instruction_forward_dispatch, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_forward_dispatch,
+    decode_instruction_forward_packed, decode_instruction_forward_pc, execute_opcode_step,
 };
 use pyre_interpreter::{locals_w, locals_w_mut};
 use pyre_object::gc_roots;
@@ -12175,9 +12176,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 return Ok(w_none());
             }
 
-            // `dispatch_bytecode` reads `co_code` once. One walk yields the
-            // opcode pc and the packed opcode/oparg.
-            let (mut opcode_pc, packed_instruction) = decode_instruction_forward_dispatch(code, pc);
+            // `pyopcode.py dispatch_bytecode` is `@jit.unroll_safe`; its
+            // EXTENDED_ARG loop is the two scalar projections. A fused
+            // `(usize, u64)` return is two residual words and leftover-aborts
+            // unique look-inside of this portal.
+            let mut opcode_pc = decode_instruction_forward_pc(code, pc);
+            let packed_instruction = decode_instruction_forward_packed(code, pc);
             if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
                 return Err(pyre_interpreter::PyError::new(
                     pyre_interpreter::PyErrorKind::BytecodeCorruption,

@@ -2186,6 +2186,8 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
 }
 
 /// `s.flag.get()` of `S { flag: Cell<bool> }` is that field's value read.
+/// `g(&Cell<bool>)` is an offset-0 `raw_load` (`FnPtrCell::get`).
+/// `h(s.ptr.get())` of `Cell<*mut u8>` is the `ptr` field's value read.
 /// The existing UnsafeCell identity test loads real majit-rlib LLBC and
 /// cannot spell a struct field plus `Cell::get`.
 #[test]

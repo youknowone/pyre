@@ -5534,8 +5534,52 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // No containing field place: the call stays
-                    // (`jtransform.py rewrite_op_getfield` has no field to read).
+                    // No containing field place (`jtransform.py
+                    // rewrite_op_getfield` has no field to read). A borrowed
+                    // `repr(transparent)` scalar receiver is the word, not an
+                    // address, so its call stays. A `Cell` address that is
+                    // already a local (a thin-pointer `T`) is Opaque in
+                    // consumer LLBC, so the read is the offset-0 `raw_load`,
+                    // like `FnPtrCell::get`.
+                    if tyref_is_copy_scalar_or_thin_ptr(&call.dest.ty, self.llbc)
+                        && !first_arg_ty.as_ref().is_some_and(|ty| {
+                            tyref_is_borrowed_transparent_scalar(
+                                ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        })
+                        && let Some((item_ty, itemsize, is_item_signed)) =
+                            self.raw_word_descr(&call.dest.ty)
+                    {
+                        let offset = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(offset.clone()),
+                            kind: OpKind::ConstInt(0),
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::RawLoad {
+                                base: args[0].clone(),
+                                offset,
+                                item_ty,
+                                itemsize,
+                                is_item_signed,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `Cell::set(&self, v)` is the containing field's own
                 // `setfield` (`jtransform.py rewrite_op_setfield`).
