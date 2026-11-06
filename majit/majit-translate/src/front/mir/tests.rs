@@ -1951,6 +1951,21 @@ fn graph_has_cast_instance(graph: &crate::model::FunctionGraph) -> bool {
     })
 }
 
+fn graph_has_intmask(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        })
+    })
+}
+
 fn two_arg_cast_int_to_ptr_type(
     graph: &crate::model::FunctionGraph,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
@@ -2255,6 +2270,30 @@ fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
             graph.dump()
         );
     }
+}
+
+/// `usize as *mut i64` stays in the int bank (`history.py` `getkind` of a
+/// raw Ptr is `'int'`). Overlay / VOIDP already returned; the unsigned
+/// source still takes `rarithmetic.intmask` so the dest is Signed.
+#[test]
+fn usize_as_raw_i64_ptr_lowers_to_intmask() {
+    let dest = serde_json::json!({"RawPtr": [
+        {"Scalar": {"Integer": {"Signed": "I64"}}},
+        "Mut"
+    ]});
+    let llbc = int_as_ptr_cast_llbc(vec![], dest);
+    let graph = crate::test_support::lower_function(&llbc, "unary_cast")
+        .unwrap_or_else(|e| panic!("lower unary_cast: {e}"));
+    assert!(
+        graph_has_intmask(&graph),
+        "unsigned→raw i64 ptr is intmask; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !graph_has_cast_instance(&graph),
+        "raw scalar dest is not an instance; graph={}",
+        graph.dump()
+    );
 }
 
 /// `*mut PyObject as *mut PyObject` is already `Ref(Some(root))` of the

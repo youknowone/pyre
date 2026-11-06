@@ -2299,6 +2299,11 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((None, raw));
                     }
+                    // Overlay / CCHARP / VOIDP dests already returned.
+                    // `getkind` of a remaining raw Ptr is `'int'`, including
+                    // `*mut i64` / `*mut f64`, so an unsigned source still
+                    // takes `intmask` (`rtype_intmask`) rather than aliasing
+                    // `SomeInteger(unsigned=True)`.
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
                             tyref_to_attr_value_type_with(
@@ -2310,7 +2315,6 @@ impl<'a> Lowering<'a> {
                             ),
                             ValueType::Int
                         )
-                        && !tyref_is_raw_pointer(dest_ty, self.llbc)
                     {
                         let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
                         return Ok((Some(kind), res));
@@ -4435,9 +4439,12 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         arg: Variable,
     ) -> Option<Variable> {
-        use crate::translator::rtyper::lltypesystem::rffi::{VOIDP, VOIDPP};
+        use crate::translator::rtyper::lltypesystem::rffi::{CCHARP, VOIDP, VOIDPP};
         if tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
-            if arg.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            // `lltype_is_ccharp` is OF==Char, so VOIDP / CONST_VOIDP match
+            // the shape. Alias only an exact `CCHARP` (`rffi.py` `CCHARP`);
+            // a VOIDP source recasts (`ann_cast_int_to_ptr`).
+            if arg.concretetype().as_ref().is_some_and(|t| t == &*CCHARP) {
                 return Some(arg);
             }
             let bb_id = self.emit_bb(mir_bb);

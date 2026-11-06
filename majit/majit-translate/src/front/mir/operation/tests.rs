@@ -410,3 +410,19 @@ fn emit_cast_int_to_voidpp_is_two_arg_voidpp() {
     assert_eq!(two_arg_cast_int_to_ptr_type(&graph), *VOIDPP);
     assert_eq!(raw.concretetype().as_ref(), Some(&*VOIDPP));
 }
+
+/// VOIDP is `Ptr(Array(Char))` with `render_as_void`, so
+/// `lltype_is_ccharp` matches the shape. Alias in `try_emit_int_to_c_ptr`
+/// is exact `CCHARP` (`rffi.py` `CCHARP` vs `VOIDP`).
+#[test]
+fn voidp_matches_ccharp_shape_not_identity() {
+    use crate::translator::rtyper::lltypesystem::rffi::{CCHARP, VOIDP};
+    assert!(
+        super::lltype_is_ccharp(&*VOIDP),
+        "VOIDP OF is Char, the CCHARP shape"
+    );
+    assert_ne!(
+        *VOIDP, *CCHARP,
+        "VOIDP hints (`render_as_void`) differ from CCHARP"
+    );
+}
