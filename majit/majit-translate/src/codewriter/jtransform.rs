@@ -9913,6 +9913,35 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `jtransform.py rewrite_op_getinteriorarraysize`: `Ptr(rstr.STR)`
+        // is `strlen` (`len(s.chars)` / `LLHelpers.ll_strlen`). Pyre's STR
+        // layout stores that word as `Utf8Str.length`; a FieldRead of it is
+        // the same query. STRLEN is an always-pure opcode (vstring
+        // `_optimize_STRLEN` / unroll extra-arg), so the compact
+        // `_length == strlen` guard can stay in the peel. A GETFIELD of
+        // the same slot — even `IR_IMMUTABLE` / `getfield_*_pure` — is
+        // reloaded after the body label.
+        if field.name == "length"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_rstr_str_layout_declaration)
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(STR.length) → strlen".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: "strlen".into(),
+                    args: vec![base.clone().into()],
+                },
+            }]);
+        }
         // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
         // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
         // lowers that word to `arraylen_gc`. A struct `getfield` of the same
@@ -41482,6 +41511,95 @@ mod tests {
                     .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
             }),
             "typeptr getfield of a parameter must become guard_class"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorarraysize` / `test_str_getinteriorarraysize`:
+    /// `Ptr(rstr.STR)` length is `strlen`. Pyre's STR length word is a
+    /// FieldRead of `Utf8Str.length` (and the other STR-layout overlays).
+    #[test]
+    fn rewrite_op_getfield_str_length_is_strlen() {
+        for owner in [
+            "unicodeobject::Utf8Str",
+            "unicodeobject::UnicodeValueStorage",
+            "bytesobject::BytesBlock",
+            "lowlevel_string::LowlevelStringHeader",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+        ] {
+            let mut graph = FunctionGraph::new("ll_strlen");
+            let bb = graph.startblock;
+            let base =
+                graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+            graph.block_mut(bb).inputargs.push(base.clone());
+            graph
+                .push_op_var(
+                    bb,
+                    OpKind::FieldRead {
+                        base: base.clone(),
+                        field: crate::model::FieldDescriptor::new("length", Some(owner.into())),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(bb, Some(base));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops: Vec<&OpKind> = transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter().map(|op| &op.kind))
+                .collect();
+            assert!(
+                ops.iter().any(|kind| matches!(
+                    kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "strlen" && args.len() == 1
+                )),
+                "{owner} length must become strlen, got {ops:?}",
+            );
+            assert!(
+                ops.iter()
+                    .all(|kind| !matches!(kind, OpKind::FieldRead { .. })),
+                "{owner} length must not stay a getfield, got {ops:?}",
+            );
+        }
+        let mut graph = FunctionGraph::new("other_utf8str_length");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "length",
+                        Some("other::Utf8Str".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(base));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "length"
+                                && field.owner_root.as_deref() == Some("other::Utf8Str")
+                    )
+                })
+            }),
+            "an unrelated Utf8Str owner is not ll_strlen"
         );
     }
 
