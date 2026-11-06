@@ -7503,14 +7503,17 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
 
 /// `*mut` / `*const` whose pointee is `c_void` (`rffi.py` `VOIDP`).
 /// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
-/// is the same VOIDP word.
+/// is the same VOIDP word. A `type T = *mut c_void` dest names the
+/// alias Adt (`TypeDeclKind::Alias`); `rffi.cast(rwinreg.HKEY, int)`
+/// is still `ann_cast_int_to_ptr` onto that VOIDP word.
 pub(in crate::front::mir) fn tyref_is_raw_c_void_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_peel_one_raw_ptr_node(ty, llbc).is_some_and(|pointee| type_node_is_c_void(pointee, llbc))
+    tyref_peel_one_raw_ptr_through_aliases(ty, llbc)
+        .is_some_and(|pointee| type_node_is_c_void(pointee, llbc))
 }
 
 /// `void **` (`rffi.py` `VOIDPP`): one raw pointer onto [`tyref_is_raw_c_void_ptr`].
 pub(in crate::front::mir) fn tyref_is_raw_c_void_pp(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_peel_one_raw_ptr_node(ty, llbc)
+    tyref_peel_one_raw_ptr_through_aliases(ty, llbc)
         .is_some_and(|inner| tyref_is_raw_c_void_ptr(&TyRef::Other(inner.clone()), llbc))
 }
 
@@ -9568,6 +9571,27 @@ pub(in crate::front::mir) fn tyref_peel_one_raw_ptr_node<'l>(
         .and_then(serde_json::Value::as_array)
         .and_then(|arr| arr.first())?;
     strip_ty_indirections(pointee, llbc)
+}
+
+/// One RawPtr layer after following `type T = U` (`TypeDeclKind::Alias`).
+///
+/// Call sites name the alias Adt, not `U`. VOIDP / VOIDPP dests spelled
+/// `type HKEY = *mut c_void` have to see the RawPtr before
+/// [`tyref_is_raw_c_void_ptr`] can stamp `rffi.py` `VOIDP`. GCREF is the
+/// same Alias shape (`type GCREF = *mut GCREFOpaque`); dest overlay and
+/// [`tyref_is_raw_pointer`] keep the strip-only peel so that word stays
+/// `llmemory.GCREF`.
+pub(in crate::front::mir) fn tyref_peel_one_raw_ptr_through_aliases<'l>(
+    ty: &'l TyRef,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = type_node_peel_aliases(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())?;
+    type_node_peel_aliases(pointee, llbc)
 }
 
 /// `MutRef<T>` is the cell a GC reference occupies for an `&mut` borrow.

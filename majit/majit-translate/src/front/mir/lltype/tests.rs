@@ -5,9 +5,10 @@ use super::{
     json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
     raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
-    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
-    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp,
+    tyref_is_raw_c_void_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
+    tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
@@ -1127,6 +1128,64 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
     assert!(
         matches!(ptr_ty.TO, PtrTarget::Func(_)),
         "stamp is Ptr(FuncType)"
+    );
+}
+
+#[test]
+fn hkey_alias_of_c_void_ptr_is_voidp() {
+    let c_void_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt, "Mut"]});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_alias(1, &["fixture", "HKEY"], voidp.clone()),
+            type_decl_alias(
+                2,
+                &["fixture", "VOIDPP"],
+                serde_json::json!({"RawPtr": [voidp, "Mut"]}),
+            ),
+            type_decl_struct(3, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_alias(
+                4,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [{
+                    "Adt": {"id": 3, "generics": empty_generics()}
+                }, "Mut"]}),
+            ),
+        ],
+        vec![],
+    );
+    let hkey = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    }));
+    let voidpp = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 2, "generics": empty_generics()}
+    }));
+    let gcref = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 4, "generics": empty_generics()}
+    }));
+    assert!(
+        tyref_is_raw_c_void_ptr(&hkey, &llbc),
+        "type HKEY = *mut c_void is VOIDP"
+    );
+    assert!(
+        tyref_is_raw_c_void_pp(&voidpp, &llbc),
+        "type VOIDPP = *mut *mut c_void is VOIDPP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_ptr(&gcref, &llbc),
+        "type GCREF = *mut GCREFOpaque is not VOIDP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_pp(&gcref, &llbc),
+        "GCREF is not VOIDPP"
     );
 }
 

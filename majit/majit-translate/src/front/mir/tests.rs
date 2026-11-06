@@ -2098,6 +2098,53 @@ fn int_as_c_void_ptr_emits_cast_int_to_ptr_voidp() {
     }
 }
 
+/// `usize as HKEY` with `type HKEY = *mut c_void` is the same VOIDP
+/// 2-arg form (`rffi.cast(rwinreg.HKEY, int)` / `ann_cast_int_to_ptr`).
+#[test]
+fn int_as_c_void_ptr_alias_emits_cast_int_to_ptr_voidp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let c_void = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    });
+    let voidp = serde_json::json!({"RawPtr": [{
+        "Adt": {
+            "id": 0,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    }, "Mut"]});
+    let hkey = type_decl_alias(
+        1,
+        &["windows_sys", "Win32", "System", "Registry", "HKEY"],
+        voidp,
+    );
+    let dest = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    });
+    let llbc = int_as_ptr_cast_llbc(vec![c_void, hkey], dest);
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        assert_eq!(
+            two_arg_cast_int_to_ptr_type(&graph),
+            *VOIDP,
+            "{name} int→HKEY alias is VOIDP; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !graph_has_cast_instance(&graph),
+            "{name} HKEY dest is not an instance; graph={}",
+            graph.dump()
+        );
+    }
+}
+
 /// `usize as *mut *mut c_void` is `cast_int_to_ptr(VOIDPP, addr)`.
 #[test]
 fn int_as_c_void_pp_emits_cast_int_to_ptr_voidpp() {
