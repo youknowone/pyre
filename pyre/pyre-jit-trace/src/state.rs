@@ -1202,7 +1202,9 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
 ///
 /// A zero pointer is the inlined level whose frame was never materialized, the
 /// state upstream reaches by keeping the MIFrame virtual; there is no object to
-/// mark and no observer that could ask.
+/// mark and no observer that could ask. `LevelExit::Yield` callers pass
+/// `got_exception = false` (`portal_yield_frame_exit` / `execute_frame`
+/// `except Yield`).
 pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
     if frame_ptr == 0 {
         return;
@@ -5117,7 +5119,7 @@ pub(crate) fn frame_debugdata_box_is_known_non_null(ctx: &TraceCtx, op: OpRef) -
 /// the same reload applies to the frame, whose own corpse is not rewritten
 /// by `walk_pyframe_roots`.
 fn current_live_frame_array(frame: usize) -> Option<(usize, *mut pyre_object::FixedObjectArray)> {
-    if frame == 0 {
+    if !concrete_frame_word_is_address(frame) {
         return None;
     }
     let frame = majit_gc::gc_current_object_address(frame);
@@ -5280,12 +5282,27 @@ pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
     Some(unsafe { &*arr_ptr }.len())
 }
 
+/// Whether `frame` can be loaded through as a `PyFrame`.
+///
+/// `_copy_data_from_miframe` (`blackhole.py`) copies typed boxes; an int
+/// in `registers_r` is a tracer bug. Preflight must not load
+/// `PYFRAME_PYCODE_OFFSET` from that word. Heap and stack `PyFrame`
+/// values sit well above the first page and are pointer-aligned; a
+/// small integer is neither. Tests mint host `PyFrame` values on the
+/// stack, which this still accepts.
+pub(crate) fn concrete_frame_word_is_address(frame: usize) -> bool {
+    frame >= 4096 && frame & (std::mem::align_of::<*const ()>() - 1) == 0
+}
+
 /// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
 /// Returns the stack base index (nlocals + ncells) for the given frame.
 /// This is the number of non-stack slots in the unified locals_cells_stack_w
 /// array: local variables + cell/free variable slots.
 fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeObject> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    if !concrete_frame_word_is_address(frame) {
+        return None;
+    }
+    let frame_ptr = frame as *const u8;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
     if w_code.is_null() {
@@ -5309,6 +5326,20 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let nlocals = code.varnames.len();
     let ncells = pyre_interpreter::pyframe::ncells(code);
     Some(nlocals + ncells)
+}
+
+#[cfg(test)]
+mod concrete_frame_addr_tests {
+    #[test]
+    fn small_integers_are_not_frame_addresses() {
+        assert!(!super::concrete_frame_word_is_address(0));
+        assert!(!super::concrete_frame_word_is_address(1));
+        assert!(!super::concrete_frame_word_is_address(4));
+        assert!(super::concrete_nlocals(0).is_none());
+        assert!(super::concrete_nlocals(4).is_none());
+        assert!(super::concrete_stack_depth(4).is_none());
+        assert!(super::concrete_frame_array_len(4).is_none());
+    }
 }
 
 /// Static operand-stack depth at `target_pc` when it differs from the depth
@@ -5335,7 +5366,7 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
 
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
-    if frame == 0 {
+    if !concrete_frame_word_is_address(frame) {
         return None;
     }
     let frame = majit_gc::gc_current_object_address(frame);
@@ -6429,7 +6460,7 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
 /// carrying the old slots as raw words, and rooting them by hand, is what
 /// replaces that ownership.
 pub(crate) fn capture_frame_locals(frame: usize) -> Option<Vec<i64>> {
-    if frame == 0 {
+    if !concrete_frame_word_is_address(frame) {
         return None;
     }
     let nlocals = concrete_nlocals(frame)?;

@@ -7779,6 +7779,12 @@ fn init_callbacks() {
             drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
         }));
         callbacks::init(cb);
+        // Static so convert-and-run (`drive_multi_frame_blackhole`) hits it
+        // without field/config plumbing. `bhimpl_abort_permanent` calls this
+        // for `YIELD_VALUE` (`interp_jit.py dispatch` `except Yield`).
+        majit_metainterp::blackhole::register_try_yield_return(Some(
+            crate::call_jit::try_yield_return,
+        ));
     });
 }
 

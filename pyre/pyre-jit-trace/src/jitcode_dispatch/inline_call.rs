@@ -19324,6 +19324,14 @@ fn walk_generator_resume<Sym: WalkSym>(
             if bank != 1 {
                 continue;
             }
+            // `extra_ref_seeds` later entries overwrite earlier ones at
+            // the same color. Portal reds (`interp_jit.py reds =
+            // ['frame', 'ec']`) were already seeded from `frame_box` /
+            // `ec_box`; a pcdep color that collides with either would
+            // replace the live PyFrame with a local.
+            if color == portal_frame_reg || color == portal_ec_reg {
+                continue;
+            }
             // GETFIELD of `locals_cells_stack_w` / GETARRAYITEM of a prior
             // slot can minor-collect. Re-read the frame from its root, copy
             // the slot, and drop the reference before the next recording
@@ -23857,6 +23865,21 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             )
         }
     };
+    // User-call inlining stamps `inline_callee_consts` on the child
+    // WalkContext (`try_walker_inline_user_call`). This door is the
+    // generator-resume twin (`SubwalkFrameKind::PythonPortal`): without
+    // the body's jitcode index, `innermost_walk_jitcode` falls through
+    // to `snapshot_sym` (the outer portal) while `resume_pc` and the
+    // banks belong to the generator.
+    let inline_callee_consts = if is_python_portal {
+        sub_body.jitcode_index.and_then(|index| {
+            i32::try_from(index)
+                .ok()
+                .map(|jitcode_index| InlineCalleeConsts { jitcode_index })
+        })
+    } else {
+        None
+    };
     let frame = SubWalkFrame {
         _helper_live: HelperLiveGuard {
             session: ctx.session,
@@ -23874,13 +23897,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         concrete_registers_i: callee_concrete_i,
 
         // The innermost MIFrame's jitcode is the body this sub-walk executes (`pyjitpl.py` `newframe(jitcode)`).
-        inline_callee_consts: if is_python_portal {
-            sub_body.jitcode_index.map(|index| InlineCalleeConsts {
-                jitcode_index: index as i32,
-            })
-        } else {
-            None
-        },
+        inline_callee_consts,
         _inline_frame: None,
         fbw_mode,
         session: ctx.session,
