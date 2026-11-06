@@ -268,6 +268,21 @@ fn residual_const_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opref: OpRef
     }
 }
 
+/// `jit.isconstant` (`rlib/jit.py isconstant`): the box is a Const while
+/// tracing. `box_value` of an IntOp is this-iteration payload and must
+/// not bake `SetfieldGc(allocated)` / `NewArray` into a loop-carried
+/// list (`rlist.py _ll_list_resize_ge` looks inside only when both
+/// lengths are `isconstant`).
+fn residual_isconstant_i64<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+) -> Option<i64> {
+    match ctx.trace_ctx.const_typed_value(opref) {
+        Some(majit_ir::Value::Int(n)) => Some(n),
+        _ => None,
+    }
+}
+
 /// True when this residual is on the Object arm: a proven `ConstInt`
 /// (`rewrite.rs` `is_null_constant` / `history.py` ConstInt) equal to
 /// `ListStrategy::Object`, or the same Int the strategy Getfield holds
@@ -477,21 +492,25 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
 }
 
 /// `w_list_resync_allocated` is `dont_look_inside_cannot_raise` and stores
-/// only `allocated`. When the list, old size, new size, and current
-/// `allocated` are constants, record that store as `SetfieldGc` so a virtual
-/// list is not forced by residual `CallN`.
+/// only `allocated`. When old/new sizes are ConstInt (`jit.isconstant`,
+/// `rlist.py _ll_list_resize_ge`), record that store as `SetfieldGc` so a
+/// virtual list is not forced by residual `CallN`.
 fn record_list_resync_allocated_setfield<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) -> Option<OpRef> {
     let list_op = *allboxes.get(1)?;
-    let old_size = residual_const_i64(ctx, *allboxes.get(2)?)?;
-    let new_size = residual_const_i64(ctx, *allboxes.get(3)?)?;
+    let old_size = residual_isconstant_i64(ctx, *allboxes.get(2)?)?;
+    let new_size = residual_isconstant_i64(ctx, *allboxes.get(3)?)?;
     let allocated_op = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         list_op,
         crate::descr::list_allocated_descr(),
     );
+    // Lengths follow `jit.isconstant` (`rlist.py _ll_list_resize_ge`).
+    // `allocated` is W_ListObject's extra capacity field, not
+    // `len(l.items)`; once the lengths are ConstInt we are on the
+    // look-inside path and the field's executed Int is the store's value.
     let allocated = residual_const_i64(ctx, allocated_op)?;
     let new_allocated = resized_allocation_const(allocated, old_size, new_size);
     let allocated_descr = crate::descr::list_allocated_descr();
@@ -507,9 +526,10 @@ fn record_list_resync_allocated_setfield<Sym: WalkSym>(
 }
 
 /// `int_ll_newlist` / `float_ll_newlist` oopspec `newlist(length)`:
-/// `do_fixed_newlist` emits `new_array` for Signed/Float. A constant length
-/// in the virtualize bound becomes `NewArray` so OptVirtualize can make a
-/// `VArray` instead of residual `CallR` + `GuardNoException`.
+/// `do_fixed_newlist` emits `new_array` for Signed/Float. A ConstInt
+/// length (`jit.isconstant`) in the virtualize bound becomes `NewArray`
+/// so OptVirtualize can make a `VArray` instead of residual `CallR` +
+/// `GuardNoException`.
 fn record_typed_ll_newlist_as_new_array<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
@@ -517,7 +537,7 @@ fn record_typed_ll_newlist_as_new_array<Sym: WalkSym>(
     array_descr: DescrRef,
 ) -> Option<OpRef> {
     let length = *allboxes.get(1)?;
-    let n = residual_const_i64(ctx, length)?;
+    let n = residual_isconstant_i64(ctx, length)?;
     if !majit_ir::ptr_info::reasonable_array_index(n) {
         return None;
     }
@@ -14428,9 +14448,12 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     // `&` of Getfields (`sync_allocated`), so `cond` is an IntOp whose
     // executed value is 1, not a ConstInt. OptRewrite later turns
     // CondCallN(1, f, args) into CallN, which forces a virtual list.
-    // When allocated/old/new are known, record the allocated SetfieldGc
-    // here so OptVirtualize can keep the list virtual (`rlist.py
-    // _ll_list_resize_ge` looks inside when both lengths are constant).
+    // When old/new are ConstInt (`jit.isconstant`), record the allocated
+    // SetfieldGc here so OptVirtualize can keep the list virtual
+    // (`rlist.py _ll_list_resize_ge` looks inside when both lengths are
+    // `isconstant`). A this-iteration `box_value` of those lengths is not
+    // `isconstant` and must not bake NewArray / allocated into a
+    // loop-carried list.
     // CondCallN allboxes are `[cond, funcptr, list, old, new]`; the
     // residual rewrite takes `[funcptr, list, old, new]`. ConstInt(0)
     // already returned above.
