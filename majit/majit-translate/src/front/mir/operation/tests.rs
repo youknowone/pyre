@@ -355,3 +355,58 @@ fn restore_offset_pointer_type_keeps_ccharp_for_gc_entry() {
         "result remains CCHARP"
     );
 }
+
+fn two_arg_cast_int_to_ptr_type(
+    graph: &FunctionGraph,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("cast_int_to_ptr") || args.len() != 2 {
+            continue;
+        }
+        let crate::model::LinkArg::Const(c) = &args[0] else {
+            panic!("cast_int_to_ptr PtrT is a Constant, got {:?}", args[0]);
+        };
+        let crate::flowspace::model::ConstValue::LowLevelType(ptr_ty) = &c.value else {
+            panic!("cast_int_to_ptr PtrT is a LowLevelType, got {:?}", c.value);
+        };
+        return (**ptr_ty).clone();
+    }
+    panic!("expected 2-arg cast_int_to_ptr, ops={:?}", graph.dump());
+}
+
+/// `cast_int_to_ptr(VOIDP, int)` (`rffi.py` `VOIDP` / `lltype.py`
+/// `ann_cast_int_to_ptr`).
+#[test]
+fn emit_cast_int_to_voidp_is_two_arg_voidp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let mut graph = FunctionGraph::new("test");
+    let bb = graph.startblock;
+    let addr = graph
+        .push_op_var(bb, OpKind::ConstInt(8), true)
+        .expect("addr");
+    let raw = super::emit_cast_int_to_voidp(&mut graph, bb, addr);
+    assert_eq!(two_arg_cast_int_to_ptr_type(&graph), *VOIDP);
+    assert_eq!(raw.concretetype().as_ref(), Some(&*VOIDP));
+}
+
+/// `cast_int_to_ptr(VOIDPP, int)` (`rffi.py` `VOIDPP`).
+#[test]
+fn emit_cast_int_to_voidpp_is_two_arg_voidpp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDPP;
+    let mut graph = FunctionGraph::new("test");
+    let bb = graph.startblock;
+    let addr = graph
+        .push_op_var(bb, OpKind::ConstInt(8), true)
+        .expect("addr");
+    let raw = super::emit_cast_int_to_voidpp(&mut graph, bb, addr);
+    assert_eq!(two_arg_cast_int_to_ptr_type(&graph), *VOIDPP);
+    assert_eq!(raw.concretetype().as_ref(), Some(&*VOIDPP));
+}

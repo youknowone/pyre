@@ -2295,6 +2295,12 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
+    // Nested C pointers (`ffi_cif.arg_types: *mut *mut ffi_type`,
+    // `rffi.py` `VOIDPP`) are one address word. Peel and ask again;
+    // do not walk the pointee struct's fields (comment above).
+    if let Some(inner) = one_level_pointer_pointee(node, llbc) {
+        return pointee_is_raw_word(inner, llbc, gc_struct_ids);
+    }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
@@ -7499,10 +7505,17 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
 /// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
 /// is the same VOIDP word.
 pub(in crate::front::mir) fn tyref_is_raw_c_void_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
-        return false;
-    };
-    let Some(node) = type_node_peel_aliases(pointee, llbc) else {
+    tyref_peel_one_raw_ptr_node(ty, llbc).is_some_and(|pointee| type_node_is_c_void(pointee, llbc))
+}
+
+/// `void **` (`rffi.py` `VOIDPP`): one raw pointer onto [`tyref_is_raw_c_void_ptr`].
+pub(in crate::front::mir) fn tyref_is_raw_c_void_pp(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_peel_one_raw_ptr_node(ty, llbc)
+        .is_some_and(|inner| tyref_is_raw_c_void_ptr(&TyRef::Other(inner.clone()), llbc))
+}
+
+fn type_node_is_c_void(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
         return false;
     };
     adt_node_def_id(node)

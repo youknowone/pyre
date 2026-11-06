@@ -2276,6 +2276,29 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         return Ok((Some(unichr_call(arg)), res));
                     }
+                    // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
+                    // Overlay `as *const T` must not alias or fold back to
+                    // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
+                    // terminator / w_cls resolves on that SomePtr.
+                    // `history.getkind` of a raw `Ptr` is `'int'`, so this
+                    // must run before the unsigned→signed `intmask` arm.
+                    let overlay_bb = self.emit_bb(mir_bb);
+                    if let Some(raw) = self.emit_dest_overlay_cast(
+                        overlay_bb,
+                        src_kind.as_ref(),
+                        arg.clone(),
+                        dest_ty,
+                    ) {
+                        return Ok((None, raw));
+                    }
+                    // Dest `*u8` / `*mut c_void` / `*mut *mut c_void` from an
+                    // int is 2-arg `cast_int_to_ptr` (`rffi.py` `CCHARP` /
+                    // `VOIDP` / `VOIDPP`, `lltype.py` `ann_cast_int_to_ptr`).
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && let Some(raw) = self.try_emit_int_to_c_ptr(mir_bb, dest_ty, arg.clone())
+                    {
+                        return Ok((None, raw));
+                    }
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
                             tyref_to_attr_value_type_with(
@@ -2287,6 +2310,7 @@ impl<'a> Lowering<'a> {
                             ),
                             ValueType::Int
                         )
+                        && !tyref_is_raw_pointer(dest_ty, self.llbc)
                     {
                         let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
                         return Ok((Some(kind), res));
@@ -2386,19 +2410,6 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
-                    // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
-                    // Overlay `as *const T` must not alias or fold back to
-                    // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
-                    // terminator / w_cls resolves on that SomePtr.
-                    let overlay_bb = self.emit_bb(mir_bb);
-                    if let Some(raw) = self.emit_dest_overlay_cast(
-                        overlay_bb,
-                        src_kind.as_ref(),
-                        arg.clone(),
-                        dest_ty,
-                    ) {
-                        return Ok((None, raw));
-                    }
                     // An address word cast to a raw-flavored instance pointer is
                     // `cast_int_to_ptr` of the raw `InstanceRepr` lowleveltype
                     // (`rbuiltin.py` `gen_cast`); routing it through GCREF would
@@ -2489,32 +2500,6 @@ impl<'a> Lowering<'a> {
                     {
                         let bb_id = self.block_id[mir_bb];
                         let raw = self.emit_rffi_cast_to_raw_scalar_ptr(bb_id, arg, dest_ty);
-                        return Ok((None, raw));
-                    }
-                    // Dest `*u8` from an int-kind / CCHARP source is the same
-                    // CCHARP value (`rffi.py` `CCHARP`). A GC-ref source is
-                    // `rffi.cast` onto CCHARP (`cast_ptr_to_adr` then
-                    // `cast_int_to_ptr`), not the classdef-less CAST_ADDRESS
-                    // Instance `ann_direct_ptradd` rejects.
-                    if tyref_is_raw_u8_ptr(dest_ty, self.llbc)
-                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
-                    {
-                        if arg.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
-                            return Ok((None, arg));
-                        }
-                        let bb_id = self.emit_bb(mir_bb);
-                        let raw = emit_cast_int_to_ccharp(&mut self.graph, bb_id, arg);
-                        return Ok((None, raw));
-                    }
-                    // Dest `*mut` / `*const c_void` from an int is
-                    // `cast_int_to_ptr(VOIDP, addr)` (`rffi.py` `VOIDP` /
-                    // `lltype.py` `ann_cast_int_to_ptr`). Aliasing the
-                    // `isize` keeps `SomeInteger` beside `SomePtr(VOIDP)`.
-                    if tyref_is_raw_c_void_ptr(dest_ty, self.llbc)
-                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
-                    {
-                        let bb_id = self.emit_bb(mir_bb);
-                        let raw = emit_cast_int_to_voidp(&mut self.graph, bb_id, arg);
                         return Ok((None, raw));
                     }
                     if tyref_is_raw_u8_ptr(dest_ty, self.llbc)
@@ -2831,17 +2816,23 @@ impl<'a> Lowering<'a> {
                     &self.raw_alloc_flavor_structs,
                 )
                 .is_some();
-                // Dest `*u8` from an int-kind / CCHARP source is the same
-                // CCHARP value. A GC-ref source is `rffi.cast` onto CCHARP
-                // except inside an items-base accessor (`cast_ptr_to_adr`).
-                if tyref_is_raw_u8_ptr(&ty, self.llbc)
-                    && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                // Dest `*u8` / `*mut c_void` / `*mut *mut c_void` from an
+                // int is 2-arg `cast_int_to_ptr` (`rffi.py` `CCHARP` /
+                // `VOIDP` / `VOIDPP`). Shared with the UnaryOp Cast arm.
+                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    && let Some(raw) = self.try_emit_int_to_c_ptr(mir_bb, &ty, v.clone())
                 {
-                    if v.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
-                        return Ok((None, v));
-                    }
-                    let bb_id = self.emit_bb(mir_bb);
-                    let raw = emit_cast_int_to_ccharp(&mut self.graph, bb_id, v);
+                    return Ok((None, raw));
+                }
+                // Raw overlay dest (`*mut ffi_cif`): 2-arg
+                // `cast_int_to_ptr(PTRTYPE, addr)` (`lltype.py`
+                // `ann_cast_int_to_ptr`). UnaryOp already calls this;
+                // an int source must not alias (`SomeInteger`) or take
+                // the 1-arg GCREF form (`SomeInstance`).
+                let overlay_bb = self.emit_bb(mir_bb);
+                if let Some(raw) =
+                    self.emit_dest_overlay_cast(overlay_bb, src_kind.as_ref(), v.clone(), &ty)
+                {
                     return Ok((None, raw));
                 }
                 if tyref_is_raw_u8_ptr(&ty, self.llbc)
@@ -4433,6 +4424,40 @@ impl<'a> Lowering<'a> {
             },
             _ => None,
         }
+    }
+
+    /// Int-kind source to CCHARP / VOIDP / VOIDPP (`rffi.py`,
+    /// `lltype.py` `ann_cast_int_to_ptr`). A matching overlay already on
+    /// the source aliases.
+    pub(in crate::front::mir) fn try_emit_int_to_c_ptr(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        arg: Variable,
+    ) -> Option<Variable> {
+        use crate::translator::rtyper::lltypesystem::rffi::{VOIDP, VOIDPP};
+        if tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            if arg.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+                return Some(arg);
+            }
+            let bb_id = self.emit_bb(mir_bb);
+            return Some(emit_cast_int_to_ccharp(&mut self.graph, bb_id, arg));
+        }
+        if tyref_is_raw_c_void_ptr(dest_ty, self.llbc) {
+            if arg.concretetype().as_ref().is_some_and(|t| t == &*VOIDP) {
+                return Some(arg);
+            }
+            let bb_id = self.emit_bb(mir_bb);
+            return Some(emit_cast_int_to_voidp(&mut self.graph, bb_id, arg));
+        }
+        if tyref_is_raw_c_void_pp(dest_ty, self.llbc) {
+            if arg.concretetype().as_ref().is_some_and(|t| t == &*VOIDPP) {
+                return Some(arg);
+            }
+            let bb_id = self.emit_bb(mir_bb);
+            return Some(emit_cast_int_to_voidpp(&mut self.graph, bb_id, arg));
+        }
+        None
     }
 
     /// 2-arg `cast_int_to_ptr(PTRTYPE, addr)` when dest is a raw overlay.
@@ -9895,6 +9920,21 @@ pub(in crate::front::mir) fn emit_cast_int_to_voidp(
         bb_id,
         addr,
         (*crate::translator::rtyper::lltypesystem::rffi::VOIDP).clone(),
+    )
+}
+
+/// `cast_int_to_ptr(VOIDPP, int)` (`rffi.py` `VOIDPP` /
+/// `lltype.py` `ann_cast_int_to_ptr`).
+pub(in crate::front::mir) fn emit_cast_int_to_voidpp(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+) -> Variable {
+    emit_dest_typed_cast_int_to_ptr(
+        graph,
+        bb_id,
+        addr,
+        (*crate::translator::rtyper::lltypesystem::rffi::VOIDPP).clone(),
     )
 }
 
