@@ -2570,6 +2570,9 @@ impl Drop for FrameBox {
 /// An unmanaged frame (`FrameBox::new_boxed`, a stack `PyFrame`) is not a
 /// GCREF. Its locals array is then rooted through the field slot until those
 /// frames become managed.
+///
+/// Jitcode looks inside the constructor; its owner-root pin lowers away like
+/// `OwnerRootGuard`, and only the unmanaged-frame slot registration stays a residual.
 pub struct FrameLocalsRoot {
     frame: *mut PyFrame,
     /// Shadow-stack livevar of the frame object (`OwnerRootGuard` /
@@ -2580,7 +2583,6 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         if frame_ptr.is_null() {
             return Self {
@@ -4370,6 +4372,35 @@ impl PyFrame {
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
         unsafe { &*(crate::w_code_get_ptr(self.getcode_w())) }
+    }
+
+    /// `pyopcode.py PyFrame.getlocalvarname`: `self.getcode().co_varnames[index]`.
+    ///
+    /// An out-of-range index is the LOAD_FAST_CHECK cell-slot fallback the
+    /// residual `bh_unbound_local_error_fn` already spells as `"<cell>"`.
+    #[inline]
+    pub fn getlocalvarname(&self, index: usize) -> &str {
+        let code = self.getcode();
+        if index < code.varnames.len() {
+            code.varnames[index].as_str()
+        } else {
+            "<cell>"
+        }
+    }
+
+    /// `pyopcode.py PyFrame._load_fast_failed` — `@dont_inline`.
+    ///
+    /// The UnboundLocalError constructor stays out of the portal graph so
+    /// unique look-inside residualizes this call (`objectmodel.dont_inline`).
+    /// `format!` of a Rust `&str` varname otherwise lowers to `ll_strconcat`
+    /// of a non-`STR` pointer.
+    #[inline(never)]
+    #[majit_macros::dont_look_inside]
+    pub fn _load_fast_failed(&self, varindex: usize) -> crate::PyError {
+        let varname = self.getlocalvarname(varindex);
+        crate::PyError::unbound_local_error(format!(
+            "cannot access local variable '{varname}' where it is not associated with a value"
+        ))
     }
 
     /// PyPy-compatible `fget_code`.
