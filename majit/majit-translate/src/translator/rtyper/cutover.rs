@@ -5571,13 +5571,31 @@ fn drive_access_direct_subject(
 /// `check_access_directly_sanity` (`warmspot.py WarmRunnerDesc.__init__`)
 /// is fatal to translation. It runs after `_inner` returns so a failing
 /// graph cannot skip Phase B, and so its panic is not swallowed.
+#[cfg(test)]
 pub(crate) fn run_two_phase_prepass(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
+    run_two_phase_prepass_with_wrappers(call_registry, candidate_graphs, function_graphs, &[]);
+}
+
+/// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
+/// `CallControl::builtin_wrapper_indirect_graphs` already unioned into
+/// the subject set by `CodeWriter::run_two_phase_prepass`.
+pub(crate) fn run_two_phase_prepass_with_wrappers(
+    call_registry: &CallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
+        run_two_phase_prepass_inner(
+            call_registry,
+            candidate_graphs,
+            function_graphs,
+            builtin_wrapper_graphs,
+        )
     }));
     check_access_directly_sanity(call_registry, candidate_graphs, function_graphs);
     call_registry.two_phase().prepass_done = true;
@@ -5988,10 +6006,297 @@ fn check_access_directly_sanity(
     );
 }
 
+/// Wrap an already-annotated two-phase subject graph so
+/// `FunctionDesc.cache[None]` / `DescEntry.get_graph` can return it
+/// without `pycall`.
+fn pygraph_for_cached_subject(
+    desc: &crate::annotator::description::FunctionDesc,
+    graph: crate::flowspace::model::GraphRef,
+) -> Rc<PyGraph> {
+    let func = desc
+        .base
+        .pyobj
+        .as_ref()
+        .and_then(HostObject::user_function)
+        .cloned()
+        .unwrap_or_else(|| {
+            GraphFunc::new(
+                desc.name.clone(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )
+        });
+    Rc::new(PyGraph {
+        graph,
+        func,
+        signature: RefCell::new(desc.signature.clone()),
+        defaults: RefCell::new(Some(desc.defaults.clone())),
+        access_directly: Cell::new(false),
+    })
+}
+
+/// Wrap a two-phase adapter graph as a `PyGraph` when the path has no
+/// `FunctionDesc` yet. `normalize_calltable_row_annotation` only reads
+/// `PyGraph.graph`.
+fn pygraph_from_adapter_graph(graph: crate::flowspace::model::GraphRef) -> Rc<PyGraph> {
+    let func = {
+        let g = graph.borrow();
+        g.func.clone().unwrap_or_else(|| {
+            GraphFunc::new(
+                g.name.clone(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )
+        })
+    };
+    Rc::new(PyGraph {
+        graph,
+        func,
+        signature: RefCell::new(Signature::new(vec!["args".to_string()], None, None)),
+        defaults: RefCell::new(Some(Vec::new())),
+        access_directly: Cell::new(false),
+    })
+}
+
+/// Dual-gate slot `v102` is a `value_to_var` twin whose annotation is
+/// `s_ImpossibleValue` (unfollowed `Result::Ok` extract), while
+/// `getreturnvar()` is already the family `SomeInstance`. Phase B
+/// rtypes Impossible to Void; `unionof(Impossible, X) == X`.
+/// `select_rtyped_representatives` may compare a candidate, so those
+/// copies are widened too.
+fn widen_impossible_value_to_var_twins(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+) -> u32 {
+    use crate::annotator::model::SomeValue;
+    let work: Vec<(Vec<Variable>, SomeValue)> = {
+        let tp = call_registry.two_phase();
+        builtin_wrapper_graphs
+            .iter()
+            .filter_map(|path| {
+                let subject = tp.subjects.get(path)?;
+                let ret = subject.graph.borrow().getreturnvar();
+                let s_payload = annotator.annotation(&ret)?;
+                if matches!(s_payload, SomeValue::Impossible) {
+                    return None;
+                }
+                let mut twins: Vec<Variable> = subject.value_to_var.values().cloned().collect();
+                for typed in subject.value_to_var_candidates.values() {
+                    twins.extend(typed.iter().cloned());
+                }
+                Some((twins, s_payload))
+            })
+            .collect()
+    };
+    let mut n = 0u32;
+    for (twins, s_payload) in work {
+        for mut v in twins {
+            if matches!(
+                annotator.annotation(&Hlvalue::Variable(v.clone())),
+                Some(SomeValue::Impossible)
+            ) {
+                annotator.setbinding(&mut v, s_payload.clone());
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn dump_wrapper_twin_census(
+    tag: &str,
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+) {
+    if !rtyper_verbose_enabled() {
+        return;
+    }
+    use crate::annotator::model::SomeValue;
+    let tp = call_registry.two_phase();
+    let mut subjects_with_void = 0u32;
+    let mut void_twins = 0u32;
+    for path in builtin_wrapper_graphs {
+        let Some(subject) = tp.subjects.get(path) else {
+            continue;
+        };
+        let name = path.display_name();
+        let watch = name.contains("client_sigalg") || name.ends_with("__majit_wrap___reduce__");
+        let bucket = |vars: &mut dyn Iterator<Item = &Variable>| {
+            let mut n = 0u32;
+            let mut imp = 0u32;
+            let mut none = 0u32;
+            let mut inst = 0u32;
+            let mut other = 0u32;
+            let mut noct = 0u32;
+            let mut void = 0u32;
+            let mut typed = 0u32;
+            for v in vars {
+                n += 1;
+                match annotator.annotation(&Hlvalue::Variable(v.clone())) {
+                    None => none += 1,
+                    Some(SomeValue::Impossible) => imp += 1,
+                    Some(SomeValue::Instance(_)) => inst += 1,
+                    Some(_) => other += 1,
+                }
+                match v.concretetype.borrow().as_ref() {
+                    None => noct += 1,
+                    Some(LowLevelType::Void) => void += 1,
+                    Some(_) => typed += 1,
+                }
+            }
+            (n, imp, none, inst, other, noct, void, typed)
+        };
+        let v2v = bucket(&mut subject.value_to_var.values());
+        let cand = bucket(&mut subject.value_to_var_candidates.values().flatten());
+        if v2v.6 + cand.6 > 0 {
+            subjects_with_void += 1;
+            void_twins += v2v.6 + cand.6;
+        }
+        if watch {
+            eprintln!(
+                "[PREPASS wrap-twins {tag}] {name}: v2v n/imp/none/inst/oth={}/{}/{}/{}/{} \
+                 ct noct/void/typed={}/{}/{} cand n/imp/none/inst/oth={}/{}/{}/{}/{} \
+                 ct noct/void/typed={}/{}/{}",
+                v2v.0,
+                v2v.1,
+                v2v.2,
+                v2v.3,
+                v2v.4,
+                v2v.5,
+                v2v.6,
+                v2v.7,
+                cand.0,
+                cand.1,
+                cand.2,
+                cand.3,
+                cand.4,
+                cand.5,
+                cand.6,
+                cand.7,
+            );
+        }
+    }
+    eprintln!(
+        "[PREPASS wrap-twins {tag}] subjects_with_void_twin={subjects_with_void} void_twins={void_twins}"
+    );
+}
+
+/// Record one PBC `CallFamily` row for the generated builtin wrappers.
+///
+/// Upstream `gateway.py` `BuiltinCode1.fastcall_1` calls
+/// `self.fastfunc_1(...)`; `bookkeeper.py` `consider_call_site` then
+/// `description.py` `FunctionDesc.consider_call_site` records that
+/// `SomePBC` as one row. Two-phase subjects skip `FunctionDesc.pycall`,
+/// and `builtin_code_call` is `dont_look_inside`. Install each
+/// annotated subject on `FunctionDesc.cache` (`GraphCacheKey::None`)
+/// and consider the generated `simple_call(func, slice)` shape once.
+fn consider_builtin_wrapper_call_site(
+    call_registry: &CallRegistry,
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+) -> Result<(), crate::annotator::model::AnnotatorError> {
+    use crate::annotator::argument::simple_args;
+    use crate::annotator::description::{FunctionDesc, GraphCacheKey};
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::normalizecalls::normalize_calltable_row_annotation;
+
+    let annotated: Vec<(&crate::parse::CallPath, crate::flowspace::model::GraphRef)> = {
+        let tp = call_registry.two_phase();
+        builtin_wrapper_graphs
+            .iter()
+            .filter_map(|path| {
+                tp.subjects
+                    .get(path)
+                    .map(|subject| (path, subject.graph.clone()))
+            })
+            .collect()
+    };
+    let mut descs: Vec<Rc<RefCell<FunctionDesc>>> = Vec::new();
+    let mut pygraphs: Vec<Rc<PyGraph>> = Vec::new();
+    let mut s_arg: Option<SomeValue> = None;
+    let mut s_result: Option<SomeValue> = None;
+    for (path, graph) in annotated {
+        let args = graph.borrow().getargs();
+        if args.len() != 1 {
+            continue;
+        }
+        if s_arg.is_none() {
+            s_arg = Some(
+                annotator
+                    .annotation(&args[0])
+                    .unwrap_or(SomeValue::Impossible),
+            );
+            let ret = graph.borrow().getreturnvar();
+            s_result = Some(annotator.annotation(&ret).unwrap_or(SomeValue::Impossible));
+        }
+        let Some(entry) = call_registry.lookup(&FunctionPathKey::from(path)) else {
+            pygraphs.push(pygraph_from_adapter_graph(graph));
+            continue;
+        };
+        let desc_rc = entry.function_desc.clone();
+        let (pygraph, include_desc) = {
+            let desc = desc_rc.borrow();
+            let include_desc = desc.signature.argnames.len() == 1
+                && !desc.signature.has_vararg()
+                && !desc.signature.has_kwarg();
+            let mut cache = desc.cache.borrow_mut();
+            let pygraph = if let Some(existing) = cache.get(&GraphCacheKey::None)
+                && Rc::ptr_eq(&existing.graph, &graph)
+            {
+                existing.clone()
+            } else {
+                let pg = pygraph_for_cached_subject(&desc, graph.clone());
+                cache.insert(GraphCacheKey::None, pg.clone());
+                pg
+            };
+            (pygraph, include_desc)
+        };
+        pygraphs.push(pygraph);
+        if include_desc {
+            descs.push(desc_rc);
+        }
+    }
+    // Rewrite the two-phase subject graphs first so Phase B rtypes the
+    // union return even when `get_graph` later misses `cache[None]`.
+    if pygraphs.len() > 1 {
+        normalize_calltable_row_annotation(annotator, &pygraphs)?;
+    }
+    // Always-raising wrappers already bind `getreturnvar()` as the
+    // `PyResult` `SomeInstance` (signature / reachable except-path).
+    // Dual-gate slot `v102` is the unfollowed `Result::Ok.__pos_0`
+    // getattr (`enum_payload_getattr_ops`), still Impossible → Void.
+    // `unionof(s_ImpossibleValue, X) == X`: give that extract the
+    // family return so Phase B rtypes GcRef.
+    let n_twins =
+        widen_impossible_value_to_var_twins(annotator, call_registry, builtin_wrapper_graphs);
+    dump_wrapper_twin_census(
+        "after-widen",
+        annotator,
+        call_registry,
+        builtin_wrapper_graphs,
+    );
+    if rtyper_verbose_enabled() {
+        eprintln!(
+            "[PREPASS builtin wrapper CallFamily] listed={} pygraphs={} descs={} twins_widened={}",
+            builtin_wrapper_graphs.len(),
+            pygraphs.len(),
+            descs.len(),
+            n_twins
+        );
+    }
+    if descs.is_empty() {
+        return Ok(());
+    }
+    let args = simple_args(vec![s_arg.unwrap_or(SomeValue::Impossible)]);
+    let s_result = s_result.unwrap_or(SomeValue::Impossible);
+    FunctionDesc::consider_call_site(&descs, &args, &s_result, None)
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
 ) {
     // Exists to localise prepass nondeterminism (gh#1139).
     let determinism_trace = crate::determinism_trace_enabled();
@@ -6222,10 +6527,51 @@ fn run_two_phase_prepass_inner(
     // the other explicit stand-ins for the deferred complete().
     annotator.seed_all_annotated_return_vars();
 
+    // Builtin-wrapper PBC family + call-family normalization. Must run
+    // after the Impossible seed (`force_return_var_annotation`) and
+    // before Phase B: `normalizecalls.py` `normalize_calltable_row_annotation`
+    // does `annotator.setbinding(graph.getreturnvar(), generalizedresult)`
+    // with `unionof(s_ImpossibleValue, X) == X`. Two-phase
+    // `run_annotator_simplify_isolated` always passes a `block_subset`,
+    // so it never reaches `perform_normalizations`. Only
+    // `normalize_call_familes` is hoisted; `assign_inheritance_ids`
+    // already ran, and `normalize_call_familes` does not require the
+    // other `perform_normalizations` passes.
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(err) =
+            consider_builtin_wrapper_call_site(call_registry, &annotator, builtin_wrapper_graphs)
+        {
+            eprintln!("[PREPASS builtin wrapper CallFamily] {err}");
+        }
+    })) {
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+        eprintln!("[PREPASS builtin wrapper CallFamily] panicked: {msg}");
+    }
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(err) =
+            crate::translator::rtyper::normalizecalls::normalize_call_familes(&annotator)
+        {
+            eprintln!("[PREPASS normalize_call_familes] {err}");
+        }
+    })) {
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+        eprintln!("[PREPASS normalize_call_familes] panicked: {msg}");
+    }
+
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
     // progress survives even if this call is cut short.
     run_phase_b_rtype_isolated(call_registry, determinism_trace, &paths, function_graphs);
+    if let Ok((annotator, _)) = call_registry.ensure_session() {
+        dump_wrapper_twin_census(
+            "after-phaseB",
+            &annotator,
+            call_registry,
+            builtin_wrapper_graphs,
+        );
+    }
 }
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
