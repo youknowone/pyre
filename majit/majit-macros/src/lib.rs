@@ -876,13 +876,6 @@ fn is_pointer_alias(ty: &Type) -> bool {
     path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef" || id == "GCREF")
 }
 
-/// `celldict.py VersionTag` is a GC instance; [`VersionTag`] here is the
-/// one-word serial (`VersionTag::fresh`). Reconstruct it with the integer
-/// conversion: `VersionTag(word as u64)`.
-fn is_version_tag_type(ty: &Type) -> bool {
-    path_type_last_ident(ty).is_some_and(|id| id == "VersionTag")
-}
-
 /// Shared `&self` / `self: &Self` / `self: &T`. `&mut self` and by-value
 /// `self` stay [`HelperFnAddrSkip::MethodReceiver`].
 ///
@@ -1065,9 +1058,6 @@ fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
     {
         return HelperCallKind::Ref;
     }
-    if is_version_tag_type(ty) {
-        return HelperCallKind::Int;
-    }
     match primitive_type_ident(ty)
         .map(|ident| ident.to_string())
         .as_deref()
@@ -1133,9 +1123,6 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
                 Some(#inner_conv)
             }
         });
-    }
-    if is_version_tag_type(ty) {
-        return Some(quote! { #ty((#arg_ident) as u64) });
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
@@ -1897,12 +1884,6 @@ fn helper_return_to_i64(
                 ::core::option::Option::None => 0,
             }
         });
-    }
-    if is_version_tag_type(ty) {
-        return Some(quote! {{
-            let __majit_tag: #ty = #value;
-            __majit_tag.0 as i64
-        }});
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
@@ -5606,7 +5587,7 @@ mod tests {
         );
         assert_eq!(
             skip(
-                "fn f(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }"
+                "fn f(&self, v: *mut VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }"
             ),
             None
         );
@@ -5995,7 +5976,7 @@ mod tests {
     #[test]
     fn shared_self_receiver_emits_one_word_trampoline() {
         let func = parse_fn(
-            "fn _orig_leaf_unlikely_name(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }",
+            "fn _orig_leaf_unlikely_name(&self, v: *mut VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }",
         );
         assert_eq!(trampoline_skip_reason(&func, "elidable", &[]), None);
         let wrapper: Ident = syn::parse_str("leaf").unwrap();
@@ -6013,7 +5994,7 @@ mod tests {
         assert!(text.contains("* const Self"), "{text}");
         assert!(text.contains("Self :: _orig_leaf_unlikely_name"), "{text}");
         assert!(
-            text.contains("VersionTag ((__majit_arg_1) as u64)"),
+            text.contains("((__majit_arg_1) as usize) as * mut VersionTag"),
             "{text}"
         );
         assert!(text.contains("register_impl_method"), "{text}");
