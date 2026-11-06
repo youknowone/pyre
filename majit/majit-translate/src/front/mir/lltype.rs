@@ -2752,6 +2752,12 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             raw_alloc_flavor_structs,
         );
     }
+    // `rffi.py` `VOIDP` / `VOIDPP`. `history.py` `getkind` of a raw `Ptr`
+    // is `'int'`. `*mut u8` stays `Ref` (GC byte erasure); `c_void` is
+    // never that erasure.
+    if raw_c_void_ptr_bank(ty, llbc).is_some() {
+        return ValueType::Int;
+    }
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
     }
@@ -2923,6 +2929,11 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
         raw_u8_ccharp_bank(place_ty, llbc).or_else(|| raw_u8_ccharp_bank(field_ty, llbc))
     {
         return Some(ccharp);
+    }
+    if let Some(voidp) =
+        raw_c_void_ptr_bank(place_ty, llbc).or_else(|| raw_c_void_ptr_bank(field_ty, llbc))
+    {
+        return Some(voidp);
     }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
     // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
@@ -3189,6 +3200,9 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
     if let Some(ccharp) = raw_u8_ccharp_bank(ty, llbc) {
         return ccharp;
+    }
+    if let Some(voidp) = raw_c_void_ptr_bank(ty, llbc) {
+        return voidp;
     }
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
         return tyref_to_value_type_with(
@@ -7551,6 +7565,12 @@ pub(in crate::front::mir) fn tyref_raw_u8_ptr_param_is_ccharp(
 /// preserves `getkind(CCHARP)` when the producer is also stamped.
 pub(in crate::front::mir) fn raw_u8_ccharp_bank(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     tyref_is_raw_u8_ptr(ty, llbc).then_some(ValueType::Unsigned)
+}
+
+/// Int-bank of `void *` / `void **` (`rffi.py` `VOIDP` / `VOIDPP`).
+pub(in crate::front::mir) fn raw_c_void_ptr_bank(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    (tyref_is_raw_c_void_ptr(ty, llbc) || tyref_is_raw_c_void_pp(ty, llbc))
+        .then_some(ValueType::Int)
 }
 
 /// Stamp a raw `*u8` cell `CCHARP`. The producing op must be Int-banked.

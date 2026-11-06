@@ -4,11 +4,11 @@ use super::{
     is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
     json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
     raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
-    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp,
-    tyref_is_raw_c_void_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_positional_aggregate_root,
+    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
@@ -1186,6 +1186,64 @@ fn hkey_alias_of_c_void_ptr_is_voidp() {
     assert!(
         !tyref_is_raw_c_void_pp(&gcref, &llbc),
         "GCREF is not VOIDPP"
+    );
+}
+
+/// Charon dests intern `*mut c_void` as `Deduplicated` (`prepare_file`
+/// `null_mut` dest). The intern body is `RawPtr` of `c_void`; VOIDP
+/// recognition has to resolve that table, not `type_decls[id]`.
+#[test]
+fn interned_c_void_ptr_dest_is_voidp() {
+    let intern_ptr = 1u64;
+    let intern_void = 2u64;
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_alias(
+                1,
+                &["fixture", "InternSeed"],
+                serde_json::json!({
+                    "Value": [intern_ptr, {
+                        "RawPtr": [
+                            {"Value": [intern_void, {
+                                "Adt": {
+                                    "id": 0,
+                                    "generics": empty_generics(),
+                                    "builtin": null
+                                }
+                            }]},
+                            "Mut"
+                        ]
+                    }]
+                }),
+            ),
+        ],
+        vec![],
+    );
+    let ty = TyRef::Dedup { id: intern_ptr };
+    assert!(
+        tyref_is_raw_c_void_ptr(&ty, &llbc),
+        "Deduplicated *mut c_void intern is VOIDP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_pp(&ty, &llbc),
+        "Deduplicated *mut c_void intern is not VOIDPP"
+    );
+    assert_eq!(
+        tyref_enum_payload_value_type(
+            &ty,
+            &llbc,
+            &no_tombstoned_leaves(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        ),
+        ValueType::Int,
+        "Result Ok *mut c_void is VOIDP int-bank, not GCREF"
     );
 }
 

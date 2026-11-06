@@ -17801,6 +17801,95 @@ fn null_mut_of_hkey_alias_emits_voidp_nullptr() {
     assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "HKEY alias");
 }
 
+/// `prepare_file` dest of `null_mut` is interned `*mut c_void`
+/// (`Deduplicated`), not an inline `RawPtr` node.
+#[test]
+fn null_mut_of_interned_c_void_ptr_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let intern_ptr = 1u64;
+    let intern_void = 2u64;
+    let dest = serde_json::json!({"Deduplicated": intern_ptr});
+    let seed = type_decl_alias(
+        1,
+        &["fixture", "InternSeed"],
+        serde_json::json!({
+            "Value": [intern_ptr, {
+                "RawPtr": [
+                    {"Value": [intern_void, {
+                        "Adt": {
+                            "id": 0,
+                            "generics": empty_generics(),
+                            "builtin": null
+                        }
+                    }]},
+                    "Mut"
+                ]
+            }]
+        }),
+    );
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0), seed], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "Deduplicated *mut c_void");
+}
+
+/// Production `prepare_file`: `Ok(null_mut())` dest is interned VOIDP.
+/// A leftover GC `null_mut` is classdef-less `SomeInstance` and cannot
+/// union with `prepare_file_argument`'s SomePtr return.
+#[test]
+fn prepare_file_null_mut_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    use crate::{ErrorCarrierSpec, HostStaticAddrs};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-module.ullbc"
+    );
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let addrs = HostStaticAddrs {
+        error_carrier: ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        },
+        ..Default::default()
+    };
+    let name = "pyre_module::module::_cffi_backend::ctypeptr::prepare_file";
+    let graph = crate::test_support::lower_function_with_static_addrs(llbc, name, addrs)
+        .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, name);
+    use crate::model::{CallTarget, OpKind};
+    let arg_call = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("prepare_file_argument")
+            )
+        })
+        .unwrap_or_else(|| panic!("{name}: missing prepare_file_argument call"));
+    let stamped = arg_call
+        .result
+        .as_ref()
+        .and_then(|v| v.concretetype())
+        .expect("prepare_file_argument result");
+    assert_eq!(
+        stamped, *VOIDP,
+        "Result Ok *mut c_void keeps VOIDP through remint"
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
+    let arg_name = "pyre_module::module::_cffi_backend::ctypeptr::prepare_file_argument";
+    let arg_graph = crate::test_support::lower_function_with_static_addrs(llbc, arg_name, addrs)
+        .unwrap_or_else(|err| panic!("lower {arg_name}: {err:?}"));
+    crate::translator::rtyper::legacy_annotator::annotate(&arg_graph);
+}
+
 /// `null_mut()` dest `*mut *mut c_void` is `cast_int_to_ptr(VOIDPP, 0)`
 /// (`rffi.py` `VOIDPP`).
 #[test]
