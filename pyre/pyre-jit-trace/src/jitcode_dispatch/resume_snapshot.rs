@@ -3294,18 +3294,25 @@ enum NumberedHelperGuard {
 /// and `reject_unresolved_call` bails at a residual call it cannot resolve;
 /// a helper section has no Python coordinate the interpreter could continue
 /// from. When a section can reach one
-/// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
-/// entered the outermost helper level instead ([`HelperCallEntry`]), which
-/// re-runs that call. That is refused once a heap-writing residual (live
-/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
-/// live-heap effect (a list pop or append, a store) has executed since the
-/// level was entered, since the re-run would apply it twice; the refusal is
-/// the one an unlowered helper gets, so the descent is cut back to a residual
-/// call when it applied nothing and the trace aborts otherwise. A residual
-/// the executed-effect odometer counts only for its void result (an
-/// allocation, `make_pyerror`) keeps the CALL-entry resume. A guard recorded
-/// right after a residual call (`after_residual_call`: `GuardNoException` /
-/// `GuardException`) skips that scan:
+/// ([`helper_resume_reaches_blocker`]) and nothing heap-writing has run
+/// since the level was entered, the guard resumes at the CALL that entered
+/// the outermost helper level ([`HelperCallEntry`]), which re-runs that
+/// call. A residual the executed-effect odometer counts only for its void
+/// result (an allocation, `make_pyerror`) keeps that CALL-entry resume.
+///
+/// Once a heap-writing residual (live heap or a user frame, or an
+/// unjournaled `ForIterNext`) or a journaled live-heap effect (a list pop
+/// or append, a store) has executed, CALL-entry is invalid: the re-run
+/// would apply it twice. `pyjitpl.py generate_guard` still numbers the
+/// helper at `orgpc` (`capture_resumedata`); the blackhole starts at that
+/// guard and does not re-run the residual. Numbering after an applied
+/// residual therefore skips the blocker scan the same way
+/// `after_residual_call` does. A Python chain that cannot publish every
+/// frame still refuses, because collapsing to the portal CALL would also
+/// re-apply.
+///
+/// A guard recorded right after a residual call (`after_residual_call`:
+/// `GuardNoException` / `GuardException`) skips the scan too:
 /// `capture_resumedata(after_residual_call=True)` numbers the helper at the
 /// trailing `-live-` and the blackhole runs `catch_exception`.
 fn numbered_helper_guard_resume<Sym: WalkSym>(
@@ -3321,28 +3328,43 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         after_residual_call,
         scope,
     )?);
-    let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
-        // `generate_guard` / `capture_resumedata(after_residual_call=True)`:
-        // the blackhole runs `handle_exception_in_frame` at this pc.
-        after_residual_call
-            || frame.resume_marker_jit_pc.is_some_and(|pc| {
-                !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
-            })
-    };
     // `capture_resumedata` numbers every frame on `framestack`. A Python
     // inline level below the helper levels that holds no paused-caller image
     // (a straight-line callee) has no section here, so numbering would skip
     // it. Such a guard takes the caller-boundary collapse that
     // `walker_inline_guard_resumes_in_callee` gives the same Python level.
-    let python_chain_complete = {
+    let (python_chain_complete, already_applied) = {
         let session = ctx.session.borrow();
-        session
+        let python_chain_complete = session
             .framestack
             .iter()
             .rev()
             .skip_while(|frame| frame.is_helper_level())
             .filter(|frame| !frame.is_portal)
-            .all(|frame| !frame.parents.is_empty())
+            .all(|frame| !frame.parents.is_empty());
+        let helper_levels = session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .count();
+        let outer_index = session.framestack.len() - helper_levels;
+        let already_applied = session.framestack.get(outer_index).is_some_and(|outer| {
+            fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects
+                || fbw_journaled_effect_delta_since(outer.entry_journal_mark) != 0
+        });
+        (python_chain_complete, already_applied)
+    };
+    let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
+        // `generate_guard` / `capture_resumedata(after_residual_call=True)`:
+        // the blackhole runs `handle_exception_in_frame` at this pc.
+        // After a heap-writing residual, CALL-entry re-run is invalid;
+        // number at orgpc instead (`capture_resumedata` for GuardClass).
+        after_residual_call
+            || already_applied
+            || frame.resume_marker_jit_pc.is_some_and(|pc| {
+                !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
+            })
     };
     let runnable = python_chain_complete && {
         let session = ctx.session.borrow();
@@ -3372,6 +3394,9 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         pc: op_pc,
         symbolic: 0,
     };
+    if already_applied {
+        return Err(refused);
+    }
     let session = ctx.session.borrow();
     let helper_levels = session
         .framestack
@@ -3383,11 +3408,6 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     let Some(outer) = session.framestack.get(outer_index) else {
         return Err(refused);
     };
-    let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
-    let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
-    if heap_moved || journal_delta != 0 {
-        return Err(refused);
-    }
     if !python_chain_complete {
         return Ok(NumberedHelperGuard::CallerBoundary);
     }
