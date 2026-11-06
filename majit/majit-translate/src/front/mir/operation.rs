@@ -7749,6 +7749,29 @@ impl<'a> Lowering<'a> {
                 });
             }
         }
+        // `PyError(ptr)` is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` leaves the wrapper so the
+        // handle class is not interned as the payload (`PyObjectRef`).
+        // Construction is still that word: a named-struct `New` of
+        // `__pos_0` is a second object, and residual callees
+        // (`wrap_set_element_hash_error_raw`, `pyerror_to_exc_object`)
+        // take the payload (`*mut PyErrorObject`).
+        if self.ty_is_error_carrier(dest_ty) {
+            if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
+                if index >= n_operands {
+                    return Err(format!("error-carrier aggregate missing field {index}"));
+                }
+                return Ok(AggregateShape::Operand {
+                    index,
+                    transparent: true,
+                });
+            } else if n_operands == 1 {
+                return Ok(AggregateShape::Operand {
+                    index: 0,
+                    transparent: true,
+                });
+            }
+        }
         // Resolve the user-defined owner + field names and types from the
         // Adt kind's `type_id` when possible.  Charon encodes
         // `AggregateKind::Adt(type_id, variant_idx, ..)` as
