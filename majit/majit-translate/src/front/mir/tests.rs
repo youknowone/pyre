@@ -17691,6 +17691,127 @@ fn null_mut_of_raw_struct_is_null_raw_without_cast() {
     );
 }
 
+fn c_void_opaque_decl(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    })
+}
+
+fn c_void_adt(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": id,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    })
+}
+
+fn lower_null_mut_dest(
+    types: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+) -> crate::model::FunctionGraph {
+    let caller = interior_caller(
+        "null_voidp",
+        0,
+        vec![],
+        dest.clone(),
+        vec![interior_local(0, None, &dest)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &dest), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], dest);
+    let llbc = llbc_with_types("fixture", types, vec![caller, null_mut]);
+    lower_interior(&llbc, "null_voidp")
+}
+
+fn assert_null_mut_is_typed_nullptr(
+    graph: &crate::model::FunctionGraph,
+    ptr_ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    label: &str,
+) {
+    use crate::model::{CallTarget, OpKind};
+    assert_eq!(
+        two_arg_cast_int_to_ptr_type(graph),
+        *ptr_ty,
+        "{label} null_mut is 2-arg cast_int_to_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .all(|op| {
+                !matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice()
+                        == ["core", "ptr", "null_mut"]
+                        || segments.as_slice() == ["std", "ptr", "null_mut"]
+                        || segments.as_slice() == ["core", "ptr", "null"]
+                        || segments.as_slice() == ["std", "ptr", "null"]
+                        || segments.as_slice() == ["core", "ptr", "null_raw"]
+                )
+            }),
+        "{label} must not remain a GC null_mut or null_raw; graph={}",
+        graph.dump()
+    );
+}
+
+/// `std::ptr::null_mut::<*mut c_void>()` is `cast_int_to_ptr(VOIDP, 0)`
+/// (`rffi.py` `VOIDP` / `ann_cast_int_to_ptr`).
+#[test]
+fn null_mut_of_c_void_ptr_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let dest = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0)], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "*mut c_void");
+}
+
+/// `null_mut()` dest `type HKEY = *mut c_void` is the same VOIDP nullptr
+/// (`as_hkey` none_ok arm / `rffi.cast(rwinreg.HKEY, int)`).
+#[test]
+fn null_mut_of_hkey_alias_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let hkey = type_decl_alias(
+        1,
+        &["windows_sys", "Win32", "System", "Registry", "HKEY"],
+        voidp,
+    );
+    let dest = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    });
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0), hkey], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "HKEY alias");
+}
+
+/// `null_mut()` dest `*mut *mut c_void` is `cast_int_to_ptr(VOIDPP, 0)`
+/// (`rffi.py` `VOIDPP`).
+#[test]
+fn null_mut_of_c_void_pp_emits_voidpp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDPP;
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let dest = serde_json::json!({"RawPtr": [voidp, "Mut"]});
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0)], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDPP, "*mut *mut c_void");
+}
+
 /// `std::ptr::null_mut::<Utf8Str>()` of a str-family GC pointee is
 /// `null_mut` recast onto that pointee (`ValueType::Str`).
 /// `ptr_null_constant` is a classdef-less `SomeInstance`; the recast is

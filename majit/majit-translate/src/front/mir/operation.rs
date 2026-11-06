@@ -10002,6 +10002,19 @@ pub(in crate::front::mir) fn emit_voidp_nullptr(
     )
 }
 
+/// Null VOIDPP: [`emit_typed_nullptr`] of `rffi.VOIDPP`.
+/// `ann_cast_int_to_ptr` returns `SomePtr(VOIDPP)`.
+pub(in crate::front::mir) fn emit_voidpp_nullptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+) -> Variable {
+    emit_typed_nullptr(
+        graph,
+        bb_id,
+        (*crate::translator::rtyper::lltypesystem::rffi::VOIDPP).clone(),
+    )
+}
+
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
 /// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
 /// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
