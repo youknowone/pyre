@@ -419,17 +419,8 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// helper graphs (`rbuilder.py ll_append` / `ll_grow_by` / `ll_build`) emit
 /// them.  No walked body builds through those graphs yet.
 ///
-/// `getfield_raw_r/id>r` is numbered the same way. `jtransform.py
-/// rewrite_op_getfield` emits the pure form to load an immutable field off
-/// a raw struct (map terminator `w_cls`); `blackhole.py bhimpl_getfield_raw_r`
-/// / `wire_bhimpl_handlers` bind the handler. `insns.rs` has no `BC_*`.
-///
-/// `record_quasiimmut_field/idd` is numbered the same way. A headerless
-/// owner (`CellFamily`, `AuditHolder`, `GilReadyState`) puts the raw
-/// pointer in the int bank, so `jtransform.py rewrite_op_getfield` keys
-/// `record_quasiimmut_field/idd`; `blackhole.rs wire_bhimpl_handlers`
-/// binds `handler_record_quasiimmut_field` next to `/rdd` (`blackhole.py
-/// bhimpl_record_quasiimmut_field`). `insns.rs` has no `BC_*`.
+/// `getfield_raw_r/id>r` and `record_quasiimmut_field/idd` left this list
+/// when `insns.rs` named `BC_GETFIELD_RAW_R` / `BC_RECORD_QUASIIMMUT_FIELD_I`.
 ///
 /// `current_trace_length/>i` is numbered the same way. `_get_adapted_tick_counter`
 /// (`interp_jit.py`) calls `jit.current_trace_length`, which `jtransform.py`
@@ -448,8 +439,6 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         .collect();
     unnamed.sort();
     let mut expected: Vec<String> = [
-        "getfield_raw_r/id>r",
-        "record_quasiimmut_field/idd",
         "current_trace_length/>i",
         "int_same_as/i>i",
         "newstr/i>r",

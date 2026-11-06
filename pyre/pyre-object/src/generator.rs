@@ -128,11 +128,11 @@ impl crate::lltype::GcType for GeneratorIterator {
     const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
 }
 
-// `pyframe.py initialize_as_generator` allocates `GeneratorIterator` /
-// `Coroutine` / `AsyncGenerator`; the GC allocation is a residual primitive
-// like `gc_hook::try_gc_alloc_nursery_raw`, and the kind-selected type pointer
-// keeps `fuse_boxing_alloc` from proving one constant vtable.
-#[majit_macros::dont_look_inside(word_enums(GeneratorKind))]
+/// Interpreter arm of `pyframe.py initialize_as_generator`. Nursery
+/// `try_gc_alloc_nursery_raw` is the residual primitive `w_float_gc_alloc`
+/// uses: the write-into-block shape is not the `malloc_typed(%agg)` cluster
+/// `fuse_boxing_alloc` rewrites.
+#[majit_macros::dont_look_inside]
 fn w_generator_or_coroutine_new(
     frame_ptr: crate::gc_hook::GCREF,
     pycode: PyObjectRef,
@@ -217,22 +217,124 @@ fn w_generator_or_coroutine_new(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum GeneratorKind {
     Generator,
     Coroutine,
     AsyncGenerator,
 }
 
+/// Jitted `GeneratorIterator(frame)` (`pyframe.py initialize_as_generator`).
+/// Own graph like `floatobject.rs newfloat` / `FrameBox::new_malloc_typed` so
+/// `fuse_boxing_alloc` sees `malloc_typed_young_nonmoving(GeneratorIterator {
+/// .. })` with constant `GENERATOR_TYPE`.
+#[inline(never)]
+fn w_generator_new_malloc_typed(
+    frame_ptr: crate::gc_hook::GCREF,
+    pycode: PyObjectRef,
+) -> PyObjectRef {
+    crate::lltype::malloc_typed_young_nonmoving(GeneratorIterator {
+        ob: PyObject {
+            ob_type: &GENERATOR_TYPE as *const PyType,
+            w_class: get_instantiate(&GENERATOR_TYPE),
+        },
+        frame_ptr,
+        pycode,
+        started: false,
+        exhausted: false,
+        running: false,
+        name: PY_NULL,
+        qualname: PY_NULL,
+        cr_origin: PY_NULL,
+        warned_unawaited: false,
+        saved_exc_value: PY_NULL,
+        previous_gen_or_coroutine: PY_NULL,
+        hooks_inited: false,
+        ag_running: false,
+        w_finalizer: PY_NULL,
+        lifeline: PY_NULL,
+    }) as PyObjectRef
+}
+
+/// Jitted `Coroutine(frame)` (`pyframe.py initialize_as_generator`).
+#[inline(never)]
+fn w_coroutine_new_malloc_typed(
+    frame_ptr: crate::gc_hook::GCREF,
+    pycode: PyObjectRef,
+) -> PyObjectRef {
+    crate::lltype::malloc_typed_young_nonmoving(GeneratorIterator {
+        ob: PyObject {
+            ob_type: &COROUTINE_TYPE as *const PyType,
+            w_class: get_instantiate(&COROUTINE_TYPE),
+        },
+        frame_ptr,
+        pycode,
+        started: false,
+        exhausted: false,
+        running: false,
+        name: PY_NULL,
+        qualname: PY_NULL,
+        cr_origin: crate::w_none(),
+        warned_unawaited: false,
+        saved_exc_value: PY_NULL,
+        previous_gen_or_coroutine: PY_NULL,
+        hooks_inited: false,
+        ag_running: false,
+        w_finalizer: PY_NULL,
+        lifeline: PY_NULL,
+    }) as PyObjectRef
+}
+
+/// Jitted `AsyncGenerator(frame)` (`pyframe.py initialize_as_generator`).
+#[inline(never)]
+fn w_async_generator_new_malloc_typed(
+    frame_ptr: crate::gc_hook::GCREF,
+    pycode: PyObjectRef,
+) -> PyObjectRef {
+    crate::lltype::malloc_typed_young_nonmoving(GeneratorIterator {
+        ob: PyObject {
+            ob_type: &ASYNC_GENERATOR_TYPE as *const PyType,
+            w_class: get_instantiate(&ASYNC_GENERATOR_TYPE),
+        },
+        frame_ptr,
+        pycode,
+        started: false,
+        exhausted: false,
+        running: false,
+        name: PY_NULL,
+        qualname: PY_NULL,
+        cr_origin: PY_NULL,
+        warned_unawaited: false,
+        saved_exc_value: PY_NULL,
+        previous_gen_or_coroutine: PY_NULL,
+        hooks_inited: false,
+        ag_running: false,
+        w_finalizer: PY_NULL,
+        lifeline: PY_NULL,
+    }) as PyObjectRef
+}
+
+/// `pyframe.py initialize_as_generator` `GeneratorIterator(self, name, qualname)`.
 pub fn w_generator_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
+    if majit_rlib::jit::we_are_jitted() {
+        return w_generator_new_malloc_typed(frame_ptr, pycode);
+    }
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Generator)
 }
 
+/// `pyframe.py initialize_as_generator` `Coroutine(self, name, qualname)`.
 pub fn w_coroutine_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
+    if majit_rlib::jit::we_are_jitted() {
+        return w_coroutine_new_malloc_typed(frame_ptr, pycode);
+    }
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Coroutine)
 }
 
+/// `pyframe.py initialize_as_generator` `AsyncGenerator(self, name, qualname)`.
 pub fn w_async_generator_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
+    if majit_rlib::jit::we_are_jitted() {
+        return w_async_generator_new_malloc_typed(frame_ptr, pycode);
+    }
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::AsyncGenerator)
 }
 

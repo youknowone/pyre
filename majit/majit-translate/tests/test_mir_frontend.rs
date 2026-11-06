@@ -6,7 +6,8 @@
 mod common;
 
 use common::{
-    CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named,
+    CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC,
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc, lower_named,
 };
 use common::{build_semantic_program_from_llbc, lower_function};
 use majit_charon_reader::Llbc;
@@ -3525,89 +3526,283 @@ fn code_flags_methods_call_translated_bodies() {
     });
 }
 
-/// `FrameBox::new` copies a by-value `PyFrame` with `core::ptr::write`.
-/// That write becomes one field store per registered field.
+/// Jitted `FrameBox::new` is `new_malloc_typed` (`floatobject.rs newfloat`):
+/// `malloc_typed_young_nonmoving(PyFrame { .. })` with constant `FRAME_TYPE`.
+/// `fuse_boxing_alloc` (`jtransform.py rewrite_op_malloc`) turns that into
+/// `NewWithVtable` plus one payload store per field; the header rides the
+/// vtable.
+///
+/// Production harvest order is majit-rlib, pyre-object, pyre-interpreter
+/// (`lib.rs` `build_semantic_program_via_active_frontend`): `PyObject`
+/// lives on the object crate, so an interpreter-only `LowerContext` leaves
+/// `resolve_header_plan` with an unregistered header layout.
 #[test]
 fn frame_box_new_ptr_write_lowers_to_field_stores() {
-    use majit_translate::front::mir::lower_fun_decl;
+    use majit_translate::HostStaticAddrs;
     use majit_translate::model::{CallTarget, OpKind};
 
-    let llbc = load_llbc(INTERPRETER_LLBC);
-    let fd = llbc
-        .iter_local_fns()
-        .find(|fd| fun_source_starts_with(fd, "pub fn new(mut frame: PyFrame)"))
-        .expect("FrameBox::new");
-    common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
-        assert!(
-            !graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
-                    )
-                }),
-            "FrameBox::new still has core::ptr::write"
-        );
-        let cast_results: std::collections::HashSet<u64> = graph
+    const FRAME_TYPE_ADDR: i64 = 0x00C0_FFEE;
+    if !std::path::Path::new(RLIB_LLBC).is_file()
+        || !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        return;
+    }
+    let rlib = load_llbc(RLIB_LLBC);
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        HostStaticAddrs {
+            pytypes: &[("pyframe::FRAME_TYPE", FRAME_TYPE_ADDR)],
+            ..Default::default()
+        },
+        &["pyframe"],
+        &["new_malloc_typed"],
+    )
+    .expect("lower FrameBox::new_malloc_typed");
+    assert!(
+        program
+            .struct_field_attrs
+            .contains_key("pyobject::PyObject"),
+        "PyObject layout must come from the object crate harvest"
+    );
+    assert!(
+        program.struct_field_attrs.contains_key("pyframe::PyFrame"),
+        "PyFrame layout must come from the interpreter harvest"
+    );
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "new_malloc_typed" && f.module_path.contains("pyframe"))
+        .expect("new_malloc_typed graph");
+    let graph = function.graph();
+    assert!(
+        !graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .filter_map(|op| {
-                (majit_translate::model::cast_instance_root(&op.kind) == Some("pyframe::PyFrame"))
-                    .then(|| op.result.as_ref().map(|var| var.id()))
-                    .flatten()
-            })
-            .collect();
-        assert!(
-            graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldWrite { base, field, .. }
-                            if cast_results.contains(&base.id()) && field.name == "pycode"
-                    )
-                }),
-            "the PyFrame copy must store pycode into the cast destination"
-        );
-        assert!(
-            !graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldWrite { field, .. } if field.name == "ob_header"
-                    )
-                }),
-            "FrameBox::new must not store the inlined ob_header as one word"
-        );
-        assert!(
-            graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldWrite { field, .. }
-                            if field.name == "w_class"
-                                && field.owner_root.as_deref() == Some("pyobject::PyObject")
-                    )
-                }),
-            "offset-0 header is the `super` chain: inner PyObject descriptors"
-        );
-    });
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+        "new_malloc_typed still has core::ptr::write"
+    );
+    let mut fused = Vec::new();
+    let mut fused_ids = std::collections::HashSet::new();
+    let mut residual_mallocs = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::NewWithVtable { owner, vtable } => {
+                    fused.push((owner.clone(), *vtable));
+                    if let Some(var) = op.result.as_ref() {
+                        fused_ids.insert(var.id());
+                    }
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s.contains("malloc_typed")) => {
+                    residual_mallocs += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        fused.len(),
+        1,
+        "one NewWithVtable for the jitted frame malloc, got {fused:?}; residual_mallocs={residual_mallocs}; pyobject_layout={} pyframe_layout={}",
+        program
+            .struct_field_attrs
+            .contains_key("pyobject::PyObject"),
+        program.struct_field_attrs.contains_key("pyframe::PyFrame"),
+    );
+    assert!(
+        fused[0].0.ends_with("PyFrame"),
+        "NewWithVtable owner is the frame, got {}",
+        fused[0].0
+    );
+    assert_eq!(
+        fused[0].1, FRAME_TYPE_ADDR,
+        "vtable is the host FRAME_TYPE address"
+    );
+    assert_eq!(
+        residual_mallocs, 0,
+        "malloc_typed_young_nonmoving is consumed, not left residual"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if fused_ids.contains(&base.id()) && field.name == "pycode"
+                )
+            }),
+        "the fused malloc must store pycode into the NewWithVtable destination"
+    );
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                )
+            }),
+        "new_malloc_typed must not store the inlined ob_header as one word"
+    );
+}
+
+/// Jitted `w_generator_new` is `w_generator_new_malloc_typed`
+/// (`floatobject.rs newfloat` / `FrameBox::new_malloc_typed`):
+/// `malloc_typed_young_nonmoving(GeneratorIterator { .. })` with constant
+/// `GENERATOR_TYPE`. `fuse_boxing_alloc` turns that into `NewWithVtable`
+/// plus one payload store per field; the header rides the vtable.
+///
+/// `pyframe.py initialize_as_generator` constructs `GeneratorIterator` /
+/// `Coroutine` / `AsyncGenerator` as three classes, each with a constant
+/// vtable. A shared helper whose type pointer is kind-selected cannot fuse.
+#[test]
+fn w_generator_new_malloc_typed_lowers_to_field_stores() {
+    use majit_translate::HostStaticAddrs;
+    use majit_translate::model::{CallTarget, OpKind};
+
+    const GENERATOR_TYPE_ADDR: i64 = 0x00D0_FFEE;
+    if !std::path::Path::new(RLIB_LLBC).is_file() || !std::path::Path::new(OBJECT_LLBC).is_file() {
+        return;
+    }
+    let rlib = load_llbc(RLIB_LLBC);
+    let object = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object],
+        HostStaticAddrs {
+            pytypes: &[("generator::GENERATOR_TYPE", GENERATOR_TYPE_ADDR)],
+            ..Default::default()
+        },
+        &["generator"],
+        &["w_generator_new_malloc_typed"],
+    )
+    .expect("lower w_generator_new_malloc_typed");
+    assert!(
+        program
+            .struct_field_attrs
+            .contains_key("pyobject::PyObject"),
+        "PyObject layout must come from the object crate harvest"
+    );
+    assert!(
+        program
+            .struct_field_attrs
+            .contains_key("generator::GeneratorIterator"),
+        "GeneratorIterator layout must come from the object crate harvest"
+    );
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_generator_new_malloc_typed" && f.module_path.contains("generator"))
+        .expect("w_generator_new_malloc_typed graph");
+    let graph = function.graph();
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+        "w_generator_new_malloc_typed still has core::ptr::write"
+    );
+    let mut fused = Vec::new();
+    let mut fused_ids = std::collections::HashSet::new();
+    let mut residual_mallocs = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::NewWithVtable { owner, vtable } => {
+                    fused.push((owner.clone(), *vtable));
+                    if let Some(var) = op.result.as_ref() {
+                        fused_ids.insert(var.id());
+                    }
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s.contains("malloc_typed")) => {
+                    residual_mallocs += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        fused.len(),
+        1,
+        "one NewWithVtable for the jitted generator malloc, got {fused:?}; pyobject_layout={} generator_layout={}",
+        program
+            .struct_field_attrs
+            .contains_key("pyobject::PyObject"),
+        program
+            .struct_field_attrs
+            .contains_key("generator::GeneratorIterator"),
+    );
+    assert!(
+        fused[0].0.ends_with("GeneratorIterator"),
+        "NewWithVtable owner is the generator, got {}",
+        fused[0].0
+    );
+    assert_eq!(
+        fused[0].1, GENERATOR_TYPE_ADDR,
+        "vtable is the host GENERATOR_TYPE address"
+    );
+    assert_eq!(
+        residual_mallocs, 0,
+        "malloc_typed_young_nonmoving is consumed, not left residual"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if fused_ids.contains(&base.id()) && field.name == "pycode"
+                )
+            }),
+        "the fused malloc must store pycode into the NewWithVtable destination"
+    );
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob"
+                )
+            }),
+        "w_generator_new_malloc_typed must not store the inlined ob header as one word"
+    );
 }
 
 /// `FrameBox::new` stores the operand of `OwnerRootGuard::new(r)` in

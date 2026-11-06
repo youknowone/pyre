@@ -299,22 +299,17 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 /// "the callee forced this vref".  A reader that forced would report its own
 /// read as a callee escape.
 ///
-/// `#[dont_look_inside]` for the same reason as [`force_vref`]: the typeptr
-/// test lives in `majit-metainterp` (`ptr_is_virtual_ref`), which is not
-/// LLBC.  A look-inside residualized a symbolic hash and aborted with
-/// `OrthodoxSubWalkTraceUnsupported` on the generatorentry walk
-/// (enter-chain identity).  Inlining `is_virtual_ref`
-/// (`inst.typeptr == jit_virtual_ref_vtable`) plus `return vref.forced` as
-/// field reads is the interpreter copy; the jitcode copy cannot hold those
-/// reads.  `jtransform.py rewrite_op_getfield` refuses a non-pure
-/// `getfield_raw_r`, and `forced` is a raw ref that `continue_tracing`
-/// rewrites, so it is not `_pure`.  `rewrite_op_jit_is_virtual` also
-/// refuses `vref.virtual` from jit-visible code.  Upstream
-/// `replace_force_virtual_with_call` supplies the typeptr test only to the
-/// interpreter copy; this attribute is how pyre spells that for a reader
-/// that never forces.
-#[inline]
-#[majit_macros::dont_look_inside]
+/// Keep `dont_look_inside`: the typeptr test is `vref.virtual`, which
+/// `rewrite_op_jit_is_virtual` refuses from jit-visible code, and
+/// `ptr_is_virtual_ref` lives in `majit-metainterp`, which is not lowered
+/// to LLBC. Looking inside residualizes that helper as a symbolic path hash
+/// (`EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`) and aborts
+/// the trace. `inline(never)` keeps the call so Charon residualizes instead
+/// of inlining the typeptr test into `ExecutionContext::enter`.
+/// `dont_look_inside_cannot_raise` is the effect: this body never raises, so
+/// `enter` does not grow a `GUARD_NO_EXCEPTION` around the identity check.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as majit_gc::header::GCREF) } {
         unsafe {
@@ -324,6 +319,17 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     } else {
         ptr
     }
+}
+
+/// One-word residual-call ABI for [`vref_referent`].
+///
+/// The residual lowering types a value-returning call as `(i64) -> i64`; a
+/// raw `*mut PyFrame` is narrower than a word on wasm32, where
+/// `call_indirect` type-checks its callee.
+#[inline(never)]
+pub extern "C" fn vref_referent_jit_abi(ptr: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::vref_referent_jit_abi");
+    vref_referent(ptr) as i64
 }
 
 /// An activation's pending result held in root slots across a call that can
@@ -4337,6 +4343,31 @@ mod tests {
         assert!(
             panicked,
             "a vref with no hook must panic, not return the vref as a frame"
+        );
+    }
+
+    #[test]
+    fn vref_referent_is_identity_or_forced_without_forcing() {
+        use super::vref_referent;
+        use majit_metainterp::virtualref::{ObjectHeader, VirtualRefInfo};
+
+        assert!(
+            std::ptr::eq(vref_referent(std::ptr::null_mut()), std::ptr::null_mut()),
+            "null is identity"
+        );
+        let mut header = ObjectHeader { typeptr: 1 };
+        let dummy = &mut header as *mut ObjectHeader as *mut PyFrame;
+        assert!(
+            std::ptr::eq(vref_referent(dummy), dummy),
+            "a non-vref is identity"
+        );
+
+        let info = VirtualRefInfo::new();
+        let forced = 0x1000 as majit_gc::header::GCREF;
+        let vref = info.virtual_ref_during_tracing(forced) as *mut PyFrame;
+        assert!(
+            std::ptr::eq(vref_referent(vref), forced as *mut PyFrame),
+            "a vref names the object stored in `forced`, without calling the hook"
         );
     }
 }

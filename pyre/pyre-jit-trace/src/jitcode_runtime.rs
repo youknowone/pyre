@@ -3107,17 +3107,14 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
     // `setup_insns(asm.insns)`: keys the production builder already pins at
-    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
-    // emitted byte is a no-op when it matches; a mismatch is the overlay
-    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
-    // the curated list; keep it here so a build that emitted it before the
-    // pin still binds.
-    // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
-    // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
-    // (`blackhole.py bhimpl_getfield_raw_r`).
-    // `record_quasiimmut_field/idd` is the headerless twin of `/rdd`
-    // (int-bank base, same no-op skip).
-    // `_get_adapted_tick_counter` (`interp_jit.py`) emits
+    // `BC_*` in `wellknown_bh_insns()` (`recursive_call_*`,
+    // `getfield_raw_r/id>r`, `record_quasiimmut_field/idd`) may still appear
+    // in this build's `asm.insns`; this curated builder omits them, so they
+    // ride the overlay at those reserved bytes. Overlaying the emitted byte
+    // is a no-op when it matches; a mismatch is the overlay assert in
+    // `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in the curated
+    // list; keep it here so a build that emitted it before the pin still
+    // binds. `_get_adapted_tick_counter` (`interp_jit.py`) emits
     // `current_trace_length/>i`; no BC_* pin, assembler get_opnum.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",

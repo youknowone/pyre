@@ -33250,7 +33250,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(jd1_desc),
+            Some(std::sync::Arc::new(jd1_desc)),
             &[frame],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));

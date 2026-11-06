@@ -18713,7 +18713,10 @@ fn handle<Sym: WalkSym>(
                 }
             }
         }
-        key if key.starts_with("recursive_call_") => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_i/iIRFIRF>i" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_r/iIRFIRF>r" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_f/iIRFIRF>f" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_v/iIRFIRF" => dispatch_recursive_call(code, op, ctx),
         other => Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: other,

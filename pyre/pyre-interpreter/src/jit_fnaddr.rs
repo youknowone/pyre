@@ -3942,16 +3942,19 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::may_ignore_finalizer",
         crate::executioncontext::may_ignore_finalizer,
     );
-    // `vref_referent` is `dont_look_inside` (`virtualref.py is_virtual_ref`
-    // plus `return vref.forced`): the typeptr test is not LLBC, and a
-    // non-pure `getfield_raw_r` of `forced` is refused
-    // (`jtransform.py rewrite_op_getfield`). Publish so the residual on
-    // the enter-chain identity residual is a real address.
-    pa1!(
+    // `vref_referent` is `dont_look_inside_cannot_raise` so the tracer does
+    // not walk `ptr_is_virtual_ref` (unbound `majit-metainterp` path). Bind
+    // the word-ABI bridge under every spelling the codewriter hashes.
+    cpa1!(
         &mut entries,
         "pyre_interpreter::executioncontext::vref_referent",
         "pyre_interpreter::vref_referent",
-        crate::executioncontext::vref_referent,
+        crate::executioncontext::vref_referent_jit_abi,
+    );
+    cp1!(
+        &mut entries,
+        "executioncontext::vref_referent",
+        crate::executioncontext::vref_referent_jit_abi,
     );
     // `rgc.FinalizerQueue.register_finalizer` is `@jit.dont_look_inside`
     // too; the same publication makes its residual call real.
@@ -10183,6 +10186,22 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
+    }
+
+    /// `vref_referent` is opaque so the tracer does not residualize
+    /// `ptr_is_virtual_ref`. Every spelling the codewriter hashes must bind
+    /// the word-ABI bridge, not a symbolic path hash.
+    #[test]
+    fn jit_trace_fnaddrs_covers_vref_referent() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::executioncontext::vref_referent_jit_abi as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::executioncontext::vref_referent"],
+            expected
+        );
+        assert_eq!(bindings["pyre_interpreter::vref_referent"], expected);
+        assert_eq!(bindings["executioncontext::vref_referent"], expected);
     }
 
     /// `w_float_gc_alloc` is `dont_look_inside`; a typo in either spelling

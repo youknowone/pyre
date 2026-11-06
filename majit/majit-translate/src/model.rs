@@ -12316,6 +12316,20 @@ mod tests {
             synthetic_transparent_ctor_owner(&foreign, Some("pyre_object")).as_deref(),
             Some("foreign_crate::shadow::W_IntObject")
         );
+
+        // A header constructed in another crate (PyObject inside pyframe)
+        // still looks up the crate-relative layout key once the defining
+        // crate is registered, matching
+        // `build_semantic_program_via_active_frontend`.
+        let _guard = crate::local_crates::push_local_crate_roots(["pyre_object".into()]);
+        let header = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["pyre_object".into()],
+            "pyobject::PyObject",
+        );
+        assert_eq!(
+            synthetic_transparent_ctor_owner(&header, Some("pyre_interpreter")).as_deref(),
+            Some("pyobject::PyObject")
+        );
     }
 
     /// `CallTarget::SyntheticTransparentCtor::path_segments()` must

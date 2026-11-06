@@ -522,6 +522,9 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
     let llbcs: &[&Llbc] = &llbc_refs;
+    let _local_crates = crate::local_crates::push_local_crate_roots(
+        llbcs.iter().map(|llbc| llbc.crate_name().to_string()),
+    );
     if link_scalars {
         link_transparent_scalar_types(llbcs);
     }

@@ -32,8 +32,9 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, interpreter_llbc, load_llbc, module_llbc,
-    object_llbc, with_llbc_link_state, with_shared_lowering, with_shared_lowering_many,
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, RLIB_LLBC, interpreter_llbc, load_llbc,
+    module_llbc, object_llbc, with_llbc_link_state, with_shared_lowering,
+    with_shared_lowering_many,
 };
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
@@ -63,6 +64,39 @@ fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGra
 
 fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
     with_shared_lowering(llbc, |ctx| lower_fun(llbc, ctx, leaf))
+}
+
+/// Harvest root-stack effects in production artefact order
+/// (`lib.rs` `build_semantic_program_via_active_frontend`: majit-rlib,
+/// pyre-object, pyre-interpreter) and lower `leaf` from the interpreter.
+/// Same loop as `wrap_cdata_call_erases_the_incoming_slice_bracket`.
+fn lower_named_with_production_dependency_effects(leaf: &str) -> Option<FunctionGraph> {
+    if !std::path::Path::new(RLIB_LLBC).is_file()
+        || !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        return None;
+    }
+    let rlib = load_llbc(RLIB_LLBC);
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    Some(with_llbc_link_state(rlib, || {
+        with_llbc_link_state(object, || {
+            with_llbc_link_state(interpreter, || {
+                let mut crates = Vec::new();
+                let mut touching = Vec::new();
+                for llbc in [rlib, object, interpreter] {
+                    llbc.set_root_stack_effects(crates.clone(), touching.clone());
+                    touching.extend(
+                        majit_translate::front::mir::harvest_root_stack_touching_paths(llbc),
+                    );
+                    crates.push(llbc.crate_name().to_string());
+                }
+                let context = LowerContext::new(interpreter);
+                lower_fun(interpreter, &context, leaf)
+            })
+        })
+    }))
 }
 
 /// Same class-static bucket the production driver stamps
@@ -1166,8 +1200,9 @@ fn format_int_decimal_bracket_is_scalar_replaced() {
 /// calls makes the walker residualize the whole body through its fnaddr.
 #[test]
 fn set_add_value_bracket_is_scalar_replaced() {
-    let llbc = interpreter_llbc();
-    let graph = lower_named(llbc, "set_add_value");
+    let Some(graph) = lower_named_with_production_dependency_effects("set_add_value") else {
+        return;
+    };
     for leaf in [
         "push_roots",
         "shadow_stack_len",

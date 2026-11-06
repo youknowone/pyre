@@ -457,7 +457,13 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
         // A Rust enum is the class hierarchy `rclass.py` flavors as one:
         // its variants inherit `_alloc_flavor_` from the base
         // (`ClassDesc.get_param` reads the attribute through the MRO).
-        if !matches!(&td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
+        // An imported class the artefact only declares (`Opaque`) carries
+        // the marker of the extracted crate that allocates it, since the
+        // defining crate is not an LLBC input.
+        if !matches!(
+            &td.kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) | TypeDeclKind::Opaque
+        ) {
             continue;
         }
         let td_path = td.item_meta.name_path();
@@ -2157,6 +2163,56 @@ mod tests {
         let raw_node = HashSet::from(["a::Node".to_string()]);
         assert!(super::alloc_flavor_raw_contains(&raw_node, "a::Node"));
         assert!(!super::alloc_flavor_raw_contains(&raw_node, "Node"));
+    }
+
+    #[test]
+    fn alloc_flavor_raw_identity_accepts_an_opaque_imported_class() {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "localcrate",
+                "fun_decls": [],
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["hostir", "quasiimmut", "QuasiImmut"]),
+                    "kind": "Opaque"
+                }],
+                "global_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["localcrate", "quasiimmut", "_alloc_flavor_QuasiImmut"]),
+                    "global_kind": "NamedConst",
+                    "value": {"Value": [1, [{"Str": "raw"}, {"Deduplicated": 1}]]}
+                }]
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("fixture Llbc parses");
+        let harvested = super::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc));
+        let td_path = llbc
+            .iter_type_decls()
+            .next()
+            .expect("opaque TypeDecl")
+            .item_meta
+            .name_path();
+        let identity = super::alloc_flavor_class_intern_key(&td_path);
+        assert_eq!(harvested, HashSet::from([identity]));
     }
 
     #[test]

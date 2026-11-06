@@ -1356,9 +1356,32 @@ fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str
 /// converting the post-decode framestack would resume past the call and read
 /// whatever the result register held before. Refuse it the way an unbound
 /// residual target is refused, so the portal replays the source arm.
-fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx) -> TraceAction {
+fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx, why: &'static str) -> TraceAction {
+    if crate::majit_log_enabled() {
+        eprintln!("[interpret] refuse recursive_call: {why}");
+    }
     ctx.symbolic_residual_abort = true;
     TraceAction::Abort
+}
+
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode` for `jitdrivers_sd[jd_index]`.
+/// Eager field first, then the deferred loader
+/// (`eval.rs` `install_extracted_portal_jitcode_loader`).
+fn driver_mainjitcode(ctx: &TraceCtx, jd_index: usize) -> Option<Arc<JitCode>> {
+    let jd = ctx.metainterp_sd().jitdrivers_sd.get(jd_index)?;
+    if let Some(jitcode) = jd.mainjitcode.as_ref() {
+        return Some(Arc::clone(jitcode));
+    }
+    if let Some(jitcode) = jd.mainjitcode_loaded.get() {
+        return Some(Arc::clone(jitcode));
+    }
+    let loader = jd.mainjitcode_loader?;
+    let jitcode = loader()?;
+    jitcode.set_jitdriver_sd(jd_index);
+    match jd.mainjitcode_loaded.set(Arc::clone(&jitcode)) {
+        Ok(()) => Some(jitcode),
+        Err(_) => jd.mainjitcode_loaded.get().cloned(),
+    }
 }
 
 /// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
@@ -3731,6 +3754,13 @@ where
             inline_depth,
             recursive_depth,
         );
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[interpret] recursive_call jd={jd_index} decision={decision:?} \
+                 green_pc={green_pc} inline_depth={inline_depth} \
+                 recursive_depth={recursive_depth}"
+            );
+        }
         if decision != crate::pyjitpl::InlineDecision::Inline {
             // pyjitpl.py `_opimpl_recursive_call` →
             // `do_recursive_call(assembler_call=True)`: instead of inlining
@@ -3778,30 +3808,50 @@ where
                 &green_values,
             );
         }
-        // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
-        // `portal_jitcode`; enter their portal at `green_pc` as before.
-        // Otherwise `pyjitpl.py _opimpl_recursive_call`
-        // `perform_call(portal_code)` with `portal_code =
-        // targetjitdriver_sd.mainjitcode`: production carries the extracted
-        // portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
-        // grab_initial_jitcodes`), and `MIFrame.setup_call` starts it at pc 0.
+        // pyjitpl.py `_opimpl_recursive_call` `perform_call(portal_code,
+        // allboxes, greenkey=greenboxes)` with
+        // `portal_code = targetjitdriver_sd.mainjitcode`. Fixture runtimes
+        // wire `portal_jitcode` and enter at `green_pc` (pc-aligned
+        // `#[jit_interp]` portals). Production
+        // `ClosureRuntimeWithResolver` leaves that seam None; the portal
+        // is `jd.mainjitcode` (or its deferred loader) and
+        // `MetaInterp.newframe` starts at pc 0.
         //
         // `#[jit_interp]` `recursive_portal_call!` emits greens only
         // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
         // are a fresh frame (`recursive_fresh_entry_reds`) on the assembler
-        // arm, not opcode boxes. `mainjitcode_of` still finds the extracted
-        // portal for those drivers, but `setup_call` of greens alone leaves
-        // the merge-point vable identity empty (`listed red register 1`).
-        // Take the mainjitcode fallback only when the opcode carries reds
-        // (jtransform `handle_recursive_call` `make_three_lists` of the
-        // portal reds).
+        // arm, not opcode boxes, and `setup_call` of greens alone leaves the
+        // merge-point vable identity empty. Take the mainjitcode only when
+        // the opcode carries reds (jtransform `handle_recursive_call`
+        // `make_three_lists` of the portal reds).
         let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
-        let (portal, start_pc) = match runtime.portal_jitcode(jd_index) {
-            Some(portal) => (Some(portal), green_pc),
-            None if opcode_has_reds => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
-            None => (None, 0),
+        let runtime_portal = runtime.portal_jitcode(jd_index);
+        let driver_portal = if runtime_portal.is_none() && opcode_has_reds {
+            driver_mainjitcode(ctx, jd_index)
+        } else {
+            None
         };
-        if let Some(portal) = portal {
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[interpret] recursive_call inline runtime_portal={} \
+                 driver_mainjitcode={}",
+                runtime_portal.is_some(),
+                driver_portal.is_some(),
+            );
+        }
+        let (portal, enter_pc) = match (runtime_portal, driver_portal) {
+            (Some(portal), _) => (portal, green_pc),
+            (None, Some(portal)) => (portal, 0),
+            (None, None) => {
+                // No portal: refuse. A refused recursive call has not run,
+                // so the blackhole must not resume past it. Routing Inline
+                // into `exec_recursive_call_assembler` for a macro-only
+                // driver (`portal_runner_adr` 0) would bake address 0 into
+                // `funcbox` (`compile_tmp_callback`, `examples/tl`).
+                return refuse_unexecuted_recursive_call(ctx, "no portal_jitcode or mainjitcode");
+            }
+        };
+        {
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
             // R then F; `newframe(jitcode, greenkey)` → `f.setup(jitcode,
             // greenkey)` uses that one `greenkey` for unique_id and
@@ -3814,8 +3864,8 @@ where
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =
                 self.frames
-                    .take_frame(portal, start_pc, Some(greenkey.clone()), Some(ctx));
-            portal_frame.code_cursor = start_pc;
+                    .take_frame(portal, enter_pc, Some(greenkey.clone()), Some(ctx));
+            portal_frame.code_cursor = enter_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
             // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
             // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
@@ -3872,17 +3922,8 @@ where
                 None => {}
             }
             self.frames.push(portal_frame);
-            return TraceAction::Continue;
+            TraceAction::Continue
         }
-
-        // No portal jitcode on the runtime seam, or the extracted
-        // `jitdrivers_sd[jd].mainjitcode` was skipped because the opcode
-        // carries no reds (`#[jit_interp]` / `tl`). A refused recursive
-        // call has not run, so the blackhole must not resume past it
-        // (`refuse_unexecuted_recursive_call`). Routing to
-        // `exec_recursive_call_assembler` would bake `portal_runner_adr == 0`
-        // into `funcbox` (`compile_tmp_callback`).
-        refuse_unexecuted_recursive_call(ctx)
     }
 
     /// pyjitpl.py `do_recursive_call(assembler_call=True)` for a
@@ -3924,7 +3965,7 @@ where
             | (Some(JitArgKind::Ref), Some(_))
             | (Some(JitArgKind::Float), Some(_))
             | (None, None) => {}
-            _ => return refuse_unexecuted_recursive_call(ctx),
+            _ => return refuse_unexecuted_recursive_call(ctx, "malformed recursive_call dest"),
         }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
@@ -3939,7 +3980,7 @@ where
         let (token_arc, _green_key) =
             match runtime.recursive_call_assembler_target(jd_index, green_values) {
                 Some(target) => target,
-                None => return refuse_unexecuted_recursive_call(ctx),
+                None => return refuse_unexecuted_recursive_call(ctx, "no assembler token"),
             };
 
         // Build the callee's red args.  A recursive portal call runs the
@@ -3955,15 +3996,25 @@ where
         // run.
         let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
             Some(pair) => pair,
-            None => return refuse_unexecuted_recursive_call(ctx),
+            None => return refuse_unexecuted_recursive_call(ctx, "no recursive_fresh_entry_reds"),
         };
         let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
             Some(capacities) => capacities,
-            None => return refuse_unexecuted_recursive_call(ctx),
+            None => {
+                return refuse_unexecuted_recursive_call(
+                    ctx,
+                    "no recursive_fresh_entry_vable_capacities",
+                );
+            }
         };
         let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
             Some(targets) => targets,
-            None => return refuse_unexecuted_recursive_call(ctx),
+            None => {
+                return refuse_unexecuted_recursive_call(
+                    ctx,
+                    "no recursive_fresh_alloc_free_targets",
+                );
+            }
         };
         // The trace-time fresh state stands in for the residual allocator's
         // result (byte-identical by construction — both build a fresh state,
@@ -4006,7 +4057,12 @@ where
                     // an extra portal red (pyjitpl.py `do_recursive_call`).
                     let cap = match capacities.next() {
                         Some(cap) => cap,
-                        None => return refuse_unexecuted_recursive_call(ctx),
+                        None => {
+                            return refuse_unexecuted_recursive_call(
+                                ctx,
+                                "no capacity for ref red",
+                            );
+                        }
                     };
                     let cap_arg = OpRef::const_int(cap);
                     let alloc_result = ctx.call_ref_typed_with_effect(
@@ -4021,11 +4077,11 @@ where
                     arg_types.push(majit_ir::Type::Ref);
                     idx += 1;
                 }
-                _ => return refuse_unexecuted_recursive_call(ctx),
+                _ => return refuse_unexecuted_recursive_call(ctx, "unsupported fresh red kind"),
             }
         }
         if capacities.next().is_some() {
-            return refuse_unexecuted_recursive_call(ctx);
+            return refuse_unexecuted_recursive_call(ctx, "extra vable capacities");
         }
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
@@ -7536,27 +7592,31 @@ mod tests {
         );
     }
 
-    /// Production `ClosureRuntimeWithResolver` leaves `portal_jitcode` None
-    /// and puts the extracted portal on `jitdrivers_sd[jd].mainjitcode`
-    /// (`call.py grab_initial_jitcodes`). Inline must still
-    /// `perform_call` that jitcode (`pyjitpl.py _opimpl_recursive_call`).
+    /// `pyjitpl.py _opimpl_recursive_call` `perform_call(portal_code, ...)`
+    /// with `portal_code = targetjitdriver_sd.mainjitcode`. Production
+    /// `ClosureRuntimeWithResolver` leaves `portal_jitcode` None; the
+    /// dispatcher must still push `jd.mainjitcode` at pc 0
+    /// (`MetaInterp.newframe`), not at the first int green (that green is
+    /// `next_instr` on a Python portal, not a jitcode cursor).
     #[test]
-    fn recursive_call_inlines_mainjitcode_when_runtime_portal_is_none() {
+    fn recursive_call_inlines_driver_mainjitcode_at_pc_zero() {
         let mut portal_builder = JitCodeBuilder::new();
-        portal_builder.int_return(0);
-        let portal = std::sync::Arc::new(portal_builder.finish());
+        portal_builder.int_return(1);
+        let mut portal = portal_builder.finish();
         portal.set_jitdriver_sd(0);
+        let portal = std::sync::Arc::new(portal);
 
         let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(4, 99);
         caller_builder.load_const_i_value(5, 42);
-        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.recursive_call_int(0, 0, &[(JitArgKind::Int, 4)], &[(JitArgKind::Int, 5)]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 
         let mut staticdata = crate::MetaInterpStaticData::new();
-        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("x", Type::Int)]);
         jd.index = Some(0);
-        jd.mainjitcode = Some(portal.clone());
+        jd.mainjitcode = Some(portal);
         staticdata.jitdrivers_sd.push(jd);
 
         let mut ctx = TraceCtx::new(
@@ -7573,18 +7633,17 @@ mod tests {
             &RecursivePortalWithoutJitcodeRuntime,
             &[],
         );
-        let finish_args = match action {
+
+        let (finish_args, finish_arg_types) = match action {
             TraceAction::Finish {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
                 ..
-            } => {
-                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
-                finish_args
-            }
-            other => panic!("expected Finish[Int] from mainjitcode inline, got {other:?}"),
+            } => (finish_args, finish_arg_types),
+            other => panic!("expected Finish[Int] from driver mainjitcode portal, got {other:?}"),
         };
+        assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
         assert_eq!(finish_args.len(), 1);
         assert_eq!(ctx.const_value(finish_args[0]), Some(42));
     }
