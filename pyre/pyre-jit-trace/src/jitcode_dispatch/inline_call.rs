@@ -1739,6 +1739,73 @@ pub(crate) fn helper_resume_reaches_blocker(
     }
 }
 
+/// Whether the blackhole, resuming at `pc` and taking only fallthrough of
+/// every `goto_if_*`, can reach a residual, `inline_call`, `abort`, or
+/// `switch` before a return.
+///
+/// After a heap-writing residual, CALL-entry re-run is invalid, so a guard
+/// has to number at `orgpc` (`capture_resumedata`). The all-CFG scan still
+/// sees fail-arm helpers (`is_bool` after an exact-int `instance_ptr_eq`).
+/// Fallthrough of `goto_if_not` is the recorded success path
+/// (`bhimpl_goto_if_not` jumps when the condition is zero). Unconditional
+/// `goto` is followed. A cycle or an undecodable op is a blocker.
+pub(crate) fn helper_resume_fallthrough_reaches_blocker(jitcode_index: usize, pc: usize) -> bool {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return true;
+    };
+    let code = pjc.jitcode.code.as_slice();
+    if code.is_empty() {
+        return true;
+    }
+    let mut cur = pc;
+    let mut seen = vec![false; code.len()];
+    loop {
+        let Some(seen_slot) = seen.get_mut(cur) else {
+            return true;
+        };
+        if *seen_slot {
+            return true;
+        }
+        *seen_slot = true;
+        let Some(d) = crate::jitcode_runtime::decode_op_at(code, cur) else {
+            return true;
+        };
+        if d.opname.starts_with("residual_call")
+            || d.opname.starts_with("conditional_call")
+            || d.opname.starts_with("inline_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("cond_call")
+            || d.opname == "abort"
+            || d.opname == "switch"
+            || d.opname == "raise"
+            || d.opname == "reraise"
+        {
+            return true;
+        }
+        if matches!(
+            d.opname,
+            "ref_return" | "int_return" | "float_return" | "void_return"
+        ) {
+            return false;
+        }
+        if d.opname == "goto" {
+            let Some(off) = label_operand_offset(d.argcodes) else {
+                return true;
+            };
+            cur = read_label(code, &d, off);
+            continue;
+        }
+        if d.opname.starts_with("goto_if") {
+            cur = d.next_pc;
+            continue;
+        }
+        cur = d.next_pc;
+        if cur >= code.len() {
+            return true;
+        }
+    }
+}
+
 /// Why a descent into a body is refused.
 enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already

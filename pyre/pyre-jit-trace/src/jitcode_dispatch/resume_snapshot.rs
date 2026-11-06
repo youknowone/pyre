@@ -3305,11 +3305,12 @@ enum NumberedHelperGuard {
 /// or append, a store) has executed, CALL-entry is invalid: the re-run
 /// would apply it twice. `pyjitpl.py generate_guard` still numbers the
 /// helper at `orgpc` (`capture_resumedata`); the blackhole starts at that
-/// guard and does not re-run the residual. Numbering after an applied
-/// residual therefore skips the blocker scan the same way
-/// `after_residual_call` does. A Python chain that cannot publish every
-/// frame still refuses, because collapsing to the portal CALL would also
-/// re-apply.
+/// guard and does not re-run the residual. The all-CFG blocker scan still
+/// sees fail-arm helpers (`is_bool` after an exact-int test), so numbering
+/// after an applied residual uses the fallthrough-only scan
+/// ([`helper_resume_fallthrough_reaches_blocker`]). A Python chain that
+/// cannot publish every frame still refuses, because collapsing to the
+/// portal CALL would also re-apply.
 ///
 /// A guard recorded right after a residual call (`after_residual_call`:
 /// `GuardNoException` / `GuardException`) skips the scan too:
@@ -3355,13 +3356,21 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         });
         (python_chain_complete, already_applied)
     };
+    // After a heap-writing residual, CALL-entry is invalid. Number at orgpc
+    // when the innermost fallthrough has no blocker (exact-int GuardClass
+    // then `ref_return`). Outer helper sections are paused at the CALL and
+    // may lack a resume marker the all-CFG scan would read.
+    let innermost_fallthrough_ok = already_applied
+        && parent_frames.last().is_some_and(|frame| {
+            frame.resume_marker_jit_pc.is_some_and(|pc| {
+                !helper_resume_fallthrough_reaches_blocker(frame.jitcode_index as usize, pc)
+            })
+        });
     let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
         // `generate_guard` / `capture_resumedata(after_residual_call=True)`:
         // the blackhole runs `handle_exception_in_frame` at this pc.
-        // After a heap-writing residual, CALL-entry re-run is invalid;
-        // number at orgpc instead (`capture_resumedata` for GuardClass).
         after_residual_call
-            || already_applied
+            || innermost_fallthrough_ok
             || frame.resume_marker_jit_pc.is_some_and(|pc| {
                 !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
             })
