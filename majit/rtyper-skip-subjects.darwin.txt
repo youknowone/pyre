@@ -2,36 +2,13 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=b341a9e7a0fc4ddf platform=darwin
+# corpus=6fcac43ea45b6758 platform=darwin
 direct-skip (never reaches unported_category)	generatorentry_portal_portal
 direct-skip (never reaches unported_category)	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_Utf16Or32Form_1aad9eec5cbb6142
-direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::_check_len_result
 direct-skip (never reaches unported_category)	pyre_interpreter::builtins::topframe_for_locals
 direct-skip (never reaches unported_category)	pyre_interpreter::executioncontext::<Impl>::set_topframeref
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::buffered_random::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::buffered_writer::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::interp_bufferedio::__majit_wrap___getstate__
 direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_back
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
-direct-skip (never reaches unported_category)	pyre_module::module::_csv::__majit_wrap___reduce__
-direct-skip (never reaches unported_category)	pyre_module::module::_csv::__majit_wrap___reduce_ex__
-direct-skip (never reaches unported_category)	pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_hashlib::hmac_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_lzma::compressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::_lzma::decompressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::_pickle::unpickler::__majit_wrap___persistent_load_default
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::certificate_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::context_methods::__majit_wrap_get_groups
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_client_sigalg
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_group
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_server_sigalg
-direct-skip (never reaches unported_category)	pyre_module::module::bz2::compressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::bz2::decompressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::gc::referents::gcref::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::gc::referents::stats::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::select::interp_select::__majit_wrap___new__
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_ConstIdx_TryFrom____0___const_generics______regi_696554d13c8380a0
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_Layout_LayoutError_MemoryError_closure_23cf47bf63e916b1
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_LoadAttr_TryFrom____0___const_generics______regi_4d418cc0f1f6f209
@@ -120,6 +97,8 @@ two-phase-annotate-skipped	option::Option::map__spec_OpArg__String_closure_dc814
 two-phase-annotate-skipped	option::Option::map__spec_PyObject__Wtf8Buf_closure_8b62b873b1f184bf
 two-phase-annotate-skipped	option::Option::map__spec_SimpleBufferBytes_Global__into_bytes____types_ou_461ba9e9793a4e7c
 two-phase-annotate-skipped	option::Option::map_or__spec_MIFrame__str_closure_1_8c16648bd67c0bc9
+two-phase-annotate-skipped	option::Option::unwrap_or_else__spec_PyObject_closure_1_6d11bc76574e10fd
+two-phase-annotate-skipped	option::Option::unwrap_or_else__spec_PyObject_closure_879cc8d72ff4a04a
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::load_attr__spec_PyFrame_180215a970c56288__AccessDirect_None
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::store_attr__spec_PyFrame_74d517a49ae98f8a__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::_pypy_generic_alias::create_union
@@ -1481,6 +1460,7 @@ two-phase-annotate-skipped	pyre_jit::call_jit::publish_residual_call_exception
 two-phase-annotate-skipped	pyre_jit::call_jit::run_frame_through_portal__AccessDirect_None
 two-phase-annotate-skipped	pyre_jit::call_jit::store_jit_exception
 two-phase-annotate-skipped	pyre_jit::eval::<Impl>::can_enter_jit__AccessDirect_None
+two-phase-annotate-skipped	pyre_jit::eval::cached_root_raw
 two-phase-annotate-skipped	pyre_jit::eval::cached_unsupported_jit_shape
 two-phase-annotate-skipped	pyre_jit::eval::cached_unsupported_jit_shape::<Impl>::call_once
 two-phase-annotate-skipped	pyre_jit::eval::call_assembler_portal_body_result
@@ -1910,6 +1890,7 @@ two-phase-annotate-skipped	pyre_object::celldict::<Impl>::setitem
 two-phase-annotate-skipped	pyre_object::celldict::<Impl>::setitem_str
 two-phase-annotate-skipped	pyre_object::celldict::_orig_module_dict_entries_insert
 two-phase-annotate-skipped	pyre_object::celldict::module_dict_entries_insert
+two-phase-annotate-skipped	pyre_object::celldict::module_dict_key_block
 two-phase-annotate-skipped	pyre_object::celldict::module_dict_storage_set
 two-phase-annotate-skipped	pyre_object::dictmultiobject::<Impl>::copy
 two-phase-annotate-skipped	pyre_object::dictmultiobject::<Impl>::delitem
@@ -2033,6 +2014,7 @@ two-phase-annotate-skipped	pyre_object::setobject::unwrapped_key_object
 two-phase-annotate-skipped	pyre_object::setobject::w_set_key_at
 two-phase-annotate-skipped	pyre_object::setobject::w_set_next_slot
 two-phase-annotate-skipped	pyre_object::tupleobject::w_tuple_wrappeditems
+two-phase-annotate-skipped	pyre_object::typeobject::<Impl>::expands_equal
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting
 two-phase-annotate-skipped	pyre_object::weakref::w_weakref_new
 two-phase-annotate-skipped	rordereddict::<Impl>::<impl pyre_object::rordereddict::Equivalent<v0,v1>>::equivalent__spec_ObjectKey_ObjectKey_61a1a6364ea7d790
@@ -2152,6 +2134,7 @@ two-phase-never-a-subject	ll_max__uint
 two-phase-never-a-subject	ll_min__int
 two-phase-never-a-subject	ll_min__uint
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
+two-phase-rtype-skipped	pyre_interpreter::baseobjspace::_check_len_result
 two-phase-rtype-skipped	pyre_interpreter::module::thread::rlock_class::<Impl>::_release_save
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
 two-phase-rtype-skipped	pyre_jit::jit::codewriter::<Impl>::callcontrol

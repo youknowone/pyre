@@ -5,33 +5,10 @@
 # corpus=fb88aa9c539d6611 platform=linux
 direct-skip (never reaches unported_category)	generatorentry_portal_portal
 direct-skip (never reaches unported_category)	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_Utf16Or32Form_1aad9eec5cbb6142
-direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::_check_len_result
 direct-skip (never reaches unported_category)	pyre_interpreter::builtins::topframe_for_locals
 direct-skip (never reaches unported_category)	pyre_interpreter::executioncontext::<Impl>::set_topframeref
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::buffered_random::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::buffered_writer::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_io::interp_bufferedio::__majit_wrap___getstate__
 direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_back
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
-direct-skip (never reaches unported_category)	pyre_module::module::_csv::__majit_wrap___reduce__
-direct-skip (never reaches unported_category)	pyre_module::module::_csv::__majit_wrap___reduce_ex__
-direct-skip (never reaches unported_category)	pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_hashlib::hmac_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_lzma::compressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::_lzma::decompressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::_pickle::unpickler::__majit_wrap___persistent_load_default
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::certificate_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::context_methods::__majit_wrap_get_groups
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_client_sigalg
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_group
-direct-skip (never reaches unported_category)	pyre_module::module::_ssl::ssl_socket_methods::__majit_wrap_server_sigalg
-direct-skip (never reaches unported_category)	pyre_module::module::bz2::compressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::bz2::decompressor_methods::__majit_wrap___getstate__
-direct-skip (never reaches unported_category)	pyre_module::module::gc::referents::gcref::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::gc::referents::stats::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_module::module::select::interp_select::__majit_wrap___new__
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_ConstIdx_TryFrom____0___const_generics______regi_696554d13c8380a0
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_Layout_LayoutError_MemoryError_closure_23cf47bf63e916b1
 direct-skip (never reaches unported_category)	result::Result::map_err__spec_LoadAttr_TryFrom____0___const_generics______regi_4d418cc0f1f6f209
