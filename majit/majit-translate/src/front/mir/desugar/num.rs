@@ -1029,6 +1029,8 @@ impl<'a> Lowering<'a> {
     /// Result-returning rbigint floor/mod projection. Intercepted at the
     /// method call so looking inside the non-elidable `floordiv` / `mod`
     /// bodies does not drop the projection residual.
+    /// `descroperation::bigint_mod` is the pointer-ABI host spelling
+    /// `long_mod` uses (`rbigint.mod`); its Ok payload is `*mut RBigInt`.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -1047,10 +1049,17 @@ impl<'a> Lowering<'a> {
         let [receiver, divisor] = args else {
             return Ok(false);
         };
-        if !segments.iter().any(|s| s == "rbigint") {
-            return Ok(false);
-        }
         let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        let host_mod = *leaf == "bigint_mod"
+            && segments
+                .iter()
+                .rev()
+                .skip(1)
+                .take(2)
+                .eq(["descroperation", "objspace"]);
+        if !host_mod && !segments.iter().any(|s| s == "rbigint") {
             return Ok(false);
         };
         if !first_arg_ty.is_some_and(|ty| tyref_is_rbigint(ty, self.llbc)) {

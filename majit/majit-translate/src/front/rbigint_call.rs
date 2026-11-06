@@ -204,7 +204,9 @@ pub(crate) fn int_binop_residual_for_method(leaf: &str) -> Option<Vec<String>> {
 ///
 /// `rbigint.floordiv` / `rbigint.mod` are not elidable upstream (their bodies
 /// call the elidable `divmod` and take one half) and the projection residuals
-/// keep that one elidable division per call.
+/// keep that one elidable division per call. `bigint_mod` is the
+/// `descroperation` host spelling `long_mod` uses; Charon spells `r#mod`
+/// as Ident `mod`.
 pub(crate) fn fallible_div_scalar_residual_for_method(
     leaf: &str,
     int_divisor: bool,
@@ -212,8 +214,7 @@ pub(crate) fn fallible_div_scalar_residual_for_method(
     use crate::model::ValueType;
     let (residual, result_ty) = match (leaf, int_divisor) {
         ("floordiv" | "div", false) => ("jit_bigint_div_floor", ValueType::Ref(None)),
-        // Charon spells `r#mod` as Ident `mod`; match both spellings.
-        ("mod" | "r#mod", false) => ("jit_bigint_mod_floor", ValueType::Ref(None)),
+        ("mod" | "r#mod" | "bigint_mod", false) => ("jit_bigint_mod_floor", ValueType::Ref(None)),
         ("int_floordiv", true) => ("jit_bigint_int_div_floor", ValueType::Ref(None)),
         ("int_mod_int_result", true) => ("jit_bigint_int_mod_int_result", ValueType::Int),
         _ => return None,
@@ -284,15 +285,19 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
-/// `descroperation::bigint_{add,sub,mul}(&RBigInt, &RBigInt) -> *mut RBigInt`
-/// are the source spellings of `rbigint.add` / `sub` / `mul`. Each
-/// call is retargeted to the matching `jit_bigint_*`, whose result the front
-/// models as one GC reference.
+/// `descroperation::bigint_{add,sub,mul,mod}` are the source spellings of
+/// `rbigint.add` / `sub` / `mul` / `mod`. Each call is retargeted to the
+/// matching `jit_bigint_*`, whose result the front models as one GC
+/// reference. `bigint_mod` is fallible; `try_lower_rbigint_div_scalar`
+/// records the `except ZeroDivisionError` site, and this mapper is the
+/// same name swap if a call still falls through. `jit_bigint_mod_floor`
+/// keeps `_divrem`'s remainder alias inside the residual.
 pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
         Some("bigint_add") => "jit_bigint_add",
         Some("bigint_sub") => "jit_bigint_sub",
         Some("bigint_mul") => "jit_bigint_mul",
+        Some("bigint_mod") => "jit_bigint_mod_floor",
         _ => return None,
     };
     if !segments
@@ -539,8 +544,9 @@ pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<Stri
 
 /// `descroperation::bigint_divrem_returns_lhs_remainder(&RBigInt, &RBigInt)
 /// -> bool` is the host form of `rbigint._divrem`'s `(NULLRBIGINT, a)`
-/// early-return test that `long_mod` and `integer_divmod_pair` consult before
-/// reusing the dividend's payload. Retarget it to the elidable
+/// early-return test that `integer_divmod_pair` consults before reusing the
+/// dividend's payload. `long_mod` keeps that alias inside `bigint_mod` /
+/// `jit_bigint_mod_floor` instead. Retarget it to the elidable
 /// `jit_bigint_divrem_returns_lhs_remainder` so the two operands reach the
 /// residual as the GC references they are; the boolean result stays in the
 /// integer bank like the RBigInt comparisons.
@@ -890,6 +896,33 @@ mod tests {
                 "jit_bigint_mul",
             ]))
         );
+        assert_eq!(
+            bigint_add_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_mod",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_mod_floor",
+            ]))
+        );
+        let (mod_path, mod_ty) =
+            fallible_div_scalar_residual_for_method("bigint_mod", false).unwrap();
+        assert_eq!(
+            mod_path,
+            segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_mod_floor",
+            ])
+        );
+        assert!(matches!(mod_ty, crate::model::ValueType::Ref(None)));
+        assert!(fallible_div_scalar_residual_for_method("bigint_mod", true).is_none());
     }
 
     #[test]

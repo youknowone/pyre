@@ -208,6 +208,30 @@ fn bigint_mul(a: &BigInt, b: &BigInt) -> *mut BigInt {
     pyre_object::longobject::alloc_bigint_nursery(a.mul(b))
 }
 
+/// Host form of `rbigint.mod` used by `long_mod`.
+///
+/// `_divrem` returns the input remainder when `|a| < |b|`; `_divmod_small`
+/// keeps that payload when the signs match and the divisor is not one digit.
+/// The MIR front retargets this call to `jit_bigint_mod_floor`, so the
+/// alias stays inside the residual instead of a
+/// `jit_bigint_divrem_returns_lhs_remainder` guard in `_mod`.
+#[majit_macros::dont_look_inside]
+fn bigint_mod(a: &BigInt, b: &BigInt) -> Result<*mut BigInt, majit_rlib::rbigint::RBigIntError> {
+    let selfsign = a.get_sign();
+    let othersign = b.get_sign();
+    if othersign == 0 {
+        return Err(majit_rlib::rbigint::RBigIntError::DivisionByZero);
+    }
+    if selfsign != 0
+        && selfsign == othersign
+        && b.numdigits() != 1
+        && divrem_returns_input_as_remainder(a, b)
+    {
+        return Ok(a as *const BigInt as *mut BigInt);
+    }
+    Ok(pyre_object::longobject::alloc_bigint_nursery(a.r#mod(b)?))
+}
+
 /// Host form of `rbigint.int_add`. `iother == 0` returns `self` unless
 /// `self` is already zero (`rbigint.py` `int_add`). The MIR front retargets
 /// this call to `jit_bigint_int_add`.
@@ -1476,14 +1500,16 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(z));
     }
     // Both values are read once and handed to `rbigint.mod`, which
-    // roots its operands before `_divmod` allocates.
+    // roots its operands before `_divmod` allocates. `bigint_mod` is the
+    // pointer-ABI host form: an aliased remainder is the dividend payload,
+    // the same way `bigint_add` returns a zero operand.
     let va = w_long_get_value(a);
     let vb = w_long_get_value(b);
-    let z = match va.r#mod(vb) {
+    let z = match bigint_mod(va, vb) {
         Ok(z) => z,
         Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
     };
-    Ok(w_long_new(z))
+    Ok(pyre_object::longobject::w_long_from_raw(z))
 }
 
 /// `_int_divmod`: `rbigint.int_divmod`, then `newtuple2` of two `newlong`s.
