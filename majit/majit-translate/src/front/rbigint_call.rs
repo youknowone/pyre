@@ -285,19 +285,18 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
-/// `descroperation::bigint_{add,sub,mul,mod}` are the source spellings of
-/// `rbigint.add` / `sub` / `mul` / `mod`. Each call is retargeted to the
+/// `descroperation::bigint_{add,sub,mul}` are the source spellings of
+/// `rbigint.add` / `sub` / `mul`. Each call is retargeted to the
 /// matching `jit_bigint_*`, whose result the front models as one GC
-/// reference. `bigint_mod` is fallible; `try_lower_rbigint_div_scalar`
-/// records the `except ZeroDivisionError` site, and this mapper is the
-/// same name swap if a call still falls through. `jit_bigint_mod_floor`
-/// keeps `_divrem`'s remainder alias inside the residual.
+/// reference. `bigint_mod` is fallible and must go through
+/// `try_lower_rbigint_div_scalar` so `result_exc` records
+/// `except ZeroDivisionError`; a name-only swap would leave the Result
+/// tag switch on a payload pointer.
 pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
         Some("bigint_add") => "jit_bigint_add",
         Some("bigint_sub") => "jit_bigint_sub",
         Some("bigint_mul") => "jit_bigint_mul",
-        Some("bigint_mod") => "jit_bigint_mod_floor",
         _ => return None,
     };
     if !segments
@@ -896,19 +895,15 @@ mod tests {
                 "jit_bigint_mul",
             ]))
         );
-        assert_eq!(
+        assert!(
             bigint_add_residual_path(&segs(&[
                 crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "bigint_mod",
-            ])),
-            Some(segs(&[
-                crate::runtime_names::crates::INTERPRETER,
-                "objspace",
-                "descroperation",
-                "jit_bigint_mod_floor",
             ]))
+            .is_none(),
+            "fallible bigint_mod must not name-swap without FallibleRbigintSite"
         );
         let (mod_path, mod_ty) =
             fallible_div_scalar_residual_for_method("bigint_mod", false).unwrap();

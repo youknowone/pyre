@@ -1097,7 +1097,7 @@ impl<'a> Lowering<'a> {
                     return Ok(false);
                 }
             }
-            _ if !tyref_is_rbigint(&success_ty, self.llbc) => return Ok(false),
+            _ if !tyref_is_rbigint_gc_payload(&success_ty, self.llbc) => return Ok(false),
             _ => {}
         }
         self.emit_fallible_rbigint_residual(

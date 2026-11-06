@@ -67,6 +67,58 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     );
 }
 
+/// Every scalar floor/mod residual is last in its block with
+/// `except ZeroDivisionError`. A name-only retarget leaves a Result tag
+/// switch on the payload pointer (`unreachable/` in the jitcode).
+fn assert_all_scalar_zerodivision_links(
+    graph: &majit_translate::model::FunctionGraph,
+    residual: &str,
+    caller_name: &str,
+) {
+    let blocks: Vec<_> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some(residual),
+                _ => false,
+            })
+        })
+        .collect();
+    assert!(
+        !blocks.is_empty(),
+        "{caller_name}: missing residual {residual}"
+    );
+    for block in blocks {
+        let last = block.operations.last().expect("raising call");
+        match &last.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => assert_eq!(
+                segments.last().map(String::as_str),
+                Some(residual),
+                "{caller_name}: {residual} must be last in its block (except-link)"
+            ),
+            other => panic!("{caller_name}: last op is not the residual: {other:?}"),
+        }
+        assert!(
+            matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+            "{caller_name}: {residual} call block is LastException"
+        );
+        let exc = block.exits.iter().find(|link| {
+            link.exitcase == Some(majit_translate::model::zerodivisionerror_exitcase())
+        });
+        assert!(
+            exc.is_some(),
+            "{caller_name}: {residual} except ZeroDivisionError"
+        );
+    }
+}
+
 fn residual_block<'a>(
     graph: &'a majit_translate::model::FunctionGraph,
     residual: &str,
@@ -1991,6 +2043,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .any(|segments| { segments.last().is_some_and(|leaf| leaf == residual_name) }),
             "{caller_name} must target {residual_name}: {calls:?}"
         );
+        assert_all_scalar_zerodivision_links(caller.graph(), residual_name, caller_name);
     }
 
     for (caller_name, residual_name, forbidden) in [
