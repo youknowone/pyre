@@ -1205,6 +1205,12 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
 /// mark and no observer that could ask. `LevelExit::Yield` callers pass
 /// `got_exception = false` (`portal_yield_frame_exit` / `execute_frame`
 /// `except Yield`).
+///
+/// A yield `compile_done_with_this_frame` uses the same FINISH descr as
+/// `RETURN_VALUE` (`pyjitpl.py`). Convert then leaves as `LevelExit::Return`
+/// because `yield_exit` is only set by `bhimpl_abort_permanent`. The live
+/// frame is still parked on `YIELD_VALUE` (`flush_yield_exit`);
+/// `generator.py` `_send_ex` would treat this store as exhaustion.
 pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
     if frame_ptr == 0 {
         return;
@@ -1217,8 +1223,32 @@ pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
     // per-level concrete frame list, and the level is being torn down here so
     // no other borrow of it is live.
     unsafe {
-        (*(frame_ptr as *mut pyre_interpreter::PyFrame)).set_frame_finished_execution(true);
+        let frame = &mut *(frame_ptr as *mut pyre_interpreter::PyFrame);
+        if frame_last_instr_is_yield(frame) {
+            return;
+        }
+        frame.set_frame_finished_execution(true);
     }
+}
+
+/// `dispatch_bytecode` has stored `last_instr` at the opcode that is running.
+/// `YIELD_VALUE` raises `Yield` without `frame_finished_execution`; a FINISH
+/// that convert runs as `Return` still sits on that opcode.
+pub(crate) fn frame_last_instr_is_yield(frame: &PyFrame) -> bool {
+    if frame.last_instr < 0 || frame.pycode.is_null() {
+        return false;
+    }
+    let code = unsafe { pyre_interpreter::pyframe_get_pycode(frame) };
+    if code.is_null() {
+        return false;
+    }
+    pyre_interpreter::decode_instruction_at(unsafe { &*code }, frame.last_instr as usize)
+        .is_some_and(|(instr, _)| {
+            matches!(
+                instr,
+                Instruction::YieldValue { .. } | Instruction::InstrumentedYieldValue
+            )
+        })
 }
 
 /// `walk_bh_regs` calls this before visiting a blackhole register bank.

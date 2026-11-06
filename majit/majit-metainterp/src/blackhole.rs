@@ -1642,7 +1642,13 @@ impl BlackholeInterpreter {
         if let Some(cb) = try_yield_return_cb() {
             let frame_ptr = self.virtualizable_ptr;
             let mut out = 0i64;
-            if frame_ptr != 0 && cb(frame_ptr, &mut out) != 0 {
+            // Helper / continuation levels bind `virtualizable_ptr` to 0.
+            // `try_yield_return` falls back to `topframeref` in that case
+            // (`executioncontext.py enter` still published the yielding
+            // `PyFrame`). Skipping the callback when the pointer is 0 left
+            // `YIELD_VALUE` as `abort_permanent` bail, which finishes the
+            // generator (`send_ex` `frame_finished_execution`).
+            if cb(frame_ptr, &mut out) != 0 {
                 self.return_type = BhReturnType::Ref;
                 self.tmpreg_r = out;
                 self.yield_exit = true;

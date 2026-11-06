@@ -1756,11 +1756,44 @@ pub(crate) fn finish_blackhole_level(
 /// `codewriter.rs` lowers `YIELD_VALUE` to `abort_permanent` first, then the
 /// SSA pop the blackhole never reaches. Decode the opcode at `next_instr`
 /// (`emit_abort_permanent` left `last_instr = py_pc - 1`) and pop TOS the
-/// way `execute_yield_value` / `execute_frame` do. Yielded `None` is a real
-/// object, so the value travels through `out_value` rather than the return
-/// code. `1` is a yield; `0` leaves `bhimpl_abort_permanent` on the existing
-/// bail.
+/// way `execute_yield_value` / `execute_frame` do. A later send of the same
+/// yield parks `last_instr` AT that opcode (`publish_yield_exit_state`), so
+/// `next_instr()` is the bytecode after it; if that store missed the live
+/// frame, the blackhole still sits on this marker and `last_instr` still
+/// decodes as the yield. Yielded `None` is a real object, so the value
+/// travels through `out_value` rather than the return code. `1` is a yield;
+/// `0` leaves `bhimpl_abort_permanent` on the existing bail.
 pub(crate) extern "C" fn try_yield_return(frame_ptr: i64, out_value: *mut i64) -> i32 {
+    if out_value.is_null() {
+        return 0;
+    }
+    if try_yield_return_on_frame(frame_ptr, out_value) != 0 {
+        return 1;
+    }
+    // Helper / continuation levels bind `virtualizable_ptr` to 0
+    // (`convert_and_run_from_pyjitpl`). `executioncontext.py enter` still
+    // published the yielding `PyFrame` as `topframeref`.
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return 0;
+    }
+    let top = unsafe { (*ec).topframeref() as i64 };
+    if top == 0 || top == frame_ptr {
+        return 0;
+    }
+    try_yield_return_on_frame(top, out_value)
+}
+
+fn opcode_at_is_yield(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
+    pyre_interpreter::decode_instruction_at(code, pc).is_some_and(|(instr, _)| {
+        matches!(
+            instr,
+            Instruction::YieldValue { .. } | Instruction::InstrumentedYieldValue
+        )
+    })
+}
+
+fn try_yield_return_on_frame(frame_ptr: i64, out_value: *mut i64) -> i32 {
     if frame_ptr == 0 || out_value.is_null() {
         return 0;
     }
@@ -1773,16 +1806,19 @@ pub(crate) extern "C" fn try_yield_return(frame_ptr: i64, out_value: *mut i64) -
     if code.is_null() {
         return 0;
     }
-    let pc = frame.next_instr();
-    let is_yield = unsafe {
-        pyre_interpreter::decode_instruction_at(&*code, pc).is_some_and(|(instr, _)| {
-            matches!(
-                instr,
-                Instruction::YieldValue { .. } | Instruction::InstrumentedYieldValue
-            )
-        })
+    let next = frame.next_instr();
+    let yield_pc = if opcode_at_is_yield(unsafe { &*code }, next) {
+        Some(next)
+    } else if frame.last_instr >= 0 {
+        let parked = frame.last_instr as usize;
+        opcode_at_is_yield(unsafe { &*code }, parked).then_some(parked)
+    } else {
+        None
     };
-    if !is_yield || frame.valuestackdepth == 0 {
+    let Some(pc) = yield_pc else {
+        return 0;
+    };
+    if frame.valuestackdepth == 0 {
         return 0;
     }
     let value = frame.pop();
@@ -2985,10 +3021,9 @@ fn leave_resumed_blackhole_frame(
         // would drop an inlined callee still sitting there. The blackhole's
         // own frame still needs the `dispatch_bytecode` / `handle_operation_error`
         // finish mark if it is a live chain member (the portal under that
-        // callee).
-        unsafe {
-            (*recovered).set_frame_finished_execution(true);
-        }
+        // callee). A yield FINISH convert is `LevelExit::Return` while the
+        // frame is still parked on `YIELD_VALUE`.
+        pyre_jit_trace::state::finish_blackhole_level_frame(recovered as i64, chain_got_exception);
     }
     if let (Some(mut err), Some(slot)) = (hook_err, hook_err_slot) {
         err.reload(&roots, slot);
@@ -3083,7 +3118,9 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
         // `PyFrame.dispatch_bytecode` / `handle_operation_error` marks the leaving
         // frame finished. Only dereference the recovered red after proving
         // that it names this execution context's still-open frame scope.
-        (*frame_ptr).set_frame_finished_execution(true);
+        // A yield `compile_done_with_this_frame` FINISH convert is Return
+        // while `last_instr` is still `YIELD_VALUE`; skip that store.
+        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr as i64, got_exception);
         (*ec).set_topframeref((*frame_ptr).f_backref);
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined
