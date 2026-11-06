@@ -1806,6 +1806,291 @@ pub(crate) fn helper_resume_fallthrough_reaches_blocker(jitcode_index: usize, pc
     }
 }
 
+/// Filler ops on the exact-int typeptr return: `-live-`, copies, and the
+/// 0/1 test of the pointer compare. Nothing that reads or writes the heap.
+fn typeptr_return_filler(opname: &str) -> bool {
+    matches!(
+        opname,
+        "live" | "int_copy" | "ref_copy" | "int_same_as" | "int_is_true" | "int_is_zero"
+    )
+}
+
+/// Pointer identity of the class word `guard_class` published
+/// (`jtransform.py handle_getfield_typeptr`).
+fn typeptr_return_compare(opname: &str) -> bool {
+    matches!(
+        opname,
+        "instance_ptr_eq" | "instance_ptr_ne" | "ptr_eq" | "ptr_ne"
+    )
+}
+
+/// Branch on that compare. Fused `goto_if_not_ptr_eq` is both the compare
+/// and the branch. Fallthrough is the recorded success path
+/// (`bhimpl_goto_if_not` jumps when the condition is zero).
+fn typeptr_return_goto(opname: &str) -> bool {
+    matches!(
+        opname,
+        "goto_if_not"
+            | "goto_if_not_int_is_true"
+            | "goto_if_not_int_is_zero"
+            | "goto_if_not_ptr_eq"
+            | "goto_if_not_ptr_ne"
+    )
+}
+
+fn typeptr_return_fused_compare(opname: &str) -> bool {
+    matches!(opname, "goto_if_not_ptr_eq" | "goto_if_not_ptr_ne")
+}
+
+const TYPEPTR_RETURN_MAX_OPS: usize = 16;
+
+/// Walk fallthrough from `pc`. True only when that path is the exact-int
+/// typeptr return `space_index` / `space_int` emit after
+/// `get_and_call_function`: `guard_class`, a pointer compare, `goto_if_not`,
+/// `ref_return` (`jtransform.py handle_getfield_typeptr`, descroperation.py
+/// `space.index` `is_w(space.type(w_result), space.w_int)`).
+///
+/// Any other clean-to-return fallthrough (dict/set insert after user
+/// `__hash__` / `__eq__`) is false: numbering that GuardClass compiled
+/// extra traces and skip-1'd the while-loop.
+pub(crate) fn fallthrough_is_typeptr_return(code: &[u8], pc: usize) -> bool {
+    classify_typeptr_fallthrough(code, pc).is_typeptr_return
+}
+
+struct TypeptrFallthrough {
+    is_typeptr_return: bool,
+    ops: Vec<&'static str>,
+}
+
+fn classify_typeptr_fallthrough(code: &[u8], pc: usize) -> TypeptrFallthrough {
+    let mut ops = Vec::new();
+    if code.is_empty() {
+        return TypeptrFallthrough {
+            is_typeptr_return: false,
+            ops,
+        };
+    }
+    let mut cur = pc;
+    let mut seen = vec![false; code.len()];
+    let mut saw_guard_class = false;
+    let mut saw_compare = false;
+    let mut saw_goto = false;
+    loop {
+        if ops.len() >= TYPEPTR_RETURN_MAX_OPS {
+            return TypeptrFallthrough {
+                is_typeptr_return: false,
+                ops,
+            };
+        }
+        let Some(seen_slot) = seen.get_mut(cur) else {
+            return TypeptrFallthrough {
+                is_typeptr_return: false,
+                ops,
+            };
+        };
+        if *seen_slot {
+            return TypeptrFallthrough {
+                is_typeptr_return: false,
+                ops,
+            };
+        }
+        *seen_slot = true;
+        let Some(d) = crate::jitcode_runtime::decode_op_at(code, cur) else {
+            return TypeptrFallthrough {
+                is_typeptr_return: false,
+                ops,
+            };
+        };
+        ops.push(d.opname);
+        if d.opname == "guard_class" {
+            if saw_guard_class {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            }
+            saw_guard_class = true;
+            cur = d.next_pc;
+            continue;
+        }
+        if typeptr_return_compare(d.opname) {
+            if saw_compare || !saw_guard_class {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            }
+            saw_compare = true;
+            cur = d.next_pc;
+            continue;
+        }
+        if typeptr_return_goto(d.opname) {
+            if saw_goto || !saw_guard_class {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            }
+            if typeptr_return_fused_compare(d.opname) {
+                if saw_compare {
+                    return TypeptrFallthrough {
+                        is_typeptr_return: false,
+                        ops,
+                    };
+                }
+                saw_compare = true;
+            } else if !saw_compare {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            }
+            saw_goto = true;
+            cur = d.next_pc;
+            continue;
+        }
+        if d.opname == "ref_return" {
+            return TypeptrFallthrough {
+                is_typeptr_return: saw_guard_class && saw_compare && saw_goto,
+                ops,
+            };
+        }
+        if d.opname == "goto" {
+            // Shared return block after the typeptr branch only.
+            if !saw_goto {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            }
+            let Some(off) = label_operand_offset(d.argcodes) else {
+                return TypeptrFallthrough {
+                    is_typeptr_return: false,
+                    ops,
+                };
+            };
+            cur = read_label(code, &d, off);
+            continue;
+        }
+        if typeptr_return_filler(d.opname) {
+            cur = d.next_pc;
+            continue;
+        }
+        return TypeptrFallthrough {
+            is_typeptr_return: false,
+            ops,
+        };
+    }
+}
+
+/// [`fallthrough_is_typeptr_return`] on the helper body at `jitcode_index`.
+pub(crate) fn helper_resume_fallthrough_is_typeptr_return(jitcode_index: usize, pc: usize) -> bool {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return false;
+    };
+    fallthrough_is_typeptr_return(pjc.jitcode.code.as_slice(), pc)
+}
+
+/// `PYRE_FBW_INLINE_DIAG`: one line per helper GuardClass after a
+/// heap-writing residual, naming the fallthrough ops the typeptr gate saw.
+pub(crate) fn log_typeptr_fallthrough(jitcode_index: usize, pc: usize) {
+    if !fbw_inline_diag_enabled() {
+        return;
+    }
+    static LOGGED: parking_lot::Mutex<Option<std::collections::HashSet<(usize, usize)>>> =
+        parking_lot::Mutex::new(None);
+    let mut guard = LOGGED.lock();
+    if !guard
+        .get_or_insert_with(Default::default)
+        .insert((jitcode_index, pc))
+    {
+        return;
+    }
+    drop(guard);
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        eprintln!("[typeptr-fallthrough] jitcode={jitcode_index} pc={pc} missing");
+        return;
+    };
+    let classified = classify_typeptr_fallthrough(pjc.jitcode.code.as_slice(), pc);
+    let clean = !helper_resume_fallthrough_reaches_blocker(jitcode_index, pc);
+    eprintln!(
+        "[typeptr-fallthrough] jitcode={jitcode_index} name={:?} pc={pc} \
+         typeptr={} clean={clean} ops={}",
+        pjc.jitcode.name(),
+        classified.is_typeptr_return,
+        classified.ops.join(",")
+    );
+}
+
+#[cfg(test)]
+mod typeptr_fallthrough_tests {
+    use super::fallthrough_is_typeptr_return;
+    use crate::jitcode_runtime::insns_opname_to_byte;
+
+    fn byte(key: &str) -> u8 {
+        *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} must be in the insns table"))
+    }
+
+    fn typeptr_return_body() -> Vec<u8> {
+        // live / guard_class / instance_ptr_eq / goto_if_not / ref_return
+        let live = byte("live/");
+        let guard = byte("guard_class/r>i");
+        let cmp = byte("instance_ptr_eq/rr>i");
+        let br = byte("goto_if_not/iL");
+        let ret = byte("ref_return/r");
+        vec![
+            live, 0, 0, guard, 0, 0, cmp, 0, 1, 2, br, 2, 20, 0, 0, ret, 0,
+        ]
+    }
+
+    #[test]
+    fn typeptr_return_from_live_is_admitted() {
+        assert!(fallthrough_is_typeptr_return(&typeptr_return_body(), 0));
+    }
+
+    #[test]
+    fn typeptr_return_from_guard_class_is_admitted() {
+        assert!(fallthrough_is_typeptr_return(&typeptr_return_body(), 3));
+    }
+
+    #[test]
+    fn guard_class_then_return_without_compare_is_refused() {
+        let code = vec![byte("guard_class/r>i"), 0, 0, byte("ref_return/r"), 0];
+        assert!(!fallthrough_is_typeptr_return(&code, 0));
+    }
+
+    #[test]
+    fn typeptr_sequence_with_a_getfield_is_refused() {
+        // guard_class / getfield_gc_i / instance_ptr_eq / goto_if_not /
+        // ref_return — a clean-looking fallthrough that is not the typeptr
+        // identity test.
+        let code = vec![
+            byte("guard_class/r>i"),
+            0,
+            0,
+            byte("getfield_gc_i/rd>i"),
+            0,
+            0,
+            0,
+            0,
+            byte("instance_ptr_eq/rr>i"),
+            0,
+            1,
+            2,
+            byte("goto_if_not/iL"),
+            2,
+            30,
+            0,
+            0,
+            byte("ref_return/r"),
+            0,
+        ];
+        assert!(!fallthrough_is_typeptr_return(&code, 0));
+    }
+}
+
 /// Why a descent into a body is refused.
 enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already

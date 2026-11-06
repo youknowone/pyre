@@ -3307,8 +3307,11 @@ enum NumberedHelperGuard {
 /// helper at `orgpc` (`capture_resumedata`); the blackhole starts at that
 /// guard and does not re-run the residual. The all-CFG blocker scan still
 /// sees fail-arm helpers (`is_bool` after an exact-int test), so numbering
-/// after an applied residual uses the fallthrough-only scan
-/// ([`helper_resume_fallthrough_reaches_blocker`]). A Python chain that
+/// after an applied residual uses the exact-int typeptr-return scan
+/// ([`helper_resume_fallthrough_is_typeptr_return`]): `guard_class` then
+/// a pointer compare then `goto_if_not` then `ref_return`
+/// (`jtransform.py handle_getfield_typeptr`). A clean fallthrough that is
+/// some other helper's GuardClass still refuses. A Python chain that
 /// cannot publish every frame still refuses, because collapsing to the
 /// portal CALL would also re-apply.
 ///
@@ -3357,13 +3360,20 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         (python_chain_complete, already_applied)
     };
     // After a heap-writing residual, CALL-entry is invalid. Number at orgpc
-    // when the innermost fallthrough has no blocker (exact-int GuardClass
-    // then `ref_return`). Outer helper sections are paused at the CALL and
-    // may lack a resume marker the all-CFG scan would read.
+    // when the innermost fallthrough is the exact-int typeptr return
+    // (`guard_class` then `instance_ptr_eq` then `goto_if_not` then
+    // `ref_return`). The all-CFG scan is not a reason to number then:
+    // a helper whose remaining CFG is clean on every arm still compiled
+    // extra traces for dict/set insert after user `__hash__` / `__eq__`.
+    // Outer helper sections are paused at the CALL and may lack a resume
+    // marker the all-CFG scan would read.
     let innermost_fallthrough_ok = already_applied
         && parent_frames.last().is_some_and(|frame| {
             frame.resume_marker_jit_pc.is_some_and(|pc| {
-                !helper_resume_fallthrough_reaches_blocker(frame.jitcode_index as usize, pc)
+                if fbw_inline_diag_enabled() {
+                    log_typeptr_fallthrough(frame.jitcode_index as usize, pc);
+                }
+                helper_resume_fallthrough_is_typeptr_return(frame.jitcode_index as usize, pc)
             })
         });
     let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
@@ -3371,9 +3381,20 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         // the blackhole runs `handle_exception_in_frame` at this pc.
         after_residual_call
             || innermost_fallthrough_ok
-            || frame.resume_marker_jit_pc.is_some_and(|pc| {
-                !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
-            })
+            // After a heap-writing residual, a helper GuardClass whose
+            // remaining CFG is clean-to-return on every arm (dict/set
+            // insert after user `__hash__` / `__eq__`) must not number:
+            // that compiled extra traces and skip-1'd `hot_loop`. The
+            // all-CFG scan is only a reason to number when CALL-entry
+            // re-run is still valid.
+            || (!already_applied
+                && frame.resume_marker_jit_pc.is_some_and(|pc| {
+                    !helper_resume_reaches_blocker(
+                        frame.jitcode_index as usize,
+                        pc,
+                        entry_array_len,
+                    )
+                }))
     };
     let runnable = python_chain_complete && {
         let session = ctx.session.borrow();
