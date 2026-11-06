@@ -8391,11 +8391,23 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     //
     // `Option<*mut PyObjectRef>` expands to `Option<*mut *mut PyObject>`:
     // the pointee is itself a raw pointer, not an ADT, so the layout
-    // gate below misses. It is still one nullable word.
+    // gate below misses. It is still one nullable word when the
+    // innermost pointee is a GC object.
+    //
+    // `*mut *mut c_void` is `rffi.VOIDPP`. The inner pointer may already
+    // be null, so rustc keeps a tag (`tyref_enum_layout_is_pointer_niche`
+    // is false). `tyref_niche_option_payload_paint` and
+    // `push_niche_null_ptr` handle VOIDP only; a VOIDPP Option stays
+    // the tagged aggregate. Peel a `type HKEY = *mut c_void` dest so
+    // `Option<*mut HKEY>` is that same VOIDPP shape.
     if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)
         && let Some(stripped) = strip_ty_wrappers(raw_pointee, llbc)
-        && type_node_raw_ptr_pointee(stripped, llbc).is_some()
+        && let Some(stripped) = type_node_peel_aliases(stripped, llbc)
+        && let Some(inner) = type_node_raw_ptr_pointee(stripped, llbc)
     {
+        if type_node_is_c_void(inner, llbc) {
+            return false;
+        }
         return true;
     }
     if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)

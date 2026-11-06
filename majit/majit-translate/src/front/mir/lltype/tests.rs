@@ -1247,6 +1247,63 @@ fn interned_c_void_ptr_dest_is_voidp() {
     );
 }
 
+/// `Option<*mut *mut c_void>` is tagged: the inner VOIDP word may already
+/// be null, so rustc keeps a discriminant. `Option<*mut PyObjectRef>`
+/// stays the GC pointer niche.
+#[test]
+fn option_of_voidpp_is_not_pointer_niche() {
+    let c_void_adt = serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    });
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt, "Mut"]});
+    let voidpp = serde_json::json!({"RawPtr": [voidp.clone(), "Mut"]});
+    let pyobject_adt = serde_json::json!({
+        "Adt": {"id": 2, "generics": empty_generics()}
+    });
+    let pyobject_ref = serde_json::json!({"RawPtr": [pyobject_adt, "Mut"]});
+    let pyobject_ref_ptr = serde_json::json!({"RawPtr": [pyobject_ref, "Mut"]});
+    let hkey = serde_json::json!({
+        "Adt": {"id": 3, "generics": empty_generics()}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_struct(2, &["pyobject", "PyObject"], vec![]),
+            type_decl_alias(3, &["fixture", "HKEY"], voidp),
+        ],
+        vec![],
+    );
+    let option_voidpp = TyRef::Other(option_adt_node(0, voidpp));
+    let option_pyobject_ref = TyRef::Other(option_adt_node(0, pyobject_ref_ptr));
+    let option_phkey = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"RawPtr": [hkey, "Mut"]}),
+    ));
+    assert!(
+        !super::tyref_is_niche_option(&option_voidpp, &llbc),
+        "Option<*mut *mut c_void> keeps the tag"
+    );
+    assert!(
+        super::tyref_niche_option_payload_paint(&option_voidpp, &llbc, &no_tombstoned_leaves())
+            .is_none(),
+        "tagged VOIDPP Option is not Int-painted as a VOIDP niche"
+    );
+    assert!(
+        super::tyref_is_niche_option(&option_pyobject_ref, &llbc),
+        "Option<*mut PyObjectRef> stays the GC pointer niche"
+    );
+    assert!(
+        !super::tyref_is_niche_option(&option_phkey, &llbc),
+        "Option<*mut HKEY> is Option of VOIDPP via alias"
+    );
+}
+
 #[test]
 fn fn_ptr_ty_keeps_gcref_result() {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
