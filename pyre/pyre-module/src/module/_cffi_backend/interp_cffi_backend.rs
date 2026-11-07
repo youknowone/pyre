@@ -259,16 +259,26 @@ pub fn default_abi() -> u32 {
     0
 }
 
-/// `moduledef.get_dict_rtld_constants` — the names `rdynload.cConfig` found,
-/// with the four cffi always needs defaulted to 0 where the platform lacks them.
-pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
-    let _root_scope = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ns = pyre_object::gc_roots::pin_root(ns);
-    let mut found: Vec<(&str, i64)> = Vec::new();
+/// `moduledef.get_dict_rtld_constants`.
+fn get_dict_rtld_constants() -> Vec<(&'static str, i64)> {
+    let mut found = Vec::new();
     #[cfg(any(unix, windows))]
     {
-        for &(name, value) in &majit_rlib::rdynload::CCONFIG_RTLD {
+        for (name, value) in [
+            ("RTLD_LAZY", majit_rlib::rdynload::cConfig::RTLD_LAZY),
+            ("RTLD_NOW", majit_rlib::rdynload::cConfig::RTLD_NOW),
+            ("RTLD_GLOBAL", majit_rlib::rdynload::cConfig::RTLD_GLOBAL),
+            ("RTLD_LOCAL", majit_rlib::rdynload::cConfig::RTLD_LOCAL),
+            (
+                "RTLD_NODELETE",
+                majit_rlib::rdynload::cConfig::RTLD_NODELETE,
+            ),
+            ("RTLD_NOLOAD", majit_rlib::rdynload::cConfig::RTLD_NOLOAD),
+            (
+                "RTLD_DEEPBIND",
+                majit_rlib::rdynload::cConfig::RTLD_DEEPBIND,
+            ),
+        ] {
             if let Some(value) = value {
                 found.push((name, value as i64));
             }
@@ -279,7 +289,15 @@ pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
             found.push((name, 0));
         }
     }
-    for (name, value) in found {
+    found
+}
+
+/// `moduledef` `for _name, _value in get_dict_rtld_constants().items()`.
+pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
+    for (name, value) in get_dict_rtld_constants() {
         pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(value));
     }
 }

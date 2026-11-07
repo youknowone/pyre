@@ -2369,9 +2369,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         // `posix.moduledef` walks `rdynload.cConfig` RTLD_* and wraps only
         // values that are not None.
-        for (name, val) in majit_rlib::rdynload::CCONFIG_RTLD {
+        for (_name, val) in [
+            ("RTLD_LAZY", majit_rlib::rdynload::cConfig::RTLD_LAZY),
+            ("RTLD_NOW", majit_rlib::rdynload::cConfig::RTLD_NOW),
+            ("RTLD_GLOBAL", majit_rlib::rdynload::cConfig::RTLD_GLOBAL),
+            ("RTLD_LOCAL", majit_rlib::rdynload::cConfig::RTLD_LOCAL),
+            ("RTLD_NODELETE", majit_rlib::rdynload::cConfig::RTLD_NODELETE),
+            ("RTLD_NOLOAD", majit_rlib::rdynload::cConfig::RTLD_NOLOAD),
+            ("RTLD_DEEPBIND", majit_rlib::rdynload::cConfig::RTLD_DEEPBIND),
+        ] {
             if let Some(val) = val {
-                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+                crate::__pyre_put_new!(ns_slot, _name, pyre_object::w_int_new(val as i64));
             }
         }
         // `<sched.h>`, read as `rposix.py` reads it: present where the

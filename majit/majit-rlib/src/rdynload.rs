@@ -8,47 +8,32 @@ use crate::rffi::{self, CCHARP, VOIDP};
 
 pub use crate::rffi::INT;
 
-/// `rdynload.cConfig` (`rffi_platform.configure`).
-mod cconfig {
+/// `rdynload.cConfig` (`rffi_platform.configure(CConfig)`).
+#[allow(non_snake_case)]
+pub mod cConfig {
     include!(concat!(env!("OUT_DIR"), "/rdynload_cconfig.rs"));
 }
-
-const fn cconfig_int_or_zero(value: Option<i32>) -> INT {
-    match value {
-        Some(v) => v as INT,
-        None => 0,
-    }
-}
-
-/// `rdynload.cConfig` names `posix.moduledef` and
-/// `_cffi_backend.get_dict_rtld_constants` walk.
-pub const CCONFIG_RTLD: [(&'static str, Option<i32>); 7] = [
-    ("RTLD_LAZY", cconfig::RTLD_LAZY),
-    ("RTLD_NOW", cconfig::RTLD_NOW),
-    ("RTLD_GLOBAL", cconfig::RTLD_GLOBAL),
-    ("RTLD_LOCAL", cconfig::RTLD_LOCAL),
-    ("RTLD_NODELETE", cconfig::RTLD_NODELETE),
-    ("RTLD_NOLOAD", cconfig::RTLD_NOLOAD),
-    ("RTLD_DEEPBIND", cconfig::RTLD_DEEPBIND),
-];
 
 /// `rdynload.DLLHANDLE`.
 #[cfg(unix)]
 pub type DLLHANDLE = VOIDP;
 
-/// `rdynload.RTLD_LOCAL` (`cConfig.RTLD_LOCAL`). None from the probe is 0 so
-/// bitwise `dlopen` / `_ctypes` still have an `INT`.
+/// `rdynload.RTLD_LOCAL` (`cConfig.RTLD_LOCAL`).
 #[cfg(unix)]
-pub const RTLD_LOCAL: INT = cconfig_int_or_zero(cconfig::RTLD_LOCAL);
+pub const RTLD_LOCAL: Option<INT> = cConfig::RTLD_LOCAL;
 /// `rdynload.RTLD_GLOBAL` (`cConfig.RTLD_GLOBAL`).
 #[cfg(unix)]
-pub const RTLD_GLOBAL: INT = cconfig_int_or_zero(cconfig::RTLD_GLOBAL);
+pub const RTLD_GLOBAL: Option<INT> = cConfig::RTLD_GLOBAL;
 /// `rdynload.RTLD_NOW` (`cConfig.RTLD_NOW`).
 #[cfg(unix)]
-pub const RTLD_NOW: INT = cconfig_int_or_zero(cconfig::RTLD_NOW);
+pub const RTLD_NOW: Option<INT> = cConfig::RTLD_NOW;
 /// `rdynload.RTLD_LAZY` (`cConfig.RTLD_LAZY`).
 #[cfg(unix)]
-pub const RTLD_LAZY: INT = cconfig_int_or_zero(cconfig::RTLD_LAZY);
+pub const RTLD_LAZY: Option<INT> = cConfig::RTLD_LAZY;
+
+/// `rdynload.RTLD_GLOBAL` on `_WIN32`.
+#[cfg(windows)]
+pub const RTLD_GLOBAL: Option<INT> = None;
 
 // `rdynload.eci`. `libraries=['dl']` except FreeBSD/NetBSD; Darwin also
 // defines `MACOSX`.
@@ -227,9 +212,9 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<Result<DLLHANDLE, i32>, r
 /// `rdynload._dlopen_default_mode`.
 #[cfg(unix)]
 pub const fn _dlopen_default_mode() -> INT {
-    let mut mode = RTLD_NOW;
-    if let Some(local) = cconfig::RTLD_LOCAL {
-        mode |= local as INT;
+    let mut mode = RTLD_NOW.unwrap();
+    if let Some(local) = RTLD_LOCAL {
+        mode |= local;
     }
     mode
 }
@@ -242,8 +227,8 @@ pub fn dlopen(
 ) -> Result<Result<DLLHANDLE, DLOpenError>, rffi::MemoryError> {
     if mode == -1 {
         mode = _dlopen_default_mode();
-    } else if (mode & (RTLD_LAZY | RTLD_NOW)) == 0 {
-        mode |= RTLD_NOW;
+    } else if (mode & (RTLD_LAZY.unwrap() | RTLD_NOW.unwrap())) == 0 {
+        mode |= RTLD_NOW.unwrap();
     }
     let ll_libname = rffi::scoped_str2charp::new(name)?;
     let res = unsafe { c_dlopen(ll_libname.buf, mode) };
@@ -392,36 +377,33 @@ pub use crate::rwin32::GetModuleHandle;
 mod cconfig_tests {
     #[test]
     fn cconfig_rtld_matches_dlfcn_where_defined() {
-        let names = [
-            "RTLD_LAZY",
-            "RTLD_NOW",
-            "RTLD_GLOBAL",
-            "RTLD_LOCAL",
-            "RTLD_NODELETE",
-            "RTLD_NOLOAD",
-            "RTLD_DEEPBIND",
-        ];
-        for ((name, _), expected) in super::CCONFIG_RTLD.iter().zip(names) {
-            assert_eq!(*name, expected);
-        }
         #[cfg(unix)]
         {
-            assert_eq!(super::cconfig::RTLD_LAZY, Some(libc::RTLD_LAZY));
-            assert_eq!(super::cconfig::RTLD_NOW, Some(libc::RTLD_NOW));
-            assert_eq!(super::cconfig::RTLD_GLOBAL, Some(libc::RTLD_GLOBAL));
-            assert_eq!(super::cconfig::RTLD_LOCAL, Some(libc::RTLD_LOCAL));
+            assert_eq!(super::cConfig::RTLD_LAZY, Some(libc::RTLD_LAZY));
+            assert_eq!(super::cConfig::RTLD_NOW, Some(libc::RTLD_NOW));
+            assert_eq!(super::cConfig::RTLD_GLOBAL, Some(libc::RTLD_GLOBAL));
+            assert_eq!(super::cConfig::RTLD_LOCAL, Some(libc::RTLD_LOCAL));
+            assert_eq!(super::RTLD_LAZY, super::cConfig::RTLD_LAZY);
+            assert_eq!(super::RTLD_NOW, super::cConfig::RTLD_NOW);
+            assert_eq!(super::RTLD_GLOBAL, super::cConfig::RTLD_GLOBAL);
+            assert_eq!(super::RTLD_LOCAL, super::cConfig::RTLD_LOCAL);
         }
         #[cfg(target_os = "macos")]
         {
-            assert_eq!(super::cconfig::RTLD_NODELETE, Some(libc::RTLD_NODELETE));
-            assert_eq!(super::cconfig::RTLD_NOLOAD, Some(libc::RTLD_NOLOAD));
-            assert_eq!(super::cconfig::RTLD_DEEPBIND, None);
+            assert_eq!(super::cConfig::RTLD_NODELETE, Some(libc::RTLD_NODELETE));
+            assert_eq!(super::cConfig::RTLD_NOLOAD, Some(libc::RTLD_NOLOAD));
+            assert_eq!(super::cConfig::RTLD_DEEPBIND, None);
         }
         #[cfg(windows)]
         {
-            for &(_, value) in &super::CCONFIG_RTLD {
-                assert_eq!(value, None);
-            }
+            assert_eq!(super::cConfig::RTLD_LAZY, None);
+            assert_eq!(super::cConfig::RTLD_NOW, None);
+            assert_eq!(super::cConfig::RTLD_GLOBAL, None);
+            assert_eq!(super::cConfig::RTLD_LOCAL, None);
+            assert_eq!(super::cConfig::RTLD_NODELETE, None);
+            assert_eq!(super::cConfig::RTLD_NOLOAD, None);
+            assert_eq!(super::cConfig::RTLD_DEEPBIND, None);
+            assert_eq!(super::RTLD_GLOBAL, None);
         }
     }
 }
@@ -450,7 +432,10 @@ mod tests {
     fn default_mode_includes_now() {
         let mode = super::_dlopen_default_mode();
         // `RTLD_LOCAL` is 0 on Linux, so only the combined value is portable.
-        assert_eq!(mode, super::RTLD_NOW | super::RTLD_LOCAL);
+        assert_eq!(
+            mode,
+            super::RTLD_NOW.unwrap() | super::RTLD_LOCAL.unwrap_or(0)
+        );
     }
 
     #[cfg(target_os = "linux")]

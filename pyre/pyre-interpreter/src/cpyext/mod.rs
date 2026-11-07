@@ -529,10 +529,7 @@ pub fn load_extension_module(
             return Ok(pyre_object::gc_roots::shadow_stack_get(module_slot));
         }
     }
-    let mut mode = DLOPEN_FLAGS.load(Ordering::Relaxed) as c_int;
-    if mode & (majit_rlib::rdynload::RTLD_LAZY | majit_rlib::rdynload::RTLD_NOW) == 0 {
-        mode |= majit_rlib::rdynload::RTLD_NOW;
-    }
+    let mode = DLOPEN_FLAGS.load(Ordering::Relaxed) as c_int;
     let handle = majit_rlib::rdynload::dlopen(Some(path.as_os_str().as_bytes()), mode)
         .map_err(|e| crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e))?
         .map_err(|error| {

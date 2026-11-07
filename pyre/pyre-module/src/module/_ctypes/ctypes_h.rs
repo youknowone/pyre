@@ -37,10 +37,16 @@ pub(super) const SIZEOF_TIME_T: usize = core::mem::size_of::<TimeT>();
 
 /// `dlfcn.h RTLD_LOCAL`.
 #[cfg(unix)]
-pub(super) const RTLD_LOCAL: i32 = majit_rlib::rdynload::RTLD_LOCAL;
+pub(super) const RTLD_LOCAL: i32 = match majit_rlib::rdynload::RTLD_LOCAL {
+    Some(v) => v,
+    None => 0,
+};
 /// `dlfcn.h RTLD_GLOBAL`.
 #[cfg(unix)]
-pub(super) const RTLD_GLOBAL: i32 = majit_rlib::rdynload::RTLD_GLOBAL;
+pub(super) const RTLD_GLOBAL: i32 = match majit_rlib::rdynload::RTLD_GLOBAL {
+    Some(v) => v,
+    None => 0,
+};
 
 // [3.14-spec] `lib_pypy/_ctypes/__init__.py` sets `RTLD_LOCAL = 0` and
 // `RTLD_GLOBAL = 256` on every platform; `_ctypes.c` (`_ctypes_add_objects`
