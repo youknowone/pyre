@@ -208,6 +208,24 @@ use crate::model::{
     CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
+fn is_rffi_cast_to_gcref(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } => {
+            segments.as_slice() == ["rpython", "rtyper", "lltypesystem", "rffi", "cast"]
+                && matches!(
+                    result_ty,
+                    ValueType::Ref(Some(root))
+                        if crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                )
+        }
+        _ => false,
+    }
+}
+
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 pub(in crate::front::mir) fn fixture_llbc() -> Llbc {
@@ -890,11 +908,12 @@ fn classed_gc_ptr_as_gcref_emits_cast_instance_to_gcref() {
     );
 }
 
-/// `*mut (Vec<T>, Vec<T>) as *mut GCREFOpaque` is `_rtype_erase` of a
-/// real object (`rerased.py`). `KwargsDictStorage` is that tuple alias;
-/// dest-GCREF recast must not require a classed GC producer.
+/// `*mut (Vec<T>, Vec<T>) as *mut GCREFOpaque` is a raw pointer to GCREF
+/// (`rffi.py` `cast` / `lltype.py` `force_cast`). The tuple pointee is not
+/// `GcType`; `cast_opaque_ptr` / `annlowlevel.py` `cast_instance_to_gcref`
+/// take a GC pointer only. `KwargsDictStorage` is that tuple alias.
 #[test]
-fn tuple_storage_ptr_as_gcref_emits_cast_instance_to_gcref() {
+fn tuple_storage_ptr_as_gcref_emits_rffi_cast() {
     let span = fixture_span();
     let empty_g = empty_generics();
     let vec_item = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
@@ -978,20 +997,140 @@ fn tuple_storage_ptr_as_gcref_emits_cast_instance_to_gcref() {
     let graph = crate::test_support::lower_function(&llbc, "tuple_to_gcref")
         .expect("lower *mut (Vec, Vec) as *mut GCREFOpaque");
     assert!(
-        graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| {
-                crate::model::cast_instance_root(&op.kind) == Some("GCREF")
-                    && matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            result_ty: ValueType::Ref(Some(root)),
-                            ..
-                        } if root == "GCREF"
-                    )
-            })
-        }),
-        "tuple-storage as GCREF emits __cast_instance_intrinsic(\"GCREF\") with Ref(Some(\"GCREF\")); graph={}",
+        graph.blocks.iter().any(|block| block
+            .operations
+            .iter()
+            .any(|op| is_rffi_cast_to_gcref(&op.kind))),
+        "tuple-storage as GCREF emits rffi.cast(GCREF, p) with Ref(Some(\"GCREF\")); graph={}",
         graph.dump()
+    );
+    assert!(
+        graph.blocks.iter().all(|block| {
+            block
+                .operations
+                .iter()
+                .all(|op| crate::model::cast_instance_root(&op.kind) != Some("GCREF"))
+        }),
+        "raw tuple storage must not emit __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        graph.dump()
+    );
+    assert_graph_return_is_someptr_gcref(&graph, "tuple-storage as GCREF");
+}
+
+/// `*mut u8 as *mut GCREFOpaque` is `rgc.reveal_gcref` /
+/// `hide_reveal.rs` `reveal_object`: `rffi.py` `cast`, not
+/// `cast_instance_to_gcref`.
+#[test]
+fn mut_u8_as_gcref_emits_rffi_cast() {
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty =
+        serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let gcref = type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "u8_to_gcref"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [src_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &dest_ty),
+                        {"UnaryOp": [
+                            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+                            {"Move": place(1, &src_ty)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [gcref],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = crate::test_support::lower_function(&llbc, "u8_to_gcref")
+        .expect("lower *mut u8 as *mut GCREFOpaque");
+    assert!(
+        graph.blocks.iter().any(|block| block
+            .operations
+            .iter()
+            .any(|op| is_rffi_cast_to_gcref(&op.kind))),
+        "*mut u8 as GCREF emits rffi.cast(GCREF, p); graph={}",
+        graph.dump()
+    );
+    assert!(
+        graph.blocks.iter().all(|block| {
+            block
+                .operations
+                .iter()
+                .all(|op| crate::model::cast_instance_root(&op.kind) != Some("GCREF"))
+        }),
+        "*mut u8 as GCREF must not emit __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        graph.dump()
+    );
+    assert_graph_return_is_someptr_gcref(&graph, "*mut u8 as GCREF");
+}
+
+fn assert_graph_return_is_someptr_gcref(graph: &crate::model::FunctionGraph, label: &str) {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeInstance, SomeObjectTrait, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(graph, &registry)
+        .unwrap_or_else(|e| panic!("{label}: lift raw→GCREF: {e}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let s_src = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(s_src.clone())).collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("{label}: annotate raw→GCREF: {e}"));
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    let want = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    assert!(
+        matches!(&s_ret, SomeValue::Ptr(_)),
+        "{label}: raw→GCREF must annotate SomePtr(GCREF), got {s_ret:?}"
+    );
+    assert_eq!(
+        s_ret, want,
+        "{label}: raw→GCREF must be lltype_to_annotation(GCREF)"
+    );
+    assert!(
+        !s_ret.is_constant(),
+        "{label}: rffi.cast(GCREF, p) is non-constant SomePtr, got {s_ret:?}"
     );
 }
 
@@ -18327,6 +18466,7 @@ fn empty_dict_get_empty_storage_production_recasts_gcref() {
             block.operations.iter().any(|op| {
                 crate::model::cast_instance_root(&op.kind)
                     .is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+                    || is_rffi_cast_to_gcref(&op.kind)
             })
         });
         let has_null_mut = graph.blocks.iter().any(|block| {

@@ -5101,6 +5101,40 @@ mod tests {
         );
     }
 
+    /// Raw pointer → GCREF is `rffi.py` `cast` /
+    /// `ForceCastEntry.compute_result_annotation` (`lltype_to_annotation(GCREF)`).
+    #[test]
+    fn rffi_cast_gcref_annotates_someptr() {
+        use crate::annotator::model::{SomeObjectTrait, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*GCREF).clone(),
+        ))));
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new(*ccharp));
+        let out = rffi_cast(&bk(), &[Some(s_restype), Some(s_p)], &no_kwds())
+            .expect("ForceCastEntry of CCHARP to GCREF");
+        let want = crate::translator::rtyper::llannotation::lltype_to_annotation((*GCREF).clone());
+        assert!(
+            matches!(&out, SomeValue::Ptr(_)),
+            "rffi.cast(GCREF, p) annotates SomePtr(GCREF), got {out:?}"
+        );
+        assert_eq!(
+            out, want,
+            "rffi.cast(GCREF, p) is lltype_to_annotation(GCREF)"
+        );
+        assert!(
+            !out.is_constant(),
+            "ForceCastEntry of a live pointer is non-constant SomePtr, got {out:?}"
+        );
+    }
+
     #[test]
     fn builtin_range_single_const_argument_returns_nonneg_list() {
         // upstream builtin_range(10) → list with SomeInteger(nonneg=True),

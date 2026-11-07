@@ -7754,6 +7754,60 @@ mod tests {
         assert!(llops._called_exception_is_here_or_cannot_occur);
     }
 
+    #[test]
+    fn rtype_force_cast_gcref_emits_force_cast() {
+        // `rffi.py` `cast` of a raw pointer to GCREF:
+        // `ForceCastEntry.specialize_call` (`ll2ctypes.py`)
+        // `genop('force_cast', [v_arg], GCREF)`.
+        use crate::annotator::model::{SomePtr, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*GCREF).clone(),
+        ))));
+        hop.args_s.borrow_mut().push(s_restype);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new((*ccharp).clone())));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new((*GCREF).clone())),
+                LowLevelType::Void,
+            )));
+        let var = Variable::named("p");
+        var.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(None);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+
+        let result = rtype_force_cast(&hop, &HashMap::new())
+            .expect("ForceCastEntry rtypes GCREF")
+            .expect("force_cast returns a value");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(last.opname, "force_cast");
+        assert_eq!(result, last.result);
+        let Hlvalue::Variable(v) = &last.result else {
+            panic!("force_cast result is a Variable, got {:?}", last.result);
+        };
+        assert_eq!(v.concretetype(), Some((*GCREF).clone()));
+        assert!(llops._called_exception_is_here_or_cannot_occur);
+    }
+
     fn dict_constructor_hop() -> (
         std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
         HighLevelOp,
