@@ -1774,14 +1774,20 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// `PyError(ptr)` is one pointer word. The class is the handle's
-    /// own leaf (`error::PyError`), a subclass of `Deref::Target`.
+    /// `PyError(ptr)` is one pointer word. `ctor_ccharp_field_store` /
+    /// `LowLevelOpList.convertvar` converts once, to the carrier's inner
+    /// class (`Deref::Target` / `PyErrorObject`). Residual callees take
+    /// that payload. Fall back to the handle leaf when the wrapper has
+    /// no Deref target.
     pub(in crate::front::mir) fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+        let Some(root) = self
+            .error_carrier_inner_class_root(wrapper_ty)
+            .or_else(|| self.error_carrier_class_root(wrapper_ty))
+        else {
             return (None, value);
         };
         let res = self
