@@ -1214,6 +1214,18 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // Handwritten JUMP_BACKWARD jitcode inline_calls these
+                // (`emit_jump_absolute_tick`); the portal never names them.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "gil_ready",
+                    "gil_ready_word",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_jit",
+                    "eval",
+                    "_get_adapted_tick_counter",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
@@ -1282,6 +1294,10 @@ fn real_main() {
                         .collect(),
                     // warmspot.py find_portals → split_graph_and_record_jitdriver
                     split_portal: true,
+                    extends: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "dispatch_frame",
+                    ])),
                 },
                 majit_translate::JitDriverSpec {
                     // `warmspot.py split_graph_and_record_jitdriver` copy of
@@ -1306,6 +1322,7 @@ fn real_main() {
                     // Already the split body; `rewrite_jit_merge_point` lives
                     // in `_unpackiterable_unknown_length` at source level.
                     split_portal: false,
+                    extends: None,
                 },
                 majit_translate::JitDriverSpec {
                     // `generator.py` `generatorentry_driver`. Greens `pycode`,
@@ -1332,6 +1349,7 @@ fn real_main() {
                     // `rewrite_jit_merge_point` leaves the original as the
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
+                    extends: None,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

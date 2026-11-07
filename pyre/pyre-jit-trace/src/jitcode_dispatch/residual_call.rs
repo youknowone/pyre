@@ -675,11 +675,6 @@ pub(crate) struct AbortHandoffFrame {
     pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
 }
 
-fn abort_handoff_from_minted(miframe: majit_metainterp::MIFrame) -> AbortHandoffFrame {
-    let banks = majit_metainterp::BlackholeAbortBanks::from_miframe_const_boxes(&miframe);
-    AbortHandoffFrame { miframe, banks }
-}
-
 pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) miframe: majit_metainterp::MIFrame,
     pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
@@ -2181,7 +2176,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
     resume_pc: usize,
     lastop_result: Option<(char, usize, i64)>,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     // An MIFrame is only representable at a `-live-` anchored startpoint: the
     // blackhole reads its registers straight out of the copied banks, so a
     // coordinate whose live set cannot be decoded must decline here rather
@@ -2192,24 +2187,21 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         i32::try_from(jitcode.index()).ok()?,
         i32::try_from(resume_pc).ok()?,
     )?;
-    let mut miframe = majit_metainterp::MIFrame::new(jitcode.clone(), resume_pc);
+    let miframe = majit_metainterp::MIFrame::new(jitcode.clone(), resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
 
     // pyjitpl.py make_result_of_lastop: the residual returned before its
     // ordinary dispatcher writeback, while `resume_pc` already points past
     // the call.  Stamp the just-produced value first: its destination is
     // normally live at `resume_pc`, but the concrete shadow still contains
     // Null/old data and must not make the all-live-color pass decline.
+    // Abort-handoff raw words live in `BlackholeAbortBanks.registers_*`;
+    // the MIFrame register slots stay `None` (`build_codeless_continuation_parent`).
     if let Some((bank, color, value)) = lastop_result {
         match bank {
-            'i' => *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value)),
-            'r' => {
-                *miframe.ref_regs.get_mut(color)? =
-                    Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)))
-            }
-            'f' => {
-                *miframe.float_regs.get_mut(color)? =
-                    Some(OpRef::const_float(f64::from_bits(value as u64)))
-            }
+            'i' => *banks.registers_i.get_mut(color)? = Some(value),
+            'r' => *banks.registers_r.get_mut(color)? = Some(value),
+            'f' => *banks.registers_f.get_mut(color)? = Some(value),
             'v' => {}
             _ => return None,
         }
@@ -2230,11 +2222,11 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // the drive can read it and the walk lost the value.
     for &color in &live.int {
         let color = color as usize;
-        if miframe.int_regs.get(color).copied().flatten().is_some() {
+        if banks.registers_i.get(color).copied().flatten().is_some() {
             continue;
         }
         if let Some(value) = recover_int_reg_concrete(ctx, color) {
-            *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value));
+            *banks.registers_i.get_mut(color)? = Some(value);
         } else if ctx.concrete_registers_i.get(color).is_none() {
             return None;
         } else if ctx.registers_i.get(color)?.is_none() {
@@ -2245,9 +2237,10 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     }
     for &color in &live.ref_ {
         let color = color as usize;
-        if miframe.ref_regs.get(color).copied().flatten().is_some() {
+        if banks.registers_r.get(color).copied().flatten().is_some() {
             continue;
         }
+        let opref = ctx.registers_r.get(color);
         let value = match ctx
             .frame_state
             .borrow()
@@ -2263,7 +2256,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // never concretized in this frame's shadow); decline only when even
             // that cannot resolve it.
             _ => {
-                let opref = ctx.registers_r.get(color)?;
+                let opref = opref?;
                 if opref.is_none() {
                     continue;
                 }
@@ -2273,11 +2266,11 @@ fn build_single_frame_miframe<Sym: WalkSym>(
                 value
             }
         };
-        *miframe.ref_regs.get_mut(color)? = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        *banks.registers_r.get_mut(color)? = Some(value);
     }
     for &color in &live.float {
         let color = color as usize;
-        if miframe.float_regs.get(color).copied().flatten().is_some() {
+        if banks.registers_f.get(color).copied().flatten().is_some() {
             continue;
         }
         let opref = ctx.registers_f.get(color)?;
@@ -2287,7 +2280,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         let Some(value) = recover_float_reg_concrete(ctx, opref) else {
             return None;
         };
-        *miframe.float_regs.get_mut(color)? = Some(OpRef::const_float(value));
+        *banks.registers_f.get_mut(color)? = Some(value.to_bits() as i64);
     }
 
     // `_copy_data_from_miframe` (`blackhole.py`) copies every non-None box
@@ -2295,11 +2288,11 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // the completeness check; this remaining walk fills every other colour
     // that still holds a box. A leftover concrete on a colour whose
     // register box is `OpRef::NONE` is not a box and is not copied.
-    if !fill_remaining_miframe_register_banks(ctx, &mut miframe) {
+    if !fill_remaining_abort_register_banks(ctx, &mut banks) {
         return None;
     }
 
-    Some(miframe)
+    Some(AbortHandoffFrame { miframe, banks })
 }
 
 /// Concrete recovery the live-color pass uses for each bank.
@@ -2344,14 +2337,14 @@ fn recover_float_reg_concrete<Sym: WalkSym>(
 }
 
 /// Whole-bank remaining walk: every colour of each bank that still holds a
-/// box, matching `fill_abort_miframe_register_banks` (no `skip_result`;
-/// dest is already stamped).
-fn fill_remaining_miframe_register_banks<Sym: WalkSym>(
+/// box, written as the raw abort-handoff word the live pass writes (no
+/// `skip_result`; dest is already stamped).
+fn fill_remaining_abort_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-    miframe: &mut majit_metainterp::MIFrame,
+    banks: &mut majit_metainterp::BlackholeAbortBanks,
 ) -> bool {
-    for color in 0..miframe.int_regs.len() {
-        if miframe.int_regs.get(color).copied().flatten().is_some() {
+    for color in 0..banks.registers_i.len() {
+        if banks.registers_i[color].is_some() {
             continue;
         }
         let Some(opref) = ctx.registers_i.get(color) else {
@@ -2363,13 +2356,10 @@ fn fill_remaining_miframe_register_banks<Sym: WalkSym>(
         let Some(value) = recover_int_reg_concrete(ctx, color) else {
             return false;
         };
-        let Some(slot) = miframe.int_regs.get_mut(color) else {
-            return false;
-        };
-        *slot = Some(OpRef::const_int(value));
+        banks.registers_i[color] = Some(value);
     }
-    for color in 0..miframe.ref_regs.len() {
-        if miframe.ref_regs.get(color).copied().flatten().is_some() {
+    for color in 0..banks.registers_r.len() {
+        if banks.registers_r[color].is_some() {
             continue;
         }
         let Some(opref) = ctx.registers_r.get(color) else {
@@ -2381,13 +2371,10 @@ fn fill_remaining_miframe_register_banks<Sym: WalkSym>(
         let Some(value) = recover_ref_reg_concrete(ctx, color, opref) else {
             return false;
         };
-        let Some(slot) = miframe.ref_regs.get_mut(color) else {
-            return false;
-        };
-        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        banks.registers_r[color] = Some(value);
     }
-    for color in 0..miframe.float_regs.len() {
-        if miframe.float_regs.get(color).copied().flatten().is_some() {
+    for color in 0..banks.registers_f.len() {
+        if banks.registers_f[color].is_some() {
             continue;
         }
         let Some(opref) = ctx.registers_f.get(color) else {
@@ -2399,10 +2386,7 @@ fn fill_remaining_miframe_register_banks<Sym: WalkSym>(
         let Some(value) = recover_float_reg_concrete(ctx, opref) else {
             return false;
         };
-        let Some(slot) = miframe.float_regs.get_mut(color) else {
-            return false;
-        };
-        *slot = Some(OpRef::const_float(value));
+        banks.registers_f[color] = Some(value.to_bits() as i64);
     }
     true
 }
@@ -3472,7 +3456,6 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     let innermost = match innermost_build {
         InnermostMiframeBuild::LiveMarker(lastop_result) => {
             build_single_frame_miframe(ctx, innermost_jitcode, resume_pc, lastop_result)
-                .map(abort_handoff_from_minted)
         }
         InnermostMiframeBuild::TraceTooLong => {
             build_trace_too_long_single_frame_miframe(ctx, innermost_jitcode, resume_pc)
@@ -7789,7 +7772,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     };
                     if let Some(handoff) = jitcode.and_then(|jitcode| {
                         build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
-                            .map(abort_handoff_from_minted)
                     }) {
                         // `ctx` is the root walk on this arm
                         // (`framestack.is_empty() && !inline_subwalk`).  It
@@ -14667,7 +14649,7 @@ mod tests {
     /// unit tests cannot install with this module's scaffolding, so this
     /// exercises the remaining walk that function calls after the live pass.
     #[test]
-    fn fill_remaining_miframe_copies_a_box_outside_the_live_set() {
+    fn fill_remaining_abort_banks_copy_a_box_outside_the_live_set() {
         pyre_interpreter::module::thread::ensure_runtime_thread();
         let mut builder = majit_metainterp::JitCodeBuilder::new();
         builder.load_const_r_value(0, 0);
@@ -14679,7 +14661,8 @@ mod tests {
             "the fixture needs a live colour, a non-live colour, and a dead colour"
         );
 
-        let mut miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
         let live_box = OpRef::input_arg_ref(0);
         let nonlive_box = OpRef::input_arg_ref(1);
         let live_ptr = pyre_object::w_none() as usize;
@@ -14699,7 +14682,7 @@ mod tests {
         ];
         let frame_state = WalkFrameState::new(data);
         // Colour 0 is in the live set: the live pass stamps it first.
-        miframe.ref_regs[0] = Some(OpRef::const_ptr(GcRef(live_ptr)));
+        banks.registers_r[0] = Some(live_ptr as i64);
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut concrete_i = [];
         let ctx: WalkContext<'_, '_, crate::state::PyreSym> = WalkContext {
@@ -14730,19 +14713,16 @@ mod tests {
             live_after_jit_pc: usize::MAX,
         };
         assert!(
-            fill_remaining_miframe_register_banks(&ctx, &mut miframe),
+            fill_remaining_abort_register_banks(&ctx, &mut banks),
             "a colour with a box must still yield an image"
         );
-        let written_live = miframe
-            .ref_value_for_blackhole(0)
-            .expect("the live colour with a box stays copied");
+        let written_live = banks.registers_r[0].expect("the live colour with a box stays copied");
         assert_eq!(written_live, live_ptr as i64);
-        let written_nonlive = miframe
-            .ref_value_for_blackhole(1)
-            .expect("a non-live colour that holds a box is copied");
+        let written_nonlive =
+            banks.registers_r[1].expect("a non-live colour that holds a box is copied");
         assert_eq!(written_nonlive, nonlive_ptr as i64);
         assert!(
-            miframe.ref_regs[2].is_none(),
+            banks.registers_r[2].is_none(),
             "a non-live Ref colour with a stale concrete must stay unset"
         );
     }

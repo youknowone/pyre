@@ -4218,7 +4218,7 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     // JitCode position can sit in a later emission island owned by that same
     // opcode (notably an exception-edge bridge), where the containing/floor
     // coordinate still names the preceding instruction.  Use the same
-    // exact-first resolution as `record_caught_blackhole_traceback`; otherwise
+    // exact-first resolution as `dispatch_bytecode` / `handle_exception`; otherwise
     // the traceback records the raising opcode while GUARD_NOT_FORCED_2 saves
     // the preceding one and a later force rolls `frame.last_instr` backwards.
     let Some(py_pc) =
@@ -4277,6 +4277,29 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         fbw_note_last_instr_undo(recording_frame_ptr);
         unsafe {
             *slot = py_pc as isize;
+        }
+    }
+    // Pair `valuestackdepth` with `last_instr` (`capture_frame_scalars`).
+    // Compiled finish never runs the per-opcode interpreter stores, so
+    // both words have to be published here. Opcode-start depth is
+    // `nlocals + vstack_boxes.len()` (`pyjitpl.py get_list_of_active_boxes`).
+    if ctx.vstack_valid {
+        if let Some(vsd_index) = info.static_field_index_by_name("valuestackdepth") {
+            if let Some(nlocals) = crate::state::concrete_nlocals(recording_frame_ptr) {
+                let stack_only = ctx.frame_state.borrow().vstack_boxes.len();
+                let vsd = (nlocals + stack_only) as i64;
+                let vsd_box = ctx.trace_ctx.const_int(vsd);
+                let vsd_descr = info.static_field_struct_descr(vsd_index);
+                ctx.trace_ctx.vable_setfield_descr(vbox, vsd_box, vsd_descr);
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "valuestackdepth",
+                    vsd_box,
+                    Value::Int(vsd),
+                );
+                fbw_note_frame_vsd_undo(recording_frame_ptr);
+                crate::state::store_live_frame_static_int(recording_frame_ptr, 2, vsd);
+            }
         }
     }
 }

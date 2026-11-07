@@ -315,12 +315,27 @@ impl<'a> Lowering<'a> {
             _ => None,
         };
         // The Call dest is already `SomeInstance(root)` when `result_ty`
-        // names that root. Recast only a genuine downcast. Keep
+        // names that root. Recast only a genuine downcast — except an
+        // erased `null`/`null_mut` result. Keep
         // `result_narrow_root` for the ARRAY layout stamp
         // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
         // array-item recast whose getarrayitem dest is still GCREF.
+        // `lltype.nullptr(T)` is typed by `T`; `rnone.py`
+        // `pairtype(NoneRepr, Repr).convert_from_to` builds the null in the
+        // destination repr. The `null`/`null_mut` analyser returns an erased
+        // nullable instance, so even a matching declared root keeps the cast.
+        let result_is_erased_null = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(is_core_ptr_null_fun_path),
+            _ => false,
+        };
         let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
-            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (ValueType::Ref(Some(declared)), Some(narrowed))
+                if declared == narrowed && !result_is_erased_null =>
+            {
+                None
+            }
             (_, other) => other.cloned(),
         };
 
@@ -1050,55 +1065,45 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Equal-size ptr↔int: `history.getkind` banks
-                    // `Ptr(FuncType)` as `int` and a data pointer as
-                    // `ref`, so the pair is a bank crossing.  Residual
-                    // `transmute` is not in CallRegistry; the same
-                    // conversion is `lltype.cast_ptr_to_int` /
-                    // `lltype.cast_int_to_ptr` (`rbuiltin.py`
-                    // `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr`).
+                    // Equal-size pointer TYPE ↔ machine-word integer, or a
+                    // data pointer ↔ `fn` pointer (`_cffi_backend::cglob`
+                    // transmutes `*mut u8` to `unsafe extern "C" fn`).
+                    // `history.getkind` banks a pointer to a GC container as
+                    // `ref` and a pointer to a raw container (and
+                    // `Ptr(FuncType)`) as `int`. The origin is the Charon
+                    // `TyKind` (`RawPtr` / `Ref` / `FnPtr`), not that bank:
+                    // a non-transparent struct also sits in the ref bank.
+                    // Residual `transmute` is not in CallRegistry;
+                    // `rbuiltin.py` `rtype_cast_ptr_to_int` /
+                    // `rtype_cast_int_to_ptr` accept
+                    // `lltype.cast_ptr_to_int` / `lltype.cast_int_to_ptr`.
                     if let Some(src_ty) = first_arg_ty.as_ref()
-                        && tyref_exact_layout_size(src_ty, self.llbc)
-                            == tyref_exact_layout_size(&call.dest.ty, self.llbc)
-                        && tyref_exact_layout_size(src_ty, self.llbc).is_some()
+                        && let Some((op, result_ty)) =
+                            transmute_ptr_int_host_cast(src_ty, &call.dest.ty, self.llbc)
                     {
-                        let src_vt = tyref_to_value_type(src_ty, self.llbc);
-                        let dst_vt = tyref_to_value_type(&call.dest.ty, self.llbc);
-                        match (value_type_bank(&src_vt), value_type_bank(&dst_vt)) {
-                            (1, 0) => {
-                                return self.emit_host_cast_llop(
-                                    mir_bb,
-                                    dest_local,
-                                    target,
-                                    args[0].clone(),
-                                    "cast_ptr_to_int",
-                                    ValueType::Int,
-                                );
+                        if op == "cast_int_to_ptr" {
+                            let src_vt = tyref_to_value_type(src_ty, self.llbc);
+                            if let Some(raw) = self.emit_dest_overlay_cast(
+                                bb_id,
+                                Some(&src_vt),
+                                args[0].clone(),
+                                &call.dest.ty,
+                            ) {
+                                self.local_var[dest_local] = Some(LocalValue::One(raw));
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
                             }
-                            (0, 1) => {
-                                if let Some(raw) = self.emit_dest_overlay_cast(
-                                    bb_id,
-                                    Some(&src_vt),
-                                    args[0].clone(),
-                                    &call.dest.ty,
-                                ) {
-                                    self.local_var[dest_local] = Some(LocalValue::One(raw));
-                                    let target_bb = self.block_id[target];
-                                    let link_args = self.edge_args(mir_bb, target)?;
-                                    self.graph.set_goto(bb_id, target_bb, link_args);
-                                    return Ok(());
-                                }
-                                return self.emit_host_cast_llop(
-                                    mir_bb,
-                                    dest_local,
-                                    target,
-                                    args[0].clone(),
-                                    "cast_int_to_ptr",
-                                    ValueType::Ref(None),
-                                );
-                            }
-                            _ => {}
                         }
+                        return self.emit_host_cast_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            op,
+                            result_ty,
+                        );
                     }
                 }
                 // `core::intrinsics::saturating_add` / `saturating_sub`

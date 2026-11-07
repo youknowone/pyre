@@ -7175,6 +7175,17 @@ fn transmute_lowering_fixture() -> Llbc {
             }
         }
     });
+    let pair_struct_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
     let instruction_ty = serde_json::json!({
         "Adt": {
             "id": 0,
@@ -7273,6 +7284,31 @@ fn transmute_lowering_fixture() -> Llbc {
             }
         }]
     });
+    let pair_struct = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "Pair"], true),
+        "kind": {"Struct": [
+            {
+                "name": "a",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                "attr_info": null
+            },
+            {
+                "name": "b",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                "attr_info": null
+            }
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0, 4]}],
+                "repr": {"repr_algo": "C", "transparent": false}
+            }
+        }]
+    });
     let transmute = serde_json::json!({
         "def_id": 2,
         "item_meta": item_meta(&["core", "intrinsics", "transmute"], false),
@@ -7288,12 +7324,13 @@ fn transmute_lowering_fixture() -> Llbc {
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [instruction],
+            "type_decls": [instruction, pair_struct],
             "fun_decls": [
                 caller(0, "transmute_u8_to_instruction", u8_ty, instruction_ty),
-                caller(1, "transmute_u64_to_f64", u64_ty, f64_ty),
+                caller(1, "transmute_u64_to_f64", u64_ty.clone(), f64_ty),
                 transmute,
-                caller(3, "transmute_rawptr_to_fnptr", raw_ptr_ty, fnptr_ty)
+                caller(3, "transmute_rawptr_to_fnptr", raw_ptr_ty, fnptr_ty),
+                caller(4, "transmute_struct_to_u64", pair_struct_ty, u64_ty)
             ],
             "global_decls": [],
             "trait_decls": [],
@@ -11992,9 +12029,11 @@ fn equal_size_int_to_float_transmute_stays_residual() {
 
 #[test]
 fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
-    // `history.getkind`: data pointer is `ref`, `Ptr(FuncType)` is
-    // `int`.  Equal-size transmute is `lltype.cast_ptr_to_int`
-    // (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+    // `_cffi_backend::cglob` transmutes a data pointer (`*mut u8`) to
+    // `unsafe extern "C" fn`. `history.getkind` banks a pointer to a
+    // GC container as `ref` and a pointer to a raw container (and
+    // `Ptr(FuncType)`) as `int`. The lowering is
+    // `lltype.cast_ptr_to_int` (`rbuiltin.py` `rtype_cast_ptr_to_int`).
     let llbc = transmute_lowering_fixture();
     let graph = crate::test_support::lower_function(&llbc, "transmute_rawptr_to_fnptr")
         .expect("lower rawptr-to-fnptr transmute");
@@ -12034,6 +12073,52 @@ fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
             )
         }),
         "expected cast_ptr_to_int host call, ops={ops:?}"
+    );
+}
+
+#[test]
+fn equal_size_struct_to_u64_transmute_stays_residual() {
+    // `#[repr(C)] struct Pair { a: u32, b: u32 }` is eight bytes and
+    // sits in the ref bank, same as a pointer, but it is not a
+    // pointer TYPE. Reinterpreting its bytes is not
+    // `rtype_cast_ptr_to_int`.
+    let llbc = transmute_lowering_fixture();
+    let graph = super::lower_function(&llbc, "transmute_struct_to_u64")
+        .expect("lower struct-to-u64 transmute");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+
+    assert_eq!(
+        ops.iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["core", "intrinsics", "transmute"]
+                )
+            })
+            .count(),
+        1,
+        "equal-size struct↔u64 transmute must stay the residual intrinsic: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| {
+                    leaf == "cast_ptr_to_int" || leaf == "cast_int_to_ptr"
+                })
+            )
+        }),
+        "struct↔u64 transmute must not lower to a ptr/int host cast: {ops:?}"
     );
 }
 
@@ -17981,6 +18066,92 @@ fn null_mut_of_utf8str_recasts_dest_str() {
     );
 }
 
+/// `core::ptr::null_mut::<GcCell>()` of a declared-GC ADT stays
+/// `null_mut`; the analyser seeds an erased nullable instance, so the
+/// call result is recast onto T's class (`lltype.nullptr(T)` /
+/// `rnone.py` `pairtype(NoneRepr, Repr).convert_from_to`).
+#[test]
+fn null_mut_of_gc_struct_is_cast_to_its_class() {
+    use crate::model::{CallTarget, OpKind};
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt);
+    let caller = interior_caller(
+        "null_gc_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["core", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "GcCell"],
+            &[("word", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, null_mut],
+        vec![gctype_trait_decl()],
+        vec![gctype_impl_row(0)],
+    );
+    let graph = lower_interior(&llbc, "null_gc_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let null_call = ops
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected core::ptr::null_mut; ops={ops:?}"));
+    let null_var = null_call
+        .result
+        .as_ref()
+        .expect("null_mut produces a result");
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, null_var).is_some())
+        .unwrap_or_else(|| {
+            panic!("null_mut result must be consumed by __cast_instance_intrinsic; ops={ops:?}")
+        });
+    let root = crate::model::cast_instance_of(&recast.kind, null_var)
+        .expect("cast_instance_of of the null_mut result");
+    assert_eq!(
+        root, "GcCell",
+        "cast root must be the GC struct class; ops={ops:?}"
+    );
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &crate::model::ValueType::Ref(Some("GcCell".to_string())),
+                "cast result_ty must be Ref(Some(GcCell)); ops={ops:?}"
+            );
+        }
+        other => panic!("expected cast-instance Call, got {other:?}"),
+    }
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;
@@ -21321,6 +21492,28 @@ fn object_vec_trait_impl_deref_builds_the_gcarray() {
     assert!(
         !matches!(returned, crate::model::LinkArg::Value(value) if value == input),
         "trait-impl deref must not alias the header; graph: {graph:#?}"
+    );
+}
+
+/// Short `vec::Vec::deref` spelling (`call_target_segments` owner type).
+#[test]
+fn object_vec_deref_short_spelling_builds_the_gcarray() {
+    let (_llbc, graph) = object_vec_whole_list_fixture(
+        "view_short",
+        &["vec", "Vec", "deref"],
+        1,
+        false,
+        false,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let leaves = object_vec_call_leaves(&graph);
+    assert!(
+        leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+        "vec::Vec::deref must copy into a gcarray: {leaves:?}"
     );
 }
 
