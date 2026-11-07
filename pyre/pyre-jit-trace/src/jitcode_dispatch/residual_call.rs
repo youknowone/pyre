@@ -132,26 +132,6 @@ static CURRENT_GC_REF_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64
         })
     });
 
-fn residual_leaf_is(name: &str, leaf: &str) -> bool {
-    let last = name.rsplit("::").next().unwrap_or(name);
-    let last = last.strip_prefix("__majit_call_target_").unwrap_or(last);
-    last == leaf
-}
-
-/// `W_ListObject::sync_allocated`'s `jit.conditional_call` target.
-static LIST_RESYNC_ALLOCATED_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
-    std::sync::LazyLock::new(|| {
-        fnaddr_set(|name| residual_leaf_is(name, "w_list_resync_allocated"))
-    });
-
-/// Integer `newlist(length)` (`rlist.py ll_newlist` / `int_ll_newlist`).
-static INT_LL_NEWLIST_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
-    std::sync::LazyLock::new(|| fnaddr_set(|name| residual_leaf_is(name, "int_ll_newlist")));
-
-/// Float twin of [`INT_LL_NEWLIST_FNADDRS`].
-static FLOAT_LL_NEWLIST_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
-    std::sync::LazyLock::new(|| fnaddr_set(|name| residual_leaf_is(name, "float_ll_newlist")));
-
 /// `frame_locals_proxy::proxy_list_append`, identified by leaf. The slot
 /// scan records this wrapper; the append descent substitutes
 /// `w_list_append_inner` when the address matches.
@@ -320,13 +300,10 @@ fn resized_allocation_const(allocated: i64, old_size: i64, new_size: i64) -> i64
     new_allocated as i64
 }
 
-fn residual_addr_matches(
-    addr: i64,
-    set: &std::collections::HashSet<i64>,
-    paths: &[&'static str],
-    raw: i64,
-) -> bool {
-    set.contains(&addr) || addr == walker_published_fnaddr(paths, raw) || addr == raw
+/// True when `addr` is this helper's `JitCode.fnaddr`.
+/// `_rewrite_op_cond_call` (`jtransform.py`) bakes the PBC as the funcbox.
+fn residual_addr_matches(addr: i64, paths: &[&'static str], raw: i64) -> bool {
+    addr == walker_published_fnaddr(paths, raw) || addr == raw
 }
 
 /// Address of a residual fn through `*const ()` (`function_casts_as_integer`).
@@ -337,7 +314,6 @@ fn residual_fnaddr_raw(f: *const ()) -> i64 {
 fn is_w_list_resync_allocated_addr(addr: i64) -> bool {
     residual_addr_matches(
         addr,
-        &LIST_RESYNC_ALLOCATED_FNADDRS,
         &[
             "pyre_object::listobject::w_list_resync_allocated",
             "pyre_object::w_list_resync_allocated",
@@ -349,7 +325,6 @@ fn is_w_list_resync_allocated_addr(addr: i64) -> bool {
 fn is_int_ll_newlist_addr(addr: i64) -> bool {
     residual_addr_matches(
         addr,
-        &INT_LL_NEWLIST_FNADDRS,
         &[
             "pyre_object::listobject::int_ll_newlist",
             "pyre_object::int_ll_newlist",
@@ -361,7 +336,6 @@ fn is_int_ll_newlist_addr(addr: i64) -> bool {
 fn is_float_ll_newlist_addr(addr: i64) -> bool {
     residual_addr_matches(
         addr,
-        &FLOAT_LL_NEWLIST_FNADDRS,
         &[
             "pyre_object::listobject::float_ll_newlist",
             "pyre_object::float_ll_newlist",
