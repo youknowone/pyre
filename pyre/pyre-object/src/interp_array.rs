@@ -221,7 +221,7 @@ pub fn w_array_user_new(typecode: u8, itemsize: u8, w_class: PyObjectRef) -> PyO
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
-        return crate::lltype::malloc_typed(body) as PyObjectRef;
+        return crate::lltype::host_or_null(body) as PyObjectRef;
     }
     unsafe {
         std::ptr::write(raw as *mut W_ArrayUser, body);

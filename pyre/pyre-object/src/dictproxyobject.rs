@@ -97,7 +97,7 @@ pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    crate::lltype::malloc_typed(W_DictProxyObject {
+    crate::lltype::host_or_null(W_DictProxyObject {
         ob_header: header,
         w_mapping,
     }) as PyObjectRef

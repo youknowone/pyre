@@ -177,7 +177,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(body) as PyObjectRef
+        crate::lltype::host_or_null(body) as PyObjectRef
     };
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
@@ -293,7 +293,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
-        crate::lltype::malloc_typed(payload) as PyObjectRef
+        crate::lltype::host_or_null(payload) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytearrayObjectUser, payload) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);

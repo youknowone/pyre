@@ -174,7 +174,7 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
         std::mem::size_of::<W_FloatObjectUser>(),
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(obj) as PyObjectRef
+        crate::lltype::host_or_null(obj) as PyObjectRef
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_FloatObjectUser, obj);

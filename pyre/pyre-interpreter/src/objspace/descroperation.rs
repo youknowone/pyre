@@ -2744,6 +2744,15 @@ pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_tuple_new(items))
 }
 
+/// `_ll_malloc_fixedsize` returned NULL: MemoryError is already pending.
+fn gc_new(obj: PyObjectRef) -> PyResult {
+    if obj.is_null() {
+        Err(PyError::memory_error(""))
+    } else {
+        Ok(obj)
+    }
+}
+
 /// listobject.py descr_mul
 pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n)?;
@@ -2766,7 +2775,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     if let Some(repeated) = pyre_object::with_roots!(
         list => pyre_object::listobject::w_list_repeat_unwrapped(list, count)
     ) {
-        return Ok(repeated);
+        return gc_new(repeated);
     }
     // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
     // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
@@ -2798,7 +2807,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     for i in 0..pinned.len() {
         items.push(pinned[i]);
     }
-    Ok(w_list_new(items))
+    gc_new(w_list_new(items))
 }
 
 /// listobject.py descr_inplace_mul — repeat the list in place; the

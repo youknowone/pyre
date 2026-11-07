@@ -173,6 +173,8 @@ fn alloc_lowlevel_string(
             unsafe { std::ptr::write_bytes(ptr, 0, total_size) };
         }
         ptr
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        return 0;
     } else {
         // Off-heap `rstr.STR` / `UNICODE` is still a `GcStruct` (`rstr.py`):
         // a prebuilt `rpy_string` carries `init_gc_object_immortal`. The

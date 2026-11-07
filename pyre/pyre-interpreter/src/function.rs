@@ -940,8 +940,8 @@ pub(crate) fn function_new_impl(
     let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
     // `function.py` `Function` is one GC object whether or not its code is a
-    // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null only when no
-    // collector hook is installed (`gc_hook.rs`); that call does not collect.
+    // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null when no collector
+    // hook is installed, or when `_ll_malloc_fixedsize` stored MemoryError.
     let raw =
         pyre_object::gc_hook::try_gc_alloc_stable_raw(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE);
     let managed = !raw.is_null();
@@ -974,6 +974,9 @@ pub(crate) fn function_new_impl(
         // Nothing collectable runs in between.
         function_write_barrier(raw as PyObjectRef);
         return raw as PyObjectRef;
+    }
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return PY_NULL;
     }
 
     // Immortal holder with the prebuilt header (`init_gc_object_immortal`):

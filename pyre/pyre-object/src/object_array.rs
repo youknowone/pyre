@@ -795,6 +795,9 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
         unsafe { (*block).capacity = cap };
         return block;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
+    }
     unsafe { alloc_items_block(cap) }
 }
 
@@ -837,27 +840,34 @@ unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
 unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)> {
     if itemsblock_gc_enabled() {
         let payload = try_items_block_layout(cap)?.size();
-        if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)
-            && !raw.is_null()
+        match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+            PY_OBJECT_ARRAY_GC_TYPE_ID,
+            payload,
+        ))
+        .allocated_or_raise()
         {
-            let block = raw as *mut ItemsBlock;
-            unsafe {
-                // IncrementalMiniMark does not zero-fill. Publish
-                // `capacity` only after the payload is NULL: the type-9
-                // walker traces `items[0..capacity]` as soon as this
-                // block is a root, and callers `pin_root` it before
-                // `try_gc_owns_object`. Zeroing the whole payload first
-                // leaves a 0 length header so a concurrent walk cannot
-                // follow dirty nursery words
-                // (`rlist.py` `_ll_list_resize_hint_really` mallocs
-                // through `gc_malloc_array`, which leaves GCREF slots
-                // NULL).
-                // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
-                // on the GCREF itself writes no bytes. Zero through `*mut u8`.
-                std::ptr::write_bytes(raw as *mut u8, 0, payload);
-                (*block).capacity = cap;
+            Some(raw) => {
+                let block = raw as *mut ItemsBlock;
+                unsafe {
+                    // IncrementalMiniMark does not zero-fill. Publish
+                    // `capacity` only after the payload is NULL: the type-9
+                    // walker traces `items[0..capacity]` as soon as this
+                    // block is a root, and callers `pin_root` it before
+                    // `try_gc_owns_object`. Zeroing the whole payload first
+                    // leaves a 0 length header so a concurrent walk cannot
+                    // follow dirty nursery words
+                    // (`rlist.py` `_ll_list_resize_hint_really` mallocs
+                    // through `gc_malloc_array`, which leaves GCREF slots
+                    // NULL).
+                    // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
+                    // on the GCREF itself writes no bytes. Zero through `*mut u8`.
+                    std::ptr::write_bytes(raw as *mut u8, 0, payload);
+                    (*block).capacity = cap;
+                }
+                return Some((block, true));
             }
-            return Some((block, true));
+            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
+            None => {}
         }
     }
     unsafe { try_alloc_items_block(cap).map(|block| (block, false)) }
@@ -1466,8 +1476,10 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     if itemsblock_gc_enabled() {
         match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(
             tid, payload,
-        )) {
-            crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
+        ))
+        .allocated_or_raise()
+        {
+            Some(raw) => {
                 let block = raw as *mut TypedItemsBlock;
                 unsafe {
                     (*block).capacity = cap;
@@ -1479,16 +1491,8 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
                 }
                 return Some(block);
             }
-            // `try_gc_alloc_stable_raw` ends the process on this answer,
-            // because its callers meet a null by allocating outside the heap
-            // and a block holding managed references must never live there.  A
-            // typed block holds unboxed words and its capacity comes from
-            // Python, so the refusal is reported instead: nothing is allocated
-            // anywhere on this path and the caller raises `MemoryError`.
-            crate::gc_hook::GcAllocOutcome::Failed => return None,
-            // No heap owns the request -- before the GC is up, or in a unit
-            // test -- so the plain allocation below is the whole heap.
-            crate::gc_hook::GcAllocOutcome::NoRoute => {}
+            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
+            None => {}
         }
     }
     unsafe {
@@ -1982,10 +1986,12 @@ unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut F
                 &mut needs_write_barrier,
             )
         })
-        .allocated_or_abort(payload)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
         let block = if !raw.is_null() {
             raw as *mut FixedObjectArray
+        } else if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
         } else {
             let layout = mro_block_layout(len);
             (unsafe { std_alloc_gc_array(layout, false) })
@@ -2027,6 +2033,8 @@ unsafe fn fill_mro_block(
     let len = values.len();
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
     } else {
         // Bootstrap / no-hook fallback: a header-prefixed `std::alloc` block
         // ([`std_alloc_gc_array`]); the collector does not own it.
@@ -2223,10 +2231,12 @@ pub fn allocate_array_struct_at_typed(
         .checked_add(items_size)
         .expect("GcTypedArray allocation size overflow");
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, total);
-    assert!(
-        !raw.is_null(),
-        "allocate_array_struct_at_typed: collector installed but allocation had no route"
-    );
+    if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
+        panic!("allocate_array_struct_at_typed: collector installed but allocation had no route");
+    }
     // `try_gc_alloc_stable_raw` is uninitialized. A virtual
     // `DICTENTRYARRAY` rebuild is `bh_new_array_clear`; leave
     // `f_valid` and the value word 0 like
