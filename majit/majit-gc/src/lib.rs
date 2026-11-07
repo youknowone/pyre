@@ -5499,12 +5499,13 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-pub fn bh_probe_note_store(obj: usize, offset: usize, site: u32) {
-    if obj == 0 || !bh_probe_enabled() {
+pub fn bh_probe_note_store(obj: GCREF, offset: usize, site: u32) {
+    if obj.is_null() || !bh_probe_enabled() {
         return;
     }
+    let addr = obj as usize;
     let _ = BH_PROBE_STORES.try_with(|m| {
-        *m.borrow_mut().entry((obj, offset)).or_insert(0) |= 1u32 << site;
+        *m.borrow_mut().entry((addr, offset)).or_insert(0) |= 1u32 << site;
     });
 }
 

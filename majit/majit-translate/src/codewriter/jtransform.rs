@@ -3260,7 +3260,14 @@ fn retarget_field_bases(
     }
 }
 
-/// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
+/// `Rvalue::Ref` / `RawPtr` borrow of a field (`rewrite_op_getsubstruct`).
+///
+/// A wide inline aggregate (`inline_vec` / `FLAG_STRUCT` larger than a
+/// word) is the usual case. A one-word row still has an address: `&s.f`
+/// is `int_add(ptr, offsetof)` on a raw owner even when the layout flag
+/// is a scalar (`bytecode::CodeObject.obj_name` as a `String` / `RustVec`
+/// header). `jtransform.py rewrite_op_getfield` raises for a leftover
+/// non-pure `getfield_raw_r`.
 fn wide_inline_borrow_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
@@ -3268,7 +3275,51 @@ fn wide_inline_borrow_offset(
     if !field.taken_by_address {
         return None;
     }
-    inline_aggregate_offset(field, cc)
+    if let Some(offset) = inline_aggregate_offset(field, cc) {
+        return Some(offset);
+    }
+    if field.vec_part.is_some() {
+        return None;
+    }
+    // `jtransform.py rewrite_op_getsubstruct` is raw-only. A GC owner's
+    // one-word Pointer/Unsigned borrow is a value load; folding it into
+    // getsubstruct then aborting because the owner is GC emits `abort/>i`.
+    if crate::codewriter::type_state::field_owner_is_gc(field, cc) {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let row = cc
+        .and_then(|cc| cc.struct_layout_for(owner))
+        .and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|row| row.name == field.name)
+                .cloned()
+        });
+    // `FLAG_SIGNED` / `FLAG_FLOAT` wide scalars stay a value load
+    // (`wide_scalar_borrow_is_not_a_substruct_address`). A pointer or
+    // unsigned word is the address of that slot.
+    if let Some(row) = row {
+        match row.flag {
+            majit_ir::descr::ArrayFlag::Pointer | majit_ir::descr::ArrayFlag::Unsigned => {
+                return Some(Ok(row.offset));
+            }
+            _ => {}
+        }
+    }
+    // Charon leaves `bytecode::CodeObject` offsets unresolved;
+    // `codeobject_layout` is the host `offset_of` table.
+    Some(Ok(exact_codeobject_field_offset(field)?))
+}
+
+fn exact_codeobject_field_offset(field: &FieldDescriptor) -> Option<usize> {
+    let owner = field.owner_root.as_deref()?;
+    crate::codeobject_layout::exact_layout_for(owner)?
+        .field_offsets
+        .get(&field.name)
+        .copied()
+        .map(|off| off as usize)
 }
 
 /// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
@@ -20908,6 +20959,188 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "one-word raw struct borrow must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `&code.obj_name` is `Rvalue::Ref` of a host `String` on flavor-raw
+    /// `bytecode::CodeObject`. `rewrite_op_getsubstruct` is `int_add` of
+    /// the field offset; assembling `getfield_raw_r` is
+    /// `jtransform.py rewrite_op_getfield` raising for a non-pure raw ref
+    /// load. The layout row may be a one-word flag (`String` as
+    /// `RustVec` header); the borrow still needs the address, not the
+    /// first word.
+    #[test]
+    fn raw_codeobject_obj_name_borrow_is_not_getfield_raw_r() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "bytecode::CodeObject";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert(owner.to_string());
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 4 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "obj_name".into(),
+                    offset: word,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+
+        let mut graph = FunctionGraph::new("reraise_obj_name");
+        let code =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, code.clone());
+        let name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: code,
+                    field: FieldDescriptor::new("obj_name", Some(owner.into()))
+                        .with_taken_by_address(true)
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(name));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        let leftover_obj_name: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "obj_name"
+                )
+            })
+            .collect();
+        assert!(
+            leftover_obj_name.is_empty(),
+            "obj_name borrow is rewrite_op_getsubstruct, leftover={leftover_obj_name:?}"
+        );
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "raw CodeObject.obj_name borrow must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `rewrite_op_getsubstruct` is raw-only (`jtransform.py` raises
+    /// `only supported for gckind=raw`). A GC owner's one-word Pointer
+    /// borrow is a value load; folding it into getsubstruct then aborting
+    /// because the owner is GC emits `abort/>i` into unique look-inside.
+    #[test]
+    fn gc_pointer_borrow_is_not_getsubstruct_abort() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "objectmodel::W_Root";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![StructFieldLayout {
+                    name: "w_class".into(),
+                    offset: word,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let field = FieldDescriptor::new("w_class", Some(owner.into()))
+            .with_taken_by_address(true)
+            .with_owner_declared_gc(Some(true));
+        assert_eq!(
+            wide_inline_borrow_offset(&field, Some(&cc)),
+            None,
+            "GC Pointer borrow is not rewrite_op_getsubstruct"
+        );
+
+        let mut graph = FunctionGraph::new("gc_pointer_borrow");
+        let obj =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, obj.clone());
+        let w_class = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: obj,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(w_class));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter().cloned())
+            .collect();
+        let aborted = ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. }));
+        assert!(
+            !aborted,
+            "GC Pointer borrow must not emit abort/>i; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_class"
+            )),
+            "GC Pointer borrow stays a value getfield; ops={ops:?}"
         );
     }
 

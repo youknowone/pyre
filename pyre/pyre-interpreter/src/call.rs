@@ -205,6 +205,17 @@ mod frame_resume_args_tests {
     }
 }
 
+#[cfg(test)]
+mod recursion_depth_guard_tests {
+    #[test]
+    fn recursion_depth_guard_is_one_residual_word() {
+        assert_eq!(
+            std::mem::size_of::<super::RecursionDepthGuard>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+}
+
 type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
 majit_gc::oncelock_fn_static!(static EVAL_OVERRIDE: OnceLock<EvalFn>);
 type ThreadEntryFn = fn();
@@ -212,6 +223,15 @@ majit_gc::oncelock_fn_static!(static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn>)
 
 type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 majit_gc::oncelock_fn_static!(static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn>);
+
+/// The context this activation charged its unit to, or a null pointer when
+/// the thread had none and [`DETACHED_RECURSION`] stood in for it.
+///
+/// Carried on the guard rather than looked up again at exit: the context a
+/// frame entered under is the one its release must reach, and reading the
+/// slot twice would let a context installed mid-activation take back a unit
+/// it never received.
+type RecursionHome = *mut crate::PyExecutionContext;
 
 thread_local! {
     /// Activation accounting for a thread that has no `ExecutionContext`
@@ -223,6 +243,15 @@ thread_local! {
     /// read against each other.
     static DETACHED_RECURSION: Cell<(usize, *mut PyFrame)> =
         const { Cell::new((0, std::ptr::null_mut())) };
+
+    /// Restore records for [`RecursionDepthGuard`]. The guard itself is one
+    /// residual word (the 1-based stack height) so unique look-inside can
+    /// leftover-bind `enter_recursive_frame`; the restore record lives here
+    /// because a heap GCREF `cast_ptr_to_int` is illegal in
+    /// `blackhole.py bhimpl_cast_ptr_to_int`. The middle word is the
+    /// shadow-stack slot that roots `prev`, not the frame address.
+    static RECURSION_GUARD_STACK: RefCell<Vec<(RecursionHome, usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
@@ -238,15 +267,6 @@ thread_local! {
     /// discriminator cannot see.
     static FRAME_ENTRY_COUNT: Cell<u64> = const { Cell::new(0) };
 }
-
-/// The context this activation charged its unit to, or a null pointer when
-/// the thread had none and [`DETACHED_RECURSION`] stood in for it.
-///
-/// Carried on the guard rather than looked up again at exit: the context a
-/// frame entered under is the one its release must reach, and reading the
-/// slot twice would let a context installed mid-activation take back a unit
-/// it never received.
-type RecursionHome = *mut crate::PyExecutionContext;
 
 /// Read the bootstrap recursion state used before an execution context is
 /// installed.  PyPy's translated hot path owns this state on its live
@@ -355,18 +375,28 @@ pub fn bump_frame_entry_count() {
 /// unit whether it runs as compiled code, through the JIT eval loop, or in the
 /// plain evaluator.  `pyframe.py` (`execute_frame.insert_stack_check_here`)
 /// puts the matching stack check at the same seam.
-#[inline]
+///
+/// `dont_look_inside`: `rstack.py stack_check` is kept out of jitcodes
+/// (`driver.py task_stackcheckinsertion_lltype` / `insert_ll_stackcheck`
+/// after `make_jitcodes`). This is that seam's Python-frame half.
+/// Looking inside emits `cast_ptr_to_int/r>i` of the heap PyFrame
+/// (`frame as usize`) which `blackhole.py bhimpl_cast_ptr_to_int`
+/// rejects (tagged immediate only). Unique look-inside residual-calls
+/// the native charge instead. `#[inline(never)]` keeps rustc from
+/// splicing the CAST into callers.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let home = recursion_home();
     let key = frame as *mut PyFrame;
     let (saved_depth, accounted) = recursion_state_get(home);
     if std::ptr::eq(accounted, key) {
-        return RecursionDepthGuard::arm(home, key, saved_depth);
+        return RecursionDepthGuard::push(home, key, saved_depth);
     }
     // Root the displaced claim before the store: the write barrier in
     // `recursion_state_set` sits between the read and the guard
     // (`shadowstack.py` `push_roots` / `pop_roots`).
-    let guard = RecursionDepthGuard::arm(home, accounted, saved_depth);
+    let guard = RecursionDepthGuard::push(home, accounted, saved_depth);
     recursion_state_set(home, saved_depth + 1, key);
     guard
 }
@@ -379,14 +409,35 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
 /// no activation to key on: the unit is spent unconditionally and
 /// `accounted_activation` is carried through unchanged, leaving the next real
 /// activation to account for itself.
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn enter_native_dispatch() -> RecursionDepthGuard {
     let home = recursion_home();
     let (saved_depth, accounted) = recursion_state_get(home);
     // The claim is carried through unchanged, so only the depth is written;
     // no write barrier sits between the read and the guard.
     recursion_depth_set(home, saved_depth + 1);
-    RecursionDepthGuard::arm(home, accounted, saved_depth)
+    RecursionDepthGuard::push(home, accounted, saved_depth)
+}
+
+/// Pop the restore record [`enter_recursive_frame`] pushed and write the
+/// two activation slots back. Unique look-inside leftover of Drop is this
+/// call; `eval_frame_with_resume` also leftover-calls it after the body
+/// because ResidualRet dest of enter is an INT (`rstack.py stack_check`
+/// stays residual the same way). `prev` is read back from its shadow-stack
+/// slot, which a collection during the activation forwarded.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) fn release_recursive_frame(token: usize) {
+    RECURSION_GUARD_STACK.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        debug_assert_eq!(stack.len(), token);
+        if let Some((home, prev_root, saved_depth)) = stack.pop() {
+            let prev = majit_gc::shadow_stack::get(prev_root);
+            majit_gc::shadow_stack::pop_to(prev_root);
+            recursion_state_set(home, saved_depth, prev.0 as *mut PyFrame);
+        }
+    });
 }
 
 /// RAII guard that gives back the activation unit `enter_recursive_frame`
@@ -407,29 +458,40 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
 /// shadow stack (`shadowstack.py` `push_roots` / `pop_roots`) so a
 /// collection during the activation forwards it, matching that guard's
 /// saved `topframeref`.
-pub struct RecursionDepthGuard {
-    home: RecursionHome,
-    prev_root: usize,
-    saved_depth: usize,
-}
+///
+/// One residual word (the TLS stack height) so leftover of
+/// `enter_recursive_frame` is `r>i`. The restore record (home, the
+/// shadow-stack slot of `prev`, saved depth) lives in
+/// `RECURSION_GUARD_STACK`.
+#[repr(transparent)]
+pub struct RecursionDepthGuard(pub(crate) usize);
 
 impl RecursionDepthGuard {
-    #[inline]
-    fn arm(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
-        Self {
-            home,
-            prev_root: majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize)),
-            saved_depth,
-        }
+    fn push(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
+        let prev_root = majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize));
+        RECURSION_GUARD_STACK.with(|slot| {
+            let mut stack = slot.borrow_mut();
+            stack.push((home, prev_root, saved_depth));
+            Self(stack.len())
+        })
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) const fn from_residual_word(word: usize) -> Self {
+        Self(word)
+    }
+
+    #[inline(always)]
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) const fn residual_word(&self) -> usize {
+        self.0
     }
 }
 
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
-        let prev = majit_gc::shadow_stack::get(self.prev_root);
-        majit_gc::shadow_stack::pop_to(self.prev_root);
-        recursion_state_set(self.home, self.saved_depth, prev.0 as *mut PyFrame);
+        release_recursive_frame(self.0);
     }
 }
 
@@ -2800,6 +2862,39 @@ fn call_callable_with_mode(
         return call_callable_with_mode(execution_context, func, &call_args, mode, profile_frame);
     }
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
+}
+
+/// Residual ABI of leftover `call_non_function_callable_with_mode`
+/// (`baseobjspace.py call_function` non-Function/Method arm). Unique
+/// look-inside of CALL residualizes the `dont_look_inside` helper as
+/// `rrrir>r` (`execution_context`, `callable`, `args_w` GcArray, `CallMode`
+/// discriminant, `profile_frame`). `&[PyObjectRef]` is one length-prefixed
+/// object-array word (`object_gcarray_slice`).
+#[inline(never)]
+pub extern "C" fn call_non_function_callable_with_mode_jit_abi(
+    execution_context: i64,
+    callable: i64,
+    args: i64,
+    mode: i64,
+    profile_frame: i64,
+) -> i64 {
+    majit_ir::icf_identity!("call::call_non_function_callable_with_mode_jit_abi");
+    let mode = if mode == 0 {
+        CallMode::Jit
+    } else {
+        CallMode::Plain
+    };
+    let args = unsafe { majit_ir::helper_fnaddr::object_gcarray_slice::<PyObjectRef>(args) };
+    match call_non_function_callable_with_mode(
+        execution_context as usize as *const crate::PyExecutionContext,
+        callable as usize as PyObjectRef,
+        args,
+        mode,
+        profile_frame as usize as *mut PyFrame,
+    ) {
+        Ok(value) => value as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
+    }
 }
 
 #[inline(never)]

@@ -6932,7 +6932,7 @@ fn walker_ec_enter(
     // old-gen `FrameBox` and the caller's vref can be young.
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as pyre_object::gc_hook::GCREF);
     majit_gc::bh_probe_note_store(
-        concrete_frame as usize,
+        concrete_frame as majit_gc::GCREF,
         crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
         4,
     );

@@ -1788,24 +1788,31 @@ fn python_portal_bh_jitdrivers_sd(
         .first()
         .map(|jd| jd.mainjitcode_calldescr.extra_info.clone())
         .unwrap_or_default();
-    let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
-        result_type: majit_metainterp::blackhole::BhReturnType::Ref,
-        portal_runner_ptr: Some(bh_portal_runner_c),
-        handle_jitexc_from_bh: driver
-            .meta_interp()
-            .staticdata
-            .jitdrivers_sd
-            .first()
-            .and_then(|jd| jd.handle_jitexc_from_bh),
-        mainjitcode_calldescr: majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
-            "iirrr".to_string(),
-            'r',
-            extra_info,
-        ),
-    };
+    let handle_jitexc_from_bh = driver
+        .meta_interp()
+        .staticdata
+        .jitdrivers_sd
+        .first()
+        .and_then(|jd| jd.handle_jitexc_from_bh);
+    let mainjitcode_calldescr = majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
+        "iirrr".to_string(),
+        'r',
+        extra_info,
+    );
     match table.first_mut() {
-        Some(slot) => *slot = jd0,
-        None => table.push(jd0),
+        Some(slot) => {
+            slot.result_type = majit_metainterp::blackhole::BhReturnType::Ref;
+            slot.portal_runner_ptr = Some(bh_portal_runner_c);
+            slot.handle_jitexc_from_bh = handle_jitexc_from_bh;
+            slot.mainjitcode_calldescr = mainjitcode_calldescr;
+        }
+        None => table.push(majit_metainterp::blackhole::BhJitDriverSd {
+            result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+            portal_runner_ptr: Some(bh_portal_runner_c),
+            handle_jitexc_from_bh,
+            mainjitcode_calldescr,
+            virtualizable_info: None,
+        }),
     }
     std::sync::Arc::from(table)
 }
@@ -3485,10 +3492,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
 
     // resume.py: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
-    // A novable resume runs no vable opcodes, so both the pointer and the
-    // vinfo handle are written null instead of jd0's. The interp comes
-    // from the shared pool; `release_interp` already cleared the vable
-    // triple, and this restates the zeros for a novable resume.
+    // A novable resume leaves both the pointer and the vinfo handle null
+    // instead of jd0's: `BlackholeInterpreter::run` GC-walks
+    // `virtualizable_ptr` whenever `virtualizable_info` is non-null, and
+    // a novable driver has no such object. Vable opcodes that unique
+    // look-inside recorded from an inlined PyFrame helper recover the
+    // owner through `BhJitDriverSd.virtualizable_info`
+    // (`vable_descr_owner_info` / `blackhole.py fielddescr.get_vinfo()`).
+    // The interp comes from the shared pool; `release_interp` already
+    // cleared the vable triple, and this restates the zeros for a
+    // novable resume.
     if !novable {
         if virtualizable_ptr != 0 {
             bh.virtualizable_ptr = virtualizable_ptr;
@@ -3563,48 +3576,53 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // `handle_jitexc_from_bh` unreachable. Only jd0's slot is replaced.
     let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> = {
         let mut table = driver.meta_interp().staticdata.bh_jitdrivers_sd().to_vec();
-        let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
-            result_type: majit_metainterp::blackhole::BhReturnType::Ref,
-            portal_runner_ptr: Some(bh_portal_runner_c),
-            handle_jitexc_from_bh: driver
-                .meta_interp()
-                .staticdata
-                .jitdrivers_sd
-                .first()
-                .and_then(|jd| jd.handle_jitexc_from_bh),
-            mainjitcode_calldescr: {
-                // `get_portal_runner` returns this descr paired with
-                // `bh_portal_runner_c`, and the blackhole recursive-portal resume
-                // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
-                // green+red argument banks against it — so it must describe the
-                // portal runner, not the traced function.  `bh_portal_runner_c`
-                // consumes the warmspot `portalfunc_ARGS` (`warmspot.py:972-975`):
-                // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
-                // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
-                // `bh.jitcode.calldescr` is the traced function's own frame-based
-                // residual-call descr and does not describe the runner.
-                // Fresh descr so `descr.py CallDescr.create_call_stub` sees
-                // `"iirrr"` / `'r'`. Cloning `bh.jitcode.calldescr` and
-                // rewriting those two fields would keep a stub selected for
-                // the traced function (`BhCallDescr::clone` copies a resolved
-                // `call_stub`). `from_arg_classes` leaves the stub unresolved
-                // and keeps extra_info.
-                majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
-                    "iirrr".to_string(),
-                    'r',
-                    bh.jitcode.calldescr().extra_info.clone(),
-                )
-            },
-            // `get_portal_runner` reaches this table by INDEX
-            // (`jitdrivers_sd[jdindex]`), so the driver never has to be found
-            // by its portal jitcode here.  Leaving it unset keeps
-            // `portal_jd_for` from claiming a frame for a synthetic driver
-            // assembled around whichever jitcode happened to be innermost when
-            // the chain was built.
-        };
+        let handle_jitexc_from_bh = driver
+            .meta_interp()
+            .staticdata
+            .jitdrivers_sd
+            .first()
+            .and_then(|jd| jd.handle_jitexc_from_bh);
+        // `get_portal_runner` returns this descr paired with
+        // `bh_portal_runner_c`, and the blackhole recursive-portal resume
+        // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
+        // green+red argument banks against it — so it must describe the
+        // portal runner, not the traced function.  `bh_portal_runner_c`
+        // consumes the warmspot `portalfunc_ARGS` (`warmspot.py portalfunc_ARGS`):
+        // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
+        // `[frame:r, ec:r]` (`interp_jit.py reds`) = 2 int + 3 ref.
+        // `bh.jitcode.calldescr` is the traced function's own frame-based
+        // residual-call descr and does not describe the runner.
+        // Fresh descr so `descr.py CallDescr.create_call_stub` sees
+        // `"iirrr"` / `'r'`. Cloning `bh.jitcode.calldescr` and
+        // rewriting those two fields would keep a stub selected for
+        // the traced function (`BhCallDescr::clone` copies a resolved
+        // `call_stub`). `from_arg_classes` leaves the stub unresolved
+        // and keeps extra_info.
+        let mainjitcode_calldescr = majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
+            "iirrr".to_string(),
+            'r',
+            bh.jitcode.calldescr().extra_info.clone(),
+        );
+        // Mutate jd0 in place so `virtualizable_info` from
+        // `build_bh_jitdrivers_sd` survives. Unique look-inside of
+        // `execute_frame` from a novable driver records `getfield_vable`
+        // against PyFrame's vinfo; `blackhole.py bhimpl_getfield_vable_r`
+        // recovers it via `fielddescr.get_vinfo()`, and pyre's
+        // `vable_descr_owner_info` reads it off this slot.
         match table.first_mut() {
-            Some(slot) => *slot = jd0,
-            None => table.push(jd0),
+            Some(slot) => {
+                slot.result_type = majit_metainterp::blackhole::BhReturnType::Ref;
+                slot.portal_runner_ptr = Some(bh_portal_runner_c);
+                slot.handle_jitexc_from_bh = handle_jitexc_from_bh;
+                slot.mainjitcode_calldescr = mainjitcode_calldescr;
+            }
+            None => table.push(majit_metainterp::blackhole::BhJitDriverSd {
+                result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+                portal_runner_ptr: Some(bh_portal_runner_c),
+                handle_jitexc_from_bh,
+                mainjitcode_calldescr,
+                virtualizable_info: None,
+            }),
         }
         std::sync::Arc::from(table)
     };

@@ -332,6 +332,35 @@ pub extern "C" fn vref_referent_jit_abi(ptr: *mut PyFrame) -> i64 {
     vref_referent(ptr) as i64
 }
 
+/// Pin `frame` across the `topframeref` write barrier and hand back the
+/// forwarded pointer.
+///
+/// `FrameAnchor` must stay out of look-inside-able `enter` /
+/// `set_topframeref`. Unique look-inside residualizes `from_raw` as
+/// `frame_anchor_push` (a live depth) then BH of the compiled loop
+/// `get`s that tracing-time index (`shadow_stack.rs` `get`). Native
+/// `FrameAnchor` Drop is LIFO; the jitcode copy is not.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn pin_frame_across_topframeref_barrier(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> *mut PyFrame {
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+    pyre_object::gc_hook::try_gc_write_barrier(ec as pyre_object::gc_hook::GCREF);
+    anchor.live()
+}
+
+/// One-word residual-call ABI for [`pin_frame_across_topframeref_barrier`].
+#[inline(never)]
+pub extern "C" fn pin_frame_across_topframeref_barrier_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::pin_frame_across_topframeref_barrier_jit_abi");
+    pin_frame_across_topframeref_barrier(ec, frame) as i64
+}
+
 /// An activation's pending result held in root slots across a call that can
 /// collect: the exit value, or the `PyError` handle. The name and object
 /// context live on the GC object the handle points at.
@@ -890,6 +919,21 @@ pub struct ExecutionContext {
 
 pub type PyExecutionContext = ExecutionContext;
 
+/// Word `cache_root_stack_slot` stored (`shadowstack.py`
+/// `gc_enter_roots_frame`). Zero when the context is missing or the
+/// slot is not resolved yet. Lives next to [`ExecutionContext`] so
+/// unique look-inside of the portal inlines
+/// [`ExecutionContext::root_stack_slot_raw`] (`getfield_gc_i`) instead
+/// of a pyre-jit Opaque `*const` load.
+#[inline(never)]
+pub fn cached_root_raw(ec: *const ExecutionContext) -> usize {
+    if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).root_stack_slot_raw() }
+    }
+}
+
 /// Runtime-assigned GC type id. Stamped at the absolute tail of
 /// `pyre-jit::eval::build_gc` so no hardcoded / `#[pyre_class(type_id = N)]`
 /// id moves (`AllVirtuals` uses the same tail rule). portal-interpret
@@ -1016,21 +1060,6 @@ pub unsafe fn executioncontext_destructor(obj_addr: usize) {
     unsafe { std::ptr::drop_in_place(obj_addr as *mut ExecutionContext) };
 }
 
-/// `root_stack_slot` cache read (`gc_enter_roots_frame`). A concrete
-/// accessor keeps the rtyper from binding generic `std::cell::Cell<T>::get`. The dispatch loop
-/// loads this word; zero means the context is missing or the slot is
-/// unresolved. `#[inline(never)]` keeps the residual at this function so
-/// rustc does not paste `Cell::get` into `eval_loop_jit`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn execution_context_root_stack_slot_get(ec: *const ExecutionContext) -> usize {
-    if ec.is_null() {
-        0
-    } else {
-        unsafe { (*ec).root_stack_slot.get() }
-    }
-}
-
 /// `root_stack_slot` cache fill (`gc_enter_roots_frame`): resolve this
 /// thread's shadow-stack slot into the context once per activation. Takes the
 /// owner pointer because the field's JIT representation is its `usize` word,
@@ -1154,16 +1183,26 @@ impl ExecutionContext {
         self.topframeref
     }
 
+    /// `shadowstack.py` `gc_enter_roots_frame` cache word. Own graph so
+    /// `Cell::get` of this field is `getfield_gc_i` (`jtransform.py`
+    /// `rewrite_op_getfield` / `nestedscope.py` `CellFamily.ever_mutated`).
+    /// `#[inline(never)]` keeps rustc from splicing that load into a
+    /// `*const ExecutionContext` wrapper; pyre-jit's LLBC sees this
+    /// struct as Opaque and would `cast_ptr_to_int` the GCREF, which
+    /// `blackhole.py` `bhimpl_cast_ptr_to_int` rejects (tagged immediate).
+    #[inline(never)]
+    pub fn root_stack_slot_raw(&self) -> usize {
+        self.root_stack_slot.get()
+    }
+
     #[inline]
     pub fn set_topframeref(&mut self, frame: *mut PyFrame) {
         // The write barrier goes through the hook cell so the native scan
         // judges this store able to collect. Hand the frame back out of the
-        // anchor, as [`Self::gettopframe`] does around `force_frame`.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        pyre_object::gc_hook::try_gc_write_barrier(
-            self as *const Self as pyre_object::gc_hook::GCREF,
-        );
-        self.topframeref = anchor.live();
+        // anchor, as [`Self::gettopframe`] does around `force_frame`. The
+        // pin lives in [`pin_frame_across_topframeref_barrier`] so
+        // `FrameAnchor` is not in this look-inside-able graph.
+        self.topframeref = pin_frame_across_topframeref_barrier(self as *mut Self, frame);
     }
 
     #[inline]
@@ -1625,8 +1664,12 @@ impl ExecutionContext {
         if std::ptr::eq(vref_referent(self.topframeref), frame) {
             return;
         }
-        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
-        majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
+        // Probe takes the GCREF word. `frame as usize` is `cast_ptr_to_int`
+        // of a heap PyFrame (`blackhole.py bhimpl_cast_ptr_to_int` asserts a
+        // tagged immediate).
+        let gc_frame = frame as pyre_object::gc_hook::GCREF;
+        pyre_object::gc_hook::try_gc_write_barrier(gc_frame);
+        majit_gc::bh_probe_note_store(gc_frame, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         unsafe {
             (*frame).f_backref = self.topframeref;
         }
@@ -3493,6 +3536,29 @@ pub extern "C" fn call_trace_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFr
     match ExecutionContext::call_trace(ec, frame) {
         Ok(()) => 0,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::leave`].
+///
+/// Unique look-inside leftover of portal `RETURN_VALUE` residualizes
+/// `executioncontext.py leave` as `rrri` (ec, frame, exitvalue, got_exception).
+/// `Result<PyObjectRef, PyError>` projects to Ref; `Err` publishes through
+/// [`crate::runtime_ops::jit_publish_residual_error_ref`].
+#[inline(never)]
+pub extern "C" fn leave_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+    w_exitvalue: PyObjectRef,
+    got_exception: i64,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::leave_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::leave(ec, frame, w_exitvalue, got_exception != 0) {
+        Ok(value) => value as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
     }
 }
 

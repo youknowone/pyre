@@ -5057,7 +5057,7 @@ fn try_adopt_multi_frame_blackhole(
             saved_links.push((*callee).f_backref as i64);
             relink_barrier(callee);
             majit_gc::bh_probe_note_store(
-                callee as usize,
+                callee as majit_gc::GCREF,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 5,
             );
@@ -5071,7 +5071,7 @@ fn try_adopt_multi_frame_blackhole(
             let f_back = pair[1] as *mut pyre_interpreter::PyFrame;
             relink_barrier(callee);
             majit_gc::bh_probe_note_store(
-                callee as usize,
+                callee as majit_gc::GCREF,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 6,
             );

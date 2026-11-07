@@ -3446,7 +3446,7 @@ pub trait Backend: Send {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
-        majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
+        majit_gc::bh_probe_note_store(struct_ptr as majit_gc::GCREF, offset, 9);
         // The store target may be an old-gen object holding a young ref; the
         // active GC's barrier remembers it. No-op where no barrier is installed.
         // This is the barrier `write_ref_at_mem` documents its callers as owing;

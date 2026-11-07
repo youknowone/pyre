@@ -12090,8 +12090,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // `action_dispatcher` (ticker wrap / fired breaker). Reload once per
         // merge point so `pc` is the live frame. `PyFrame.dispatch` does not
         // resolve the root stack here; the cell already holds it.
-        let raw_slot =
-            pyre_interpreter::executioncontext::execution_context_root_stack_slot_get(marker_ec);
+        let raw_slot = pyre_interpreter::cached_root_raw(marker_ec);
         f = if raw_slot == 0 {
             gc_roots::reload_top_root(f as *mut PyFrame as pyre_object::PyObjectRef) as *mut PyFrame
         } else {
@@ -12132,11 +12131,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         } else {
             // SAFETY: the word is `root_stack_slot` as `cache_root_stack_slot` stored for this thread.
             unsafe {
-                majit_gc::shadow_stack::slot_from_cached(
-                    pyre_interpreter::executioncontext::execution_context_root_stack_slot_get(
-                        marker_ec,
-                    ),
-                )
+                majit_gc::shadow_stack::slot_from_cached(pyre_interpreter::cached_root_raw(
+                    marker_ec,
+                ))
             }
         };
         // `frame` is the marker's red — the one frame value declared live
@@ -17399,7 +17396,7 @@ fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::
         struct_ptr != 0,
         "bh_setfield_gc_i: null struct; llmodel.py bh_setfield_gc_i writes via write_int_at_mem"
     );
-    majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+    majit_gc::bh_probe_note_store(struct_ptr as majit_gc::GCREF, descr_info.offset, 8);
     // SAFETY: `struct_ptr` is a materialized virtual; offset and size come
     // from the field descriptor that described the store being replayed.
     unsafe {
@@ -17544,7 +17541,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // collection reclaims the payload while the materialized struct still
         // points at it, and the following major mark reads a dangling header.
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
-        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 7);
+        majit_gc::bh_probe_note_store(struct_ptr as majit_gc::GCREF, descr_info.offset, 7);
         // SAFETY: see `bh_setfield_gc_int_write`.
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(
@@ -17567,7 +17564,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             struct_ptr != 0,
             "bh_setfield_gc_f: null struct; llmodel.py bh_setfield_gc_f writes via write_float_at_mem"
         );
-        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+        majit_gc::bh_probe_note_store(struct_ptr as majit_gc::GCREF, descr_info.offset, 8);
         // `resume.py:1515` → `llmodel.py bh_setfield_gc_f`, which
         // unpacks only the offset: float fields are excluded from the size
         // table, so this store takes the storage width and no `field_size`.

@@ -1549,11 +1549,16 @@ fn real_main() {
     // leaves `check-rtyper-skip-subjects.py` a stderr with no census line.
     let decline_census = std::env::var_os("MAJIT_DECLINE_LOG")
         .is_some_and(|value| value != "0" && !value.is_empty());
+    // Build-script stderr is hidden on a successful cargo run, so the BFS
+    // dump writes a file; restoring the cache would leave that file empty.
+    let bfs_trace =
+        std::env::var_os("MAJIT_BFS_TRACE").is_some_and(|value| value != "0" && !value.is_empty());
     if !verbose_prepass
         && !decline_census
         && !callee_census
         && !field_mint_trace
         && !struct_layout_census
+        && !bfs_trace
         && determinism_check == DeterminismCheck::Off
         && restore_codegen_cache(&cache_dir, &out_dir)
     {
@@ -1564,6 +1569,11 @@ fn real_main() {
         touch_codegen_cache_entry(&cache_dir);
         prune_codegen_cache(&repo_root, &cache_dir);
         return;
+    }
+    if bfs_trace {
+        println!(
+            "cargo::warning=MAJIT_BFS_TRACE live prepass (codegen cache skipped); dump at MAJIT_BFS_TRACE"
+        );
     }
 
     // One whole generation, writing every [`CODEGEN_OUTPUTS`] entry into the
@@ -2458,6 +2468,7 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-env-changed=PYRE_SHARED_BUILD");
     println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_ENTRIES_ENV}");
     println!("cargo::rerun-if-env-changed=MAJIT_RTYPER_VERBOSE");
+    println!("cargo::rerun-if-env-changed=MAJIT_BFS_TRACE");
     println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS");
     println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS_ROWS");
     println!("cargo::rerun-if-env-changed=MAJIT_FIELD_MINT_TRACE");

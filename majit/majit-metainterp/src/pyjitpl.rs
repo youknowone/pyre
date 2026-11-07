@@ -6275,6 +6275,9 @@ impl<M: Clone> MetaInterp<M> {
                 assign(jd);
             }
         }
+        // `build_bh_jitdrivers_sd` now copies `virtualizable_info`, so the
+        // memoised blackhole projection is stale after this write.
+        sd.bh_jitdrivers_sd.take();
     }
 
     /// Get the active virtualizable info.
@@ -21878,9 +21881,9 @@ pub struct MetaInterpStaticData {
     /// clone of the one table instead of re-casting every row.
     ///
     /// Cleared by [`Self::finish_setup_descrs_for_jitdrivers`], which every
-    /// path that appends a driver or rewrites a result kind already ends in.
-    /// The other two `iter_mut` writers set `virtualizable_info` /
-    /// `greenfield_info`, neither of which this projection reads.
+    /// path that appends a driver or rewrites a result kind already ends in,
+    /// and by [`MetaInterp::set_virtualizable_info`], which this projection
+    /// now copies. `greenfield_info` is still not projected.
     pub(crate) bh_jitdrivers_sd:
         std::sync::OnceLock<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
     /// pyjitpl.py `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`
