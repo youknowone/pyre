@@ -5,10 +5,9 @@
 # tests, so `getfd()` drops below the snapshot and the assertion reads
 # `3 != 6`.
 # parity-tests reason: `os.fwalk` holds an exhausted `scandir` iterator at the
-# topdown yield.  `W_ScandirIterator.fail` / `_close` (interp_scandir.py) is
-# what makes that iterator's finalizer a no-op; `may_ignore_finalizer` is the
-# same hint so `fwalk().close()` does not keep the exhausted scandir on the
-# finalizer queue.
+# topdown yield.  `W_ScandirIterator.fail` / `_close` (interp_scandir.py)
+# marks it closed, so its finalizer is a no-op, and `fwalk().close()` runs
+# no collection that could reach the unrelated FileIO.
 
 """fwalk().close() must not finalize FileIO that is not in its frame."""
 
