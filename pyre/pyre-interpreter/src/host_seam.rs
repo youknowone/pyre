@@ -139,29 +139,6 @@ pub mod sys {
         _SC_XOPEN_REALTIME_THREADS, _SC_XOPEN_SHM, _SC_XOPEN_UNIX, _SC_XOPEN_VERSION,
         _SC_XOPEN_XCU_VERSION,
     };
-    // `time`'s clock ids: numbers only; `clock_gettime` itself is `rtime`.
-    // The cfgs match `interp_time.rs` usage sites.
-    #[cfg(not(any(
-        target_os = "illumos",
-        target_os = "netbsd",
-        target_os = "solaris",
-        target_os = "openbsd",
-        target_os = "wasi",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-    )))]
-    pub use libc::CLOCK_PROCESS_CPUTIME_ID;
-    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-    pub use libc::CLOCK_PROF;
-    #[cfg(not(any(
-        target_os = "illumos",
-        target_os = "netbsd",
-        target_os = "solaris",
-        target_os = "openbsd",
-        target_os = "redox",
-    )))]
-    pub use libc::CLOCK_THREAD_CPUTIME_ID;
-    pub use libc::{CLOCK_MONOTONIC, CLOCK_REALTIME};
     // `posix.pathconf_names`' `_PC_*` table. `libc` exports these on the BSD
     // family only, so the table names them there and spells the glibc values
     // out for Linux — this re-export carries the same gate.

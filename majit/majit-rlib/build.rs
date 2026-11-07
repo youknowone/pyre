@@ -1,12 +1,15 @@
 //! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
-//! (`DefinedConstantInteger` RTLD_*), and `dup3` (`rposix.py` `HAVE_DUP3`)
+//! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
+//! `DefinedConstantInteger` CLOCK_*), and `dup3` (`rposix.py` `HAVE_DUP3`)
 //! probes go through `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use majit_eci::ExternalCompilationInfo;
-use majit_eci::rffi_platform::{CConfig, CConfigEntry, CConfigSingleEntry, ConfigValue, configure};
+use majit_eci::rffi_platform::{
+    CConfig, CConfigEntry, CConfigSingleEntry, ConfigValue, FieldType, StructLayout, configure,
+};
 
 /// `clibffi.py` `base_names`.
 const CLIBFFI_BASE_NAMES: &[&str] = &[
@@ -46,6 +49,9 @@ fn main() {
     }
     if target_is_unix_or_windows() {
         write_rdynload_cconfig();
+    }
+    if std::env::var("CARGO_CFG_UNIX").is_ok() {
+        write_rtime_cconfig();
     }
 }
 
@@ -127,7 +133,267 @@ fn cconfig_lookup<'a>(results: &'a [(String, ConfigValue)], name: &str) -> &'a C
             return value;
         }
     }
-    panic!("rdynload CConfig missing {name}");
+    panic!("CConfig missing {name}");
+}
+
+/// `rtime.py` `constant_names`.
+const RTIME_CONSTANT_NAMES: &[&str] = &[
+    "RUSAGE_SELF",
+    "EINTR",
+    "CLOCK_REALTIME",
+    "CLOCK_REALTIME_COARSE",
+    "CLOCK_MONOTONIC",
+    "CLOCK_MONOTONIC_COARSE",
+    "CLOCK_MONOTONIC_RAW",
+    "CLOCK_BOOTTIME",
+    "CLOCK_PROCESS_CPUTIME_ID",
+    "CLOCK_THREAD_CPUTIME_ID",
+    "CLOCK_HIGHRES",
+    "CLOCK_PROF",
+    "CLOCK_UPTIME",
+];
+
+/// `rtime.py` `CConfig` / `configure(CConfig)`, then `CConfigForFTime` when
+/// `HAVE_FTIME` and `CConfigForClockGetTime` when `HAS_CLOCK_GETTIME_RUNTIME`.
+fn write_rtime_cconfig() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+    let mut includes = vec![
+        "sys/time.h".into(),
+        "time.h".into(),
+        "errno.h".into(),
+        "sys/select.h".into(),
+        "sys/types.h".into(),
+        "unistd.h".into(),
+        "sys/time.h".into(),
+        "sys/resource.h".into(),
+    ];
+    if target_os != "openbsd" && target_os != "freebsd" {
+        includes.push("sys/timeb.h".into());
+    }
+    let mut entries = vec![
+        (
+            "TIMEVAL".into(),
+            CConfigEntry::struct_type(
+                "struct timeval",
+                vec![
+                    ("tv_sec".into(), FieldType::int()),
+                    ("tv_usec".into(), FieldType::int()),
+                ],
+                None,
+            ),
+        ),
+        (
+            "TIMEZONE".into(),
+            CConfigEntry::struct_type(
+                "struct timezone",
+                vec![
+                    ("tz_minuteswest".into(), FieldType::int()),
+                    ("tz_dsttime".into(), FieldType::int()),
+                ],
+                None,
+            ),
+        ),
+        (
+            "RUSAGE".into(),
+            CConfigEntry::struct_type(
+                "struct rusage",
+                vec![
+                    ("ru_utime".into(), FieldType::nested("struct timeval")),
+                    ("ru_stime".into(), FieldType::nested("struct timeval")),
+                ],
+                None,
+            ),
+        ),
+        (
+            "GETTIMEOFDAY_NO_TZ".into(),
+            CConfigEntry::Defined("GETTIMEOFDAY_NO_TZ".into()),
+        ),
+    ];
+    for name in RTIME_CONSTANT_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    let cconfig = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes,
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![
+            (
+                "HAVE_GETTIMEOFDAY".into(),
+                CConfigSingleEntry::Has("gettimeofday".into()),
+            ),
+            ("HAVE_FTIME".into(), CConfigSingleEntry::Has("ftime".into())),
+            (
+                "HAVE_NANOSLEEP".into(),
+                CConfigSingleEntry::Has("nanosleep".into()),
+            ),
+            (
+                "HAVE_CLOCK_NANOSLEEP".into(),
+                CConfigSingleEntry::Has("clock_nanosleep".into()),
+            ),
+        ],
+    };
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
+    let mut text = String::from(
+        "// rtime.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
+    );
+    emit_struct_layout(&mut text, "TIMEVAL", cconfig_lookup(&results, "TIMEVAL"));
+    emit_struct_layout(&mut text, "TIMEZONE", cconfig_lookup(&results, "TIMEZONE"));
+    emit_struct_layout(&mut text, "RUSAGE", cconfig_lookup(&results, "RUSAGE"));
+    emit_bool(
+        &mut text,
+        "GETTIMEOFDAY_NO_TZ",
+        cconfig_lookup(&results, "GETTIMEOFDAY_NO_TZ"),
+    );
+    for name in RTIME_CONSTANT_NAMES {
+        emit_option_i32(&mut text, name, cconfig_lookup(&results, name));
+    }
+    for name in [
+        "HAVE_GETTIMEOFDAY",
+        "HAVE_FTIME",
+        "HAVE_NANOSLEEP",
+        "HAVE_CLOCK_NANOSLEEP",
+    ] {
+        emit_bool(&mut text, name, cconfig_lookup(&results, name));
+    }
+
+    let have_ftime = match cconfig_lookup(&results, "HAVE_FTIME") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_FTIME: {other:?}"),
+    };
+    if have_ftime {
+        let libraries = rtime_libraries(&target_os);
+        let ftime_config = CConfig {
+            compilation_info: ExternalCompilationInfo {
+                includes: vec!["sys/time.h".into(), "sys/timeb.h".into()],
+                libraries,
+                ..Default::default()
+            },
+            entries: vec![(
+                "TIMEB".into(),
+                CConfigEntry::struct_type(
+                    "struct timeb",
+                    vec![
+                        ("time".into(), FieldType::int()),
+                        ("millitm".into(), FieldType::int()),
+                    ],
+                    None,
+                ),
+            )],
+            single_entries: vec![],
+        };
+        let ftime_results = configure(&ftime_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rtime.py CConfigForFTime\n");
+        emit_struct_layout(&mut text, "TIMEB", cconfig_lookup(&ftime_results, "TIMEB"));
+    }
+
+    let clock_monotonic = cconfig_lookup(&results, "CLOCK_MONOTONIC");
+    let has_clock_gettime_runtime =
+        target_vendor == "apple" || matches!(clock_monotonic, ConfigValue::Int(_));
+    if has_clock_gettime_runtime {
+        let libraries = rtime_libraries(&target_os);
+        let clock_config = CConfig {
+            compilation_info: ExternalCompilationInfo {
+                includes: vec!["time.h".into()],
+                libraries: libraries.clone(),
+                ..Default::default()
+            },
+            entries: vec![(
+                "TIMESPEC".into(),
+                CConfigEntry::struct_type(
+                    "struct timespec",
+                    vec![
+                        ("tv_sec".into(), FieldType::signed_word()),
+                        ("tv_nsec".into(), FieldType::signed_word()),
+                    ],
+                    None,
+                ),
+            )],
+            single_entries: vec![(
+                "_NO_MISSING_RT".into(),
+                CConfigSingleEntry::Has("printf(\"%d\", clock_gettime(0, 0))".into()),
+            )],
+        };
+        let clock_results = configure(&clock_config, false).unwrap_or_else(|err| panic!("{err}"));
+        text.push_str("// rtime.py CConfigForClockGetTime\n");
+        emit_struct_layout(
+            &mut text,
+            "TIMESPEC",
+            cconfig_lookup(&clock_results, "TIMESPEC"),
+        );
+        emit_bool(
+            &mut text,
+            "_NO_MISSING_RT",
+            cconfig_lookup(&clock_results, "_NO_MISSING_RT"),
+        );
+        let no_missing_rt = match cconfig_lookup(&clock_results, "_NO_MISSING_RT") {
+            ConfigValue::Bool(v) => *v,
+            other => panic!("_NO_MISSING_RT: {other:?}"),
+        };
+        if !no_missing_rt {
+            println!("cargo:rustc-link-lib=rt");
+        }
+    }
+
+    let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("rtime_cconfig.rs");
+    std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+}
+
+/// `rtime.py` `libraries` for `CConfigForFTime` / `CConfigForClockGetTime`.
+/// `sys.platform == 'linux2'` is the RPython branch; cargo's OS name is
+/// `linux`, so that arm does not fire here either (PyPy3's `sys.platform` is
+/// also `linux`). `_NO_MISSING_RT` is the real `-lrt` gate.
+fn rtime_libraries(target_os: &str) -> Vec<String> {
+    if target_os == "freebsd" || target_os == "netbsd" {
+        vec!["compat".into()]
+    } else if target_os == "linux2" {
+        vec!["rt".into()]
+    } else {
+        vec![]
+    }
+}
+
+fn emit_option_i32(text: &mut String, name: &str, value: &ConfigValue) {
+    text.push_str(&format!(
+        "pub const {name}: Option<i32> = {};\n",
+        option_i32(name, value)
+    ));
+}
+
+fn emit_bool(text: &mut String, name: &str, value: &ConfigValue) {
+    match value {
+        ConfigValue::Bool(b) => text.push_str(&format!("pub const {name}: bool = {b};\n")),
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+fn emit_struct_layout(text: &mut String, attr: &str, value: &ConfigValue) {
+    let layout: &StructLayout = match value {
+        ConfigValue::Struct(s) => s,
+        other => panic!("{attr}: {other:?}"),
+    };
+    text.push_str(&format!(
+        "pub const {attr}_SIZE: usize = {};\n",
+        layout.size
+    ));
+    text.push_str(&format!(
+        "pub const {attr}_ALIGN: usize = {};\n",
+        layout.align
+    ));
+    for ((fname, _), off) in layout.fields.iter().zip(&layout.fieldoffsets) {
+        if layout.padding.iter().any(|p| p == fname) {
+            continue;
+        }
+        text.push_str(&format!(
+            "pub const {attr}_{fname}_OFFSET: usize = {off};\n"
+        ));
+    }
 }
 
 fn option_i32(name: &str, value: &ConfigValue) -> String {
