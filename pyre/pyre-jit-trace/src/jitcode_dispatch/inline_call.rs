@@ -7209,7 +7209,7 @@ fn walker_ec_enter(
     let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as pyre_object::gc_hook::GCREF);
     majit_gc::bh_probe_note_store(
-        concrete_frame as usize,
+        concrete_frame as majit_gc::GCREF,
         crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
         4,
     );

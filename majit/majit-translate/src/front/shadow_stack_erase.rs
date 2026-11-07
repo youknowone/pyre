@@ -4644,6 +4644,25 @@ pub fn erase_named(llbc: &Llbc, suffix: &str) -> String {
     }
 }
 
+/// One local body's scalar-replace outcome: `"erased"`, `"no-bracket"`,
+/// `"missing"`, `"opaque"`, or the refusal reason. Targeted dump so a
+/// leftover `push_roots` test does not walk the whole artefact (`census`).
+#[cfg(test)]
+pub fn erase_status(llbc: &Llbc, name: &str) -> &'static str {
+    ensure_stack_sensitive_fns(llbc);
+    let Some(fd) = llbc.local_fn(name) else {
+        return "missing";
+    };
+    let Some(body) = fd.unstructured() else {
+        return "opaque";
+    };
+    match erase_shadow_stack(fd, &body, llbc) {
+        Ok(Some(_)) => "erased",
+        Ok(None) => "no-bracket",
+        Err(reason) => reason,
+    }
+}
+
 /// Every local body with a root bracket, bucketed by what the scalar
 /// replacement did with it: `"erased"`, or the refusal reason.  The subject
 /// list names the bodies in each bucket.

@@ -1575,6 +1575,71 @@ mod tests {
         );
     }
 
+    /// Host `bytecode::CodeObject` is `_alloc_flavor_ = "raw"`. A Signed
+    /// `*const CodeObject` stays an address (`history.getkind` of a raw
+    /// Ptr is `'int'`); `promote_gc_field_bases` must not insert
+    /// `cast_int_to_ptr` for `CodeObject.flags`.
+    #[test]
+    fn promote_gc_field_bases_leaves_a_flavor_raw_signed_base() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("raw_codeobject_getfield");
+        let base = push_input(&mut graph, "code", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("flags", Some("bytecode::CodeObject".into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "flavor-raw CodeObject* keeps the producer Signed cell"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let casts: Vec<_> = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
+                )
+            })
+            .collect();
+        assert!(
+            casts.is_empty(),
+            "no cast_int_to_ptr of a flavor-raw Signed base; ops={ops:?}"
+        );
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read")
+            .kind
+        else {
+            unreachable!("field read");
+        };
+        assert_eq!(
+            field_base.id(),
+            base.id(),
+            "getfield_raw reads the Signed CodeObject* directly"
+        );
+    }
+
     #[test]
     fn promote_gc_field_bases_lifts_a_signed_array_read_base() {
         let mut graph = FunctionGraph::new("int_base_getarrayitem");
@@ -2514,6 +2579,11 @@ mod tests {
         assert!(
             !field_owner_is_gc(&field, Some(&cc)),
             "getgcflavor of CodeObject is raw"
+        );
+        let unstamped = FieldDescriptor::new("flags", Some("bytecode::CodeObject".into()));
+        assert!(
+            !field_owner_is_gc(&unstamped, Some(&cc)),
+            "getgcflavor raw is STRUCT._gckind when the producer left None"
         );
     }
 
