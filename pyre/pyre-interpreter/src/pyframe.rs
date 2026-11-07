@@ -1633,7 +1633,7 @@ unsafe fn alloc_frame_locals_array(
         FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::GcAllocOutcome::from_hook(
             pyre_object::gc_hook::try_gc_alloc(pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
         )
-        .allocated_or_abort(payload)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut()),
         FrameLocalsArrayAllocation::OldGenGc => pyre_object::gc_hook::try_gc_alloc_stable_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
@@ -1665,6 +1665,9 @@ unsafe fn alloc_frame_locals_array(
             remember_frame_locals_array(arr);
         }
         return arr;
+    }
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
 }
@@ -2378,6 +2381,9 @@ unsafe fn clone_debugdata_ptr(
                 // The clone may carry young locals / trace callback refs.
                 remember_frame_debug_data(raw as *mut FrameDebugData);
                 return raw as *mut FrameDebugData;
+            }
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return std::ptr::null_mut();
             }
             pyre_object::lltype::malloc_raw((*ptr).clone())
         } else {

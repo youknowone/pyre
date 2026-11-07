@@ -3206,6 +3206,26 @@ pub fn bump_minor_epoch() {
     MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Last `malloc_fixedsize` on this thread answered `GcAllocOutcome::Failed`.
+thread_local! {
+    static ALLOC_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last [`GcAllocOutcome::allocated_or_raise`] on this thread
+/// was [`GcAllocOutcome::Failed`].
+///
+/// RPython's `_ll_malloc_fixedsize` raises MemoryError, which translation
+/// stores in `cpu.pos_exc_value` and then returns NULL. Residual constructors
+/// here cannot unwind, so [`raise_memory_error`] is that store and this flag
+/// is the C ABI's "that malloc returned NULL because the GC refused" — the
+/// same thread-local exception state as errno / `pos_exc_value`. A host
+/// `malloc_raw` fallback reads it immediately; it is not a process-wide
+/// side-table of boxes.
+#[inline]
+pub fn gc_alloc_failed_pending() -> bool {
+    ALLOC_FAILED.with(|c| c.get())
+}
+
 /// What an allocation answered, with the two non-pointer states kept apart.
 ///
 /// `malloc_fixedsize` (incminimark.py) has neither state. The GC is a
@@ -3258,7 +3278,8 @@ impl GcAllocOutcome {
 
     /// The allocated pointer, or `None` for [`NoRoute`](Self::NoRoute) so the
     /// caller takes its own non-GC path. A [`Failed`](Self::Failed) does not
-    /// return: see [`gc_alloc_failed`].
+    /// return: see [`gc_alloc_failed`]. Product constructors use
+    /// [`allocated_or_raise`](Self::allocated_or_raise) instead.
     #[inline]
     pub fn allocated_or_abort(self, payload_size: usize) -> Option<GCREF> {
         match self {
@@ -3267,15 +3288,33 @@ impl GcAllocOutcome {
             Self::NoRoute => None,
         }
     }
+
+    /// `_ll_malloc_fixedsize`: NULL from allocate raises MemoryError and
+    /// returns NULL.
+    ///
+    /// JIT frames cannot unwind, so this stores the prebuilt MemoryError
+    /// (`raise_memory_error`) and answers `None`. [`gc_alloc_failed_pending`]
+    /// is set so a host `malloc_raw` fallback can tell this `None` from
+    /// [`NoRoute`](Self::NoRoute). The caller returns PY_NULL; compiled
+    /// `CHECK_MEMORY_ERROR` and interpreter `PyResult` surface the exception.
+    #[inline]
+    pub fn allocated_or_raise(self) -> Option<GCREF> {
+        ALLOC_FAILED.with(|c| c.set(false));
+        match self {
+            Self::Allocated(raw) => Some(raw),
+            Self::NoRoute => None,
+            Self::Failed => {
+                ALLOC_FAILED.with(|c| c.set(true));
+                raise_memory_error();
+                None
+            }
+        }
+    }
 }
 
-/// A GC that owns the heap could not satisfy an allocation.
-///
-/// `collect_and_reserve` (incminimark.py) raises MemoryError at this
-/// point, so no caller of `malloc_fixedsize` observes a null. The callers here
-/// return a bare pointer and run under JIT frames that cannot unwind, so the
-/// failure aborts instead — the answer `alloc_typed_items_block_nursery`
-/// already gives for a digit array whose allocation fails.
+/// Host `Layout` abort when a GC-owned allocation is still being treated as
+/// a fatal `handle_alloc_error`. Product constructors use
+/// [`GcAllocOutcome::allocated_or_raise`] (`_ll_malloc_fixedsize`).
 #[cold]
 #[inline(never)]
 pub fn gc_alloc_failed(payload_size: usize) -> ! {

@@ -175,14 +175,15 @@ pub fn w_pytraceback_new(
     // `malloc_typed` block.
     let mut allocation_root = roots.get(inputs) as pyre_object::gc_hook::GCREF;
     let mut needs_write_barrier = true;
-    let raw = unsafe {
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
         pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
             PYTRACEBACK_GC_TYPE_ID,
             PYTRACEBACK_OBJECT_SIZE,
             &mut allocation_root,
             &mut needs_write_barrier,
         )
-    }
+    })
+    .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let tb_slot = if raw.is_null() {
         None
@@ -210,6 +211,9 @@ pub fn w_pytraceback_new(
     };
 
     let Some(tb_slot) = tb_slot else {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return pyre_object::PY_NULL;
+        }
         return pyre_object::lltype::malloc_typed(value) as PyObjectRef;
     };
     let raw = pyre_object::gc_roots::shadow_stack_get(tb_slot) as *mut PyTraceback;

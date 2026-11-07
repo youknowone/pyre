@@ -188,7 +188,14 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
 // The `NoRoute` / `Failed` split is the allocator's contract, not this hook
 // layer's, so it lives with the allocator (`majit_gc`). The hooks here answer
 // in `Option<GCREF>` and classify with `GcAllocOutcome::from_hook`.
-pub use majit_gc::{GcAllocOutcome, gc_alloc_failed};
+pub use majit_gc::{GcAllocOutcome, gc_alloc_failed, gc_alloc_failed_pending};
+
+/// Null from [`try_gc_alloc_stable_raw`] / [`GcAllocOutcome::allocated_or_raise`]
+/// is a host malloc only when no collector refused the request.
+#[inline]
+pub fn host_fallback_on_null(raw: GCREF) -> bool {
+    raw.is_null() && !majit_gc::gc_alloc_failed_pending()
+}
 
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
     GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
@@ -249,15 +256,10 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
 
 /// [`try_gc_alloc_stable`] narrowed to the one answer its callers can act on.
 ///
-/// `null` means [`GcAllocOutcome::NoRoute`] alone: no hook is installed, so
-/// the caller's own `malloc_raw` path is the whole heap and taking it keeps
-/// the object graph consistent.  A [`Failed`](GcAllocOutcome::Failed) does not
-/// come back — a GC owns the heap and could not satisfy the request, and every
-/// caller here answers a null by allocating outside that heap, which is the
-/// one thing it must not do: the object would hold managed references the
-/// collector never traces or forwards, and its missing header lets a type-id
-/// witness misread the words before it.  So the two are told apart here rather
-/// than at each call site, and the failure aborts (see [`gc_alloc_failed`]).
+/// `null` is [`GcAllocOutcome::NoRoute`] or [`Failed`](GcAllocOutcome::Failed)
+/// after `_ll_malloc_fixedsize` stored MemoryError. NoRoute is the host
+/// `malloc_raw` licence; Failed is not — [`host_fallback_on_null`] tells
+/// them apart via [`gc_alloc_failed_pending`].
 ///
 /// Residualising this primitive (`@dont_look_inside`, `rlib/jit.py`) keeps the
 /// process-global hook dispatch out of the trace — a `GCREF` return has no
@@ -269,7 +271,7 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> GCREF {
         return core::ptr::null_mut();
     }
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
-        .allocated_or_abort(payload_size)
+        .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
 }
 
@@ -311,7 +313,7 @@ pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GC
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
     GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
-        .allocated_or_abort(payload_size)
+        .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
 }
 
@@ -348,7 +350,7 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
     GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
-        .allocated_or_abort(payload_size)
+        .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
 }
 
@@ -386,7 +388,7 @@ pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> GCREF {
         return core::ptr::null_mut();
     }
     GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
-        .allocated_or_abort(payload_size)
+        .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
 }
 
@@ -1337,14 +1339,27 @@ mod tests {
 
     #[test]
     fn only_no_route_returns_the_caller_to_its_raw_path() {
-        // `Failed` does not return at all, so the surviving `None` is the sole
-        // licence for a `malloc_raw` fallback.
+        // `allocated_or_abort` still aborts on `Failed`, so the surviving
+        // `None` is the sole licence for a `malloc_raw` fallback there.
         assert!(GcAllocOutcome::NoRoute.allocated_or_abort(24).is_none());
         let mut probe = 0u8;
         assert_eq!(
             GcAllocOutcome::Allocated((&mut probe as *mut u8).cast()).allocated_or_abort(24),
             Some((&mut probe as *mut u8).cast())
         );
+    }
+
+    #[test]
+    fn allocated_or_raise_failed_returns_none_after_storing_memory_error() {
+        let _hook_lock = hook_test_guard();
+        majit_gc::set_active_raise_memory_error(Some(|| {}));
+        assert!(GcAllocOutcome::Failed.allocated_or_raise().is_none());
+        assert!(majit_gc::gc_alloc_failed_pending());
+        assert!(!host_fallback_on_null(core::ptr::null_mut()));
+        assert!(GcAllocOutcome::NoRoute.allocated_or_raise().is_none());
+        assert!(!majit_gc::gc_alloc_failed_pending());
+        assert!(host_fallback_on_null(core::ptr::null_mut()));
+        majit_gc::set_active_raise_memory_error(None);
     }
 
     #[test]
@@ -1359,10 +1374,8 @@ mod tests {
     #[test]
     fn a_stable_allocation_with_no_hook_installed_still_answers_null() {
         // `NoRoute` is the one answer `try_gc_alloc_stable_raw` still hands
-        // back: nothing owns the heap, so each caller's own `malloc_raw` path
-        // is the whole heap and taking it is correct. The `Failed` it now
-        // separates out cannot be asserted from here — that one does not
-        // return.
+        // back without raising: nothing owns the heap, so each caller's own
+        // `malloc_raw` path is the whole heap and taking it is correct.
         let _hook_lock = hook_test_guard();
         clear_gc_alloc_stable_hook();
         assert!(try_gc_alloc_stable(1, 8).is_none());

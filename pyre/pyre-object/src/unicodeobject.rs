@@ -614,6 +614,9 @@ pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
         hash: 0,
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // Header alloc failed after the value box: rebuild a fully immortal
         // string rather than pair a `malloc_typed` header with a GC value box it
         // cannot grey. `gc_alloc_storage_box` may have returned a GC-owned
@@ -671,11 +674,13 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
             &mut needs_write_barrier,
         )
     };
-    let raw = match raw {
-        Some(p) if !p.is_null() => p,
-        _ => std::ptr::null_mut(),
-    };
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_raise()
+        .unwrap_or(std::ptr::null_mut());
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         let recovered = unsafe { utf8_payload_wtf8(unicode.value).to_owned() };
         return w_str_from_wtf8_immortal(recovered);
     }
@@ -814,6 +819,9 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // Keep the subclass header. An immortal holder cannot grey a
         // GC value box, so copy the bytes into `malloc_raw` first.
         // Unit tests have no GC hook: `gc_alloc_storage_box` already

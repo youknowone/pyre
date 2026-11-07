@@ -4542,6 +4542,11 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "payload_size"],
         LowLevelType::Address,
     ),
+    (
+        &["GcAllocOutcome", "allocated_or_raise"],
+        &["self"],
+        LowLevelType::Address,
+    ),
     // `OnceLock<fn(...)>` for the `sys.exc_info` JIT-direct helper.
     (
         &["pyre_interpreter", "function", "SYS_EXC_INFO_DIRECT_FN"],

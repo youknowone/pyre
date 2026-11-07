@@ -2087,7 +2087,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
         )
     };
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_USER_OBJECT_SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
     let body = W_ListObjectUser {
         base: W_ListObject {
@@ -2108,6 +2108,9 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
@@ -2460,10 +2463,10 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         )
     };
     // The `malloc_typed` header below is the answer for a missing hook, not
-    // for a GC that owns the heap and refused: that one would leave the list's
-    // managed edges untraced behind a header the collector never walks.
+    // for a GC that owns the heap and refused: that one raises MemoryError
+    // (`_ll_malloc_fixedsize`) and this returns PY_NULL.
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_OBJECT_SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
@@ -2492,6 +2495,9 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         ascii_items,
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
         // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
         return crate::lltype::malloc_typed(body) as PyObjectRef;
@@ -2610,7 +2616,7 @@ unsafe fn w_list_from_storage_and_strategy(
         &mut needs_write_barrier,
     );
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_LIST_OBJECT_SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
     int_items.reload_block(int_slot);
     float_items.reload_block(float_slot);
@@ -2635,6 +2641,9 @@ unsafe fn w_list_from_storage_and_strategy(
         ascii_items,
     };
     let obj = if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
         // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
         crate::lltype::malloc_typed(body) as PyObjectRef
@@ -2672,24 +2681,34 @@ pub unsafe fn w_list_repeat_unwrapped(obj: PyObjectRef, times: usize) -> Option<
     match strategy {
         ListStrategy::Integer | ListStrategy::IntOrFloat => {
             let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_int_array(
-                strategy,
-                IntArray::from_repeated(&values, times)?,
-            ))
+            match IntArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_int_array(strategy, arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(crate::PY_NULL)
+                }
+            }
         }
         ListStrategy::Float => {
             let values = snapshot_float_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_float_array(FloatArray::from_repeated(
-                &values, times,
-            )?))
+            match FloatArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_float_array(arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(crate::PY_NULL)
+                }
+            }
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
             // `inplace_mul` materialises the clone, then `IntegerListStrategy.mul`.
             let values = snapshot_range_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_int_array(
-                ListStrategy::Integer,
-                IntArray::from_repeated(&values, times)?,
-            ))
+            match IntArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_int_array(ListStrategy::Integer, arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(crate::PY_NULL)
+                }
+            }
         }
         ListStrategy::Object => {
             repeat_object_storage(crate::gc_roots::shadow_stack_get(obj_slot), times)
