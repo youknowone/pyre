@@ -2677,7 +2677,7 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
     if len_a == 0
         && let Some(clone) = pyre_object::with_roots!(a, b => pyre_object::listobject::w_list_clone_if_shared_strategy(b))
     {
-        return Ok(clone);
+        return crate::runtime_ops::obj_or_memory_error(clone);
     }
     // `W_ListObject.descr_add`: same-strategy storage append, otherwise
     // `getitems_copy` into an object list. Bytes/Ascii keep the loop below.
@@ -2709,7 +2709,10 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
             fetched += 1;
         }
     }
-    let mut items = Vec::with_capacity(fetched);
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(fetched)
+        .map_err(|_| crate::builtins::reservation_failed())?;
     for i in 0..fetched {
         items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
@@ -2750,7 +2753,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     if let Some(clone) =
         pyre_object::with_roots!(list => pyre_object::listobject::w_list_clone_if_size(list))
     {
-        return Ok(clone);
+        return crate::runtime_ops::obj_or_memory_error(clone);
     }
     let len = w_list_len(list);
     let cap = len

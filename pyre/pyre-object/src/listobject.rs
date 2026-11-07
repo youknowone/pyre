@@ -2083,6 +2083,9 @@ pub fn w_list_allocate_instance(w_listtype: PyObjectRef) -> PyObjectRef {
     let w_listtype = crate::gc_roots::shadow_stack_get(type_slot);
     if !w_listtype.is_null() && w_listtype != list_class {
         let obj = w_list_user_new_empty(w_listtype);
+        if obj.is_null() {
+            return obj;
+        }
         crate::gc_hook::maybe_register_finalizer(obj);
         return obj;
     }
@@ -2168,6 +2171,9 @@ pub fn w_list_new_with_sizehint(sizehint: i64) -> PyObjectRef {
     let state = unsafe { alloc_sizehint_state(sizehint) };
     let _ = crate::gc_roots::pin_root(state as PyObjectRef);
     let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Size);
+    if obj.is_null() {
+        return obj;
+    }
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
     unsafe {
@@ -2198,6 +2204,9 @@ pub fn w_list_new_range(start: i64, step: i64, length: i64) -> PyObjectRef {
     let state = unsafe { alloc_range_state(values) };
     let _ = crate::gc_roots::pin_root(state as PyObjectRef);
     let obj = w_list_new_with_strategy(Vec::new(), strategy);
+    if obj.is_null() {
+        return obj;
+    }
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
     unsafe {
@@ -2232,6 +2241,9 @@ pub unsafe fn w_list_clone_if_shared_strategy(obj: PyObjectRef) -> Option<PyObje
     let state_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(list.items as PyObjectRef);
     let clone = w_list_new_with_strategy(Vec::new(), strategy);
+    if clone.is_null() {
+        return Some(clone);
+    }
     let clone_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(clone);
     let clone = crate::gc_roots::shadow_stack_get(clone_slot);
@@ -2260,6 +2272,9 @@ pub unsafe fn w_list_clone_if_size(obj: PyObjectRef) -> Option<PyObjectRef> {
     let state_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(list.items as PyObjectRef);
     let clone = w_list_new_with_strategy(Vec::new(), ListStrategy::Size);
+    if clone.is_null() {
+        return Some(clone);
+    }
     let clone_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(clone);
     let clone = crate::gc_roots::shadow_stack_get(clone_slot);

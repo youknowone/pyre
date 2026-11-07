@@ -771,7 +771,7 @@ pub fn newlist_from_iter_hint(last_val: PyObjectRef) -> Result<PyObjectRef, PyEr
             0
         }
     };
-    Ok(pyre_object::listobject::w_list_new_with_sizehint(hint))
+    crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new_with_sizehint(hint))
 }
 
 /// LIST_EXTEND — extend `list` in place with the items of `iterable`.
