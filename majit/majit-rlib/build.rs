@@ -1,5 +1,6 @@
-//! `clibffi` `cConfig` (`configure_simple_type`) and `dup3` (`rposix.py`
-//! `HAVE_DUP3`) probes go through `majit_eci::rffi_platform`, and
+//! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
+//! (`DefinedConstantInteger` RTLD_*), and `dup3` (`rposix.py` `HAVE_DUP3`)
+//! probes go through `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -38,13 +39,108 @@ fn main() {
         ..Default::default()
     });
 
-    if target_has_clibffi() && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+    if target_is_unix_or_windows()
+        && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc"
+    {
         write_clibffi_cconfig();
+    }
+    if target_is_unix_or_windows() {
+        write_rdynload_cconfig();
     }
 }
 
-fn target_has_clibffi() -> bool {
+fn target_is_unix_or_windows() -> bool {
     std::env::var("CARGO_CFG_UNIX").is_ok() || std::env::var("CARGO_CFG_WINDOWS").is_ok()
+}
+
+/// `rdynload.py` `CConfig` names, in class-body order.
+const RDYNLOAD_RTLD_NAMES: &[&str] = &[
+    "RTLD_LOCAL",
+    "RTLD_GLOBAL",
+    "RTLD_NOW",
+    "RTLD_LAZY",
+    "RTLD_NODELETE",
+    "RTLD_NOLOAD",
+    "RTLD_DEEPBIND",
+];
+
+/// `rdynload.py` `CConfig` / `configure(CConfig)`. The probe ECI is
+/// `rdynload.eci`: `dlfcn.h` plus Darwin `#define MACOSX` and `libraries=['dl']`
+/// except FreeBSD/NetBSD; Win32 is `windows.h` and no `dl`.
+fn write_rdynload_cconfig() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+    let windows = target_os == "windows";
+    let includes = if windows {
+        vec!["windows.h".into()]
+    } else {
+        vec!["dlfcn.h".into()]
+    };
+    let pre_include_bits = if target_vendor == "apple" {
+        vec!["#define MACOSX".into()]
+    } else {
+        vec![]
+    };
+    let libraries = if windows || target_os == "freebsd" || target_os == "netbsd" {
+        vec![]
+    } else {
+        vec!["dl".into()]
+    };
+    let entries = RDYNLOAD_RTLD_NAMES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                CConfigEntry::DefinedConstantInteger((*name).into()),
+            )
+        })
+        .collect();
+    let cconfig = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            pre_include_bits,
+            includes,
+            libraries,
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![],
+    };
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
+    let mut text = String::from(
+        "// rdynload.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
+    );
+    for name in RDYNLOAD_RTLD_NAMES {
+        let value = cconfig_lookup(&results, name);
+        text.push_str(&format!(
+            "pub const {name}: Option<i32> = {};\n",
+            option_i32(name, value)
+        ));
+    }
+    let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("rdynload_cconfig.rs");
+    std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+}
+
+fn cconfig_lookup<'a>(results: &'a [(String, ConfigValue)], name: &str) -> &'a ConfigValue {
+    for (key, value) in results {
+        if key == name {
+            return value;
+        }
+    }
+    panic!("rdynload CConfig missing {name}");
+}
+
+fn option_i32(name: &str, value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Int(n) => {
+            if *n < i32::MIN as i128 || *n > i32::MAX as i128 {
+                panic!("{name}: {n}");
+            }
+            format!("Some({n})")
+        }
+        ConfigValue::None => "None".into(),
+        other => panic!("{name}: {other:?}"),
+    }
 }
 
 /// `clibffi.py` `add_simple_type` / `configure(CConfig)`. The probe ECI is

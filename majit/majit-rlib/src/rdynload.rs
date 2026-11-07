@@ -8,46 +8,47 @@ use crate::rffi::{self, CCHARP, VOIDP};
 
 pub use crate::rffi::INT;
 
+/// `rdynload.cConfig` (`rffi_platform.configure`).
+mod cconfig {
+    include!(concat!(env!("OUT_DIR"), "/rdynload_cconfig.rs"));
+}
+
+const fn cconfig_int_or_zero(value: Option<i32>) -> INT {
+    match value {
+        Some(v) => v as INT,
+        None => 0,
+    }
+}
+
+/// `rdynload.cConfig` names `posix.moduledef` and
+/// `_cffi_backend.get_dict_rtld_constants` walk.
+pub const CCONFIG_RTLD: [(&'static str, Option<i32>); 7] = [
+    ("RTLD_LAZY", cconfig::RTLD_LAZY),
+    ("RTLD_NOW", cconfig::RTLD_NOW),
+    ("RTLD_GLOBAL", cconfig::RTLD_GLOBAL),
+    ("RTLD_LOCAL", cconfig::RTLD_LOCAL),
+    ("RTLD_NODELETE", cconfig::RTLD_NODELETE),
+    ("RTLD_NOLOAD", cconfig::RTLD_NOLOAD),
+    ("RTLD_DEEPBIND", cconfig::RTLD_DEEPBIND),
+];
+
 /// `rdynload.DLLHANDLE`.
 #[cfg(unix)]
 pub type DLLHANDLE = VOIDP;
 
-/// `rdynload.RTLD_LOCAL`.
+/// `rdynload.RTLD_LOCAL` (`cConfig.RTLD_LOCAL`). None from the probe is 0 so
+/// bitwise `dlopen` / `_ctypes` still have an `INT`.
 #[cfg(unix)]
-pub const RTLD_LOCAL: INT = libc::RTLD_LOCAL;
-/// `rdynload.RTLD_GLOBAL`.
+pub const RTLD_LOCAL: INT = cconfig_int_or_zero(cconfig::RTLD_LOCAL);
+/// `rdynload.RTLD_GLOBAL` (`cConfig.RTLD_GLOBAL`).
 #[cfg(unix)]
-pub const RTLD_GLOBAL: INT = libc::RTLD_GLOBAL;
-/// `rdynload.RTLD_NOW`.
+pub const RTLD_GLOBAL: INT = cconfig_int_or_zero(cconfig::RTLD_GLOBAL);
+/// `rdynload.RTLD_NOW` (`cConfig.RTLD_NOW`).
 #[cfg(unix)]
-pub const RTLD_NOW: INT = libc::RTLD_NOW;
-/// `rdynload.RTLD_LAZY`.
+pub const RTLD_NOW: INT = cconfig_int_or_zero(cconfig::RTLD_NOW);
+/// `rdynload.RTLD_LAZY` (`cConfig.RTLD_LAZY`).
 #[cfg(unix)]
-pub const RTLD_LAZY: INT = libc::RTLD_LAZY;
-
-/// `rdynload.cConfig.RTLD_NODELETE`.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-pub const RTLD_NODELETE: INT = libc::RTLD_NODELETE;
-/// `rdynload.cConfig.RTLD_NOLOAD`.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-pub const RTLD_NOLOAD: INT = libc::RTLD_NOLOAD;
-/// `rdynload.cConfig.RTLD_DEEPBIND`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub const RTLD_DEEPBIND: INT = libc::RTLD_DEEPBIND;
+pub const RTLD_LAZY: INT = cconfig_int_or_zero(cconfig::RTLD_LAZY);
 
 // `rdynload.eci`. `libraries=['dl']` except FreeBSD/NetBSD; Darwin also
 // defines `MACOSX`.
@@ -225,9 +226,11 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<Result<DLLHANDLE, i32>, r
 
 /// `rdynload._dlopen_default_mode`.
 #[cfg(unix)]
-pub fn _dlopen_default_mode() -> INT {
+pub const fn _dlopen_default_mode() -> INT {
     let mut mode = RTLD_NOW;
-    mode |= RTLD_LOCAL;
+    if let Some(local) = cconfig::RTLD_LOCAL {
+        mode |= local as INT;
+    }
     mode
 }
 
@@ -384,6 +387,44 @@ pub fn dlsym_byordinal(handle: DLLHANDLE, index: INT) -> Result<VOIDP, INT> {
 /// `rdynload.GetModuleHandle` (`rwin32.GetModuleHandle`).
 #[cfg(windows)]
 pub use crate::rwin32::GetModuleHandle;
+
+#[cfg(test)]
+mod cconfig_tests {
+    #[test]
+    fn cconfig_rtld_matches_dlfcn_where_defined() {
+        let names = [
+            "RTLD_LAZY",
+            "RTLD_NOW",
+            "RTLD_GLOBAL",
+            "RTLD_LOCAL",
+            "RTLD_NODELETE",
+            "RTLD_NOLOAD",
+            "RTLD_DEEPBIND",
+        ];
+        for ((name, _), expected) in super::CCONFIG_RTLD.iter().zip(names) {
+            assert_eq!(*name, expected);
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(super::cconfig::RTLD_LAZY, Some(libc::RTLD_LAZY));
+            assert_eq!(super::cconfig::RTLD_NOW, Some(libc::RTLD_NOW));
+            assert_eq!(super::cconfig::RTLD_GLOBAL, Some(libc::RTLD_GLOBAL));
+            assert_eq!(super::cconfig::RTLD_LOCAL, Some(libc::RTLD_LOCAL));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(super::cconfig::RTLD_NODELETE, Some(libc::RTLD_NODELETE));
+            assert_eq!(super::cconfig::RTLD_NOLOAD, Some(libc::RTLD_NOLOAD));
+            assert_eq!(super::cconfig::RTLD_DEEPBIND, None);
+        }
+        #[cfg(windows)]
+        {
+            for &(_, value) in &super::CCONFIG_RTLD {
+                assert_eq!(value, None);
+            }
+        }
+    }
+}
 
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {

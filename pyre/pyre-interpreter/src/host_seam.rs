@@ -57,10 +57,9 @@ pub mod sys {
         LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE,
         O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY,
         O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP,
-        PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE,
-        RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET,
-        ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED,
-        WUNTRACED, X_OK,
+        PRIO_PROCESS, PRIO_USER, R_OK, RUSAGE_SELF, S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END,
+        SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
+        WSTOPPED, WUNTRACED, X_OK,
     };
     // `posix`'s darwin-only names: the `setpriority` scopes, the `copyfile`
     // flags `_fcopyfile` takes, and `<stdio.h>`'s own `TMP_MAX`.
@@ -92,12 +91,10 @@ pub mod sys {
         CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED, F_LOCK,
         F_TEST, F_TLOCK, F_ULOCK, P_ALL, P_PGID, P_PID,
     };
-    // `posix`'s `<sched.h>` and `<dlfcn.h>` names, which carry the same gates
-    // there as the table that publishes them: the Apple targets declare the
-    // scheduling policies outside the `libc` crate, `SCHED_BATCH`/`SCHED_IDLE`
-    // are Linux's own, and `RTLD_DEEPBIND` is glibc's.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    pub use libc::RTLD_DEEPBIND;
+    // `posix`'s `<sched.h>` names, which carry the same gates there as the
+    // table that publishes them: the Apple targets declare the scheduling
+    // policies outside the `libc` crate, `SCHED_BATCH`/`SCHED_IDLE` are
+    // Linux's own.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub use libc::{SCHED_BATCH, SCHED_DEADLINE, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK};
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]

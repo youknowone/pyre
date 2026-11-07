@@ -2367,22 +2367,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
         }
-        // `<dlfcn.h>` — `rdynload.py:50-82` reads the same set, and
-        // `sys.setdlopenflags` and `ctypes` hand them straight back to
-        // `dlopen`, where a zero would ask for `RTLD_LOCAL | RTLD_LAZY`
-        // whatever was named.
-        for (name, val) in [
-            ("RTLD_LAZY", libc::RTLD_LAZY as i64),
-            ("RTLD_NOW", libc::RTLD_NOW as i64),
-            ("RTLD_GLOBAL", libc::RTLD_GLOBAL as i64),
-            ("RTLD_LOCAL", libc::RTLD_LOCAL as i64),
-            ("RTLD_NODELETE", libc::RTLD_NODELETE as i64),
-            ("RTLD_NOLOAD", libc::RTLD_NOLOAD as i64),
-            // A glibc extension, absent from the header anywhere else.
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+        // `posix.moduledef` walks `rdynload.cConfig` RTLD_* and wraps only
+        // values that are not None.
+        for (name, val) in majit_rlib::rdynload::CCONFIG_RTLD {
+            if let Some(val) = val {
+                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+            }
         }
         // `<sched.h>`, read as `rposix.py` reads it: present where the
         // header defines it, and with the host's own numbering rather than a
