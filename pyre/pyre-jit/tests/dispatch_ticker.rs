@@ -40,8 +40,8 @@ fn simple_counted_loop_few_iters_stays_in_the_interpreter() {
         .spawn(|| {
             pyre_module::register();
             init_jit_hooks();
-            let ec = Rc::new(PyExecutionContext::default());
-            let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
+            let ec = alloc_execution_context();
+            let ec_ptr = ec.as_mut_ptr();
             pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
             let code = compile_source_with_filename(
                 "i = 0\nwhile i < 10:\n    i += 1\nassert i == 10\n",
