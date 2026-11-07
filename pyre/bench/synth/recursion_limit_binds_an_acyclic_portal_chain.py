@@ -1,14 +1,15 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot,level0,level1,level2,level3,level4,level5,entry-bridge:level0,entry-bridge:level2
-# Distinct callees still compile their own loops. After
-# `_opimpl_recursive_call` dropped the FBW inline screens
-# (`can_inline_callable` then `max_unroll_recursion` then
-# `dont_trace_here`), level1/3/4/5 entries inline into the
-# caller and no longer form a CALL_ASSEMBLER entry-bridge.
 # Every Python activation consumes recursion budget, not only an activation
 # whose code object is already present in the live call chain.  The six
-# distinct callees below each carry a loop so a warmed caller can cross their
-# entries through compiled portal/CALL_ASSEMBLER paths.
+# distinct callees below each carry a loop so a warmed caller compiles each
+# of them as its own portal loop.
+#
+# `_opimpl_recursive_call` (`pyjitpl.py`) inlines a callee whose greenkey is
+# not already on the framestack, so an acyclic chain inlines the next pycode
+# and residualizes after that. Only `level0` and `level2` therefore mint
+# function-entry bridges; `level1`/`level3`/`level4`/`level5` compile as
+# loops. pypy3 `jit-log-opt` on this file is the same two entry-bridges.
 #
 # The two limits pin the conservative lower-level check used by PyPy's
 # approximative recursion limit. On this six-callee compiled shape, `base + 5`
