@@ -114,40 +114,6 @@ fn bigint_mul_int_int(a: i64, b: i64) -> BigInt {
     BigInt::mul_int_int_bigint_result(a, b)
 }
 
-/// Host spelling of the already-zero-checked quotient half of
-/// `rbigint.divmod`. The MIR front retargets this exact seam to
-/// `jit_bigint_div_floor`, restoring RPython's one-GCREF CALL_PURE result
-/// instead of exposing Rust's `Result<(RBigInt, RBigInt), RBigIntError>`.
-#[majit_macros::jit_elidable]
-fn bigint_floordiv_nonzero(a: &BigInt, b: &BigInt) -> BigInt {
-    a.divmod(b).expect("divisor was checked nonzero").0
-}
-
-/// Remainder companion of [`bigint_floordiv_nonzero`].
-#[majit_macros::jit_elidable]
-fn bigint_modulo_nonzero(a: &BigInt, b: &BigInt) -> BigInt {
-    a.divmod(b).expect("divisor was checked nonzero").1
-}
-
-/// Machine-int-divisor form of [`bigint_floordiv_nonzero`]
-/// (`longobject.py _int_floordiv` → `rbigint.int_floordiv`). The dedicated
-/// leg divides by a single digit instead of first materializing an rbigint for
-/// the `W_IntObject`.
-#[majit_macros::jit_elidable]
-fn bigint_int_floordiv_nonzero(a: &BigInt, b: i64) -> BigInt {
-    a.int_floordiv(b).expect("divisor was checked nonzero")
-}
-
-/// Machine-int-divisor form of [`bigint_modulo_nonzero`]
-/// (`longobject.py _int_mod` → `rbigint.int_mod_int_result`). The remainder
-/// of a long by a machine int always fits a machine int, so the descriptor
-/// returns `space.newint` and this leg allocates no result bigint.
-#[majit_macros::jit_elidable]
-fn bigint_int_modulo_int_result_nonzero(a: &BigInt, b: i64) -> i64 {
-    a.int_mod_int_result(b)
-        .expect("divisor was checked nonzero")
-}
-
 #[majit_macros::elidable]
 fn bigint_and(a: BigInt, b: BigInt) -> BigInt {
     a & b
@@ -242,25 +208,28 @@ fn bigint_mul(a: &BigInt, b: &BigInt) -> *mut BigInt {
     pyre_object::longobject::alloc_bigint_nursery(a.mul(b))
 }
 
-/// Host form of `rbigint.mod` (`rbigint.py` `mod` / `_divmod` / `_divrem`).
-/// A same-sign divisor of more than one digit returns `self` when `|a| < |b|`;
-/// a one-digit divisor goes through `int_divmod` and constructs, and opposite
-/// signs construct. The MIR front retargets this call to `jit_bigint_mod_floor`.
+/// Host form of `rbigint.mod` used by `long_mod`.
+///
+/// `_divrem` returns the input remainder when `|a| < |b|`; `_divmod_small`
+/// keeps that payload when the signs match and the divisor is not one digit.
+/// The MIR front retargets this call to `jit_bigint_mod_floor`, so the
+/// alias stays inside the residual instead of a
+/// `jit_bigint_divrem_returns_lhs_remainder` guard in `_mod`.
 #[majit_macros::dont_look_inside]
-fn bigint_mod(a: &BigInt, b: &BigInt) -> *mut BigInt {
+fn bigint_mod(a: &BigInt, b: &BigInt) -> Result<*mut BigInt, majit_rlib::rbigint::RBigIntError> {
     let selfsign = a.get_sign();
     let othersign = b.get_sign();
+    if othersign == 0 {
+        return Err(majit_rlib::rbigint::RBigIntError::DivisionByZero);
+    }
     if selfsign != 0
-        && othersign != 0
         && selfsign == othersign
         && b.numdigits() != 1
         && divrem_returns_input_as_remainder(a, b)
     {
-        return a as *const BigInt as *mut BigInt;
+        return Ok(a as *const BigInt as *mut BigInt);
     }
-    pyre_object::longobject::alloc_bigint_nursery(
-        a.divmod(b).expect("divisor was checked nonzero").1,
-    )
+    Ok(pyre_object::longobject::alloc_bigint_nursery(a.r#mod(b)?))
 }
 
 /// Host form of `rbigint.int_add`. `iother == 0` returns `self` unless
@@ -363,26 +332,31 @@ fn bigint_to_f64(a: BigInt) -> f64 {
 /// its operand pointers rooted across the alloc), matching the arithmetic
 /// residuals. Returns a freshly heap-allocated `*mut BigInt` encoded as the
 /// JIT's uniform i64 word; the MIR retarget keeps the result modeled as GcRef.
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint._divrem`) and returns
+/// a dummy null.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_div(
     a: *const BigInt,
     b: *const BigInt,
 ) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a, b);
     unsafe {
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::_divrem(&*a, &*b)
-                    .expect("division by zero")
-                    .0,
-            ),
-        )
+        let ptr = match majit_rlib::rbigint::_divrem(&*a, &*b) {
+            Ok(v) => pyre_object::longobject::alloc_bigint_nursery_collecting(v.0),
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_result(ptr)
     }
 }
 
 /// `_divrem`'s truncated remainder.
 /// See [`jit_bigint_div`]; both project the same upstream helper.
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint._divrem`) and returns
+/// a dummy null.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_rem(
     a: *const BigInt,
     b: *const BigInt,
@@ -392,13 +366,14 @@ pub extern "C" fn jit_bigint_rem(
         if (&*b).get_sign() != 0 && divrem_returns_input_as_remainder(&*a, &*b) {
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                majit_rlib::rbigint::_divrem(&*a, &*b)
-                    .expect("division by zero")
-                    .1,
-            ),
-        )
+        let ptr = match majit_rlib::rbigint::_divrem(&*a, &*b) {
+            Ok(v) => pyre_object::longobject::alloc_bigint_nursery_collecting(v.1),
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_result(ptr)
     }
 }
 
@@ -407,24 +382,31 @@ pub extern "C" fn jit_bigint_rem(
 /// matching the arithmetic residuals. Returns a freshly heap-allocated
 /// `*mut BigInt` encoded as the JIT's uniform i64 word; the MIR retarget keeps
 /// the result modeled as a traced GcRef.
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint.divmod`) and returns
+/// a dummy null.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_div_floor(
     a: *const BigInt,
     b: *const BigInt,
 ) -> pyre_object::longobject::JitBigIntResult {
     let (a, b) = (a, b);
     unsafe {
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                (&*a).divmod(&*b).expect("division by zero").0,
-            ),
-        )
+        let ptr = match (&*a).divmod(&*b) {
+            Ok(v) => pyre_object::longobject::alloc_bigint_nursery_collecting(v.0),
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_result(ptr)
     }
 }
 
 /// Machine-int-divisor quotient (`longobject.py _int_floordiv` →
 /// `rbigint.int_floordiv`). `b` is a bare machine word, not a payload pointer.
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint.int_floordiv`) and
+/// returns a dummy null.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_int_div_floor(
     a: *const BigInt,
     b: i64,
@@ -435,11 +417,14 @@ pub extern "C" fn jit_bigint_int_div_floor(
         if b == 1 && (&*a).get_sign() == 1 {
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                (&*a).int_floordiv(b).expect("division by zero"),
-            ),
-        )
+        let ptr = match (&*a).int_floordiv(b) {
+            Ok(v) => pyre_object::longobject::alloc_bigint_nursery_collecting(v),
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_result(ptr)
     }
 }
 
@@ -447,14 +432,26 @@ pub extern "C" fn jit_bigint_int_div_floor(
 /// `rbigint.int_mod_int_result`). The remainder of a long by a machine int
 /// always fits a machine int, so this residual returns the value itself and
 /// allocates nothing.
+/// A zero divisor publishes ZeroDivisionError (`rbigint.int_mod`) and returns
+/// dummy 0.
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_int_mod_int_result(a: *const BigInt, b: i64) -> i64 {
-    unsafe { (&*a).int_mod_int_result(b).expect("division by zero") }
+    unsafe {
+        match (&*a).int_mod_int_result(b) {
+            Ok(v) => v,
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                0
+            }
+        }
+    }
 }
 
 /// Both halves of a machine-int divmod (`longobject.py _int_divmod` →
 /// `rbigint.int_divmod`, rbigint.py `@jit.elidable`). `b` is a bare
 /// machine word, not a payload pointer.
+/// A zero divisor publishes ZeroDivisionError (`rbigint.int_divmod`) and
+/// returns a dummy null pair.
 ///
 /// One call produces both results: `//` and `%` each reach `_divmod`, so
 /// splitting this into two residuals would run the division twice. The result
@@ -462,36 +459,52 @@ pub extern "C" fn jit_bigint_int_mod_int_result(a: *const BigInt, b: i64) -> i64
 /// halves with `getfield_gc_r` before boxing each as a `W_LongObject` — the
 /// wrappers and the interpreter tuple stay in traced code, where they remain
 /// virtualizable.
-#[majit_macros::elidable_or_memerror]
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_int_divmod(
     a: *const BigInt,
     b: i64,
 ) -> pyre_object::longobject::JitBigIntPairResult {
     unsafe {
-        let (div, modulo) = (&*a).int_divmod(b).expect("division by zero");
-        pyre_object::longobject::encode_jit_bigint_pair_result(
-            pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo),
-        )
+        let ptr = match (&*a).int_divmod(b) {
+            Ok((div, modulo)) => {
+                pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo)
+            }
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_pair_result(ptr)
     }
 }
 
 /// `rbigint.divmod` (`@jit.elidable`) with both halves in one `tuple2`,
 /// the two-rbigint counterpart of [`jit_bigint_int_divmod`].
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint.divmod`) and returns
+/// a dummy null pair.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_divmod(
     a: *const BigInt,
     b: *const BigInt,
 ) -> pyre_object::longobject::JitBigIntPairResult {
     unsafe {
-        let (div, modulo) = (&*a).divmod(&*b).expect("division by zero");
-        pyre_object::longobject::encode_jit_bigint_pair_result(
-            pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo),
-        )
+        let ptr = match (&*a).divmod(&*b) {
+            Ok((div, modulo)) => {
+                pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo)
+            }
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_pair_result(ptr)
     }
 }
 
 /// `rbigint.divmod`'s floored modulus projection.
-#[majit_macros::elidable_or_memerror]
+/// A zero divisor publishes ZeroDivisionError (`rbigint.divmod`) and returns
+/// a dummy null.
+#[majit_macros::elidable]
 pub extern "C" fn jit_bigint_mod_floor(
     a: *const BigInt,
     b: *const BigInt,
@@ -511,11 +524,14 @@ pub extern "C" fn jit_bigint_mod_floor(
         {
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(
-                (&*a).divmod(&*b).expect("division by zero").1,
-            ),
-        )
+        let ptr = match (&*a).divmod(&*b) {
+            Ok(v) => pyre_object::longobject::alloc_bigint_nursery_collecting(v.1),
+            Err(_) => {
+                pyre_object::interp_exceptions::publish_zero_division_error();
+                std::ptr::null_mut()
+            }
+        };
+        pyre_object::longobject::encode_jit_bigint_result(ptr)
     }
 }
 
@@ -1218,7 +1234,11 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // `fromint` of `vb` collects.
         let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
-        return Ok(bigint_result(bigint_floordiv_nonzero(&va, &vb)));
+        let z = match va.floordiv(&vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(bigint_result(z));
     }
     Ok(w_int_new(ll_int_py_div(va, vb)))
 }
@@ -1235,7 +1255,11 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // `fromint` of `vb` collects.
         let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
-        return Ok(bigint_result(bigint_modulo_nonzero(&va, &vb)));
+        let z = match va.r#mod(&vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(bigint_result(z));
     }
     Ok(w_int_new(ll_int_py_mod(va, vb)))
 }
@@ -1398,12 +1422,10 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// `_int_floordiv`: a machine-int divisor never becomes an rbigint.
-/// The guard runs before the receiver is read, then `rbigint.int_floordiv`,
-/// then `newlong`. Nothing allocates between entry and that read.
+/// The receiver is read, then `rbigint.int_floordiv`, whose
+/// ZeroDivisionError becomes the OperationError, then `newlong`.
+/// Nothing allocates between entry and that read.
 unsafe fn long_int_floordiv(a: PyObjectRef, other: i64) -> PyResult {
-    if other == 0 {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     debug_assert!(is_long(a));
     let va = w_long_get_value(a);
     // `int_floordiv` returns `self` for a positive receiver and divisor 1.
@@ -1413,7 +1435,11 @@ unsafe fn long_int_floordiv(a: PyObjectRef, other: i64) -> PyResult {
             w_long_get_raw_value(a),
         ));
     }
-    Ok(w_long_new(bigint_int_floordiv_nonzero(va, other)))
+    let z = match va.int_floordiv(other) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
+    Ok(w_long_new(z))
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1427,32 +1453,36 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // after that malloc.
         let va = BigInt::from(int_value(a));
         let vb = w_long_get_value(b);
-        if !vb.tobool() {
-            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-        }
-        return Ok(w_long_new(bigint_floordiv_nonzero(&va, vb)));
+        // longobject.py: `except ZeroDivisionError: raise oefmt(...)`.
+        let z = match va.floordiv(vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(w_long_new(z));
     }
     // Both values are read once and handed to `rbigint.floordiv`, which
     // roots its operands before `_divmod` allocates.
     let va = w_long_get_value(a);
     let vb = w_long_get_value(b);
-    if !vb.tobool() {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
     // `_floordiv` `newlong`s the quotient, keeping a long.
-    Ok(w_long_new(bigint_floordiv_nonzero(va, vb)))
+    let z = match va.floordiv(vb) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
+    Ok(w_long_new(z))
 }
 
 /// `_int_mod`: `rbigint.int_mod_int_result`, then `space.newint`.
 /// The remainder of a long by a machine int always fits a machine int.
 unsafe fn long_int_mod(a: PyObjectRef, other: i64) -> PyResult {
-    if other == 0 {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     debug_assert!(is_long(a));
     let va = w_long_get_value(a);
-    Ok(w_int_new(bigint_int_modulo_int_result_nonzero(va, other)))
+    let z = match va.int_mod_int_result(other) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
+    Ok(w_int_new(z))
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1463,32 +1493,33 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // after that malloc.
         let va = BigInt::from(int_value(a));
         let vb = w_long_get_value(b);
-        if !vb.tobool() {
-            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-        }
-        return Ok(w_long_new(bigint_modulo_nonzero(&va, vb)));
+        let z = match va.r#mod(vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(w_long_new(z));
     }
-    // Both values are read once: the zero and remainder-is-lhs checks
-    // allocate nothing, and `rbigint.mod` roots its operands before
-    // `_divmod` allocates.
+    // Both values are read once and handed to `rbigint.mod`, which
+    // roots its operands before `_divmod` allocates. `bigint_mod` is the
+    // pointer-ABI host form: an aliased remainder is the dividend payload,
+    // the same way `bigint_add` returns a zero operand.
     let va = w_long_get_value(a);
     let vb = w_long_get_value(b);
-    if !vb.tobool() {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
-    // `rbigint.mod` returns the input payload when `_divrem` does. The alias
-    // stays inside `bigint_mod`; this descriptor only boxes it.
-    Ok(pyre_object::longobject::w_long_from_raw(bigint_mod(va, vb)))
+    let z = match bigint_mod(va, vb) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
+    Ok(pyre_object::longobject::w_long_from_raw(z))
 }
 
 /// `_int_divmod`: `rbigint.int_divmod`, then `newtuple2` of two `newlong`s.
 unsafe fn long_int_divmod(a: PyObjectRef, other: i64) -> PyResult {
-    if other == 0 {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     debug_assert!(is_long(a));
     let va = live_long_num(a);
-    let (q, r) = va.int_divmod(other).expect("divisor was checked nonzero");
+    let (q, r) = match va.int_divmod(other) {
+        Ok(pair) => pair,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     // Two live rbigints before either wrapper is allocated. The GC transform
     // roots both across those collecting allocations.
     let q = RBigIntGcRoot::new(q);
@@ -1505,13 +1536,16 @@ unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResul
     if is_int_like(a) && is_int_like(b) {
         let va = int_value(a);
         let vb = int_value(b);
-        debug_assert_ne!(vb, 0, "numeric_divmod checks the divisor");
+        if vb == 0 {
+            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+        }
         // rint.py `ll_int_py_div_ovf`: the overflow test is not
         // short-circuited, so a known divisor removes it entirely.
         if (va == i64::MIN) & (vb == -1) {
-            let (q, r) = BigInt::from(va)
-                .int_divmod(vb)
-                .expect("divisor was checked nonzero");
+            let (q, r) = match BigInt::from(va).int_divmod(vb) {
+                Ok(pair) => pair,
+                Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+            };
             let q = RBigIntGcRoot::new(q);
             let r = RBigIntGcRoot::new(r);
             let mut w_q = bigint_result(q.translated_alias());
@@ -1544,8 +1578,10 @@ unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResul
         RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
     let vb = live_long_num(b);
-    let (q, r) =
-        pyre_object::with_roots!(a, b => va.divmod(&vb)).expect("divisor was checked nonzero");
+    let (q, r) = match pyre_object::with_roots!(a, b => va.divmod(&vb)) {
+        Ok(pair) => pair,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     // `_divmod` produces two live rbigints before either wrapper is
     // allocated. RPython's GC transform roots both across those collecting
     // allocations.
@@ -5672,13 +5708,12 @@ pub(crate) fn divmod_builtin(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
         if lhs_num && rhs_num {
-            // Python 3.14 reports the builtin operation's uniform spelling for
-            // every numeric zero divisor.  This intentionally differs from
-            // PyPy 3.11's int/float-specific divmod and modulo messages.
-            if !pyre_object::with_roots!(a, b => is_true(b))? {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-            }
             if is_float_pair(a, b) {
+                // floatobject.py `_divmod_w` raises on a zero divisor.
+                // int/long operands go to `integer_divmod_pair`.
+                if !pyre_object::with_roots!(a, b => is_true(b))? {
+                    return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+                }
                 let (x, y) = float_operands(a, b)?;
                 let (q, r) = float_divmod_w(x, y)?;
                 let mut w_q = w_float_new(q);
@@ -6455,12 +6490,12 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
         if !numeric_override && lhs_num && rhs_num {
-            // Python 3.14 target-version spelling; see `divmod_builtin` above
-            // for the PyPy 3.11 difference.
-            if !pyre_object::with_roots!(a, b => is_true(b))? {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-            }
             if is_float_pair(a, b) {
+                // floatobject.py `_divmod_w` raises on a zero divisor.
+                // int/long operands go to `integer_divmod_pair`.
+                if !pyre_object::with_roots!(a, b => is_true(b))? {
+                    return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+                }
                 let (x, y) = float_operands(a, b)?;
                 let (q, r) = float_divmod_w(x, y)?;
                 let mut w_q = w_float_new(q);
@@ -8567,6 +8602,34 @@ mod tests {
     }
 
     #[test]
+    fn long_division_by_zero_raises_zero_division_error() {
+        let x = w_long_new(BigInt::one().lshift(100).unwrap());
+        let zero_long = w_long_new(BigInt::from(0));
+        let one_long = w_long_new(BigInt::one());
+        let zero_int = w_int_new(0);
+        let seven = w_int_new(7);
+        let assert_zdiv = |result: PyResult| {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind, PyErrorKind::ZeroDivisionError);
+            assert_eq!(err.message_text(), ZERO_DIVISION_MSG);
+        };
+        unsafe {
+            assert_zdiv(long_floordiv(x, zero_long));
+            assert_zdiv(long_int_floordiv(x, 0));
+            assert_zdiv(long_mod(x, zero_long));
+            assert_zdiv(long_int_mod(x, 0));
+            assert_zdiv(long_int_divmod(x, 0));
+            assert_zdiv(integer_divmod_pair(x, zero_long));
+            assert_zdiv(integer_divmod_pair(seven, zero_int));
+        }
+        assert_zdiv(divmod_builtin(x, zero_int));
+        let q = unsafe { long_floordiv(x, one_long) }.unwrap();
+        assert!(unsafe { as_bigint(q) }.eq(&BigInt::one().lshift(100).unwrap()));
+        let r = unsafe { long_mod(x, one_long) }.unwrap();
+        assert!(unsafe { as_bigint(r) }.get_sign() == 0);
+    }
+
+    #[test]
     fn test_long_floordiv_and_mod_keep_python_sign_rules() {
         let magnitude = BigInt::one().lshift(80).unwrap().int_add(13);
         for (lhs, rhs) in [
@@ -8769,6 +8832,18 @@ mod tests {
         assert_eq!(decoded_bigint_result(jit_bigint_rem(a, b)), a);
         assert_eq!(decoded_bigint_result(jit_bigint_mod_floor(a, b)), a);
 
+        let null_bigint = pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut());
+        let null_pair =
+            pyre_object::longobject::encode_jit_bigint_pair_result(std::ptr::null_mut());
+        assert_eq!(jit_bigint_div(a, zero), null_bigint);
+        assert_eq!(jit_bigint_rem(a, zero), null_bigint);
+        assert_eq!(jit_bigint_div_floor(a, zero), null_bigint);
+        assert_eq!(jit_bigint_mod_floor(a, zero), null_bigint);
+        assert_eq!(jit_bigint_int_div_floor(a, 0), null_bigint);
+        assert_eq!(jit_bigint_int_mod_int_result(a, 0), 0);
+        assert_eq!(jit_bigint_int_divmod(a, 0), null_pair);
+        assert_eq!(jit_bigint_divmod(a, zero), null_pair);
+
         // `lshift` returns even a non-canonical zero handle unchanged.
         let fresh_zero = majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting(unsafe {
             (&*zero).clone()
@@ -8783,9 +8858,6 @@ mod tests {
     #[test]
     fn test_machine_int_host_seams_use_dedicated_rbigint_legs() {
         let value = BigInt::one().lshift(130).unwrap().int_add(17);
-        let quotient = bigint_int_floordiv_nonzero(&value, 3);
-        assert!(quotient.eq(&value.int_floordiv(3).unwrap()));
-
         let power = bigint_int_pow_nomod(&value, 3).expect("small exponent");
         assert!(power.eq(&value.int_pow(3, None).unwrap()));
     }

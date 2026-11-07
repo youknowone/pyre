@@ -253,6 +253,7 @@ fn build() -> AllJitCodes {
             pytypes: &[
                 ("interp_exceptions::EXC_STOPITERATION_TYPE", 1),
                 ("interp_exceptions::EXC_OVERFLOW_ERROR_TYPE", 2),
+                ("interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE", 3),
             ],
             ..crate::HostStaticAddrs::default()
         },

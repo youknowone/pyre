@@ -16,8 +16,9 @@ use common::{
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
+    flowspace::model::ConstValue,
     front::llbc_hints::harvest_hints_from_llbcs,
-    model::{CallTarget, OpKind, ValueType},
+    model::{CallTarget, ExitSwitch, OpKind, ValueType},
 };
 
 const RBIGINT_RS: &str = concat!(
@@ -66,14 +67,178 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     );
 }
 
-/// `RBigInt::floordiv` is `self.divmod(other)?`. The `Result` is not stamped
-/// `Ok`: the call stays `RBigInt::divmod`, and `?` switches on
-/// `Result<(RBigInt, RBigInt), RBigIntError>`'s discriminant, `Err` payload
-/// included. `RBigInt::divmod`'s `return this.int_divmod(...)` is the
-/// function result and stays a `Result` call too. `expect` consumers
-/// (`integer_divmod_pair`) keep the pair residual.
+/// Every scalar floor/mod residual is last in its block with
+/// `except ZeroDivisionError`. A name-only retarget leaves a Result tag
+/// switch on the payload pointer (`unreachable/` in the jitcode).
+fn assert_all_scalar_zerodivision_links(
+    graph: &majit_translate::model::FunctionGraph,
+    residual: &str,
+    caller_name: &str,
+) {
+    let blocks: Vec<_> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some(residual),
+                _ => false,
+            })
+        })
+        .collect();
+    assert!(
+        !blocks.is_empty(),
+        "{caller_name}: missing residual {residual}"
+    );
+    for block in blocks {
+        let last = block.operations.last().expect("raising call");
+        match &last.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => assert_eq!(
+                segments.last().map(String::as_str),
+                Some(residual),
+                "{caller_name}: {residual} must be last in its block (except-link)"
+            ),
+            other => panic!("{caller_name}: last op is not the residual: {other:?}"),
+        }
+        assert!(
+            matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+            "{caller_name}: {residual} call block is LastException"
+        );
+        let exc = block.exits.iter().find(|link| {
+            link.exitcase == Some(majit_translate::model::zerodivisionerror_exitcase())
+        });
+        assert!(
+            exc.is_some(),
+            "{caller_name}: {residual} except ZeroDivisionError"
+        );
+    }
+}
+
+fn residual_block<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    residual: &str,
+) -> &'a majit_translate::model::Block {
+    graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some(residual),
+                _ => false,
+            })
+        })
+        .unwrap_or_else(|| panic!("missing residual {residual}"))
+}
+
+fn pair_item_field_read(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::FieldRead { field, .. }
+            if (field.name == "item0" || field.name == "item1")
+                && field.owner_root.as_deref() == Some("RBigIntPair")
+    )
+}
+
+fn tuple_ctor_op(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            ..
+        } if name.starts_with("Tuple")
+    )
+}
+
+/// Pair residual is last, `except ZeroDivisionError`, item FieldReads + Tuple
+/// only on the normal successor.
+fn assert_pair_zerodivision_link(
+    graph: &majit_translate::model::FunctionGraph,
+    residual: &str,
+    caller_name: &str,
+) {
+    let block = residual_block(graph, residual);
+    let last = block.operations.last().expect("raising call");
+    match &last.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => assert_eq!(
+            segments.last().map(String::as_str),
+            Some(residual),
+            "{caller_name}: pair Call is last in its block"
+        ),
+        other => panic!("{caller_name}: last op is not the residual: {other:?}"),
+    }
+    assert!(
+        matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+        "{caller_name}: call block is LastException"
+    );
+    let disc_on_call = block.operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "__discriminant"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|root| root.contains("Result<(RBigInt,RBigInt)"))
+        )
+    });
+    assert!(
+        !disc_on_call,
+        "{caller_name}: call block has no Result<(RBigInt,RBigInt),RBigIntError> discriminant switch"
+    );
+    let exc = block
+        .exits
+        .iter()
+        .find(|link| link.exitcase == Some(majit_translate::model::zerodivisionerror_exitcase()))
+        .unwrap_or_else(|| panic!("{caller_name}: except ZeroDivisionError"));
+    assert!(
+        exc.last_exception.is_some(),
+        "{caller_name}: last_exception"
+    );
+    assert!(
+        exc.last_exc_value.is_some(),
+        "{caller_name}: last_exc_value"
+    );
+    assert_eq!(
+        exc.llexitcase.as_ref(),
+        Some(&ConstValue::builtin("ZeroDivisionError")),
+        "{caller_name}: llexitcase ZeroDivisionError"
+    );
+    let normal = block
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_none())
+        .unwrap_or_else(|| panic!("{caller_name}: normal exit"));
+    let n = &graph.blocks[normal.target.0];
+    let e = &graph.blocks[exc.target.0];
+    assert!(
+        n.operations.iter().any(|op| pair_item_field_read(&op.kind)),
+        "{caller_name}: N FieldReads item0/item1"
+    );
+    assert!(
+        n.operations.iter().any(|op| tuple_ctor_op(&op.kind)),
+        "{caller_name}: N builds the Tuple"
+    );
+    assert!(
+        !e.operations.iter().any(|op| pair_item_field_read(&op.kind)),
+        "{caller_name}: exception successor has no pair item FieldRead"
+    );
+}
+
+/// `RBigInt::floordiv` is `self.divmod(other)?`. The inner `divmod?` is the
+/// ZeroDivisionError exception edge (`rpython/rlib/rbigint.py` `rbigint.floordiv`).
 #[test]
-fn floordiv_keeps_divmod_result_for_try_branch() {
+fn floordiv_divmod_question_is_zerodivisionerror_link() {
     let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
@@ -95,61 +260,24 @@ fn floordiv_keeps_divmod_result_for_try_branch() {
             })
             .collect()
     };
-    let reads_field = |graph: &majit_translate::model::FunctionGraph, name: &str, owner: &str| {
-        graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.name == name
-                            && field
-                                .owner_root
-                                .as_deref()
-                                .is_some_and(|root| root.contains(owner))
-                )
-            })
-        })
-    };
 
     let graph = lower_named(llbcs[0], "floordiv").expect("lower floordiv");
     let calls = call_leaves(&graph);
     assert!(
-        calls.iter().any(|name| name == "divmod"),
-        "floordiv must keep RBigInt::divmod: {calls:?}"
+        calls.iter().any(|name| name == "jit_bigint_divmod"),
+        "floordiv's inner divmod? is the pair residual: {calls:?}"
     );
-    assert!(
-        calls.iter().all(|name| name != "jit_bigint_divmod"),
-        "floordiv must not stamp divmod's Result Ok: {calls:?}"
-    );
-    assert!(
-        reads_field(
-            &graph,
-            "__discriminant",
-            "Result<(RBigInt,RBigInt),RBigIntError>",
-        ),
-        "floordiv's ? must switch on divmod's Result discriminant"
-    );
-    assert!(
-        reads_field(
-            &graph,
-            "__pos_0",
-            "Result<(RBigInt,RBigInt),RBigIntError>::Err",
-        ),
-        "floordiv's ? must read the Err payload"
-    );
+    assert_pair_zerodivision_link(&graph, "jit_bigint_divmod", "floordiv");
 
     let divmod = lower_named(llbcs[0], "divmod").expect("lower divmod");
     let divmod_calls = call_leaves(&divmod);
     assert!(
-        divmod_calls.iter().any(|name| name == "int_divmod"),
-        "divmod's returned int_divmod stays a Result call: {divmod_calls:?}"
-    );
-    assert!(
         divmod_calls
             .iter()
-            .all(|name| name != "jit_bigint_int_divmod"),
-        "divmod must not stamp the returned int_divmod Ok: {divmod_calls:?}"
+            .any(|name| name == "jit_bigint_int_divmod"),
+        "divmod's returned int_divmod is the pair residual: {divmod_calls:?}"
     );
+    assert_pair_zerodivision_link(&divmod, "jit_bigint_int_divmod", "divmod");
 }
 
 /// The same erasure, on the side the `?` diamond does not cover.
@@ -1447,10 +1575,6 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "objspace::descroperation::jit_bigint_shl",
         "objspace::descroperation::jit_bigint_pow_nomod",
         "objspace::descroperation::jit_bigint_lshift_int_int_result",
-        "objspace::descroperation::jit_bigint_div",
-        "objspace::descroperation::jit_bigint_rem",
-        "objspace::descroperation::jit_bigint_div_floor",
-        "objspace::descroperation::jit_bigint_mod_floor",
         "jit_compiler_bigint_to_rbigint",
     ] {
         let values = hints
@@ -1460,6 +1584,32 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         assert!(
             values.iter().any(|hint| hint == "elidable_or_memerror"),
             "{path} must be allocation-only elidable, got {values:?}"
+        );
+    }
+    // rbigint.py `divmod` / `int_divmod` / `_divrem` / `int_floordiv` /
+    // `int_mod` are `@jit.elidable` and raise ZeroDivisionError, so these
+    // wrappers keep a full exception edge.
+    for path in [
+        "objspace::descroperation::jit_bigint_div",
+        "objspace::descroperation::jit_bigint_rem",
+        "objspace::descroperation::jit_bigint_div_floor",
+        "objspace::descroperation::jit_bigint_mod_floor",
+        "objspace::descroperation::jit_bigint_int_div_floor",
+        "objspace::descroperation::jit_bigint_int_mod_int_result",
+        "objspace::descroperation::jit_bigint_int_divmod",
+        "objspace::descroperation::jit_bigint_divmod",
+    ] {
+        let values = hints
+            .get(path)
+            .unwrap_or_else(|| panic!("missing pointer-ABI wrapper hints for {path}"));
+        assert!(values.iter().any(|hint| hint == "elidable"));
+        assert!(
+            !values.iter().any(|hint| hint == "elidable_or_memerror"),
+            "{path} must keep a full exception edge, got {values:?}"
+        );
+        assert!(
+            !values.iter().any(|hint| hint == "elidable_cannot_raise"),
+            "{path} must keep a full exception edge, got {values:?}"
         );
     }
     // rbigint.py `_make_int_comparison` only reads existing digits and
@@ -1893,18 +2043,19 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .any(|segments| { segments.last().is_some_and(|leaf| leaf == residual_name) }),
             "{caller_name} must target {residual_name}: {calls:?}"
         );
+        assert_all_scalar_zerodivision_links(caller.graph(), residual_name, caller_name);
     }
 
     for (caller_name, residual_name, forbidden) in [
         (
             "long_int_floordiv",
             "jit_bigint_int_div_floor",
-            "bigint_int_floordiv_nonzero",
+            "int_floordiv",
         ),
         (
             "long_int_mod",
             "jit_bigint_int_mod_int_result",
-            "bigint_int_modulo_int_result_nonzero",
+            "int_mod_int_result",
         ),
         ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
         ("long_bitxor", "jit_bigint_xor", "xor"),
@@ -1945,25 +2096,8 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .any(|segments| segments.last().is_some_and(|leaf| leaf == forbidden)),
             "{caller_name} retained {forbidden}: {calls:?}"
         );
-        // The pair residual binds its destination to the bare
-        // `(RBigInt, RBigInt)` payload, so no `Ok` field may be read off it,
-        // including through the temporary `with_roots!` returns it in.
         if residual_name.ends_with("divmod") {
-            let ok_reads: Vec<String> = caller
-                .graph()
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .filter_map(|operation| match &operation.kind {
-                    OpKind::FieldRead { field, .. } => field.owner_root.clone(),
-                    _ => None,
-                })
-                .filter(|owner| owner.starts_with("core::result::Result<(RBigInt,RBigInt)"))
-                .collect();
-            assert!(
-                ok_reads.is_empty(),
-                "{caller_name} reads a Result payload off the pair tuple: {ok_reads:?}"
-            );
+            assert_pair_zerodivision_link(caller.graph(), residual_name, caller_name);
         }
     }
 

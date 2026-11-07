@@ -4517,11 +4517,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
         || tyref_is_option_of_string_value(ty, llbc)
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
+/// True when `ty` (after stripping `&` / `&mut` wrappers) resolves to the
 /// exact `majit_rlib::rbigint::RBigInt` ADT. Guards the
 /// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
 /// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
 /// a `jit_bigint_*` residual that would misread its non-RBigInt pointer.
+///
+/// [`strip_ty_wrappers`] peels `Ref` and leaves `RawPtr`. A `*mut RBigInt`
+/// payload is [`tyref_is_rbigint_gc_payload`].
 ///
 /// In `pyre-object.ullbc` the declaration is the local struct whose bodies
 /// stay available to source translation. In dependent-crate LLBCs Charon
@@ -4529,9 +4532,33 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
 /// qualified identity is therefore the invariant; requiring either storage
 /// kind would make the rewrite depend on which crate owns the caller.
 pub(in crate::front::mir) fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(adt_node_def_id)
+    rbigint_adt_node(
+        tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)),
+        llbc,
+    )
+}
+
+/// `RBigInt` by value, or one pointer word to it (`&RBigInt`, `*mut RBigInt`).
+///
+/// Host `descroperation::bigint_mod` returns `Result<*mut RBigInt, RBigIntError>`
+/// so an aliased remainder can be the dividend payload (`rbigint._divrem` /
+/// `_divmod_small`). The Ok type is a `RawPtr`, which [`tyref_is_rbigint`]
+/// does not peel.
+pub(in crate::front::mir) fn tyref_is_rbigint_gc_payload(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_rbigint(ty, llbc) {
+        return true;
+    }
+    rbigint_adt_node(
+        tyref_node(ty, llbc)
+            .and_then(|n| strip_ty_indirections(n, llbc))
+            .and_then(|n| one_level_pointer_pointee(n, llbc))
+            .and_then(|n| strip_ty_wrappers(n, llbc)),
+        llbc,
+    )
+}
+
+fn rbigint_adt_node(node: Option<&serde_json::Value>, llbc: &Llbc) -> bool {
+    node.and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
             let path = td.item_meta.name_path();
