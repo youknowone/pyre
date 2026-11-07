@@ -610,6 +610,17 @@ pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header_immortal(value, type_id)
 }
 
+/// Host [`malloc_typed`] after `_raw` returned null, or a null pointer when
+/// that null was [`GcAllocOutcome::Failed`] (`_ll_malloc_fixedsize`).
+#[inline]
+pub fn host_or_null<T: GcType>(value: T) -> *mut T {
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        std::ptr::null_mut()
+    } else {
+        malloc_typed(value)
+    }
+}
+
 /// Managed typed allocation.
 ///
 /// `gct_fv_gc_malloc` / `init_gc_object(result, typeid, flags=0)`

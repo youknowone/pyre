@@ -1292,6 +1292,9 @@ unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
         payload,
     );
     if raw.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         let zeros = vec![pyre_object::PY_NULL; len];
         return unsafe { pyre_object::alloc_mro_block_gc(&zeros) };
     }

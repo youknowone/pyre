@@ -231,10 +231,16 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
         return;
     };
     let mut boxed = crate::pyframe::FrameBox::new(frame);
+    if boxed.is_null() {
+        return;
+    }
     // `frameobject.py:75 d.f_lineno = rffi.getintfield(py_frame,
     // 'c_f_lineno')` — the line the extension wrote before handing the frame
     // on, which is the whole reason it asked for one.
-    boxed.getorcreatedebug(-1).f_lineno = unsafe { (*py_frame).f_lineno } as isize;
+    let Ok(debug) = boxed.getorcreatedebug(-1) else {
+        return;
+    };
+    debug.f_lineno = unsafe { (*py_frame).f_lineno } as isize;
     if !boxed.is_gc_owned() {
         // A frame the collector does not own is freed when this handle dies,
         // and the mirror would outlive it.  Only the pre-hook bootstrap window

@@ -173,6 +173,8 @@ fn alloc_lowlevel_string(
             unsafe { std::ptr::write_bytes(ptr, 0, total_size) };
         }
         ptr
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        return 0;
     } else {
         // Host fallback of `rstr.mallocstr` (`malloc(STR, length)`): reclaimable
         // `malloc_varsize`, not a prebuilt. The leaf still stamps

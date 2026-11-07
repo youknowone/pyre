@@ -706,7 +706,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
             &mut needs_write_barrier,
         )
     })
-    .allocated_or_abort(W_TYPE_OBJECT_SIZE)
+    .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
@@ -717,6 +717,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     // swept before it is stored into the type below.
     let name_value = name.to_string();
     let (name, qualname) = if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::PY_NULL;
+        }
         (
             crate::lltype::malloc_raw(name_value.clone()),
             crate::lltype::malloc_raw(name_value),

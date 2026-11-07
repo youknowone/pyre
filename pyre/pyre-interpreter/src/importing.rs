@@ -2192,6 +2192,9 @@ fn new_builtin_module(
                 // local, and `module_ns_store` can allocate. Reload it from
                 // the shadow stack after that store.
                 let created = unsafe { crate::function::builtin_function_new_managed(value) };
+                if created.is_null() {
+                    return Err(crate::PyError::memory_error(""));
+                }
                 let created_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(created);
                 crate::module_ns_store(
@@ -5032,6 +5035,9 @@ impl AppleveldefNamespace for PyObjectRef {
             name,
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
+        if stored.is_null() {
+            return;
+        }
         let stored_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(stored);
         crate::module_ns_store(
@@ -5162,7 +5168,12 @@ pub fn appleveldef_install_seeded(
                 name,
             )
         } {
-            Some(val) => ns.store(name, val),
+            Some(val) => {
+                ns.store(name, val);
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::PyError::memory_error(""));
+                }
+            }
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }
     }

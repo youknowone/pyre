@@ -921,6 +921,9 @@ fn try_commit_midbody_abort_inner(
         Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
     };
     let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
+    if frame.is_null() {
+        return Err(MidBodyDecline::BeforeRun("callee frame allocation failed"));
+    }
     frame.fix_array_ptrs();
     let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
 
@@ -1168,6 +1171,10 @@ pub fn trace_bytecode<Sym: WalkSym>(
     live_frame_addr: usize,
     allow_propagate_out: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox, bool) {
+    if concrete_frame.is_null() {
+        // `_ll_malloc_fixedsize` raised MemoryError in `FrameBox::new`.
+        return (TraceAction::Abort, concrete_frame, false);
+    }
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
     // `bh_strgetitem` family routes through rstr `STR` `str_descr`

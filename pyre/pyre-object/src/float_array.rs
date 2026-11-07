@@ -79,8 +79,12 @@ impl FloatArray {
 
     pub fn from_vec(values: Vec<f64>) -> Self {
         let len = values.len();
+        let block = unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) };
+        if block.is_null() {
+            return Self::empty();
+        }
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(len),
         };
         unsafe {
@@ -126,8 +130,12 @@ impl FloatArray {
         if capacity == 0 {
             return Self::empty();
         }
+        let block = unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) };
+        if block.is_null() {
+            return Self::empty();
+        }
         Self {
-            block: unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) },
+            block,
             len: crate::object_array::length_cell(0),
         }
     }

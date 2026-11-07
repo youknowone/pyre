@@ -558,6 +558,9 @@ impl<K, V, S> RDict<K, V, S> {
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = src.clone_index_block();
+        if fresh.is_null() {
+            return;
+        }
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
         let old = self.indexes;
@@ -721,6 +724,9 @@ impl<K, V, S> RDict<K, V, S> {
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = Self::alloc_index_block(new_size);
+        if fresh.is_null() {
+            return;
+        }
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as PyObjectRef);
         let old = self.indexes;
@@ -742,6 +748,9 @@ impl<K, V, S> RDict<K, V, S> {
         }
         let n = self.index_len();
         let fresh = Self::alloc_index_block(n);
+        if fresh.is_null() {
+            return std::ptr::null_mut();
+        }
         // `ll_dict_copy`: `rgc.ll_arraycopy(indexes, newindexes, 0, 0, n)`.
         unsafe { ll_arraycopy_int_items_block(self.indexes, fresh, 0, 0, n as i64) };
         fresh
@@ -1561,6 +1570,9 @@ where
     fn reindex(&mut self, new_size: usize) {
         debug_assert!(new_size.is_power_of_two());
         self.install_index_block(new_size);
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return;
+        }
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
         let mut slot = 0usize;
         while slot < self.num_ever_used_items {

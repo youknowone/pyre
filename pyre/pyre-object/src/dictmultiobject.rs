@@ -1879,7 +1879,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
             W_DICT_GC_TYPE_ID,
             W_DICT_OBJECT_SIZE,
         ))
-        .allocated_or_abort(W_DICT_OBJECT_SIZE)
+        .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut())
     };
     value.dstorage = crate::gc_roots::shadow_stack_get(save_point) as GCREF;
@@ -1892,6 +1892,8 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
         // traces the box and its entries dangle. No-op for a young header.
         crate::gc_hook::try_gc_write_barrier(raw);
         raw as PyObjectRef
+    } else if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::PY_NULL
     } else {
         crate::lltype::malloc_typed(value) as PyObjectRef
     }
@@ -6463,7 +6465,7 @@ fn w_dict_view_iterator_new_direction(
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(value) as PyObjectRef
+        crate::lltype::host_or_null(value) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
         // The shell is a livevar across the barrier: that call is a `gc_op`,

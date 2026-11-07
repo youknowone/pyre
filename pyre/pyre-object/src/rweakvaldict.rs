@@ -134,6 +134,9 @@ fn alloc_raw(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
         crate::gc_hook::try_gc_write_barrier_managed(gc_ptr);
         return gc_ptr;
     }
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return std::ptr::null_mut();
+    }
     let layout = std::alloc::Layout::from_size_align(bytes, std::mem::align_of::<usize>())
         .expect("weakdict layout");
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -173,8 +176,11 @@ fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
             )
         };
         let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-            .allocated_or_abort(bytes)
+            .allocated_or_raise()
             .unwrap_or(std::ptr::null_mut());
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         if !raw.is_null() {
             // Collecting malloc stamps the header only. `_ll_malloc_entries`
             // is `zero=True`. `GCREF` is `*mut GCREFOpaque` (`size_of` 0), so
@@ -390,6 +396,9 @@ fn store_entry<K>(entries: *mut WeakDictEntries<K>, i: usize, key: K, value: *mu
 #[majit_macros::dont_look_inside]
 pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
     let raw = alloc_raw(weakdict_gc_type_id(), std::mem::size_of::<WeakDict<K>>());
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
     // `_ll_malloc_entries` may collect (`framework.py` `push_roots`). `d` is
     // the livevar across that malloc (`_rweakvaldict.py` `ll_new_weakdict`).
     // The table is `alloc_raw` old-gen (`WEAKDICT`); `d` does not move.

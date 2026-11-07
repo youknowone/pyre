@@ -1267,7 +1267,7 @@ fn make_user_call_frame(
         closure,
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     )?;
-    Ok(crate::pyframe::FrameBox::new(frame))
+    crate::pyframe::FrameBox::new(frame).into_result()
 }
 
 enum PreparedUserCall {
@@ -1438,7 +1438,8 @@ pub fn call_user_function_resolved(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        );
+        )
+        .into_result()?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -1452,7 +1453,8 @@ pub fn call_user_function_resolved(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)
+        .into_result()?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame, None)
@@ -2873,7 +2875,8 @@ pub fn call_user_function_plain_with_ctx(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        );
+        )
+        .into_result()?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -2885,7 +2888,8 @@ pub fn call_user_function_plain_with_ctx(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)
+        .into_result()?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -4672,7 +4676,8 @@ fn call_with_kwargs_in_ctx_impl(
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
                 )?,
-            );
+            )
+            .into_result()?;
             func_frame.fix_array_ptrs();
             // Generator/coroutine function: return a generator object
             // instead of running the body, matching the positional call
@@ -5760,7 +5765,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
+        let gen_frame = match crate::pyframe::FrameBox::new(
             match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
@@ -5775,7 +5780,15 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                     return PY_NULL;
                 }
             },
-        );
+        )
+        .into_result()
+        {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        };
         return match frame_into_generator_for_function(gen_frame, func) {
             Ok(v) => v,
             Err(e) => {
@@ -5785,7 +5798,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
         };
     }
 
-    let mut frame = crate::pyframe::FrameBox::new(
+    let mut frame = match crate::pyframe::FrameBox::new(
         match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             &final_args,
@@ -5800,7 +5813,15 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                 return PY_NULL;
             }
         },
-    );
+    )
+    .into_result()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     // `function.py Function.call_args` delegates every application-level
     // function to `PyCode.funcrun` (`pycode.py`), which builds the
@@ -5859,7 +5880,7 @@ fn call_user_function_resolved_frameless(
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
-    let mut frame = crate::pyframe::FrameBox::new(
+    let mut frame = match crate::pyframe::FrameBox::new(
         pyre_object::with_roots!(func => PyFrame::new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             args,
@@ -5868,7 +5889,15 @@ fn call_user_function_resolved_frameless(
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )),
-    );
+    )
+    .into_result()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame_into_generator_for_function(frame, func) {
@@ -7598,7 +7627,8 @@ fn build_class_inner(
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        )?)
+        .into_result()?;
     // compiling.py `build_class`: `frame.setdictscope(w_namespace)` then
     // `frame.run()`.  The body executes against a namespace OBJECT so
     // STORE_NAME / LOAD_NAME route through the object form, not the raw

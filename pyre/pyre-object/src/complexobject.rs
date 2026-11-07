@@ -126,7 +126,7 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
         std::mem::size_of::<W_ComplexObjectUser>(),
     );
     if raw.is_null() {
-        crate::lltype::malloc_typed(obj) as PyObjectRef
+        crate::lltype::host_or_null(obj) as PyObjectRef
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_ComplexObjectUser, obj);

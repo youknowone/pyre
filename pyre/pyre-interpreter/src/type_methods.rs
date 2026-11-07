@@ -653,7 +653,13 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
                 other,
                 majit_metainterp::jit::we_are_jitted(),
             )
-            .expect("copy_into an empty list");
+            .map_err(|e| {
+                if e == "MemoryError" {
+                    crate::PyError::memory_error("")
+                } else {
+                    panic!("copy_into an empty list")
+                }
+            })?;
             return Ok(());
         }
         for i in 0..n {

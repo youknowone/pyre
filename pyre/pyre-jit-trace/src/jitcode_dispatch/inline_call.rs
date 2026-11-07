@@ -11391,6 +11391,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             ),
         );
         drop(arg_roots);
+        if frame.is_null() {
+            return resolved_inline_decline(op.pc, line!());
+        }
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;
         callee_state.borrow_mut().concrete_registers_r[frame_reg as usize] =

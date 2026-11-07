@@ -2187,7 +2187,9 @@ pub fn handle_exception_with_context(
             let saved_trace_slot = pyre_object::gc_roots::shadow_stack_len();
             let saved_trace = pyre_object::gc_roots::pin_root(saved_trace);
             if !saved_trace.is_null() {
-                frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+                if let Ok(d) = frame.getorcreatedebug(-1) {
+                    d.w_f_trace = pyre_object::PY_NULL;
+                }
             }
             let after_exc_result =
                 unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
@@ -2197,7 +2199,9 @@ pub fn handle_exception_with_context(
             let frame = unsafe { &mut *frame_anchor.live() };
             let saved_trace = pyre_object::gc_roots::shadow_stack_get(saved_trace_slot);
             if !saved_trace.is_null() {
-                frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+                if let Ok(d) = frame.getorcreatedebug(-1) {
+                    d.w_f_trace = saved_trace;
+                }
             }
             match after_exc_result {
                 // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
@@ -3128,7 +3132,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // slot is not realized.  The popped value's only name is this word.
         let roots = pyre_object::gc_roots::push_roots();
         let _ = roots.pin_root(value);
-        let w_locals = self.get_or_create_w_locals();
+        let w_locals = self.get_or_create_w_locals()?;
         let w_code = self.getcode_w();
         let value = roots.get(roots.base());
         let base = roots.pin_roots(&[value, w_locals, w_code]);
@@ -3400,7 +3404,7 @@ pub unsafe fn store_name_value_w(
     let _ = roots.pin_root(w_name);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(value);
-    let w_locals = frame.get_or_create_w_locals();
+    let w_locals = frame.get_or_create_w_locals()?;
     let locals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_locals);
     let w_name = roots.get(name_slot);
@@ -3433,7 +3437,7 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
     let roots = pyre_object::gc_roots::push_roots();
     let name_slot = roots.base();
     let _ = roots.pin_root(w_name);
-    let w_locals = frame.get_or_create_w_locals();
+    let w_locals = frame.get_or_create_w_locals()?;
     crate::baseobjspace::delitem(w_locals, roots.get(name_slot)).map_err(|err| {
         if matches!(err.kind, PyErrorKind::KeyError) {
             let w_name = roots.get(name_slot);
@@ -4563,7 +4567,7 @@ impl OpcodeStepExecutor for PyFrame {
         // them and the key after the dict.
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
-        let _ = roots.pin_root(self.get_or_create_w_locals());
+        let _ = roots.pin_root(self.get_or_create_w_locals()?);
         if crate::baseobjspace::finditem_str(roots.get(locals_slot), "__annotations__")?.is_none() {
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(unsafe { pyre_object::w_str_new("__annotations__") });
@@ -5699,7 +5703,7 @@ impl OpcodeStepExecutor for PyFrame {
         // read, so the mapping crosses an allocation before the delete.
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
-        let _ = roots.pin_root(self.get_or_create_w_locals());
+        let _ = roots.pin_root(self.get_or_create_w_locals()?);
         let key =
             unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
         crate::baseobjspace::delitem(roots.get(locals_slot), key).map_err(|err| {
@@ -6335,7 +6339,7 @@ impl OpcodeStepExecutor for PyFrame {
         // globals into the class namespace and make LOAD_FROM_DICT_OR_DEREF
         // select a global over its closure cell.
         let anchor = FrameAnchor::new(self);
-        let w_locals = self.get_or_create_w_locals();
+        let w_locals = self.get_or_create_w_locals()?;
         Self::push_anchored(&anchor, w_locals)
     }
 

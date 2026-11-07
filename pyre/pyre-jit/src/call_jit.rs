@@ -547,7 +547,7 @@ fn alloc_callee_frame(
     w_globals: PyObjectRef,
     execution_context: *const pyre_interpreter::PyExecutionContext,
 ) -> *mut PyFrame {
-    let ptr = pyre_interpreter::pyframe::FrameBox::new(
+    let boxed = pyre_interpreter::pyframe::FrameBox::new(
         PyFrame::new_for_call_with_closure_and_globals_obj(
             code,
             args,
@@ -556,8 +556,11 @@ fn alloc_callee_frame(
             PY_NULL,
             pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ),
-    )
-    .into_raw();
+    );
+    if boxed.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ptr = boxed.into_raw();
     LIVE_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
     ptr
 }
@@ -8544,7 +8547,9 @@ pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
          site must thread portal_frame_reg as its ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    frame.get_or_create_w_locals()
+    frame
+        .get_or_create_w_locals()
+        .unwrap_or(pyre_object::PY_NULL)
 }
 
 /// `LOAD_BUILD_CLASS` residual using the frame receiver.
