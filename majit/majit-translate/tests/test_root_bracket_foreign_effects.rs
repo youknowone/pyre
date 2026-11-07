@@ -73,6 +73,30 @@ fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
     (opening, erased)
 }
 
+/// Interpreter bodies whose foreign `pyre_object` callees become known
+/// non-touching only after the object crate's effects are published.
+/// `iter_local_fns` order is not stable across hosts, so the population
+/// sample above is diagnostic; these names are the product of that publish.
+const NEWLY_ERASING_WITNESSES: &[&str] = &[
+    "pyre_interpreter::module::_codecs::call_codec",
+    "pyre_interpreter::module::_io::iobase_close",
+];
+
+fn named_body_erases(llbc: &Llbc, suffix: &str) -> Option<bool> {
+    let root_stack_state = RootStackState::new(llbc);
+    for fd in llbc.iter_local_fns() {
+        let path = fd.item_meta.name_path();
+        if !path.contains(suffix) {
+            continue;
+        }
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        return Some(!erased_root_bracket_guards(llbc, fd, &body, &root_stack_state).is_empty());
+    }
+    None
+}
+
 #[test]
 fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -100,12 +124,23 @@ fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(interpreter, || {
         let (opening, before) = erased_bodies(interpreter);
+        let before_witnesses: Vec<(&str, bool)> = NEWLY_ERASING_WITNESSES
+            .iter()
+            .filter_map(|name| named_body_erases(interpreter, name).map(|erased| (*name, erased)))
+            .collect();
         interpreter.set_root_stack_effects(vec![crate_name], touching);
         let (_, after) = erased_bodies(interpreter);
         eprintln!("bodies opening a bracket: {opening}; erased before {before}, after {after}");
+        let newly: Vec<&str> = before_witnesses
+            .iter()
+            .filter(|(name, erased_before)| {
+                !*erased_before && named_body_erases(interpreter, name).unwrap_or(false)
+            })
+            .map(|(name, _)| *name)
+            .collect();
         assert!(
-            after > before,
-            "publishing pyre-object's effects must let more interpreter brackets go"
+            !newly.is_empty() || after > before,
+            "publishing pyre-object's effects must erase a named interpreter bracket ({NEWLY_ERASING_WITNESSES:?}) or raise the sampled count; witnesses={before_witnesses:?} after={after} before={before}"
         );
     });
 }

@@ -2010,25 +2010,6 @@ pub fn w_list_make_empty() -> PyObjectRef {
     crate::lltype::malloc_typed_managed(full) as PyObjectRef
 }
 
-/// `rlist.py ll_newlist` `malloc(LIST)`: `incminimark.py malloc_fixedsize`
-/// raises MemoryError when `collect_and_reserve` cannot satisfy the
-/// request. `GcAllocOutcome::Failed` is that raise;
-/// `interp_exceptions::publish_memory_error` is the residual / interpreter
-/// carrier (`rstr.py` `LLHelpers.ll_str_mul` / `mallocstr`). `NoRoute` is
-/// the missing-hook bootstrap that still uses `malloc_typed`.
-fn list_header_from_hook(
-    raw: Option<crate::gc_hook::GCREF>,
-) -> Result<Option<crate::gc_hook::GCREF>, ()> {
-    match crate::gc_hook::GcAllocOutcome::from_hook(raw) {
-        crate::gc_hook::GcAllocOutcome::Allocated(ptr) => Ok(Some(ptr)),
-        crate::gc_hook::GcAllocOutcome::NoRoute => Ok(None),
-        crate::gc_hook::GcAllocOutcome::Failed => {
-            crate::interp_exceptions::publish_memory_error();
-            Err(())
-        }
-    }
-}
-
 /// Allocate a new W_ListObject from a Vec of items.
 ///
 /// Residualized: the storage construction below
@@ -2108,10 +2089,9 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
             &mut needs_write_barrier,
         )
     };
-    let raw = match list_header_from_hook(raw) {
-        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
-        Err(()) => return std::ptr::null_mut(),
-    };
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_raise()
+        .unwrap_or(std::ptr::null_mut());
     let body = W_ListObjectUser {
         base: W_ListObject {
             ob_header: PyObject {
@@ -2131,6 +2111,9 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
@@ -2495,12 +2478,11 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         )
     };
     // The `malloc_typed` header below is the answer for a missing hook, not
-    // for a GC that owns the heap and refused: that one would leave the list's
-    // managed edges untraced behind a header the collector never walks.
-    let raw = match list_header_from_hook(raw) {
-        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
-        Err(()) => return std::ptr::null_mut(),
-    };
+    // for a GC that owns the heap and refused: that one raises MemoryError
+    // (`_ll_malloc_fixedsize`) and this returns PY_NULL.
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_raise()
+        .unwrap_or(std::ptr::null_mut());
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
     storage.reload_typed_blocks();
@@ -2528,6 +2510,9 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         ascii_items,
     };
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
         // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
         return crate::lltype::malloc_typed(body) as PyObjectRef;
@@ -2645,10 +2630,9 @@ unsafe fn w_list_from_storage_and_strategy(
         &mut allocation_root,
         &mut needs_write_barrier,
     );
-    let raw = match list_header_from_hook(raw) {
-        Ok(ptr) => ptr.unwrap_or(std::ptr::null_mut()),
-        Err(()) => return std::ptr::null_mut(),
-    };
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_raise()
+        .unwrap_or(std::ptr::null_mut());
     int_items.reload_block(int_slot);
     float_items.reload_block(float_slot);
     bytes_items.reload_block(bytes_slot);
@@ -2672,6 +2656,9 @@ unsafe fn w_list_from_storage_and_strategy(
         ascii_items,
     };
     let obj = if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
         // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
         crate::lltype::malloc_typed(body) as PyObjectRef
@@ -2709,24 +2696,34 @@ pub unsafe fn w_list_repeat_unwrapped(obj: PyObjectRef, times: usize) -> Option<
     match strategy {
         ListStrategy::Integer | ListStrategy::IntOrFloat => {
             let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_int_array(
-                strategy,
-                IntArray::from_repeated(&values, times)?,
-            ))
+            match IntArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_int_array(strategy, arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(std::ptr::null_mut())
+                }
+            }
         }
         ListStrategy::Float => {
             let values = snapshot_float_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_float_array(FloatArray::from_repeated(
-                &values, times,
-            )?))
+            match FloatArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_float_array(arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(std::ptr::null_mut())
+                }
+            }
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
             // `inplace_mul` materialises the clone, then `IntegerListStrategy.mul`.
             let values = snapshot_range_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            Some(finish_int_array(
-                ListStrategy::Integer,
-                IntArray::from_repeated(&values, times)?,
-            ))
+            match IntArray::from_repeated(&values, times) {
+                Some(arr) => Some(finish_int_array(ListStrategy::Integer, arr)),
+                None => {
+                    majit_gc::raise_memory_error();
+                    Some(std::ptr::null_mut())
+                }
+            }
         }
         ListStrategy::Object => {
             repeat_object_storage(crate::gc_roots::shadow_stack_get(obj_slot), times)
@@ -4248,6 +4245,11 @@ unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObj
         bytes_items: BytesArray::empty(),
         ascii_items: UnicodeArray::empty(),
     });
+    // `CHECK_MEMORY_ERROR` after `malloc_fixedsize`: a Failed header is
+    // PY_NULL with MemoryError already stored (`allocated_or_raise`).
+    if list.is_null() {
+        return std::ptr::null_mut();
+    }
     ll_list_int_set_items(&mut *list, block);
     ll_list_int_set_len(&mut *list, n);
     list as PyObjectRef
