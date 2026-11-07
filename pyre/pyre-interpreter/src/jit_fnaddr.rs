@@ -4416,6 +4416,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_resync_allocated",
         pyre_object::listobject::__majit_call_target_w_list_resync_allocated,
     );
+    // Integer/Float `newlist(length)` (`rlist.py ll_newlist`). jtransform
+    // leaves an untyped-result call as residual CALL; the walker rewrites a
+    // constant length to `NewArray` (`do_fixed_newlist`). Publish so the
+    // residual funcptr matches wasm-stably (`walker_published_fnaddr`).
+    upa1!(
+        &mut entries,
+        "pyre_object::listobject::int_ll_newlist",
+        "pyre_object::int_ll_newlist",
+        pyre_object::listobject::int_ll_newlist,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::listobject::float_ll_newlist",
+        "pyre_object::float_ll_newlist",
+        pyre_object::listobject::float_ll_newlist,
+    );
     up2!(
         &mut entries,
         "pyre_object::W_ListObject::object_push",
