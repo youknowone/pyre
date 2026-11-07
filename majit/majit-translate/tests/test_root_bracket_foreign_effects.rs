@@ -47,20 +47,10 @@ fn path_is_gc_roots_leaf(path: &str, leaf: &str) -> bool {
     path.rsplit("::").next() == Some(leaf) && path.split("::").any(|s| s == "gc_roots")
 }
 
-/// True when every terminator callee outside `gc_roots` lives in a crate the
-/// harvest can name. An interpreter-local helper is analysed from its own
-/// body, so publishing `pyre-object` cannot change whether it touches.
-fn only_foreign_non_root_callees(paths: &[String]) -> bool {
-    paths.iter().all(|path| {
-        path.split("::").any(|s| s == "gc_roots")
-            || path.split("::").next() != Some("pyre_interpreter")
-    })
-}
-
 /// Bodies holding at least one erased bracket, over the first [`SAMPLE`]
-/// bodies that open one and whose other callees are all foreign. Those are
-/// the bodies whose unknown `pyre-object` / `core` callees the harvest can
-/// answer.
+/// bodies that open one. Interpreter-local helpers have their own graphs;
+/// publishing `pyre-object` still answers the remaining body-less
+/// `pyre_object` callees (`call_codec` / `iobase_close`).
 fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
     let (mut opening, mut erased) = (0, 0);
     let root_stack_state = RootStackState::new(llbc);
@@ -70,9 +60,6 @@ fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
         };
         let paths: Vec<String> = callee_name_paths(llbc, &body).collect();
         if !paths.iter().any(|p| path_is_gc_roots_leaf(p, "push_roots")) {
-            continue;
-        }
-        if !only_foreign_non_root_callees(&paths) {
             continue;
         }
         if opening == SAMPLE {
