@@ -1081,9 +1081,13 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
-        // Promote `self` before reading `self.version`, so that the read is
-        // a no-op due to the quasi-immutable field.
-        let this = unsafe { &*majit_ir::jit::promote(self as *const Self) };
+        // `celldict.py getdictvalue_no_unwrapping`: `self = jit.promote(self)`.
+        // Promote the GC reference (`llmemory.GCREF`), not `&Self` / `as usize`:
+        // those record `cast_ptr_to_int` + `int_guard_value` on every store.
+        // `self.version` stays a FieldRead so `jtransform.py rewrite_op_getfield`
+        // emits `record_quasiimmut_field` + `getfield_*_pure`.
+        let gcref = majit_ir::jit::promote(self as *const Self as crate::gc_hook::GCREF);
+        let this = unsafe { &*(gcref as *const Self) };
         this._getdictvalue_no_unwrapping_pure(this.version, w_dict, key)
     }
 
