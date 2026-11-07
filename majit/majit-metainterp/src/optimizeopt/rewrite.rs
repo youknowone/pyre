@@ -1125,16 +1125,18 @@ impl OptRewrite {
                 return false;
             }
             // rewrite.py: copy interior fields element by element.
-            // `ArrayStructInfo.getinteriorfield_virtual` returns the stored
-            // box, including `None` for a cleared slot, and
+            // `source_info.getinteriorfield_virtual` reads the stored box,
+            // including `None` for a cleared slot, and
             // `setinteriorfield_virtual` writes that value so a later
             // `GETINTERIORFIELD` raises `InvalidLoop` on the dest the way
             // it would on the source (`virtualize.py
-            // optimize_GETINTERIORFIELD_GC_I`).
+            // optimize_GETINTERIORFIELD_GC_I`). The source PtrInfo is the
+            // same object for the whole copy (`rewrite.py` `source_info`).
+            let source_info = ctx.peek_ptr_info(&source_b);
             for index in 0..length_int {
                 for &fdescr_idx in &all_fdescr_indices {
-                    let val = ctx
-                        .peek_ptr_info(&source_b)
+                    let val = source_info
+                        .as_ref()
                         .and_then(|info| match info {
                             crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
                                 let ei = (index + source_start) as usize;
