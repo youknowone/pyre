@@ -490,9 +490,11 @@ impl<'a> Lowering<'a> {
         // nullptr. Family union is `SomePtr ∪ SomePtr`, not
         // `Instance(None) ∪ SomePtr`.
         if tyref_is_gcref_spelling(&call.dest.ty, self.llbc) {
-            // `recast_instance_to_gcref` stamps `ValueType::Ref(Some("GCREF"))`.
-            // `tyref_to_value_type_with` of a class-root-less GCREF word is
-            // not that shell (`*mut u8` / address collapse to Int).
+            // `recast_instance_to_gcref` / `cast_instance_call("GCREF")`
+            // stamps `ValueType::Ref(Some("GCREF"))` so a later
+            // GCREF→GCREF aliases (`src_already_gcref`).
+            // `tyref_to_value_type_with` keeps `GCREFOpaque` / `*mut u8`
+            // as `Ref(None)`; only VOIDP and `ty_is_raw_address` are Int.
             let recast_ty = ValueType::Ref(Some("GCREF".to_string()));
             let bb_id = self.emit_bb(mir_bb);
             let res = self

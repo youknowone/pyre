@@ -979,12 +979,18 @@ fn tuple_storage_ptr_as_gcref_emits_cast_instance_to_gcref() {
         .expect("lower *mut (Vec, Vec) as *mut GCREFOpaque");
     assert!(
         graph.blocks.iter().any(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"))
+            block.operations.iter().any(|op| {
+                crate::model::cast_instance_root(&op.kind) == Some("GCREF")
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            result_ty: ValueType::Ref(Some(root)),
+                            ..
+                        } if root == "GCREF"
+                    )
+            })
         }),
-        "tuple-storage as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        "tuple-storage as GCREF emits __cast_instance_intrinsic(\"GCREF\") with Ref(Some(\"GCREF\")); graph={}",
         graph.dump()
     );
 }

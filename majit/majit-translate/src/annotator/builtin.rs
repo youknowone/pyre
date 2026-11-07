@@ -2160,19 +2160,16 @@ fn cast_instance_intrinsic(
         //
         // `annlowlevel.py` `cast_instance_to_gcref` and `rerased.py`
         // `_some_erased` annotate as `lltype_to_annotation(GCREF)` (the
-        // non-constant `projected` SomePtr). A classdef-less Instance
-        // that is not `is_constant()` (`ptr_null_constant`, kwargs
-        // `*mut (Vec, Vec)`) is a live pointer, not known-null, so it
-        // takes that same `projected`. Only `SomeNone` (`erase(None)`)
-        // stamps `inputconst(GCREF, nullptr)` (`rerased.py`
-        // `_rtype_erase` Void arm).
+        // non-constant `projected` SomePtr), including `SomeNone`
+        // (`erase(None)`). `nullptr(GCREF.TO)` is `_rtype_erase`'s Void
+        // arm (`rbuiltin.rs` `rtype_cast_instance_intrinsic`).
         return match operand {
-            SomeValue::None_(_) => Ok(crate::annotator::bookkeeper::gcref_null_annotation()),
             SomeValue::String(_)
             | SomeValue::Instance(_)
             | SomeValue::List(_)
             | SomeValue::Ptr(_)
-            | SomeValue::Address(_) => Ok(projected),
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-GC-pointer operand for GCREF: {other:?}"
             ))),
@@ -3663,8 +3660,8 @@ mod tests {
             "None_ dest-GCREF annotates SomePtr(GCREF), got {s_none_gcref:?}"
         );
         assert!(
-            s_none_gcref.is_constant(),
-            "_rtype_erase Void arm stamps nullptr(GCREF.TO), got {s_none_gcref:?}"
+            !s_none_gcref.is_constant(),
+            "None_ dest-GCREF is _some_erased / lltype_to_annotation(GCREF), got {s_none_gcref:?}"
         );
         let s_cast = gcref_ptr_annotation();
         assert!(
