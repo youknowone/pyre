@@ -1,5 +1,10 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,level0,entry-bridge:level0,entry-bridge:level1,entry-bridge:level2,entry-bridge:level3,entry-bridge:level4,entry-bridge:level5
+# pyre-check: selfcheck-compiles=hot,level0,level1,level2,level3,level4,level5,entry-bridge:level0,entry-bridge:level2
+# Distinct callees still compile their own loops. After
+# `_opimpl_recursive_call` dropped the FBW inline screens
+# (`can_inline_callable` then `max_unroll_recursion` then
+# `dont_trace_here`), level1/3/4/5 entries inline into the
+# caller and no longer form a CALL_ASSEMBLER entry-bridge.
 # Every Python activation consumes recursion budget, not only an activation
 # whose code object is already present in the live call chain.  The six
 # distinct callees below each carry a loop so a warmed caller can cross their
