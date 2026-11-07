@@ -1212,10 +1212,22 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
 /// frame is still parked on `YIELD_VALUE` (`flush_yield_exit`);
 /// `generator.py` `_send_ex` would treat this store as exhaustion.
 pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
-    if frame_ptr == 0 {
+    if !got_exception {
         return;
     }
-    if !got_exception {
+    stamp_finished_unless_parked_at_yield(frame_ptr);
+}
+
+/// `dispatch_bytecode` / `handle_operation_error` finish mark for compiled
+/// and resume leave (`leave_compiled_frame_chain`). RETURN_VALUE already
+/// stored the bit in assembler; residual leave still needs this store.
+/// Skip when `last_instr` is `YIELD_VALUE`.
+pub fn finish_dispatch_leave_frame(frame_ptr: i64) {
+    stamp_finished_unless_parked_at_yield(frame_ptr);
+}
+
+fn stamp_finished_unless_parked_at_yield(frame_ptr: i64) {
+    if frame_ptr == 0 {
         return;
     }
     // SAFETY: the caller resolved this from the blackhole level's own

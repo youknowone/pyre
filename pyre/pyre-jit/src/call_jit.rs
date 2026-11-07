@@ -3023,7 +3023,7 @@ fn leave_resumed_blackhole_frame(
         // finish mark if it is a live chain member (the portal under that
         // callee). A yield FINISH convert is `LevelExit::Return` while the
         // frame is still parked on `YIELD_VALUE`.
-        pyre_jit_trace::state::finish_blackhole_level_frame(recovered as i64, chain_got_exception);
+        pyre_jit_trace::state::finish_dispatch_leave_frame(recovered as i64);
     }
     if let (Some(mut err), Some(slot)) = (hook_err, hook_err_slot) {
         err.reload(&roots, slot);
@@ -3120,7 +3120,7 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
         // that it names this execution context's still-open frame scope.
         // A yield `compile_done_with_this_frame` FINISH convert is Return
         // while `last_instr` is still `YIELD_VALUE`; skip that store.
-        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr as i64, got_exception);
+        pyre_jit_trace::state::finish_dispatch_leave_frame(frame_ptr as i64);
         (*ec).set_topframeref((*frame_ptr).f_backref);
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined
