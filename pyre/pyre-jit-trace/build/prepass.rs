@@ -1239,6 +1239,19 @@ fn real_main() {
                     "baseobjspace",
                     "generator_frame_is_finished",
                 ]),
+                // SET_ADD's `inline_call` target (`flatten.rs
+                // inline_call_targets::SET_ADD`). `pyopcode.py SET_ADD` is
+                // `space.call_method(w_set, 'add', w_value)`; the exact-set
+                // helper is `opcode_ops::set_add_value`. The portal
+                // residualizes `PyFrame::set_add`, so the portal closure
+                // never names this graph (`call.py`
+                // `CallControl.register_helper_graph` /
+                // `grab_initial_jitcodes`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "set_add_value",
+                ]),
                 // Handwritten JUMP_BACKWARD jitcode inline_calls these
                 // (`emit_jump_absolute_tick`); the portal never names them.
                 majit_translate::CallPath::from_segments([
