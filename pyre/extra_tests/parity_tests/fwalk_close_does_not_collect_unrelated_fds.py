@@ -1,9 +1,9 @@
 # pyre-check: platforms=linux,darwin
-# test_os.FwalkTests.test_fd_finalization now collects before the snapshot
-# (same as test_fd_leak) so leftover FileIO from earlier tests do not move
-# getfd(). This script still pins that `os.fwalk().close()` itself must not
-# collect those FileIO: a collection taken from close() would run `__del__`
-# of the leaked handles and `getfd()` would drop.
+# CPython-suite gap: test_os.FwalkTests.test_fd_finalization now collects
+# before the snapshot (same as test_fd_leak), so leftover FileIO from earlier
+# tests do not move getfd(). It still does not pin that `os.fwalk().close()`
+# itself must not collect those FileIO: a collection taken from close() would
+# run `__del__` of the leaked handles and `getfd()` would drop.
 # parity-tests reason: `os.fwalk` holds an exhausted `scandir` iterator at the
 # topdown yield.  `W_ScandirIterator.fail` / `_close` (interp_scandir.py) is
 # what makes that iterator's finalizer a no-op.
