@@ -6425,6 +6425,32 @@ pub(crate) fn gcref_ptr_annotation() -> super::model::SomeValue {
     )
 }
 
+/// `rerased.py` `_some_erased` is `lltype_to_annotation(GCREF)` (`SomePtr`).
+/// `_rtype_erase` Void arm is `inputconst(GCREF, nullptr(GCREF.TO))`.
+/// Stamp that nullptr on the SomePtr shell (`ann_nullptr` /
+/// `immutablevalue(nullptr(T))`).
+pub(crate) fn gcref_null_annotation() -> super::model::SomeValue {
+    let mut s = gcref_ptr_annotation();
+    stamp_gcref_null_const(&mut s);
+    s
+}
+
+fn stamp_gcref_null_const(s: &mut super::model::SomeValue) {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, nullptr};
+
+    let super::model::SomeValue::Ptr(p) = s else {
+        return;
+    };
+    let ll = LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()));
+    let Ok(null) = nullptr(LowLevelType::from(p.ll_ptrtype.TO.clone())) else {
+        return;
+    };
+    s.set_const_box(crate::flowspace::model::Constant::with_concretetype(
+        crate::flowspace::model::ConstValue::LLPtr(Box::new(null)),
+        ll,
+    ));
+}
+
 /// Walk `field_ty`'s type-string structure and collect every bare-named
 /// type that the `StructFieldRegistry` recognises.  Used by
 /// [`Bookkeeper::getuniqueclassdef_for_struct_root`]'s pass-1 discovery

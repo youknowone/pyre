@@ -2157,13 +2157,22 @@ fn cast_instance_intrinsic(
         // annotation. A GC-erasure identity around the cast
         // (`reload_top_root`, `try_gc_current_object_address`) is peeled
         // before annotation (`retarget_gc_erasure_identity_args`).
+        //
+        // `annlowlevel.py` `cast_instance_to_gcref` and `rerased.py`
+        // `_some_erased` annotate as `lltype_to_annotation(GCREF)` (the
+        // non-constant `projected` SomePtr). A classdef-less Instance
+        // that is not `is_constant()` (`ptr_null_constant`, kwargs
+        // `*mut (Vec, Vec)`) is a live pointer, not known-null, so it
+        // takes that same `projected`. Only `SomeNone` (`erase(None)`)
+        // stamps `inputconst(GCREF, nullptr)` (`rerased.py`
+        // `_rtype_erase` Void arm).
         return match operand {
+            SomeValue::None_(_) => Ok(crate::annotator::bookkeeper::gcref_null_annotation()),
             SomeValue::String(_)
             | SomeValue::Instance(_)
             | SomeValue::List(_)
             | SomeValue::Ptr(_)
-            | SomeValue::Address(_)
-            | SomeValue::None_(_) => Ok(projected),
+            | SomeValue::Address(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-GC-pointer operand for GCREF: {other:?}"
             ))),
@@ -3602,6 +3611,102 @@ mod tests {
         assert!(
             matches!(collapsed, SomeValue::Instance(_)),
             "null_mut collapses a fn pointer, got {collapsed:?}"
+        );
+    }
+
+    /// Dest-GCREF `null_mut` recast (`_some_erased` / `cast_instance_to_gcref`)
+    /// and an `as GCREF` member union to `SomePtr(GCREF)`. Family rtype is
+    /// `PtrRepr` identity; there is no InstanceRepr→PtrRepr convert.
+    #[test]
+    fn dest_gcref_null_mut_family_unions_to_someptr_and_rtypes() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::{gcref_ptr_annotation, is_gcref_type_spelling};
+        use crate::annotator::model::{SomeObjectTrait, unionof};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::pairtype::ReprClassId;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+
+        let bk = bk();
+        let s_null_mut = ptr_null_constant(&bk, &[], &no_kwds()).expect("ptr_null_constant");
+        assert!(
+            matches!(&s_null_mut, SomeValue::Instance(inst) if inst.classdef.is_none() && inst.can_be_none),
+            "GC-instance dest null_mut stays classdef-less SomeInstance, got {s_null_mut:?}"
+        );
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("GCREF"))
+            .expect("GCREF root constant");
+        assert!(is_gcref_type_spelling("GCREF"));
+        let s_null = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_null_mut.clone()), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("dest-GCREF recast of null_mut");
+        assert!(
+            matches!(&s_null, SomeValue::Ptr(_)),
+            "dest-GCREF null_mut annotates SomePtr(GCREF), got {s_null:?}"
+        );
+        assert!(
+            !s_null.is_constant(),
+            "non-constant ptr_null_constant recast is lltype_to_annotation(GCREF), got {s_null:?}"
+        );
+        let s_none_gcref = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_none()), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("dest-GCREF recast of None_");
+        assert!(
+            matches!(&s_none_gcref, SomeValue::Ptr(_)),
+            "None_ dest-GCREF annotates SomePtr(GCREF), got {s_none_gcref:?}"
+        );
+        assert!(
+            s_none_gcref.is_constant(),
+            "_rtype_erase Void arm stamps nullptr(GCREF.TO), got {s_none_gcref:?}"
+        );
+        let s_cast = gcref_ptr_annotation();
+        assert!(
+            matches!(&s_cast, SomeValue::Ptr(_)),
+            "as GCREF is SomePtr, got {s_cast:?}"
+        );
+        let family = unionof([&s_null, &s_cast]).expect("family SomePtr ∪ SomePtr");
+        assert!(
+            matches!(&family, SomeValue::Ptr(_)),
+            "family return is SomePtr(GCREF), got {family:?}"
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_null = rtyper.getrepr(&s_null).expect("null member PtrRepr");
+        let r_cast = rtyper.getrepr(&s_cast).expect("cast member PtrRepr");
+        let r_family = rtyper.getrepr(&family).expect("family PtrRepr");
+        assert_eq!(r_null.repr_class_id(), ReprClassId::PtrRepr);
+        assert_eq!(r_cast.repr_class_id(), ReprClassId::PtrRepr);
+        assert_eq!(r_family.repr_class_id(), ReprClassId::PtrRepr);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let v = Hlvalue::Variable(Variable::named("storage"));
+        llops
+            .convertvar(v.clone(), r_null.as_ref(), r_family.as_ref())
+            .expect("null member convert is PtrRepr identity");
+        llops
+            .convertvar(v.clone(), r_cast.as_ref(), r_family.as_ref())
+            .expect("cast member convert is PtrRepr identity");
+
+        let r_inst = rtyper
+            .getrepr(&s_null_mut)
+            .expect("InstanceRepr of null_mut");
+        assert_eq!(r_inst.repr_class_id(), ReprClassId::InstanceRepr);
+        let err = llops
+            .convertvar(v, r_inst.as_ref(), r_family.as_ref())
+            .expect_err("no InstanceRepr→PtrRepr pairtype");
+        assert!(
+            err.to_string().contains("don't know how to convert from"),
+            "Instance→Ptr convert must fail, got {err}"
         );
     }
 

@@ -4577,16 +4577,16 @@ impl<'a> Lowering<'a> {
     ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
     ///   `ValueType::Str`, not
     ///   [`Self::instance_narrow_for_type`]'s default `Ref(Some(root))`.
-    /// * **dest-GCREF** — `p as *mut GCREFOpaque` from a classed GC
-    ///   pointer (`Ref(Some(root))` / registered GC class root). The
-    ///   class is the type of the value being cast
-    ///   (`annlowlevel.py` `cast_instance_to_gcref`), read off `arg`'s
-    ///   producer when the caller hint is blank. Aliasing keeps
-    ///   `SomeInstance` on a GCREF-declared result; the MethodDesc
-    ///   PBC then unions `Ptr(GCREF) ∪ Instance`. Upstream
-    ///   `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
-    ///   is an explicit op whose annotation is `lltype_to_annotation(GCREF)`
-    ///   (`SomePtr`). [`Self::recast_instance_to_gcref`] stamps
+    /// * **dest-GCREF** — `p as *mut GCREFOpaque` from a pointer that is
+    ///   not already GCREF (`annlowlevel.py` `cast_instance_to_gcref` /
+    ///   `rerased.py` `_rtype_erase` `cast_opaque_ptr`). The class of a
+    ///   classed GC source is the type of the value being cast, read off
+    ///   `arg`'s producer when the caller hint is blank. A classdef-less
+    ///   pointer (`*mut (Vec, Vec)` kwargs storage) is the same erase:
+    ///   aliasing leaves `SomeInstance(classdef=None)` on a GCREF dest
+    ///   and the MethodDesc PBC unions `Ptr(GCREF) ∪ Instance`. Annotation
+    ///   is `lltype_to_annotation(GCREF)` (`SomePtr`).
+    ///   [`Self::recast_instance_to_gcref`] stamps
     ///   `__cast_instance_intrinsic("GCREF")`. A GCREF→GCREF or raw/int
     ///   source stays an alias.
     ///
@@ -4665,64 +4665,59 @@ impl<'a> Lowering<'a> {
                 res,
             ));
         }
+        // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`) is
+        // `rgc.cast_instance_to_gcref` / `_rtype_erase` (`rerased.py`
+        // `cast_opaque_ptr`, `llannotation.py` `lltype_to_annotation`).
+        // Run before the `Ref` gate: a classed GC pointer already recasts
+        // here, and a classdef-less pointer (`*mut (Vec, Vec)` kwargs
+        // storage) must too — aliasing leaves `SomeInstance(classdef=None)`
+        // on the family return, and `InstanceRepr → PtrRepr` has no
+        // pairtype. GCREF→GCREF stays an alias (`same_as`). An int source
+        // is `cast_int_to_ptr`, not this erase.
+        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
+            let producer_ty = resolve_to_producer_op(&self.graph, arg)
+                .and_then(|(block_id, idx)| {
+                    self.graph
+                        .blocks
+                        .iter()
+                        .find(|block| block.id == block_id)
+                        .and_then(|block| block.operations.get(idx))
+                })
+                .and_then(|op| match &op.kind {
+                    OpKind::Call { result_ty, .. }
+                    | OpKind::UnaryOp { result_ty, .. }
+                    | OpKind::BinOp { result_ty, .. }
+                    | OpKind::Input { ty: result_ty, .. }
+                    | OpKind::FieldRead { ty: result_ty, .. }
+                    | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
+                    _ => None,
+                });
+            let src_already_gcref = match producer_ty {
+                Some(ValueType::Ref(Some(root))) => {
+                    crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                }
+                _ => match src_kind {
+                    Some(ValueType::Ref(Some(root))) => {
+                        crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                    }
+                    Some(ValueType::Ref(_)) => {
+                        src_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+                    }
+                    _ => false,
+                },
+            };
+            if src_already_gcref {
+                return None;
+            }
+            if src_is_pointer || matches!(src_kind, Some(ValueType::Ref(_))) {
+                return Some(self.recast_instance_to_gcref(arg));
+            }
+            return None;
+        }
         if !matches!(src_kind, Some(ValueType::Ref(_))) {
             return None;
         }
         if !matches!(dest_kind, ValueType::Ref(_)) {
-            return None;
-        }
-        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
-            // `annlowlevel.py` `cast_instance_to_gcref` /
-            // `rgc.cast_instance_to_gcref`: the erase is the type of the
-            // value being cast, not the caller's src hint. Recovery
-            // (`p as usize as *mut GCREFOpaque`) passes `Ref(None)` / no
-            // root; read the class off `arg`'s producer
-            // (`resolve_to_producer_op`, same walk as
-            // [`Self::address_cast_pointer`]). GCREF→GCREF and unclassed
-            // `Ref(None)` fall through to the hint and stay an alias.
-            let src_classed = {
-                let from_arg = resolve_to_producer_op(&self.graph, arg)
-                    .and_then(|(block_id, idx)| {
-                        self.graph
-                            .blocks
-                            .iter()
-                            .find(|block| block.id == block_id)
-                            .and_then(|block| block.operations.get(idx))
-                    })
-                    .and_then(|op| match &op.kind {
-                        OpKind::Call { result_ty, .. }
-                        | OpKind::UnaryOp { result_ty, .. }
-                        | OpKind::BinOp { result_ty, .. }
-                        | OpKind::Input { ty: result_ty, .. }
-                        | OpKind::FieldRead { ty: result_ty, .. }
-                        | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
-                        _ => None,
-                    })
-                    .is_some_and(|ty| match ty {
-                        ValueType::Ref(Some(root)) => {
-                            !crate::annotator::bookkeeper::is_gcref_type_spelling(root)
-                        }
-                        _ => false,
-                    });
-                if from_arg {
-                    true
-                } else {
-                    match src_kind {
-                        Some(ValueType::Ref(Some(root)))
-                            if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
-                        {
-                            true
-                        }
-                        Some(ValueType::Ref(_)) => src_root.is_some_and(|r| {
-                            !crate::annotator::bookkeeper::is_gcref_type_spelling(r)
-                        }),
-                        _ => false,
-                    }
-                }
-            };
-            if src_classed {
-                return Some(self.recast_instance_to_gcref(arg));
-            }
             return None;
         }
         let (segments, result_ty) =

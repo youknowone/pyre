@@ -890,6 +890,105 @@ fn classed_gc_ptr_as_gcref_emits_cast_instance_to_gcref() {
     );
 }
 
+/// `*mut (Vec<T>, Vec<T>) as *mut GCREFOpaque` is `_rtype_erase` of a
+/// real object (`rerased.py`). `KwargsDictStorage` is that tuple alias;
+/// dest-GCREF recast must not require a classed GC producer.
+#[test]
+fn tuple_storage_ptr_as_gcref_emits_cast_instance_to_gcref() {
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let vec_item = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let vec_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [vec_item],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [vec_ty.clone(), vec_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [tuple_ty, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let gcref = type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let vec_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "vec", "Vec"])),
+        "kind": "Opaque"
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "tuple_to_gcref"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [src_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &dest_ty),
+                        {"UnaryOp": [
+                            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+                            {"Move": place(1, &src_ty)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [gcref, vec_decl],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = crate::test_support::lower_function(&llbc, "tuple_to_gcref")
+        .expect("lower *mut (Vec, Vec) as *mut GCREFOpaque");
+    assert!(
+        graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"))
+        }),
+        "tuple-storage as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        graph.dump()
+    );
+}
+
 /// `p as usize as *mut GCREFOpaque` is `annlowlevel.py`
 /// `cast_instance_to_gcref`: recovery folds the int round-trip back to
 /// the classed orig, and dest-GCREF erase keys that orig's type.
@@ -17978,6 +18077,285 @@ fn null_mut_of_utf8str_recasts_dest_str() {
     assert!(
         crate::front::mir::is_str_family_class_root(root),
         "recast root must be str-family, got {root}"
+    );
+}
+
+fn lower_null_mut_gcref_dest() -> crate::model::FunctionGraph {
+    let gcrefopaque_adt = interior_adt(0);
+    let dest = interior_adt(1);
+    let caller = interior_caller(
+        "null_gcref",
+        0,
+        vec![],
+        dest.clone(),
+        vec![interior_local(0, None, &dest)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &dest), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], dest.clone());
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_alias(
+                1,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [gcrefopaque_adt, "Mut"]}),
+            ),
+        ],
+        vec![caller, null_mut],
+    );
+    lower_interior(&llbc, "null_gcref")
+}
+
+/// `std::ptr::null_mut()` dest GCREF (`llmemory.GCREF` / `*mut GCREFOpaque`)
+/// recasts onto GCREF (`rerased.py` `_some_erased`).
+#[test]
+fn null_mut_of_gcref_recasts_dest_gcref() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let graph = lower_null_mut_gcref_dest();
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let null = ops
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected dest-GCREF null_mut; ops={ops:?}"));
+    let null_var = null.result.as_ref().expect("null_mut produces a result");
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, null_var).is_some())
+        .unwrap_or_else(|| panic!("dest-GCREF null_mut must recast onto GCREF; ops={ops:?}"));
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Ref(Some("GCREF".to_string())),
+                "GCREF recast is dest-GCREF, got {result_ty:?}"
+            );
+        }
+        other => panic!("expected recast call, got {other:?}"),
+    }
+    let root = crate::model::cast_instance_root(&recast.kind).expect("recast names a root");
+    assert!(
+        crate::annotator::bookkeeper::is_gcref_type_spelling(root),
+        "recast root must be GCREF, got {root}"
+    );
+}
+
+/// A GCREF-returning function whose body is `null_mut()` annotates its
+/// return as `SomePtr(GCREF)` (`lltype_to_annotation(GCREF)` /
+/// `_some_erased`).
+#[test]
+fn null_mut_gcref_dest_annotates_someptr() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeObjectTrait, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let graph = lower_null_mut_gcref_dest();
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift dest-GCREF null_mut");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let cells: Vec<Option<SomeValue>> =
+        (0..n_inputs).map(|_| Some(SomeValue::Impossible)).collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("dest-GCREF null_mut must annotate");
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    let want = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    assert!(
+        matches!(&s_ret, SomeValue::Ptr(_)),
+        "dest-GCREF null_mut must annotate SomePtr(GCREF), got {s_ret:?}"
+    );
+    let (SomeValue::Ptr(got), SomeValue::Ptr(want_p)) = (&s_ret, &want) else {
+        panic!("expected SomePtr pair, got {s_ret:?} vs {want:?}");
+    };
+    assert_eq!(
+        got.ll_ptrtype, want_p.ll_ptrtype,
+        "dest-GCREF null_mut must be lltype_to_annotation(GCREF)"
+    );
+    assert!(
+        !s_ret.is_constant(),
+        "dest-GCREF recast of non-constant ptr_null_constant is lltype_to_annotation(GCREF), got {s_ret:?}"
+    );
+}
+
+/// A GC-instance dest keeps today's classdef-less nullable `SomeInstance`
+/// (`ptr_null_constant`); it is not recast onto GCREF.
+#[test]
+fn null_mut_of_classed_gc_ptr_stays_null_mut() {
+    use crate::model::{CallTarget, OpKind};
+    let dest = interior_raw_mut(interior_adt(0));
+    let caller = interior_caller(
+        "null_gc_inst",
+        0,
+        vec![],
+        dest.clone(),
+        vec![interior_local(0, None, &dest)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &dest), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], dest);
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [{"Value": [0, {"Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }}]}]
+            }
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "GcStorage"],
+            &[("n", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, null_mut],
+        vec![gctype],
+        vec![gctype_impl],
+    );
+    let graph = lower_interior(&llbc, "null_gc_inst");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        }),
+        "GC-instance dest keeps null_mut; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .all(|op| crate::model::cast_instance_root(&op.kind) != Some("GCREF")),
+        "GC-instance dest must not recast onto GCREF; ops={ops:?}"
+    );
+}
+
+/// Production `EmptyDictStrategy::get_empty_storage` is `null_mut()` dest
+/// GCREF (`rerased.py` `erase(None)`). `KwargsDictStrategy` is
+/// `gc_alloc_young_storage_box(...) as GCREF` of a `(Vec, Vec)` box;
+/// dest-GCREF recast must land on both extracted artefacts.
+#[test]
+fn empty_dict_get_empty_storage_production_recasts_gcref() {
+    use crate::model::{CallTarget, OpKind};
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    )) else {
+        return;
+    };
+    let ctx = crate::front::mir::LowerContext::new(llbc);
+    let mut seen = 0usize;
+    let mut recast = 0usize;
+    let mut null_mut_recast = 0usize;
+    let mut misses = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        let n = fd.item_meta.name_path();
+        if !n.contains("get_empty_storage") {
+            continue;
+        }
+        let Ok(graph) = crate::front::mir::lower_fun_decl_with_static_addrs(
+            &ctx,
+            fd,
+            crate::HostStaticAddrs::default(),
+        ) else {
+            continue;
+        };
+        seen += 1;
+        let has_gcref = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+            })
+        });
+        let has_null_mut = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                        || segments.as_slice() == ["std", "ptr", "null_mut"]
+                )
+            })
+        });
+        if has_gcref {
+            recast += 1;
+            if has_null_mut {
+                null_mut_recast += 1;
+            }
+        } else {
+            misses.push(format!("id={} name={n}", fd.def_id));
+        }
+    }
+    assert!(
+        seen > 0,
+        "pyre-object.ullbc has no get_empty_storage graphs"
+    );
+    assert!(
+        null_mut_recast > 0,
+        "EmptyDictStrategy dest-GCREF null_mut must recast onto GCREF; seen={seen}"
+    );
+    assert!(
+        misses.is_empty(),
+        "every get_empty_storage recasts onto GCREF (KwargsDict tuple storage included); recast={recast}/{seen} misses={}",
+        misses.join("\n")
     );
 }
 
