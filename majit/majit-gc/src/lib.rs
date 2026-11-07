@@ -3181,6 +3181,17 @@ pub fn set_active_raise_memory_error(hook: Option<RaiseMemoryErrorFn>) {
     ACTIVE_RAISE_MEMORY_ERROR.set(hook);
 }
 
+/// Backend-installed `rpyexc_occurred` (`exceptiontransform.py`).
+/// Each backend's hook is `jit_exc_is_pending` (`pos_exc_value != 0`).
+pub type ExceptionOccurredFn = fn() -> bool;
+
+global_hook!(static ACTIVE_EXCEPTION_OCCURRED: ExceptionOccurredFn);
+
+/// Install the active backend's exception-occurred query. Pass `None` to clear.
+pub fn set_active_exception_occurred(hook: Option<ExceptionOccurredFn>) {
+    ACTIVE_EXCEPTION_OCCURRED.set(hook);
+}
+
 /// Store the prebuilt MemoryError singleton as the pending exception.
 ///
 /// The hook stores the prebuilt MemoryError
@@ -3206,24 +3217,21 @@ pub fn bump_minor_epoch() {
     MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-// Last `malloc_fixedsize` on this thread answered `GcAllocOutcome::Failed`.
-thread_local! {
-    static ALLOC_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether the last [`GcAllocOutcome::allocated_or_raise`] on this thread
-/// was [`GcAllocOutcome::Failed`].
+/// Whether a MemoryError is pending (`exceptiontransform.py rpyexc_occurred`).
 ///
-/// RPython's `_ll_malloc_fixedsize` raises MemoryError, which translation
-/// stores in `cpu.pos_exc_value` and then returns NULL. Residual constructors
-/// here cannot unwind, so [`raise_memory_error`] is that store and this flag
-/// is the C ABI's "that malloc returned NULL because the GC refused" — the
-/// same thread-local exception state as errno / `pos_exc_value`. A host
-/// `malloc_raw` fallback reads it immediately; it is not a process-wide
-/// side-table of boxes.
+/// RPython `_ll_malloc_fixedsize` raises MemoryError, which translation
+/// stores in immortal `exc_data` (`rpyexc_raise`) and then returns NULL.
+/// Residual constructors here cannot unwind, so [`raise_memory_error`] is
+/// that store (`jit_exc_raise` of the prebuilt singleton) and this query
+/// is `rpyexc_occurred` — the installed backend's `jit_exc_is_pending`
+/// (`pos_exc_value != 0`). A host `malloc_raw` fallback reads it
+/// immediately so a Failed null is not answered with an untraced object.
 #[inline]
 pub fn gc_alloc_failed_pending() -> bool {
-    ALLOC_FAILED.with(|c| c.get())
+    ACTIVE_EXCEPTION_OCCURRED
+        .get()
+        .map(|f| f())
+        .unwrap_or(false)
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.
@@ -3294,17 +3302,16 @@ impl GcAllocOutcome {
     ///
     /// JIT frames cannot unwind, so this stores the prebuilt MemoryError
     /// (`raise_memory_error`) and answers `None`. [`gc_alloc_failed_pending`]
-    /// is set so a host `malloc_raw` fallback can tell this `None` from
-    /// [`NoRoute`](Self::NoRoute). The caller returns PY_NULL; compiled
-    /// `CHECK_MEMORY_ERROR` and interpreter `PyResult` surface the exception.
+    /// then reads `rpyexc_occurred` so a host `malloc_raw` fallback can tell
+    /// this `None` from [`NoRoute`](Self::NoRoute). The caller returns PY_NULL;
+    /// compiled `CHECK_MEMORY_ERROR` and interpreter `PyResult` surface the
+    /// exception.
     #[inline]
     pub fn allocated_or_raise(self) -> Option<GCREF> {
-        ALLOC_FAILED.with(|c| c.set(false));
         match self {
             Self::Allocated(raw) => Some(raw),
             Self::NoRoute => None,
             Self::Failed => {
-                ALLOC_FAILED.with(|c| c.set(true));
                 raise_memory_error();
                 None
             }

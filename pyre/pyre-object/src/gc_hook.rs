@@ -1351,15 +1351,30 @@ mod tests {
 
     #[test]
     fn allocated_or_raise_failed_returns_none_after_storing_memory_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let _hook_lock = hook_test_guard();
-        majit_gc::set_active_raise_memory_error(Some(|| {}));
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
         assert!(GcAllocOutcome::Failed.allocated_or_raise().is_none());
         assert!(majit_gc::gc_alloc_failed_pending());
         assert!(!host_fallback_on_null(core::ptr::null_mut()));
+        // `exc_data` is not reset by a later malloc (`rpyexc_occurred`).
         assert!(GcAllocOutcome::NoRoute.allocated_or_raise().is_none());
+        assert!(majit_gc::gc_alloc_failed_pending());
+        assert!(!host_fallback_on_null(core::ptr::null_mut()));
+        PENDING.store(false, Ordering::SeqCst);
         assert!(!majit_gc::gc_alloc_failed_pending());
         assert!(host_fallback_on_null(core::ptr::null_mut()));
         majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
     }
 
     #[test]
