@@ -4982,6 +4982,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let allboxes = recursive_call_allboxes(
         funcbox, call_descr, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
+    // `gettrace()` / `profilefunc` in front of `CALL_ASSEMBLER`, at this
+    // recursive-call's pc — the inlined `execute_frame` read upstream
+    // places here.  This opcode is already inside `dispatch` of a frame
+    // whose `call_trace` ran; a hook already set records nothing
+    // (`record_call_trace_guards_before_assembler`) and the assembler call
+    // proceeds.
+    record_call_trace_guards_before_assembler(ctx, op.pc)?;
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // Concrete portal runner first (`do_recursive_call` /
     // `execute_varargs`). `direct_assembler_call` then records
@@ -6869,7 +6876,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or(&[]);
+        .unwrap_or_default();
     if pcdep.is_empty() {
         return;
     }
@@ -6881,7 +6888,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in pcdep {
+    for &(bank, color, slot) in &pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -8462,27 +8469,29 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+    let entry_pcdep_entries: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
             .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         // Defensive default for a genuinely absent entry coordinate
         // (marker miss); 0-fire across the corpus.
-        _ => &[],
+        _ => Vec::new(),
     };
     let (carried_pcdep_entries, carried_stack_only) = match jc {
-        None => (&[] as &[(u8, u16, u16)], 0usize),
+        None => (Vec::new(), 0usize),
         Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
+                jc.payload
+                    .pcdep_for_jitcode_pc(cjc as usize)
+                    .unwrap_or_default()
             } else {
-                &[] as &[(u8, u16, u16)]
+                Vec::new()
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -8511,9 +8520,9 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
         valid_stack_only
     };
     let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
-        carried_pcdep_entries
+        &carried_pcdep_entries
     } else {
-        entry_pcdep_entries
+        &entry_pcdep_entries
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
@@ -8589,7 +8598,7 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
             let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 carried_stack_only,
-                carried_pcdep_entries,
+                &carried_pcdep_entries,
                 color,
             );
             if let Some(mirror) = vstack_mirror {
@@ -8819,8 +8828,17 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                     // residual call and the stack push — is live here and its
                     // inputarg is the only source. Only a NONE register (a color
                     // dead at this pc under a shared marker) becomes `CONST_NULL`.
-                    // Under the walker (gate-off) each PC owns a depth-narrowed
-                    // marker, so this arm never fires.
+                    //
+                    // After-pop CALL/attr `-live-` is the depth-narrowed exception:
+                    // the op still reads the popped operand colors
+                    // (`get_list_of_active_boxes` `registers_r[index]`) while
+                    // pcdep/depth at the marker are post-pop, so this arm *does*
+                    // fire. Residual-call entry plants those boxes into the
+                    // walker bank from the valuestack mirror (positional zip with
+                    // the R-list, not a pcdep invert — a reused color's opcode-start
+                    // slot is a different value). A bridge walk seeds the same
+                    // colors from failargs. Encode that register; CONST_NULL only
+                    // when it is genuinely empty.
                     None => match regs_r.get_box(color) {
                         Some(v) if v != OpRef::NONE => v,
                         _ => OpRef::const_ptr(majit_ir::GcRef(0)),
@@ -15346,6 +15364,25 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     walker_record_unarmed_call_trace(ctx, op_pc, ec_box)
 }
 
+/// `pyframe.py execute_frame` → `ec.call_trace(frame)` reads `gettrace()`
+/// (`jit.promote(self.w_tracefunc)`) and `profilefunc` before `dispatch`.
+/// Record those reads in front of a `CALL_ASSEMBLER` that jumps to compiled
+/// `dispatch`, with resume at the CALLER's CALL (`op_pc`) — the same
+/// snapshot that call's other pre-call guards use.
+///
+/// A hook installed later fails the guards and re-runs the call in the
+/// interpreter.  A hook already set is declined by the caller (residual
+/// portal runner / `CallFn`); this records nothing in that state.
+pub(crate) fn record_call_trace_guards_before_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ec_hook_installed() {
+        return Ok(());
+    }
+    walker_call_trace_hook_reads(ctx, op_pc)
+}
+
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
 /// body behind `opimpl_goto_if_not_ptr_nonzero` /
 /// `opimpl_goto_if_not_ptr_iszero`:
@@ -18206,8 +18243,7 @@ fn handle<Sym: WalkSym>(
             // `DEBUG_MERGE_POINT`. The auto-stamp ladder below uses this
             // snapshot: a first visit of an already-compiled green with an
             // empty history stays inert. Checking `num_ops()` after the
-            // record (or after the portal debugdata/tracefunc/profilefunc
-            // guards) would close a degenerate retrace at that merge.
+            // record would close a degenerate retrace at that merge.
             let any_operation = ctx.trace_ctx.num_ops() != 0;
 
             // `MIFrame.debug_merge_point` records a real

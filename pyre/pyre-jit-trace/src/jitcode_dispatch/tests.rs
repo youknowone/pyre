@@ -2219,6 +2219,34 @@ fn async_force_result_slot_skips_only_guard_not_forced_ref_residual() {
 }
 
 #[test]
+fn after_residual_guard_uses_adjacent_trailing_live() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let live = crate::state::op_live();
+    let catch_exception = *insns_opname_to_byte()
+        .get("catch_exception/L")
+        .expect("catch_exception/L must be in the insns table");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_residual_adjacent_live_test");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        // residual_call (int_add stand-in) at 0, trailing `-live-` at 4,
+        // catch_exception/L at 7 (1 + LABEL_OPERAND_SIZE=3).
+        code: vec![int_add, 0, 1, 2, live, 0, 0, catch_exception, 0, 0, 0],
+        startpoints: Some([0_usize, 4, 7].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.after_residual_call_resume_pred_by_jit_pc = vec![(0, Some(0))];
+
+    assert_eq!(
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, 0, Some(0)),
+        Some(4),
+        "jtransform.py handle_residual_call trailing -live- is the byte after the call",
+    );
+}
+
+#[test]
 fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
     let live = crate::state::op_live();
     let int_copy = *insns_opname_to_byte()
@@ -19843,6 +19871,99 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
 }
 
 #[test]
+fn int_mul_overflow_writes_dst_before_guard_no_exception() {
+    // `emit_int_ovf_to_long` records `CallR` then `GUARD_NO_EXCEPTION`.
+    // `make_result_of_lastop` (`pyjitpl.py execute_varargs`) must write the
+    // boxed product into dst before that guard's snapshot, so a later
+    // `ResumeGuardCopiedDescr` sharer restores the product rather than the
+    // pre-call local.
+    let lhs_obj = pyre_object::w_int_new(1i64 << 32);
+    let rhs_obj = pyre_object::w_int_new(1i64 << 32);
+    let _lhs_pin = super::residual_call::owner_root_if_gc(lhs_obj as usize);
+    let _rhs_pin = super::residual_call::owner_root_if_gc(rhs_obj as usize);
+    let _ = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    // Non-const boxes so `record_int_ovf` records `INT_MUL_OVF` and
+    // `emit_int_ovf_to_long` records `CallR` rather than a ConstInt fold.
+    let lhs = OpRef::input_arg_ref(0);
+    let rhs = OpRef::input_arg_ref(1);
+    tc.set_opref_concrete(lhs, majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)));
+    tc.set_opref_concrete(rhs, majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)));
+    let dst_pre = dummy_ptr_eq_box(&mut tc);
+    let regs_r = vec![lhs, rhs, dst_pre];
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let mul_tag = 2; // `runtime_ops.rs` BinaryOperator::Multiply
+    let outcome =
+        super::specialize::try_emit_exact_int_binop(&mut wc, 0, mul_tag, &[lhs, rhs], 2, 'r')
+            .expect("overflow int mul must dispatch")
+            .expect("overflow int mul must emit");
+    let regs_r = wc.registers_r.to_vec();
+    drop(wc);
+    let ops: Vec<_> = tc.ops().iter().skip(ops_before).collect();
+    let opcodes: Vec<_> = ops.iter().map(|o| o.opcode).collect();
+    // `call_typed_with_effect_pure_can_raise` records CALL then patches
+    // it to CALL_PURE (`pyjitpl.py record_result_of_call_pure`).
+    let call_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::CallR || op == OpCode::CallPureR)
+        .unwrap_or_else(|| {
+            panic!("CallR/CallPureR (bigint mul) must be recorded, got {opcodes:?}")
+        });
+    let boxed_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::NewWithVtable)
+        .unwrap_or_else(|| panic!("boxed W_Long must be recorded, got {opcodes:?}"));
+    let guard_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::GuardNoException)
+        .unwrap_or_else(|| {
+            panic!("GuardNoException must follow the residual mul, got {opcodes:?}")
+        });
+    assert!(
+        call_idx < boxed_idx && boxed_idx < guard_idx,
+        "CallR/CallPureR then box then GuardNoException, got {opcodes:?}"
+    );
+    let boxed_pos = ops[boxed_idx].pos().get();
+    assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
+    assert_eq!(
+        regs_r[2], boxed_pos,
+        "registers_r[dst] must hold the boxed product when GuardNoException is recorded"
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::SubReturn { result: Some(r) } if r == boxed_pos),
+        "SubReturn must keep the boxed product, got {outcome:?}"
+    );
+}
+
+#[test]
 fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
     // Dst register OOR — the call was already recorded at this
     // point (RPython parity: `do_residual_or_indirect_call` records
@@ -28810,7 +28931,7 @@ fn restored_valuestackdepth_survives_helper_publish() {
         .static_field_index_by_name("valuestackdepth")
         .expect("valuestackdepth is a declared static vable field");
     let last_instr = tc.const_int(11);
-    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+    crate::trace_opcode::mirror_vable_static_to_boxes(
         &mut tc,
         "last_instr",
         last_instr,

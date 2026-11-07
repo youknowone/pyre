@@ -4623,6 +4623,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    // A `CALL_ASSEMBLER` jumps straight into the callee's compiled
+    // `dispatch`, past `pyframe.py execute_frame`'s `call_trace`.
+    // While a hook is installed there is nothing that can report those
+    // events from here, so decline before the first recorded op.
+    // Same test as `try_walker_call_assembler_self_recursive`.
+    if super::ec_hook_installed() {
+        return Ok(None);
+    }
     // The bridge resume captures its after-call guards on the paused callers;
     // decline before the first recorded op when they cannot take the result.
     if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
@@ -4742,6 +4750,13 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             concrete_callee_frame as usize,
         )
     });
+
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
+    // `dispatch`.  `CALL_ASSEMBLER` jumps to compiled `dispatch`;
+    // record the reads at the CALLER's CALL (`pc`).  A hook already
+    // set declined above, so this only runs when the assembler call
+    // is recorded.
+    super::record_call_trace_guards_before_assembler(ctx, pc)?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -7952,7 +7967,7 @@ struct BuiltinWrapperCallSite {
     helper_return: HelperReturn,
     nested_helper_entry: Option<HelperLevel>,
     call_site_py_pc: u32,
-    vsd_value: i64,
+    vsd_value: Option<i64>,
     outer_jitcode_index: u32,
     call_site_marker: Option<usize>,
     call_site_active: Vec<OpRef>,
@@ -8055,7 +8070,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
             ctx.entry_py_pc(),
-            0,
+            Some(0),
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
         )
@@ -8063,7 +8078,9 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
+            let resume = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
+            let after_pops = resume.as_ref().map(|r| r.after_pops).unwrap_or(false);
+            let marker = resume.map(|r| r.marker);
             // Forward py twin first (#73 phase-3): equals the
             // containing coordinate plus trivia normalization by
             // construction; the containing lookup survives for the
@@ -8077,7 +8094,12 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
                     crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
                 });
             if jc.payload.code_ptr.is_null() {
-                (py, sym.valuestackdepth() as i64, jc_index, marker)
+                let vsd = if after_pops {
+                    None
+                } else {
+                    Some(sym.valuestackdepth() as i64)
+                };
+                (py, vsd, jc_index, marker)
             } else {
                 let codeobj = &*jc.payload.code_ptr;
                 py = skip_python_trivia_forward(codeobj, py as usize) as u32;
@@ -8089,9 +8111,15 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
                         .get(py as usize)
                         .copied()
                 };
-                let vsd = depth
-                    .map(|d| (sym.nlocals() + d as usize) as i64)
-                    .unwrap_or(sym.valuestackdepth() as i64);
+                let vsd = if after_pops {
+                    None
+                } else {
+                    Some(
+                        depth
+                            .map(|d| (sym.nlocals() + d as usize) as i64)
+                            .unwrap_or(sym.valuestackdepth() as i64),
+                    )
+                };
                 (py, vsd, jc_index, marker)
             }
         }
@@ -8216,13 +8244,15 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             last_instr_op,
             Value::Int(last_instr),
         );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
+        if let Some(vsd_value) = vsd_value {
+            let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(vsd_value),
+            );
+        }
         Some(saved)
     } else {
         None
@@ -8676,7 +8706,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
             ctx.entry_py_pc(),
-            0,
+            Some(0),
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
         )
@@ -8684,7 +8714,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
+            let resume = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
+            let after_pops = resume.as_ref().map(|r| r.after_pops).unwrap_or(false);
+            let marker = resume.map(|r| r.marker);
             let mut py = jc
                 .payload
                 .forward_py_pc_for_jitcode_pc(op.pc)
@@ -8692,7 +8724,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                     crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
                 });
             if jc.payload.code_ptr.is_null() {
-                (py, sym.valuestackdepth() as i64, jc_index, marker)
+                let vsd = if after_pops {
+                    None
+                } else {
+                    Some(sym.valuestackdepth() as i64)
+                };
+                (py, vsd, jc_index, marker)
             } else {
                 let codeobj = &*jc.payload.code_ptr;
                 py = skip_python_trivia_forward(codeobj, py as usize) as u32;
@@ -8704,9 +8741,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                         .get(py as usize)
                         .copied()
                 };
-                let vsd = depth
-                    .map(|d| (sym.nlocals() + d as usize) as i64)
-                    .unwrap_or(sym.valuestackdepth() as i64);
+                let vsd = if after_pops {
+                    None
+                } else {
+                    Some(
+                        depth
+                            .map(|d| (sym.nlocals() + d as usize) as i64)
+                            .unwrap_or(sym.valuestackdepth() as i64),
+                    )
+                };
                 (py, vsd, jc_index, marker)
             }
         }
@@ -8789,13 +8832,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             last_instr_op,
             Value::Int(last_instr),
         );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
+        if let Some(vsd_value) = vsd_value {
+            let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(vsd_value),
+            );
+        }
         Some(saved)
     } else {
         None
@@ -12264,7 +12309,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -14231,7 +14276,6 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             );
             match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
                 Ok(live_norm) => {
-                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
                     ctx.trace_ctx
                         .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
                     (raw, live_norm)
@@ -14263,7 +14307,13 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         let live_ptr = pyre_object::w_int_new(live_norm) as i64;
         ctx.trace_ctx
             .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+        // `make_result_of_lastop` before `GUARD_NO_EXCEPTION` on the residual
+        // normalize path (`pyjitpl.py execute_varargs`). Capture stays at
+        // `op.pc`; this site does not set `live_after_jit_pc`.
+        make_result_of_lastop(ctx, op.pc, dst, 'r', boxed)?;
+        if !inline_unbox {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+        }
     }
     Ok(Some(inlined))
 }
@@ -18050,6 +18100,12 @@ fn descend_generatorentry<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `CALL_ASSEMBLER` jumps to compiled `generatorentry` past
+    // `pyframe.py execute_frame`'s `call_trace`.  A hook already
+    // installed residualizes `jit_next`, which still runs the bracket.
+    if super::ec_hook_installed() {
+        return Ok(None);
+    }
     let Some(canonical) =
         crate::jitcode_runtime::portal_jitcode_for_key(crate::genentry_state::GENENTRY_PORTAL_KEY)
     else {
@@ -18143,6 +18199,10 @@ fn descend_generatorentry<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
+    // `dispatch`.  Record those reads at this `next()` CALL (`op.pc`)
+    // in front of `CALL_ASSEMBLER`.
+    super::record_call_trace_guards_before_assembler(ctx, op.pc)?;
     // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` records `CALL_ASSEMBLER` after
@@ -23555,7 +23615,8 @@ fn python_portal_subwalk_site<Sym: WalkSym>(
                 crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_pc);
             (
                 jc_index,
-                super::specialize::collapsed_parent_resume_marker(&jc.payload, call_pc),
+                super::specialize::collapsed_parent_resume_marker(&jc.payload, call_pc)
+                    .map(|r| r.marker),
                 py_pc as u32,
             )
         }

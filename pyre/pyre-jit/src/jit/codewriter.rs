@@ -2080,6 +2080,24 @@ fn record_graph_op(
     op
 }
 
+/// Keep a can-raise residual block's graph tail as `[raising_op, -live-]`
+/// so `flatten.py insert_exits` emits `catch_exception` after that live
+/// (`jtransform.py handle_residual_call`).
+fn ensure_canraise_trailing_live(block: &super::flow::BlockRef, offset: i64) {
+    let last_is_live = block
+        .borrow()
+        .operations
+        .last()
+        .is_some_and(|op| op.opname == super::flatten::OPNAME_LIVE);
+    if last_is_live {
+        return;
+    }
+    super::flow::push_op(
+        block,
+        super::flow::SpaceOperation::new(super::flatten::OPNAME_LIVE, Vec::new(), None, offset),
+    );
+}
+
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
@@ -2964,6 +2982,7 @@ fn emit_jump_absolute_tick(
             ResKind::Void,
             py_pc as i64,
         );
+        ensure_canraise_trailing_live(&slow.block(), py_pc as i64);
         if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
             && let Some(site) = catch_sites
                 .iter()
@@ -5934,6 +5953,9 @@ fn filter_liveness_in_place(
     for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
         *pos = remap[*pos];
     }
+    for (pos, _) in ssarepr.after_pops_live_insn_pos.iter_mut() {
+        *pos = remap[*pos];
+    }
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -6502,6 +6524,82 @@ fn build_pcdep_color_slots(
         entries.sort_unstable();
         entries.dedup();
         out[py_pc] = entries;
+    }
+    out
+}
+
+/// Exact color→slot rows at one after-pop `-live-`. Returns
+/// `(insn_idx, base_rows, popped_rows)`: `base_rows` are locals plus
+/// remaining stack, `popped_rows` the `$popped` operand slots
+/// (`nloc + remaining_depth + k`). Each slot maps to the color of the
+/// Variable occupying it there (`pyjitpl.py get_list_of_active_boxes`
+/// encodes `registers_r[color]` of the colors live at that `-live-`).
+/// Same local-liveness / bank/color resolution as
+/// `build_pcdep_color_slots`. Joins `after_pops_live_insn_pos` to
+/// `after_pops_force_alive` by the record index carried as the `-live-`
+/// Signed constant. The record is `(py_pc, slot_vars, n_base)` with
+/// `slot_vars[..n_base]` base and `[n_base..]` popped.
+fn build_pcdep_after_pops(
+    after_pops: &[(usize, usize)],
+    force_alive: &[(i64, Vec<(u16, u32)>, usize)],
+    colorings: [&crate::jit::regalloc::Coloring; 3],
+    live_oracles: [&crate::jit::regalloc::Coloring; 3],
+    rename: &[Vec<u16>; 3],
+    code: &CodeObject,
+    nlocals: usize,
+    stack_base: usize,
+) -> Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)> {
+    let lv = pyre_jit_trace::state::liveness_for(code as *const _);
+    let mut out: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)> =
+        Vec::with_capacity(after_pops.len());
+    for &(insn_idx, rec_idx) in after_pops {
+        let Some((py_pc_i64, slot_vars, n_base)) = force_alive.get(rec_idx) else {
+            out.push((insn_idx, Vec::new(), Vec::new()));
+            continue;
+        };
+        if *py_pc_i64 < 0 {
+            out.push((insn_idx, Vec::new(), Vec::new()));
+            continue;
+        }
+        let py_pc = *py_pc_i64 as usize;
+        if !lv.is_reachable(py_pc) {
+            out.push((insn_idx, Vec::new(), Vec::new()));
+            continue;
+        }
+        let resolve = |vars: &[(u16, u32)]| -> Vec<(u8, u16, u16)> {
+            let mut slot_bank_color: std::collections::BTreeMap<u16, (u8, u16)> =
+                std::collections::BTreeMap::new();
+            for &(slot, var_id) in vars {
+                let slot_us = slot as usize;
+                if slot_us < nlocals && !lv.is_local_live(py_pc, slot_us) {
+                    continue;
+                }
+                let vid = super::flow::VariableId(var_id);
+                for (bank_idx, kind) in [Kind::Int, Kind::Ref, Kind::Float].iter().enumerate() {
+                    if !live_oracles[bank_idx].contains_key(&vid) {
+                        continue;
+                    }
+                    let Some(&pre) = colorings[bank_idx].get(&vid) else {
+                        continue;
+                    };
+                    let color = super::regalloc::rename_lookup(rename, *kind, pre);
+                    slot_bank_color.insert(slot, (bank_idx as u8, color));
+                    break;
+                }
+            }
+            let mut entries: Vec<(u8, u16, u16)> = slot_bank_color
+                .into_iter()
+                .map(|(slot, (bank, color))| {
+                    (bank, color, frame_layout_slot(slot, nlocals, stack_base))
+                })
+                .collect();
+            entries.sort_unstable();
+            entries.dedup();
+            entries
+        };
+        let n_base = (*n_base).min(slot_vars.len());
+        let (base_vars, popped_vars) = slot_vars.split_at(n_base);
+        out.push((insn_idx, resolve(base_vars), resolve(popped_vars)));
     }
     out
 }
@@ -7946,6 +8044,15 @@ impl CodeWriter {
         // proved the constants are redundant. So `build_pcdep_color_slots` can
         // build the per-PC color map from these Variables alone (no flat base).
         let mut pcdep_slot_var_resume: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
+        // After-pop `-live-` FrameState: `(py_pc, slot_vars, n_base)`
+        // captured at the marker itself. `slot_vars[..n_base]` are locals
+        // and remaining stack; `[n_base..]` are popped operands at their
+        // pre-pop stack slots. Flatten records the Signed record index;
+        // `build_pcdep_after_pops` joins by that index and maps each
+        // part through the same gates/coloring (`pyjitpl.py
+        // get_list_of_active_boxes` encodes `registers_r[color]` of the
+        // colors live at that `-live-`).
+        let mut after_pops_force_alive: Vec<(i64, Vec<(u16, u32)>, usize)> = Vec::new();
         // Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`),
         // captured at the same PRE-dispatch resume depth as
         // `pcdep_slot_var_resume`. The pcdep color map records Variables only
@@ -8974,6 +9081,86 @@ impl CodeWriter {
         // `record_graph_op` companion — recording it graph-side at
         // every PC would create a `-live-` cluster the upstream graph
         // never holds.
+        // Force-alive args for a `-live-` at the current FrameState:
+        // portal reds, live Ref locals, remaining operand-stack Refs
+        // (`liveness.py compute_liveness`). Shared by the per-PC placeholder and the
+        // after-pop marker so coloring/`make_dependencies` see the same
+        // live Variable set the assembled bitmap at that marker encodes.
+        macro_rules! live_force_alive_args {
+            ($py_pc:expr) => {{
+                let py_pc: usize = $py_pc;
+                let mut live_args: Vec<super::flow::SpaceOperationArg> = Vec::new();
+                live_args.push(frame_var.into());
+                live_args.push(ec_var.into());
+                for (i, lv) in current_state.locals_w.iter().enumerate() {
+                    if let Some(super::flow::FlowValue::Variable(v)) = lv {
+                        if v.kind == Some(Kind::Ref) && frame_liveness.is_local_live(py_pc, i) {
+                            live_args.push((*v).into());
+                        }
+                    }
+                }
+                for sv in &current_state.stack {
+                    if let super::flow::FlowValue::Variable(v) = sv {
+                        if v.kind == Some(Kind::Ref) {
+                            live_args.push((*v).into());
+                        }
+                    }
+                }
+                live_args
+            }};
+        }
+        // After-pop `-live-`: force-alive locals/remaining stack plus the
+        // popped operand Variables the residual still uses, so coloring
+        // sees them co-live with still-live locals (`make_dependencies`).
+        // Trailing Signed constant is the index of the record this macro
+        // pushes into `after_pops_force_alive`: `(py_pc, slot_vars, n_base)`
+        // with `slot_vars[..n_base]` locals/remaining stack and
+        // `[n_base..]` popped. `$popped` is bottom→top stack order
+        // (Constants are positional placeholders). Popped Variables keep
+        // their pre-pop stack slots because they are still live in
+        // registers at the marker. The exact table colors those Variables
+        // (`pyjitpl.py get_list_of_active_boxes` encodes
+        // `registers_r[color]` of the colors live at that `-live-`).
+        macro_rules! emit_after_pop_live {
+            ($py_pc:expr, $popped:expr) => {{
+                let py_pc: usize = $py_pc;
+                let mut live_args = live_force_alive_args!(py_pc);
+                let remaining_depth = current_state.stack.len();
+                let mut slot_vars: Vec<(u16, u32)> = Vec::new();
+                let nloc = current_state.locals_w.len();
+                for (i, lv) in current_state.locals_w.iter().enumerate() {
+                    if let Some(super::flow::FlowValue::Variable(v)) = lv {
+                        slot_vars.push((i as u16, v.id.0));
+                    }
+                }
+                for (d, sv) in current_state.stack.iter().enumerate() {
+                    if let super::flow::FlowValue::Variable(v) = sv {
+                        slot_vars.push(((nloc + d) as u16, v.id.0));
+                    }
+                }
+                let n_base = slot_vars.len();
+                for (k, sv) in IntoIterator::into_iter($popped).enumerate() {
+                    let fv: super::flow::FlowValue = sv.into();
+                    if let super::flow::FlowValue::Variable(v) = fv {
+                        if v.kind == Some(Kind::Ref) {
+                            live_args.push(v.into());
+                        }
+                        slot_vars.push(((nloc + remaining_depth + k) as u16, v.id.0));
+                    }
+                }
+                after_pops_force_alive.push((py_pc as i64, slot_vars, n_base));
+                live_args.push(
+                    super::flow::Constant::signed((after_pops_force_alive.len() - 1) as i64).into(),
+                );
+                record_graph_op(
+                    &current_block.block(),
+                    "-live-",
+                    live_args,
+                    None,
+                    py_pc as i64,
+                );
+            }};
+        }
         macro_rules! emit_live_placeholder {
             ($py_pc:expr) => {{
                 let py_pc: usize = $py_pc;
@@ -9006,23 +9193,7 @@ impl CodeWriter {
                 // boundary (mergeblock / catch landing) opens the block the
                 // resume point belongs to.
                 let block_open = current_block.block().borrow().exits.is_empty();
-                let mut live_args: Vec<super::flow::SpaceOperationArg> = Vec::new();
-                live_args.push(frame_var.into());
-                live_args.push(ec_var.into());
-                for (i, lv) in current_state.locals_w.iter().enumerate() {
-                    if let Some(super::flow::FlowValue::Variable(v)) = lv {
-                        if v.kind == Some(Kind::Ref) && frame_liveness.is_local_live(py_pc, i) {
-                            live_args.push((*v).into());
-                        }
-                    }
-                }
-                for sv in &current_state.stack {
-                    if let super::flow::FlowValue::Variable(v) = sv {
-                        if v.kind == Some(Kind::Ref) {
-                            live_args.push((*v).into());
-                        }
-                    }
-                }
+                let live_args = live_force_alive_args!(py_pc);
                 if block_open && at_instruction_start {
                     record_graph_op(
                         &current_block.block(),
@@ -9207,22 +9378,19 @@ impl CodeWriter {
             }};
         }
 
-        // pyframe.py `popvalue_maybe_none` lowers to
-        // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
-        // + `setfield_vable_i(valuestackdepth, depth)` via
-        // jtransform.py do_fixed_list_setitem / :927. The SSA op carries `ConstRef(0)`
-        // as the value operand — at assembler time the dispatch routes
-        // it to `vable_setarrayitem_ref_const_value`, which reuses the
-        // existing `BC_SETARRAYITEM_VABLE_R` bytecode with its src u16
-        // patched to the constants suffix of the unified register
-        // space. Single bytecode op per pop, matching upstream's
-        // `iric` argcode lowering. The popped SSA register stays
-        // available for downstream uses. The graph shadow's third
-        // operand is `Constant::none()` (`ConstantValue::None` +
-        // `Kind::Ref`), the canonical null ref representation upstream
-        // uses for stack-slot clears (pyframe.py `None`,
-        // assembler.py:109 null ref handling). `flatten_constant_operand`
-        // lowers it to `ConstRef(0)`.
+        // pyframe.py `popvalue_maybe_none` reads `locals_cells_stack_w[depth]`,
+        // stores None, then sets `valuestackdepth = depth`. `jtransform.py
+        // do_fixed_list_getitem` (vable branch) lowers the read to
+        // `getarrayitem_vable_r` with `op.result` as dest;
+        // `do_fixed_list_setitem` lowers the None store to void
+        // `setarrayitem_vable_r`. The dest Variable is what later ops name.
+        // The SSA None store carries `ConstRef(0)` — at assembler time the
+        // dispatch routes it to `vable_setarrayitem_ref_const_value`, which
+        // reuses `BC_SETARRAYITEM_VABLE_R` with its src u16 patched to the
+        // constants suffix. The graph shadow's third operand is
+        // `Constant::none()` (`ConstantValue::None` + `Kind::Ref`), the
+        // canonical null ref (pyframe.py `None`, assembler.py null ref
+        // handling). `flatten_constant_operand` lowers it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
             ($depth:ident, $py_pc:expr) => {{
                 // Do not change this to a plain `$depth -= 1` until the
@@ -9233,25 +9401,31 @@ impl CodeWriter {
                 // --synthetic-pattern comprehensions.py`).
                 let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 $depth = $depth.saturating_sub(1);
-                let popped_reg = stack_base + $depth;
-                {
-                    let depth_value = (stack_base_absolute + $depth as usize) as i64;
-                    let v_idx: super::flow::FlowValue =
-                        super::flow::Constant::signed(depth_value).into();
-                    record_graph_op(
-                        &current_block.block(),
-                        "setarrayitem_vable_r",
-                        vable_setarrayitem_ref_graph_args(
-                            frame_var.into(),
-                            v_idx.into(),
-                            super::flow::Constant::none().into(),
-                        ),
-                        None,
-                        popvalue_ref_py_pc,
-                    );
-                }
+                let depth_value = (stack_base_absolute + $depth as usize) as i64;
+                let v_idx: super::flow::FlowValue =
+                    super::flow::Constant::signed(depth_value).into();
+                let v_loaded = emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "getarrayitem_vable_r",
+                    vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.clone().into()),
+                    Kind::Ref,
+                    popvalue_ref_py_pc,
+                );
+                let loaded: super::flow::FlowValue = v_loaded.into();
+                record_graph_op(
+                    &current_block.block(),
+                    "setarrayitem_vable_r",
+                    vable_setarrayitem_ref_graph_args(
+                        frame_var.into(),
+                        v_idx.into(),
+                        super::flow::Constant::none().into(),
+                    ),
+                    None,
+                    popvalue_ref_py_pc,
+                );
                 emit_vsd!($depth, popvalue_ref_py_pc);
-                popped_reg
+                loaded
             }};
         }
 
@@ -10361,37 +10535,18 @@ impl CodeWriter {
                             let _ = binary_op_tag(op_kind)
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
-                            let operands_are_local_loads = {
-                                let block = current_block.block();
-                                let block = block.borrow();
-                                current_state.stack.len() >= 2
-                                    && current_state.stack.iter().rev().take(2).all(|value| {
-                                        block.operations.iter().rev().any(|operation| {
-                                            operation.opname == "getarrayitem_vable_r"
-                                                && operation.result.as_ref() == Some(value)
-                                        })
-                                    })
-                            };
-                            // RPython puts a live marker immediately before
-                            // overflowing integer arithmetic.  Python bytecode
-                            // is dynamically typed, so preserve that boundary
-                            // for the local-load shape handled by the integer
-                            // fast path.
-                            if operands_are_local_loads {
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "-live-",
-                                    Vec::new(),
-                                    None,
-                                    py_pc as i64,
-                                );
-                            }
                             // Pop rhs (blackhole will see vsd reflect this pop).
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // Pop lhs.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(py_pc, [lhs_value.clone(), rhs_value.clone()]);
                             let result_value = emit_frontend_binary(
                                 &mut graph,
                                 &current_block.block(),
@@ -10408,24 +10563,16 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let _ = compare_op_tag(op_kind);
-                            // `MIFrame.generate_guard()` captures resumedata at
-                            // the current jitcode pc (`pyjitpl.py`).
-                            // CompareOp specialization emits class/value guards
-                            // after consuming both Python operands, so retain
-                            // the opcode-start `-live-`; the pre-dispatch pcdep
-                            // snapshot supplies those operands on guard failure,
-                            // matching PyPy's per-frame register snapshot.
-                            record_graph_op(
-                                &current_block.block(),
-                                "-live-",
-                                Vec::new(),
-                                None,
-                                py_pc as i64,
-                            );
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(py_pc, [lhs_value.clone(), rhs_value.clone()]);
                             let result_value = emit_frontend_compare(
                                 &mut graph,
                                 &current_block.block(),
@@ -10919,8 +11066,8 @@ impl CodeWriter {
                             }
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
-                                let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let arg_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let arg_value = emit_popvalue_ref!(current_depth, py_pc);
+                                let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 graph_arg_values_rev.push(arg_value);
                             }
                             // shared_opcode.rs `opcode_call` pops null_or_self
@@ -10930,87 +11077,27 @@ impl CodeWriter {
                             // mirror the interpreter exactly or a pre-call
                             // resume reads the null slot as the callable.
                             //
-                            // When the abstract stack carries the LoadAttr/
-                            // LoadGlobal null sentinel as a graph Constant, the
-                            // slot value exists ONLY in the vable array
-                            // (`emit_pushvalue_ref_const!` writes no stack
-                            // register), and it must NOT const-fold to
-                            // ConstRef(0): a pre-call resume seeds the slot
-                            // from the tracer, which may hold a real receiver
-                            // (load_method_fast_path pushes `[w_descr, w_obj]`,
-                            // callmethod.py:60-68).  Materialize the slot value
-                            // with the upstream popvalue read
-                            // (`pyframe.py` reads
-                            // `locals_cells_stack_w[depth]` BEFORE clearing it,
-                            // `jtransform.py do_fixed_list_getitem`) so the
-                            // stack register has a producer on the straight-line
-                            // jitcode path; a producer-less pinned variable
-                            // leaves the register unbound for any execution that
-                            // is not rd_numb-seeded (walker full-body walk,
-                            // blackhole entry upstream of the push).
-                            let null_or_self_needs_read = !matches!(
-                                current_state.stack.last(),
-                                Some(super::flow::FlowValue::Variable(_))
-                            );
-                            let null_or_self_read = if null_or_self_needs_read {
-                                let slot =
-                                    (stack_base_absolute + current_depth as usize - 1) as i64;
-                                let v_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(slot).into();
-                                Some(emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getarrayitem_vable_r",
-                                    vable_getarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_idx.into(),
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                ))
-                            } else {
-                                None
-                            };
-                            let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let null_or_self_value: super::flow::FlowValue =
-                                match pop_ref_or_fresh(&mut current_state, &mut graph) {
-                                    super::flow::FlowValue::Variable(v) => {
-                                        super::flow::FlowValue::Variable(v)
-                                    }
-                                    _ => match null_or_self_read {
-                                        Some(v) => super::flow::FlowValue::Variable(v),
-                                        None => {
-                                            // Non-portal plain-call PY_NULL
-                                            // self-slot.  Pass the constant null
-                                            // directly as the call's
-                                            // `null_or_self` instead of
-                                            // materializing a `ref_copy(
-                                            // ConstRef(0))` into the popped stack
-                                            // register: the splice can coalesce
-                                            // that stack slot onto the call's
-                                            // live arg0 register, and the
-                                            // null-init would then clobber the
-                                            // argument (`f(g(x), x)` nulls `x`
-                                            // before the inner call).  A constant
-                                            // `null_or_self` lowers to a
-                                            // `ConstRef(0)` arglist entry in the
-                                            // const window, leaving the arg
-                                            // register intact.  Only the PY_NULL
-                                            // sentinel reaches here — a real
-                                            // receiver is a Variable (handled
-                                            // above) and a portal reads the slot
-                                            // from the vable mirror.  The slot is
-                                            // consumed by this call (popped), so
-                                            // no downstream read needs a
-                                            // producer; a pre-call resume seeds
-                                            // it from rd_numb.
-                                            let _ = null_or_self_reg;
-                                            super::flow::Constant::none().into()
-                                        }
-                                    },
-                                };
-                            let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // Each popvalue dest is the `getarrayitem_vable_r`
+                            // result (`pyframe.py popvalue_maybe_none`,
+                            // `jtransform.py do_fixed_list_getitem`); drain the
+                            // shadow stack without using that Variable as an
+                            // operand.
+                            let null_or_self_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let callable_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            {
+                                let mut popped = Vec::with_capacity(2 + graph_arg_values_rev.len());
+                                popped.push(callable_value.clone());
+                                popped.push(null_or_self_value.clone());
+                                popped.extend(graph_arg_values_rev.iter().rev().cloned());
+                                emit_after_pop_live!(py_pc, popped);
+                            }
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
@@ -11041,7 +11128,7 @@ impl CodeWriter {
                                     &mut graph,
                                     &current_block.block(),
                                     callable_value,
-                                    null_or_self_value.into(),
+                                    null_or_self_value,
                                     graph_call_args,
                                     py_pc as i64,
                                 )
@@ -11240,7 +11327,8 @@ impl CodeWriter {
                                     super::flow::FlowValue,
                                 ) = if n >= 2 {
                                     let cause_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                    let cause_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
+                                    let cause_reg = stack_base + current_depth;
                                     (
                                         super::flatten::Operand::Register(
                                             super::flatten::Register::new(
@@ -12127,6 +12215,12 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(py_pc, [stored_value.clone(), obj_value.clone()]);
                             emit_frontend_store_attr(
                                 &current_block.block(),
                                 obj_value,
@@ -12170,6 +12264,12 @@ impl CodeWriter {
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(py_pc, [obj_value.clone()]);
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
                                 &current_block.block(),
@@ -12881,22 +12981,34 @@ impl CodeWriter {
                             } else {
                                 // Pop order (top→bottom): kwnames, arg{N-1}..arg0,
                                 // null_or_self, callable — mirroring the
-                                // interpreter's `call_kw` stack reads.
-                                let _kwnames_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let kwnames_value =
-                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // interpreter's `call_kw` stack reads. Each
+                                // operand is the popvalue dest Variable;
+                                // `pop_ref_or_fresh` only drains the shadow.
+                                let kwnames_value = emit_popvalue_ref!(current_depth, py_pc);
+                                let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let mut arg_values_rev = Vec::with_capacity(nargs);
                                 for _ in 0..nargs {
-                                    let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                    let arg_value =
-                                        pop_ref_or_fresh(&mut current_state, &mut graph);
+                                    let arg_value = emit_popvalue_ref!(current_depth, py_pc);
+                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                     arg_values_rev.push(arg_value);
                                 }
-                                let _self_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let callable_value =
-                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let self_value = emit_popvalue_ref!(current_depth, py_pc);
+                                let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let callable_value = emit_popvalue_ref!(current_depth, py_pc);
+                                let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // The `-live-` before the operation, after its
+                                // operands are in registers
+                                // (`jtransform.py rewrite_op_int_add_ovf`); a
+                                // guard the operation produces resumes there
+                                // (`generate_guard(resumepc=orgpc)`).
+                                {
+                                    let mut popped = Vec::with_capacity(3 + arg_values_rev.len());
+                                    popped.push(callable_value.clone());
+                                    popped.push(self_value.clone());
+                                    popped.extend(arg_values_rev.iter().rev().cloned());
+                                    popped.push(kwnames_value.clone());
+                                    emit_after_pop_live!(py_pc, popped);
+                                }
                                 // Graph op args: callable, null_or_self, kwnames,
                                 // arg0..argN-1 (pops were top-first, so reverse).
                                 let mut op_args: Vec<super::flow::SpaceOperationArg> =
@@ -13437,14 +13549,28 @@ impl CodeWriter {
                         // `bh_call_function_ex_fn` unpacks `*`/`**` and
                         // dispatches (MayForce).
                         Instruction::CallFunctionEx => {
-                            let _kwargs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let kwargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _starargs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let starargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _self_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let kwargs_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let starargs_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let self_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let callable_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(
+                                py_pc,
+                                [
+                                    callable_value.clone(),
+                                    self_value.clone(),
+                                    starargs_value.clone(),
+                                    kwargs_value.clone()
+                                ]
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -14037,12 +14163,12 @@ impl CodeWriter {
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let is_two_arg_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(is_two_arg as i64).into();
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
-                            let global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let self_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let cls_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let global_super = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let raw_value = if is_two_arg {
                                 // `super(C, self).name` is a call and an
                                 // attribute load, and spelling it as those two
@@ -14357,6 +14483,12 @@ impl CodeWriter {
                                     super::flow::Constant::signed(u32::from(op_arg) as i64).into();
                                 let _ = emit_popvalue_ref!(current_depth, py_pc);
                                 let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // The `-live-` before the operation, after its
+                                // operands are in registers
+                                // (`jtransform.py rewrite_op_int_add_ovf`); a
+                                // guard the operation produces resumes there
+                                // (`generate_guard(resumepc=orgpc)`).
+                                emit_after_pop_live!(py_pc, [obj_value.clone()]);
                                 let result_value = emit_frontend_load_special(
                                     &mut graph,
                                     &current_block.block(),
@@ -16177,6 +16309,7 @@ impl CodeWriter {
         // construction in `finalize_jitcode` reuses the same names against
         // the final insn stream (`emit_dispatch_bytecode_jitted_trace_arm`).
         ssarepr.label_blocks = spliced.label_blocks;
+        ssarepr.after_pops_live_insn_pos = spliced.after_pops_live_insn_pos;
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
@@ -16399,6 +16532,25 @@ impl CodeWriter {
                 *slot = frame_layout_slot(*slot, nlocals, stack_base_absolute);
             }
         }
+        let after_pops_color_slots: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)> =
+            build_pcdep_after_pops(
+                &ssarepr.after_pops_live_insn_pos,
+                &after_pops_force_alive,
+                [
+                    &splice_regallocs[Kind::Int.index()].coloring,
+                    &splice_regallocs[Kind::Ref.index()].coloring,
+                    &splice_regallocs[Kind::Float.index()].coloring,
+                ],
+                [
+                    &graph_regallocs[Kind::Int.index()].coloring,
+                    &graph_regallocs[Kind::Ref.index()].coloring,
+                    &graph_regallocs[Kind::Float.index()].coloring,
+                ],
+                &alloc_result.rename,
+                code,
+                nlocals,
+                stack_base_absolute,
+            );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -16443,6 +16595,7 @@ impl CodeWriter {
             pcdep_color_slots,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
+            after_pops_color_slots,
         )
     }
 
@@ -16519,6 +16672,7 @@ impl CodeWriter {
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
+        after_pops_color_slots: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)>,
     ) -> Option<PyJitCode> {
         // call.py — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -16617,6 +16771,8 @@ impl CodeWriter {
                 combined_indices.push(end_idx);
             }
         }
+        let after_pops_base = combined_indices.len();
+        combined_indices.extend(after_pops_color_slots.iter().map(|(idx, _, _)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -16648,6 +16804,25 @@ impl CodeWriter {
         // two disjoint regions keeps both, and the byte range between two
         // consecutive entries is exactly one opcode's emission.
         let pc_run_base = abort_permanent_base + abort_permanent_some.len();
+        let mut pcdep_after_pops_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)> =
+            after_pops_color_slots
+                .iter()
+                .enumerate()
+                .map(|(k, (_, base, popped))| {
+                    (
+                        combined_bytes[after_pops_base + k],
+                        base.clone(),
+                        popped.clone(),
+                    )
+                })
+                .collect();
+        pcdep_after_pops_by_jit_pc.sort_unstable_by_key(|&(off, _, _)| off);
+        debug_assert!(
+            pcdep_after_pops_by_jit_pc
+                .windows(2)
+                .all(|w| w[0].0 != w[1].0),
+            "after-pop -live- markers must land on distinct jitcode offsets: {pcdep_after_pops_by_jit_pc:?}"
+        );
         // `(offset, emission index, py_pc)`.  The emission index is carried
         // into the sort key because the run order is what decides the owner
         // below, and it is NOT recoverable from the py_pc: a run that opens a
@@ -17486,6 +17661,7 @@ impl CodeWriter {
             merge_entry_by_green,
             loop_header_by_green,
             pcdep_by_jit_pc,
+            pcdep_after_pops_by_jit_pc,
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,

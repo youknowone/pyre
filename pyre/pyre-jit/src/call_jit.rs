@@ -4742,8 +4742,8 @@ fn trace_and_compile_from_bridge_body(
     refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
-            // `resume_pc` addresses the
-            // INNERMOST inlined frame while `code` is the live OUTER frame, so
+            // `resume_pc` addresses the INNERMOST inlined frame while `code`
+            // is the live OUTER frame, so
             // the single-frame lookup below would consult the wrong code object.
             // Ask each resumed frame about its OWN pc instead.
             // `finishframe_exception` walks `framestack` innermost-first and

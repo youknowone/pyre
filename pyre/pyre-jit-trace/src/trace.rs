@@ -1244,7 +1244,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
-    concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    // resume.py rebuild_from_resumedata already wrote last_instr from the
+    // snapshot boxes. pyjitpl.py handle_guard_failure / setup_resume_at_op
+    // starts at the encoded jitcode pc and does not plant a Python pc over
+    // that field.
+    if carrier.is_some() || sym.bridge_walk_entry_pc().is_none() {
+        concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    }
     let w_code = concrete_frame.pycode;
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks

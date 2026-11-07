@@ -1564,7 +1564,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    pjc.pcdep_for_jitcode_pc(0).map(<[_]>::to_vec)
+    pjc.pcdep_for_jitcode_pc(0)
 }
 
 pub(crate) type SubDescrPool = (
@@ -2103,7 +2103,6 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
             .get(jitcode_index as usize)?
             .payload
             .pcdep_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
-            .map(ToOwned::to_owned)
     })
 }
 
@@ -2415,10 +2414,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
             // decodable, the two sidecars are independently optional: a miss
             // in one must not discard the other.
-            let pcdep = payload
-                .pcdep_for_jitcode_pc(jp)
-                .map(<[_]>::to_vec)
-                .unwrap_or_default();
+            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
@@ -3016,18 +3012,12 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: crate::jitcode_dispatch::RegisterList,
-    /// Kept-stack branch-guard resume coordinate for the full-body walk: the
-    /// guard's OWN jitcode byte offset (`frame0.jitcode_pc`, the mid-opcode
-    /// `goto_if_not`), resolved the same way the blackhole resolves its
-    /// `setposition` (`resolve_resume_pc_with_jitcode_pc`).  A chained-compare /
-    /// short-circuit guard resumes mid-opcode: the opcode-entry marker
-    /// for `py_pc` re-executes the whole comparison from the top, reading
-    /// abstract-register colors that were live at entry but dead (recolored /
-    /// consumed) at the guard — colors the guard snapshot never preserved.  The
-    /// walk must resume where the blackhole does (the guard offset), so the
-    /// re-executed suffix only reads colors the resume data actually carries.
-    /// `None` for a non-branch-guard resume, where the walk
-    /// keeps the opcode-entry offset for `py_pc`.
+    /// Guard-resume walk entry: the encoded rd_numb top-frame jitcode pc
+    /// (`resume.py` `rebuild_from_resumedata` / `blackhole.py` `setposition`).
+    /// A copied guard's storage is the donor's (`get_resumestorage`); the
+    /// walker re-records donor→sharer from that offset, including a trailing
+    /// `-live-` that is not an opcode-entry startpoint. `None` only when the
+    /// resume section stored no non-negative pc.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
     /// JitCode body that owns `bridge_walk_entry_pc`. `resume.py:1049-1056`
     /// constructs the resumed frame and applies its PC from the same resume
@@ -7834,7 +7824,7 @@ impl PyreJitState {
 
     /// Address of the live virtualizable after any minor that ran since
     /// [`Self::publish_frame`].
-    pub(crate) fn live_frame(&self) -> usize {
+    pub fn live_frame(&self) -> usize {
         if let Some(root) = self.frame_root.inner.as_ref() {
             let now = root.get().0;
             if now != 0 {
@@ -9138,7 +9128,30 @@ pub(crate) fn reconstruct_inline_recipe(
         Some(color) => {
             match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
                 Some(slot) => Some(slot),
-                None => decline!("PendingResultColorUnmapped"),
+                None => {
+                    // Interior `-live-` (`floor_segment_for_jitcode_pc`
+                    // start != `frame.pc`, same test as
+                    // `LiveRefColorUnmapped` below): the CALL dest is
+                    // pushed after the residual, so it has no stack slot
+                    // yet. `get_list_of_active_boxes` (`pyjitpl.py`)
+                    // under `in_a_call` clears that color;
+                    // `MIFrame.make_result_of_lastop` writes the callee
+                    // return into `registers_r[color]`. Opcode-start
+                    // floor still declines a truly unmapped dest.
+                    let interior_live = pyjitcode_for_jitcode_index(frame.jitcode_index)
+                        .and_then(|p| {
+                            crate::pyjitcode::floor_segment_for_jitcode_pc(
+                                &p.metadata.py_floor_by_jit_pc,
+                                frame.pc as usize,
+                            )
+                        })
+                        .is_some_and(|(start, _)| start != frame.pc as usize);
+                    if interior_live {
+                        None
+                    } else {
+                        decline!("PendingResultColorUnmapped")
+                    }
+                }
             }
         }
         None => None,
@@ -9341,7 +9354,24 @@ pub(crate) fn reconstruct_inline_recipe(
                 || matches!(by_color_c.get(c), Some(majit_ir::Value::Ref(g)) if g.is_null())
         });
         if !mapped && dropped {
-            decline!("LiveRefColorUnmapped");
+            // After-pop CALL `-live-` is an interior marker (not the
+            // opcode-start floor). Popped operand colors are slot-less
+            // there, and a live PUSH_NULL self_or_null is CONST_NULL.
+            // `consume_boxes` (`resume.py`) still writes that box into
+            // `registers_r[index]`. Keep the color. Opcode-start floor
+            // still declines a true unmapped dead color under a shared
+            // marker.
+            let interior_live = pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .and_then(|p| {
+                    crate::pyjitcode::floor_segment_for_jitcode_pc(
+                        &p.metadata.py_floor_by_jit_pc,
+                        frame.pc as usize,
+                    )
+                })
+                .is_some_and(|(start, _)| start != frame.pc as usize);
+            if !interior_live {
+                decline!("LiveRefColorUnmapped");
+            }
         }
     }
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds
@@ -12393,13 +12423,14 @@ impl JitState for PyreJitState {
                 // rebuilt registers_r and the full-body-walk argbox seed recover the
                 // kept conditional-expression / short-circuit value.
                 sym.bridge_stack_oprefs.replace(bridge_stack);
-                // Kept-stack branch guards resume the full-body walk at the guard's OWN
-                // mid-opcode jitcode offset — the same resolved coordinate stored in
-                // the frame pc — instead of the opcode-entry marker for `py_pc`.
-                // `None` leaves the walk on the opcode-entry marker.
-                sym.bridge_walk_entry_pc =
-                    crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
-                        .then_some(frame0.pc as usize);
+                // resume.py rebuild_from_resumedata / blackhole.py setposition:
+                // the encoded rd_numb top-frame jitcode pc is the walk entry
+                // (`MIFrame.pc`), even when it is not a startpoint `-live-`.
+                // A copied guard's storage is the donor's (`get_resumestorage`);
+                // the walker re-records donor→sharer from that offset.
+                if frame0.pc >= 0 {
+                    sym.bridge_walk_entry_pc = Some(frame0.pc as usize);
+                }
                 sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
                 sym.bridge_local_types = Some(bridge_local_types);
                 // consume_boxes (resume.py) fills `f.registers_r` by abstract
@@ -12877,19 +12908,12 @@ impl JitState for PyreJitState {
         // `write_from_resume_data_partial`, resume.py).  The
         // per-frame liveness section fills the blackhole REGISTERS and never
         // touches the vable (blackhole.py:1376+), so the positional restore
-        // is authoritative for the frame.  Validate it and clear stale slots
-        // beyond valuestackdepth (blackhole fresh-frame parity), which the
-        // vable section restore does not perform.
-        if !self.validate_frame() {
-            return false;
-        }
-        let vsd = self.valuestackdepth();
-        if let Some(arr) = self.locals_cells_stack_array_mut() {
-            for i in vsd..arr.len() {
-                arr[i] = pyre_object::PY_NULL;
-            }
-        }
-        true
+        // is authoritative for the frame.  Callers trim slots above the
+        // *aligned* vsd (`decode_and_restore_guard_failure` after
+        // `correct_resume_vsd`; `restore_reconstructed_frame_values` at
+        // the restored depth). Trimming here at the snapshot vsd would
+        // NULL live locals a later raise is about to reveal.
+        self.validate_frame()
     }
 
     /// resume.py consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
@@ -12930,7 +12954,12 @@ impl JitState for PyreJitState {
         exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         // resume.py consume_boxes parity: write values to the frame.
-        self.restore_guard_failure_values(meta, values, exception)
+        if !self.restore_guard_failure_values(meta, values, exception) {
+            return false;
+        }
+        let vsd = self.valuestackdepth();
+        self.clear_stack_above(vsd);
+        true
     }
 
     /// blackhole.py:1800 parity: multi-frame support.
@@ -15598,6 +15627,7 @@ mod tests {
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
+                pcdep_after_pops_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: vec![(0, 1)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],

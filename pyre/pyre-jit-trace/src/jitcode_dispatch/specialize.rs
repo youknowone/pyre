@@ -7389,6 +7389,8 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     rb: i64,
     lhs_obj: pyre_object::PyObjectRef,
     rhs_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     use pyre_interpreter::objspace::descroperation as desc;
@@ -7465,9 +7467,6 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         .unwrap_or(raw_concrete as usize);
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete)));
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
     let boxed = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
@@ -7482,6 +7481,15 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_obj as usize)),
     );
+    // `make_result_of_lastop` (`pyjitpl.py execute_varargs`): the caller's
+    // dst is this fold's later `SubReturn` box. Write it before
+    // `GUARD_NO_EXCEPTION` so `get_list_of_active_boxes` at the trailing
+    // `-live-` sees the product. Capture stays at `op_pc` (the CALL);
+    // `walker_emit_guard_with_snapshot` does not set `live_after_jit_pc`.
+    make_result_of_lastop(ctx, op_pc, dst, dst_bank, boxed)?;
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
     }))
@@ -7605,7 +7613,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
                 .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
                 .unwrap_or(rhs_obj);
             return emit_int_ovf_to_long(
-                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
+                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj, dst, dst_bank,
             );
         }
         if !raw.is_constant() {
@@ -10036,6 +10044,11 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
 /// `getindex_w`) for an exact `str` and an exact `int` index.
 /// A missing jitcode declines to the generic residual.
 ///
+/// `descr_getitem` returns `_getitem_result`, so the helper return is
+/// the subscript. `HelperReturn::CallResult` numbers that `MIFrame`
+/// (`capture_resumedata` / `_setup_return_value_*`) and keeps
+/// start/end/utf8/strlen in the guard failargs.
+///
 /// The boxed index is not frozen: a loop over `s[i]` must keep the
 /// live key so the generated length test stays in the body.
 /// Specialised-tuple descent freezes because that reader is a
@@ -10091,7 +10104,8 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
 
@@ -11495,7 +11509,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     if !(3..=5).contains(&r_args.len()) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let mut arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
     else {
@@ -11509,26 +11523,33 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // The bounds are pinned from the moment they are read because the fold
+    // records guards before it runs the constructor, and a minor collection
+    // in any of them moves the bound; an RPython trace keeps each argument
+    // in a GC-visible box (`history.py` `FrontendOp.value`, `pyjitpl.py`
+    // `MIFrame.registers_r`), so the value the constructor sees is the
+    // forwarded one.
+    let arg_pins = residual_call::owner_roots_for_concretes(&arg_concretes);
+
     let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     enum BoundPlan {
-        Exact {
-            op: OpRef,
-            concrete: pyre_object::PyObjectRef,
-        },
-        UserIndex(IndexInlineCandidate),
+        Exact { op: OpRef, arg_index: usize },
+        UserIndex { arg_index: usize },
     }
     let mut plans = Vec::with_capacity(r_args.len() - 2);
-    for (&arg_op, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
-        let ConcreteValue::Ref(arg_obj) = *concrete else {
+    for i in 2..r_args.len().min(arg_concretes.len()) {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let ConcreteValue::Ref(arg_obj) = arg_concretes[i] else {
             return Ok(None);
         };
+        let arg_op = r_args[i];
         if walker_is_exact_machine_int_concrete(arg_obj) {
             plans.push(BoundPlan::Exact {
                 op: arg_op,
-                concrete: arg_obj,
+                arg_index: i,
             });
-        } else if let Some(candidate) = prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-            plans.push(BoundPlan::UserIndex(candidate));
+        } else if prepare_walker_inline_index(ctx, arg_op, arg_obj).is_some() {
+            plans.push(BoundPlan::UserIndex { arg_index: i });
         } else {
             return Ok(None);
         }
@@ -11543,30 +11564,38 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let mut concrete_args = Vec::with_capacity(plans.len());
-    let mut arg_pins = Vec::with_capacity(plans.len());
+    let mut exact_indices = Vec::with_capacity(plans.len());
+    let mut user_pins = Vec::with_capacity(plans.len());
     let mut concrete_values = Vec::with_capacity(plans.len());
     let mut raw_args = Vec::with_capacity(plans.len());
     for plan in plans {
-        let (arg_op, arg_obj) = match plan {
-            BoundPlan::Exact { op, concrete } => (op, concrete),
-            BoundPlan::UserIndex(candidate) => {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let (arg_op, exact_index, user_pin, arg_obj) = match plan {
+            BoundPlan::Exact { op, arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold Exact bound is a Ref");
+                };
+                (op, Some(arg_index), None, arg_obj)
+            }
+            BoundPlan::UserIndex { arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold UserIndex bound is a Ref");
+                };
+                let Some(candidate) = prepare_walker_inline_index(ctx, r_args[arg_index], arg_obj)
+                else {
+                    return walker_range_decline(ctx, pre_emit_pos);
+                };
                 let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
                     ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
                 )?
                 else {
                     return walker_range_decline(ctx, pre_emit_pos);
                 };
-                (result, concrete)
+                let user_pin = residual_call::owner_root_if_gc(concrete as usize);
+                let arg_obj = pinned_obj(&user_pin, concrete);
+                (result, None, user_pin, arg_obj)
             }
         };
-        // `walker_guard_class` / `opimpl_getfield_gc_i` append to
-        // `opencoder.py Trace._ops`. Pin the bound so
-        // `call_function_impl_result` receives the forwarded object.
-        let arg_pin = residual_call::owner_root_if_gc(arg_obj as usize);
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
         // A trace-constant bound carries its class in the constant itself, so
         // record the class as known without proving it: `walker_guard_class`
         // would emit a `GuardClass` that can never fail plus the tagged-operand
@@ -11579,10 +11608,15 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
             walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
         }
         walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let arg_obj = if let Some(arg_index) = exact_index {
+            let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            arg_obj
+        } else {
+            pinned_obj(&user_pin, arg_obj)
+        };
         let concrete_value = unsafe { pyre_object::w_int_get_value(arg_obj) };
         let raw = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
@@ -11592,13 +11626,24 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
         concrete_args.push(arg_obj);
-        arg_pins.push(arg_pin);
+        exact_indices.push(exact_index);
+        user_pins.push(user_pin);
         concrete_values.push(concrete_value);
         raw_args.push(raw);
     }
-    for (arg, pin) in concrete_args.iter_mut().zip(arg_pins.iter()) {
-        if let Some(pin) = pin {
-            *arg = pin.get().0 as pyre_object::PyObjectRef;
+    residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+    for ((arg, exact_index), user_pin) in concrete_args
+        .iter_mut()
+        .zip(exact_indices.iter())
+        .zip(user_pins.iter())
+    {
+        if let Some(arg_index) = *exact_index {
+            let ConcreteValue::Ref(obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            *arg = obj;
+        } else {
+            *arg = pinned_obj(user_pin, *arg);
         }
     }
 
@@ -16605,19 +16650,67 @@ pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker
         .unwrap_or(marker)
 }
 
+/// Parent resume for a guard recorded inside a collapsed helper or inlined
+/// callee: the last `-live-` of the call's own opcode before the call op.
+pub(super) struct CollapsedParentResume {
+    pub marker: usize,
+    pub after_pops: bool,
+}
+
 /// Parent resume coordinate for a guard recorded inside a collapsed helper
 /// or inlined callee.
 ///
-/// The parent re-executes the Python opcode from this `-live-`. On a
-/// loop-header opcode that is the op2 `-live-` after `jit_merge_point`
+/// The parent re-executes the collapsed call, so it resumes at the last
+/// `-live-` the call's own opcode passed before the call op (its operand
+/// pops already applied). `pyjitpl.py get_list_of_active_boxes` reads
+/// liveness at that preceding `-live-`; `blackhole.py setposition` restores
+/// those colors. On a loop-header opcode the walk starts at the op2
+/// `-live-` after `jit_merge_point`
 /// (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn collapsed_parent_resume_marker(
     payload: &crate::PyJitCode,
     jit_pc: usize,
-) -> Option<usize> {
-    payload
-        .resume_marker_for_jitcode_pc(jit_pc)
-        .map(|m| loop_header_guard_resume_marker(payload, m))
+) -> Option<CollapsedParentResume> {
+    let start =
+        loop_header_guard_resume_marker(payload, payload.resume_marker_for_jitcode_pc(jit_pc)?);
+    let jitcode = payload.jitcode.as_ref();
+    let code = jitcode.code.as_slice();
+    let op_live = crate::state::op_live();
+    let mut remembered: Option<usize> = None;
+    let mut decode_failed = false;
+    match crate::jitcode_runtime::decode_op_at(code, start) {
+        None => decode_failed = true,
+        Some(start_op) => {
+            let mut pc = start_op.next_pc;
+            while pc < jit_pc {
+                match crate::jitcode_runtime::decode_op_at(code, pc) {
+                    None => {
+                        decode_failed = true;
+                        break;
+                    }
+                    Some(op) => {
+                        if op.opname == "live" && jitcode.can_decode_live_vars(pc, op_live) {
+                            remembered = Some(pc);
+                        }
+                        if op.opname == "goto"
+                            || op.opname.starts_with("goto_if")
+                            || op.opname == "switch"
+                        {
+                            remembered = None;
+                        }
+                        pc = op.next_pc;
+                    }
+                }
+            }
+        }
+    }
+    if decode_failed {
+        remembered = None;
+    }
+    Some(CollapsedParentResume {
+        marker: remembered.unwrap_or(start),
+        after_pops: remembered.is_some(),
+    })
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -16669,7 +16762,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             let jc = &*sym.jitcode();
             (
                 jc.index as u32,
-                collapsed_parent_resume_marker(&jc.payload, op_pc),
+                collapsed_parent_resume_marker(&jc.payload, op_pc).map(|r| r.marker),
             )
         }
     };
