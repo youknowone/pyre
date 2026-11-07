@@ -7113,6 +7113,14 @@ fn bh_call_kw_impl(
     kwnames: PyObjectRef,
     positional: &[PyObjectRef],
 ) -> i64 {
+    // Same ABI-root as [`bh_call_fn_impl`]: native copies are not rewritten
+    // by a moving collection, and [`park_residual_call_exception`] may
+    // `normalize` when the caller's exception pair is live.
+    let npos = positional.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.publish(&[callable, null_or_self, kwnames]);
+    _roots.publish(positional);
+    _roots.normalize(root_base, 3 + npos);
     let ec = pyre_interpreter::call::getexecutioncontext();
     assert!(
         !ec.is_null(),
@@ -7124,25 +7132,40 @@ fn bh_call_kw_impl(
     // [`residual_call_c_profile_frame`].  `call_kw` is `call_kw_in_ctx` with
     // the frame that settles it, plus the caller `FrameLocalsRoot` the
     // interpreter's own CALL_KW installs.
-    let profile_frame = residual_call_c_profile_frame(ec, callable);
+    let profile_frame = residual_call_c_profile_frame(ec, _roots.get(root_base));
+    let profile_slot = if profile_frame.is_null() {
+        None
+    } else {
+        let slot = _roots.publish(&[profile_frame as PyObjectRef]);
+        _roots.normalize(slot, 1);
+        Some(slot)
+    };
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-    let _root = pyre_object::gc_roots::push_roots();
     if !saved_ctx.is_null() {
-        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+        let _ = _roots.pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let parked = park_residual_call_exception();
+    let callable = _roots.get(root_base);
+    let null_or_self = _roots.get(root_base + 1);
+    let kwnames = _roots.get(root_base + 2);
+    let positional: Vec<PyObjectRef> = (0..npos).map(|i| _roots.get(root_base + 3 + i)).collect();
     let result = {
-        if profile_frame.is_null() {
-            pyre_interpreter::call::call_kw_in_ctx(ec, callable, null_or_self, positional, kwnames)
-        } else {
-            pyre_interpreter::call::call_kw(
-                unsafe { &mut *profile_frame },
+        match profile_slot {
+            None => pyre_interpreter::call::call_kw_in_ctx(
+                ec,
                 callable,
                 null_or_self,
-                positional,
+                &positional,
                 kwnames,
-            )
+            ),
+            Some(slot) => pyre_interpreter::call::call_kw(
+                unsafe { &mut *(_roots.get(slot) as *mut pyre_interpreter::PyFrame) },
+                callable,
+                null_or_self,
+                &positional,
+                kwnames,
+            ),
         }
     };
     unpark_residual_call_exception(parked);
@@ -7360,16 +7383,18 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // CALL takes for this shape, receiver-prefixed argument vector included.
     let profile_frame = residual_call_c_profile_frame(ec, _roots.get(root_base));
     if !profile_frame.is_null() {
-        let call_args = reload_args();
-        let callable = _roots.get(root_base);
+        let profile_slot = _roots.publish(&[profile_frame as PyObjectRef]);
+        _roots.normalize(profile_slot, 1);
         // The two hooks are application-level Python and can enter compiled
         // code, which writes the very cells this helper publishes to — the
         // same nesting the user-function arm below parks across, and for the
         // same reason: a raise the hook handled internally would otherwise be
         // read by this call's `GUARD_NO_EXCEPTION` as a pending exception.
         let parked = park_residual_call_exception();
+        let call_args = reload_args();
+        let callable = _roots.get(root_base);
         let result = pyre_interpreter::call::call_callable(
-            unsafe { &mut *profile_frame },
+            unsafe { &mut *(_roots.get(profile_slot) as *mut pyre_interpreter::PyFrame) },
             callable,
             &call_args,
         );
@@ -7515,6 +7540,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // `GUARD_NO_EXCEPTION` as a spurious pending exception (the failure
         // `drain_backend_jit_exc` names for the walker's snapshot side).
         let parked = park_residual_call_exception();
+        let callable = _roots.get(root_base);
+        let call_args = reload_args();
         let result =
             pyre_interpreter::call::call_user_function_with_ctx(ec, callable, &call_args, false);
         unpark_residual_call_exception(parked);
@@ -7543,9 +7570,9 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
+    let parked = park_residual_call_exception();
     let callable = _roots.get(root_base);
     let call_args = reload_args();
-    let parked = park_residual_call_exception();
     let result = pyre_interpreter::call::call_function_impl_result(callable, &call_args);
     unpark_residual_call_exception(parked);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
@@ -7575,6 +7602,9 @@ pub extern "C" fn bh_call_function_ex_fn(
     starargs: PyObjectRef,
     kwargs_or_null: PyObjectRef,
 ) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.publish(&[callable, self_or_null, starargs, kwargs_or_null]);
+    _roots.normalize(root_base, 4);
     let ec = pyre_interpreter::call::getexecutioncontext();
     assert!(
         !ec.is_null(),
@@ -7584,31 +7614,40 @@ pub extern "C" fn bh_call_function_ex_fn(
     );
     // `pyopcode.py CALL_FUNCTION_EX`'s C-profile diversion — see
     // [`residual_call_c_profile_frame`].
-    let profile_frame = residual_call_c_profile_frame(ec, callable);
+    let profile_frame = residual_call_c_profile_frame(ec, _roots.get(root_base));
+    let profile_slot = if profile_frame.is_null() {
+        None
+    } else {
+        let slot = _roots.publish(&[profile_frame as PyObjectRef]);
+        _roots.normalize(slot, 1);
+        Some(slot)
+    };
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-    let _root = pyre_object::gc_roots::push_roots();
     if !saved_ctx.is_null() {
-        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+        let _ = _roots.pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let parked = park_residual_call_exception();
+    let callable = _roots.get(root_base);
+    let self_or_null = _roots.get(root_base + 1);
+    let starargs = _roots.get(root_base + 2);
+    let kwargs_or_null = _roots.get(root_base + 3);
     let result = {
-        if profile_frame.is_null() {
-            pyre_interpreter::call::call_function_ex_in_ctx(
+        match profile_slot {
+            None => pyre_interpreter::call::call_function_ex_in_ctx(
                 ec,
                 callable,
                 self_or_null,
                 starargs,
                 kwargs_or_null,
-            )
-        } else {
-            pyre_interpreter::call::call_function_ex(
-                unsafe { &mut *profile_frame },
+            ),
+            Some(slot) => pyre_interpreter::call::call_function_ex(
+                unsafe { &mut *(_roots.get(slot) as *mut pyre_interpreter::PyFrame) },
                 callable,
                 self_or_null,
                 starargs,
                 kwargs_or_null,
-            )
+            ),
         }
     };
     unpark_residual_call_exception(parked);
