@@ -147,6 +147,33 @@ pub enum BhReturnType {
 /// RPython `history.py:AbstractDescr` parity.
 pub use majit_jitcode::jitcode::{BhCallDescr, BhDescr, DescrTable, EMPTY_DESCR_TABLE};
 
+/// Host callback for `interp_jit.py dispatch` `except Yield`.
+///
+/// `abort_permanent` is the codewriter stand-in for `YIELD_VALUE`. This crate
+/// cannot name `PyFrame` or `Instruction`, so the embedder registers a
+/// decoder that pops TOS on that opcode. Signature is
+/// `(frame_ptr, *mut yielded_ref) -> i32` with `1` a yield: yielded `None`
+/// is a real object, so the value cannot travel in the return code.
+pub type TryYieldReturn = extern "C" fn(i64, *mut i64) -> i32;
+
+static TRY_YIELD_RETURN: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn register_try_yield_return(cb: Option<TryYieldReturn>) {
+    let ptr = cb.map_or(std::ptr::null_mut(), |f| f as *mut ());
+    TRY_YIELD_RETURN.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+fn try_yield_return_cb() -> Option<TryYieldReturn> {
+    let ptr = TRY_YIELD_RETURN.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: stored only by `register_try_yield_return` as this type.
+        Some(unsafe { std::mem::transmute::<*mut (), TryYieldReturn>(ptr) })
+    }
+}
+
 /// Per-jitdriver static data visible to the blackhole interpreter.
 ///
 /// Mirrors the subset of `metainterp_sd.jitdrivers_sd[jdindex]` that
@@ -331,6 +358,11 @@ pub struct BlackholeInterpreter {
     /// marker is a clean bail to the interpreter after the codewriter has
     /// already materialized the frame's resume coordinate.
     pub abort_permanent_bail: bool,
+    /// True when `abort_permanent` was `interp_jit.py dispatch` `except Yield`
+    /// rather than a bail. The frame is suspended: `tmpreg_r` holds the
+    /// yielded ref and `frame_finished_execution` must stay clear
+    /// (`generator.py send_ex` treats the bit as exhausted).
+    pub yield_exit: bool,
     /// Name of the residual whose unbound call produced this bail.
     /// `None` until a reject site or `resume_mainloop` fills it.
     pub bail_residual: Option<String>,
@@ -609,6 +641,7 @@ impl Default for BlackholeInterpreter {
             return_type: BhReturnType::Void,
             aborted: false,
             abort_permanent_bail: false,
+            yield_exit: false,
             bail_residual: None,
             got_exception: false,
             last_opcode_position: 0,
@@ -733,8 +766,8 @@ impl BlackholeInterpreter {
     ///
     /// Nothing else: upstream's `setposition` assigns `jitcode` and `position`
     /// and touches no other state.  `aborted` / `abort_permanent_bail` /
-    /// `got_exception` are reset where an interpreter is handed back
-    /// ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
+    /// `yield_exit` / `got_exception` are reset where an interpreter is handed
+    /// back ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
     /// fresh one, and `exception_last_value` is cleared by
     /// [`Self::cleanup_registers`] — which is upstream's owner for it too.
     /// Clearing it here dropped the exception a caller had already been
@@ -839,6 +872,7 @@ impl BlackholeInterpreter {
         self.return_type = BhReturnType::Void;
         self.aborted = false;
         self.abort_permanent_bail = false;
+        self.yield_exit = false;
         self.bail_residual = None;
         self.got_exception = false;
         self.state_field_layout = StateFieldLayout::default();
@@ -1565,10 +1599,12 @@ impl BlackholeInterpreter {
 
     /// pyre-only `BC_ABORT_PERMANENT` body. Routes a TLS-stashed exception
     /// through `RaiseException` (so `handle_exception_in_frame` can pick
-    /// the except handler); falls back to `aborted = true` + `LeaveFrame`
-    /// when no exception is set. RPython has no direct counterpart — the
-    /// canonical `abort_permanent/` handler is emitted by pyre's codegen
-    /// for fail-paths that should always terminate the blackhole frame.
+    /// the except handler). With no exception, a registered yield-return
+    /// callback may treat this marker as `interp_jit.py dispatch`
+    /// `except Yield` / `pyopcode.py YIELD_VALUE`: pop TOS, write a Ref
+    /// return, `LeaveFrame` without `aborted`. Otherwise `aborted = true`
+    /// + `LeaveFrame`. RPython has no `abort_permanent` opcode — pyre's
+    /// codegen emits the marker for fail-paths and for `YIELD_VALUE`.
     pub(crate) fn bhimpl_abort_permanent(&mut self) -> Result<(), DispatchError> {
         let exc = self.last_exc().get();
         if exc != 0 {
@@ -1596,6 +1632,28 @@ impl BlackholeInterpreter {
                 exc,
                 resume_position: self.position,
             });
+        }
+        // `codewriter.rs` emits `abort_permanent` before the SSA pop of
+        // `YIELD_VALUE`, so the live frame still holds the yielded TOS.
+        // Decode via the embedder (`try_yield_return`): a 1 return is
+        // `execute_frame` `except Yield` — copy the ref to the caller
+        // and leave this frame suspended. A 0 return, or no callback,
+        // is the existing bail (unported CALL, etc.).
+        if let Some(cb) = try_yield_return_cb() {
+            let frame_ptr = self.virtualizable_ptr;
+            let mut out = 0i64;
+            // Helper / continuation levels bind `virtualizable_ptr` to 0.
+            // `try_yield_return` falls back to `topframeref` in that case
+            // (`executioncontext.py enter` still published the yielding
+            // `PyFrame`). Skipping the callback when the pointer is 0 left
+            // `YIELD_VALUE` as `abort_permanent` bail, which finishes the
+            // generator (`send_ex` `frame_finished_execution`).
+            if cb(frame_ptr, &mut out) != 0 {
+                self.return_type = BhReturnType::Ref;
+                self.tmpreg_r = out;
+                self.yield_exit = true;
+                return Err(DispatchError::LeaveFrame);
+            }
         }
         self.aborted = true;
         self.abort_permanent_bail = true;
@@ -3128,6 +3186,7 @@ impl BlackholeInterpBuilder {
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.abort_permanent_bail = false;
+        interp.yield_exit = false;
         interp.bail_residual = None;
         interp.got_exception = false;
         // The virtualizable handle is frame identity, not builder state, and
@@ -3459,7 +3518,8 @@ impl BlackholeTerminalImage {
 /// `pyframe.py execute_frame` passes `w_exitvalue` (the dispatch result) to
 /// `return_trace` and `leave`. A Python portal returns a ref
 /// (`bhimpl_ref_return` / `_setup_return_value_r` / `get_tmpreg_r`). Unwind
-/// is `got_exception=True` with `w_exitvalue = space.w_None`.
+/// is `got_exception=True` with `w_exitvalue = space.w_None`. Yield is
+/// `interp_jit.py dispatch` `except Yield`: same hooks, frame not finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LevelExit {
     /// `_done_with_this_frame` / `_setup_return_value_r`: the interpreter
@@ -3468,15 +3528,21 @@ pub enum LevelExit {
     /// `_handle_jitexception` abandoned this non-portal level, or
     /// `_resume_mainloop` returned a live exception to the caller.
     Exception,
+    /// `execute_frame` `except Yield` / `portal_yield_frame_exit`: the
+    /// yielded ref. `frame_finished_execution` stays clear.
+    Yield(i64),
 }
 
 /// `execute_frame`'s `w_exitvalue` after `_resume_mainloop` returned.
 ///
-/// A live `current_exc` is the unwind path. A ref return is `get_tmpreg_r`.
-/// Int/float/void kinds do not invent `w_None`; a Python portal returns a ref.
+/// A live `current_exc` is the unwind path. A yield is `yield_exit`. A ref
+/// return is `get_tmpreg_r`. Int/float/void kinds do not invent `w_None`;
+/// a Python portal returns a ref.
 fn level_exit_after_resume(bh: &mut BlackholeInterpreter, current_exc: i64) -> LevelExit {
     if current_exc != 0 {
         LevelExit::Exception
+    } else if bh.yield_exit {
+        LevelExit::Yield(bh.get_tmpreg_r())
     } else {
         match bh.return_type {
             BhReturnType::Ref => LevelExit::Return(bh.get_tmpreg_r()),
@@ -7212,6 +7278,61 @@ mod tests {
                 !bh.got_exception,
                 "abort_permanent without pending TLS exception must not set got_exception"
             );
+        }
+
+        thread_local! {
+            static YIELD_RETURN_STUB_VALUE: std::cell::Cell<i64> =
+                const { std::cell::Cell::new(0) };
+        }
+
+        extern "C" fn yield_return_stub(_frame_ptr: i64, out_value: *mut i64) -> i32 {
+            let value = YIELD_RETURN_STUB_VALUE.with(|c| c.get());
+            if value == 0 || out_value.is_null() {
+                return 0;
+            }
+            unsafe { *out_value = value };
+            1
+        }
+
+        /// A registered yield-return callback turns a no-exception
+        /// `abort_permanent` into `interp_jit.py dispatch` `except Yield`:
+        /// LeaveFrame with a Ref result and without `aborted`, so
+        /// `resume_mainloop` copies the value to the caller instead of
+        /// `BailToInterpreter`.
+        #[test]
+        fn test_bh_abort_permanent_yield_return_leaves_without_abort() {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    YIELD_RETURN_STUB_VALUE.with(|c| c.set(0));
+                    register_try_yield_return(None);
+                }
+            }
+            let _guard = Guard;
+            const YIELDED: i64 = 0xBEEF;
+            YIELD_RETURN_STUB_VALUE.with(|c| c.set(YIELDED));
+            register_try_yield_return(Some(yield_return_stub));
+
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
+            let mut bh = builder.acquire_interp();
+            bh.virtualizable_ptr = 0x1000;
+            let outcome = bh.bhimpl_abort_permanent();
+            assert!(
+                matches!(outcome, Err(DispatchError::LeaveFrame)),
+                "yield-return must LeaveFrame"
+            );
+            assert!(
+                !bh.aborted && !bh.abort_permanent_bail,
+                "yield-return must not bail the chain"
+            );
+            assert!(bh.yield_exit);
+            assert_eq!(bh.tmpreg_r, YIELDED);
+            assert_eq!(bh.return_type, BhReturnType::Ref);
+            let exit = level_exit_after_resume(&mut bh, 0);
+            assert_eq!(exit, LevelExit::Yield(YIELDED));
         }
 
         /// `bhimpl_abort_permanent` must re-home the exception into a walked

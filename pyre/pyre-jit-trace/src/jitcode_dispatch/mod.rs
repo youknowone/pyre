@@ -16034,47 +16034,47 @@ fn handle<Sym: WalkSym>(
             // `ref_return/r` records. The frame stays suspended: do not set
             // `FLAG_FRAME_FINISHED`.
             if let Some((yielded, yield_py_pc)) = portal_yield_frame_exit(ctx, op.pc) {
-                if !yielded.is_constant() {
-                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
-                        ctx.trace_ctx.concrete_of_opref(yielded)
-                    {
-                        if ptr != 0 {
-                            ctx.trace_ctx.set_opref_concrete(
-                                yielded,
-                                majit_ir::Value::Ref(majit_ir::GcRef(ptr)),
-                            );
-                        }
+                let concrete_ptr = yield_finish_concrete_ptr(ctx, yielded);
+                if let Some(ptr) = concrete_ptr {
+                    if !yielded.is_constant() {
+                        ctx.trace_ctx.set_opref_concrete(
+                            yielded,
+                            majit_ir::Value::Ref(majit_ir::GcRef(ptr)),
+                        );
                     }
                 }
                 if ctx.is_top_level {
-                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
-                        ctx.trace_ctx.concrete_of_opref(yielded)
-                    {
-                        if ptr != 0 {
-                            fbw_finish_concrete_set(ConcreteValue::Ref(
-                                ptr as pyre_object::PyObjectRef,
-                            ));
-                        }
+                    // `tracing_finished` no-replay needs `fbw_finish_concrete`.
+                    // A Finish without it restarts past the parked yield
+                    // (`flush_yield_exit`) and `RETURN_VALUE` marks the
+                    // generator finished (`send_ex` `frame_finished_execution`).
+                    // Convert's `try_yield_return` pops the live TOS instead.
+                    if let Some(ptr) = concrete_ptr {
+                        fbw_finish_concrete_set(ConcreteValue::Ref(
+                            ptr as pyre_object::PyObjectRef,
+                        ));
+                        let (finish_arg, finish_arg_type) =
+                            fbw_terminate_with_finish(ctx, yielded, op.pc)?;
+                        flush_yield_exit(ctx, yield_py_pc);
+                        return Ok((
+                            DispatchOutcome::Terminate {
+                                finish_arg,
+                                finish_arg_type,
+                            },
+                            op.next_pc,
+                        ));
                     }
-                    let (finish_arg, finish_arg_type) =
-                        fbw_terminate_with_finish(ctx, yielded, op.pc)?;
-                    // After the finish's own `last_instr` store, so the hint
-                    // flushes the yield coordinate and the popped depth.
-                    flush_yield_exit(ctx, yield_py_pc);
+                } else if publish_nested_yield_exit(ctx, yield_py_pc) {
                     return Ok((
-                        DispatchOutcome::Terminate {
-                            finish_arg,
-                            finish_arg_type,
+                        DispatchOutcome::SubReturn {
+                            result: Some(yielded),
                         },
                         op.next_pc,
                     ));
                 }
-                return Ok((
-                    DispatchOutcome::SubReturn {
-                        result: Some(yielded),
-                    },
-                    op.next_pc,
-                ));
+                // This walk cannot name a concrete yield value or its portal
+                // red. SubReturn / Finish without that would skip the yield;
+                // convert instead.
             }
             // pyre-only `BC_ABORT_PERMANENT` fail-path
             // (`bhimpl_abort_permanent`, `blackhole.rs`): emitted for

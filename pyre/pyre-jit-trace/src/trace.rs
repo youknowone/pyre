@@ -3564,6 +3564,52 @@ fn apply_blackhole_crn_outcome(cf_addr: Option<usize>, live_root: usize, resume_
             (*(live_root as *mut pyre_interpreter::PyFrame)).last_instr = resume_py_pc as isize - 1;
         }
     }
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        dump_live_frame_after_blackhole("crn", live_root, Some(resume_py_pc));
+    }
+}
+
+/// Operand-stack image the interpreter will dispatch after a blackhole CRN.
+fn dump_live_frame_after_blackhole(tag: &str, live_root: usize, resume_py_pc: Option<usize>) {
+    if live_root == 0 {
+        eprintln!("[s2-post-bh] tag={tag} live_root=0");
+        return;
+    }
+    let frame = unsafe { &*(live_root as *const pyre_interpreter::PyFrame) };
+    let vsd = frame.valuestackdepth;
+    let base = frame.stack_base();
+    let last = frame.last_instr;
+    let next = frame.next_instr();
+    let opcode = unsafe {
+        let code = pyre_interpreter::pyframe_get_pycode(frame);
+        if code.is_null() {
+            "<no-code>".to_string()
+        } else {
+            pyre_interpreter::decode_instruction_at(&*code, next)
+                .map(|(instr, _)| format!("{instr:?}"))
+                .unwrap_or_else(|| "<undecodable>".to_string())
+        }
+    };
+    let slots = locals_w!(frame);
+    let start = base.saturating_sub(1);
+    let end = vsd.min(slots.len());
+    let mut words = Vec::new();
+    for i in start..end {
+        words.push(format!("{i}:{:#x}", slots[i] as usize));
+    }
+    let peek0 = vsd
+        .checked_sub(1)
+        .and_then(|i| slots.as_slice().get(i).copied())
+        .unwrap_or(std::ptr::null_mut());
+    let peek1 = vsd
+        .checked_sub(2)
+        .and_then(|i| slots.as_slice().get(i).copied())
+        .unwrap_or(std::ptr::null_mut());
+    eprintln!(
+        "[s2-post-bh] tag={tag} resume_py_pc={resume_py_pc:?} last={last} next={next} \
+         opcode={opcode} vsd={vsd} base={base} peek0={peek0:p} peek1={peek1:p} slots=[{}]",
+        words.join(" ")
+    );
 }
 
 struct SingleFrameBlackholeCash {
@@ -3910,6 +3956,10 @@ fn cash_multi_frame_blackhole(
     // Convert's `bh_portal_runner_c` levels instead take
     // `finish_per_code_blackhole_level` (`call_jit.rs`).
     let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        // Yield and Return both pass `got_exception = false`; only
+        // no-handler exception leave stamps FLAG_FINISHED. `execute_frame`
+        // `except Yield` still runs leave, but `generator.py send_ex`
+        // treats the bit as exhausted.
         crate::state::finish_blackhole_level_frame(
             frame_ptr,
             matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
@@ -4194,9 +4244,33 @@ fn cash_multi_frame_blackhole(
     fbw_diag::bump(fbw_diag::BLACKHOLE_ADOPTED_MULTI_FRAME);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!(
-            "[fbw-blackhole] adopted multi-frame terminal depth={}",
-            staged.framestack.len()
+            "[fbw-blackhole] adopted multi-frame terminal depth={} outcome={}",
+            staged.framestack.len(),
+            match &outcome {
+                majit_metainterp::jitexc::JitException::ContinueRunningNormally(args) => {
+                    format!("CRN green_int={:?}", args.green_int)
+                }
+                majit_metainterp::jitexc::JitException::BailToInterpreter => {
+                    "BailToInterpreter".to_string()
+                }
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
+                    "DoneWithThisFrameVoid".to_string()
+                }
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(_) => {
+                    "DoneWithThisFrameInt".to_string()
+                }
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(_) => {
+                    "DoneWithThisFrameRef".to_string()
+                }
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(_) => {
+                    "DoneWithThisFrameFloat".to_string()
+                }
+                majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) => {
+                    "ExitFrameWithExceptionRef".to_string()
+                }
+            }
         );
+        dump_live_frame_after_blackhole("mf-done", root_addr, None);
     }
     true
 }

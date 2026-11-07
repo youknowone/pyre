@@ -2102,7 +2102,13 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         };
         let frame_ptr = frame_ptr as usize;
         let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
-            latchdbg!("origin={origin} pf-nlocals");
+            latchdbg!(
+                "origin={origin} pf-nlocals index={index}/{} jitcode={} pc={} \
+                 frame_reg={frame_reg} frame_ptr={frame_ptr:#x}",
+                framestack.frames.len(),
+                frame.jitcode.name(),
+                frame.pc
+            );
             return false;
         };
         let Some(stack_depth) = crate::state::concrete_stack_depth(frame_ptr) else {
@@ -3484,11 +3490,91 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     };
     frames.push(innermost.miframe);
     banks.push(innermost.banks);
+    repair_portal_frame_regs(ctx, &frames, &mut banks, origin);
     s2built!(
         "origin={origin} BUILT multi-frame depth={}",
         frames.frames.len()
     );
     Some((frames, banks))
+}
+
+/// Live portal PyFrame the walk is tracing, forwarded through the
+/// snapshot_sym root. Index 0 of a multi-frame image must be this
+/// object (`convert_and_run_from_pyjitpl` / one red frame per MIFrame).
+fn live_portal_frame_addr<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> usize {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return 0;
+    }
+    unsafe {
+        let sym = &*ctx.fbw_mode.snapshot_sym;
+        let live = match ctx.trace_ctx.lookup_opref_concrete(sym.frame()) {
+            Some(majit_ir::Value::Ref(value)) if value.0 != 0 => value.0,
+            _ => sym.live_vable_frame_addr(),
+        };
+        if live != 0 {
+            live
+        } else {
+            sym.tracing_vable_frame_addr()
+        }
+    }
+}
+
+/// Restore each MIFrame's portal red from the live PyFrame that belongs
+/// to that level when the copied Ref bank holds a non-address (an int
+/// box in `registers_r` is a tracer bug; `_copy_data_from_miframe`
+/// (`blackhole.py`) never dereferences one as a virtualizable).
+///
+/// Index 0 is the walked portal; the innermost inline sub-walk's frame
+/// is [`current_inline_concrete_frame`]. A middle Python level with a
+/// bad word is left for preflight to decline — stuffing the portal
+/// frame into a callee would collapse reds onto one anchor.
+fn repair_portal_frame_regs<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frames: &majit_metainterp::MIFrameStack,
+    banks: &mut [majit_metainterp::BlackholeAbortBanks],
+    origin: &'static str,
+) {
+    let root = live_portal_frame_addr(ctx);
+    let innermost_live = current_inline_concrete_frame();
+    let n = frames.frames.len();
+    for (index, frame) in frames.frames.iter().enumerate() {
+        let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            continue;
+        };
+        let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
+        if frame_reg == u16::MAX {
+            continue;
+        }
+        let Some(slot) = banks
+            .get_mut(index)
+            .and_then(|b| b.registers_r.get_mut(frame_reg as usize))
+        else {
+            continue;
+        };
+        let word = slot.unwrap_or(0) as usize;
+        if crate::state::concrete_frame_word_is_address(word) {
+            continue;
+        }
+        let fallback =
+            if index + 1 == n && crate::state::concrete_frame_word_is_address(innermost_live) {
+                innermost_live
+            } else if index == 0 {
+                root
+            } else {
+                0
+            };
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[portal-frame-repair] origin={origin} index={index}/{n} jitcode={} \
+                 pc={} frame_reg={frame_reg} word={word:#x} fallback={fallback:#x}",
+                frame.jitcode.name(),
+                frame.pc
+            );
+        }
+        if crate::state::concrete_frame_word_is_address(fallback) {
+            *slot = Some(fallback as i64);
+        }
+    }
 }
 
 /// TLS cell pointer for the store-journal root area: the undo stays armed

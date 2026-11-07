@@ -17402,6 +17402,110 @@ pub(super) fn portal_yield_frame_exit<Sym: WalkSym>(
     Some((value, py_pc as i64))
 }
 
+/// Concrete pointer `compile_done_with_this_frame` no-replay needs for a
+/// yield Finish.
+///
+/// `eval.rs` `tracing_finished` takes `ContinueRunningNormally` when
+/// `fbw_finish_concrete` is empty. That restart sits on the yield's own
+/// `last_instr` (`flush_yield_exit`), so `next_instr()` skips the opcode,
+/// the generator falls through to `RETURN_VALUE`, and `send_ex` treats
+/// `frame_finished_execution` as exhaustion. The optimizer box may be
+/// unstamped (`NewWithVtable` before allocation); the virtualizable slot
+/// still holds the live TOS (`virtualizable.py` `read_boxes`).
+pub(super) fn yield_finish_concrete_ptr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    yielded: OpRef,
+) -> Option<usize> {
+    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
+        ctx.trace_ctx.concrete_of_opref(yielded)
+    {
+        if ptr != 0 {
+            return Some(ptr);
+        }
+    }
+    portal_yield_tos_heap_ptr(ctx)
+}
+
+/// Live TOS the yield marker wrote into the standard virtualizable.
+fn portal_yield_tos_heap_ptr<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+    let info = ctx.trace_ctx.virtualizable_info()?;
+    let depth_index = info.static_field_index_by_name("valuestackdepth")?;
+    let (_, majit_ir::Value::Int(depth)) = ctx.trace_ctx.virtualizable_entry_at(depth_index)?
+    else {
+        return None;
+    };
+    let slot = usize::try_from(depth).ok()?.checked_sub(1)?;
+    let flat = crate::virtualizable_gen::NUM_VABLE_SCALARS + slot;
+    match ctx.trace_ctx.virtualizable_entry_at(flat) {
+        Some((_, majit_ir::Value::Ref(majit_ir::GcRef(ptr)))) if ptr != 0 => Some(ptr),
+        _ => None,
+    }
+}
+
+/// Publish a nested `except Yield` onto this walk's own portal red.
+///
+/// `walk_generator_resume` holds `InlineConcreteFrameGuard` on the OUTER
+/// generator, so `current_inline_concrete_frame` is not this frame.
+/// `registers_r[portal_frame_reg]` is the red this MIFrame executes on
+/// (`interp_jit.py` `reds = ['frame', 'ec']`). Without that store, a
+/// `SubReturn` leaves `last_instr` at `emit_abort_permanent`'s `py_pc - 1`
+/// (or on the outer generator) and the next `send` skips the yield.
+/// `false` means the red is unnamed: the caller falls through to
+/// `AbortPermanentMarkerReached` so convert's `try_yield_return` can pop.
+pub(super) fn publish_nested_yield_exit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    yield_py_pc: i64,
+) -> bool {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return false;
+    };
+    let (frame_reg, _) = crate::state::portal_red_regs_at(consts.jitcode_index);
+    if frame_reg == u16::MAX {
+        return false;
+    }
+    let Some(frame_box) = ctx.registers_r.get(frame_reg as usize) else {
+        return false;
+    };
+    if frame_box.is_none() {
+        return false;
+    }
+    let frame = match ctx.trace_ctx.concrete_of_opref(frame_box) {
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr)))
+            if crate::state::concrete_frame_word_is_address(ptr) =>
+        {
+            ptr
+        }
+        _ => match ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(frame_reg as usize)
+        {
+            Some(ConcreteValue::Ref(ptr))
+                if crate::state::concrete_frame_word_is_address(*ptr as usize) =>
+            {
+                *ptr as usize
+            }
+            _ => return false,
+        },
+    };
+    let Some(top) =
+        crate::state::concrete_stack_depth(frame).and_then(|depth| depth.checked_sub(1))
+    else {
+        return false;
+    };
+    fbw_arm_durable_frame_undo(frame);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(frame as pyre_object::PyObjectRef);
+    let live = pyre_object::gc_roots::shadow_stack_get(frame_root) as usize;
+    publish_generator_suspension(ctx, live, frame_box, "valuestackdepth", top as i64);
+    let live = pyre_object::gc_roots::shadow_stack_get(frame_root) as usize;
+    publish_generator_suspension(ctx, live, frame_box, "last_instr", yield_py_pc);
+    publish_generator_slot_null(ctx, frame_root, frame_box, top);
+    true
+}
+
 /// The yielded ref the `abort_permanent` marker just flushed into the portal
 /// virtualizable. `valuestackdepth` is absolute, so the popped slot is one
 /// below it.
@@ -19322,6 +19426,14 @@ fn walk_generator_resume<Sym: WalkSym>(
         let locals_array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_box);
         for &(bank, color, slot) in &pcdep {
             if bank != 1 {
+                continue;
+            }
+            // `extra_ref_seeds` later entries overwrite earlier ones at
+            // the same color. Portal reds (`interp_jit.py reds =
+            // ['frame', 'ec']`) were already seeded from `frame_box` /
+            // `ec_box`; a pcdep color that collides with either would
+            // replace the live PyFrame with a local.
+            if color == portal_frame_reg || color == portal_ec_reg {
                 continue;
             }
             // GETFIELD of `locals_cells_stack_w` / GETARRAYITEM of a prior
@@ -23811,6 +23923,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 transparent_helper_trace_at_entry: None,
                 inline_caller_py_pc: site.inline_caller_py_pc,
                 immediate_inline_caller_py_pc: site.immediate_inline_caller_py_pc,
+                // `generator_resume` is this body's own latch
+                // (`walk_generator_resume`). A nested portal for a different
+                // `w_code` must not inherit it: that would disable
+                // `portal_yield_frame_exit` on the inner yield.
+                generator_resume: ctx
+                    .fbw_mode
+                    .generator_resume
+                    .filter(|resume| inline_w_code != 0 && inline_w_code == resume.w_pycode),
                 ..ctx.fbw_mode.clone()
             };
             (
@@ -23847,6 +23967,10 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                     .fbw_mode
                     .inline_caller_py_pc
                     .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
+                // `FbwWalkMode.generator_resume` is only the resume
+                // sub-walk. Cloning the parent mode onto a helper would
+                // keep `portal_yield_frame_exit` off an inner `YIELD_VALUE`.
+                generator_resume: None,
                 ..ctx.fbw_mode.clone()
             };
             (
@@ -23856,6 +23980,21 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 ctx.outer_jitcode_index,
             )
         }
+    };
+    // User-call inlining stamps `inline_callee_consts` on the child
+    // WalkContext (`try_walker_inline_user_call`). This door is the
+    // generator-resume twin (`SubwalkFrameKind::PythonPortal`): without
+    // the body's jitcode index, `innermost_walk_jitcode` falls through
+    // to `snapshot_sym` (the outer portal) while `resume_pc` and the
+    // banks belong to the generator.
+    let inline_callee_consts = if is_python_portal {
+        sub_body.jitcode_index.and_then(|index| {
+            i32::try_from(index)
+                .ok()
+                .map(|jitcode_index| InlineCalleeConsts { jitcode_index })
+        })
+    } else {
+        None
     };
     let frame = SubWalkFrame {
         _helper_live: HelperLiveGuard {
@@ -23874,13 +24013,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         concrete_registers_i: callee_concrete_i,
 
         // The innermost MIFrame's jitcode is the body this sub-walk executes (`pyjitpl.py` `newframe(jitcode)`).
-        inline_callee_consts: if is_python_portal {
-            sub_body.jitcode_index.map(|index| InlineCalleeConsts {
-                jitcode_index: index as i32,
-            })
-        } else {
-            None
-        },
+        inline_callee_consts,
         _inline_frame: None,
         fbw_mode,
         session: ctx.session,
