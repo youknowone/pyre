@@ -2492,8 +2492,10 @@ fn encode_value_into_endian(
     swapped: bool,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
-        let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
-        let copy = pyre_object::with_roots!(dest, value => pyre_object::bytesobject::w_bytes_from_bytes(&cfield::clone_as_null_terminated(raw)));
+        let owned = cfield::clone_as_null_terminated(unsafe {
+            pyre_object::bytesobject::w_bytes_data(value)
+        });
+        let copy = pyre_object::with_roots!(dest, value => pyre_object::bytesobject::w_bytes_from_bytes(&owned));
         // Retain the copy before reading its address, so a GC triggered while
         // inserting the keepalive cannot leave the stored pointer stale.  Until
         // `keep_alive` links it into the root, only this frame holds the copy and
@@ -2502,11 +2504,15 @@ fn encode_value_into_endian(
         let base = roots.pin_roots(&[copy, dest]);
         keep_ref(roots.get(base + 1), key, value);
         keep_alive(roots.get(base + 1), key, roots.get(base));
-        let addr =
-            unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base)).as_ptr() } as usize;
+        // `rffi.get_raw_address_of_string`: the address is stored for the
+        // object's lifetime.
+        let addr = unsafe { pyre_object::bytesobject::w_bytes_raw_address(roots.get(base)) };
+        if addr.is_null() {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
         return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
-            cfield::SimpleStorageValue::Pointer(addr),
+            cfield::SimpleStorageValue::Pointer(addr as usize),
             swapped,
         ));
     }

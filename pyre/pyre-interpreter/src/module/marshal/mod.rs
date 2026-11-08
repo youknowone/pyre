@@ -45,46 +45,26 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-enum MarshalBytes {
-    Borrowed(&'static [u8]),
-    Owned(Vec<u8>),
-}
-
-impl MarshalBytes {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(bytes) => bytes,
-            Self::Owned(bytes) => bytes,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-}
-
-fn bytes_like(obj: PyObjectRef, function: &str) -> Result<MarshalBytes, PyError> {
+fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     if unsafe { bytesobject::is_bytes_like(obj) } {
-        return Ok(MarshalBytes::Borrowed(unsafe {
-            bytesobject::bytes_like_data(obj)
-        }));
+        // `StringUnmarshaller` reads its own str: copy before
+        // `unmarshal_bytes` allocates.
+        return Ok(unsafe { bytesobject::bytes_like_data(obj).to_vec() });
     }
     if unsafe { memoryview::is_w_memoryview(obj) } {
         unsafe { crate::builtins::memoryview_check_released(obj) }?;
         crate::typedef::require_contiguous_buffer(obj)?;
         let view = unsafe { memoryview::w_memoryview_view(obj) };
         return Ok(match unsafe { view.as_contiguous_bytes() } {
-            Some(bytes) => MarshalBytes::Borrowed(bytes),
-            None => MarshalBytes::Owned(unsafe { view.gather() }),
+            Some(bytes) => bytes.to_vec(),
+            None => unsafe { view.gather() },
         });
     }
     // Any readable buffer is accepted (`interp_marshal` unwraps via
     // `space.readbuf_w`): `SourcelessFileLoader.get_code` hands `loads` a
     // sliced memoryview of the pyc payload.
     if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
-        return Ok(MarshalBytes::Owned(
-            unsafe { bytesobject::bytes_like_data(src) }.to_vec(),
-        ));
+        return Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec());
     }
     Err(PyError::type_error(format!(
         "{function}() argument must be a bytes-like object"
@@ -665,7 +645,7 @@ impl FileReader {
                 bytes.len()
             )));
         }
-        self.scratch.extend_from_slice(bytes.as_slice());
+        self.scratch.extend_from_slice(&bytes);
         Ok(())
     }
 
@@ -1406,7 +1386,7 @@ crate::py_module! {
             let allow_code =
                 resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
             let data = bytes_like(pyre_object::gc_roots::shadow_stack_get(base), "loads")?;
-            unmarshal_bytes(data.as_slice(), allow_code)
+            unmarshal_bytes(&data, allow_code)
         }
         // interp_marshal.py `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
         // — writes the stream `dumps` would return to `f.write`
@@ -1548,11 +1528,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_bytes_are_borrowed_for_unmarshal() {
+    fn exact_bytes_are_copied_for_unmarshal() {
         let input = bytesobject::w_bytes_from_bytes(b"payload");
         let bytes = bytes_like(input, "loads").expect("bytes input");
 
-        assert!(matches!(bytes, MarshalBytes::Borrowed(b"payload")));
+        assert_eq!(bytes, b"payload");
     }
 
     #[test]

@@ -2403,10 +2403,17 @@ fn com_status(
 #[cfg(windows)]
 fn com_error_iid(obj: PyObjectRef, com: Option<(usize, usize)>) -> Option<(usize, usize)> {
     let (this_ptr, _) = com?;
-    let iid = instance_get(obj, IID_KEY)?;
+    let mut iid = instance_get(obj, IID_KEY)?;
     let (addr, len) = if unsafe { pyre_object::is_bytes(iid) } {
-        let data = unsafe { pyre_object::bytesobject::w_bytes_data(iid) };
-        (data.as_ptr() as usize, data.len())
+        // `rffi.get_raw_address_of_string`: the address is a COM iid pointer.
+        let len = unsafe { pyre_object::bytesobject::w_bytes_len(iid) };
+        let addr = pyre_object::with_roots!(iid => unsafe {
+            pyre_object::bytesobject::w_bytes_raw_address(iid)
+        });
+        if addr.is_null() {
+            return None;
+        }
+        (addr as usize, len)
     } else {
         (cdata::cdata_addr(iid)?, cdata::cdata_len(iid)?)
     };
@@ -2719,7 +2726,14 @@ fn argument_address(mut obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyE
         return Ok(pyre_interpreter::baseobjspace::int_w(obj)? as usize);
     }
     if unsafe { pyre_object::is_bytes(obj) } {
-        return Ok(unsafe { pyre_object::bytesobject::w_bytes_data(obj) }.as_ptr() as usize);
+        // `rffi.get_raw_address_of_string`: the address is handed to C.
+        let addr = pyre_object::with_roots!(obj => unsafe {
+            pyre_object::bytesobject::w_bytes_raw_address(obj)
+        });
+        if addr.is_null() {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
+        return Ok(addr as usize);
     }
     if is_funcptr_instance(obj) {
         return funcptr_buffer_word(obj);
@@ -2981,10 +2995,15 @@ fn internal_pybytes_fromstringandsize(
             "PyBytes_FromStringAndSize needs string and size",
         ));
     }
-    let bytes = unsafe { pyre_object::bytesobject::w_bytes_data(args[0]) };
-    let size = pyre_interpreter::baseobjspace::int_w(args[1])?.max(0) as usize;
+    let mut src = args[0];
+    let size_obj = args[1];
+    // `space.int_w` can run `__index__`; re-read `W_BytesObject._value` after
+    // it (`StringBuffer.getitem`).
+    let size = pyre_object::with_roots!(src => pyre_interpreter::baseobjspace::int_w(size_obj))?
+        .max(0) as usize;
+    let data = unsafe { pyre_object::bytesobject::w_bytes_data(src) };
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-        &bytes[..size.min(bytes.len())],
+        &data[..size.min(data.len())],
     ))
 }
 

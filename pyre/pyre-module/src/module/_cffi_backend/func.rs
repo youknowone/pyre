@@ -306,12 +306,10 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             unsafe { pyre_interpreter::builtins::fileio_writebuf(roots.get(object_slot)) }?;
         (data.as_mut_ptr(), data.len() as i64, owner)
     } else {
-        let data = unsafe { pyre_interpreter::builtins::acquire_readbuf(roots.get(object_slot)) }?;
-        (
-            data.as_ptr().cast_mut(),
-            data.len() as i64,
-            roots.get(object_slot),
-        )
+        let (ptr, len) = unsafe {
+            pyre_interpreter::builtins::acquire_readbuf_raw_address(roots.get(object_slot))
+        }?;
+        (ptr, len as i64, roots.get(object_slot))
     };
     let owner_slot = object_slot + 2;
     let _ = roots.pin_root(owner);

@@ -646,6 +646,20 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         ));
         return -1;
     }
+    // `buf.get_raw_address()` (`StringBuffer.get_raw_address` /
+    // `rffi.get_raw_address_of_string`): the address C stores must not move.
+    // Take it before `make_ref` so a MemoryError does not leak C refs.
+    let first = unsafe {
+        pyre_object::memoryview::w_memoryview_view(reload(view_slot))
+            .backing()
+            .get_raw_address()
+    };
+    if first.is_null() {
+        release_acquired(reload(view_slot));
+        super::pyerrors::set_pending_error(crate::PyError::memory_error(""));
+        return -1;
+    }
+    let first = first as usize;
     // Both references first: minting one can move what the other names.
     let holder = pyobject::make_ref(reload(view_slot));
     let exporter = pyobject::make_ref(reload(obj_slot));
@@ -669,9 +683,6 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         strides: widen(unsafe { carrier.native_strides() }),
         suboffsets: widen(unsafe { carrier.native_suboffsets() }),
     });
-    // The exporter's own storage, which the collector does not move: the
-    // address stays the one C was handed for as long as the export is open.
-    let first = unsafe { carrier.backing().as_bytes() }.as_ptr() as usize;
     // `init_shape_strides` answers NULL for a zero-dimensional view, and an
     // empty `Vec` hands out a dangling address rather than one.
     let axes = carrier.ndim() != 0;

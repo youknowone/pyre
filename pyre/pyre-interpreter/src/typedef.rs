@@ -27493,9 +27493,12 @@ fn init_bytes_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__getnewargs__",
                 |args| {
-                    let data = unsafe { pyre_object::w_bytes_data(args[0]) };
+                    // `descr_getnewargs` / `space.newbytes(self._value)` shares
+                    // the rstr.
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_bytes_from_bytes(data));
+                    fields.push(unsafe {
+                        pyre_object::w_bytes_from_block(pyre_object::w_bytes_block(args[0]))
+                    });
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,

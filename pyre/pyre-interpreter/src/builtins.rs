@@ -1786,17 +1786,19 @@ fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// `memoryview._pypy_raw_address` — the integer raw address of the view's
 /// backing store, base data pointer plus the view's byte offset
-/// (`descr_pypy_raw_address` → `get_raw_address`).  Every pyre backing
-/// (bytes / bytearray / array) is a contiguous in-heap store with a real
-/// data pointer, so the "no raw address" branch is structurally unreachable.
+/// (`descr_pypy_raw_address` → `get_raw_address`).
 fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mut mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
-        let view = pyre_object::memoryview::w_memoryview_view(mv);
-        let base = view.backing().as_bytes().as_ptr() as usize;
-        let offset = view.offset() as usize;
-        Ok(w_int_new((base + offset) as i64))
+        let (base, offset) = pyre_object::with_roots!(mv => {
+            let view = pyre_object::memoryview::w_memoryview_view(mv);
+            (view.backing().get_raw_address(), view.offset() as usize)
+        });
+        if base.is_null() {
+            return Err(crate::PyError::memory_error(""));
+        }
+        Ok(w_int_new((base as usize + offset) as i64))
     }
 }
 
@@ -25521,6 +25523,60 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
         // This is the object-space acquisition layer; public gateways that
         // own a more specific refusal (for example mmap's `Py_buffer`
         // converter) translate this TypeError at their boundary.
+        Err(crate::PyError::type_error(
+            "a bytes-like object is required",
+        ))
+    }
+}
+
+/// `space.readbuf_w` plus `Buffer.get_raw_address`: a C address that outlives
+/// this call (`rffi.get_raw_address_of_string` for a bytes STR).
+pub unsafe fn acquire_readbuf_raw_address(
+    obj: PyObjectRef,
+) -> Result<(*mut u8, usize), crate::PyError> {
+    unsafe {
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
+        {
+            return Ok((address as *mut u8, length));
+        }
+        if pyre_object::bytesobject::is_bytes(obj) {
+            let ptr = pyre_object::bytesobject::w_bytes_raw_address(obj);
+            if ptr.is_null() {
+                return Err(crate::PyError::memory_error(""));
+            }
+            return Ok((ptr, pyre_object::bytesobject::w_bytes_len(obj)));
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
+            return Ok((data.as_ptr() as *mut u8, data.len()));
+        }
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
+            return Ok((address as *mut u8, length));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            let data = pyre_object::interp_array::w_array_bytes(obj);
+            return Ok((data.as_ptr() as *mut u8, data.len()));
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if !memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let view = pyre_object::memoryview::w_memoryview_view(obj);
+            let base = view.backing().get_raw_address();
+            if base.is_null() {
+                return Err(crate::PyError::memory_error(""));
+            }
+            let off = view.offset() as usize;
+            let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+            return Ok((base.add(off), len));
+        }
         Err(crate::PyError::type_error(
             "a bytes-like object is required",
         ))

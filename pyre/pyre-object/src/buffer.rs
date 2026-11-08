@@ -228,7 +228,9 @@ impl Buffer {
 
     /// The byte storage this buffer exposes (`getlength` is its `.len()`).  A
     /// `Sub` is the `[offset, offset+size)` window of its parent, clamped to
-    /// the parent's live length (`SubBuffer.getlength`, `buffer.py:413`).
+    /// the parent's live length (`SubBuffer.getlength`).
+    ///
+    /// A `String` slice is valid until the next collection that moves the STR.
     ///
     /// # Safety
     /// The variant's `w_obj` must point to a live object of the tagged kind.
@@ -276,6 +278,50 @@ impl Buffer {
                         at_most
                     };
                     &full[off..off + length]
+                }
+            }
+        }
+    }
+
+    /// `Buffer.get_raw_address` (`rpython/rlib/buffer.py`).
+    ///
+    /// A `String` buffer uses `rffi.get_raw_address_of_string`. Null means
+    /// MemoryError is pending. The exporter must be rooted: moving out of
+    /// the nursery can collect. A `Sub` is `parent.get_raw_address() + offset`
+    /// (`SubBuffer.get_raw_address`).
+    ///
+    /// # Safety
+    /// The variant's `w_obj` must point to a live object of the tagged kind.
+    pub unsafe fn get_raw_address(&self) -> *mut u8 {
+        unsafe {
+            match self {
+                Buffer::String { w_obj } => crate::bytesobject::w_bytes_raw_address(*w_obj),
+                Buffer::Byte { w_obj } => {
+                    crate::bytearrayobject::w_bytearray_data(*w_obj).as_ptr() as *mut u8
+                }
+                Buffer::Array { w_obj } => {
+                    crate::interp_array::w_array_bytes(*w_obj).as_ptr() as *mut u8
+                }
+                Buffer::External {
+                    w_obj,
+                    address,
+                    size,
+                    ..
+                } => {
+                    let (address, _) = match external_buffer_view(*w_obj) {
+                        Some(Ok((address, size, _))) => (address, size),
+                        Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
+                        None => (*address, *size),
+                    };
+                    address as *mut u8
+                }
+                Buffer::Sub { parent, offset, .. } => {
+                    let base = parent.get_raw_address();
+                    if base.is_null() {
+                        core::ptr::null_mut()
+                    } else {
+                        base.wrapping_add(*offset)
+                    }
                 }
             }
         }
