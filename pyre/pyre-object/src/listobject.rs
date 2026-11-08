@@ -406,8 +406,10 @@ impl W_ListObject {
         unsafe { std::slice::from_raw_parts(items_block_items_base(self.items), len) }
     }
 
+    /// Blackhole `bhimpl_inline_call_*` native-calls `jitcode.fnaddr`
+    /// (`call.py getfunctionptr`); `jit_fnaddr.rs` publishes this method.
     #[inline]
-    fn live_len(&self) -> usize {
+    pub fn live_len(&self) -> usize {
         match self.strategy {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
@@ -1680,7 +1682,11 @@ unsafe fn install_range_state(obj: PyObjectRef, strategy: ListStrategy, values: 
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
 /// expected to perform the actual append immediately afterward.
-unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRef) -> PyObjectRef {
+/// `pub` because the blackhole calls it by address (`call.py getfunctionptr`).
+pub unsafe fn switch_to_correct_strategy(
+    list: &mut W_ListObject,
+    w_item: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::publish_roots(&[list as *mut W_ListObject as PyObjectRef, w_item]);

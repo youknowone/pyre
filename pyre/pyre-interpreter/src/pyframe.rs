@@ -4079,6 +4079,18 @@ register_frame_builtin_wrapper!(
     __majit_wrap_descr_typecheck_fset_f_trace_opcodes
 );
 
+/// `pyframe.py PyFrame.get_w_globals` override: `debugdata.w_globals`.
+///
+/// A looked-inside field read of that GC interior is
+/// `jtransform.py rewrite_op_getsubstruct` refused as `abort`. Residual:
+/// `blackhole.py` `bhimpl_inline_call_*` native-calls `getfunctionptr`.
+/// Typical frames have a null `debugdata` and take `getcode().w_globals`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_w_globals_from_debugdata(frame: &PyFrame) -> PyObjectRef {
+    unsafe { (*frame.debugdata).w_globals }
+}
+
 impl PyFrame {
     /// pyframe.py getdebug → self.debugdata
     #[inline]
@@ -4218,13 +4230,16 @@ impl PyFrame {
     /// `hook_access_field` inserts `jit_force_virtualizable`; `jtransform`
     /// deletes the Call in looked-inside graphs. A native force here would
     /// abort residual IMPORT_NAME / MAKE_FUNCTION (`flatten.rs`
-    /// `load_import_globals`).
+    /// `load_import_globals`). The override arm is
+    /// [`get_w_globals_from_debugdata`]: a looked-inside interior read is
+    /// `rewrite_op_getsubstruct` `abort`.
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
-        if let Some(data) = self.getdebug_data() {
-            return data.w_globals;
+        if self.debugdata.is_null() {
+            unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
+        } else {
+            get_w_globals_from_debugdata(self)
         }
-        unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
     }
 
     /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override

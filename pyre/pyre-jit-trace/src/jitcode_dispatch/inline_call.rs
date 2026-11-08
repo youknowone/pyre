@@ -3260,8 +3260,9 @@ fn summarize_body_blockers_from(
             // raise runs forward over bytes no fallthrough reaches — the walker
             // routes `raise/r` and `reraise/` through exactly this lookahead
             // (`mod.rs`, the current-frame arm).  Seeded like `catch_exception`
-            // below and for the same reason: the state at the raise is one of
-            // several the handler can be entered with.
+            // below: `catch_exception L` guards this raising op
+            // (`handle_exception_in_frame`), so the handler is reachable
+            // from this resume only when the scan already passed it.
             //
             // No body in the current build takes this edge — every one of the
             // 1764 `catch_exception` ops sits after a call, which the
@@ -3276,9 +3277,7 @@ fn summarize_body_blockers_from(
                         work,
                         target,
                         DescentPoint {
-                            // A handler is entered from any op in its region,
-                            // so it may run after the resume point.
-                            resumed: true,
+                            resumed,
                             effect: true,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
@@ -3314,20 +3313,23 @@ fn summarize_body_blockers_from(
                 }
             }
             "catch_exception" => {
-                // The exception this handler catches can be raised by any op in
-                // the region it protects, so the handler is entered with the
-                // join of every state in the body rather than this op's.
-                // Seeding it as effectful is the sound over-approximation of
-                // that join.
+                // `catch_exception L` guards the immediately preceding call
+                // (`handle_exception_in_frame` inspects the instruction after
+                // that call's trailing `-live-`). The handler is entered with
+                // the join of every state in the protected region, so it is
+                // seeded effectful; it is reachable from this resume only
+                // when the scan already passed that call (`resumed` is then
+                // set here). Resume after a residual call lands on the
+                // trailing live or this catch
+                // (`helper_residual_guard_lands_on_catch`); `resumed` is
+                // true in that case too.
                 if let Some(target) = label {
                     push!(
                         points,
                         work,
                         target,
                         DescentPoint {
-                            // A handler is entered from any op in its region,
-                            // so it may run after the resume point.
-                            resumed: true,
+                            resumed,
                             effect: true,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
