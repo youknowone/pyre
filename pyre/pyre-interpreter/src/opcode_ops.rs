@@ -7,6 +7,16 @@ use crate::{
     pow, rshift, sub, truediv, xor,
 };
 
+/// Which `StdObjSpaceFrame` opcode replacement applies (`frame.py`
+/// `_intshortcut`, `list_BINARY_SUBSCR`). Only reads `ob_type`; never collects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StdFrameShortcut {
+    None,
+    IntAdd,
+    IntSub,
+    ListSubscr,
+}
+
 /// `frame.py` `_intshortcut` and `list_BINARY_SUBSCR`.
 ///
 /// `pypyoption.py` turns `intshortcut` and `optimized_list_getitem` on at
@@ -15,41 +25,59 @@ use crate::{
 /// `W_IntObject` takes `w_list_getitem`. `None` is the generic
 /// `binaryoperation()` fall-through.
 #[majit_macros::always_inline]
-pub(crate) fn stdframe_binop_shortcut(
+pub(crate) fn stdframe_binop_shortcut_kind(
     a: PyObjectRef,
     b: PyObjectRef,
     op: BinaryOperator,
-) -> Result<Option<PyObjectRef>, PyError> {
+) -> StdFrameShortcut {
     unsafe {
         match op {
             BinaryOperator::Add | BinaryOperator::InplaceAdd
                 if pyre_object::py_type_check(a, &pyre_object::INT_TYPE)
                     && pyre_object::py_type_check(b, &pyre_object::INT_TYPE) =>
             {
-                Ok(Some(crate::objspace::descroperation::_int_add(
-                    pyre_object::w_int_get_value(a),
-                    pyre_object::w_int_get_value(b),
-                )?))
+                StdFrameShortcut::IntAdd
             }
             BinaryOperator::Subtract | BinaryOperator::InplaceSubtract
                 if pyre_object::py_type_check(a, &pyre_object::INT_TYPE)
                     && pyre_object::py_type_check(b, &pyre_object::INT_TYPE) =>
             {
-                Ok(Some(crate::objspace::descroperation::_int_sub(
-                    pyre_object::w_int_get_value(a),
-                    pyre_object::w_int_get_value(b),
-                )?))
+                StdFrameShortcut::IntSub
             }
             BinaryOperator::Subscr
                 if pyre_object::py_type_check(a, &pyre_object::LIST_TYPE)
                     && pyre_object::py_type_check(b, &pyre_object::INT_TYPE) =>
             {
+                StdFrameShortcut::ListSubscr
+            }
+            _ => StdFrameShortcut::None,
+        }
+    }
+}
+
+/// The replacement opcode body for a `kind` other than `None`.
+pub(crate) fn stdframe_binop_shortcut_apply(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    kind: StdFrameShortcut,
+) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        match kind {
+            StdFrameShortcut::IntAdd => crate::objspace::descroperation::_int_add(
+                pyre_object::w_int_get_value(a),
+                pyre_object::w_int_get_value(b),
+            ),
+            StdFrameShortcut::IntSub => crate::objspace::descroperation::_int_sub(
+                pyre_object::w_int_get_value(a),
+                pyre_object::w_int_get_value(b),
+            ),
+            StdFrameShortcut::ListSubscr => {
                 match pyre_object::w_list_getitem(a, pyre_object::w_int_get_value(b)) {
-                    Some(w) => Ok(Some(w)),
+                    Some(w) => Ok(w),
                     None => Err(PyError::index_error("list index out of range")),
                 }
             }
-            _ => Ok(None),
+            StdFrameShortcut::None => unreachable!(),
         }
     }
 }
@@ -231,10 +259,11 @@ fn binary_value_from_tag_inner(
     // Same `StdObjSpaceFrame` patches as [`binary_value`]: this is the
     // graph `try_walker_orthodox_binary_op` descends, so the type tests
     // have to live here or traces still walk `space.add`.
-    if let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag)
-        && let Some(w) = stdframe_binop_shortcut(a, b, op)?
-    {
-        return Ok(w);
+    if let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag) {
+        let kind = stdframe_binop_shortcut_kind(a, b, op);
+        if kind != StdFrameShortcut::None {
+            return stdframe_binop_shortcut_apply(a, b, kind);
+        }
     }
     // In-place tags (13-24) must consult the in-place special (`__iadd__`
     // etc.) first; route them through `binary_value`.  Tags 0-12 use the
@@ -1754,32 +1783,54 @@ mod tests {
 
     #[test]
     fn test_stdframe_binop_shortcut_exact_ints_and_list_subscr() {
-        let add = stdframe_binop_shortcut(w_int_new(8), w_int_new(3), BinaryOperator::Add)
-            .expect("intshortcut add should succeed")
-            .expect("intshortcut add should hit");
-        let iadd = stdframe_binop_shortcut(w_int_new(8), w_int_new(3), BinaryOperator::InplaceAdd)
-            .expect("intshortcut inplace_add should succeed")
-            .expect("intshortcut inplace_add should hit");
+        let a8 = w_int_new(8);
+        let b3 = w_int_new(3);
+        assert_eq!(
+            stdframe_binop_shortcut_kind(a8, b3, BinaryOperator::Add),
+            StdFrameShortcut::IntAdd
+        );
+        let add = stdframe_binop_shortcut_apply(a8, b3, StdFrameShortcut::IntAdd)
+            .expect("intshortcut add should succeed");
+        assert_eq!(
+            stdframe_binop_shortcut_kind(w_int_new(8), w_int_new(3), BinaryOperator::InplaceAdd),
+            StdFrameShortcut::IntAdd
+        );
+        let iadd =
+            stdframe_binop_shortcut_apply(w_int_new(8), w_int_new(3), StdFrameShortcut::IntAdd)
+                .expect("intshortcut inplace_add should succeed");
+        assert_eq!(
+            stdframe_binop_shortcut_kind(
+                w_int_new(8),
+                w_int_new(3),
+                BinaryOperator::InplaceSubtract
+            ),
+            StdFrameShortcut::IntSub
+        );
         let isub =
-            stdframe_binop_shortcut(w_int_new(8), w_int_new(3), BinaryOperator::InplaceSubtract)
-                .expect("intshortcut inplace_sub should succeed")
-                .expect("intshortcut inplace_sub should hit");
+            stdframe_binop_shortcut_apply(w_int_new(8), w_int_new(3), StdFrameShortcut::IntSub)
+                .expect("intshortcut inplace_sub should succeed");
         let tagged_add = binary_value_from_tag(w_int_new(8), w_int_new(3), 0)
             .expect("intshortcut add tag should succeed");
-        let ovf = stdframe_binop_shortcut(w_int_new(i64::MAX), w_int_new(1), BinaryOperator::Add)
-            .expect("intshortcut overflow should promote")
-            .expect("intshortcut overflow should hit");
-        let bools =
-            stdframe_binop_shortcut(w_bool_from(true), w_bool_from(true), BinaryOperator::Add)
-                .expect("bool add should fall through");
+        let ovf = stdframe_binop_shortcut_apply(
+            w_int_new(i64::MAX),
+            w_int_new(1),
+            StdFrameShortcut::IntAdd,
+        )
+        .expect("intshortcut overflow should promote");
+        assert_eq!(
+            stdframe_binop_shortcut_kind(w_bool_from(true), w_bool_from(true), BinaryOperator::Add),
+            StdFrameShortcut::None
+        );
         let list = pyre_object::w_list_new(vec![w_int_new(7), w_int_new(9)]);
-        let item = stdframe_binop_shortcut(list, w_int_new(1), BinaryOperator::Subscr)
-            .expect("list_BINARY_SUBSCR should succeed")
-            .expect("list_BINARY_SUBSCR should hit");
-        let last = stdframe_binop_shortcut(list, w_int_new(-1), BinaryOperator::Subscr)
-            .expect("list_BINARY_SUBSCR negative should succeed")
-            .expect("list_BINARY_SUBSCR negative should hit");
-        let oob = stdframe_binop_shortcut(list, w_int_new(5), BinaryOperator::Subscr)
+        assert_eq!(
+            stdframe_binop_shortcut_kind(list, w_int_new(1), BinaryOperator::Subscr),
+            StdFrameShortcut::ListSubscr
+        );
+        let item = stdframe_binop_shortcut_apply(list, w_int_new(1), StdFrameShortcut::ListSubscr)
+            .expect("list_BINARY_SUBSCR should succeed");
+        let last = stdframe_binop_shortcut_apply(list, w_int_new(-1), StdFrameShortcut::ListSubscr)
+            .expect("list_BINARY_SUBSCR negative should succeed");
+        let oob = stdframe_binop_shortcut_apply(list, w_int_new(5), StdFrameShortcut::ListSubscr)
             .expect_err("list_BINARY_SUBSCR oob should raise");
         unsafe {
             assert_eq!(w_int_get_value(add), 11);
@@ -1790,7 +1841,6 @@ mod tests {
             assert_eq!(w_int_get_value(item), 9);
             assert_eq!(w_int_get_value(last), 9);
         }
-        assert!(bools.is_none());
         assert_eq!(oob.kind, crate::PyErrorKind::IndexError);
     }
 

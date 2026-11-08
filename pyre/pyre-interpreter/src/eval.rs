@@ -4089,8 +4089,9 @@ impl ArithmeticOpcodeHandler for PyFrame {
         // `compare` pins only `both_exact_builtin_instances_promoted == false`.
         // `frame.py` `StdObjSpaceFrame`: `int_BINARY_ADD` / `list_BINARY_SUBSCR`
         // replace the opcode ahead of `space.add` / `space.getitem`.
-        if let Some(w) = crate::opcode_ops::stdframe_binop_shortcut(a, b, op)? {
-            return Ok(w);
+        let kind = crate::opcode_ops::stdframe_binop_shortcut_kind(a, b, op);
+        if kind != crate::opcode_ops::StdFrameShortcut::None {
+            return crate::opcode_ops::stdframe_binop_shortcut_apply(a, b, kind);
         }
         binary_value(a, b, op)
     }
