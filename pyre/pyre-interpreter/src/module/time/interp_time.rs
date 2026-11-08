@@ -115,20 +115,22 @@ fn monotonic_baseline() -> Instant {
 
 /// `interp_time._timespec_to_seconds`.
 #[cfg(all(unix, feature = "host_env"))]
-fn timespec_to_seconds(ts: &libc::timespec) -> f64 {
-    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+fn timespec_to_seconds(ts: &majit_rlib::rtime::TIMESPEC) -> f64 {
+    ts.c_tv_sec as f64 + ts.c_tv_nsec as f64 * 1e-9
 }
 
 /// `interp_time._timespec_to_nanoseconds`.
 #[cfg(all(unix, feature = "host_env"))]
-fn timespec_to_nanos_i128(ts: &libc::timespec) -> i128 {
-    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+fn timespec_to_nanos_i128(ts: &majit_rlib::rtime::TIMESPEC) -> i128 {
+    ts.c_tv_sec as i128 * 1_000_000_000 + ts.c_tv_nsec as i128
 }
 
 /// `rtime.c_clock_gettime` into a `TIMESPEC`.
 #[cfg(all(unix, feature = "host_env"))]
-fn clock_gettime_timespec(clk: majit_rlib::rffi::SIGNED) -> Result<libc::timespec, i32> {
-    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+fn clock_gettime_timespec(
+    clk: majit_rlib::rffi::SIGNED,
+) -> Result<majit_rlib::rtime::TIMESPEC, i32> {
+    let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
     let ret = unsafe { majit_rlib::rtime::c_clock_gettime(clk, &mut ts) };
     if ret != 0 {
         return Err(majit_rlib::rposix::get_saved_errno());
@@ -140,12 +142,12 @@ fn clock_gettime_timespec(clk: majit_rlib::rffi::SIGNED) -> Result<libc::timespe
 #[cfg(all(unix, feature = "host_env"))]
 fn clock_monotonic_duration() -> Option<std::time::Duration> {
     let ts = clock_gettime_timespec(majit_rlib::rtime::CLOCK_MONOTONIC? as _).ok()?;
-    if ts.tv_sec < 0 {
+    if ts.c_tv_sec < 0 {
         return None;
     }
     Some(std::time::Duration::new(
-        ts.tv_sec as u64,
-        ts.tv_nsec as u32,
+        ts.c_tv_sec as u64,
+        ts.c_tv_nsec as u32,
     ))
 }
 
@@ -195,7 +197,7 @@ impl ClockInfo {
 /// `clock_getres(clk_id)` in seconds, 1e-9 when the clock has no answer.
 #[cfg(all(unix, feature = "host_env"))]
 fn clock_getres_seconds(clk: majit_rlib::rffi::SIGNED) -> f64 {
-    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
     let ret = unsafe { majit_rlib::rtime::c_clock_getres(clk as _, &mut ts) };
     if ret == 0 {
         timespec_to_seconds(&ts)
@@ -239,12 +241,12 @@ fn system_clock(info: Option<&mut ClockInfo>) -> Option<std::time::Duration> {
                 true,
             );
         }
-        if ts.tv_sec < 0 {
+        if ts.c_tv_sec < 0 {
             return Some(std::time::Duration::ZERO);
         }
         Some(std::time::Duration::new(
-            ts.tv_sec as u64,
-            ts.tv_nsec as u32,
+            ts.c_tv_sec as u64,
+            ts.c_tv_nsec as u32,
         ))
     }
     #[cfg(all(
@@ -438,10 +440,9 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         loop {
             let slept = pyre_object::with_roots!(w_secs => {
                 let _blocking = crate::module::thread::before_external_block();
-                let mut ts = libc::timespec {
-                    tv_sec: remaining.as_secs() as libc::time_t,
-                    tv_nsec: remaining.subsec_nanos() as libc::c_long,
-                };
+                let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
+                ts.c_tv_sec = remaining.as_secs() as _;
+                ts.c_tv_nsec = remaining.subsec_nanos() as _;
                 // `interp_time.nanosleep` — GIL already left by
                 // `before_external_block`; `rtime.c_nanosleep` saves errno.
                 unsafe { majit_rlib::rtime::c_nanosleep(&mut ts, std::ptr::null_mut()) }
@@ -726,7 +727,7 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
 ///
 /// Unix arm: `clock_gettime(CLOCK_PROF)` when libc defines it, else
 /// `CLOCK_PROCESS_CPUTIME_ID`; on failure `rtime.c_getrusage(RUSAGE_SELF)`
-/// (`decode_timeval` / `decode_timeval_ns` of `ru_utime` + `ru_stime`), then
+/// (`decode_timeval` / `decode_timeval_ns` of `c_ru_utime` + `c_ru_stime`), then
 /// `rposix.c_times` over `rposix.CLOCK_TICKS_PER_SECOND`.  Each stage that
 /// reads publishes its own call and resolution into a non-null `w_info`
 /// (`_setinfo`), then builds its own result.  With
@@ -790,13 +791,13 @@ fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef
             }
             if return_ns {
                 return Ok(w_int_new(
-                    majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime)
-                        + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime),
+                    majit_rlib::rtime::decode_timeval_ns(&rusage.c_ru_utime)
+                        + majit_rlib::rtime::decode_timeval_ns(&rusage.c_ru_stime),
                 ));
             }
             return Ok(floatobject::w_float_new(
-                majit_rlib::rtime::decode_timeval(&rusage.ru_utime)
-                    + majit_rlib::rtime::decode_timeval(&rusage.ru_stime),
+                majit_rlib::rtime::decode_timeval(&rusage.c_ru_utime)
+                    + majit_rlib::rtime::decode_timeval(&rusage.c_ru_stime),
             ));
         }
         let mut tms = unsafe { std::mem::zeroed::<libc::tms>() };
@@ -1037,10 +1038,9 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // truncates toward zero, `frac = secs - integer_secs`.
     let integer_secs = secs.trunc();
     let frac = secs - integer_secs;
-    let mut ts = libc::timespec {
-        tv_sec: integer_secs as libc::time_t,
-        tv_nsec: (frac * 1e9) as libc::c_long,
-    };
+    let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
+    ts.c_tv_sec = integer_secs as _;
+    ts.c_tv_nsec = (frac * 1e9) as _;
     let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
         majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
     });
@@ -1081,10 +1081,9 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let ns = unsafe { w_int_get_value(w_when) };
     // `tv_sec = ns // 10**9`, `tv_nsec = ns % 10**9` (Python floor div/mod,
     // so a negative `ns` normalises to a non-negative `tv_nsec`).
-    let mut ts = libc::timespec {
-        tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
-        tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
-    };
+    let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
+    ts.c_tv_sec = ns.div_euclid(1_000_000_000) as _;
+    ts.c_tv_nsec = ns.rem_euclid(1_000_000_000) as _;
     let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
         majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
     });
@@ -1114,7 +1113,7 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let mut w_clk_id = args[0];
     let id = unsafe { w_int_get_value(w_clk_id) } as majit_rlib::rffi::SIGNED;
-    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rtime::TIMESPEC>() };
     let ret = pyre_object::with_roots!(w_clk_id => unsafe {
         majit_rlib::rtime::c_clock_getres(id as _, &mut ts)
     });

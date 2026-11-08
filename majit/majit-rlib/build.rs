@@ -36,6 +36,9 @@ const CLIBFFI_BASE_NAMES: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(rtime_have_gettimeofday)");
+    println!("cargo:rustc-check-cfg=cfg(rtime_gettimeofday_no_tz)");
+    println!("cargo:rustc-check-cfg=cfg(rtime_have_ftime)");
     let have_dup3 = have_dup3();
     majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
@@ -242,9 +245,18 @@ fn write_rtime_cconfig() {
     let mut text = String::from(
         "// rtime.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
     );
-    emit_struct_layout(&mut text, "TIMEVAL", cconfig_lookup(&results, "TIMEVAL"));
-    emit_struct_layout(&mut text, "TIMEZONE", cconfig_lookup(&results, "TIMEZONE"));
-    emit_struct_layout(&mut text, "RUSAGE", cconfig_lookup(&results, "RUSAGE"));
+    text.push_str(
+        &struct_layout("TIMEVAL", cconfig_lookup(&results, "TIMEVAL"))
+            .rust_struct_source("TIMEVAL", &[]),
+    );
+    text.push_str(
+        &struct_layout("TIMEZONE", cconfig_lookup(&results, "TIMEZONE"))
+            .rust_struct_source("TIMEZONE", &[]),
+    );
+    text.push_str(
+        &struct_layout("RUSAGE", cconfig_lookup(&results, "RUSAGE"))
+            .rust_struct_source("RUSAGE", &[("timeval", "TIMEVAL")]),
+    );
     emit_bool(
         &mut text,
         "GETTIMEOFDAY_NO_TZ",
@@ -262,11 +274,26 @@ fn write_rtime_cconfig() {
         emit_bool(&mut text, name, cconfig_lookup(&results, name));
     }
 
+    let have_gettimeofday = match cconfig_lookup(&results, "HAVE_GETTIMEOFDAY") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("HAVE_GETTIMEOFDAY: {other:?}"),
+    };
+    let gettimeofday_no_tz = match cconfig_lookup(&results, "GETTIMEOFDAY_NO_TZ") {
+        ConfigValue::Bool(v) => *v,
+        other => panic!("GETTIMEOFDAY_NO_TZ: {other:?}"),
+    };
     let have_ftime = match cconfig_lookup(&results, "HAVE_FTIME") {
         ConfigValue::Bool(v) => *v,
         other => panic!("HAVE_FTIME: {other:?}"),
     };
+    if have_gettimeofday {
+        println!("cargo:rustc-cfg=rtime_have_gettimeofday");
+    }
+    if gettimeofday_no_tz {
+        println!("cargo:rustc-cfg=rtime_gettimeofday_no_tz");
+    }
     if have_ftime {
+        println!("cargo:rustc-cfg=rtime_have_ftime");
         let libraries = rtime_libraries(&target_os);
         let ftime_config = CConfig {
             compilation_info: ExternalCompilationInfo {
@@ -289,7 +316,10 @@ fn write_rtime_cconfig() {
         };
         let ftime_results = configure(&ftime_config, false).unwrap_or_else(|err| panic!("{err}"));
         text.push_str("// rtime.py CConfigForFTime\n");
-        emit_struct_layout(&mut text, "TIMEB", cconfig_lookup(&ftime_results, "TIMEB"));
+        text.push_str(
+            &struct_layout("TIMEB", cconfig_lookup(&ftime_results, "TIMEB"))
+                .rust_struct_source("TIMEB", &[]),
+        );
     }
 
     let clock_monotonic = cconfig_lookup(&results, "CLOCK_MONOTONIC");
@@ -321,10 +351,9 @@ fn write_rtime_cconfig() {
         };
         let clock_results = configure(&clock_config, false).unwrap_or_else(|err| panic!("{err}"));
         text.push_str("// rtime.py CConfigForClockGetTime\n");
-        emit_struct_layout(
-            &mut text,
-            "TIMESPEC",
-            cconfig_lookup(&clock_results, "TIMESPEC"),
+        text.push_str(
+            &struct_layout("TIMESPEC", cconfig_lookup(&clock_results, "TIMESPEC"))
+                .rust_struct_source("TIMESPEC", &[]),
         );
         emit_bool(
             &mut text,
@@ -335,8 +364,17 @@ fn write_rtime_cconfig() {
             ConfigValue::Bool(v) => *v,
             other => panic!("_NO_MISSING_RT: {other:?}"),
         };
+        // `rtime.eciclock`: `CConfigForClockGetTime._compilation_info_`,
+        // merged with `libraries=['rt']` when `not _NO_MISSING_RT`.
+        let mut clock_eci = clock_config.compilation_info.clone();
         if !no_missing_rt {
-            println!("cargo:rustc-link-lib=rt");
+            clock_eci = clock_eci.merge(&[&ExternalCompilationInfo {
+                libraries: vec!["rt".into()],
+                ..Default::default()
+            }]);
+        }
+        for lib in &clock_eci.libraries {
+            println!("cargo:rustc-link-lib={lib}");
         }
     }
 
@@ -346,13 +384,12 @@ fn write_rtime_cconfig() {
 }
 
 /// `rtime.py` `libraries` for `CConfigForFTime` / `CConfigForClockGetTime`.
-/// `sys.platform == 'linux2'` is the RPython branch; cargo's OS name is
-/// `linux`, so that arm does not fire here either (PyPy3's `sys.platform` is
-/// also `linux`). `_NO_MISSING_RT` is the real `-lrt` gate.
+/// `freebsd`/`netbsd` → `["compat"]`; `linux` → `["rt"]` (RPython
+/// `sys.platform == 'linux2'`); else empty.
 fn rtime_libraries(target_os: &str) -> Vec<String> {
     if target_os == "freebsd" || target_os == "netbsd" {
         vec!["compat".into()]
-    } else if target_os == "linux2" {
+    } else if target_os == "linux" {
         vec!["rt".into()]
     } else {
         vec![]
@@ -373,26 +410,10 @@ fn emit_bool(text: &mut String, name: &str, value: &ConfigValue) {
     }
 }
 
-fn emit_struct_layout(text: &mut String, attr: &str, value: &ConfigValue) {
-    let layout: &StructLayout = match value {
+fn struct_layout<'a>(attr: &str, value: &'a ConfigValue) -> &'a StructLayout {
+    match value {
         ConfigValue::Struct(s) => s,
         other => panic!("{attr}: {other:?}"),
-    };
-    text.push_str(&format!(
-        "pub const {attr}_SIZE: usize = {};\n",
-        layout.size
-    ));
-    text.push_str(&format!(
-        "pub const {attr}_ALIGN: usize = {};\n",
-        layout.align
-    ));
-    for ((fname, _), off) in layout.fields.iter().zip(&layout.fieldoffsets) {
-        if layout.padding.iter().any(|p| p == fname) {
-            continue;
-        }
-        text.push_str(&format!(
-            "pub const {attr}_{fname}_OFFSET: usize = {off};\n"
-        ));
     }
 }
 

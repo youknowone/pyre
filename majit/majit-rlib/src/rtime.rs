@@ -13,17 +13,15 @@ use crate::rffi::{CCHARP, INT, SIGNED, SIZE_T, VOIDP};
 use majit_jitcode::rffi::RFFI_SAVE_ERRNO;
 
 /// `rtime.cConfig` (`rffi_platform.configure(CConfig)`).
-#[allow(non_snake_case, dead_code, non_upper_case_globals)]
+#[allow(non_snake_case, non_camel_case_types)]
 pub mod cConfig {
     include!(concat!(env!("OUT_DIR"), "/rtime_cconfig.rs"));
 }
 
-/// `rtime.TIMEVAL`.
-pub type TIMEVAL = libc::timeval;
-/// `rtime.TIMEZONE`.
-pub type TIMEZONE = libc::timezone;
-/// `rtime.TIMESPEC`.
-pub type TIMESPEC = libc::timespec;
+/// `rtime.TIMEB` (`CConfigForFTime` when `HAVE_FTIME`).
+#[cfg(rtime_have_ftime)]
+pub use cConfig::TIMEB;
+pub use cConfig::{RUSAGE, TIMESPEC, TIMEVAL, TIMEZONE};
 /// `rffi.TIME_T`.
 #[allow(non_camel_case_types)]
 pub type TIME_T = libc::time_t;
@@ -35,8 +33,6 @@ pub type TM = libc::tm;
 /// `interp_time.TM_P`.
 #[allow(non_camel_case_types)]
 pub type TM_P = *mut TM;
-/// `rtime.RUSAGE`.
-pub type RUSAGE = libc::rusage;
 
 /// `rtime.RUSAGE_SELF` (`RUSAGE_SELF or 0`).
 pub const RUSAGE_SELF: INT = match cConfig::RUSAGE_SELF {
@@ -131,12 +127,32 @@ crate::rffi::external_compilation_info! {
     };
 }
 
-// `rtime.c_gettimeofday` (`HAVE_GETTIMEOFDAY` and not `GETTIMEOFDAY_NO_TZ`).
-const _: () = assert!(HAVE_GETTIMEOFDAY && !GETTIMEOFDAY_NO_TZ);
+// `rtime.c_gettimeofday` (`HAVE_GETTIMEOFDAY` / `GETTIMEOFDAY_NO_TZ`).
+#[cfg(all(rtime_have_gettimeofday, rtime_gettimeofday_no_tz))]
+crate::rffi::llexternal!(
+    pub c_gettimeofday = "gettimeofday",
+    [*mut TIMEVAL],
+    INT,
+    compilation_info = TIME_ECI,
+    _nowrapper = true,
+    releasegil = false
+);
+#[cfg(all(rtime_have_gettimeofday, not(rtime_gettimeofday_no_tz)))]
 crate::rffi::llexternal!(
     pub c_gettimeofday = "gettimeofday",
     [*mut TIMEVAL, *mut TIMEZONE],
     INT,
+    compilation_info = TIME_ECI,
+    _nowrapper = true,
+    releasegil = false
+);
+
+// `rtime.c_ftime` (`HAVE_FTIME`; `FTIME` is `ftime`).
+#[cfg(rtime_have_ftime)]
+crate::rffi::llexternal!(
+    pub c_ftime = "ftime",
+    [*mut TIMEB],
+    (),
     compilation_info = TIME_ECI,
     _nowrapper = true,
     releasegil = false
@@ -152,7 +168,7 @@ crate::rffi::llexternal!(
     releasegil = false
 );
 
-// `rtime.c_clock_getres`.
+// Defined under `if HAS_CLOCK_GETTIME_RUNTIME:`; callers check `HAS_CLOCK_GETTIME_RUNTIME`.
 crate::rffi::llexternal!(
     pub c_clock_getres = "clock_getres",
     [SIGNED, *mut TIMESPEC],
@@ -251,14 +267,14 @@ crate::rffi::llexternal!(
 
 /// `rtime.decode_timeval`.
 pub fn decode_timeval(t: &TIMEVAL) -> f64 {
-    t.tv_sec as f64 + t.tv_usec as f64 * 0.000001
+    t.c_tv_sec as f64 + t.c_tv_usec as f64 * 0.000001
 }
 
 /// `rtime.decode_timeval_ns`.
 pub fn decode_timeval_ns(t: &TIMEVAL) -> i64 {
-    (t.tv_sec as i64)
+    (t.c_tv_sec as i64)
         .wrapping_mul(1_000_000_000)
-        .wrapping_add((t.tv_usec as i64).wrapping_mul(1000))
+        .wrapping_add((t.c_tv_usec as i64).wrapping_mul(1000))
 }
 
 // `rtime.c_select` (`save_err=RFFI_SAVE_ERRNO`; default `releasegil=True`).
@@ -273,12 +289,38 @@ crate::rffi::llexternal!(
 /// `rtime.time` (`replace_time_function('time')`).
 #[majit_macros::replace_time_function("time")]
 pub fn time() -> f64 {
-    if HAVE_GETTIMEOFDAY {
+    let mut result = -1.0;
+    #[cfg(rtime_have_gettimeofday)]
+    {
         let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
-        let tz = std::ptr::null_mut::<TIMEZONE>();
-        let errcode = unsafe { c_gettimeofday(&mut t, tz) };
-        if errcode == 0 {
-            return decode_timeval(&t);
+        let errcode = {
+            #[cfg(rtime_gettimeofday_no_tz)]
+            {
+                unsafe { c_gettimeofday(&mut t) }
+            }
+            #[cfg(not(rtime_gettimeofday_no_tz))]
+            {
+                let tzvoid = std::ptr::null_mut::<TIMEZONE>();
+                unsafe { c_gettimeofday(&mut t, tzvoid) }
+            }
+        };
+        if errcode as crate::rffi::LONG == 0 {
+            result = decode_timeval(&t);
+        }
+        if result != -1.0 {
+            return result;
+        }
+    }
+    #[cfg(not(rtime_have_gettimeofday))]
+    {
+        #[cfg(rtime_have_ftime)]
+        {
+            let mut t = unsafe { std::mem::zeroed::<TIMEB>() };
+            unsafe {
+                c_ftime(&mut t);
+            }
+            result = t.c_time as f64 + t.c_millitm as f64 * 0.001;
+            return result;
         }
     }
     unsafe { c_time(std::ptr::null_mut()) as f64 }
@@ -290,14 +332,14 @@ pub fn clock() -> f64 {
     if HAS_CLOCK_GETTIME_RUNTIME && let Some(clk) = CLOCK_PROCESS_CPUTIME_ID {
         let mut ts = unsafe { std::mem::zeroed::<TIMESPEC>() };
         if unsafe { c_clock_gettime(clk as SIGNED, &mut ts) } == 0 {
-            return ts.tv_sec as f64 + ts.tv_nsec as f64 * 0.000000001;
+            return ts.c_tv_sec as f64 + ts.c_tv_nsec as f64 * 0.000000001;
         }
     }
     let mut ru = unsafe { std::mem::zeroed::<RUSAGE>() };
     unsafe {
         c_getrusage(RUSAGE_SELF, &mut ru);
     }
-    decode_timeval(&ru.ru_utime) + decode_timeval(&ru.ru_stime)
+    decode_timeval(&ru.c_ru_utime) + decode_timeval(&ru.c_ru_stime)
 }
 
 /// `rtime.sleep` (`replace_time_function('sleep')`). EINTR from `c_select`
@@ -305,12 +347,11 @@ pub fn clock() -> f64 {
 /// `int(math.fmod(secs, 1.0) * 1000000.)` and must be `>= 0`.
 #[majit_macros::replace_time_function("sleep")]
 pub fn sleep(secs: f64) -> Result<(), i32> {
-    let frac = ((secs % 1.0) * 1_000_000.0) as libc::suseconds_t;
+    let frac = ((secs % 1.0) * 1_000_000.0) as i64;
     assert!(frac >= 0);
-    let mut t = TIMEVAL {
-        tv_sec: secs as TIME_T,
-        tv_usec: frac,
-    };
+    let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
+    t.c_tv_sec = secs as _;
+    t.c_tv_usec = frac as _;
     let ret = unsafe {
         c_select(
             0,
@@ -322,7 +363,7 @@ pub fn sleep(secs: f64) -> Result<(), i32> {
     };
     if ret != 0 {
         let errno = crate::rposix::get_saved_errno();
-        if errno != EINTR.unwrap() {
+        if Some(errno) != EINTR {
             return Err(errno);
         }
     }
@@ -336,8 +377,17 @@ mod tests {
     #[test]
     fn c_gettimeofday_succeeds() {
         let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
-        let tz = std::ptr::null_mut::<TIMEZONE>();
-        let errcode = unsafe { c_gettimeofday(&mut t, tz) };
+        let errcode = {
+            #[cfg(rtime_gettimeofday_no_tz)]
+            {
+                unsafe { c_gettimeofday(&mut t) }
+            }
+            #[cfg(not(rtime_gettimeofday_no_tz))]
+            {
+                let tz = std::ptr::null_mut::<TIMEZONE>();
+                unsafe { c_gettimeofday(&mut t, tz) }
+            }
+        };
         assert_eq!(errcode, 0);
         assert!(decode_timeval(&t) > 0.0);
         assert!(time() > 0.0);
@@ -354,7 +404,7 @@ mod tests {
             "c_clock_gettime errno {}",
             crate::rposix::get_saved_errno()
         );
-        assert!(ts.tv_sec > 0 || ts.tv_nsec > 0);
+        assert!(ts.c_tv_sec > 0 || ts.c_tv_nsec > 0);
         let mut res = unsafe { std::mem::zeroed::<TIMESPEC>() };
         let ret = unsafe { c_clock_getres(clk, &mut res) };
         assert_eq!(
@@ -367,36 +417,26 @@ mod tests {
 
     #[test]
     fn cconfig_struct_layouts_match_libc() {
-        assert_eq!(std::mem::size_of::<TIMEVAL>(), cConfig::TIMEVAL_SIZE);
-        assert_eq!(std::mem::align_of::<TIMEVAL>(), cConfig::TIMEVAL_ALIGN);
         assert_eq!(
-            std::mem::offset_of!(TIMEVAL, tv_sec),
-            cConfig::TIMEVAL_c_tv_sec_OFFSET
+            std::mem::size_of::<TIMEVAL>(),
+            std::mem::size_of::<libc::timeval>()
         );
         assert_eq!(
-            std::mem::offset_of!(TIMEVAL, tv_usec),
-            cConfig::TIMEVAL_c_tv_usec_OFFSET
-        );
-        assert_eq!(std::mem::size_of::<RUSAGE>(), cConfig::RUSAGE_SIZE);
-        assert_eq!(
-            std::mem::offset_of!(RUSAGE, ru_utime),
-            cConfig::RUSAGE_c_ru_utime_OFFSET
+            std::mem::size_of::<TIMESPEC>(),
+            std::mem::size_of::<libc::timespec>()
         );
         assert_eq!(
-            std::mem::offset_of!(RUSAGE, ru_stime),
-            cConfig::RUSAGE_c_ru_stime_OFFSET
+            std::mem::size_of::<RUSAGE>(),
+            std::mem::size_of::<libc::rusage>()
         );
-        if HAS_CLOCK_GETTIME_RUNTIME {
-            assert_eq!(std::mem::size_of::<TIMESPEC>(), cConfig::TIMESPEC_SIZE);
-            assert_eq!(
-                std::mem::offset_of!(TIMESPEC, tv_sec),
-                cConfig::TIMESPEC_c_tv_sec_OFFSET
-            );
-            assert_eq!(
-                std::mem::offset_of!(TIMESPEC, tv_nsec),
-                cConfig::TIMESPEC_c_tv_nsec_OFFSET
-            );
-        }
+        assert_eq!(
+            std::mem::offset_of!(TIMEVAL, c_tv_sec),
+            std::mem::offset_of!(libc::timeval, tv_sec)
+        );
+        assert_eq!(
+            std::mem::offset_of!(TIMESPEC, c_tv_nsec),
+            std::mem::offset_of!(libc::timespec, tv_nsec)
+        );
     }
 
     #[test]
@@ -426,12 +466,12 @@ mod tests {
     #[test]
     fn decode_timeval_ns_uses_wrapping_int64() {
         let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
-        t.tv_sec = i64::MAX as TIME_T;
-        t.tv_usec = 2;
+        t.c_tv_sec = i64::MAX as _;
+        t.c_tv_usec = 2 as _;
         let got = decode_timeval_ns(&t);
-        let expected = (t.tv_sec as i64)
+        let expected = (t.c_tv_sec as i64)
             .wrapping_mul(1_000_000_000)
-            .wrapping_add((t.tv_usec as i64).wrapping_mul(1000));
+            .wrapping_add((t.c_tv_usec as i64).wrapping_mul(1000));
         assert_eq!(got, expected);
         assert_ne!(got, i64::MAX);
     }
@@ -441,8 +481,8 @@ mod tests {
         let mut ru = unsafe { std::mem::zeroed::<RUSAGE>() };
         let ret = unsafe { c_getrusage(RUSAGE_SELF, &mut ru) };
         assert_eq!(ret, 0);
-        assert!(decode_timeval(&ru.ru_utime) + decode_timeval(&ru.ru_stime) >= 0.0);
-        assert!(decode_timeval_ns(&ru.ru_utime) + decode_timeval_ns(&ru.ru_stime) >= 0);
+        assert!(decode_timeval(&ru.c_ru_utime) + decode_timeval(&ru.c_ru_stime) >= 0.0);
+        assert!(decode_timeval_ns(&ru.c_ru_utime) + decode_timeval_ns(&ru.c_ru_stime) >= 0);
     }
 
     #[test]

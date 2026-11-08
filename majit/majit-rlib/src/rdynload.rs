@@ -31,10 +31,6 @@ pub const RTLD_NOW: Option<INT> = cConfig::RTLD_NOW;
 #[cfg(unix)]
 pub const RTLD_LAZY: Option<INT> = cConfig::RTLD_LAZY;
 
-/// `rdynload.RTLD_GLOBAL` on `_WIN32`.
-#[cfg(windows)]
-pub const RTLD_GLOBAL: Option<INT> = None;
-
 // `rdynload.eci`. `libraries=['dl']` except FreeBSD/NetBSD; Darwin also
 // defines `MACOSX`.
 #[cfg(target_vendor = "apple")]
@@ -403,7 +399,6 @@ mod cconfig_tests {
             assert_eq!(super::cConfig::RTLD_NODELETE, None);
             assert_eq!(super::cConfig::RTLD_NOLOAD, None);
             assert_eq!(super::cConfig::RTLD_DEEPBIND, None);
-            assert_eq!(super::RTLD_GLOBAL, None);
         }
     }
 }
