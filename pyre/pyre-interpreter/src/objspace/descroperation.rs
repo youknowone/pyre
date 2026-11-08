@@ -2054,20 +2054,24 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // intobject.py `_pow_nomod`: exponentiation by squaring with an
     // overflow check at each machine multiplication. `checked_mul` is the
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
+    // `int_pow_nomod`'s error is built by an allocating constructor, so the
+    // exponent object stays rooted for `_pow_ovf2long`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exponent_root = pyre_object::gc_roots::pin_roots(&[b]);
     match int_pow_nomod(va, vb) {
         Ok(r) => Ok(w_int_new(r)),
-        Err(_) => Ok(w_long_new(pow_ovf2long(va, vb)?)),
+        Err(_) => pow_ovf2long(va, pyre_object::gc_roots::shadow_stack_get(exponent_root)),
     }
 }
 
-/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then
-/// `rbigint.int_pow(iw)`.  The base is built inside this opaque call, so
-/// the traced `int_pow` never passes a stack `BigInt` to the
-/// `jit_bigint_int_pow_nomod` residual, which reads a heap rbigint pointer.
-#[majit_macros::dont_look_inside]
-fn pow_ovf2long(iv: i64, iw: i64) -> Result<BigInt, PyError> {
-    let base = BigInt::from(iv);
-    bigint_int_pow_nomod(&base, iw)
+/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then its
+/// `descr_pow` with the original exponent object.
+unsafe fn pow_ovf2long(iv: i64, w_iw: PyObjectRef) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exponent_root = pyre_object::gc_roots::pin_roots(&[w_iw]);
+    let w_iv = pyre_object::longobject::w_long_from_i64(iv);
+    let w_iw = pyre_object::gc_roots::shadow_stack_get(exponent_root);
+    long_pow(w_iv, w_iw)
 }
 
 /// Negative-exponent `int ** int` float route, kept opaque so `int_pow`
@@ -2125,10 +2129,6 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
     if va.int_eq(1) {
         return Ok(w_long_new(BigInt::from(1)));
-    }
-    if va.int_eq(-1) {
-        let even = vb.digit(0) & 1 == 0;
-        return Ok(w_long_new(BigInt::from(if even { 1 } else { -1 })));
     }
     // longobject.py: `descr_pow` keeps a `W_IntObject` exponent
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
