@@ -88,9 +88,10 @@ pub fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
     Some(origin)
 }
 
-/// The identity-qualified spelling of `origin`'s funcobj among `aliases`
-/// (`trait_impl_identity_path`), or `origin` when this funcobj has no
-/// such alias. `FunctionDesc.cachedgraph` stores the `(AccessDirect, None)`
+/// Fallback identity-qualified spelling of `origin`'s funcobj among
+/// `aliases` (`trait_impl_identity_path`), or `origin` when this funcobj
+/// has no such alias. Used when the funcobj has no recorded declared
+/// identity. `FunctionDesc.cachedgraph` stores the `(AccessDirect, None)`
 /// graph on that same desc, so the AccessDirect copy must name it.
 pub(crate) fn access_directly_identity_origin(origin: &CallPath, aliases: &[CallPath]) -> CallPath {
     aliases
@@ -2384,6 +2385,10 @@ struct GraphSlot {
     /// of `StoreCore.path_to_key`: the store's alias list for the funcobj
     /// (`bookkeeper.py getdesc`, one desc per callable).
     paths: Vec<CallPath>,
+    /// Declared identity path of this funcobj (`trait_impl_identity_path`
+    /// over its self type); the desc `cachedgraph` copies are named from
+    /// (`bookkeeper.py Bookkeeper.getdesc`).
+    identity: Option<CallPath>,
 }
 
 #[derive(Clone)]
@@ -2675,6 +2680,7 @@ impl GraphSlot {
             building: std::cell::Cell::new(false),
             declared: false,
             paths: Vec::new(),
+            identity: None,
         }
     }
 
@@ -2687,6 +2693,7 @@ impl GraphSlot {
             building: std::cell::Cell::new(false),
             declared: false,
             paths: Vec::new(),
+            identity: None,
         }
     }
 
@@ -2977,11 +2984,11 @@ impl StoreCore {
             .collect();
         self.passes.push(pass.clone());
         for key in keys {
-            let Some((mut graph, paths, declared)) = self.take_graph(&key) else {
+            let Some((mut graph, paths, declared, identity)) = self.take_graph(&key) else {
                 continue;
             };
             self.apply_pass(&pass, &mut graph);
-            self.restore_graph(key, graph, paths, declared);
+            self.restore_graph(key, graph, paths, declared, identity);
         }
     }
 
@@ -3327,7 +3334,10 @@ impl StoreCore {
 
     /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
-    fn take_graph(&mut self, key: &GraphKey) -> Option<(FunctionGraph, Vec<CallPath>, bool)> {
+    fn take_graph(
+        &mut self,
+        key: &GraphKey,
+    ) -> Option<(FunctionGraph, Vec<CallPath>, bool, Option<CallPath>)> {
         self.register_declared();
         let graphs = self.graphs.get_mut();
         let slot = graphs.remove(key)?;
@@ -3335,8 +3345,14 @@ impl StoreCore {
             let slot = std::rc::Rc::unwrap_or_clone(slot);
             let paths = slot.paths;
             let declared = slot.declared;
+            let identity = slot.identity;
             let built = slot.graph.into_inner().flatten()?;
-            return Some((std::rc::Rc::unwrap_or_clone(built.graph), paths, declared));
+            return Some((
+                std::rc::Rc::unwrap_or_clone(built.graph),
+                paths,
+                declared,
+                identity,
+            ));
         }
         // Not built: put it back untouched.
         graphs.insert(key.clone(), slot);
@@ -3350,10 +3366,12 @@ impl StoreCore {
         graph: FunctionGraph,
         paths: Vec<CallPath>,
         declared: bool,
+        identity: Option<CallPath>,
     ) {
         let mut slot = GraphSlot::built(std::rc::Rc::new(graph));
         slot.paths = paths;
         slot.declared = declared;
+        slot.identity = identity;
         self.graphs.get_mut().insert(key, std::rc::Rc::new(slot));
     }
 
@@ -3375,6 +3393,27 @@ impl StoreCore {
         match self.graphs.borrow().get(&key) {
             Some(slot) => slot.paths.clone(),
             None => vec![path.clone()],
+        }
+    }
+
+    /// Declared identity path of the funcobj `path` names, when
+    /// `share_trait_impl_funcobj_aliases` recorded one.
+    pub(crate) fn funcobj_identity(&self, path: &CallPath) -> Option<CallPath> {
+        let key = self.key_for(path)?;
+        self.graphs.borrow().get(&key)?.identity.clone()
+    }
+
+    /// Record `identity` on the slot `existing` names. The first
+    /// declaration wins and is never overwritten.
+    fn record_funcobj_identity(&mut self, existing: &CallPath, identity: CallPath) {
+        let Some(key) = self.key_for(existing) else {
+            return;
+        };
+        let Some(slot) = self.slot_mut(&key) else {
+            return;
+        };
+        if slot.identity.is_none() {
+            slot.identity = Some(identity);
         }
     }
 
@@ -3438,7 +3477,8 @@ impl StoreCore {
     /// (`cachedgraph`).
     pub(crate) fn access_directly_desc_origin(&self, path: &CallPath) -> CallPath {
         let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
-        access_directly_identity_origin(&origin, &self.alias_paths(&origin))
+        self.funcobj_identity(&origin)
+            .unwrap_or_else(|| access_directly_identity_origin(&origin, &self.alias_paths(&origin)))
     }
 
     /// Register `path` as another spelling of the funcobj `existing` names,
@@ -3520,6 +3560,7 @@ impl StoreCore {
                 None => return,
             }
         };
+        self.record_funcobj_identity(&existing, identity_path.clone());
         if existing != identity_path {
             self.share_path(identity_path.clone(), &existing);
         }
@@ -8415,7 +8456,10 @@ impl CallControl {
         // same FunctionDesc as the regular graph. Trait-impl methods
         // register that desc under `trait_impl_identity_path`, so the
         // copy's CallPath must keep that identity.
-        let identity_origin = access_directly_identity_origin(origin, &aliases);
+        let identity_origin = self
+            .function_graphs
+            .funcobj_identity(origin)
+            .unwrap_or_else(|| access_directly_identity_origin(origin, &aliases));
         let ad_path = access_directly_path(&identity_origin);
         if self.function_graphs.contains_key(&ad_path) {
             return Some(ad_path);
@@ -17446,6 +17490,60 @@ mod tests {
         assert_eq!(
             access_directly_identity_origin(&origin, &[origin.clone()]),
             origin
+        );
+    }
+
+    /// AccessDirect copies are named from the funcobj's declared identity
+    /// (`GraphSlot.identity`), not the first identity-qualified alias
+    /// (`bookkeeper.py Bookkeeper.getdesc`).
+    #[test]
+    fn access_directly_origin_is_the_declared_identity_not_the_first_alias() {
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "pyframe::PyFrame",
+            "NamespaceOpcodeHandler<PyFrame>",
+            "m",
+        ));
+        let module_identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "eval::<Impl>",
+            "NamespaceOpcodeHandler<PyFrame>",
+            "m",
+        ));
+        let charon = CallPath::from_segments(["eval", "<Impl>", "m"]);
+        let mut graph = FunctionGraph::new("m");
+        graph.source_identity =
+            Some("pyframe::PyFrame::<impl NamespaceOpcodeHandler<PyFrame>>::m".into());
+        let mut store = GraphStore::new();
+        store.insert(identity.clone(), graph);
+        store.share_trait_impl_funcobj_aliases(
+            Some("pyframe::PyFrame"),
+            "eval::<Impl>",
+            "NamespaceOpcodeHandler<PyFrame>",
+            "m",
+            false,
+            None,
+        );
+        assert_eq!(
+            store.key_for(&module_identity),
+            store.key_for(&identity),
+            "module-identity spelling must share the declared GraphKey"
+        );
+        let aliases = store.alias_paths(&identity);
+        let module_pos = aliases
+            .iter()
+            .position(|p| p == &module_identity)
+            .expect("module-identity spelling must be stored");
+        let identity_pos = aliases
+            .iter()
+            .position(|p| p == &identity)
+            .expect("declared identity spelling must be stored");
+        assert!(
+            module_pos < identity_pos,
+            "module-identity must sort before the declared identity: {aliases:?}"
+        );
+        assert_eq!(
+            store.access_directly_desc_origin(&access_directly_path(&charon)),
+            identity,
+            "AccessDirect origin must be the declared identity"
         );
     }
 
