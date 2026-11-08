@@ -2646,8 +2646,8 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 ///
 /// `startpoints` (`jitcode.py:40`) is the assembler's own record of where
 /// instructions begin, and the authority the blackhole already uses for this
-/// question — `blackhole.py dispatch_loop` asserts its position against it,
-/// and `find_catch_before_resume_live` scans it for op boundaries. Assembled
+/// question — `blackhole.py dispatch_loop` asserts its position against it.
+/// Assembled
 /// jitcodes always populate it; a hand-built one leaves it `None`
 /// (`jitcode.py setup(..., startpoints=None)`), so fall back to walking the
 /// fallthrough layout. `decoded_ops` starts at 0 and stops at the first byte it
