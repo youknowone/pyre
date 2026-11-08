@@ -2293,7 +2293,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // `SubReturn`s both go through `drive_middles_finishframe`, which
     // clears. Keep the same clear here so a later drain abort still sees
     // a consumed grab (`seed_standing_exception_for_walk`).
-    if subwalk_result.is_some() && ctx.bridge_source_is_exception_guard() {
+    if subwalk_result.is_some() {
         finishframe_clear_last_exc(&session, sym);
     }
     if let Some(result) = subwalk_result {

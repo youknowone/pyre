@@ -8115,30 +8115,29 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
 ) -> Option<BuiltinWrapperCallSite> {
     let nested_helper = ctx.fbw_mode.inline_subwalk;
     // The helper level a guard inside the wrapper resumes through
-    // (`helper_subwalk_level`). Nested Python must name the caller or the
-    // descent declines.
+    // (`helper_subwalk_level`). A caller that cannot pause past the call
+    // declines the descent; the wrapper stays a residual call.
     let nested_helper_entry = match helper_subwalk_level(ctx, op.pc, helper_return) {
         Ok(level) => level,
         Err(_) => {
-            if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
-                if fbw_inline_diag_enabled() {
-                    let name = if unsafe { pyre_interpreter::is_function(callable) } {
-                        unsafe { pyre_interpreter::function_get_name(callable) }
-                    } else {
-                        ""
-                    };
-                    eprintln!(
-                        "[builtin-inline-decline] pc={} why=no entry frame for the nested helper call callable={} operand={} fnaddr={:#x} name={}",
-                        op.pc,
-                        unsafe { pyre_object::type_name_of(callable) },
-                        unsafe { pyre_object::type_name_of(callable_operand) },
-                        fnaddr,
-                        name,
-                    );
-                }
-                return None;
+            // A helper the walker cannot number stays a residual call
+            // (`jtransform.py` `handle_residual_call`).
+            if fbw_inline_diag_enabled() {
+                let name = if unsafe { pyre_interpreter::is_function(callable) } {
+                    unsafe { pyre_interpreter::function_get_name(callable) }
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "[builtin-inline-decline] pc={} why=no entry frame for the nested helper call callable={} operand={} fnaddr={:#x} name={}",
+                    op.pc,
+                    unsafe { pyre_object::type_name_of(callable) },
+                    unsafe { pyre_object::type_name_of(callable_operand) },
+                    fnaddr,
+                    name,
+                );
             }
-            None
+            return None;
         }
     };
     // The full-body symbol is the authority for the Python caller's
@@ -8781,12 +8780,17 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     let mut nested_helper_entry = match helper_subwalk_level(ctx, op.pc, HelperReturn::Converted) {
         Ok(level) => level,
         Err(_) => {
-            if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
-                return Err(super::fbw_state::fbw_decline_inline_callee(
-                    ctx, op.pc, None,
-                ));
+            // A helper the walker cannot number stays a residual call
+            // (`jtransform.py` `handle_residual_call`). `__new__`'s
+            // unreferenced allocation is no effect, so the CALL is cut
+            // back when nothing unrewindable has run (`rewind`).
+            if rewind.nothing_unrewindable_applied() && !abort_blackhole_latched() {
+                cut_declined_subwalk(ctx, rewind.pre_fold_pos);
+                return Ok(None);
             }
-            None
+            return Err(super::fbw_state::fbw_decline_inline_callee(
+                ctx, op.pc, None,
+            ));
         }
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -19354,7 +19358,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         }
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
-    bind_generator_resume_foriter_item(
+    match bind_generator_resume_foriter_item(
         ctx,
         op,
         dst,
@@ -19364,7 +19368,22 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_root,
         iter_op,
         caller_parent,
-    )
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(error @ DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
+            residualize_generator_resume_foriter(
+                ctx,
+                op.pc,
+                frame_root,
+                executed_effects_before,
+                pre_emit_pos,
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
@@ -21191,19 +21210,29 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     };
     ctx.fbw_mode.subwalk_floor = saved_subwalk_floor;
     match walk {
-        // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
-        // inside the callee is not a portal abort.  Residualize through
-        // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
-        //
-        // `GuardResumeCoordinateUnavailable` is the same class of decline:
+        // `GuardResumeCoordinateUnavailable` is a decline:
         // `run_codewriter_helper_inline_call` cannot stamp the helper's
-        // parent resume word (`pyjitpl.py capture_resumedata`).  Aborting
-        // the caller would drop a recursive carrier before `getframe`
-        // forces it; residualize the helper and keep walking the caller.
-        Err(
-            error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
-            | DispatchError::GuardResumeCoordinateUnavailable { .. }),
-        ) => {
+        // parent resume word (`pyjitpl.py capture_resumedata`). Residualize
+        // the helper (`do_residual_call`) the same way
+        // `try_execute_residual_call_via_executor_inner` does.
+        Err(error @ DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+            // Resume has no coordinate for this subwalk, so the call
+            // stays residual (`do_residual_call`).
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
+            cut_declined_subwalk(ctx, pre_fold_pos);
+            residualize_inline_call_via_fnaddr(
+                ctx,
+                code,
+                pc,
+                descr_index,
+                int_args,
+                ref_args,
+                float_args,
+            )
+        }
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
             // `SwitchToBlackhole` unwinds `_interpret`. A deeper helper
             // already staged its MIFrame; cutting and residualizing this
             // CALL would apply the executed residual a second time.
