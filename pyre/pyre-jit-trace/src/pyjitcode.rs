@@ -182,11 +182,11 @@ pub struct PyJitCodeMetadata {
     /// Each entry is `(offset, base_rows, popped_rows)`: `base_rows` are
     /// locals plus remaining stack, `popped_rows` the `$popped` operand
     /// slots. `get_list_of_active_boxes` (`pyjitpl.py`) reads the `-live-`
-    /// at the resume pc, so popped rows belong at the after-pop marker
-    /// and at ops between it and the residual — not at a later `-live-`
-    /// in the same opcode (the trailing marker
-    /// `flatten.rs insn_needs_trailing_live` emits after the residual,
-    /// where those operands are dead). Empty for skeleton / fixture.
+    /// that governs the resume pc, so popped rows apply at the after-pop
+    /// marker and at ops up to the next `-live-`; from the next `-live-`
+    /// on (the trailing marker `flatten.rs insn_needs_trailing_live` emits
+    /// after the residual, and everything after it in the opcode) only
+    /// base rows apply. Empty for skeleton / fixture.
     pub pcdep_after_pops_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)>,
     /// Predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
     /// built alongside `pcdep_by_jit_pc` with the same `containing_py_pc_for_jitcode_pc`
@@ -1033,13 +1033,15 @@ impl PyJitCode {
     /// Rows of `pcdep_after_pops_by_jit_pc` valid at `jit_pc`.
     ///
     /// An exact marker offset returns base ++ popped (sorted). A
-    /// same-opcode fallback (the `py_exact` test below) decodes the op
-    /// at `jit_pc`: a `live` op is a later `-live-` in the opcode, so
-    /// the popped operands are dead there and only base rows apply;
-    /// any other op (between the after-pop marker and its trailing
-    /// `-live-`) returns base ++ popped; decode failure returns base
-    /// only. `get_list_of_active_boxes` (`pyjitpl.py`) reads the
-    /// `-live-` at the resume pc, so each `-live-` has its own live set.
+    /// same-opcode fallback (the `py_exact` test below) walks from the
+    /// after-pop marker to `jit_pc`: popped rows apply at the after-pop
+    /// marker and at ops up to the next `-live-`; from the next `-live-`
+    /// on (the trailing marker and everything after it in the opcode)
+    /// only base rows apply. Decode failure, or a query that is not an
+    /// op start, returns base only. `get_list_of_active_boxes`
+    /// (`pyjitpl.py`) reads the liveness of the `-live-` that governs
+    /// the resume pc, so the popped rows apply only while the after-pop
+    /// marker is the last `-live-` at or before `jit_pc`.
     fn after_pops_rows_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
         let after = &self.metadata.pcdep_after_pops_by_jit_pc;
         if after.is_empty() {
@@ -1067,13 +1069,30 @@ impl PyJitCode {
                     exact_py_pc_for_jitcode_pc(&self.metadata.py_exact_by_jit_pc, pred_off);
                 if query_py.is_some() && query_py == pred_py {
                     let (_, ref base, ref popped) = after[i - 1];
-                    let include_popped = match crate::jitcode_runtime::decode_op_at(
-                        self.jitcode.code.as_slice(),
-                        jit_pc,
-                    ) {
-                        Some(op) if op.opname == "live" => false,
-                        Some(_) => true,
-                        None => false,
+                    let include_popped = {
+                        let code = self.jitcode.code.as_slice();
+                        let mut pc = pred_off;
+                        let mut last_live_pc = None;
+                        let mut landed = false;
+                        while pc <= jit_pc {
+                            match crate::jitcode_runtime::decode_op_at(code, pc) {
+                                Some(op) => {
+                                    if op.opname == "live" {
+                                        last_live_pc = Some(pc);
+                                    }
+                                    if pc == jit_pc {
+                                        landed = true;
+                                        break;
+                                    }
+                                    if op.next_pc <= pc {
+                                        break;
+                                    }
+                                    pc = op.next_pc;
+                                }
+                                None => break,
+                            }
+                        }
+                        landed && last_live_pc == Some(pred_off)
                     };
                     Some(combine(base, popped, include_popped))
                 } else {
