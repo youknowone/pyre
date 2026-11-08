@@ -3801,6 +3801,7 @@ fn cash_single_frame_blackhole(
             staged.jitcode_index, terminal.position, terminal.last_opcode_position,
         );
     }
+    majit_metainterp::recycle_standalone_frame(staged.miframe);
     true
 }
 
