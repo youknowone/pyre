@@ -3499,10 +3499,14 @@ impl StoreCore {
         let colliding_inherent = |alias: &CallPath| -> bool {
             skip_for_impl_method
                 && self_ty_root.is_some_and(|owner| {
-                    *alias == CallPath::for_impl_method(owner, name) || {
-                        let leaf = owner.rsplit("::").next().unwrap_or(owner);
-                        leaf != owner && *alias == CallPath::for_impl_method(leaf, name)
-                    }
+                    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                    *alias == CallPath::for_impl_method(owner, name)
+                        || *alias == CallPath::from_segments([owner, name])
+                        || {
+                            leaf != owner
+                                && (*alias == CallPath::for_impl_method(leaf, name)
+                                    || *alias == CallPath::from_segments([leaf, name]))
+                        }
                 })
         };
         let existing = if self.names_funcobj(&identity_path) {
@@ -3567,10 +3571,14 @@ impl StoreCore {
         let colliding_inherent = |alias: &CallPath| -> bool {
             skip_for_impl_method
                 && self_ty_root.is_some_and(|owner| {
-                    *alias == CallPath::for_impl_method(owner, name) || {
-                        let leaf = owner.rsplit("::").next().unwrap_or(owner);
-                        leaf != owner && *alias == CallPath::for_impl_method(leaf, name)
-                    }
+                    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                    *alias == CallPath::for_impl_method(owner, name)
+                        || *alias == CallPath::from_segments([owner, name])
+                        || {
+                            leaf != owner
+                                && (*alias == CallPath::for_impl_method(leaf, name)
+                                    || *alias == CallPath::from_segments([leaf, name]))
+                        }
                 })
         };
         let existing = if self.names_funcobj(&identity_path) {
@@ -3640,8 +3648,10 @@ impl StoreCore {
 /// Spellings of one trait-impl funcobj besides `trait_impl_identity_path`.
 /// Charon's `name_path()` is `{module}::<Impl>::{leaf}`; `for_impl_method`
 /// splits the ADT owner. Unique-impl `[trait_root, leaf]` is the
-/// `CallKind::Trait` direct path. `skip_for_impl_method` leaves the
-/// inherent's two-segment key alone (`CallControl.graphs_from`).
+/// `CallKind::Trait` direct path. With an inherent collision,
+/// `skip_for_impl_method` proposes neither the split `for_impl_method`
+/// owner spelling nor the unsplit `[owner, name]` spelling
+/// (`CallControl.graphs_from`).
 ///
 /// A leading `crate::` / local crate root is not a stored spelling:
 /// `GraphStore::key_for` strips it at lookup (`bookkeeper.py
@@ -3661,7 +3671,7 @@ pub(crate) fn trait_impl_funcobj_alias_paths(
         if !skip_for_impl_method {
             paths.push(CallPath::for_impl_method(owner, name));
         }
-        if owner.contains("::") || owner.contains('.') {
+        if !skip_for_impl_method && (owner.contains("::") || owner.contains('.')) {
             paths.push(CallPath::from_segments([owner, name]));
         }
         let leaf = owner.rsplit("::").next().unwrap_or(owner);
@@ -17579,6 +17589,50 @@ mod tests {
             store.key_for(&charon),
             store.key_for(&identity),
             "Charon <Impl> token must still share the identity GraphKey"
+        );
+    }
+
+    /// An inherent occupying both the split `for_impl_method` spelling
+    /// and the unsplit `[owner, name]` spelling is a different funcobj.
+    /// `skip_for_impl_method` must not rebind either (`CallControl.graphs_from`).
+    #[test]
+    fn trait_impl_alias_skips_unsplit_inherent_spelling() {
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "a::b::T",
+            "Trait for T",
+            "m",
+        ));
+        let inherent_split = CallPath::for_impl_method("a::b::T", "m");
+        let inherent_unsplit = CallPath::from_segments(["a::b::T", "m"]);
+        let mut trait_graph = FunctionGraph::new("m");
+        trait_graph.source_identity = Some("trait-m".into());
+        let mut inherent_split_graph = FunctionGraph::new("m");
+        inherent_split_graph.source_identity = Some("inherent-split-m".into());
+        let mut inherent_unsplit_graph = FunctionGraph::new("m");
+        inherent_unsplit_graph.source_identity = Some("inherent-unsplit-m".into());
+        let mut store = GraphStore::new();
+        store.insert(identity.clone(), trait_graph);
+        store.insert(inherent_split.clone(), inherent_split_graph);
+        store.insert(inherent_unsplit.clone(), inherent_unsplit_graph);
+        let split_key_before = store.key_for(&inherent_split);
+        let unsplit_key_before = store.key_for(&inherent_unsplit);
+        store.share_trait_impl_funcobj_aliases(
+            Some("a::b::T"),
+            "a::b::<Impl>",
+            "Trait for T",
+            "m",
+            true,
+            Some("Trait"),
+        );
+        assert_eq!(
+            store.key_for(&inherent_split),
+            split_key_before,
+            "split inherent spelling must keep its GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&inherent_unsplit),
+            unsplit_key_before,
+            "unsplit inherent spelling must keep its GraphKey"
         );
     }
 
