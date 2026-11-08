@@ -4646,12 +4646,7 @@ pub struct CallControl {
     /// A stub therefore stands in for a missing registry key, and for the
     /// declarations Charon emits with no body at all; it does not stand in
     /// for a body some gate refused.
-    pub unsafe_fn_stubs: Vec<(
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        Option<String>,
-        Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
-    )>,
+    pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …).  `impl_method_owner` declines the `CallTarget::Method` hint for

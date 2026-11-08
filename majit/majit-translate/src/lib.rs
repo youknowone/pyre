@@ -1977,11 +1977,13 @@ fn analyze_pipeline_from_module_paths(
             // `SomeInteger` with `r_uint` at its readers.
             Some("u64".into()),
             None,
+            None,
         ),
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],
             Signature::new(vec!["depth".into()], None, None),
             Some("gcref".into()),
+            None,
             None,
         ),
         (
@@ -1991,6 +1993,7 @@ fn analyze_pipeline_from_module_paths(
                 "try_pop_to".into(),
             ],
             Signature::new(vec!["depth".into()], None, None),
+            None,
             None,
             None,
         ),
@@ -2008,6 +2011,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["root".into()], None, None),
             Some("u64".into()),
             None,
+            None,
         ),
         (
             vec![
@@ -2016,6 +2020,7 @@ fn analyze_pipeline_from_module_paths(
                 "release_owner_root".into(),
             ],
             Signature::new(vec!["index".into()], None, None),
+            None,
             None,
             None,
         ),
@@ -2028,6 +2033,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["index".into()], None, None),
             Some("gcref".into()),
             None,
+            None,
         ),
         (
             vec![
@@ -2038,6 +2044,7 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec!["index".into(), "root".into()], None, None),
             None,
             None,
+            None,
         ),
         // `framework.py` keeps the GC as a prebuilt constant, so a nursery
         // request always has a route. This query is the port's stand-in and
@@ -2046,6 +2053,7 @@ fn analyze_pipeline_from_module_paths(
             vec!["majit_gc".into(), "gc_allocator_installed".into()],
             Signature::new(vec![], None, None),
             Some("bool".into()),
+            None,
             None,
         ),
         // `rffi.aroundstate.before` (`_RPyGilRelease`).  The helper lives
@@ -2059,6 +2067,7 @@ fn analyze_pipeline_from_module_paths(
             ],
             Signature::new(vec![], None, None),
             Some("ref".into()),
+            None,
             None,
         ),
         // `executioncontext.py enter` writes `f_backref` through this
@@ -2074,6 +2083,7 @@ fn analyze_pipeline_from_module_paths(
                 None,
                 None,
             ),
+            None,
             None,
             None,
         ),

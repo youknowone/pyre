@@ -1096,6 +1096,14 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 raw_alloc_flavor_structs,
             )
         };
+        let class_root = dont_look_inside_return_class_root(
+            &fd.signature.output,
+            llbc,
+            error_carrier,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         let result_lltype = if token.is_none() {
             let lltype = tyref_to_external_lltype(&fd.signature.output, llbc);
             if crate::translator::rtyper::cutover::default_someshell_for_lltype(&lltype).is_none() {
@@ -1185,6 +1193,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 Signature::new(argnames.clone(), None, None),
                 token.clone(),
                 result_lltype.clone(),
+                class_root.clone(),
             ));
         }
     }

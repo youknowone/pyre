@@ -79,10 +79,22 @@ use crate::translator::translator::TranslationContext;
 pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 
 /// Annotator-only residual stub: Charon `name_path` segments, signature,
-/// the pre-existing FUNC.RESULT token, and the declared result lltype
-/// when the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
-/// `llexternal` / `extfunc.py` `register_external`).
-pub(crate) type ResidualStubSpec = (Vec<String>, Signature, Option<String>, Option<LowLevelType>);
+/// the pre-existing FUNC.RESULT token, the declared result lltype when
+/// the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
+/// `llexternal` / `extfunc.py` `register_external`), and
+/// `dont_look_inside_return_class_root` of that result.
+///
+/// A skipped look-inside / bodyless callee must intern no more precisely
+/// than the declared type (`extfunc.py` `ExtFuncEntry.compute_result_annotation`
+/// / `signature.py` `annotationoftype`). A `*mut T` onto a non-GC ADT is
+/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` → `SomePtr`.
+pub(crate) type ResidualStubSpec = (
+    Vec<String>,
+    Signature,
+    Option<String>,
+    Option<LowLevelType>,
+    Option<String>,
+);
 
 /// Residual FUNC.RESULT token for an rstr `STR` result (`ValueType::Str`):
 /// ref-kind, annotated `SomeString` and lowered `Ptr(STR)`.
@@ -3295,7 +3307,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
     registry: &Rc<CallRegistry>,
     stubs: &[ResidualStubSpec],
 ) {
-    for (segments, _signature, _return_token, _return_lltype) in stubs {
+    for (segments, _signature, _return_token, _return_lltype, _return_class_root) in stubs {
         let key = FunctionPathKey::from_segments(segments.iter().cloned());
         if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name())
             .is_some()
@@ -3881,6 +3893,32 @@ fn residual_stub_result_shell(
     }
 }
 
+/// Intern of `*mut T` / `*const T` onto a declared non-GC ADT.
+///
+/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
+/// struct / Opaque is `lltype.py` `SomePtr`. `SomePtr.bool` folds only
+/// when the pointer is constant (`lltype.py`). A skipped callee whose
+/// declared result is this spelling must intern this shell
+/// (`extfunc.py` `ExtFuncEntry.compute_result_annotation`), not the
+/// classdef-less `ref` instance (`valuetype_to_someshell(Ref(None))`)
+/// whose `SomeInstance.bool` is const-True when `!can_be_None`.
+fn nongc_raw_ptr_class_root_someptr(
+    bk: &crate::annotator::bookkeeper::Bookkeeper,
+    root: &str,
+) -> Option<crate::annotator::model::SomeValue> {
+    if !crate::front::mir::is_raw_ptr_to_classed_instance_spelling(root) {
+        return None;
+    }
+    let pointee = root
+        .strip_prefix("*const ")
+        .or_else(|| root.strip_prefix("*mut "))
+        .map(str::trim)?;
+    if bk.owner_layout_gckind_is_gc(pointee) {
+        return None;
+    }
+    Some(bk.nongc_adt_raw_ptr_annotation(pointee))
+}
+
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
 /// a low-level `STR` pointer (`FunctionGraph::return_is_str`) or a
@@ -4001,25 +4039,26 @@ fn declared_return_annotation(
     // struct / Opaque is `lltype.py` `SomePtr`. Never SomeInstance:
     // `SomeInstance.bool` const-True when `!can_be_None` folds the live
     // null arm (`transform.py` `transform_dead_code`).
+    if let Some(s) = nongc_raw_ptr_class_root_someptr(bk, root) {
+        return Some(s);
+    }
     if crate::front::mir::is_raw_ptr_to_classed_instance_spelling(root)
         && let Some(pointee) = root
             .strip_prefix("*const ")
             .or_else(|| root.strip_prefix("*mut "))
             .map(str::trim)
+        && bk.owner_layout_gckind_is_gc(pointee)
     {
-        if bk.owner_layout_gckind_is_gc(pointee) {
-            let classdef = bk
-                .getuniqueclassdef(&bk.intern_class_by_qualname(pointee))
-                .ok()?;
-            return Some(crate::annotator::model::SomeValue::Instance(
-                crate::annotator::model::SomeInstance::new(
-                    Some(classdef),
-                    graph.return_can_be_none,
-                    std::collections::BTreeMap::new(),
-                ),
-            ));
-        }
-        return Some(bk.nongc_adt_raw_ptr_annotation(pointee));
+        let classdef = bk
+            .getuniqueclassdef(&bk.intern_class_by_qualname(pointee))
+            .ok()?;
+        return Some(crate::annotator::model::SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                Some(classdef),
+                graph.return_can_be_none,
+                std::collections::BTreeMap::new(),
+            ),
+        ));
     }
     // A `GcStruct._arrayfld` class root is the array itself
     // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
@@ -4316,7 +4355,7 @@ pub(crate) fn register_unsafe_fn_stubs(
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let foreign_callables = registry_foreign_callables(registry);
-    for (segments, signature, return_token, return_lltype) in specs {
+    for (segments, signature, return_token, return_lltype, return_class_root) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
         // here, before they ever become a `SemanticFunction`. Declining
@@ -4383,6 +4422,20 @@ pub(crate) fn register_unsafe_fn_stubs(
                 store_graph
                     .as_ref()
                     .and_then(|graph| declared_return_annotation(registry, graph.as_ref()))
+            })
+            .or_else(|| {
+                // A skipped look-inside / bodyless callee has no
+                // GraphStore header for `declared_return_annotation`.
+                // The `"ref"` token alone is the classdef-less instance
+                // (`residual_return_annotation`); a declared `*mut T`
+                // onto a non-GC ADT is SomePtr (`lltype.py`).
+                if declared_token != Some("ref") && declared_token != Some(GCREF_RETURN_TYPE) {
+                    return None;
+                }
+                nongc_raw_ptr_class_root_someptr(
+                    registry.bookkeeper(),
+                    return_class_root.as_deref()?,
+                )
             })
             .or_else(|| residual_return_annotation(declared_token, Some(registry.bookkeeper())));
         if alias_existing_lookup(registry, &key) {
@@ -9163,6 +9216,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         for segments in [
             vec!["std", "alloc", "alloc_zeroed"],
@@ -9174,6 +9228,7 @@ mod tests {
                 segments.iter().map(|s| (*s).to_string()).collect(),
                 Signature::new(vec!["layout".to_string()], None, None),
                 Some("ref".to_string()),
+                None,
                 None,
             ));
         }
@@ -9273,6 +9328,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         for segments in [
             vec!["core", "ptr", "copy_nonoverlapping"],
@@ -9286,6 +9342,7 @@ mod tests {
                     None,
                     None,
                 ),
+                None,
                 None,
                 None,
             ));
@@ -11287,6 +11344,7 @@ mod tests {
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
                 None,
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let qualified_entry = registry
@@ -11366,6 +11424,7 @@ mod tests {
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
                 None,
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stub_entry = registry
@@ -11419,6 +11478,7 @@ mod tests {
             vec!["other".into(), "f".into()],
             Signature::new(vec![], None, None),
             Some("ref".to_string()),
+            None,
             None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -11484,6 +11544,7 @@ mod tests {
                     sig.clone(),
                     Some("i64".to_string()),
                     None,
+                    None,
                 ),
                 (
                     vec![
@@ -11493,6 +11554,7 @@ mod tests {
                     ],
                     sig.clone(),
                     Some("i64".to_string()),
+                    None,
                     None,
                 ),
             ];
@@ -11588,6 +11650,7 @@ mod tests {
                 ],
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
+                None,
                 None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -11995,6 +12058,7 @@ mod tests {
                 None,
             ),
             Some(token),
+            None,
             None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -18613,6 +18677,7 @@ mod tests {
             Signature::new(vec!["kind".to_string()], None, None),
             Some("ref".to_string()),
             None,
+            None,
         )];
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
@@ -19709,6 +19774,185 @@ mod tests {
         );
     }
 
+    /// A skipped look-inside / bodyless callee whose declared result is
+    /// `*mut T` onto a non-GC ADT intern's `SomePtr` (`llannotation.py`
+    /// `lltype_to_annotation` of `lltype.Ptr`, `extfunc.py`
+    /// `ExtFuncEntry.compute_result_annotation`). The `"ref"` token
+    /// alone is the classdef-less instance whose `SomeInstance.bool`
+    /// is const-True.
+    #[test]
+    fn register_unsafe_fn_stubs_nongc_raw_ptr_intern_is_someptr() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        let specs = vec![(
+            vec!["nongc_raw_ptr_session".to_string()],
+            Signature::new(vec!["conn".to_string()], None, None),
+            Some("ref".to_string()),
+            None,
+            Some("*mut ffi_raw::NativeSession".into()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["nongc_raw_ptr_session"]))
+            .expect("stub registered");
+        let intern = entry
+            .function_desc
+            .borrow()
+            .residual_signature_result()
+            .expect("bodyless residual intern");
+        let SomeValue::Ptr(ptr) = intern else {
+            panic!("skipped *mut nongc intern is SomePtr, got {intern:?}");
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ffi_raw::NativeSession");
+                assert_eq!(op._gckind, GcKind::Raw);
+            }
+            PtrTarget::Struct(st) => {
+                assert_eq!(st._gckind, GcKind::Raw);
+            }
+            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
+        }
+        let SomeValue::Bool(b) = ptr.bool() else {
+            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
+        };
+        assert!(
+            b.base.const_box.is_none(),
+            "SomePtr.bool does not fold (lltype.py SomePtr.bool)"
+        );
+    }
+
+    /// Look-inside caller of a skipped callee that returns `null_mut()`
+    /// or a real `*mut T` onto a non-GC struct. Frontend `is_null` is
+    /// `eq(bool(p), False)` (`desugar/std_call.rs` `is_raw_ptr_is_null`).
+    /// Both exits are followed (`annrpython.py` `follow_link`): intern is
+    /// non-constant `SomePtr`, so `SomePtr.bool` does not fold.
+    #[test]
+    fn look_inside_is_null_of_skipped_nongc_raw_ptr_follows_both_exits() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::transform::link_not_in_links_followed;
+
+        let _lock = anchor_lock();
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        let specs = vec![(
+            vec!["nongc_raw_ptr_session".to_string()],
+            Signature::new(vec!["conn".to_string()], None, None),
+            Some("ref".to_string()),
+            None,
+            Some("*mut ffi_raw::NativeSession".into()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+
+        let mut graph = LegacyGraph::new("look_inside_is_null_nongc_raw_ptr");
+        let conn = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Input {
+                    name: "conn".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .block_mut(graph.startblock)
+            .inputargs
+            .push(conn.clone());
+        setbinding(&conn, ValueType::Ref(None));
+        let backend = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["nongc_raw_ptr_session"]),
+                    args: crate::model::call_args(vec![conn.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let is_true = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: backend.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let false_c = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::ConstBool(false),
+                true,
+            )
+            .unwrap();
+        let is_null = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: is_true,
+                    rhs: false_c,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let null_arm = graph.create_block();
+        let nonnull_arm = graph.create_block();
+        graph.set_branch(
+            graph.startblock,
+            is_null.clone(),
+            null_arm,
+            vec![],
+            nonnull_arm,
+            vec![],
+        );
+        graph.set_return(null_arm, None);
+        graph.set_return(nonnull_arm, None);
+
+        let (flow, value_to_var, _, _, _, _) = drive_subject(&graph, &registry, true)
+            .expect("look-inside is_null of skipped *mut nongc annotates");
+        let backend_ann = value_to_var.get(&backend).and_then(|typed| {
+            typed
+                .annotation
+                .borrow()
+                .as_ref()
+                .map(|cell| (**cell).clone())
+        });
+        let SomeValue::Ptr(ptr) = backend_ann.as_ref().expect("call result annotated") else {
+            panic!("call result is SomePtr, got {backend_ann:?}");
+        };
+        let SomeValue::Bool(b) = ptr.bool() else {
+            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
+        };
+        assert!(
+            b.base.const_box.is_none(),
+            "is_null of a skipped *mut nongc must not fold, got {b:?}"
+        );
+        let (ann, _) = registry
+            .session_if_started()
+            .expect("drive_subject starts the annotator session");
+        let start = flow.borrow().startblock.clone();
+        let exits = start.borrow().exits.clone();
+        assert_eq!(exits.len(), 2, "is_null is a two-exit switch");
+        for link in &exits {
+            assert!(
+                !link_not_in_links_followed(&ann, link),
+                "both is_null exits are followed (annrpython.py follow_link); unfollowed {link:?}"
+            );
+        }
+    }
+
     #[test]
     fn declared_return_annotation_gc_raw_ptr_class_root_stays_instance() {
         use crate::annotator::model::SomeValue;
@@ -20198,6 +20442,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, None);
             let (graph, result) = bodyless_extern_wrapper_call_graph(&[name], result_ty);
@@ -20248,6 +20493,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, None);
             let mut graph = LegacyGraph::new("wrapper_void_then_ext");
@@ -20361,6 +20607,7 @@ mod tests {
                 Signature::new(vec!["x".to_string()], None, None),
                 None,
                 Some(result_lltype.clone()),
+                None,
             )];
             register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
             let crate_entry = registry
@@ -20431,12 +20678,14 @@ mod tests {
                 sig.clone(),
                 None,
                 Some(LowLevelType::Signed),
+                None,
             ),
             (
                 vec!["m".to_string(), "f".to_string()],
                 sig,
                 None,
                 Some(LowLevelType::Signed),
+                None,
             ),
         ];
         register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
@@ -20464,17 +20713,20 @@ mod tests {
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
                 None,
+                None,
             ),
             (
                 vec!["pyobject".to_string(), "is_int".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
                 None,
+                None,
             ),
             (
                 vec!["majit_gc".to_string(), "shadow_push".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("u64".to_string()),
+                None,
                 None,
             ),
             // A token `residual_return_shell` declines — 128-bit has no
@@ -20484,6 +20736,7 @@ mod tests {
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
                 Some("i128".to_string()),
+                None,
                 None,
             ),
         ];
@@ -20524,6 +20777,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);
@@ -20588,6 +20842,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
@@ -22018,6 +22273,7 @@ mod tests {
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
             None,
+            None,
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
@@ -22059,6 +22315,7 @@ mod tests {
             vec!["pyobject".to_string(), "shared".to_string()],
             signature,
             Some("bool".to_string()),
+            None,
             None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);

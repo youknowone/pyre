@@ -1204,12 +1204,7 @@ pub struct SemanticProgram {
     /// `FunctionDesc`-equivalent signature without becoming JitCode bodies.
     /// Feeds `CallControl.unsafe_fn_stubs` →
     /// `cutover::register_unsafe_fn_stubs`.
-    pub unsafe_fn_stubs: Vec<(
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        Option<String>,
-        Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
-    )>,
+    pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …) whose result is faithfully modelable, harvested from the LLBC by
