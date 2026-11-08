@@ -6262,6 +6262,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.result_type = majit_ir::Type::Ref;
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
+    pyre_jit_trace::state::register_python_portal_bh_runner(crate::call_jit::bh_portal_runner_c);
     jd.handle_jitexc_from_bh = Some(pyre_portal_runner);
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
@@ -8176,7 +8177,8 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     );
     let portal_frame = per_frame.first().map(|&(p, _)| p).unwrap_or(0);
     let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
-        let replaced = crate::call_jit::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
+        let replaced =
+            pyre_jit_trace::state::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
         if frame_ptr != 0 {
             level_recursion.borrow_mut().pop();
         }

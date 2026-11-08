@@ -3819,30 +3819,6 @@ fn cash_multi_frame_blackhole(
             })
             .collect::<Vec<_>>(),
     );
-    // This closure does not run `return_trace` / `ExecutionContext.leave`.
-    // Adopted Python levels finish through `bhimpl_jit_merge_point`'s
-    // recursive arm; `ll_portal_runner_shim`'s bracket already ran
-    // `pyframe.py execute_frame`'s inner and outer `finally` hooks
-    // (`portal_activation_bracketed`, `PortalLeaveOwner::CompiledTrace`).
-    // The bracket skips the chain half of `leave`, which this supplies.
-    // Convert's `bh_portal_runner_c` levels instead take
-    // `finish_per_code_blackhole_level` (`call_jit.rs`).
-    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
-        // Only no-handler exception leave stores the bit (`handle_operation_error`); a return executed its own flags store.
-        crate::state::finish_blackhole_level_frame(
-            frame_ptr,
-            matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
-        );
-        if frame_ptr != 0 {
-            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
-            // before the caller's residuals run.
-            unsafe {
-                (*ec).set_topframeref((*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref);
-            }
-            level_recursion.borrow_mut().pop();
-        }
-        None
-    };
     if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
         crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3867,6 +3843,18 @@ fn cash_multi_frame_blackhole(
     for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
         slot.0 = ptr;
     }
+    // Adopted inner levels now finish through `bh_portal_runner_c`
+    // (`portal_ptr`, no second `enter`/`call_trace`) and their
+    // `execute_frame` finally (`return_trace`, `leave`) runs here, as in
+    // convert.
+    let portal_frame = per_frame.first().map(|&(p, _)| p).unwrap_or(0);
+    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        let replaced = crate::state::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
+        if frame_ptr != 0 {
+            level_recursion.borrow_mut().pop();
+        }
+        replaced
+    };
     let virtualizable_info = std::sync::Arc::as_ptr(&staged.virtualizable_info);
     let drive_vable = cf_addr.unwrap_or(live_root_addr) as i64;
     WALK_HANDED_TO_BLACKHOLE.with(|c| c.set(true));
@@ -3892,7 +3880,9 @@ fn cash_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64, majit_metainterp::blackhole::LevelExit) -> Option<i64>),
-        None,
+        Some(crate::state::python_portal_bh_jitdrivers_sd(
+            staged.metainterp_sd.as_ref(),
+        )),
         Some(staged.banks.as_mut_slice()),
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,

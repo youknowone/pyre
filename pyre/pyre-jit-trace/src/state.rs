@@ -1164,6 +1164,188 @@ pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
     }
 }
 
+/// The runner is `warmspot.py ll_portal_runner`'s `portal_ptr`
+/// (`PyFrame.dispatch` inside the open enter/leave). pyre-jit owns it
+/// because it runs the eval loop.
+static PYTHON_PORTAL_BH_RUNNER: std::sync::OnceLock<extern "C" fn(i64, i64, i64, i64, i64) -> i64> =
+    std::sync::OnceLock::new();
+
+/// Install the Python-portal blackhole runner. Set once; a second call
+/// with the same function is a no-op.
+pub fn register_python_portal_bh_runner(f: extern "C" fn(i64, i64, i64, i64, i64) -> i64) {
+    if let Some(&existing) = PYTHON_PORTAL_BH_RUNNER.get() {
+        if std::ptr::fn_addr_eq(existing, f) {
+            return;
+        }
+    }
+    let _ = PYTHON_PORTAL_BH_RUNNER.set(f);
+}
+
+/// `get_portal_runner` table for a Python-portal blackhole.
+///
+/// `bhimpl_jit_merge_point`'s recursive-portal arm calls
+/// `portal_runner_adr`. The static table copies `ll_portal_runner_shim`,
+/// which is `execute_frame` for a fresh activation (`compile_tmp_callback`).
+/// Convert, resume, and walker-abort cash walk an already-entered chain, so
+/// the runner is the registered Python-portal blackhole runner (`portal_ptr` =
+/// `PyFrame.dispatch` inside the open enter/leave), the same jd0
+/// `resume_in_blackhole` installs.
+pub fn python_portal_bh_jitdrivers_sd(
+    sd: &majit_metainterp::MetaInterpStaticData,
+) -> std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> {
+    // `blackhole.py get_portal_runner`:
+    //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+    //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
+    //   calldescr    = jitdriver_sd.mainjitcode.calldescr
+    //
+    // The table keeps every driver at its own `jdindex`: a resumed jd1 or jd2
+    // jitcode still carries that index, so a one-slot table would leave its
+    // `handle_jitexc_from_bh` unreachable. Only jd0's slot is replaced.
+    let mut table = sd.bh_jitdrivers_sd().to_vec();
+    let extra_info = table
+        .first()
+        .map(|jd| jd.mainjitcode_calldescr.extra_info.clone())
+        .unwrap_or_default();
+    let jd0 =
+        majit_metainterp::blackhole::BhJitDriverSd {
+            result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+            portal_runner_ptr: Some(*PYTHON_PORTAL_BH_RUNNER.get().expect(
+                "register_python_portal_bh_runner must run before a Python-portal blackhole",
+            )),
+            handle_jitexc_from_bh: sd
+                .jitdrivers_sd
+                .first()
+                .and_then(|jd| jd.handle_jitexc_from_bh),
+            mainjitcode_calldescr: {
+                // `get_portal_runner` returns this descr paired with the
+                // Python-portal blackhole runner, and the blackhole
+                // recursive-portal resume (`bhimpl_recursive_call_r` ->
+                // `bh_call_r`) verifies the merged green+red argument banks
+                // against it — so it must describe the portal runner, not the
+                // traced function. The runner consumes the warmspot
+                // `portalfunc_ARGS` (`warmspot.py ll_portal_runner`): greens
+                // `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
+                // `[frame:r, ec:r]` (`interp_jit.py`) = 2 int + 3 ref.
+                // Fresh descr so `descr.py CallDescr.create_call_stub` sees
+                // `"iirrr"` / `'r'`. Cloning a traced-function calldescr and
+                // rewriting those two fields would keep a stub selected for
+                // the traced function (`BhCallDescr::clone` copies a resolved
+                // `call_stub`). `from_arg_classes` leaves the stub unresolved
+                // and keeps extra_info from table[0].
+                majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
+                    "iirrr".to_string(),
+                    'r',
+                    extra_info,
+                )
+            },
+        };
+    match table.first_mut() {
+        Some(slot) => *slot = jd0,
+        None => table.push(jd0),
+    }
+    std::sync::Arc::from(table)
+}
+
+/// Inner `finally` then outer `finally` of `pyframe.py execute_frame`:
+/// `executioncontext.py return_trace`, then `ExecutionContext.leave`.
+///
+/// `blackhole.py bhimpl_ref_return` is `LeaveFrame` only; upstream's
+/// `execute_frame` jitcode above that level runs these hooks. Per-code
+/// jitcode has no such wrapper, so the leave callback does it here.
+/// `Some(exc)` replaces the pending outcome (`execute_frame`).
+pub fn per_code_return_trace_then_leave(
+    frame: *mut pyre_interpreter::PyFrame,
+    mut w_exitvalue: pyre_object::PyObjectRef,
+    mut got_exception: bool,
+) -> Option<i64> {
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    if ec.is_null() || frame.is_null() {
+        return None;
+    }
+    let anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let exit_slot = roots.base();
+    let exit = roots.pin_root(w_exitvalue);
+    let trace = unsafe { (*ec).return_trace(anchor.live(), exit) };
+    let leave_result = match trace {
+        Err(err) => {
+            got_exception = true;
+            w_exitvalue = roots.get(exit_slot);
+            let mut pending: pyre_interpreter::PyResult = Err(err);
+            let pinned = pyre_interpreter::executioncontext::PinnedResult::pin(&mut pending);
+            let leave_result = unsafe { (*ec).leave(anchor.live(), w_exitvalue, got_exception) };
+            pinned.reload(&mut pending);
+            match leave_result {
+                Err(leave_err) => Err(leave_err),
+                Ok(_) => pending,
+            }
+        }
+        Ok(live) => {
+            w_exitvalue = live;
+            unsafe { (*ec).leave(anchor.live(), w_exitvalue, got_exception) }
+        }
+    };
+    match leave_result {
+        // pyframe.py execute_frame: return_trace/leave replace the pending
+        // outcome. Do not park it on residual-call cells.
+        Err(mut err) => Some(err.to_exc_object() as i64),
+        Ok(_) => None,
+    }
+}
+
+/// Per-code blackhole `on_leave_level`: finished bit, then `execute_frame`'s
+/// finally. Every such level already ran `ExecutionContext.enter`
+/// (`walker_ec_enter` while inlining / CA-cut, republished as `topframeref`
+/// by convert's `on_enter_level`). `leave` has no identity check.
+pub fn finish_per_code_blackhole_level(
+    frame_ptr: i64,
+    w_exitvalue: pyre_object::PyObjectRef,
+    got_exception: bool,
+) -> Option<i64> {
+    finish_blackhole_level_frame(frame_ptr, got_exception);
+    if frame_ptr == 0 {
+        return None;
+    }
+    per_code_return_trace_then_leave(
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        w_exitvalue,
+        got_exception,
+    )
+}
+
+/// `on_leave_level` for convert-and-run. Per-code levels take
+/// `finish_per_code_blackhole_level`. The portal level is
+/// `continue_entered_frame` → `portal_return_trace_then_leave`
+/// (`bhimpl_jit_merge_point` recursive arm / bottommost CRN).
+pub fn finish_blackhole_level(
+    frame_ptr: i64,
+    portal_frame: i64,
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    exit: majit_metainterp::blackhole::LevelExit,
+) -> Option<i64> {
+    if frame_ptr != 0 && frame_ptr != portal_frame {
+        let (w_exitvalue, got_exception) = match &exit {
+            majit_metainterp::blackhole::LevelExit::Return(word) => {
+                (*word as pyre_object::PyObjectRef, false)
+            }
+            majit_metainterp::blackhole::LevelExit::Exception => (pyre_object::w_none(), true),
+        };
+        return finish_per_code_blackhole_level(frame_ptr, w_exitvalue, got_exception);
+    }
+    // Only no-handler exception leave stores the bit (`handle_operation_error`); a return executed its own flags store.
+    finish_blackhole_level_frame(
+        frame_ptr,
+        matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
+    );
+    if !ec.is_null() && frame_ptr != 0 {
+        unsafe {
+            (*ec).set_topframeref((*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref);
+        }
+    }
+    None
+}
+
 /// `walk_bh_regs` calls this before visiting a blackhole register bank.
 ///
 /// `bhimpl_live` only records the marker pc. Precise liveness is a
