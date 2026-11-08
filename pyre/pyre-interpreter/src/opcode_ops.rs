@@ -72,7 +72,18 @@ pub(crate) fn stdframe_binop_shortcut_apply(
                 pyre_object::w_int_get_value(b),
             ),
             StdFrameShortcut::ListSubscr => {
-                match pyre_object::w_list_getitem(a, pyre_object::w_int_get_value(b)) {
+                // `frame.py` `list_BINARY_SUBSCR` calls `w_1.getitem(w_2.intval)`
+                // with no list lock. Same `gil_ready` split as `getitem_list`:
+                // the look-inside `w_list_getitem_inner` is the body traces
+                // record; a published runtime takes the locked wrapper.
+                let idx = pyre_object::w_int_get_value(b);
+                let ready = pyre_object::gil_ready::gil_ready_word();
+                let item = if ready != 0 {
+                    pyre_object::w_list_getitem(a, idx)
+                } else {
+                    pyre_object::w_list_getitem_inner(a, idx)
+                };
+                match item {
                     Some(w) => Ok(w),
                     None => Err(PyError::index_error("list index out of range")),
                 }
