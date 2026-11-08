@@ -11,6 +11,15 @@
 
 use crate::pyobject::PyObjectRef;
 
+/// `Buffer.get_raw_address` failure (`rpython/rlib/buffer.py`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawAddressError {
+    /// The buffer cannot give a raw address (`ValueError`).
+    NoAddress,
+    /// `str2charp` / `get_raw_address_of_string` OOM; MemoryError is pending.
+    Memory,
+}
+
 /// Flat byte storage behind a buffer-protocol exporter.
 ///
 /// `Clone` shares the storage, not the bytes: a variant holds only the
@@ -285,22 +294,30 @@ impl Buffer {
 
     /// `Buffer.get_raw_address` (`rpython/rlib/buffer.py`).
     ///
-    /// A `String` buffer uses `rffi.get_raw_address_of_string`. Null means
-    /// MemoryError is pending. The exporter must be rooted: moving out of
+    /// A `String` buffer uses `rffi.get_raw_address_of_string`. [`RawAddressError::Memory`]
+    /// means MemoryError is pending. [`RawAddressError::NoAddress`] is the
+    /// default `ValueError` arm. The exporter must be rooted: moving out of
     /// the nursery can collect. A `Sub` is `parent.get_raw_address() + offset`
     /// (`SubBuffer.get_raw_address`).
     ///
     /// # Safety
     /// The variant's `w_obj` must point to a live object of the tagged kind.
-    pub unsafe fn get_raw_address(&self) -> *mut u8 {
+    pub unsafe fn get_raw_address(&self) -> Result<*mut u8, RawAddressError> {
         unsafe {
             match self {
-                Buffer::String { w_obj } => crate::bytesobject::w_bytes_raw_address(*w_obj),
+                Buffer::String { w_obj } => {
+                    let ptr = crate::bytesobject::w_bytes_raw_address(*w_obj);
+                    if ptr.is_null() {
+                        Err(RawAddressError::Memory)
+                    } else {
+                        Ok(ptr)
+                    }
+                }
                 Buffer::Byte { w_obj } => {
-                    crate::bytearrayobject::w_bytearray_data(*w_obj).as_ptr() as *mut u8
+                    Ok(crate::bytearrayobject::w_bytearray_data(*w_obj).as_ptr() as *mut u8)
                 }
                 Buffer::Array { w_obj } => {
-                    crate::interp_array::w_array_bytes(*w_obj).as_ptr() as *mut u8
+                    Ok(crate::interp_array::w_array_bytes(*w_obj).as_ptr() as *mut u8)
                 }
                 Buffer::External {
                     w_obj,
@@ -313,15 +330,11 @@ impl Buffer {
                         Some(Err(_)) => (core::ptr::NonNull::<u8>::dangling().as_ptr() as usize, 0),
                         None => (*address, *size),
                     };
-                    address as *mut u8
+                    Ok(address as *mut u8)
                 }
                 Buffer::Sub { parent, offset, .. } => {
-                    let base = parent.get_raw_address();
-                    if base.is_null() {
-                        core::ptr::null_mut()
-                    } else {
-                        base.wrapping_add(*offset)
-                    }
+                    let base = parent.get_raw_address()?;
+                    Ok(base.wrapping_add(*offset))
                 }
             }
         }

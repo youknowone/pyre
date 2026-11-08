@@ -16,9 +16,8 @@ pub struct StringDecoder<'a> {
 }
 
 impl<'a> StringDecoder<'a> {
-    pub fn new(w_ffi: PyObjectRef, string: &'a [u8]) -> Self {
-        let ffi_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_ffi);
+    /// Host `types` string. `ffi_slot` is the slot `ffiobj_init` already pinned.
+    pub fn new(ffi_slot: usize, string: &'a [u8]) -> Self {
         Self {
             ffi_slot,
             packed_slot: None,
@@ -30,12 +29,9 @@ impl<'a> StringDecoder<'a> {
     /// Packed descriptor owned by a Python `bytes` object.
     ///
     /// `StringBuffer.getitem` re-reads `self.value` each time; `next_name`
-    /// re-derives after `allocate_free_mem`.
-    pub fn from_packed(w_ffi: PyObjectRef, w_packed: PyObjectRef) -> Self {
-        let ffi_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_ffi);
-        let packed_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_packed);
+    /// re-derives after `allocate_free_mem`. `ffi_slot` / `packed_slot` are
+    /// the slots `ffiobj_init` already pinned.
+    pub fn from_packed(ffi_slot: usize, packed_slot: usize) -> Self {
         Self {
             ffi_slot,
             packed_slot: Some(packed_slot),
@@ -186,7 +182,7 @@ pub fn ffiobj_init(
         }
         let n = types.len() / 4;
         let ntypes = allocate_array::<parse_c_type::OpcodeT>(roots.get(ffi_slot), n)?;
-        let mut decoder = StringDecoder::new(roots.get(ffi_slot), types);
+        let mut decoder = StringDecoder::new(ffi_slot, types);
         for i in 0..n {
             unsafe { ntypes.add(i).write(decoder.next_opcode()?) };
         }
@@ -225,8 +221,9 @@ pub fn ffiobj_init(
         let nglobs = block.cast::<parse_c_type::GlobalS>();
         let nintconsts = unsafe { block.add(globals_bytes) }.cast::<CdlIntConst>();
         for i in 0..n {
-            let packed = packed_bytes(roots.get(base + i * 2))?;
-            let mut decoder = StringDecoder::from_packed(roots.get(ffi_slot), packed);
+            let packed_slot = base + i * 2;
+            let _ = packed_bytes(roots.get(packed_slot))?;
+            let mut decoder = StringDecoder::from_packed(ffi_slot, packed_slot);
             let target = unsafe { &mut *nglobs.add(i) };
             target.type_op = decoder.next_opcode()?;
             target.name = decoder.next_name()?;
@@ -267,8 +264,9 @@ pub fn ffiobj_init(
                 let _ = roots.pin_root(item);
             }
             let nf1 = desc.len().saturating_sub(1);
-            let packed = packed_bytes(roots.get(desc_base))?;
-            let mut decoder = StringDecoder::from_packed(roots.get(ffi_slot), packed);
+            let packed_slot = desc_base;
+            let _ = packed_bytes(roots.get(packed_slot))?;
+            let mut decoder = StringDecoder::from_packed(ffi_slot, packed_slot);
             let target = unsafe { &mut *nstructs.add(i) };
             target.type_index = decoder.next_4bytes()?;
             target.flags = decoder.next_4bytes()?;
@@ -290,8 +288,9 @@ pub fn ffiobj_init(
                 target.num_fields = nf1 as core::ffi::c_int;
             }
             for j in 0..nf1 {
-                let packed = packed_bytes(roots.get(desc_base + j + 1))?;
-                let mut decoder = StringDecoder::from_packed(roots.get(ffi_slot), packed);
+                let packed_slot = desc_base + j + 1;
+                let _ = packed_bytes(roots.get(packed_slot))?;
+                let mut decoder = StringDecoder::from_packed(ffi_slot, packed_slot);
                 let field = unsafe { &mut *nfields.add(nf) };
                 field.field_type_op = decoder.next_opcode()?;
                 field.field_offset = usize::MAX;
@@ -323,8 +322,9 @@ pub fn ffiobj_init(
         let n = enums.len();
         let nenums = allocate_array::<parse_c_type::EnumS>(roots.get(ffi_slot), n)?;
         for i in 0..n {
-            let packed = packed_bytes(roots.get(base + i))?;
-            let mut decoder = StringDecoder::from_packed(roots.get(ffi_slot), packed);
+            let packed_slot = base + i;
+            let _ = packed_bytes(roots.get(packed_slot))?;
+            let mut decoder = StringDecoder::from_packed(ffi_slot, packed_slot);
             let target = unsafe { &mut *nenums.add(i) };
             target.type_index = decoder.next_4bytes()?;
             target.type_prim = decoder.next_4bytes()?;
@@ -347,8 +347,9 @@ pub fn ffiobj_init(
         let n = typenames.len();
         let ntypenames = allocate_array::<parse_c_type::TypenameS>(roots.get(ffi_slot), n)?;
         for i in 0..n {
-            let packed = packed_bytes(roots.get(base + i))?;
-            let mut decoder = StringDecoder::from_packed(roots.get(ffi_slot), packed);
+            let packed_slot = base + i;
+            let _ = packed_bytes(roots.get(packed_slot))?;
+            let mut decoder = StringDecoder::from_packed(ffi_slot, packed_slot);
             let target = unsafe { &mut *ntypenames.add(i) };
             target.type_index = decoder.next_4bytes()?;
             target.name = decoder.next_name()?;

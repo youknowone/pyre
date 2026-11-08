@@ -47,8 +47,6 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
 
 fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     if unsafe { bytesobject::is_bytes_like(obj) } {
-        // `StringUnmarshaller` reads its own str: copy before
-        // `unmarshal_bytes` allocates.
         return Ok(unsafe { bytesobject::bytes_like_data(obj).to_vec() });
     }
     if unsafe { memoryview::is_w_memoryview(obj) } {
@@ -69,6 +67,51 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     Err(PyError::type_error(format!(
         "{function}() argument must be a bytes-like object"
     )))
+}
+
+/// The owning object `StringUnmarshaller` holds (`self.view` / `self.buf`).
+fn marshal_owner(obj: PyObjectRef, function: &str) -> Result<PyObjectRef, PyError> {
+    if unsafe { bytesobject::is_bytes_like(obj) } {
+        return Ok(obj);
+    }
+    if unsafe { memoryview::is_w_memoryview(obj) } {
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        crate::typedef::require_contiguous_buffer(obj)?;
+        return Ok(obj);
+    }
+    if unsafe { interp_array::is_array(obj) } {
+        return Ok(obj);
+    }
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+        return Ok(src);
+    }
+    Err(PyError::type_error(format!(
+        "{function}() argument must be a bytes-like object"
+    )))
+}
+
+/// `StringUnmarshaller.get` / `get1`: re-derive the slice from the rooted owner.
+///
+/// A memoryview released (or made non-contiguous) during unmarshal raises the
+/// same error `loads` already raises at entry (`W_MemoryView._check_released`
+/// / `require_contiguous_buffer`). Upstream `buf.getslice` / `getitem` go
+/// through that released check rather than reading an empty window.
+unsafe fn marshal_payload(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
+    unsafe {
+        if bytesobject::is_bytes_like(obj) {
+            Ok(bytesobject::bytes_like_data(obj))
+        } else if interp_array::is_array(obj) {
+            Ok(interp_array::w_array_bytes(obj))
+        } else if memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_check_released(obj)?;
+            crate::typedef::require_contiguous_buffer(obj)?;
+            Ok(memoryview::w_memoryview_view(obj)
+                .as_contiguous_bytes()
+                .unwrap_or(&[]))
+        } else {
+            Ok(&[])
+        }
+    }
 }
 
 /// PyPy `marshal_impl.py marshal` buffer fallback.
@@ -700,14 +743,48 @@ fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalEr
 }
 
 /// A marshal byte stream, wrapped so `read_wtf8` is the strict one.
+///
+/// `owner_slot` is `StringUnmarshaller`'s rooted buffer: `get` / `get1`
+/// re-derive the slice per read (`buf.getslice` / `buf.getitem`). Host
+/// `data` is frozen / `loads_bytes` payload with no GC owner.
 struct BytesReader<'a> {
     data: &'a [u8],
+    owner_slot: Option<usize>,
+    pos: usize,
+    scratch: Vec<u8>,
     errors: ErrorSink,
+}
+
+impl BytesReader<'_> {
+    fn python_error<T>(&mut self, error: PyError) -> Result<T, wire::MarshalError> {
+        self.errors.remember(error);
+        Err(wire::MarshalError::BadType)
+    }
 }
 
 impl wire::Read for BytesReader<'_> {
     fn read_slice(&mut self, n: u32) -> Result<&[u8], wire::MarshalError> {
-        self.data.read_slice(n)
+        if let Some(slot) = self.owner_slot {
+            let owner = pyre_object::gc_roots::shadow_stack_get(slot);
+            let data = match unsafe { marshal_payload(owner) } {
+                Ok(data) => data,
+                Err(error) => return self.python_error(error),
+            };
+            let n = n as usize;
+            let end = self
+                .pos
+                .checked_add(n)
+                .ok_or(wire::MarshalError::DataTooShort)?;
+            if end > data.len() {
+                return Err(wire::MarshalError::DataTooShort);
+            }
+            self.scratch.clear();
+            self.scratch.extend_from_slice(&data[self.pos..end]);
+            self.pos = end;
+            Ok(&self.scratch)
+        } else {
+            self.data.read_slice(n)
+        }
     }
 
     fn read_wtf8(&mut self, len: u32) -> Result<&Wtf8, wire::MarshalError> {
@@ -1229,7 +1306,21 @@ fn marshal_to_bytes(
 /// Deserialize one object from a marshal byte stream.  With `allow_code`
 /// false, a decoded code object is rejected (marshal.check_no_code).
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
+    unmarshal_source(data, None, allow_code)
+}
+
+/// `StringUnmarshaller`: the owner is rooted here and re-derived per read.
+fn unmarshal_owned(owner: PyObjectRef, allow_code: bool) -> PyResult {
+    unmarshal_source(&[], Some(owner), allow_code)
+}
+
+fn unmarshal_source(data: &[u8], owner: Option<PyObjectRef>, allow_code: bool) -> PyResult {
     let roots = pyre_object::gc_roots::push_roots();
+    let owner_slot = owner.map(|owner| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(owner);
+        slot
+    });
     let mut pending_error = None;
     let mut name_slots = Vec::with_capacity(64);
     let errors = ErrorSink::park(&roots, &mut pending_error);
@@ -1237,6 +1328,9 @@ fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let bag = PyreMarshalBag::new(errors, &mut name_slots, &mut raw_code);
     let mut reader = BytesReader {
         data,
+        owner_slot,
+        pos: 0,
+        scratch: Vec::new(),
         errors: bag.errors,
     };
     let result = match wire::deserialize_value(&mut reader, bag) {
@@ -1385,8 +1479,8 @@ crate::py_module! {
             let allow_slot = has_allow.then_some(base + 1);
             let allow_code =
                 resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
-            let data = bytes_like(pyre_object::gc_roots::shadow_stack_get(base), "loads")?;
-            unmarshal_bytes(&data, allow_code)
+            let owner = marshal_owner(pyre_object::gc_roots::shadow_stack_get(base), "loads")?;
+            unmarshal_owned(owner, allow_code)
         }
         // interp_marshal.py `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
         // — writes the stream `dumps` would return to `f.write`
@@ -1528,11 +1622,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_bytes_are_copied_for_unmarshal() {
+    fn exact_bytes_are_held_for_unmarshal() {
         let input = bytesobject::w_bytes_from_bytes(b"payload");
-        let bytes = bytes_like(input, "loads").expect("bytes input");
+        let owner = marshal_owner(input, "loads").expect("bytes input");
 
-        assert_eq!(bytes, b"payload");
+        assert!(std::ptr::eq(owner, input));
     }
 
     #[test]

@@ -654,15 +654,46 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
             .backing()
             .get_raw_address()
     };
-    if first.is_null() {
-        release_acquired(reload(view_slot));
-        super::pyerrors::set_pending_error(crate::PyError::memory_error(""));
-        return -1;
-    }
-    let first = first as usize;
+    let mut snapshot_slot = None;
+    let mut force_readonly = false;
+    let first = match first {
+        Ok(ptr) => ptr as usize,
+        Err(pyre_object::buffer::RawAddressError::Memory) => {
+            release_acquired(reload(view_slot));
+            super::pyerrors::set_pending_error(crate::PyError::memory_error(""));
+            return -1;
+        }
+        // `buff_w` `except ValueError`: snapshot `as_str()`, `space.newbytes`,
+        // `make_ref` of that, `str2charp`, readonly.
+        Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+            let snapshot = unsafe {
+                pyre_object::memoryview::w_memoryview_view(reload(view_slot))
+                    .backing()
+                    .as_bytes()
+            }
+            .to_vec();
+            let w_s = pyre_object::bytesobject::w_bytes_from_bytes(&snapshot);
+            snapshot_slot = Some(pyre_object::gc_roots::shadow_stack_len());
+            let _ = roots.pin_root(w_s);
+            match majit_rlib::rffi::str2charp(&snapshot, false) {
+                Ok(ptr) => {
+                    force_readonly = true;
+                    ptr as usize
+                }
+                Err(_) => {
+                    release_acquired(reload(view_slot));
+                    super::pyerrors::set_pending_error(crate::PyError::memory_error(""));
+                    return -1;
+                }
+            }
+        }
+    };
     // Both references first: minting one can move what the other names.
     let holder = pyobject::make_ref(reload(view_slot));
-    let exporter = pyobject::make_ref(reload(obj_slot));
+    let exporter = pyobject::make_ref(match snapshot_slot {
+        Some(slot) => reload(slot),
+        None => reload(obj_slot),
+    });
     let source_is_memoryview = unsafe {
         if pyre_object::memoryview::is_w_memoryview(reload(obj_slot)) {
             pyre_object::memoryview::w_memoryview_exports_incref(reload(obj_slot));
@@ -691,7 +722,11 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         (*view).obj = exporter;
         (*view).len = carrier.length() as isize;
         (*view).itemsize = carrier.itemsize() as isize;
-        (*view).readonly = carrier.readonly() as c_int;
+        (*view).readonly = if force_readonly {
+            1
+        } else {
+            carrier.readonly() as c_int
+        };
         // `memory_getbuf`: a request with no shape in it reads the whole
         // export as one run of unsigned chars, whatever its own rank.
         (*view).ndim = match request.contains(BufFlags::PYBUF_ND) {

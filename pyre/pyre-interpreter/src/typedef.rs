@@ -30691,8 +30691,10 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             // `PyErr_ExceptionMatches(PyExc_TypeError)` (subclasses included).
             // PyPy `_from_byte_sequence` lets `space.iter` propagate.
             let it = crate::baseobjspace::iter(other).map_err(|mut e| {
-                let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
                 if crate::baseobjspace::type_error_matched(&mut e) {
+                    // Reload after `type_error_matched` (`shadowstack.py
+                    // pop_roots` re-reads each live GCREF).
+                    let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     crate::PyError::type_error(format!(
                         "can't extend bytearray with {}",
                         crate::baseobjspace::object_functionstr_type_name(other)

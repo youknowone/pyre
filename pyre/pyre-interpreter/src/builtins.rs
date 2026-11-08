@@ -1795,10 +1795,19 @@ fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let view = pyre_object::memoryview::w_memoryview_view(mv);
             (view.backing().get_raw_address(), view.offset() as usize)
         });
-        if base.is_null() {
-            return Err(crate::PyError::memory_error(""));
+        match base {
+            Ok(base) => Ok(w_int_new((base as usize + offset) as i64)),
+            Err(pyre_object::buffer::RawAddressError::Memory) => {
+                Err(crate::PyError::memory_error(""))
+            }
+            Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+                let view = pyre_object::memoryview::w_memoryview_view(mv);
+                Err(crate::PyError::value_error(format!(
+                    "cannot find the underlying address of buffer that is internally {}",
+                    view.internal_repr()
+                )))
+            }
         }
-        Ok(w_int_new((base as usize + offset) as i64))
     }
 }
 
@@ -25541,11 +25550,15 @@ pub unsafe fn acquire_readbuf_raw_address(
             return Ok((address as *mut u8, length));
         }
         if pyre_object::bytesobject::is_bytes(obj) {
+            // Length before `w_bytes_raw_address` (`StringBuffer.get_raw_address` /
+            // `rffi.get_raw_address_of_string`): that call can collect, and `obj`
+            // is a raw copy the GC does not rewrite.
+            let len = pyre_object::bytesobject::w_bytes_len(obj);
             let ptr = pyre_object::bytesobject::w_bytes_raw_address(obj);
             if ptr.is_null() {
                 return Err(crate::PyError::memory_error(""));
             }
-            return Ok((ptr, pyre_object::bytesobject::w_bytes_len(obj)));
+            return Ok((ptr, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
@@ -25569,13 +25582,21 @@ pub unsafe fn acquire_readbuf_raw_address(
                 ));
             }
             let view = pyre_object::memoryview::w_memoryview_view(obj);
-            let base = view.backing().get_raw_address();
-            if base.is_null() {
-                return Err(crate::PyError::memory_error(""));
-            }
+            // Offset and length before `get_raw_address` (`StringBuffer.get_raw_address` /
+            // `rffi.get_raw_address_of_string`): that call can collect, and `obj` /
+            // `view` are raw copies the GC does not rewrite.
             let off = view.offset() as usize;
             let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
-            return Ok((base.add(off), len));
+            let base = view.backing().get_raw_address();
+            return match base {
+                Ok(base) => Ok((base.add(off), len)),
+                Err(pyre_object::buffer::RawAddressError::Memory) => {
+                    Err(crate::PyError::memory_error(""))
+                }
+                Err(pyre_object::buffer::RawAddressError::NoAddress) => Err(
+                    crate::PyError::value_error("cannot take the raw address of this buffer"),
+                ),
+            };
         }
         Err(crate::PyError::type_error(
             "a bytes-like object is required",

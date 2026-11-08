@@ -401,8 +401,9 @@ pub fn offset_in_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py memmove`.
 pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    // A `bytes` source hands back an interior pointer, and the size argument's
-    // `__int__` runs arbitrary Python, so the source is pinned across it.
+    // `simple_buffer_bytes` copies a non-cdata source into a host `Vec`
+    // (`charbuf_w`). The size argument's `__int__` runs arbitrary Python, so
+    // dest/src/n stay pinned across it.
     let roots = pyre_object::gc_roots::push_roots();
     let args_base = roots.pin_roots(&[args[0], args[1], args[2]]);
     let src_slot = args_base + 1;

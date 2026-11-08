@@ -326,9 +326,10 @@ fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
             pyre_interpreter::gateway::short_type_name(w_data)
         ))
     })?;
-    pyre_object::with_roots!(obj, w_state => cdata_write(obj, 0, unsafe {
-        pyre_object::bytesobject::bytes_like_data(source)
-    }));
+    // Host copy: `cdata_write` → `getdict_native` → `_obj_getdict` can collect
+    // (`char_array_set_raw`).
+    let buf = unsafe { pyre_object::bytesobject::bytes_like_data(source) }.to_vec();
+    pyre_object::with_roots!(obj, w_state => cdata_write(obj, 0, &buf));
     let mut d =
         pyre_object::with_roots!(w_state => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {

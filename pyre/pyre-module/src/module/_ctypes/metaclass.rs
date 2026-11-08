@@ -1922,7 +1922,10 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                         .ok_or_else(|| {
                             pyre_interpreter::PyError::type_error("bytes-like object expected")
                         })?;
-                    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
+                    // Host copy: `cdata_write` → `getdict_native` → `_obj_getdict`
+                    // can collect (`char_array_set_raw`).
+                    let bytes =
+                        unsafe { pyre_object::bytesobject::bytes_like_data(source) }.to_vec();
                     if bytes.len() > size {
                         return Err(pyre_interpreter::PyError::value_error("bytes too long"));
                     }

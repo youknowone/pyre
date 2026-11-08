@@ -52,9 +52,13 @@ pub type BytesBlock = crate::unicodeobject::Utf8Str;
 
 /// Allocate a [`BytesBlock`] holding `bytes`.
 ///
-/// Nursery bump first, then the young-nonmoving allocator when the bump
-/// cannot serve the size. A refused request is not allocated anywhere; the
-/// caller raises `MemoryError`.
+/// `rstr.mallocstr` / `incminimark.malloc_varsize`: nursery allocation with
+/// old-gen spill (`gc_hook::try_gc_alloc`), then
+/// `external_malloc(..., alloc_young=True)` without the collection
+/// (`try_gc_alloc_young_nonmoving_no_collect`) when that does not allocate.
+/// A refused request aborts via `handle_alloc_error`. Only
+/// [`try_alloc_bytes_block`] reports `None` so a Python-facing caller can
+/// raise `MemoryError`.
 ///
 /// Falls back to a plain allocation before the GC is up or in a unit test,
 /// where the block is immortal, as the storage box's `malloc_raw` fallback is.
