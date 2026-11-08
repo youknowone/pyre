@@ -11234,19 +11234,20 @@ impl FunctionGraph {
                 break;
             }
             let drop_cond = cond.clone();
-            let drop_const = const_false.filter(|c| {
-                !self.blocks.iter().any(|block| {
-                    block.operations.iter().any(|op| {
-                        op.result.as_ref() != Some(c)
-                            && op.result.as_ref() != Some(&drop_cond)
-                            && op_kind_uses_var(&op.kind, c)
-                    }) || block
-                        .exits
-                        .iter()
-                        .any(|link| link.args.iter().any(|arg| arg.as_variable() == Some(c)))
-                        || block.inputargs.iter().any(|input| input == c)
-                })
-            });
+            let drop_const =
+                const_false.filter(|c| {
+                    !true_args.iter().any(|v| v == c)
+                        && !false_args.iter().any(|v| v == c)
+                        && !self.blocks.iter().any(|block| {
+                            block.operations.iter().any(|op| {
+                                op.result.as_ref() != Some(c)
+                                    && op.result.as_ref() != Some(&drop_cond)
+                                    && op_kind_uses_var(&op.kind, c)
+                            }) || block.exits.iter().any(|link| {
+                                link.args.iter().any(|arg| arg.as_variable() == Some(c))
+                            }) || block.inputargs.iter().any(|input| input == c)
+                        })
+                });
             self.block_mut(block).operations.retain(|op| {
                 let Some(result) = op.result.as_ref() else {
                     return true;
@@ -12092,6 +12093,66 @@ mod tests {
         assert_eq!(graph.block(entry).operations.len(), 2);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
         assert_eq!(graph.block(graph.exceptblock).inputargs.len(), 2);
+    }
+
+    /// `peel_bool_not_feeding_switch` must keep `f = ConstBool(false)` when
+    /// `f` is forwarded on a pending successor arg. `set_branch` installs
+    /// those args after the peel, so a drop that only scanned existing
+    /// operations / exits / inputargs left `f` undefined
+    /// (`flowspace/model.py` `checkgraph`).
+    #[test]
+    fn peel_bool_not_keeps_const_false_forwarded_on_true_args() {
+        let mut graph = FunctionGraph::new("peel_bool_not_true_args");
+        let entry = graph.startblock;
+        let b = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "b".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let f = graph
+            .push_op_var(entry, OpKind::ConstBool(false), true)
+            .unwrap();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: b,
+                    rhs: f.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (if_true, _) = graph.create_block_with_arg_vars(1);
+        let if_false = graph.create_block();
+        graph.set_branch(entry, cond, if_true, vec![f.clone()], if_false, vec![]);
+
+        for link in &graph.block(entry).exits {
+            for arg in &link.args {
+                if let Some(var) = arg.as_variable() {
+                    assert!(
+                        graph.variable_defined_in_block(entry, var),
+                        "link arg must stay defined after set_branch"
+                    );
+                }
+            }
+        }
+        assert!(
+            graph
+                .block(entry)
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&f)
+                    && matches!(op.kind, OpKind::ConstBool(false))),
+            "op producing f must remain because f is a successor arg"
+        );
     }
 
     /// `fold_constant_exitswitch` folds a switch whose discriminant is a
