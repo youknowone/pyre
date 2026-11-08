@@ -4304,6 +4304,11 @@ pub unsafe fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, n: usi
     let _obj = crate::gc_roots::pin_root(obj);
     let result_slot = crate::gc_roots::shadow_stack_len();
     let result = w_list_new_with_strategy(Vec::new(), ListStrategy::Float);
+    // `CHECK_MEMORY_ERROR` after `malloc_fixedsize`: a Failed header is
+    // PY_NULL with MemoryError already stored (`allocated_or_raise`).
+    if result.is_null() {
+        return std::ptr::null_mut();
+    }
     let _ = crate::gc_roots::pin_root(result);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = unsafe { &*(obj as *const W_ListObject) };
@@ -4344,6 +4349,11 @@ pub unsafe fn ll_listslice_new_object_list(
     let _obj = crate::gc_roots::pin_root(obj);
     let result_slot = crate::gc_roots::shadow_stack_len();
     let result = w_list_new_object(Vec::new());
+    // `CHECK_MEMORY_ERROR` after `malloc_fixedsize`: a Failed header is
+    // PY_NULL with MemoryError already stored (`allocated_or_raise`).
+    if result.is_null() {
+        return std::ptr::null_mut();
+    }
     let _ = crate::gc_roots::pin_root(result);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &*(obj as *const W_ListObject);
