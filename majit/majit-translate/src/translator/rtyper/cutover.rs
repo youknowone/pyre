@@ -6288,19 +6288,16 @@ fn insert_function_desc_jit_graphs(
         jit_graphs.insert(Rc::as_ptr(graph));
         candidate_flow_graphs.push(graph.graph.clone());
     }
-    // A regular candidate contributes `cache[None]` only. AccessDirect copies
-    // are exempt only as candidate paths themselves, as the origin's
-    // `(AccessDirect, None)` copy — the origin is the jitdriver's recorded
-    // `jit_merge_point_in` (`warmspot.py split_graph_and_record_jitdriver`) —
-    // or as called callees (`close_access_directly_callees_of_candidates`).
-    // The cache is not reachability (`call.py find_all_graphs`).
-    if include_access_direct {
-        for (key, graph) in cache.iter() {
-            if key.is_access_direct() {
-                jit_graphs.insert(Rc::as_ptr(graph));
-                candidate_flow_graphs.push(graph.graph.clone());
-            }
-        }
+    // A candidate's AccessDirect exemption is the origin's `(AccessDirect, None)`
+    // copy only. Other `(AccessDirect, key)` copies enter only as reached
+    // callees (`close_access_directly_callees_of_candidates`); the cache is
+    // not reachability (`call.py find_all_graphs`).
+    if include_access_direct
+        && let Some(graph) =
+            cache.get(&crate::annotator::description::GraphCacheKey::access_direct_none())
+    {
+        jit_graphs.insert(Rc::as_ptr(graph));
+        candidate_flow_graphs.push(graph.graph.clone());
     }
 }
 

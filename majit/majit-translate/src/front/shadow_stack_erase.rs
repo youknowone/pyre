@@ -210,6 +210,43 @@ fn classify_call(
     Some((kind, false))
 }
 
+/// Module of the unique type decl whose last path segment is `FrameAnchor`
+/// (`name_path` with the trailing `::FrameAnchor` removed). `None` when
+/// there is none, or when two such decls name different modules.
+fn frame_anchor_module(llbc: &Llbc) -> Option<&str> {
+    super::lltype::llbc_derived(llbc)
+        .frame_anchor_module
+        .get_or_init(|| {
+            let mut found: Option<String> = None;
+            for td in llbc.iter_type_decls() {
+                let Some(module) = td.item_meta.name_path_str().strip_suffix("::FrameAnchor")
+                else {
+                    continue;
+                };
+                match found.as_deref() {
+                    None => found = Some(module.to_string()),
+                    Some(existing) if existing == module => {}
+                    Some(_) => return None,
+                }
+            }
+            found
+        })
+        .as_deref()
+}
+
+/// Free `frame_anchor_*` functions in the unique FrameAnchor module.
+/// Shared by [`classify_frame_anchor`] and [`is_frame_anchor_helper`].
+const FRAME_ANCHOR_FREE_FNS: &[&str] = &[
+    "frame_anchor_push",
+    "frame_anchor_live",
+    "frame_anchor_release",
+    "frame_anchor_push_jit_abi",
+    "frame_anchor_live_jit_abi",
+    "frame_anchor_release_jit_abi",
+    "frame_anchor_new_jit_abi",
+    "frame_anchor_live_method_jit_abi",
+];
+
 /// `FrameAnchor` / `frame_anchor_*` leaves. Open and the free push are
 /// not methods (the frame is args[0]). `live` as an inherent method
 /// takes `&self`; the jit-abi and free `frame_anchor_live` take the
@@ -221,7 +258,12 @@ fn classify_frame_anchor(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
-    let named = segments.iter().any(|s| *s == "FrameAnchor") || leaf.starts_with("frame_anchor_");
+    let module = segments[..segments.len() - 1].join("::");
+    let named = frame_anchor_module(llbc).is_some_and(|m| {
+        (module == m && FRAME_ANCHOR_FREE_FNS.contains(&leaf))
+            || module == format!("{m}::FrameAnchor")
+            || module.starts_with(&format!("{m}::FrameAnchor::"))
+    });
     let dest_anchor = is_frame_anchor_ty(&call.dest.ty, llbc);
     let recv_ty = match call.args.first() {
         Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
@@ -270,16 +312,21 @@ fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Optio
 /// `from_raw` / `live` / `drop` / `frame_anchor_{push,live,release}` own
 /// graphs. Erasing one would strip the index it returns (`pin_self`) or
 /// the Guard on local 0; the Open is modeled at the call site.
-/// Helpers are recognised by the FrameAnchor owner in their signature,
-/// not by module.
+/// Inherent methods sit under the unique FrameAnchor module; free
+/// `frame_anchor_*` functions live in that module; the signature-typed
+/// branch still names the owner type.
 fn is_frame_anchor_helper(fd: &FunDecl, llbc: &Llbc) -> bool {
     let path = fd.item_meta.name_path();
     let segments: Vec<&str> = path.split("::").collect();
     let Some(leaf) = segments.last().copied() else {
         return false;
     };
+    let module = segments[..segments.len() - 1].join("::");
     if segments.iter().any(|s| *s == "FrameAnchor") {
-        return matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place");
+        return frame_anchor_module(llbc).is_some_and(|m| {
+            module == format!("{m}::FrameAnchor")
+                || module.starts_with(&format!("{m}::FrameAnchor::"))
+        }) && matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place");
     }
     if matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place")
         && (is_frame_anchor_ty(&fd.signature.output, llbc)
@@ -291,17 +338,7 @@ fn is_frame_anchor_helper(fd: &FunDecl, llbc: &Llbc) -> bool {
     {
         return true;
     }
-    matches!(
-        leaf,
-        "frame_anchor_push"
-            | "frame_anchor_live"
-            | "frame_anchor_release"
-            | "frame_anchor_push_jit_abi"
-            | "frame_anchor_live_jit_abi"
-            | "frame_anchor_release_jit_abi"
-            | "frame_anchor_new_jit_abi"
-            | "frame_anchor_live_method_jit_abi"
-    )
+    FRAME_ANCHOR_FREE_FNS.contains(&leaf) && frame_anchor_module(llbc).is_some_and(|m| module == m)
 }
 
 fn is_frame_anchor_ty(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -339,14 +376,14 @@ enum Special {
 /// `drop(roots)` is `core::mem::drop` of the guard. rustc emits a Call that
 /// moves the `RootScope`, not a `Drop` terminator, so NLL can keep the
 /// bracket live across the preceding call. That Call is the same rewind as
-/// `TermKind::Drop` / `root_scope_close`.
+/// `TermKind::Drop` / `root_scope_close`. Only the full paths
+/// `core::mem::drop` and `core::ptr::drop_in_place` match.
 fn mem_drop_scope_local(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
 ) -> Option<usize> {
     let path = callee_path(call, llbc)?;
-    let leaf = path.rsplit("::").next()?;
-    if leaf != "drop" && leaf != "drop_in_place" {
+    if path != "core::mem::drop" && path != "core::ptr::drop_in_place" {
         return None;
     }
     match call.args.first()? {
@@ -4229,6 +4266,7 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "c",
+                "type_decls": [frame_anchor_type_decl()],
                 "fun_decls": [
                     null,
                     opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
@@ -4610,6 +4648,83 @@ mod tests {
             Ok(Some(_)) => panic!("from_raw helper must skip erase"),
             Err(reason) => panic!("from_raw helper must skip erase, got {reason}"),
         }
+    }
+
+    #[test]
+    fn other_drop_is_not_a_scope_close() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["other", "drop"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let body = body_of(
+            2,
+            vec![
+                bb(call_fun(1, vec![json!({"Move": place(1)})], 0, 1)),
+                bb(json!("Return")),
+            ],
+        );
+        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+            panic!("expected Call");
+        };
+        assert_eq!(mem_drop_scope_local(call, &llbc), None);
+    }
+
+    #[test]
+    fn other_frame_anchor_push_is_not_anchor_open() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [frame_anchor_type_decl()],
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["other", "frame_anchor_push"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let body = body_of(1, vec![bb(call_fun(1, vec![], 0, 1)), bb(json!("Return"))]);
+        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+            panic!("expected Call");
+        };
+        assert!(
+            !matches!(classify_call(call, &llbc), Some((Leaf::AnchorOpen, _))),
+            "other::frame_anchor_push is not AnchorOpen"
+        );
+    }
+
+    #[test]
+    fn same_module_helper_is_not_a_frame_anchor_call() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [frame_anchor_type_decl()],
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_interpreter", "eval", "some_helper"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let body = body_of(1, vec![bb(call_fun(1, vec![], 0, 1)), bb(json!("Return"))]);
+        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+            panic!("expected Call");
+        };
+        assert_eq!(classify_call(call, &llbc), None);
     }
 
     /// RootScope open, nested FrameAnchor open/close, then get of an
