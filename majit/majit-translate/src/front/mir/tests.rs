@@ -36978,6 +36978,69 @@ fn generic_ref_field_keeps_ref_wrapper() {
     assert!(saw, "g reads Holder.p; graph={}", graph.dump());
 }
 
+/// `RDict<K,V,S>.entries: *mut GcEntries<K,V>` with a concrete container
+/// substitutes the nested ADT args (`get_ll_dict` / `rewrite_op_getinteriorfield`).
+#[test]
+fn generic_nested_adt_field_substitutes_inner_type_args() {
+    let i64_ty = interior_i64();
+    let unit_ty = interior_unit_ty();
+    let field_ty = interior_raw_mut(serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [
+                    {"TypeVar": {"Bound": [0, 0]}},
+                    {"TypeVar": {"Bound": [0, 1]}}
+                ],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let container = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone(), unit_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let subst_llbc = empty_llbc();
+    let subst = super::tyref_subst_bound_typevar(
+        &TyRef::Other(field_ty.into()),
+        &TyRef::Other(container.into()),
+        &subst_llbc,
+    );
+    let node = super::tyref_node(&subst, &subst_llbc).expect("substituted field ty");
+    let pointee = node
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .expect("substituted *mut GcEntries keeps RawPtr");
+    let adt = pointee
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .expect("pointee is Adt");
+    assert_eq!(
+        adt.get("id").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "pointee Adt id 1; node={node}"
+    );
+    let types = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .expect("Adt generics.types");
+    assert_eq!(
+        types,
+        &serde_json::json!([i64_ty, unit_ty]),
+        "nested ADT type args are the container instantiation; node={node}"
+    );
+}
+
 /// `rbigint.py` `ptwotable` is a prebuilt list. `_x_mul` must read that
 /// array, not a residual accessor named `PTWOTABLE`.
 #[test]

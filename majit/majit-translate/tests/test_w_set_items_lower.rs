@@ -121,30 +121,30 @@ fn w_set_items_fieldread_bases_are_defined() {
 fn set_strategy_trampoline_keeps_its_vtable_call() {
     let llbc = load_llbc(OBJECT_LLBC);
     let graph =
-        match lower_named_with_static_addrs(llbc, "set_strategy_add_key_ptr", production_addrs()) {
+        match lower_named_with_static_addrs(llbc, "set_strategy_has_key_ptr", production_addrs()) {
             Ok(graph) => graph,
-            Err(err) => panic!("set_strategy_add_key_ptr lower failed: {err}"),
+            Err(err) => panic!("set_strategy_has_key_ptr lower failed: {err}"),
         };
     eprintln!(
-        "set_strategy_add_key_ptr name={:?} source_identity={:?}",
+        "set_strategy_has_key_ptr name={:?} source_identity={:?}",
         graph.name, graph.source_identity
     );
     let mut self_calls = 0usize;
-    let mut family_add = 0usize;
+    let mut family_has_key = 0usize;
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("set_strategy_add_key_ptr") => {
+                } if segments.last().map(String::as_str) == Some("set_strategy_has_key_ptr") => {
                     self_calls += 1;
                 }
                 OpKind::IndirectCall { family_key, .. }
                     if family_key.as_ref()
-                        == Some(&IndirectFamilyKey::dyn_trait("SetStrategy", "add")) =>
+                        == Some(&IndirectFamilyKey::dyn_trait("SetStrategy", "has_key")) =>
                 {
-                    family_add += 1;
+                    family_has_key += 1;
                 }
                 _ => {}
             }
@@ -157,8 +157,8 @@ fn set_strategy_trampoline_keeps_its_vtable_call() {
         dump_graph(&graph)
     );
     assert!(
-        family_add > 0,
-        "trampoline body must keep IndirectCall family SetStrategy::add\n{}",
+        family_has_key > 0,
+        "trampoline body must keep IndirectCall family SetStrategy::has_key\n{}",
         dump_graph(&graph)
     );
 }

@@ -7336,20 +7336,23 @@ impl<'a> Lowering<'a> {
                 let passes_pairs = !pair_lens.is_empty();
                 let mut args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
-                    // `SetStrategy::{add,remove,has_key}` take
-                    // `(&self, w_set, ObjectKey)`. The flow graph drops the
-                    // ZST `&self` and leaves `ObjectKey` as one pointer, so
-                    // the residual words are `(w_set, &ObjectKey)`. The vtable
-                    // slot is the rustc method, which reads those words as
-                    // `self` and `w_set`. Call the word trampoline that
-                    // matches the residual instead. Do not recast the
-                    // receiver before this trampoline. Inside the trampoline
-                    // the vtable call is the operation itself, so it stays
-                    // an `indirect_call` for the effect analysis (the
-                    // trampoline is `dont_look_inside`; its body is
-                    // analyzed, never run as jitcode).
+                    // `SetStrategy::remove` and `has_key` still take
+                    // `(&self, w_set, ObjectKey)` and residualize as
+                    // `(w_set, &ObjectKey)`. The vtable slot is the rustc
+                    // method, which reads those words as `self` and `w_set`.
+                    // Call the word trampoline that matches the residual
+                    // instead. Do not recast the receiver before this
+                    // trampoline. Inside the trampoline the vtable call is
+                    // the operation itself, so it stays an `indirect_call`
+                    // for the effect analysis (the trampoline is
+                    // `dont_look_inside`; its body is analyzed, never run as
+                    // jitcode).
+                    //
+                    // `SetStrategy::add` takes `(w_set, w_key)` wrapped
+                    // objects (`setobject.py SetStrategy.add`) and uses
+                    // the vtable `indirect_call` below, matching
+                    // `rpython/jit/codewriter/jtransform.py::handle_regular_indirect_call`.
                     let leaf = match method_name.as_str() {
-                        "add" => "set_strategy_add_key_ptr",
                         "remove" => "set_strategy_remove_key_ptr",
                         _ => "set_strategy_has_key_ptr",
                     };
@@ -7360,7 +7363,7 @@ impl<'a> Lowering<'a> {
                         .as_deref()
                         .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
-                        && matches!(method_name.as_str(), "add" | "remove" | "has_key")
+                        && matches!(method_name.as_str(), "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
                         && current_fn != trampoline_path
                     {

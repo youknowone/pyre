@@ -1275,7 +1275,7 @@ pub enum RuntimeHelperKind {
     /// It RETURNS the proxy (`Ref`) while `_super_check` may run a `__class__`
     /// property, i.e. arbitrary Python, so it is a value-returning call the
     /// `Void`-result write proxy cannot see — the same standing as
-    /// [`RuntimeHelperKind::SetAddMethod`], and the reason the tag exists.
+    /// [`RuntimeHelperKind::StoreDeref`], and the reason the tag exists.
     /// Without it the substitution would replace a `CallFn` the
     /// `writes_live_heap` discriminator counts with a descr it does not, and a
     /// nested abort would rewind past a property that has already run.
@@ -1307,18 +1307,6 @@ pub enum RuntimeHelperKind {
     /// definition sequence stays one virtual instead of escaping through an
     /// opaque call whose result has to be re-read and re-guarded.
     SetFunctionAttribute,
-    /// `jit_set_add_method(set, value)` — the target the walker substitutes for
-    /// a traced `s.add(x)` on a `set` (`try_walker_specialize_set_add_method`).
-    /// It inserts into the live set and RETURNS `None` (`Ref`), so it is a
-    /// value-returning heap write the `Void`-result write proxy cannot see —
-    /// the same standing as [`RuntimeHelperKind::StoreDeref`], and the reason the
-    /// tag exists: without it the substitution would replace a `CallFn` the
-    /// `writes_live_heap` discriminator counts with a descr it does not, and a
-    /// nested abort would rewind past a completed insert.  The element's
-    /// `__hash__` is not necessarily Python — a cpyext `tp_hash` runs native
-    /// code and moves no frame-entry odometer — so the frame-entry signal
-    /// cannot stand in for this one.
-    SetAddMethod,
     /// `bh_clear_in_flight_exception()` — the `[] -> void` residual emitted by
     /// PUSH_EXC_INFO to complete the caught-exception ownership transfer.  The
     /// full-body walker applies the concrete clear during its authoritative

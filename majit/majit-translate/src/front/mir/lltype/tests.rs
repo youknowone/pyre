@@ -16377,6 +16377,28 @@ fn entry_family_holder_instantiation_splits_key_class() {
         None,
         "an unsubstituted holder is not an instantiation"
     );
+    let unit = serde_json::json!({"Tuple": []});
+    let with_unit = named_adt(2, vec![u64_ty.clone(), unit]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Table",
+            adt_of(&with_unit),
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<u64,()>")
+    );
+    let half_open = named_adt(2, vec![u64_ty.clone(), tvar(1)]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Table",
+            adt_of(&half_open),
+            &llbc,
+            &tomb,
+        ),
+        None
+    );
 }
 
 #[test]
