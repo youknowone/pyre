@@ -207,3 +207,20 @@ fn registered_dyn_impl_keys_equal_charon_name_path_of_their_type() {
         "registered impl_key must equal Charon name_path() of its type exactly: {mismatches:?}"
     );
 }
+
+#[test]
+fn w_set_add_checked_is_present() {
+    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
+        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+    });
+    assert!(
+        object.local_fn("w_set_add_checked").is_some(),
+        "w_set_add_checked missing from pyre-object LLBC"
+    );
+    assert!(
+        object
+            .local_fn(concat!("set_strategy_add_", "key_ptr"))
+            .is_none(),
+        "deleted pointer-to-ObjectKey add residual must not remain in pyre-object LLBC"
+    );
+}

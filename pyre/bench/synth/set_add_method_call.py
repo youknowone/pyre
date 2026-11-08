@@ -1,31 +1,14 @@
 # `s.add(x)` and a set comprehension name one operation -- `pyopcode.py SET_ADD`
-# is `space.call_method(w_set, 'add', w_value)`. The method call descends
-# through the `set.add` gateway into the set strategy's `add`, the same body
-# the comprehension's SET_ADD reaches. `hot_add` is that descent and
-# `hot_add_comprehension` is the spelling it is held level with; a
-# regression separates the two legs.
+# is `space.call_method(w_set, 'add', w_value)`. `hot_add` and
+# `hot_add_comprehension` must agree on the result.
 #
-# The descent is not a fold: a miss stays a MayForce residual because
-# hashing the element can run a user `__hash__`. A plain int already stored in
-# an integer-strategy set records a cannot-collect contains check. A set whose
-# only element is that int guards the unboxed intval, set_id and content_gen
-# instead. `hot_add` saturates past one element and takes the contains check.
-# `hot_add_user_hash` stays on the
-# MayForce residual -- the element's `__hash__` and `__eq__` are Python, so the
-# call really does force -- and `hot_add_raising_hash` walks the exception
-# channel out of the descended residual, which has to reach the `except` in
-# the loop body
-# exactly as the generic call did.
+# `hot_add_user_hash` inserts keys whose `__hash__` and `__eq__` are Python.
+# `hot_add_raising_hash` walks the exception channel out of the add and must
+# reach the `except` in the loop body.
 #
-# The three remaining legs pin what the descent may and may not swallow, and are
-# here because a wrong answer there is silently wrong code rather than a slow
-# loop. `hot_add_subclass` MUST be descended: the receiver guard is the
-# builtin's own `require_set_receiver` predicate, an `ob_type` layout test that
-# a `set` subclass shares, and an inherited `add` runs the identical body.
-# `hot_add_override` MUST NOT be, and is the leg that says so -- its `add`
-# stores a different value, so bypassing it changes `len`. `hot_add_unbound`
-# calls the descriptor with an explicit receiver, which is one argument more
-# than the descent accepts.
+# `hot_add_subclass` inherits `add` on a `set` subclass. `hot_add_override`
+# stores a different value, so bypassing it would change `len`.
+# `hot_add_unbound` calls the descriptor with an explicit receiver.
 
 try:
     import pypyjit
