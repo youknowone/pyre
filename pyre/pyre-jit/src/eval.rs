@@ -13476,8 +13476,13 @@ fn compile_and_run_once(
                 // abort that replays from the merge point.
                 let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
                 let traced_on_live = pinned.is_some();
-                let concrete_frame =
-                    pinned.unwrap_or_else(|| frame_root.frame().snapshot_for_tracing());
+                let concrete_frame = match pinned {
+                    Some(frame) => frame,
+                    None => match frame_root.frame().snapshot_for_tracing() {
+                        Ok(frame) => frame,
+                        Err(_) => return majit_metainterp::TraceAction::Abort,
+                    },
+                };
                 let saved_last_instr = frame_root.frame().last_instr;
                 let saved_valuestackdepth = frame_root.frame().valuestackdepth;
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
@@ -17204,7 +17209,7 @@ mod tests {
         let module =
             compile_exec("def f(x):\n    return (x, x)\nf(1)\n").expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let depth = frame.valuestackdepth;
         assert!(
             locals_w!(&*frame).len() > depth,
@@ -17830,7 +17835,7 @@ mod tests {
         let module = compile_exec("def f(a, b):\n    c = a\n    return c\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let array_len = locals_w!(frame).as_slice().len();
@@ -18508,7 +18513,7 @@ mod tests {
         ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         init(&mut frame);
         frame.fix_array_ptrs();
 
@@ -18544,7 +18549,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18638,7 +18643,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18748,7 +18753,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18815,7 +18820,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_list_new(vec![w_int_new(11)]);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -18925,7 +18930,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_int_new(11);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);
@@ -19083,7 +19088,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = PyFrame::new(code.clone());
+        let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         locals_w_mut!(frame)[0] = w_int_new(11);
         locals_w_mut!(frame)[1] = w_int_new(7);
         locals_w_mut!(frame)[2] = w_list_new(vec![w_int_new(21)]);

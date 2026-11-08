@@ -207,13 +207,6 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
 // in `Option<GCREF>` and classify with `GcAllocOutcome::from_hook`.
 pub use majit_gc::{GcAllocOutcome, gc_alloc_failed, gc_alloc_failed_pending};
 
-/// Null from [`try_gc_alloc_stable_raw`] / [`GcAllocOutcome::allocated_or_raise`]
-/// is a host malloc only when no collector refused the request.
-#[inline]
-pub fn host_fallback_on_null(raw: GCREF) -> bool {
-    raw.is_null() && !majit_gc::gc_alloc_failed_pending()
-}
-
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
     GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
 }
@@ -280,8 +273,8 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
 ///
 /// `null` is [`GcAllocOutcome::NoRoute`] or [`Failed`](GcAllocOutcome::Failed)
 /// after `_ll_malloc_fixedsize` stored MemoryError. NoRoute is the host
-/// `malloc_raw` licence; Failed is not — [`host_fallback_on_null`] tells
-/// them apart via [`gc_alloc_failed_pending`].
+/// `malloc_raw` licence; Failed is not — [`gc_alloc_failed_pending`] tells
+/// them apart.
 ///
 /// Residualising this primitive (`@dont_look_inside`, `rlib/jit.py`) keeps the
 /// process-global hook dispatch out of the trace — a `GCREF` return has no
@@ -1387,14 +1380,11 @@ mod tests {
         majit_gc::set_active_exception_occurred(Some(occurred));
         assert!(GcAllocOutcome::Failed.allocated_or_raise().is_none());
         assert!(majit_gc::gc_alloc_failed_pending());
-        assert!(!host_fallback_on_null(core::ptr::null_mut()));
         // `exc_data` is not reset by a later malloc (`rpyexc_occurred`).
         assert!(GcAllocOutcome::NoRoute.allocated_or_raise().is_none());
         assert!(majit_gc::gc_alloc_failed_pending());
-        assert!(!host_fallback_on_null(core::ptr::null_mut()));
         PENDING.store(false, Ordering::SeqCst);
         assert!(!majit_gc::gc_alloc_failed_pending());
-        assert!(host_fallback_on_null(core::ptr::null_mut()));
         majit_gc::set_active_raise_memory_error(None);
         majit_gc::set_active_exception_occurred(None);
     }

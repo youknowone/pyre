@@ -1751,9 +1751,7 @@ impl ExecutionContext {
             let frame = anchor.live();
             if self.profilefunc.is_some() && !frame.is_null() {
                 unsafe {
-                    if let Ok(d) = (*frame).getorcreatedebug(-1) {
-                        d.is_being_profiled = true;
-                    }
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = true;
                 }
             }
         }

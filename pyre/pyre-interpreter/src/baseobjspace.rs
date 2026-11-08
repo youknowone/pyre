@@ -5655,7 +5655,7 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     if w_list_setitem(obj, idx, value) {
         Ok(w_none())
     } else if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        Err(PyError::memory_error(""))
+        Err(crate::runtime_ops::fetch_memory_error())
     } else {
         Err(PyError::index_error("list index out of range"))
     }
@@ -5722,9 +5722,9 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
             w_other,
             majit_metainterp::jit::we_are_jitted(),
         )
-        .map_err(|e| {
-            if e == "MemoryError" {
-                PyError::memory_error("")
+        .map_err(|_| {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                crate::runtime_ops::fetch_memory_error()
             } else {
                 panic!("w_other is always a valid list")
             }

@@ -1267,7 +1267,7 @@ fn make_user_call_frame(
         closure,
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     )?;
-    crate::pyframe::FrameBox::new(frame).into_result()
+    crate::pyframe::FrameBox::new(frame)
 }
 
 enum PreparedUserCall {
@@ -1438,8 +1438,7 @@ pub fn call_user_function_resolved(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        )
-        .into_result()?;
+        )?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -1453,8 +1452,7 @@ pub fn call_user_function_resolved(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)
-        .into_result()?;
+        )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame, None)
@@ -2875,8 +2873,7 @@ pub fn call_user_function_plain_with_ctx(
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ))?,
-        )
-        .into_result()?;
+        )?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -2888,8 +2885,7 @@ pub fn call_user_function_plain_with_ctx(
             execution_context,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)
-        .into_result()?;
+        )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -4676,8 +4672,7 @@ fn call_with_kwargs_in_ctx_impl(
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
                 )?,
-            )
-            .into_result()?;
+            )?;
             func_frame.fix_array_ptrs();
             // Generator/coroutine function: return a generator object
             // instead of running the body, matching the positional call
@@ -5780,9 +5775,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                     return PY_NULL;
                 }
             },
-        )
-        .into_result()
-        {
+        ) {
             Ok(f) => f,
             Err(e) => {
                 set_call_error(e);
@@ -5813,9 +5806,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
                 return PY_NULL;
             }
         },
-    )
-    .into_result()
-    {
+    ) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);
@@ -5881,17 +5872,21 @@ fn call_user_function_resolved_frameless(
     let code_ref = unsafe { &*func_code };
 
     let mut frame = match crate::pyframe::FrameBox::new(
-        pyre_object::with_roots!(func => PyFrame::new_for_call_with_closure_and_globals_obj(
+        match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             args,
             w_globals,
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )),
-    )
-    .into_result()
-    {
+        )) {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        },
+    ) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);
@@ -6602,7 +6597,7 @@ mod function_call_args_tests {
         crate::test_hooks::install_hash_hook();
         let source = "def f(a, b=2, *, c=3):\n    return (a, b, c)\n";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("define f");
         let w_globals = frame.get_w_globals();
         let f = unsafe { pyre_object::w_dict_getitem_str(w_globals, "f") }.expect("f");
@@ -6650,7 +6645,7 @@ c = C(1, k=2)
 r = (c.a, c.k)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("construct C");
         let w_globals = frame.get_w_globals();
         let r = unsafe { pyre_object::w_dict_getitem_str(w_globals, "r") }.expect("r");
@@ -6677,7 +6672,7 @@ mod forgotten_self_hint_tests {
     fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("forgotten-self snippet");
         frame.get_w_globals()
     }
@@ -6872,7 +6867,7 @@ mod call_kw_parse_into_scope_tests {
     fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .expect("call_kw parse_into_scope snippet");
@@ -7102,11 +7097,11 @@ except TypeError as e:
     ) -> pyre_object::PyObjectRef {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         // `initialize_frame_scopes` already aliased `w_locals` to this
         // frame's own globals. Point both at the caller's dict so
         // LOAD_NAME / STORE_NAME see the function `f` defined there.
-        frame.set_w_globals(globals);
+        frame.set_w_globals(globals).expect("frame allocation");
         let globals = frame.get_w_globals();
         frame.setdictscope(globals, false).expect("setdictscope");
         frame
@@ -7627,8 +7622,7 @@ fn build_class_inner(
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)
-        .into_result()?;
+        )?)?;
     // compiling.py `build_class`: `frame.setdictscope(w_namespace)` then
     // `frame.run()`.  The body executes against a namespace OBJECT so
     // STORE_NAME / LOAD_NAME route through the object form, not the raw

@@ -40638,7 +40638,7 @@ mod tests {
     fn run_exec(source: &str) {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile failed");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).unwrap_or_else(|err| {
             panic!("{}", err.message_text());
         });

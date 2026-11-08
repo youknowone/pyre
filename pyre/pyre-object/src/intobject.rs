@@ -297,7 +297,11 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         std::mem::size_of::<W_IntObjectUser>(),
     );
     if raw.is_null() {
-        crate::lltype::host_or_null(obj) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            crate::PY_NULL
+        } else {
+            crate::lltype::malloc_typed(obj) as PyObjectRef
+        }
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_IntObjectUser, obj);

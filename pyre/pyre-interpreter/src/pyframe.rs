@@ -1763,7 +1763,8 @@ pub struct FrameBox {
     owner_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
-/// `FrameBox::new` takes the frame **by value**, and the codewriter depends on
+/// `FrameBox::new` takes the frame **by value** and returns
+/// `Result<FrameBox, crate::PyError>`; the codewriter depends on
 /// it: a virtualizable-field projection whose base is a non-dereferenced local
 /// aggregate is not treated as reaching a live virtualizable, which is what
 /// keeps the twelve frame-construction projections in `new` off the
@@ -1773,7 +1774,7 @@ pub struct FrameBox {
 ///
 /// Changing this signature is therefore a decision, not a refactor.
 /// `pyre-jit-trace`'s `vable_projection_census` test is the corpus-level check.
-const _: fn(PyFrame) -> FrameBox = FrameBox::new;
+const _: fn(PyFrame) -> Result<FrameBox, crate::PyError> = FrameBox::new;
 
 /// First published-root index [`FrameBox::new`] gives to the interior of a
 /// `std::alloc` `FrameDebugData`, after the frame's own eight GCREF fields.
@@ -1835,7 +1836,7 @@ impl FrameBox {
     /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
     /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
     /// distinguishes them with `try_gc_owns_object`.
-    pub fn new(mut frame: PyFrame) -> Self {
+    pub fn new(mut frame: PyFrame) -> Result<FrameBox, crate::PyError> {
         // `frame` is an RPython aggregate local whose GCREF fields are all
         // translated livevars across the frame allocation. Publish every field
         // before it, the way `gct_fv_gc_malloc` brackets a malloc with the
@@ -1950,10 +1951,10 @@ impl FrameBox {
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
-            return FrameBox {
+            return Ok(FrameBox {
                 ptr,
                 owner_root: Some(owner_root),
-            };
+            });
         }
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             // `_ll_malloc_fixedsize` raised MemoryError. Locals are already
@@ -1962,29 +1963,12 @@ impl FrameBox {
             // next collection reclaims them because this function publishes
             // no owner root.
             std::mem::forget(frame);
-            return FrameBox {
-                ptr: std::ptr::null_mut(),
-                owner_root: None,
-            };
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
             frame.locals_cells_stack_w as pyre_object::gc_hook::GCREF
         ));
-        FrameBox::new_boxed(frame)
-    }
-
-    /// `None` when [`Self::new`] stored MemoryError (`rpyexc_occurred`).
-    pub fn into_result(self) -> Result<Self, crate::PyError> {
-        if self.ptr.is_null() {
-            Err(crate::PyError::memory_error(""))
-        } else {
-            Ok(self)
-        }
-    }
-
-    /// True when [`Self::new`] returned the Failed null handle.
-    pub fn is_null(&self) -> bool {
-        self.ptr.is_null()
+        Ok(FrameBox::new_boxed(frame))
     }
 
     /// Allocate a frame outside the GC — a plain `std::alloc`
@@ -2021,20 +2005,13 @@ impl FrameBox {
     fn frame_ptr(&self) -> *mut PyFrame {
         match &self.owner_root {
             Some(owner_root) => owner_root.get().0 as *mut PyFrame,
-            None => {
-                debug_assert!(!self.ptr.is_null(), "FrameBox::new Failed; use into_result");
-                self.ptr
-            }
+            None => self.ptr,
         }
     }
 
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
     pub fn into_raw(mut self) -> *mut PyFrame {
-        if self.ptr.is_null() {
-            std::mem::forget(self);
-            return std::ptr::null_mut();
-        }
         // Read the slot before releasing it — afterwards the handle has no
         // root to answer from and only the stale field remains.
         let ptr = self.frame_ptr();
@@ -2130,7 +2107,6 @@ impl FrameBox {
         name: Option<PyObjectRef>,
         qualname: Option<PyObjectRef>,
     ) -> crate::PyResult {
-        self = self.into_result()?;
         self.fix_array_ptrs();
         // CPython `insert_prefix_instructions` runs `COPY_FREE_VARS` /
         // `MAKE_CELL` before `RETURN_GENERATOR` builds the object
@@ -2332,10 +2308,6 @@ impl Drop for FrameBox {
         // and block chain with the frame, so no manual cleanup runs here.
         // Only a `std::alloc` snapshot / bootstrap fallback box is freed
         // manually — reconstruct and drop it, which runs `PyFrame::drop`.
-        // A Failed null handle owns no prefix.
-        if self.ptr.is_null() {
-            return;
-        }
         if self.owner_root.take().is_some() {
             return;
         }
@@ -4079,7 +4051,7 @@ impl PyFrame {
             let value = FrameDebugData::init(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
             let debugdata = if raw.is_null() {
                 if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                    return Err(crate::PyError::memory_error(""));
+                    return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 pyre_object::lltype::malloc_raw(value)
             } else {
@@ -4174,14 +4146,14 @@ impl PyFrame {
     /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override
     /// into lazily-created debugdata. Root the value across that allocation;
     /// RPython's shadow-stack transform does the same for the live argument.
-    pub fn set_w_globals(&mut self, w_globals: PyObjectRef) {
+    pub fn set_w_globals(&mut self, w_globals: PyObjectRef) -> Result<(), crate::PyError> {
         let roots = pyre_object::gc_roots::push_roots();
         let slot = roots.base();
         let _ = roots.pin_root(w_globals);
-        if let Ok(debug) = self.getorcreate_debug_data(-1) {
-            debug.w_globals = roots.get(slot);
-            remember_frame_debug_data(self.debugdata);
-        }
+        let debug = self.getorcreate_debug_data(-1)?;
+        debug.w_globals = roots.get(slot);
+        remember_frame_debug_data(self.debugdata);
+        Ok(())
     }
 
     /// pyframe.py get_w_f_trace
@@ -4282,7 +4254,8 @@ impl PyFrame {
         // `pyframe.py PyFrame.__init__`: only a code/globals identity mismatch
         // creates a per-frame debugdata override.
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
-            self.set_w_globals(w_globals);
+            self.set_w_globals(w_globals)
+                .expect("PyFrame::__init__: set_w_globals raised — caller should use createframe");
         }
         // pyframe.py — final step of __init__.
         self.initialize_frame_scopes(outer_func, code).expect(
@@ -4347,10 +4320,10 @@ impl PyFrame {
     ///
     /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
     /// proxy, so those opcodes route through the object.
-    fn bind_unoptimized_locals_scope(&mut self) {
+    fn bind_unoptimized_locals_scope(&mut self) -> Result<(), crate::PyError> {
         let flags = self.co_flags();
         if flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 {
-            return;
+            return Ok(());
         }
         if flags & crate::astcompiler::consts::CO_NEWLOCALS != 0 {
             // `build_class` replaces this with the `__prepare__` namespace via
@@ -4358,15 +4331,12 @@ impl PyFrame {
             // mapping.  `newdict(module=True)` — the mapping a class body binds
             // names in carries `ModuleDictStrategy.version?`.
             let w_locals = pyre_object::w_module_dict_new();
-            if let Ok(debug) = self.getorcreate_debug_data(-1) {
-                debug.w_locals = w_locals;
-            }
+            self.getorcreate_debug_data(-1)?.w_locals = w_locals;
         } else {
             let w_globals = self.get_w_globals();
-            if let Ok(debug) = self.getorcreate_debug_data(-1) {
-                debug.w_locals = w_globals;
-            }
+            self.getorcreate_debug_data(-1)?.w_locals = w_globals;
         }
+        Ok(())
     }
 
     /// pyframe.py initialize_frame_scopes.
@@ -4386,10 +4356,7 @@ impl PyFrame {
         outer_func: PyObjectRef,
         _code: *const (),
     ) -> Result<(), crate::PyError> {
-        self.bind_unoptimized_locals_scope();
-        if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
-        }
+        self.bind_unoptimized_locals_scope()?;
 
         // `pyframe.py initialize_frame_scopes` reads the `code` argument,
         // which is this frame's `self.pycode`. The compiler `CodeObject` is
@@ -4702,7 +4669,7 @@ impl PyFrame {
     /// `pyre-jit-trace` test modules) but routes the body through
     /// `createframe` (PyPy `baseobjspace.py`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
-    pub fn new(code: CodeObject) -> FrameBox {
+    pub fn new(code: CodeObject) -> Result<FrameBox, crate::PyError> {
         let execution_context = crate::alloc_execution_context();
         let ctx_ptr = execution_context.as_ptr();
         // `threadlocals.py:enter_thread` / `pyrex` `setup_exec_context` —
@@ -4710,7 +4677,6 @@ impl PyFrame {
         // the threadlocals slot roots it across `new_with_context`.
         crate::call::set_last_exec_ctx(ctx_ptr);
         Self::new_with_context(code, execution_context)
-            .expect("PyFrame::new: test entry code must not carry freevars")
     }
 
     /// Module-entry adapter for `createframe` — leaks owned arguments
@@ -4817,7 +4783,7 @@ impl PyFrame {
     /// bytecodes concretely during tracing, so use an owned snapshot when
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
-    pub fn snapshot_for_tracing(&self) -> FrameBox {
+    pub fn snapshot_for_tracing(&self) -> Result<FrameBox, crate::PyError> {
         // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
         // the whole `trace_bytecode` walk, during which a major GC cycle can
         // complete.  `FrameBox::new` is what makes that safe: it acquires a
@@ -4834,13 +4800,11 @@ impl PyFrame {
         // slot to read back.  Same allocation shape as
         // `snapshot_for_generator` below, for the same reason.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc))?;
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
-        if !frame.is_null() {
-            frame.fix_array_ptrs();
-        }
-        frame
+        frame.fix_array_ptrs();
+        Ok(frame)
     }
 
     /// Build the copied `PyFrame` value shared by the tracer snapshot and
@@ -4903,16 +4867,14 @@ impl PyFrame {
     /// `FrameBox::new` (GC lifetime): a generator's suspended frame lives as
     /// long as the generator object reaches it (`generator.py` holds the
     /// frame), and the generator's custom trace greys the frame block.
-    pub fn snapshot_for_generator(&self) -> FrameBox {
+    pub fn snapshot_for_generator(&self) -> Result<FrameBox, crate::PyError> {
         // `build_snapshot_frame` finishes its allocations before returning.
         // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
         // and write-barriers the frame before this returns.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
-        if !frame.is_null() {
-            frame.fix_array_ptrs();
-        }
-        frame
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc))?;
+        frame.fix_array_ptrs();
+        Ok(frame)
     }
 
     /// Number of local variable slots.
@@ -5745,6 +5707,9 @@ impl PyFrame {
             let had_locals = !debug.w_locals.is_null();
             // Allocate before remembering debugdata: a minor can happen here.
             let w_locals = had_locals.then(|| unsafe { pyre_object::w_dict_new() });
+            // Residual fnaddr (`jit_fnaddr` `ResidualRet`) cannot carry
+            // `PyError`; the debug block already exists when `getdebug()`
+            // answered Some, so this allocation path is not taken.
             let Ok(d) = self.getorcreate_debug_data(-1) else {
                 return;
             };
@@ -6554,7 +6519,7 @@ impl PyFrame {
         for i in 0..args.len() {
             live[3 + i] = _roots.get(root_base + 3 + i);
         }
-        let frame = Self::finish_for_call_with_globals_obj(
+        Self::finish_for_call_with_globals_obj(
             _roots.get(root_base) as *const (),
             &live[3..],
             _roots.get(root_base + 1),
@@ -6562,11 +6527,7 @@ impl PyFrame {
             _roots.get(root_base + 2),
             w_builtin,
             allocation,
-        );
-        if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
-        }
-        Ok(frame)
+        )
     }
 
     /// PyPy `space.createframe(code, function.w_func_globals, function)`.
@@ -6608,6 +6569,7 @@ impl PyFrame {
             w_builtin,
             allocation,
         )
+        .expect("new_for_call_with_closure_and_globals_obj: frame allocation")
     }
 
     /// Common tail of the frame builders: everything in `Frame.__init__`
@@ -6621,7 +6583,7 @@ impl PyFrame {
         closure: PyObjectRef,
         w_builtin: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         // `alloc_frame_locals_array` is a collection point.  Keep the call
         // inputs in real shadow-stack slots and populate the new locals array
         // from those forwarded slots, matching gctransform/framework.py's
@@ -6646,6 +6608,9 @@ impl PyFrame {
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
         };
+        if locals_cells_stack_w.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         // The allocation result is a translated livevar before it is stored in
         // the eventual PyFrame. Publish it before `w_cell_new`, the barrier or
         // anything else below: until a heap edge names it, the shadow-stack
@@ -6740,13 +6705,13 @@ impl PyFrame {
             // around `initialize_frame_scopes`.
             let _locals_root = FrameLocalsRoot::new(&mut frame);
             if frame_stores_global {
-                frame.set_w_globals(_roots.get(root_base + 1));
+                frame.set_w_globals(_roots.get(root_base + 1))?;
             }
             // This constructor bypasses `initialize_frame_scopes`, so apply the
             // scope binding it would have done.  `FunctionType(co, globals)` over
             // a module-level code object arrives here, and without the binding its
             // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
-            frame.bind_unoptimized_locals_scope();
+            frame.bind_unoptimized_locals_scope()?;
             frame.init_cells();
         }
         // `bind_unoptimized_locals_scope` allocates the class-body mapping, and
@@ -6757,7 +6722,10 @@ impl PyFrame {
         unsafe {
             store_locals_cells_stack_w(&mut frame, _roots.get(locals_idx) as *mut FixedObjectArray);
         }
-        frame
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        Ok(frame)
     }
 
     /// Borrow the raw CodeObject (`pyframe.py` `self.pycode` field read).
@@ -6887,7 +6855,7 @@ impl PyFrame {
         // `FrameBox::into_generator` to skip this copy.  Use the GC-managed
         // snapshot: the generator owns the frame for its whole life, off the
         // `CURRENT_FRAME` chain, so its lifetime is GC reachability.
-        self.snapshot_for_generator().into_generator()
+        self.snapshot_for_generator()?.into_generator()
     }
 
     /// pyframe.py `get_generator`: `self.f_generator_wref()`.
@@ -7208,12 +7176,9 @@ pub fn createframe_obj(
     let frame = majit_metainterp::jit::hint_fresh_virtualizable(
         majit_metainterp::jit::hint_access_directly(frame),
     );
-    let mut frame = FrameBox::new(frame).into_result()?;
+    let mut frame = FrameBox::new(frame)?;
     if frame_stores_global {
-        frame.set_w_globals(_roots.get(root_base + 1));
-        if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
-        }
+        frame.set_w_globals(_roots.get(root_base + 1))?;
     }
     // pyframe.py `PyFrame.__init__` — final step. PY_NULL plays the role of
     // Python `None` per the existing `initialize_frame_scopes` convention.
@@ -7957,7 +7922,7 @@ x = 7
             "got = outer(8)\n",
         );
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = super::PyFrame::new(code);
+        let mut frame = super::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
@@ -7992,7 +7957,7 @@ x = 7
             "got = g.gi_frame.f_locals['x']\n",
         );
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = super::PyFrame::new(code);
+        let mut frame = super::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
@@ -8021,7 +7986,7 @@ x = 7
             "m = Boom()\n",
         );
         let setup_code = crate::compile_exec(setup).expect("compile setup");
-        let mut setup_frame = super::PyFrame::new(setup_code);
+        let mut setup_frame = super::PyFrame::new(setup_code).expect("frame allocation");
         setup_frame
             .execute_frame(None)
             .unwrap_or_else(|err| panic!("setup failed: {err:?}"));
@@ -8049,7 +8014,7 @@ x = 7
     fn make_arguments_stores_methodcall_flag() {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec("a = 1").expect("compile");
-        let mut frame = super::PyFrame::new(code);
+        let mut frame = super::PyFrame::new(code).expect("frame allocation");
         frame.push(pyre_object::w_int_new(1));
         let method = frame.make_arguments(1, true, pyre_object::PY_NULL);
         assert!(method.methodcall);
@@ -8106,7 +8071,7 @@ x = 7
         let _clear = ClearYoungFrameHooks;
 
         let code = crate::compile_exec("a = 1").expect("compile");
-        let mut frame = super::PyFrame::new(code);
+        let mut frame = super::PyFrame::new(code).expect("frame allocation");
         let roots = pyre_object::gc_roots::push_roots();
         let installed_slot = roots.base();
         let _ = roots.pin_root(pyre_object::w_dict_new());
@@ -8119,7 +8084,7 @@ x = 7
         });
         pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(headered_young_alloc);
         pyre_object::gc_hook::register_gc_owns_object_hook(young_frame_alloc_is_owned);
-        let boxed = super::FrameBox::new(snapshot);
+        let boxed = super::FrameBox::new(snapshot).expect("frame allocation");
         assert!(
             boxed.is_gc_owned(),
             "FrameBox::new must take the GC allocation branch"

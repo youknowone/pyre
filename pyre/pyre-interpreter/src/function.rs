@@ -4304,8 +4304,7 @@ fn funccall_flat_from_args(
             _roots.get(env_base + 1),
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )
-    })?)
-    .into_result()?;
+    })?)?;
 
     // funccallunrolling: `for i in unrolling_iterable(range(4)): if i < nargs`
     match nargs {
@@ -4691,9 +4690,7 @@ fn _flat_pycall(
                 return pyre_object::PY_NULL;
             }
         },
-    )
-    .into_result()
-    {
+    ) {
         Ok(f) => f,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -4792,9 +4789,7 @@ fn _flat_pycall_defaults(
                 return pyre_object::PY_NULL;
             }
         },
-    )
-    .into_result()
-    {
+    ) {
         Ok(f) => f,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -5057,7 +5052,7 @@ except TypeError as e:
     r_g0 = str(e)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame.execute_frame(None).expect("methodcall arity snippet");
         let w_globals = frame.get_w_globals();
         let get = |name: &str| {
@@ -5127,7 +5122,7 @@ except TypeError as e:
     r_self_named = str(e)
 ";
         let code = crate::compile_exec(source).expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
+        let mut frame = crate::pyframe::PyFrame::new(code).expect("frame allocation");
         frame
             .execute_frame(None)
             .expect("CALL_KW methodcall arity snippet");

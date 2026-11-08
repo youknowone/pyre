@@ -2193,7 +2193,7 @@ fn new_builtin_module(
                 // the shadow stack after that store.
                 let created = unsafe { crate::function::builtin_function_new_managed(value) };
                 if created.is_null() {
-                    return Err(crate::PyError::memory_error(""));
+                    return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 let created_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(created);
@@ -5016,11 +5016,11 @@ fn exec_code_module(
 /// those functions keep the namespace transitively reachable.
 #[doc(hidden)]
 pub trait AppleveldefNamespace {
-    fn store(&mut self, name: &str, value: PyObjectRef);
+    fn store(&mut self, name: &str, value: PyObjectRef) -> Result<(), crate::PyError>;
 }
 
 impl AppleveldefNamespace for PyObjectRef {
-    fn store(&mut self, name: &str, value: PyObjectRef) {
+    fn store(&mut self, name: &str, value: PyObjectRef) -> Result<(), crate::PyError> {
         // Only a mixed-module dict is wrapped. `load_builtin_module` stamps
         // `__name__` before `init`. Callers that install into a fresh dict
         // (`app_functional`, `async_operation`, `reduce_protocol`) have no
@@ -5036,7 +5036,7 @@ impl AppleveldefNamespace for PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
         if stored.is_null() {
-            return;
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         let stored_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(stored);
@@ -5045,6 +5045,7 @@ impl AppleveldefNamespace for PyObjectRef {
             name,
             pyre_object::gc_roots::shadow_stack_get(stored_slot),
         );
+        Ok(())
     }
 }
 
@@ -5169,10 +5170,7 @@ pub fn appleveldef_install_seeded(
             )
         } {
             Some(val) => {
-                ns.store(name, val);
-                if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                    return Err(crate::PyError::memory_error(""));
-                }
+                ns.store(name, val)?;
             }
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }

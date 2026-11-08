@@ -547,19 +547,27 @@ fn alloc_callee_frame(
     w_globals: PyObjectRef,
     execution_context: *const pyre_interpreter::PyExecutionContext,
 ) -> *mut PyFrame {
-    let boxed = pyre_interpreter::pyframe::FrameBox::new(
-        PyFrame::new_for_call_with_closure_and_globals_obj(
-            code,
-            args,
-            w_globals,
-            execution_context,
-            PY_NULL,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-        ),
-    );
-    if boxed.is_null() {
-        return std::ptr::null_mut();
-    }
+    let frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        code,
+        args,
+        w_globals,
+        execution_context,
+        PY_NULL,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+    ) {
+        Ok(frame) => frame,
+        Err(mut e) => {
+            publish_residual_call_exception(e.to_exc_object());
+            return std::ptr::null_mut();
+        }
+    };
+    let boxed = match pyre_interpreter::pyframe::FrameBox::new(frame) {
+        Ok(boxed) => boxed,
+        Err(mut e) => {
+            publish_residual_call_exception(e.to_exc_object());
+            return std::ptr::null_mut();
+        }
+    };
     let ptr = boxed.into_raw();
     LIVE_CALLEE_FRAMES.with(|cell| unsafe { &mut *cell.get() }.push(ptr));
     ptr
@@ -4905,7 +4913,10 @@ fn trace_and_compile_from_bridge_body(
     // after the walk so the post-bridge interpreter resumes at the guard
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
-    let resume_state = bridge_frame_root.frame().snapshot_for_tracing();
+    let resume_state = match bridge_frame_root.frame().snapshot_for_tracing() {
+        Ok(frame) => frame,
+        Err(_) => return BridgeResolution::ResumeBlackhole,
+    };
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
     // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
@@ -4960,7 +4971,10 @@ fn trace_and_compile_from_bridge_body(
                 // as the previous segment left it, so the snapshot is taken
                 // here rather than once outside — `FrameBox` owns a shadow
                 // stack root guard and cannot be cloned.
-                let trace_frame = bridge_frame_root.frame().snapshot_for_tracing();
+                let trace_frame = match bridge_frame_root.frame().snapshot_for_tracing() {
+                    Ok(frame) => frame,
+                    Err(_) => return majit_metainterp::TraceAction::Abort,
+                };
                 // `sym.set_live_vable_frame_addr` records this word as the
                 // virtualizable the walk writes back through, so it has to be
                 // the frame's address as of this entry: the driver re-enters
@@ -9655,7 +9669,7 @@ mod tests_bh_normalize_raise {
             pyre_interpreter::builtins::__majit_wrap_builtin_len,
         );
         let code = compile_exec("").expect("empty module should compile");
-        let frame = pyre_interpreter::PyFrame::new(code);
+        let frame = pyre_interpreter::PyFrame::new(code).expect("frame allocation");
 
         let frame_ptr = &*frame as *const pyre_interpreter::PyFrame;
         let result =

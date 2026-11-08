@@ -6465,7 +6465,11 @@ fn w_dict_view_iterator_new_direction(
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
     if raw.is_null() {
-        crate::lltype::host_or_null(value) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(value) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
         // The shell is a livevar across the barrier: that call is a `gc_op`,

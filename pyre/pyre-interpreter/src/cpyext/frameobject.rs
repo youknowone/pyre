@@ -230,10 +230,9 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     ) else {
         return;
     };
-    let mut boxed = crate::pyframe::FrameBox::new(frame);
-    if boxed.is_null() {
+    let Ok(mut boxed) = crate::pyframe::FrameBox::new(frame) else {
         return;
-    }
+    };
     // `frameobject.py:75 d.f_lineno = rffi.getintfield(py_frame,
     // 'c_f_lineno')` — the line the extension wrote before handing the frame
     // on, which is the whole reason it asked for one.

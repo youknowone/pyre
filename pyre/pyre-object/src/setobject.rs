@@ -931,7 +931,11 @@ unsafe fn wrap_shared_utf8(block: *mut crate::unicodeobject::Utf8Str) -> PyObjec
         hash: 0,
     };
     if raw.is_null() {
-        crate::lltype::host_or_null(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     } else {
         unsafe { std::ptr::write(raw as *mut crate::W_UnicodeObject, body) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);
@@ -2774,7 +2778,11 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::host_or_null(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     }
 }
 
@@ -2821,7 +2829,11 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::host_or_null(body) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(body) as PyObjectRef
+        }
     }
 }
 

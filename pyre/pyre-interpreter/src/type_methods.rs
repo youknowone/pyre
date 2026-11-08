@@ -653,9 +653,9 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
                 other,
                 majit_metainterp::jit::we_are_jitted(),
             )
-            .map_err(|e| {
-                if e == "MemoryError" {
-                    crate::PyError::memory_error("")
+            .map_err(|_| {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    crate::runtime_ops::fetch_memory_error()
                 } else {
                     panic!("copy_into an empty list")
                 }

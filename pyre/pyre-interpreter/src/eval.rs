@@ -6476,7 +6476,7 @@ mod tests {
         // seed the builtins.
         crate::test_hooks::install_hash_hook();
         let code = compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let result = frame.execute_frame(None);
         (result, frame)
     }
@@ -6512,7 +6512,7 @@ mod tests {
             .iter()
             .position(|constant| matches!(constant, crate::bytecode::ConstantData::Code { .. }))
             .expect("nested code constant");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let enclosing = frame.code().clone();
         for idx in [str_idx, tuple_idx, code_idx] {
             let index = crate::bytecode::oparg::ConstIdx::from_u32(idx as u32);
@@ -6541,7 +6541,7 @@ mod tests {
     fn test_install_current_frame_does_not_own_an_already_entered_chain() {
         let _ = run_exec_frame("pass");
         let code = compile_exec("pass").expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let frame_ptr = frame.as_mut_ptr();
         // The frame no longer carries its context, so resolve the thread's.
         // Read it AFTER building the frame: `PyFrame::new` re-stamps
@@ -6742,7 +6742,7 @@ mod tests {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
             code.instructions.replace_op(1, Instruction::EndFor);
         }
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         let err = frame
             .execute_frame(None)
             .expect_err("expected bytecode corruption");
@@ -7783,7 +7783,7 @@ result = (
         let dead_before = dead.0;
 
         let code = compile_exec("x = 1").expect("compile failed");
-        let mut frame = PyFrame::new(code);
+        let mut frame = PyFrame::new(code).expect("frame allocation");
         unsafe {
             let frame_ptr = frame.as_mut_ptr();
             let arr = (*frame_ptr).locals_cells_stack_w;

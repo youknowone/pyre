@@ -113,7 +113,11 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::host_or_null(payload) as PyObjectRef
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            PY_NULL
+        } else {
+            crate::lltype::malloc_typed(payload) as PyObjectRef
+        }
     }
 }
 

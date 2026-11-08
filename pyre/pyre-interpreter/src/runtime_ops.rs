@@ -265,11 +265,22 @@ pub fn register_sandbox_stub_publisher() {
 /// interpreter-side `except` handler and its compiled-loop entry do not pass
 /// through that consumer, so they clear both carriers here instead, or a
 /// previous raise would be re-delivered by the next `GUARD_NO_EXCEPTION`.
+/// Opaque for the same reason as [`jit_publish_exception`]: it reads a OnceLock hook.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub(crate) fn jit_clear_published_exception() {
     if let Some(clearer) = JIT_EXC_CLEARER.get() {
         clearer();
     }
+}
+
+/// The C-level `rpyexc_fetch_value` + `rpyexc_clear` pair
+/// (`exceptiontransform.py`) moving the MemoryError the GC stored into
+/// the interpreter's error value.
+#[inline]
+pub(crate) fn fetch_memory_error() -> crate::PyError {
+    jit_clear_published_exception();
+    crate::PyError::memory_error("")
 }
 
 /// llmodel.py _store_exception: publish `exc_obj` into the
