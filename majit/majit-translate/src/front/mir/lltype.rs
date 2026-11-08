@@ -5416,9 +5416,20 @@ pub(crate) fn is_raw_ptr_to_classed_instance_spelling(ty: &str) -> bool {
 /// Reconstructs [`tyref_niche_option_gc_payload_spelling`] from a
 /// class-root spelling. The stamp keeps a reference/raw-pointer wrapper
 /// on the payload (`Option<&W_X>`, `Option<*mut PyObject>`), so a tagged
-/// by-value `Option<W_X>` is not this family. See
+/// by-value `Option<W_X>` is not this family.
+///
+/// A GC instance payload is `annotator/model.py` `SomeInstance.noneify`
+/// when the pointee's harvested layout gckind is Gc (`lltype.py`
+/// `Struct._first_struct`,
+/// [`crate::annotator::bookkeeper::owner_layout_gckind_is_gc_with`]). A
+/// string-family payload is `SomeString.noneify` from its family, not
+/// from gckind. No layout is not GC. A caller with no layouts must not
+/// guess GC from the uppercase / `::` spelling. See
 /// [`crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation`].
-pub(crate) fn is_niche_option_gc_payload_spelling(ty: &str) -> bool {
+pub(crate) fn is_niche_option_gc_payload_spelling(
+    ty: &str,
+    layouts: Option<&crate::codewriter::call::StructLayoutTable>,
+) -> bool {
     let t = ty.trim();
     let Some(inner) = majit_ir::descr::option_payload_spelling(t) else {
         return false;
@@ -5433,7 +5444,7 @@ pub(crate) fn is_niche_option_gc_payload_spelling(ty: &str) -> bool {
     if crate::annotator::bookkeeper::is_gcref_type_spelling(inner) {
         return false;
     }
-    let (is_ptr, pointee) = peel_niche_option_payload_pointer(inner);
+    let (_, pointee) = peel_niche_option_payload_pointer(inner);
     if matches!(
         pointee,
         "CCHARP"
@@ -5467,23 +5478,15 @@ pub(crate) fn is_niche_option_gc_payload_spelling(ty: &str) -> bool {
     if is_str_family_class_root(inner)
         || is_str_family_class_root(pointee)
         || is_raw_ptr_to_str_family_spelling(inner)
-        || inner == "PyObjectRef"
-        || inner.ends_with("::PyObjectRef")
-        // `&PyObjectRef` where PyObjectRef is `*mut PyObject` pretty-prints
-        // as `&*mut PyObject`. Peel of the shared borrow leaves a raw GC
-        // pointer (`is_raw_ptr_to_classed_instance_spelling`).
-        || is_raw_ptr_to_classed_instance_spelling(inner)
-        || is_raw_ptr_to_classed_instance_spelling(pointee)
     {
         return true;
     }
+    let (is_ptr, pointee) = intern_option_gc_pointee(inner);
     is_ptr
         && !pointee.is_empty()
-        && (pointee.contains("::")
-            || pointee
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase()))
+        && layouts.is_some_and(|layouts| {
+            crate::annotator::bookkeeper::owner_layout_gckind_is_gc_with(layouts, pointee)
+        })
 }
 
 /// Pointer wrapper around a niche Option payload, or `(false, inner)` when
@@ -5507,6 +5510,27 @@ fn peel_niche_option_payload_pointer(inner: &str) -> (bool, &str) {
         return (true, span[1..span.len() - 1].trim());
     }
     (false, inner)
+}
+
+/// Pointer-niche payload pointee after every `*mut` / `&` / `NonNull`
+/// wrapper. `is_ptr` is true when at least one wrapper was a pointer.
+/// A type-alias leaf that the stamp did not resolve is not a pointer;
+/// intern answers not-GC for it.
+fn intern_option_gc_pointee(inner: &str) -> (bool, &str) {
+    let mut cur = inner.trim();
+    let mut is_ptr = false;
+    for _ in 0..8 {
+        let (p, next) = peel_niche_option_payload_pointer(cur);
+        if !p {
+            return (is_ptr, cur);
+        }
+        is_ptr = true;
+        if next == cur {
+            return (is_ptr, cur);
+        }
+        cur = next;
+    }
+    (is_ptr, cur)
 }
 
 /// Charon spelling of a raw pointer onto a str-family pointee, or `None`.
@@ -5547,8 +5571,10 @@ pub(in crate::front::mir) fn tyref_raw_ptr_to_classed_instance_spelling(
 /// `llannotation.py` `lltype_to_annotation` → `SomePtr` (never a
 /// noneified Instance: classed Instance ∪ Ptr is a UnionError). A GC
 /// instance pointer is `model.py` `SomeInstance.noneify` via
-/// [`is_niche_option_gc_payload_spelling`] when the pointee is in
-/// `gc_struct_ids` (`registered_gc_ptr_class_root_with`). Decide by the
+/// [`registered_gc_ptr_class_root_with`] when the pointee is in
+/// `gc_struct_ids`. Intern reconstructs that from the class-root
+/// spelling with the pointee's layout gckind
+/// ([`is_niche_option_gc_payload_spelling`]). Decide by the
 /// substituted payload's declaration, never the graph name.
 pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
     ty: &TyRef,
@@ -5588,17 +5614,17 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
         return None;
     }
     // Storage-raw (`Option<&OwnedFd>`) is int-bank SomePtr, not a GC
-    // instance. Check it before the uppercase-pointee heuristic in
-    // `is_niche_option_gc_payload_spelling`. A GC `&*mut T` is not
+    // instance. Check it before intern's layout gckind
+    // (`is_niche_option_gc_payload_spelling`). A GC `&*mut T` is not
     // storage-raw (`declared_raw_adt_node` requires a raw struct).
     if niche_option_storage_raw_struct_root(option_ty, llbc, no_tombstoned_leaves()).is_some() {
         return None;
     }
     // Raw-enum borrow (`Option<&MappedObj>`). `storage_raw_struct_root`
-    // requires `TypeDeclKind::Struct` + layout, so an Enum pointee
-    // would otherwise hit the intern predicate's uppercase `&T`
-    // heuristic and noneify. `ty_is_raw_address` /
-    // `borrowed_pointee_is_raw_enum` already classify this as
+    // requires `TypeDeclKind::Struct` + layout. Intern's layout gckind
+    // does not noneify an undeclared uppercase `&T`; stamp still keeps
+    // a raw-enum borrow off the GC Option spelling. `ty_is_raw_address`
+    // / `borrowed_pointee_is_raw_enum` already classify this as
     // int-bank. Classed Instance ∪ Ptr is a UnionError; rtype then
     // fails `cast_int_to_ptr` InstanceRepr → IntegerRepr on
     // `map_or__spec_MappedObj`.
@@ -5631,11 +5657,13 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
     }
 }
 
-/// Concrete `T` of `Option<T>` after a unique-impl associated-type
-/// projection (`H::Value` → `*mut PyObject`). `tyref_option_payload`
-/// keeps the `TraitType` node; `tyref_is_niche_option` already peels
-/// it before the raw-pointer test. Multi-impl projections stay the
-/// original node and do not stamp.
+/// Concrete `T` of `Option<T>` after an associated-type projection
+/// (`H::Value` → `*mut PyObject`). `tyref_option_payload` keeps the
+/// `TraitType` node; `tyref_is_niche_option` already peels it before
+/// the raw-pointer test. A unique impl binds the projection; several
+/// impls still resolve when the projection's predicate matches one
+/// (`assoc_value_for_matching_impl`). Zero or several matches stay
+/// the original node and do not stamp.
 fn resolved_option_payload_ty(payload: &TyRef, llbc: &Llbc) -> TyRef {
     tyref_node(payload, llbc)
         .and_then(|node| trait_payload_node(node, llbc))
@@ -5677,18 +5705,29 @@ fn registered_gc_ptr_payload_root(
 /// Payload spelling inside a niche-Option stamp. A shared/mut reference
 /// keeps `&` / `&mut ` so `Option<&W_X>` does not collide with a tagged
 /// by-value `Option<W_X>`. Raw pointers already keep `*mut` / `*const`.
+/// Type aliases (`type T = *mut U`) render as the aliased pointer
+/// ([`type_node_peel_aliases`]) so intern reconstructs from the
+/// declaration target, never the alias leaf.
 fn niche_option_payload_inner_spelling(payload: &TyRef, llbc: &Llbc) -> String {
-    if let Some(node) = tyref_node(payload, llbc) {
-        if let Some(pointee) = type_node_shared_ref_pointee(node, llbc) {
-            return format!("&{}", charon_type_value_to_ast_string(pointee, llbc, 0));
-        }
-        if type_node_is_mut_ref(node, llbc)
-            && let Some(pointee) = type_node_mut_ref_pointee(node, llbc)
-        {
-            return format!("&mut {}", charon_type_value_to_ast_string(pointee, llbc, 0));
-        }
+    let Some(node) = tyref_node(payload, llbc) else {
+        return tyref_to_ast_string(payload, llbc);
+    };
+    if let Some(pointee) = type_node_shared_ref_pointee(node, llbc) {
+        return format!("&{}", alias_resolved_ast_string(pointee, llbc));
     }
-    tyref_to_ast_string(payload, llbc)
+    if type_node_is_mut_ref(node, llbc)
+        && let Some(pointee) = type_node_mut_ref_pointee(node, llbc)
+    {
+        return format!("&mut {}", alias_resolved_ast_string(pointee, llbc));
+    }
+    alias_resolved_ast_string(node, llbc)
+}
+
+/// [`charon_type_value_to_ast_string`] of `node` after following
+/// `type T = U` ([`type_node_peel_aliases`]).
+fn alias_resolved_ast_string(node: &serde_json::Value, llbc: &Llbc) -> String {
+    let peeled = type_node_peel_aliases(node, llbc).unwrap_or(node);
+    charon_type_value_to_ast_string(peeled, llbc, 0)
 }
 
 fn type_node_mut_ref_pointee<'l>(

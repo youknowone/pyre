@@ -9068,10 +9068,18 @@ impl<'a> Lowering<'a> {
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
         // the roots already match, so the Call dest is the value.
+        //
+        // The narrowed Variable keeps the Call dest's `concretetype`
+        // (`Variable.copy`, `flowspace/model.py`): `do_fixed_newlist`
+        // reads `op.result.concretetype.TO` and
+        // `do_fixed_list_ll_arraycopy` reads the dest ARRAY, and without
+        // it the residual `OS_ARRAYCOPY` lands on
+        // `WriteAnalyzer.top_result` (`EF_RANDOM_EFFECTS`).
         if !dest_is_cell && let Some(root) = recast_result_root {
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            copy_concretetype(&result_var, &narrowed);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(narrowed.clone()),
                 kind: crate::model::cast_instance_call(root, result_var.clone()),

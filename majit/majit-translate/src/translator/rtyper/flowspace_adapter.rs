@@ -5795,10 +5795,12 @@ pub(crate) fn derive_subject_inputcells(
                 });
                 continue;
             }
-            if class_root
-                .as_deref()
-                .is_some_and(crate::front::mir::is_niche_option_gc_payload_spelling)
-            {
+            if class_root.as_deref().is_some_and(|root| match bookkeeper {
+                Some(bk) => bk.is_niche_option_gc_payload_spelling(root),
+                // No Bookkeeper: string-family still noneifies; GC
+                // instance-ness is the pointee's layout, never the name.
+                None => crate::front::mir::is_niche_option_gc_payload_spelling(root, None),
+            }) {
                 let root = class_root.as_deref().unwrap();
                 cells.push(
                     crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
@@ -7937,6 +7939,9 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_niche_option_instance_as_nullable() {
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_layouts(layouts);
         let mut graph = LegacyGraph::new("takes_opt_instance");
         let entry = graph.startblock;
         let var = graph
@@ -7951,7 +7956,7 @@ mod tests {
             )
             .unwrap();
         graph.push_inputarg_var(entry, var);
-        let cells = derive_subject_inputcells(&graph, None)
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("niche Option of a GC instance must project");
         assert_eq!(cells.len(), 1);
         let SomeValue::Instance(s) = &cells[0] else {

@@ -3964,7 +3964,7 @@ fn declared_return_annotation(
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
         return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
     }
-    if crate::front::mir::is_niche_option_gc_payload_spelling(root) {
+    if bk.is_niche_option_gc_payload_spelling(root) {
         return Some(
             crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
                 Some(bk),
@@ -19489,8 +19489,10 @@ mod tests {
     #[test]
     fn declared_return_annotation_niche_option_gc_payload_is_nullable() {
         use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
 
         let mut graph = LegacyGraph::new("returns_opt_instance");
         graph.return_type = Some("ref".into());
@@ -19518,6 +19520,44 @@ mod tests {
         assert!(
             s.inner.can_be_none,
             "niche Option of a GC string is SomeString(can_be_None=True)"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_undeclared_uppercase_option_is_not_gc_instance() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("returns_opt_undeclared");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<*mut SomeUndeclared>".into());
+        let declared = declared_return_annotation(&registry, &graph);
+        assert!(
+            !matches!(&declared, Some(SomeValue::Instance(inst)) if inst.can_be_none),
+            "uppercase pointee with no Gc layout must not noneify, got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_registered_gc_option_is_nullable_instance() {
+        use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["SomeUndeclared"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let mut graph = LegacyGraph::new("returns_opt_declared");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<*mut SomeUndeclared>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a niche Option of a registered-Gc pointee intern's");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("registered-Gc Option payload is SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "registered-Gc Option payload is SomeInstance(can_be_None=True)"
         );
     }
 

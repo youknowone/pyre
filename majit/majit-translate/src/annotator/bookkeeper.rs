@@ -1803,6 +1803,15 @@ impl Bookkeeper {
         owner_layout_gckind_is_gc_with(layouts, pointee)
     }
 
+    /// Intern predicate for a niche `Option<P>` of a GC instance or
+    /// str-family pointee. GC instance-ness is the pointee's harvested
+    /// layout gckind (`lltype.py` `Struct._first_struct`), never the
+    /// spelling. No layouts answers not-GC for the instance arm.
+    pub fn is_niche_option_gc_payload_spelling(&self, ty: &str) -> bool {
+        let layouts = self.struct_layouts.borrow();
+        crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref())
+    }
+
     /// SomeInstance of a registered named struct — the shell
     /// `robjmodel_instantiate` writes. Variant payloads (`__pos_N`) use
     /// this so the constructor does not union Instance with the SomePtr
@@ -4898,12 +4907,12 @@ impl Bookkeeper {
     /// Annotation of a niche `Option<P>` of a GC instance or str-family
     /// pointee. A niche `Option<P>` is one word whose None is the NULL
     /// payload. RPython `annotator/model.py`
-    /// `SomeInstance.__init__(can_be_None)` / `SomeString.noneify`;
+    /// `SomeInstance.noneify` / `SomeString.noneify`;
     /// `binaryop.py` `is__default` const-folds `is_(opt, None)` unless
     /// `can_be_None`. Field projection already unions the payload with
     /// `s_None`; an unregistered payload is a classdef-less instance
-    /// (or `s_str0`) then noneified. See
-    /// [`crate::front::mir::is_niche_option_gc_payload_spelling`].
+    /// (or `s_str0`) then noneified. The intern gate is
+    /// [`Self::is_niche_option_gc_payload_spelling`].
     pub(crate) fn niche_option_gc_payload_annotation(
         bookkeeper: Option<&Rc<Self>>,
         root: &str,

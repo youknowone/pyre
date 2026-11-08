@@ -128,47 +128,49 @@ fn raw_ptr_to_classed_instance_spelling_is_the_star_prefix() {
 
 #[test]
 fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&pyobject::PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<*mut pyobject::PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "option::Option<string::String>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<*mut unicodeobject::Utf8Str>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&W_BufferedReader>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<NonNull<W_BufferedReader>>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<pyobject::PyObject>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<W_BufferedReader>"
-    ));
-    assert!(!is_niche_option_gc_payload_spelling("pyobject::PyObject"));
-    assert!(!is_niche_option_gc_payload_spelling("string::String"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<fn()>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<i64>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<*mut u8>"));
-    assert!(!is_niche_option_gc_payload_spelling("Option<&[u8]>"));
-    assert!(!is_niche_option_gc_payload_spelling(
-        "Option<*mut GCREFOpaque>"
-    ));
-    // `&PyObjectRef` is `*mut PyObject`; the payload pretty-print is
-    // `&*mut PyObject`. Peel the shared borrow, then the raw GC pointer.
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&*mut PyObject>"
-    ));
-    assert!(is_niche_option_gc_payload_spelling(
-        "Option<&*mut pyobject::PyObject>"
-    ));
+    let intern_none = |s: &str| is_niche_option_gc_payload_spelling(s, None);
+    assert!(intern_none("option::Option<string::String>"));
+    assert!(intern_none("Option<*mut unicodeobject::Utf8Str>"));
+    assert!(!intern_none("Option<pyobject::PyObject>"));
+    assert!(!intern_none("Option<W_BufferedReader>"));
+    assert!(!intern_none("pyobject::PyObject"));
+    assert!(!intern_none("string::String"));
+    assert!(!intern_none("Option<fn()>"));
+    assert!(!intern_none("Option<i64>"));
+    assert!(!intern_none("Option<*mut u8>"));
+    assert!(!intern_none("Option<&[u8]>"));
+    assert!(!intern_none("Option<*mut GCREFOpaque>"));
+    // Uppercase / `::` spelling is not GC without a harvested layout.
+    assert!(!intern_none("Option<&pyobject::PyObject>"));
+    assert!(!intern_none("Option<*mut pyobject::PyObject>"));
+    assert!(!intern_none("Option<&W_BufferedReader>"));
+    assert!(!intern_none("Option<NonNull<W_BufferedReader>>"));
+    assert!(!intern_none("Option<&*mut PyObject>"));
+    assert!(!intern_none("Option<*mut SomeUndeclared>"));
+
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+        "pyobject::PyObject",
+        "PyObject",
+        "W_BufferedReader",
+        "SomeUndeclared",
+    ]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
+    assert!(intern("Option<&pyobject::PyObject>"));
+    assert!(intern("Option<*mut pyobject::PyObject>"));
+    assert!(intern("Option<&W_BufferedReader>"));
+    assert!(intern("Option<NonNull<W_BufferedReader>>"));
+    assert!(intern("Option<&*mut PyObject>"));
+    assert!(intern("Option<&*mut pyobject::PyObject>"));
+    assert!(intern("Option<*mut PyObject>"));
+    // Stamp peels `type PyObjectRef = *mut PyObject` via
+    // `type_node_peel_aliases`; intern has the class-root spelling, not
+    // the TypeDecl, so an unresolved alias leaf is not GC.
+    assert!(!intern("Option<PyObjectRef>"));
+    assert!(!intern("Option<&PyObjectRef>"));
+    assert!(intern("Option<*mut SomeUndeclared>"));
+    assert!(!intern("Option<pyobject::PyObject>"));
+    assert!(!intern("Option<W_BufferedReader>"));
+    assert!(!intern("Option<*mut u8>"));
 }
 
 /// `node_is_string_value` identifies the rstr `STR` layout set by
@@ -8718,7 +8720,7 @@ fn result_with_pointer_like_err_still_paints_class_root() {
 fn option_of_raw_pointer_stays_classdef_less() {
     // `Option<*mut u8>` is the null-word niche, not an enum class.
     // `*mut u8` is not a GC pointee (`is_niche_option_gc_payload_spelling`
-    // is false); the Input stamp stays classdef-less. A GC pointee such as
+    // with no layout is false); the Input stamp stays classdef-less. A GC pointee such as
     // `*mut pyobject::PyObject` is a different test.
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let node = option_adt_node(0, raw_mut_u8_arg());
@@ -8927,9 +8929,9 @@ fn stamp_option_method_inputs(
 
 /// Substituted pointer-niche `Option<P>` Input stamp from `local.ty`.
 /// GCREF → `SomePtr` class_root; GC instance / `&PyObjectRef` /
-/// `*mut TypedItemsBlock` → `Option<{payload}>` so
-/// `is_niche_option_gc_payload_spelling` noneifies. `Option<i64>` is the
-/// tagged enum and stays `option::Option<i64>`.
+/// `*mut TypedItemsBlock` → `Option<{payload}>` so intern noneifies
+/// when the pointee has a Gc layout. `Option<i64>` is the tagged enum
+/// and stays `option::Option<i64>`.
 #[test]
 fn substituted_pointer_niche_option_param_input_stamp() {
     let llbc = option_payload_stamp_llbc();
@@ -8937,6 +8939,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
     let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
     let helper =
         |ty: &TyRef| tyref_niche_option_gc_payload_spelling(ty, &llbc, &gc_struct_ids, &empty_s);
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+        "PyObject",
+        "pyobject::PyObject",
+        "TypedItemsBlock",
+    ]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
 
     let gcref_ty = TyRef::Other(option_adt_ty(raw_mut_adt(1)));
     let gcref_root = helper(&gcref_ty);
@@ -8965,9 +8973,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<*mut PyObject> self is not Void"
     );
     assert!(
-        py_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        py_class.as_deref().is_some_and(intern),
         "Option<*mut PyObject> stamps a niche Option, got {py_class:?}"
     );
     assert!(
@@ -8983,9 +8989,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&*mut PyObject> self is not Void"
     );
     assert!(
-        borrowed_raw_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_raw_class.as_deref().is_some_and(intern),
         "Option<&*mut PyObject> stamps a niche Option, got {borrowed_raw_class:?}"
     );
 
@@ -8997,16 +9001,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&PyObjectRef> self is not Void"
     );
     assert!(
-        borrowed_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_class.as_deref().is_some_and(intern),
         "Option<&PyObjectRef> stamps a niche Option, got {borrowed_class:?}"
     );
-    assert!(
-        borrowed_class
-            .as_deref()
-            .is_some_and(|r| r.contains("PyObjectRef") || r.contains("PyObject")),
-        "peeled shared-borrow payload is PyObjectRef, got {borrowed_class:?}"
+    assert_eq!(
+        borrowed_class, borrowed_raw_class,
+        "Option<&PyObjectRef> stamps the alias-resolved pointer, got {borrowed_class:?}"
     );
 
     let block_ty = option_adt_ty(raw_mut_adt(5));
@@ -9016,9 +9016,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<*mut TypedItemsBlock> self is not Void"
     );
     assert!(
-        block_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        block_class.as_deref().is_some_and(intern),
         "Option<*mut TypedItemsBlock> stamps a niche Option, got {block_class:?}"
     );
     assert!(
@@ -9035,10 +9033,12 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<PyObjectRef> self is not Void"
     );
     assert!(
-        alias_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        alias_class.as_deref().is_some_and(intern),
         "Option<PyObjectRef> stamps a niche Option, got {alias_class:?}"
+    );
+    assert_eq!(
+        alias_class, py_class,
+        "Option<PyObjectRef> stamps the alias-resolved pointer, got {alias_class:?}"
     );
 
     let borrowed_object = serde_json::json!({"Ref": ["Erased", adt_node(3), "Shared"]});
@@ -9049,9 +9049,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&PyObject> self is not Void"
     );
     assert!(
-        borrowed_object_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_object_class.as_deref().is_some_and(intern),
         "Option<&PyObject> stamps a niche Option, got {borrowed_object_class:?}"
     );
 
@@ -9063,9 +9061,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<&TypedItemsBlock> self is not Void"
     );
     assert!(
-        borrowed_block_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        borrowed_block_class.as_deref().is_some_and(intern),
         "Option<&TypedItemsBlock> stamps a niche Option, got {borrowed_block_class:?}"
     );
 
@@ -9082,9 +9078,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "Option<H::Value> self is not Void"
     );
     assert!(
-        assoc_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        assoc_class.as_deref().is_some_and(intern),
         "unique-impl TraitType payload *mut PyObject stamps a niche Option, got {assoc_class:?}"
     );
 
@@ -9100,9 +9094,7 @@ fn substituted_pointer_niche_option_param_input_stamp() {
         "tagged Option<i64> keeps its enum class_root, got {i64_class:?}"
     );
     assert!(
-        !i64_class
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        !i64_class.as_deref().is_some_and(intern),
         "Option<i64> is not a pointer-niche GC payload"
     );
 }
@@ -9137,16 +9129,16 @@ fn undeclared_named_object_pointee_is_not_noneify_stamp() {
     assert!(
         !py_class
             .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+            .is_some_and(|s| is_niche_option_gc_payload_spelling(s, None)),
         "Input class_root of undeclared PyObject is not a GC payload, got {py_class:?}"
     );
 }
 
 /// `Option<&RawEnum>` is the int-bank null word (`borrowed_pointee_is_raw_enum`),
-/// not a GC instance. The uppercase `&T` heuristic in
-/// `is_niche_option_gc_payload_spelling` would otherwise stamp
-/// `Option<&MappedObj>` and noneify; rtype then fails
-/// `cast_int_to_ptr` InstanceRepr → IntegerRepr.
+/// not a GC instance. Intern's layout gckind
+/// (`is_niche_option_gc_payload_spelling`) does not noneify an
+/// undeclared uppercase `&T`; rtype then fails `cast_int_to_ptr`
+/// InstanceRepr → IntegerRepr if intern did.
 #[test]
 fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
     let mut option = option_enum(0);
@@ -9198,7 +9190,7 @@ fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
     assert!(
         !class
             .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+            .is_some_and(|s| is_niche_option_gc_payload_spelling(s, None)),
         "Input class_root of Option<&RawEnum> is not a GC payload, got {class:?}"
     );
 }
@@ -9238,6 +9230,8 @@ fn niched_unwrap_or_else_keeps_self_input() {
         &[1],
         vec![],
     );
+    let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["PyObject"]);
+    let intern = |s: &str| is_niche_option_gc_payload_spelling(s, Some(&layouts));
     let opt_ty = option_adt_ty(raw_mut_adt(1));
     let closure_ty = adt_node(2);
     let ty = TyRef::Other(opt_ty.clone());
@@ -9264,10 +9258,7 @@ fn niched_unwrap_or_else_keeps_self_input() {
         "self is a payload word, not Void"
     );
     assert!(
-        self_input
-            .2
-            .as_deref()
-            .is_some_and(is_niche_option_gc_payload_spelling),
+        self_input.2.as_deref().is_some_and(intern),
         "self class_root is the niche Option spelling, got {:?}",
         self_input.2
     );
