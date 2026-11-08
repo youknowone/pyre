@@ -3090,6 +3090,9 @@ impl<'l> CrateLowering<'l> {
         clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
+        // Same bracket erasure as `build_decl_body`: a clause-spec copy is a
+        // jitcode body too, and upstream never has `gc_push_roots` in one.
+        let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             llbc,

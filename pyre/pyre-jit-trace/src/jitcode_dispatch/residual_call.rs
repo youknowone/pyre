@@ -5884,7 +5884,6 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
             | majit_ir::RuntimeHelperKind::SetCurrentException
             | majit_ir::RuntimeHelperKind::RestoreExcInfo
             | majit_ir::RuntimeHelperKind::StoreDeref
-            | majit_ir::RuntimeHelperKind::SetAddMethod
             | majit_ir::RuntimeHelperKind::BareSuperFromFrame
     )
 }
@@ -12405,56 +12404,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
-    // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
-    // concrete-executed by the shared tail below, so the force/exception
-    // guards, the heapcache invalidation and the `None` writeback are the ones
-    // the generic path already emits.  A decline leaves every binding
-    // untouched.
-    //
-    // The substituted descr carries `RuntimeHelperKind::SetAddMethod` for one
-    // reason: `writes_live_heap` below reads the helper tag and the result
-    // type, and the generic call it replaces arrived tagged `CallFn`.  An
-    // untagged `MOST_GENERAL` descr with a `Ref` result matches neither, so the
-    // substitution would quietly stop bumping the executed-effect odometer and
-    // stop setting `body_effect_candidate` -- and a nested walk that aborted
-    // behind a completed insert would rewind and run it again.  The set table
-    // survives that (adding the same element twice is one insert), but the
-    // element's `__hash__` need not be Python: a cpyext `tp_hash` runs native
-    // code, moves no frame-entry odometer, and can do anything.  Keeping the
-    // marker is what makes the substitution invisible to the rollback rules
-    // rather than merely survivable by them.
-    //
-    // The zero-argument `super()` re-route is the second arm of the same shape
-    // and is spelled here rather than with the folds above precisely so it can
-    // reuse this tail: its leaf can run a `__class__` property, so it needs the
-    // concrete execution, the raise transcription and the force bracket that
-    // only the generic path performs.  The two arms are mutually exclusive by
-    // callable -- `set.add` bound method against the `super` type -- so the
-    // order between them is free; `set_add` is asked first only because it is
-    // the cheaper recognition.
-    //
-    // An integer-strategy hit is not this tail.  The contains check does not
-    // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
-    // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
-    // still counts that `Some` as the same row.
+    // The zero-argument `super()` re-route is spelled here rather than with
+    // the folds above so it can reuse this tail: its leaf can run a
+    // `__class__` property, so it needs the concrete execution, the raise
+    // transcription and the force bracket that only the generic path performs.
+    // A decline leaves every binding untouched.
     let direct_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
+        spec_gate(SpecFold::BareSuperCall, || {
+            try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+        })?
     } else {
         None
     };

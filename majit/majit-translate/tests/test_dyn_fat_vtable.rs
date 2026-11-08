@@ -691,3 +691,281 @@ fn mir_identity_dict_setitem_declares_void_and_indirect_residual_is_void() {
     assert_eq!(result_type, 'v');
     assert_eq!(result_size, 0);
 }
+
+fn call_ops_with_leaf<'a>(
+    graph: &'a FunctionGraph,
+    leaf: &str,
+) -> Vec<(
+    &'a [majit_translate::model::LinkArg],
+    &'a ValueType,
+    BlockId,
+)> {
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if call_leaf_is(target, leaf) {
+                out.push((args.as_slice(), result_ty, block.id));
+            }
+        }
+    }
+    out
+}
+
+/// Checkpoint B: ordinary add is the vtable `indirect_call`
+/// (`jtransform.py handle_regular_indirect_call`). remove/has_key keep
+/// the pointer-to-ObjectKey trampolines.
+#[test]
+fn w_set_add_checked_is_set_strategy_add_indirect_call() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "w_set_add_checked").expect("lower w_set_add_checked");
+    let dump = graph.dump();
+    assert!(
+        call_ops_with_leaf(&graph, "set_strategy_add_ptr").is_empty(),
+        "w_set_add_checked must not residualize through set_strategy_add_ptr\n{dump}"
+    );
+    let old_add_leaf = concat!("set_strategy_add_", "key_ptr");
+    assert!(
+        call_ops_with_leaf(&graph, old_add_leaf).is_empty(),
+        "old pointer-to-ObjectKey add leaf must not remain\n{dump}"
+    );
+    assert!(
+        !dump.contains("__dyn_call"),
+        "known SetStrategy::add family must not use __dyn_call\n{dump}"
+    );
+
+    let (call_block, call_args, family) = first_indirect_call(&graph).unwrap_or_else(|| {
+        panic!("w_set_add_checked must emit IndirectCall for SetStrategy::add\n{dump}")
+    });
+    assert!(
+        family.is_some_and(|(trait_root, method)| {
+            trait_root.contains("SetStrategy") && method == "add"
+        }),
+        "IndirectCall family must be SetStrategy::add, got {family:?}\n{dump}"
+    );
+    assert!(
+        call_args.len() >= 3,
+        "SetStrategy::add keeps self plus (w_set, w_key), got {} args\n{dump}",
+        call_args.len()
+    );
+    let recv = call_args
+        .first()
+        .unwrap_or_else(|| panic!("dyn add call must pass a receiver\n{dump}"));
+    assert_ne!(
+        FunctionGraph::concretetype_of(recv),
+        ConcreteType::Void,
+        "dyn call receiver must not be Void\n{dump}"
+    );
+    let recv_kind = var_kind(&graph, call_block, recv)
+        .unwrap_or_else(|| panic!("dyn add receiver has no kind (var={recv:?})\n{dump}"));
+    assert_eq!(
+        recv_kind, 'r',
+        "SetStrategy self is a GC instance (Ref) even for ZST impls, got {recv_kind}"
+    );
+
+    let contains = lower_function(llbc, "w_set_contains_key_checked")
+        .expect("lower w_set_contains_key_checked");
+    assert!(
+        !call_ops_with_leaf(&contains, "set_strategy_has_key_ptr").is_empty(),
+        "has_key keeps set_strategy_has_key_ptr\n{}",
+        contains.dump()
+    );
+    let discard =
+        lower_function(llbc, "w_set_discard_key_checked").expect("lower w_set_discard_key_checked");
+    assert!(
+        !call_ops_with_leaf(&discard, "set_strategy_remove_key_ptr").is_empty(),
+        "remove keeps set_strategy_remove_key_ptr\n{}",
+        discard.dump()
+    );
+}
+
+/// `lib.rs` family registration of `(self_ty_root, trait_root)` plus the
+/// default-body arm for a generic `Self`. Mirrors production so a missing
+/// unwrapped member is a discovery bug, not a test-only substitution.
+fn register_production_set_strategy_add_family(
+    cc: &mut CallControl,
+    program: &majit_translate::SemanticProgram,
+) -> Vec<String> {
+    let mut members = Vec::new();
+    for func in &program.functions {
+        let Some(trait_leaf) = func.trait_root.as_deref() else {
+            continue;
+        };
+        if trait_leaf != "SetStrategy" {
+            continue;
+        }
+        let leaf = func.name.rsplit("::").next().unwrap_or(func.name.as_str());
+        if leaf != "add" && !leaf.starts_with("add__spec_") {
+            continue;
+        }
+        match func.self_ty_root.as_deref() {
+            Some(owner) => {
+                let path = match func.trait_impl_identity.as_deref() {
+                    Some(identity) => {
+                        let mut segments: Vec<String> = owner
+                            .split("::")
+                            .filter(|seg| !seg.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        segments.push(format!("<impl {identity}>"));
+                        segments.push(func.name.clone());
+                        majit_translate::CallPath::from_segments(segments)
+                    }
+                    None => majit_translate::CallPath::for_impl_method(owner, &func.name),
+                };
+                cc.register_trait_family_path(&func.name, trait_leaf, path.clone());
+                cc.register_function_graph(path.clone(), func.graph().clone());
+                members.push(format!(
+                    "{path} (owner={owner}, identity={:?}, return={:?})",
+                    func.trait_impl_identity, func.return_type
+                ));
+            }
+            None => {
+                let impl_type = format!("<default methods of {trait_leaf}>");
+                cc.register_trait_method(
+                    &func.name,
+                    Some(trait_leaf),
+                    &impl_type,
+                    func.graph().clone(),
+                );
+                members.push(format!(
+                    "{impl_type}::{} (generic Self, identity={:?}, return={:?})",
+                    func.name, func.trait_impl_identity, func.return_type
+                ));
+            }
+        }
+    }
+    members
+}
+
+const SET_STRATEGY_ADD_IMPLS: [&str; 6] = [
+    "EmptySetStrategy",
+    "ObjectSetStrategy",
+    "IntegerSetStrategy",
+    "BytesSetStrategy",
+    "AsciiSetStrategy",
+    "IdentitySetStrategy",
+];
+
+fn family_member_names(family: &[majit_translate::CallPath]) -> Vec<String> {
+    family.iter().map(|path| path.to_string()).collect()
+}
+
+fn family_covers_impl(family: &[majit_translate::CallPath], impl_leaf: &str) -> bool {
+    family.iter().any(|path| {
+        path.segments
+            .iter()
+            .any(|segment| segment == impl_leaf || segment.contains(impl_leaf))
+    })
+}
+
+/// `rpbc.rs lower_indirect_calls_with` fills `(SetStrategy, add)` with
+/// Empty, Object, and the four unwrapped monomorphized impl graphs.
+/// `jtransform.rs Transformer::lower_indirect_call_op` then emits
+/// `int_guard_value` plus `IndirectCallTargets` (`guess_call_kind` Regular).
+#[test]
+fn set_strategy_add_family_has_six_impls_and_regular_ict() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let mut graph = lower_function(llbc, "w_set_add_checked").expect("lower w_set_add_checked");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["setobject"],
+        &["add", "w_set_add_checked"],
+    )
+    .expect("build SetStrategy::add graphs");
+
+    let mut cc = CallControl::new();
+    let registered = register_production_set_strategy_add_family(&mut cc, &program);
+    let family = cc.all_impls_for_indirect("SetStrategy", "add");
+    let names = family_member_names(&family);
+    let missing: Vec<&str> = SET_STRATEGY_ADD_IMPLS
+        .iter()
+        .copied()
+        .filter(|impl_leaf| !family_covers_impl(&family, impl_leaf))
+        .collect();
+    assert!(
+        missing.is_empty() && family.len() >= 6,
+        "SetStrategy::add family must include Empty, Object, and the four unwrapped impls; \
+         missing={missing:?} family={names:?} registered={registered:?}"
+    );
+
+    majit_translate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph, &cc);
+    let filled = graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::IndirectCall {
+                graphs, family_key, ..
+            } => Some((graphs.clone(), family_key.clone())),
+            _ => None,
+        })
+    });
+    let (graphs, family_key) = filled.unwrap_or_else(|| {
+        panic!(
+            "lower_indirect_calls must keep the SetStrategy::add IndirectCall\n{}",
+            graph.dump()
+        )
+    });
+    assert!(
+        family_key.is_none(),
+        "rtyper must consume the family key, got {family_key:?}"
+    );
+    let graphs = graphs.unwrap_or_else(|| {
+        panic!("known SetStrategy::add family must fill graphs, not collapse to unknown")
+    });
+    assert!(
+        graphs.len() >= 6,
+        "filled graphs must keep all six impls, got {}",
+        graphs.len()
+    );
+
+    let caller_path = majit_translate::CallPath::from_segments(["w_set_add_checked"]);
+    cc.register_function_graph(caller_path.clone(), graph.clone());
+    cc.find_helper_graphs(
+        &mut majit_translate::policy::DefaultJitPolicy::new(),
+        &[caller_path],
+    );
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let transformed = transformer.transform(&graph);
+    let has_guard = transformed.graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::GuardValue { kind_char: 'i', .. }))
+    });
+    let ict_len = transformed.graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual {
+                indirect_targets: Some(targets),
+                ..
+            } => Some(targets.lst.len()),
+            _ => None,
+        })
+    });
+    assert!(
+        has_guard,
+        "regular indirect add must emit int_guard_value\n{}",
+        transformed.graph.dump()
+    );
+    let ict_len = ict_len.unwrap_or_else(|| {
+        panic!(
+            "regular indirect add must emit IndirectCallTargets\n{}",
+            transformed.graph.dump()
+        )
+    });
+    assert!(
+        ict_len >= 6,
+        "IndirectCallTargets must list all six impl jitcodes, got {ict_len}"
+    );
+}

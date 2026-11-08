@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
 use majit_charon_reader::ullbc::{Signature, TyRef, TypeDecl, TypeDeclKind, duplicate_return};
-use majit_charon_reader::{FunDecl, Llbc, Unstructured};
+use majit_charon_reader::{FunDecl, FunSrc, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -672,7 +672,59 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
         .pointer("/kind/TraitImpl/generics")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
+    // objectmodel.py import_from_mixin copies each mixin method per class;
+    // rpbc.py MethodsPBCRepr makes self.unwrap a direct call to that class's method.
+    if let Some(fd) = llbc.fn_by_id(fn_id)
+        && let Some(default_generics) =
+            provided_trait_default_generics(fd, llbc, impl_id, &resolved, &generics)
+    {
+        return Some((fn_id, default_generics));
+    }
     Some((fn_id, generics))
+}
+
+/// Instantiation of a provided trait method the impl does not override.
+/// That FunDecl is generic over the trait (`Self`, trait params, TraitSelf);
+/// the impl's own GenericArgs do not match that binder.
+fn provided_trait_default_generics(
+    fd: &FunDecl,
+    llbc: &Llbc,
+    impl_id: u64,
+    resolved: &Value,
+    impl_generics: &Value,
+) -> Option<Value> {
+    if !matches!(fd.src, Some(FunSrc::TraitDefault)) {
+        return None;
+    }
+    let impl_trait_g = peel_generic_args(
+        llbc.trait_impls_raw()
+            .get(impl_id as usize)?
+            .get("impl_trait")?
+            .get("generics")?,
+    );
+    let (mut types, mut const_generics) = generic_args_lists(impl_trait_g);
+    let (subst_types, subst_consts) = generic_args_lists(impl_generics);
+    for ty in &mut types {
+        substitute_type_vars(ty, llbc, &subst_types, &subst_consts);
+    }
+    for cg in &mut const_generics {
+        substitute_type_vars(cg, llbc, &subst_types, &subst_consts);
+    }
+    let clause_n = fd.generics.as_ref().map_or(0, |g| g.trait_clauses.len());
+    let mut trait_refs = vec![resolved.clone()];
+    if clause_n > 1 {
+        if let Some(extra) = impl_trait_g.get("trait_refs").and_then(Value::as_array) {
+            trait_refs.extend(extra.iter().cloned());
+        }
+    }
+    if trait_refs.len() != clause_n {
+        return None;
+    }
+    Some(serde_json::json!({
+        "types": types,
+        "const_generics": const_generics,
+        "trait_refs": trait_refs,
+    }))
 }
 
 /// The impl's own body for the trait's `method_idx`-th method. Each impl

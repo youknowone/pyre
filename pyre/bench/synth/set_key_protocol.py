@@ -78,6 +78,93 @@ class EqOk:
         return "EqOk"
 
 
+class Sub(TypeError):
+    pass
+
+
+class EqTypeError:
+    def __hash__(self):
+        return 42
+
+    def __eq__(self, other):
+        raise TypeError("eq boom")
+
+
+class EqTypeErrorSub:
+    def __hash__(self):
+        return 42
+
+    def __eq__(self, other):
+        raise Sub("eq boom")
+
+
+def eq_type_error_add():
+    s = set()
+    s.add(EqTypeError())
+    try:
+        s.add(EqTypeError())
+    except TypeError as e:
+        return type(e).__name__, str(e), type(e) is TypeError, len(s)
+    return "no-raise", len(s)
+
+
+def eq_type_error_comprehension():
+    try:
+        return len({x for x in [EqTypeError(), EqTypeError()]})
+    except TypeError as e:
+        return type(e).__name__, str(e), type(e) is TypeError
+
+
+def eq_type_error_sub_add():
+    s = set()
+    s.add(EqTypeErrorSub())
+    try:
+        s.add(EqTypeErrorSub())
+    except Sub as e:
+        return type(e).__name__, str(e), type(e) is Sub, isinstance(e, TypeError), len(s)
+    return "no-raise", len(s)
+
+
+def eq_type_error_sub_comprehension():
+    try:
+        return len({x for x in [EqTypeErrorSub(), EqTypeErrorSub()]})
+    except Sub as e:
+        return type(e).__name__, str(e), type(e) is Sub, isinstance(e, TypeError)
+
+
+def eq_type_error_identity():
+    caught = []
+
+    class EqIdent:
+        def __hash__(self):
+            return 42
+
+        def __eq__(self, other):
+            err = TypeError("eq boom")
+            caught.append(err)
+            raise err
+
+    s = set()
+    s.add(EqIdent())
+    try:
+        s.add(EqIdent())
+    except TypeError as e:
+        return e is caught[0], str(e), len(s)
+    return "no-raise", len(s)
+
+
+def eq_type_error_leftover_then_ok():
+    s = set()
+    s.add(EqTypeError())
+    try:
+        s.add(EqTypeError())
+    except TypeError:
+        pass
+    n = len(s)
+    s.add(1)
+    return n, len(s)
+
+
 def add_twice(st):
     st.add(EqBoom())
     st.add(EqBoom())
@@ -157,6 +244,12 @@ def main():
     # a collision whose __eq__ does not raise still dedupes on identity
     m("collide_ok", lambda: len(set([EqOk(), EqOk()])))
     m("same_obj_twice", lambda: (lambda a: len(set([a, a])))(EqBoom()))
+    m("add_eq_type_error", eq_type_error_add)
+    m("comprehension_eq_type_error", eq_type_error_comprehension)
+    m("add_eq_type_error_sub", eq_type_error_sub_add)
+    m("comprehension_eq_type_error_sub", eq_type_error_sub_comprehension)
+    m("eq_type_error_identity", eq_type_error_identity)
+    m("eq_type_error_leftover_then_ok", eq_type_error_leftover_then_ok)
 
 
 main()

@@ -28,6 +28,20 @@ class RaisingHash:
         raise ValueError("nope")
 
 
+class Sub(TypeError):
+    pass
+
+
+class HashTypeErrorSub:
+    def __hash__(self):
+        raise Sub("hash boom")
+
+
+class HashValueError:
+    def __hash__(self):
+        raise ValueError("hash boom")
+
+
 def build_literal(x):
     return {x}
 
@@ -79,6 +93,13 @@ def main():
     m("ctor_empty", lambda: sorted(set()))
     m("ctor_generator", lambda: sorted(set(i for i in range(3))))
     m("nested_frozenset_ok", lambda: sorted(set([frozenset([1]), frozenset([1])]), key=repr))
+    # hash-callback errors that are not an exact TypeError propagate unchanged, below the JIT threshold
+    m("add_hash_type_error_sub", lambda: do_add(HashTypeErrorSub()))
+    m("literal_hash_type_error_sub", lambda: build_literal(HashTypeErrorSub()))
+    m("comprehension_hash_type_error_sub", lambda: build_comprehension([HashTypeErrorSub()]))
+    m("add_hash_value_error", lambda: do_add(HashValueError()))
+    m("literal_hash_value_error", lambda: build_literal(HashValueError()))
+    m("comprehension_hash_value_error", lambda: build_comprehension([HashValueError()]))
 
 
 def do_update_two():

@@ -2247,31 +2247,6 @@ fn a_new_opref_is_allocated_after_the_helper_entry_index() {
     assert!(!opref_allocated_after(OpRef::NONE, 0));
 }
 
-/// The `s.add(x)` substitution replaces a residual the executed-effect odometer
-/// counts (`CallFn`) with one it judges by descr shape alone.  A `Ref` result
-/// clears the `Void` write proxy, so the helper tag is the only thing left
-/// saying an insert happened — and the element's `__hash__` cannot stand in for
-/// it, since a cpyext `tp_hash` runs native code and moves no frame-entry
-/// odometer.  Drop the tag and a nested abort rewinds past a completed insert.
-#[test]
-fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
-    let descr = super::specialize::set_add_method_descr();
-    let call_descr = descr
-        .as_call_descr()
-        .expect("the substitution installs a call descr");
-    assert_eq!(
-        call_descr.result_type(),
-        Type::Ref,
-        "`set.add` returns None, so the Void write proxy cannot see this store"
-    );
-    assert!(
-        super::residual_call::helper_kind_writes_live_heap(
-            call_descr.get_extra_info().runtime_helper
-        ),
-        "an untagged descr takes the insert out of the executed-effect odometer"
-    );
-}
-
 /// The zero-argument `super()` substitution has the same two obligations, and
 /// for it they are load-bearing on a shape the corpus runs: the leaf reaches
 /// `_super_check`'s `__class__` lookup, which a property answers with arbitrary

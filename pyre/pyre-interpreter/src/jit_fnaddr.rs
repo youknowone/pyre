@@ -4833,12 +4833,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_int_set_has_key",
         pyre_object::setobject::jit_int_set_has_key,
     );
-    cpa2!(
-        &mut entries,
-        "pyre_object::setobject::jit_int_set_add",
-        "pyre_object::jit_int_set_add",
-        pyre_object::setobject::jit_int_set_add,
-    );
     cpa1!(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_is_true",
@@ -5579,16 +5573,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
         "pyre_object::w_dict_unicode_key_hash",
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash,
-    );
-    // A runtime-mutable global counter, not a build-time constant: bind the
-    // read seam by address so the JIT calls it instead of folding whatever
-    // serial the build process saw. Same shape for the `W_SetObject.set_id`
-    // counter the `w_set_new` body calls.
-    pa0!(
-        &mut entries,
-        "pyre_object::setobject::fresh_set_id",
-        "pyre_object::fresh_set_id",
-        pyre_object::setobject::fresh_set_id,
     );
     // `quasiimmut.py _invalidate_now`, shared by both `?` fields.
     upa1!(
@@ -9750,15 +9734,6 @@ mod tests {
             set_int
         );
         assert_eq!(bindings["pyre_object::jit_int_set_has_key"], set_int);
-        let set_add_int = occupied_published_addr(
-            "pyre_object::setobject::jit_int_set_add",
-            pyre_object::setobject::jit_int_set_add as *const () as usize as i64,
-        );
-        assert_eq!(
-            bindings["pyre_object::setobject::jit_int_set_add"],
-            set_add_int
-        );
-        assert_eq!(bindings["pyre_object::jit_int_set_add"], set_add_int);
     }
 
     #[test]
