@@ -1185,38 +1185,6 @@ pub fn gc_is_young_object(addr: usize) -> bool {
     }
 }
 
-/// Whether `intern` may record `addr` as a `ConstPtr` referent.
-///
-/// `history.py` `ConstPtr.value` is a GCREF. Unset keeps today's intern of
-/// any non-null word (unit tests, no collector). A MiniMark hook refuses a
-/// nursery interior / leftover header so `_find_shadow` does not run on a
-/// payload.
-pub type GcIsInternableFn = fn(usize) -> bool;
-
-static GC_IS_INTERNABLE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Install or clear the process-global internable-GCREF hook.
-#[inline]
-pub fn set_gc_is_internable(hook: Option<GcIsInternableFn>) {
-    let raw: *mut () = match hook {
-        None => std::ptr::null_mut(),
-        Some(f) => unsafe { std::mem::transmute_copy::<GcIsInternableFn, *mut ()>(&f) },
-    };
-    GC_IS_INTERNABLE.store(raw, Ordering::Release);
-}
-
-/// The installed internable test, or `true` when the slot is clear.
-#[inline]
-pub fn gc_is_internable(addr: usize) -> bool {
-    let p = GC_IS_INTERNABLE.load(Ordering::Acquire);
-    if p.is_null() {
-        true
-    } else {
-        let f: GcIsInternableFn = unsafe { std::mem::transmute_copy(&p) };
-        f(addr)
-    }
-}
-
 /// OPEN POLICY FORK — the one place that decides what an unregistered
 /// frontend gets.  Today: today's behaviour, i.e. no retain, which leaves the
 /// address-recycling hazard exactly as it is rather than changing it.

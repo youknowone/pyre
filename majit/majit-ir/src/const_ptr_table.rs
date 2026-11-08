@@ -27,9 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering}
 
 use parking_lot::{Mutex, ReentrantMutex};
 
-use crate::value::{
-    GcRef, gc_current_object_address, gc_id_or_identityhash, gc_is_internable, gc_is_young_object,
-};
+use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash, gc_is_young_object};
 
 /// Live word of `addr`. `gc_current_object_address` follows a nursery
 /// forwarding stub (`_trace_drag_out`) without treating the address as a
@@ -304,9 +302,6 @@ pub fn intern(addr: GcRef) -> u32 {
     // (`arena_reset` mode 0). `history.py` `ConstPtr.value` is the live
     // word.
     let addr = live_gcref(addr);
-    if !gc_is_internable(addr.0) {
-        return 0;
-    }
     let hash = gc_id_or_identityhash(addr.0) as u64;
     let mut guard = table();
     intern_under(&mut guard, addr, hash)
@@ -324,10 +319,6 @@ pub fn intern_and_take_young(addr: GcRef) -> (u32, Vec<u32>) {
         return (0, take_young_under(&mut guard));
     }
     let addr = live_gcref(addr);
-    if !gc_is_internable(addr.0) {
-        let mut guard = table();
-        return (0, take_young_under(&mut guard));
-    }
     let hash = gc_id_or_identityhash(addr.0) as u64;
     let mut guard = table();
     let idx = intern_under(&mut guard, addr, hash);
@@ -896,21 +887,6 @@ mod tests {
         assert_eq!(resolve(i), a);
         let b = GcRef(0x2222_0000);
         assert_ne!(intern(b), i);
-    }
-
-    #[test]
-    fn intern_refuses_a_word_the_collector_does_not_own_as_an_object() {
-        let _serial = TEST_SERIAL.lock();
-        struct ResetHook;
-        impl Drop for ResetHook {
-            fn drop(&mut self) {
-                crate::set_gc_is_internable(None);
-            }
-        }
-        let _reset = ResetHook;
-        crate::set_gc_is_internable(Some(|_| false));
-        assert_eq!(intern(GcRef(0x3333_0000)), 0);
-        assert!(resolve(0).is_null());
     }
 
     #[test]

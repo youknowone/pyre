@@ -2876,8 +2876,6 @@ pub struct PyreSym {
     /// pyjitpl.py setup: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
-    /// Namespace for global lookups (W_DictObject / W_ModuleDictObject).
-    pub(crate) concrete_namespace: PyObjectRef,
     /// Execution context pointer (for creating callee frames).
     pub(crate) concrete_execution_context: *const pyre_interpreter::PyExecutionContext,
     /// Virtualizable object pointer (PyFrame).
@@ -3253,7 +3251,6 @@ pub struct TestSymState {
     pub symbolic_stack_types: Vec<Type>,
     pub registers_r: Vec<OpRef>,
     pub concrete_stack: Vec<ConcreteValue>,
-    pub concrete_namespace: PyObjectRef,
     pub vable_last_instr: OpRef,
     pub vable_pycode: OpRef,
     pub vable_valuestackdepth: OpRef,
@@ -7164,9 +7161,7 @@ impl PyreSym {
             is_active_vable_owner: false,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
-            // jitcode and concrete_namespace initialized below
             jitcode: null_jitcode() as *const JitCode,
-            concrete_namespace: std::ptr::null_mut(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_raw: std::ptr::null_mut(),
@@ -7348,7 +7343,6 @@ impl PyreSym {
         sym.symbolic_stack_types = state.symbolic_stack_types;
         sym.registers_r.replace(state.registers_r);
         sym.concrete_stack = state.concrete_stack;
-        sym.concrete_namespace = state.concrete_namespace;
         sym.vable_last_instr = state.vable_last_instr;
         sym.vable_pycode = state.vable_pycode;
         sym.vable_valuestackdepth = state.vable_valuestackdepth;
@@ -7561,8 +7555,7 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.jitcode = jitcode_for(frame.pycode);
-            self.concrete_namespace = frame.get_w_globals();
-            self.frame_w_globals = ctx.const_ref(self.concrete_namespace as usize as i64);
+            self.frame_w_globals = ctx.const_ref(frame.get_w_globals() as usize as i64);
             if self.concrete_execution_context.is_null() {
                 self.concrete_execution_context =
                     pyre_interpreter::call::getexecutioncontext() as *const _;
@@ -17008,7 +17001,6 @@ pub(crate) fn assemble_bridge_inline_pending(
         concrete_stack.push(concrete_value_from_slot(recipe_slot_to_pyobj(live)));
     }
     sym.concrete_stack = concrete_stack;
-    sym.concrete_namespace = w_globals;
     sym.frame_w_globals = ctx.const_ref(w_globals as usize as i64);
     sym.concrete_execution_context = execution_context;
     // perform_call threads the caller's `ec` down to every inlined callee

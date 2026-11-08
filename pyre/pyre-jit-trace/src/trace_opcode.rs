@@ -159,7 +159,6 @@ fn trace_guard_exact_w_class(
 }
 
 use crate::descr::{float_floatval_descr, int_intval_descr, w_float_size_descr, w_int_size_descr};
-use crate::frame_layout::PYFRAME_PYCODE_OFFSET;
 
 /// pyjitpl.py `_opimpl_setfield_vable` parity helper.
 ///
@@ -1512,33 +1511,12 @@ impl MIFrame {
     /// (in pyjitpl.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
-        let frame_addr = self.concrete_frame_addr;
-        // virtualizable.py read_boxes reads statics from the LIVE
-        // virtualizable.  The root MIFrame's concrete frame is the
-        // trace-stepping snapshot (`snapshot_for_tracing`), whose
-        // `debugdata` is an owned clone freed when tracing
-        // ends — a const captured from the snapshot dangles in the
-        // compiled trace's resume data, and the guard-failure vable
-        // write (`write_from_resume_data_partial`) then stamps the
-        // dangling pointer into the live frame.  Read the pointer-valued
-        // statics from the live virtualizable instead; `pycode` is
-        // copied by the snapshot so either source gives the same value.
-        // `last_instr` / `valuestackdepth` are plain values that evolve
-        // with the trace, so they stay snapshot-sourced below.
-        let statics_addr = {
-            let live = self.sym().current_live_vable_frame();
-            if live != 0 && self.sym().owns_virtualizable_shadow() {
-                live
-            } else {
-                frame_addr
-            }
-        };
-        let code_ptr = if statics_addr != 0 {
-            unsafe { *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize) }
-        } else {
-            0
-        };
-        let ns_ptr = self.sym().concrete_namespace as i64;
+        // `virtualizable.py` `read_boxes` and `pyjitpl.py`
+        // `reached_loop_header` use the live boxes. Reuse this frame's
+        // existing `vable_pycode` / `frame_w_globals` rather than
+        // reconstructing their identities from a raw heap word. The
+        // scalars that evolve with the trace (`last_instr` /
+        // `valuestackdepth`) stay snapshot-sourced below.
         // Read from the concrete `PyFrame.valuestackdepth` rather than the
         // symbolic mirror. `resume_pc == self.orgpc` (the
         // start PC of the current opcode) so PyFrame holds the correct
@@ -1562,7 +1540,13 @@ impl MIFrame {
         // `cut_trace_from` / `opencoder.py` `TraceIterator._get`).
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
-        let pycode_op = ctx.const_ref(code_ptr as i64);
+        let pycode_op = if self.sym().owns_virtualizable_shadow() {
+            ctx.virtualizable_box_at(crate::virtualizable_spec::PYCODE_VABLE_FIELD_INDEX)
+                .filter(|&op| !op.is_none() && !ctx.opref_is_void_producer(op))
+                .unwrap_or_else(|| self.sym().vable_pycode)
+        } else {
+            self.sym().vable_pycode
+        };
         let vsd_op = ctx.const_int(vsd);
         let debugdata_idx = ctx
             .virtualizable_info()
@@ -1571,14 +1555,12 @@ impl MIFrame {
             .and_then(|i| ctx.virtualizable_box_at(i))
             .filter(|&op| !op.is_none() && !ctx.opref_is_void_producer(op))
             .unwrap_or_else(|| self.sym().vable_debugdata);
-        let w_globals_op = ctx.const_ref(ns_ptr);
         let owns = {
             let s = self.sym_mut();
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
             s.vable_debugdata = debugdata_op;
-            s.frame_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
         // pyjitpl.py `_opimpl_setfield_vable` parity:
@@ -1586,7 +1568,8 @@ impl MIFrame {
         // `metainterp.virtualizable_boxes` shadow so subsequent readers
         // (snapshot, JUMP-arg dedup) see the same identity that
         // `s.vable_*` carries. Leave `debugdata` on the shadow box
-        // `read_boxes` already installed — it is not republished.
+        // `read_boxes` already installed — it is not republished. The
+        // pycode box is already the shadow's (`read_boxes`).
         if owns {
             mirror_vable_static_to_boxes(
                 ctx,
@@ -1594,7 +1577,6 @@ impl MIFrame {
                 last_instr_op,
                 Value::Int(last_instr_value),
             );
-            mirror_vable_static_to_boxes(ctx, "pycode", pycode_op, Value::Ref(GcRef(code_ptr)));
             mirror_vable_static_to_boxes(ctx, "valuestackdepth", vsd_op, Value::Int(vsd));
         }
     }

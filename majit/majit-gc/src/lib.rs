@@ -19,7 +19,6 @@ pub use paste;
 pub fn install_const_ptr_table_walker() {
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
     majit_ir::set_gc_is_young_object(Some(gc_is_young_object));
-    majit_ir::set_gc_is_internable(Some(gc_is_internable_gcref));
     majit_ir::set_remember_const_pool(Some(gc_remember_const_pool));
 }
 
@@ -4595,28 +4594,6 @@ fn gc_is_young_object(addr: usize) -> bool {
         return gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr));
     }
     false
-}
-
-/// Whether `intern` may record `addr` as a `ConstPtr` referent.
-///
-/// Same collector dispatch as [`gc_is_young_object`]. Unset MiniMark
-/// (tests without a collector) is `true` at the majit-ir hook default;
-/// this function is only installed once a collector is live.
-fn gc_is_internable_gcref(addr: usize) -> bool {
-    if addr == 0 {
-        return false;
-    }
-    #[cfg(test)]
-    {
-        let p = TEST_IS_YOUNG_OBJECT_GC.load(std::sync::atomic::Ordering::Acquire);
-        if !p.is_null() {
-            return unsafe { (*p).is_internable_gcref(addr) };
-        }
-    }
-    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() {
-        return gc_sync::gc_query_reentrant(|gc| gc.is_internable_gcref(addr));
-    }
-    true
 }
 
 /// Return the current address for a managed object without treating it as a
