@@ -317,6 +317,110 @@ fn node_is_string_value_uses_declaration_identity() {
     ));
 }
 
+/// A `dont_look_inside` residual of `*mut Utf8Str` is nullable even when
+/// Utf8Str has no `GcType` impl. `registered_gc_ptr_class_root_with` is
+/// the gckind answer and stays None; nullability follows the raw
+/// pointer (`model.py` `SomeString.noneify`). `binaryop.py`
+/// `is__default` must not fold `is_(ret, None)`. A by-value / `&`
+/// string stays non-nullable.
+#[test]
+fn dont_look_inside_return_raw_str_ptr_is_nullable() {
+    use crate::annotator::binaryop::is__default;
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::{SomeValue, s_none};
+    use crate::flowspace::model::{Hlvalue, Variable};
+    use crate::flowspace::operation::{HLOperation, OpKind};
+
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let llbc = window_llbc(vec![utf8], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert!(
+        gc.is_empty(),
+        "Utf8Str has no GcType impl; gc_struct_ids must stay empty"
+    );
+    let empty = std::collections::HashSet::<String>::new();
+    let spec = crate::ErrorCarrierSpec::default();
+    let adt = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    }));
+    let raw = TyRef::Other(serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        }, "Mut"]
+    }));
+    let shared = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", {
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        }, "Shared"]
+    }));
+
+    assert!(super::dont_look_inside_return_is_str(&raw, &llbc, spec));
+    assert!(super::dont_look_inside_return_can_be_none(
+        &raw, &llbc, spec, &gc, &empty
+    ));
+    assert!(super::dont_look_inside_return_is_str(&adt, &llbc, spec));
+    assert!(!super::dont_look_inside_return_can_be_none(
+        &adt, &llbc, spec, &gc, &empty
+    ));
+    assert!(super::dont_look_inside_return_is_str(&shared, &llbc, spec));
+    assert!(!super::dont_look_inside_return_can_be_none(
+        &shared, &llbc, spec, &gc, &empty
+    ));
+
+    let intern = |can_be_none: bool| {
+        let s = crate::codewriter::annotation_state::valuetype_to_someshell(&ValueType::Str)
+            .expect("Str shells as SomeString");
+        if can_be_none {
+            Bookkeeper::nullable_raw_ptr_annotation(s)
+        } else {
+            s
+        }
+    };
+    let is_none_of = |s: SomeValue| {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let mut ret = Variable::named("ret");
+        let mut n = Variable::named("n");
+        ann.setbinding(&mut ret, s);
+        ann.setbinding(&mut n, s_none());
+        is__default(
+            &ann,
+            &HLOperation::new(
+                OpKind::Is,
+                vec![Hlvalue::Variable(ret), Hlvalue::Variable(n)],
+            ),
+        )
+    };
+
+    let SomeValue::String(s) = intern(true) else {
+        panic!("raw *mut Utf8Str intern is SomeString");
+    };
+    assert!(
+        s.inner.can_be_none,
+        "raw *mut Utf8Str intern is SomeString(can_be_none=true) (SomeString.noneify)"
+    );
+    assert!(
+        is_none_of(SomeValue::String(s)).const_().is_none(),
+        "is_(nullable SomeString, None) must not fold (is__default)"
+    );
+
+    let SomeValue::String(by_value) = intern(false) else {
+        panic!("by-value / & string intern is SomeString");
+    };
+    assert!(
+        !by_value.inner.can_be_none,
+        "by-value / & string intern stays SomeString(can_be_none=false)"
+    );
+    assert_eq!(
+        is_none_of(SomeValue::String(by_value)).const_(),
+        Some(&crate::flowspace::model::ConstValue::Bool(false)),
+        "is_(non-nullable SomeString, None) folds to False (is__default)"
+    );
+}
+
 fn family_ptr_newtype_llbc(
     inner_path: &[&str],
     wrapper_path: &[&str],
@@ -447,6 +551,26 @@ fn pointer_newtype_llbc(
             "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
             "kind": {"Struct": []}
         }));
+        // `*mut Obj` is a GC instance pointer only when Obj is in
+        // `gc_struct_ids` (`GcType` / first-field ancestor). A Vec field
+        // is not that declaration.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": [wrap, unwrap],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": window_meta(&["majit_gc", "header", "GcType"], false)
+                }],
+                "trait_impls": [gctype_impl_for_adt(0)]
+            }
+        });
+        return Llbc::from_slice(file.to_string().as_bytes())
+            .expect("gc object pointer newtype fixture parses");
     }
     window_llbc(types, vec![wrap, unwrap])
 }

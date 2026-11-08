@@ -4661,6 +4661,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     ) {
         return Some(root);
     }
+    // Intern residual of `*mut T` / `*const T` / `NonNull<T>` onto a
+    // declared non-GC ADT. Stamp `*mut {root}` so
+    // `declared_return_annotation` intern's `lltype.py` `SomePtr`
+    // (`llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a
+    // raw struct / Opaque), never a non-nullable `SomeInstance`.
+    if let Some(root) =
+        nongc_raw_ptr_return_class_root(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+    {
+        return Some(root);
+    }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
@@ -4686,8 +4696,65 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     Some(format!("{}{suffix}", td.item_meta.name_path()))
 }
 
+/// Intern class root of a `*mut T` / `*const T` / `NonNull<T>` whose
+/// pointee is a declared ADT that is not GC.
+///
+/// Flavor-raw already stamps `raw:<owner>`; GCREF / str-family / a
+/// registered GC pointee stay on their own seeds. The `*mut {root}`
+/// spelling is what [`is_raw_ptr_to_classed_instance_spelling`] matches
+/// so `declared_return_annotation` intern's `SomePtr`.
+fn nongc_raw_ptr_return_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return None;
+    }
+    if flavor_raw_pointer_class_root(ty, llbc, no_tombstoned_leaves(), raw_alloc_flavor_structs)
+        .is_some()
+    {
+        return None;
+    }
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    let is_raw_ptr = node.as_object().is_some_and(|o| o.contains_key("RawPtr"));
+    let is_nonnull = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull");
+    if !is_raw_ptr && !is_nonnull {
+        return None;
+    }
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    let root = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves())?;
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
+        || is_str_family_class_root(&root)
+        || majit_ir::descr::is_list_container_spelling(&root)
+        || majit_ir::descr::is_fn_ptr_spelling(&root)
+    {
+        return None;
+    }
+    if let Some(sid) = declared_adt_struct_id(pointee, llbc)
+        && gc_struct_ids.contains(&sid)
+    {
+        return None;
+    }
+    Some(format!("*mut {root}"))
+}
+
 /// A residual returning `*mut` / `Ref` of a registered GC struct is a
-/// nullable instance (`rnone.py` `can_be_None`). A by-value ADT is not.
+/// nullable instance (`model.py` `SomeInstance.noneify`). A `*mut` /
+/// `*const` of the string family is a nullable string (`model.py`
+/// `SomeString.noneify`) even when the pointee is not in `gc_struct_ids`:
+/// a Rust raw pointer can be null. Nullability is not gckind.
+/// `binaryop.py` `is__default` folds `is_(s, None)` to False when
+/// `not can_be_none`. A by-value ADT, `&T`, `Box<T>`, or `NonNull<T>`
+/// is not.
 pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
     output: &TyRef,
     llbc: &Llbc,
@@ -4707,6 +4774,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
             raw_alloc_flavor_structs,
         )
         .is_some()
+        || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
 }
 
 /// Field-layout spelling of a `*mut Vec<T>` / `*mut VecDeque<T>` / `*mut [T]`
@@ -7299,11 +7367,10 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                 // `*mut BytesBlock` — Charon erases the alias) is already
                 // `ValueType::Str`: `tyref_raw_ptr_pointee_is_string_value`
                 // runs before the GC-pointer arm of `tyref_to_value_type_with`.
-                // `registered_gc_ptr_class_root_with` answers for every raw
-                // pointer onto an ADT, which kept the wrapper as `SomeInstance`
-                // while `project_struct_field_type` and the str-family input
-                // seed record `SomeString`. The word is the STR (`ll_strhash`
-                // / `ll_streq`). Construction and `.0` are then the identity.
+                // `registered_gc_ptr_class_root_with` answers for a raw
+                // pointer onto a registered GC ADT. The word is the STR
+                // (`ll_strhash` / `ll_streq`). Construction and `.0` are
+                // then the identity.
                 // A registered GC pointer peels the same way: `history.getkind`
                 // of a GC `Ptr` is `'ref'`, and `repr(transparent)` construction
                 // / `.0` are the identity on that word. Keep the wrapper only
@@ -8060,6 +8127,19 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     if let Some(root) = raw_ptr_pointee_class_root_with(node, llbc, tombstoned) {
         // `GCREFOpaque` has no class root (`llmemory.GCREF`).
         if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+            return None;
+        }
+        // A RawPtr is a GC instance only when the pointee is in
+        // `gc_struct_ids` (`GcType` / first-field ancestor), matching
+        // the Ref / Box / NonNull arm below. Any other declared ADT is
+        // raw: `llannotation.py` `lltype_to_annotation` of `lltype.Ptr`
+        // of a raw struct / Opaque is `lltype.py` `SomePtr`.
+        let raw = node.as_object()?.get("RawPtr")?.as_array()?;
+        let pointee = strip_ty_wrappers(raw.first()?, llbc)?;
+        let Some(sid) = declared_adt_struct_id(pointee, llbc) else {
+            return None;
+        };
+        if !gc_struct_ids.contains(&sid) {
             return None;
         }
         return Some(root);

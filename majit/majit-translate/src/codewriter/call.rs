@@ -9963,6 +9963,9 @@ impl CallControl {
         let kind = return_type_string_to_value_type(Some(&effective));
         // Use the same declared repr as the annotator. A headerless native
         // layout alone does not make a nominal instance a raw-word owner.
+        // Intern of `*mut T` onto a declared non-GC ADT is `lltype.py`
+        // `SomePtr` (`llannotation.py` `lltype_to_annotation`); `getkind`
+        // is int while the frontend token stays `"ref"`.
         if kind == Type::Ref
             && graph.return_class_root.as_deref().is_some_and(|root| {
                 crate::annotator::bookkeeper::raw_struct_ptr_from_layout(
@@ -9971,6 +9974,10 @@ impl CallControl {
                     root,
                 )
                 .is_some()
+                    || crate::annotator::bookkeeper::intern_nongc_raw_ptr_result_is_int_bank(
+                        &self.struct_layouts,
+                        root,
+                    )
             })
         {
             Some(Type::Int)
@@ -24130,6 +24137,77 @@ mod tests {
             FunctionGraph::concretetype_of(&result),
             crate::model::ConcreteType::Signed
         );
+    }
+
+    #[test]
+    fn getcalldescr_nongc_raw_ptr_intern_result_is_int() {
+        // Intern residual of `*mut T` onto a declared non-GC ADT: token
+        // stays `"ref"`, mint is `lltype.py` `SomePtr`, FUNC.RESULT is Int.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["connection_session"]);
+        let target = CallTarget::function_path(["connection_session"]);
+        let mut graph = simple_graph("connection_session").with_return_type("ref");
+        graph.return_class_root = Some("*mut ffi_raw::NativeSession".into());
+        graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_type_for_target(&target), Some(Type::Int));
+        assert_eq!(cc.declared_return_kind(&path), Some('i'));
+        assert_eq!(cc.declared_result_argclass(&path), Some('i'));
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(target),
+            vec![],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_ir_type(), Type::Int);
+    }
+
+    #[test]
+    fn getcalldescr_gc_raw_ptr_intern_result_stays_ref() {
+        // Negative: `*mut` onto a GC-declared struct keeps SomeInstance
+        // and FUNC.RESULT Ref.
+        let owner = "PyObject";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let path = CallPath::from_segments(["shadow_stack_get_raw"]);
+        let target = CallTarget::function_path(["shadow_stack_get_raw"]);
+        let mut graph = simple_graph("shadow_stack_get_raw").with_return_type("ref");
+        graph.return_class_root = Some("*mut PyObject".into());
+        graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_type_for_target(&target), Some(Type::Ref));
+        assert_eq!(cc.declared_return_kind(&path), Some('r'));
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(target),
+            vec![],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_ir_type(), Type::Ref);
     }
 
     #[test]

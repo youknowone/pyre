@@ -7825,6 +7825,44 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
     dest_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
 ) -> Llbc {
+    std_extern_call_fixture_with_types_and_traits(
+        caller_name,
+        callee_name,
+        arg_tys,
+        dest_ty,
+        type_decls,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn fixture_gctype_trait_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    })
+}
+
+fn fixture_gctype_impl_for(type_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [type_id, {
+                "Adt": {"id": type_id, "builtin": null, "generics": {"types": []}}
+            }]}]}
+        }
+    })
+}
+
+pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
+    caller_name: &str,
+    callee_name: &[&str],
+    arg_tys: &[serde_json::Value],
+    dest_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    trait_decls: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
     let span = || {
         serde_json::json!({
             "data": {
@@ -7955,8 +7993,8 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
             "type_decls": type_decls,
             "fun_decls": [caller, callee],
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
@@ -8583,13 +8621,31 @@ fn lower_raw_ptr_is_null(
     ptr_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
 ) -> crate::model::FunctionGraph {
+    lower_raw_ptr_is_null_gc(ptr_ty, type_decls, false)
+}
+
+fn lower_raw_ptr_is_null_gc(
+    ptr_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    declared_gc: bool,
+) -> crate::model::FunctionGraph {
     let bool_ty = serde_json::json!({"Scalar": "Bool"});
-    let llbc = std_extern_call_fixture_with_types(
+    let (trait_decls, trait_impls) = if declared_gc {
+        (
+            vec![fixture_gctype_trait_decl()],
+            vec![fixture_gctype_impl_for(0)],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let llbc = std_extern_call_fixture_with_types_and_traits(
         "is_null_ptr",
         &["core", "ptr", "mut_ptr", "<Impl>", "is_null"],
         &[ptr_ty],
         bool_ty,
         type_decls,
+        trait_decls,
+        trait_impls,
     );
     super::lower_function(&llbc, "is_null_ptr").expect("lower is_null")
 }
@@ -8661,13 +8717,14 @@ fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
 fn raw_ptr_is_null_of_gc_instance_and_gc_string_keeps_is_none() {
     let obj_adt = named_adt(0, vec![]);
     let obj_ptr = serde_json::json!({"RawPtr": [obj_adt.clone(), "Mut"]});
-    let obj_graph = lower_raw_ptr_is_null(
+    let obj_graph = lower_raw_ptr_is_null_gc(
         obj_ptr.clone(),
         vec![type_decl_struct(
             0,
             &["pyobject", "PyObject"],
             vec![struct_field_json("ob_type", obj_ptr)],
         )],
+        true,
     );
     let obj_ops = graph_ops(&obj_graph);
     assert!(

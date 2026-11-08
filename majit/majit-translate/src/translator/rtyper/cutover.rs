@@ -3994,6 +3994,33 @@ fn declared_return_annotation(
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
+    // Intern residual of `*mut T` / `*const T` onto a declared non-GC
+    // ADT. A GC pointee is stamped unprefixed (`registered_gc_ptr`)
+    // and intern's `SomeInstance`. A non-GC pointee stamps `*mut {root}`;
+    // `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
+    // struct / Opaque is `lltype.py` `SomePtr`. Never SomeInstance:
+    // `SomeInstance.bool` const-True when `!can_be_None` folds the live
+    // null arm (`transform.py` `transform_dead_code`).
+    if crate::front::mir::is_raw_ptr_to_classed_instance_spelling(root)
+        && let Some(pointee) = root
+            .strip_prefix("*const ")
+            .or_else(|| root.strip_prefix("*mut "))
+            .map(str::trim)
+    {
+        if bk.owner_layout_gckind_is_gc(pointee) {
+            let classdef = bk
+                .getuniqueclassdef(&bk.intern_class_by_qualname(pointee))
+                .ok()?;
+            return Some(crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    Some(classdef),
+                    graph.return_can_be_none,
+                    std::collections::BTreeMap::new(),
+                ),
+            ));
+        }
+        return Some(bk.nongc_adt_raw_ptr_annotation(pointee));
+    }
     // A `GcStruct._arrayfld` class root is the array itself
     // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
     // a ClassDef would rtype the residual as `InstanceRepr` of `object`
@@ -19364,11 +19391,40 @@ mod tests {
         graph.return_can_be_none = true;
         let nullable = declared_return_annotation(&registry, &graph)
             .expect("a nullable STR pointer result declares its annotation");
-        let SomeValue::String(ns) = nullable else {
+        let SomeValue::String(ns) = &nullable else {
             panic!("a nullable STR pointer result is SomeString, got {nullable:?}")
         };
         assert!(ns.inner.can_be_none);
         graph.return_can_be_none = false;
+        let is_none_of = |s: SomeValue| {
+            use crate::annotator::binaryop::is__default;
+            use crate::annotator::model::s_none;
+            use crate::flowspace::model::{Hlvalue, Variable};
+            use crate::flowspace::operation::{HLOperation, OpKind};
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let mut ret = Variable::named("ret");
+            let mut n = Variable::named("n");
+            ann.setbinding(&mut ret, s);
+            ann.setbinding(&mut n, s_none());
+            is__default(
+                &ann,
+                &HLOperation::new(
+                    OpKind::Is,
+                    vec![Hlvalue::Variable(ret), Hlvalue::Variable(n)],
+                ),
+            )
+        };
+        assert!(
+            is_none_of(nullable.clone()).const_().is_none(),
+            "is_(SomeString(can_be_none=true), None) must not fold (is__default)"
+        );
+        let non_null = declared_return_annotation(&registry, &graph)
+            .expect("a non-nullable STR pointer result declares its annotation");
+        assert_eq!(
+            is_none_of(non_null).const_(),
+            Some(&crate::flowspace::model::ConstValue::Bool(false)),
+            "is_(SomeString(can_be_none=false), None) folds to False (is__default)"
+        );
         let ft = declared_funcptr_type_from_legacy(&graph, None)
             .expect("a no-arg STR-returning graph has a declared fn type");
         assert_eq!(
@@ -19573,6 +19629,93 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn declared_return_annotation_nongc_raw_ptr_class_root_is_someptr() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        // Fixture struct is NOT in `gc_struct_ids`, not a raw-word owner,
+        // and has no layout: a declared ADT that is not GC. Intern of
+        // `*mut T` is SomePtr (`llannotation.py` `lltype_to_annotation`
+        // of `lltype.Ptr(OpaqueType)`, `lltype.py` `SomePtr`).
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("connection_session");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut ffi_raw::NativeSession".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a raw pointer onto a non-GC struct intern's SomePtr");
+        let SomeValue::Ptr(ptr) = declared else {
+            panic!("expected SomePtr, got {declared:?}");
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ffi_raw::NativeSession");
+                assert_eq!(op._gckind, GcKind::Raw);
+            }
+            PtrTarget::Struct(st) => {
+                assert_eq!(st._gckind, GcKind::Raw);
+            }
+            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
+        }
+        let SomeValue::Bool(b) = ptr.bool() else {
+            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
+        };
+        assert!(
+            b.base.const_box.is_none(),
+            "SomePtr.bool does not fold (lltype.py SomePtr.bool)"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_gc_raw_ptr_class_root_stays_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        // Negative: `*mut` onto a GC-declared struct (layout gckind Gc,
+        // the intern-path proxy for `gc_struct_ids`) keeps SomeInstance.
+        let (registry, _rtyper, _classdef) = root_instance_rtyper_with_classdef();
+        let owner = "PyObject";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        registry.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = LegacyGraph::new("shadow_stack_get_raw");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut PyObject".into());
+        graph.return_can_be_none = true;
+        graph.push_hint("dont_look_inside");
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a *mut registered-GC-struct residual declares SomeInstance");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("expected SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "a raw pointer return is nullable (rnone.py can_be_None)"
+        );
+        assert!(
+            inst.classdef.is_some(),
+            "GC pointee intern's the classdef, not SomePtr"
+        );
     }
 
     #[test]

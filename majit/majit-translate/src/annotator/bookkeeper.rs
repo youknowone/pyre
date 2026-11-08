@@ -718,6 +718,28 @@ pub(crate) fn raw_struct_ptr_from_layout(
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
 ) -> Option<super::model::SomeValue> {
+    raw_struct_ptr_from_layout_gated(registry, layouts, class_root, true)
+}
+
+/// Like [`raw_struct_ptr_from_layout`], but a declared non-GC ADT that
+/// is not a raw-word owner still mints `SomePtr` of its Raw layout.
+/// Intern residual of `*mut T` onto such a pointee
+/// (`declared_return_annotation`); by-value intern of the ADT stays
+/// `SomeInstance` for getattr.
+pub(crate) fn nongc_struct_ptr_from_layout(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: &str,
+) -> Option<super::model::SomeValue> {
+    raw_struct_ptr_from_layout_gated(registry, layouts, class_root, false)
+}
+
+fn raw_struct_ptr_from_layout_gated(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: &str,
+    require_raw_word_owner: bool,
+) -> Option<super::model::SomeValue> {
     use crate::translator::rtyper::lltypesystem::lltype::{
         ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget,
     };
@@ -746,7 +768,8 @@ pub(crate) fn raw_struct_ptr_from_layout(
     // A dict strategy or a type object is still an instance; only a
     // word-storage ADT is `SomePtr`. An empty set is a fixture that never
     // harvested owners, so the gckind test below stays in force.
-    if !registry.raw_word_owners.is_empty()
+    if require_raw_word_owner
+        && !registry.raw_word_owners.is_empty()
         && !registry.raw_word_owners.contains(lookup)
         && !registry.raw_word_owners.contains(class_root)
     {
@@ -764,6 +787,15 @@ pub(crate) fn raw_struct_ptr_from_layout(
         TO: PtrTarget::Struct(*st),
     }));
     Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
+}
+
+/// rffi analog of `lltype.Ptr(lltype.OpaqueType(name))`.
+/// `llannotation.py` `lltype_to_annotation` of that Ptr is `lltype.py` `SomePtr`.
+fn opaque_raw_ptr_annotation(pointee: &str) -> super::model::SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr};
+    let ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(OpaqueType::new(pointee))))
+        .expect("OpaqueType is a container");
+    crate::translator::rtyper::llannotation::lltype_to_annotation(LowLevelType::Ptr(Box::new(ptr)))
 }
 
 /// Interned `Ptr(Struct raw)` of a harvested storage-raw enum base.
@@ -811,6 +843,41 @@ fn layout_for_owner(
     let sid = majit_ir::descr::struct_id_for_name(name)?;
     let layout = layouts.borrow().get(&sid)?.clone();
     Some((sid, layout))
+}
+
+/// True when `pointee` has a harvested layout whose gckind is Gc.
+/// No layout is not GC.
+pub(crate) fn owner_layout_gckind_is_gc_with(
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    pointee: &str,
+) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    layout_for_owner(layouts, generic_owner_lookup(pointee))
+        .is_some_and(|(_, lo)| lo.gckind == GcKind::Gc)
+}
+
+/// Intern residual of `*mut T` / `*const T` onto a declared non-GC ADT
+/// banks as Int (`history.getkind` of `lltype.py` `SomePtr`;
+/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
+/// struct / Opaque). The frontend token stays `"ref"`; `CallControl`
+/// remaps that Ref to Int so `getcalldescr` FUNC.RESULT matches the
+/// annotator. A GC pointee intern's `SomeInstance` and stays Ref.
+/// Unprefixed `PyObjectRef` is not this spelling.
+pub(crate) fn intern_nongc_raw_ptr_result_is_int_bank(
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: &str,
+) -> bool {
+    if !crate::front::mir::is_raw_ptr_to_classed_instance_spelling(class_root) {
+        return false;
+    }
+    let Some(pointee) = class_root
+        .strip_prefix("*const ")
+        .or_else(|| class_root.strip_prefix("*mut "))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    !owner_layout_gckind_is_gc_with(layouts, pointee)
 }
 
 /// Container lltype of `name`: a finished `Struct`, or the `ForwardReference`
@@ -1704,6 +1771,36 @@ impl Bookkeeper {
         let registry = registry.as_ref()?;
         let layouts = self.struct_layouts.borrow().clone()?;
         raw_struct_ptr_from_layout(registry, &layouts, class_root)
+    }
+
+    /// Intern residual of a `*mut T` onto a declared non-GC ADT.
+    ///
+    /// Tries [`Self::raw_struct_ptr_annotation`], then a Raw layout
+    /// that is not a raw-word owner, then `lltype.Ptr(OpaqueType(T))`.
+    /// `llannotation.py` `lltype_to_annotation` of that Ptr is
+    /// `lltype.py` `SomePtr`.
+    pub fn nongc_adt_raw_ptr_annotation(&self, pointee: &str) -> super::model::SomeValue {
+        if let Some(cell) = self.raw_struct_ptr_annotation(pointee) {
+            return cell;
+        }
+        let registry = self.struct_fields.borrow();
+        let layouts = self.struct_layouts.borrow();
+        if let (Some(reg), Some(lay)) = (registry.as_ref(), layouts.as_ref())
+            && let Some(cell) = nongc_struct_ptr_from_layout(reg, lay, pointee)
+        {
+            return cell;
+        }
+        opaque_raw_ptr_annotation(pointee)
+    }
+
+    /// True when `pointee` has a harvested layout whose gckind is Gc
+    /// (`gc_struct_ids` / first-field ancestor). No layout is not GC.
+    pub fn owner_layout_gckind_is_gc(&self, pointee: &str) -> bool {
+        let layouts = self.struct_layouts.borrow();
+        let Some(layouts) = layouts.as_ref() else {
+            return false;
+        };
+        owner_layout_gckind_is_gc_with(layouts, pointee)
     }
 
     /// SomeInstance of a registered named struct — the shell
