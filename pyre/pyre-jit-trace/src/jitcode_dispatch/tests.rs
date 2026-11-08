@@ -11490,8 +11490,9 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     );
     dump(&descr_str.code, "descr_str");
     // `ll_int2dec` is the one residual that returns the STR; `len(res)` is
-    // `LLHelpers.ll_strlen`, a field read off that STR, and the result is
-    // wrapped by the inlined newutf8 body.
+    // `LLHelpers.ll_strlen` (`len(s.chars)`), which
+    // `jtransform.py rewrite_op_getinteriorarraysize` rewrites to `strlen`,
+    // and the result is wrapped by the inlined newutf8 body.
     assert_eq!(
         descr_str_ops
             .iter()
@@ -11502,9 +11503,9 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     );
     let strlen_at = descr_str_ops
         .iter()
-        .position(|op| *op == "getfield_gc_i")
+        .position(|op| *op == "strlen")
         .unwrap_or_else(|| {
-            panic!("descr_str must read the STR length field; ops={descr_str_ops:?}")
+            panic!("descr_str must read the STR length with strlen; ops={descr_str_ops:?}")
         });
     let int2dec_at = descr_str_ops
         .iter()
@@ -11563,8 +11564,8 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
     );
     assert_eq!(jc.calldescr().result_type, 'r', "ops={ops:?}");
     assert!(
-        ops.iter().any(|op| *op == "getfield_gc_i"),
-        "the STR length is a field read; ops={ops:?}"
+        ops.iter().any(|op| *op == "strlen"),
+        "the STR length is strlen; ops={ops:?}"
     );
     assert!(
         ops.iter()
