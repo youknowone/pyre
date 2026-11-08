@@ -1493,29 +1493,14 @@ pub fn emit_promote_empty_list_inline(
     strategy: pyre_object::listobject::ListStrategy,
 ) {
     use crate::descr::{
-        list_allocated_descr, list_ascii_items_block_descr, list_ascii_items_len_descr,
-        list_float_items_block_descr, list_float_items_len_descr, list_int_items_block_descr,
-        list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
+        list_ascii_items_block_descr, list_ascii_items_len_descr, list_float_items_block_descr,
+        list_float_items_len_descr, list_int_items_block_descr, list_int_items_len_descr,
+        list_items_descr, list_length_descr, list_strategy_descr,
     };
     use crate::state::{float_gcarray_descr, int_gcarray_descr, pyobject_gcarray_descr};
 
     let cap_ref = ctx.const_int(4);
     let zero_ref = ctx.const_int(0);
-    // First `_ll_list_resize_ge` overallocate: `len(l.items)` becomes 4
-    // (`rlist.py`). Store that as ConstInt `allocated` so `jit.isconstant`
-    // sees the same capacity the NewArray below stages.
-    if matches!(
-        strategy,
-        pyre_object::listobject::ListStrategy::Integer
-            | pyre_object::listobject::ListStrategy::Float
-            | pyre_object::listobject::ListStrategy::Object
-            | pyre_object::listobject::ListStrategy::Ascii
-    ) {
-        let allocated_descr = list_allocated_descr();
-        let allocated_idx = allocated_descr.index();
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, cap_ref], allocated_descr);
-        ctx.heapcache_setfield_cached(list_op, allocated_idx, cap_ref);
-    }
 
     match strategy {
         pyre_object::listobject::ListStrategy::Integer => {

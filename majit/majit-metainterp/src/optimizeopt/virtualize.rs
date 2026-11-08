@@ -2125,19 +2125,6 @@ impl OptVirtualize {
                 OptimizationResult::PassOn
             }
 
-            // Walker records COND_CALL_GC_WB during tracing; rewrite.py
-            // gen_write_barrier inserts it only after optimize, so virtual
-            // objects never see it upstream. A virtual (young) object needs
-            // no barrier. `_emit_operation` force_boxes remaining args, so
-            // PassOn would materialize the list.
-            OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                if op.num_args() >= 1 && Self::is_virtual(op.arg(0).to_opref(), ctx) {
-                    self.last_emitted_was_removed.set(true);
-                    return OptimizationResult::Remove;
-                }
-                OptimizationResult::PassOn
-            }
-
             // virtualize.py optimize_CALL_N (aliased to CALL_R / CALL_I)
             //
             //   def optimize_CALL_N(self, op):
@@ -6010,57 +5997,6 @@ mod tests {
             result.is_empty(),
             "all array ops on virtual should be removed; got {} ops: {:?}",
             result.len(),
-            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_cond_call_gc_wb_on_virtual_is_removed() {
-        // Walker records COND_CALL_GC_WB during tracing; rewrite.py
-        // gen_write_barrier would insert it only after optimize. Virtual
-        // objects are young. emit force_boxes remaining args, so PassOn
-        // would materialize the NewWithVtable.
-        let sd = size_descr(30);
-        let mut ops = vec![
-            Op::with_descr(OpCode::NewWithVtable, &[], sd),
-            Op::new(
-                OpCode::CondCallGcWb,
-                &[crate::history::test_support::rooted_resop_operand(
-                    Type::Ref,
-                    0,
-                )],
-            ),
-        ];
-        assign_positions(&mut ops);
-        let result = run_pass(&ops);
-        assert!(
-            result
-                .iter()
-                .all(|o| o.opcode != OpCode::CondCallGcWb && o.opcode != OpCode::NewWithVtable),
-            "virtual COND_CALL_GC_WB must drop and keep the allocation virtual; got {:?}",
-            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_cond_call_gc_wb_array_on_virtual_is_removed() {
-        let sd = size_descr(31);
-        let mut ops = vec![
-            Op::with_descr(OpCode::NewWithVtable, &[], sd),
-            Op::new(
-                OpCode::CondCallGcWbArray,
-                &[
-                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    Operand::const_from_value(Value::Int(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-        let result = run_pass(&ops);
-        assert!(
-            result.iter().all(|o| o.opcode != OpCode::CondCallGcWbArray
-                && o.opcode != OpCode::NewWithVtable),
-            "virtual COND_CALL_GC_WB_ARRAY must drop and keep the allocation virtual; got {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }
