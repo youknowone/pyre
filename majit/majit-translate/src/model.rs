@@ -6956,6 +6956,7 @@ pub(crate) fn fuse_boxing_alloc_with(
 
     let fused = sites.len();
     let fused_aggregates: Vec<_> = sites.iter().map(|site| site.aggregate.clone()).collect();
+    let fused_results: Vec<_> = sites.iter().map(|site| site.result.clone()).collect();
     // Rewrite highest `(block, op)` first so an insert does not shift
     // not-yet-processed rewrite indices. Removals of earlier `new_uninit` /
     // `ptr::write` still shift remaining sites; update those indices after
@@ -7081,6 +7082,54 @@ pub(crate) fn fuse_boxing_alloc_with(
             graph.blocks[dbi].operations.remove(doi);
             for remaining in &mut sites {
                 drop_site(remaining, dbi, doi);
+            }
+        }
+    }
+    // ExceptionTransformer.gen_exc_check / check_for_alloc_shortcut add the
+    // post-malloc null test only for the interpreter executable; the JIT
+    // backend (llsupport/rewrite.py CHECK_MEMORY_ERROR) does not. A normally
+    // returned allocation is non-null; failure leaves through MemoryError.
+    let mut fresh_result_vars = Vec::new();
+    let mut none_vars = Vec::new();
+    for result in &fused_results {
+        let info = lifetime(graph, result);
+        if !info.foreign_creation {
+            fresh_result_vars.extend(info.vars);
+        }
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if matches!(op.kind, OpKind::ConstNone)
+                && let Some(result) = &op.result
+            {
+                none_vars.push(result.clone());
+            }
+        }
+    }
+    if !fresh_result_vars.is_empty() {
+        for block in &mut graph.blocks {
+            for op in &mut block.operations {
+                let folded = match &op.kind {
+                    OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } if (name == "ptr_iszero" || name == "ptr_nonzero")
+                        && fresh_result_vars.contains(operand) =>
+                    {
+                        Some(name == "ptr_nonzero")
+                    }
+                    OpKind::BinOp {
+                        op: name, lhs, rhs, ..
+                    } if name == "is_"
+                        && ((fresh_result_vars.contains(lhs) && none_vars.contains(rhs))
+                            || (fresh_result_vars.contains(rhs) && none_vars.contains(lhs))) =>
+                    {
+                        Some(false)
+                    }
+                    _ => None,
+                };
+                if let Some(nonzero) = folded {
+                    op.kind = OpKind::ConstBool(nonzero);
+                }
             }
         }
     }
@@ -21424,6 +21473,132 @@ mod tests {
                 matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
             }),
             "the cluster must still fuse"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_drops_null_test_on_fresh_result() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let foreign = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(foreign.clone());
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", LinkArg::Value(payload)),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "ptr_iszero".into(),
+                    operand: ret.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let foreign_is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "ptr_iszero".into(),
+                    operand: foreign.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "the managed boxing cluster must fuse"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::NewWithVtable { owner, .. } | OpKind::New { owner }
+                        if owner == "W_FloatObject"
+                )
+            }),
+            "the malloc must lower to NewWithVtable/New"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                op.result.as_ref() == Some(&is_null) && matches!(&op.kind, OpKind::ConstBool(false))
+            }),
+            "ptr_iszero of a fresh allocation must fold to ConstBool(false)"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                op.result.as_ref() == Some(&foreign_is_null)
+                    && matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, .. }
+                            if op == "ptr_iszero" && operand == &foreign
+                    )
+            }),
+            "ptr_iszero of an unrelated variable must remain unchanged"
         );
     }
 
