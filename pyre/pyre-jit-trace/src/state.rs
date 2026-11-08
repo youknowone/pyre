@@ -5338,9 +5338,11 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 /// on resume with every field, None included (`resume.py
 /// AbstractVirtualStructInfo.setfields`, `VArrayInfoClear.setfields`;
 /// `virtualizable.py write_from_resume_data_partial` writes every item
-/// `0..len`). Operand slots `0..stack_only` (`maps.stack_depth_at_pc`)
-/// are therefore written in full — a live NULL register and an unrecovered
-/// slot both store NULL — and `valuestackdepth` is `nlocals + stack_only`.
+/// `0..len`). Operand slots `0..stack_only` are therefore written in full
+/// — a live NULL register and an unrecovered slot both store NULL.
+/// `stack_only` is `maps.stack_depth_at_pc` capped at the frame's stored
+/// `valuestackdepth` (the last recorded `setfield_vable`); the overlay
+/// never writes `valuestackdepth`.
 pub fn sync_inlined_section_heap_frame(
     jitcode_index: i32,
     jitcode_pc: i32,
@@ -5360,7 +5362,16 @@ pub fn sync_inlined_section_heap_frame(
         return;
     }
     let (frame_reg, ec_reg) = portal_red_regs_at(jitcode_index);
-    let stack_only = maps.stack_depth_at_pc;
+    // The frame's `valuestackdepth` is what the last recorded
+    // `setfield_vable` wrote (`pyjitpl.py _opimpl_setfield_vable` /
+    // `_nonstandard_virtualizable`, materialized by `resume.py
+    // AbstractVirtualStructInfo.setfields`). Slots at or above it were
+    // popped before the guard; `stack_depth_at_pc` is the opcode-start
+    // depth and must not widen it.
+    let Some(vsd) = concrete_stack_depth(frame_ptr) else {
+        return;
+    };
+    let stack_only = maps.stack_depth_at_pc.min(vsd.saturating_sub(nlocals));
     let int_len = banks.int.len();
     let null_ref = majit_ir::Value::Ref(majit_ir::GcRef::NULL);
     let mut operand: Vec<Option<majit_ir::Value>> = vec![None; stack_only];
@@ -5422,7 +5433,6 @@ pub fn sync_inlined_section_heap_frame(
         };
         store_live_frame_array_slot(frame_ptr, nlocals + i, value);
     }
-    store_live_frame_static_int(frame_ptr, 2, (nlocals + stack_only) as i64);
 }
 
 /// Blackhole analog of [`sync_inlined_section_heap_frame`]: rebuild the
