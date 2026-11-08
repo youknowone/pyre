@@ -3906,13 +3906,7 @@ fn nongc_raw_ptr_class_root_someptr(
     bk: &crate::annotator::bookkeeper::Bookkeeper,
     root: &str,
 ) -> Option<crate::annotator::model::SomeValue> {
-    if !crate::front::mir::is_raw_ptr_to_classed_instance_spelling(root) {
-        return None;
-    }
-    let pointee = root
-        .strip_prefix("*const ")
-        .or_else(|| root.strip_prefix("*mut "))
-        .map(str::trim)?;
+    let pointee = bk.raw_ptr_declared_owner_pointee(root)?;
     if bk.owner_layout_gckind_is_gc(pointee) {
         return None;
     }
@@ -4042,11 +4036,7 @@ fn declared_return_annotation(
     if let Some(s) = nongc_raw_ptr_class_root_someptr(bk, root) {
         return Some(s);
     }
-    if crate::front::mir::is_raw_ptr_to_classed_instance_spelling(root)
-        && let Some(pointee) = root
-            .strip_prefix("*const ")
-            .or_else(|| root.strip_prefix("*mut "))
-            .map(str::trim)
+    if let Some(pointee) = bk.raw_ptr_declared_owner_pointee(root)
         && bk.owner_layout_gckind_is_gc(pointee)
     {
         let classdef = bk
@@ -4073,6 +4063,11 @@ fn declared_return_annotation(
     }
     if crate::front::semantic::is_list_family_spelling(root) {
         return Some(projected);
+    }
+    // `*mut T` / `*const T` whose T has no harvested layout is unknown.
+    // Do not intern a ClassDef of the pointer spelling.
+    if root.trim().starts_with("*mut ") || root.trim().starts_with("*const ") {
+        return None;
     }
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
@@ -19741,12 +19736,15 @@ mod tests {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
-        // Fixture struct is NOT in `gc_struct_ids`, not a raw-word owner,
-        // and has no layout: a declared ADT that is not GC. Intern of
-        // `*mut T` is SomePtr (`llannotation.py` `lltype_to_annotation`
-        // of `lltype.Ptr(OpaqueType)`, `lltype.py` `SomePtr`).
+        // Fixture struct is NOT in `gc_struct_ids` and not a raw-word
+        // owner: a harvested Raw layout. Intern of `*mut T` is SomePtr
+        // (`llannotation.py` `lltype_to_annotation` of
+        // `lltype.Ptr(OpaqueType)`, `lltype.py` `SomePtr`).
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
         let mut graph = LegacyGraph::new("connection_session");
         graph.return_type = Some("ref".into());
         graph.return_class_root = Some("*mut ffi_raw::NativeSession".into());
@@ -19774,6 +19772,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn declared_return_annotation_undeclared_uppercase_raw_ptr_is_not_someptr() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("connection_session");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut SomeUndeclared".into());
+        let declared = declared_return_annotation(&registry, &graph);
+        assert!(
+            declared.is_none(),
+            "uppercase pointee with no harvested layout is unknown, got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_lowercase_declared_raw_ptr_is_someptr() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let (layouts, _ids) = crate::test_support::raw_layout_table_for(&["foo::bar_state"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let mut graph = LegacyGraph::new("bar_state_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut foo::bar_state".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a raw pointer onto a lowercase declared struct intern's SomePtr");
+        let SomeValue::Ptr(_) = declared else {
+            panic!("expected SomePtr, got {declared:?}");
+        };
+        let SomeValue::Ptr(ptr) = declared else {
+            unreachable!();
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Opaque(op) => assert_eq!(op.tag, "foo::bar_state"),
+            PtrTarget::Struct(st) => assert_eq!(st._name, "foo::bar_state"),
+            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
+        }
+    }
+
     /// A skipped look-inside / bodyless callee whose declared result is
     /// `*mut T` onto a non-GC ADT intern's `SomePtr` (`llannotation.py`
     /// `lltype_to_annotation` of `lltype.Ptr`, `extfunc.py`
@@ -19787,7 +19826,10 @@ mod tests {
         use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        registry.set_struct_layouts(layouts);
         let specs = vec![(
             vec!["nongc_raw_ptr_session".to_string()],
             Signature::new(vec!["conn".to_string()], None, None),
@@ -19838,8 +19880,11 @@ mod tests {
         use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::transform::link_not_in_links_followed;
 
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
         let _lock = anchor_lock();
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        registry.set_struct_layouts(layouts);
         let specs = vec![(
             vec!["nongc_raw_ptr_session".to_string()],
             Signature::new(vec!["conn".to_string()], None, None),

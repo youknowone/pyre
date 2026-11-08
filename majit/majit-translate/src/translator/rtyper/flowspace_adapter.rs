@@ -5772,27 +5772,17 @@ pub(crate) fn derive_subject_inputcells(
                 );
                 continue;
             }
-            // `PyObjectRef` / `*mut pyobject::PyObject` is a raw pointer
-            // (`SomeInstance.__init__(can_be_None=True)`). A peeled
-            // `pyobject::PyObject` Input is a non-null instance.
-            if class_root
-                .as_deref()
-                .is_some_and(crate::front::mir::is_raw_ptr_to_classed_instance_spelling)
+            // `*mut T` / `*const T` onto a harvested owner layout is a
+            // raw pointer (`SomeInstance.__init__(can_be_None=True)`).
+            // `llannotation.py` `lltype_to_annotation` of `lltype.Ptr`;
+            // gckind follows `lltype.py` `Struct._first_struct`. No
+            // Bookkeeper, or a pointee with no layout, is unknown: the
+            // classdef-less shell below. A peeled `pyobject::PyObject`
+            // Input is a non-null instance.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && bk.raw_ptr_declared_owner_pointee(root).is_some()
             {
-                let root = class_root.as_deref().unwrap();
-                cells.push(if let Some(bk) = bookkeeper {
-                    bk.project_struct_field_type(root)
-                } else {
-                    crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(
-                        crate::annotator::model::SomeValue::Instance(
-                            crate::annotator::model::SomeInstance::new(
-                                None,
-                                false,
-                                std::collections::BTreeMap::new(),
-                            ),
-                        ),
-                    )
-                });
+                cells.push(bk.project_struct_field_type(root));
                 continue;
             }
             if class_root.as_deref().is_some_and(|root| match bookkeeper {
@@ -8011,13 +8001,25 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_raw_ptr_to_instance_as_nullable() {
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&[
+            "pyobject::PyObject",
+            "PyObject",
+            "foo::bar_state",
+            "bar_state",
+        ]);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_layouts(layouts);
         for (name, class_root, expect_none) in [
             (
                 "raw_pyobject",
                 Some("*mut pyobject::PyObject".to_string()),
                 true,
             ),
-            ("pyobject_ref_alias", Some("PyObjectRef".to_string()), true),
+            (
+                "lowercase_declared",
+                Some("*mut foo::bar_state".to_string()),
+                true,
+            ),
             (
                 "owned_pyobject",
                 Some("pyobject::PyObject".to_string()),
@@ -8038,7 +8040,7 @@ mod tests {
                 )
                 .unwrap();
             graph.push_inputarg_var(entry, var);
-            let cells = derive_subject_inputcells(&graph, None)
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
                 .expect("instance Input must project to a definite SomeValue cell");
             assert_eq!(cells.len(), 1);
             let crate::annotator::model::SomeValue::Instance(s) = &cells[0] else {
@@ -8049,6 +8051,34 @@ mod tests {
                 "{name}: can_be_None={expect_none}"
             );
         }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_undeclared_uppercase_raw_ptr_is_not_classed() {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = LegacyGraph::new("raw_undeclared");
+        let entry = graph.startblock;
+        let var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("*mut SomeUndeclared".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, var);
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("undeclared raw pointer still seeds a Ref shell");
+        let crate::annotator::model::SomeValue::Instance(s) = &cells[0] else {
+            panic!("must seed SomeInstance, got {:?}", cells[0]);
+        };
+        assert!(
+            !s.can_be_none,
+            "uppercase pointee with no harvested layout is the classdef-less shell, not a nullable instance"
+        );
     }
 
     #[test]

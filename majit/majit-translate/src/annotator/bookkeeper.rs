@@ -856,25 +856,50 @@ pub(crate) fn owner_layout_gckind_is_gc_with(
         .is_some_and(|(_, lo)| lo.gckind == GcKind::Gc)
 }
 
+/// True when `pointee` has a harvested owner layout.
+///
+/// Same table as [`owner_layout_gckind_is_gc_with`]. No layout is
+/// unknown (`lltype.py` `Struct._first_struct`).
+pub(crate) fn owner_layout_is_declared_with(
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    pointee: &str,
+) -> bool {
+    layout_for_owner(layouts, generic_owner_lookup(pointee)).is_some()
+}
+
+/// Pointee of `*mut T` / `*const T` when T has a harvested owner layout.
+///
+/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a
+/// declared struct / Opaque. A non-ADT pointee (str-family, GCREF,
+/// list, fn-ptr, primitive) is not this intern. No layout is unknown:
+/// the caller takes its non-classed fallback.
+pub(crate) fn raw_ptr_declared_owner_pointee<'a>(
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: &'a str,
+) -> Option<&'a str> {
+    let t = class_root.trim();
+    let pointee = t
+        .strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+        .map(str::trim)?;
+    if crate::front::mir::raw_ptr_pointee_is_non_adt_spelling(t, pointee) {
+        return None;
+    }
+    owner_layout_is_declared_with(layouts, pointee).then_some(pointee)
+}
+
 /// Intern residual of `*mut T` / `*const T` onto a declared non-GC ADT
 /// banks as Int (`history.getkind` of `lltype.py` `SomePtr`;
 /// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
 /// struct / Opaque). The frontend token stays `"ref"`; `CallControl`
 /// remaps that Ref to Int so `getcalldescr` FUNC.RESULT matches the
 /// annotator. A GC pointee intern's `SomeInstance` and stays Ref.
-/// Unprefixed `PyObjectRef` is not this spelling.
+/// No harvested layout is unknown.
 pub(crate) fn intern_nongc_raw_ptr_result_is_int_bank(
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
 ) -> bool {
-    if !crate::front::mir::is_raw_ptr_to_classed_instance_spelling(class_root) {
-        return false;
-    }
-    let Some(pointee) = class_root
-        .strip_prefix("*const ")
-        .or_else(|| class_root.strip_prefix("*mut "))
-        .map(str::trim)
-    else {
+    let Some(pointee) = raw_ptr_declared_owner_pointee(layouts, class_root) else {
         return false;
     };
     !owner_layout_gckind_is_gc_with(layouts, pointee)
@@ -1801,6 +1826,23 @@ impl Bookkeeper {
             return false;
         };
         owner_layout_gckind_is_gc_with(layouts, pointee)
+    }
+
+    /// True when `pointee` has a harvested owner layout
+    /// (`lltype.py` `Struct._first_struct`). No layout is unknown.
+    pub fn owner_layout_is_declared(&self, pointee: &str) -> bool {
+        let layouts = self.struct_layouts.borrow();
+        let Some(layouts) = layouts.as_ref() else {
+            return false;
+        };
+        owner_layout_is_declared_with(layouts, pointee)
+    }
+
+    /// Pointee of `*mut T` / `*const T` when T has a harvested owner
+    /// layout. No layouts, or a non-ADT pointee, is unknown.
+    pub fn raw_ptr_declared_owner_pointee<'a>(&self, class_root: &'a str) -> Option<&'a str> {
+        let layouts = self.struct_layouts.borrow();
+        raw_ptr_declared_owner_pointee(layouts.as_ref()?, class_root)
     }
 
     /// Intern predicate for a niche `Option<P>` of a GC instance or
@@ -10058,6 +10100,43 @@ mod tests {
             }
             other => panic!("expected classdef-less instance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn intern_nongc_raw_ptr_uses_harvested_layout_not_spelling() {
+        let (layouts, _ids) =
+            crate::test_support::raw_layout_table_for(&["foo::bar_state", "bar_state"]);
+        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts,
+            "*mut foo::bar_state"
+        ));
+        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts,
+            "*const foo::bar_state"
+        ));
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts,
+            "*mut SomeUndeclared"
+        ));
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts,
+            "PyObjectRef"
+        ));
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts, "*mut u8"
+        ));
+        assert!(owner_layout_is_declared_with(&layouts, "foo::bar_state"));
+        assert!(!owner_layout_is_declared_with(&layouts, "SomeUndeclared"));
+    }
+
+    #[test]
+    fn intern_nongc_raw_ptr_gc_layout_is_not_int_bank() {
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &layouts,
+            "*mut pyobject::PyObject"
+        ));
+        assert!(raw_ptr_declared_owner_pointee(&layouts, "*mut pyobject::PyObject").is_some());
     }
 
     #[test]

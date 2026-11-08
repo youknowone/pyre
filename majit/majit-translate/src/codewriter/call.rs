@@ -24138,7 +24138,25 @@ mod tests {
     fn getcalldescr_nongc_raw_ptr_intern_result_is_int() {
         // Intern residual of `*mut T` onto a declared non-GC ADT: token
         // stays `"ref"`, mint is `lltype.py` `SomePtr`, FUNC.RESULT is Int.
+        let owner = "ffi_raw::NativeSession";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
         let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
         let path = CallPath::from_segments(["connection_session"]);
         let target = CallTarget::function_path(["connection_session"]);
         let mut graph = simple_graph("connection_session").with_return_type("ref");
