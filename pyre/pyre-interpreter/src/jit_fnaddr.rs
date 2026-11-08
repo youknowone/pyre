@@ -5034,7 +5034,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `rgc.ll_arraycopy` / `list.ll_arraycopy` keeps PyPy's five-argument
     // residual ABI. `_handle_list_call` retargets the oopspec residual to
-    // `["jit_ll_arraycopy"]`.
+    // `["jit_ll_arraycopy"]`. An erased (`PyObjectRef`) ARRAY residual
+    // `direct_call`s this same name (`functionptr_with_external_name`).
     cpa5!(
         &mut entries,
         "pyre_object::object_array::jit_ll_arraycopy",

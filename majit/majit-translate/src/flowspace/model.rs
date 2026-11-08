@@ -2762,6 +2762,21 @@ impl HostEnv {
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_RAW),
         );
 
+        // `rgc.py` `ll_arraycopy`: `@specialize.ll()` is one ARRAY per
+        // graph; the erased residual is `dont_look_inside` and
+        // `rtype_jit_ll_arraycopy` residualizes it. Harvesting the
+        // erased `jit_ll_arraycopy` FunDecl shares one FunctionGraph
+        // whose `mergeinputargs` unions List and Instance(PyObject).
+        // Layer-3b resolves the crate-qualified path
+        // (`pyre_object.object_array`) and the crate-stripped alias
+        // (`object_array`) to one HostObject Arc.
+        let object_array_module =
+            HostObject::new_module(crate::runtime_names::modules::OBJECT_ARRAY);
+        object_array_module.module_set(
+            "jit_ll_arraycopy",
+            HostObject::new_builtin_callable(crate::runtime_names::modules::JIT_LL_ARRAYCOPY),
+        );
+
         // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
         // / `dealloc_varsize_with_gc_header` — concrete `malloc_varsize`
         // analogues (`init_gc_object_immortal`). Generic `alloc_with_gc_header`
@@ -2867,6 +2882,14 @@ impl HostEnv {
         mods.insert(
             crate::runtime_names::modules::OBJECT_LLTYPE.into(),
             lltype_module,
+        );
+        mods.insert(
+            crate::runtime_names::modules::OBJECT_ARRAY.into(),
+            object_array_module.clone(),
+        );
+        mods.insert(
+            crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
+            object_array_module,
         );
         mods.insert(
             crate::runtime_names::modules::GC_HEADER.into(),
@@ -2977,6 +3000,30 @@ pub(crate) fn is_host_env_conditional_call_leaf(leaf: &str) -> bool {
             | "conditional_call_elidable3"
             | "conditional_call_elidable4"
     )
+}
+
+/// `rgc.py` `ll_arraycopy` residual named by the callable's real path:
+/// `pyre_object::object_array::jit_ll_arraycopy`, the local-crate-stripped
+/// `object_array::jit_ll_arraycopy`, or the `SemanticFunction.name` leaf
+/// alias. `@specialize.ll()` wrappers keep one ARRAY per graph; this
+/// shared residual body is not a look-inside graph.
+pub(crate) fn is_jit_ll_arraycopy_path(segs: &[String]) -> bool {
+    let leaf = match segs {
+        [crate_name, module, leaf]
+            if crate_name == crate::runtime_names::crates::OBJECT
+                && module == crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED =>
+        {
+            leaf.as_str()
+        }
+        [module, leaf] if module == crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED => {
+            leaf.as_str()
+        }
+        [leaf] => leaf.as_str(),
+        _ => return false,
+    };
+    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
+    let leaf = leaf.rsplit("::").next().unwrap_or(leaf);
+    leaf == "jit_ll_arraycopy"
 }
 
 /// ExtRegistry `rlib/jit.py` `ConditionalCallEntry` named by the
