@@ -215,6 +215,26 @@ extern "C" fn ll_list_float_resize_ge_word(obj: i64, newsize: i64) {
     }
 }
 
+extern "C" fn ll_list_ascii_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_ascii_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_ascii_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
+extern "C" fn ll_list_obj_resize_ge_word(obj: i64, newsize: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::ll_list_obj_resize_ge_word");
+    unsafe {
+        pyre_object::listobject::ll_list_obj_resize_ge(
+            obj as usize as pyre_object::PyObjectRef,
+            newsize as usize,
+        )
+    }
+}
+
 /// One-word residual ABI for `w_dict_lookup_int_strategy`. A miss is NULL.
 /// `Option<PyObjectRef>` is two words with no pointer niche, so the Rust
 /// item would return the `Some` discriminant; `llmodel.py bh_call_r` reads
@@ -4667,6 +4687,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::ll_list_float_resize_ge",
         ll_list_float_resize_ge_word,
     );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_ascii_resize_ge",
+        "pyre_object::ll_list_ascii_resize_ge",
+        ll_list_ascii_resize_ge_word,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_obj_resize_ge",
+        "pyre_object::ll_list_obj_resize_ge",
+        ll_list_obj_resize_ge_word,
+    );
     // The fold descends the Option-returning Rust body. Residual/blackhole
     // calls use the one-word bridges: `Option<PyObjectRef>` has no pointer
     // niche, so the raw function would return the Some discriminant.
@@ -7756,9 +7788,9 @@ mod tests {
         is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
         is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
         jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
-        ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
-        module_dict_getdictvalue_no_unwrapping_pure_word, object_dict_getitem_str_hashed_word,
-        object_dict_getitem_str_word, occupied_published_addr,
+        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
+        ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
+        object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
         pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
         shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
@@ -8348,6 +8380,8 @@ mod tests {
         let switch = switch_to_correct_strategy_word as *const () as usize as i64;
         let int_resize = ll_list_int_resize_ge_word as *const () as usize as i64;
         let float_resize = ll_list_float_resize_ge_word as *const () as usize as i64;
+        let ascii_resize = ll_list_ascii_resize_ge_word as *const () as usize as i64;
+        let obj_resize = ll_list_obj_resize_ge_word as *const () as usize as i64;
         let gil = pyre_object::gil_ready::gil_ready_word as *const () as usize as i64;
         let append_inner =
             pyre_object::listobject::w_list_append_inner as *const () as usize as i64;
@@ -8372,6 +8406,13 @@ mod tests {
                 float_resize,
             ),
             ("pyre_object::ll_list_float_resize_ge", float_resize),
+            (
+                "pyre_object::listobject::ll_list_ascii_resize_ge",
+                ascii_resize,
+            ),
+            ("pyre_object::ll_list_ascii_resize_ge", ascii_resize),
+            ("pyre_object::listobject::ll_list_obj_resize_ge", obj_resize),
+            ("pyre_object::ll_list_obj_resize_ge", obj_resize),
             ("pyre_object::gil_ready::gil_ready_word", gil),
             ("pyre_object::listobject::w_list_append_inner", append_inner),
             ("pyre_object::w_list_append_inner", append_inner),
