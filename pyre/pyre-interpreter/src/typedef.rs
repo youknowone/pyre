@@ -27737,10 +27737,11 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
-            let mut error = error;
-            let error_slot = error.pin(&_roots);
-            receiver.release();
-            error.reload(&_roots, error_slot);
+            // `descr_find` holds the receiver export across `_op_val`.
+            // `BytearrayBuffer.releasebuffer` closes it without
+            // `memoryview_release` so the conversion error can outlive
+            // the bracket.
+            receiver.releasebuffer();
             return Err(error);
         }
     };
@@ -27757,7 +27758,7 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
         };
         Ok(pos.map(|p| (start + p) as i64).unwrap_or(-1))
     })();
-    receiver.release();
+    receiver.releasebuffer();
     result
 }
 
@@ -27800,29 +27801,32 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let base = pyre_object::gc_roots::pin_roots(args);
     let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i);
     let bounds = bytes_idx_args(base, args.len())?;
+    // CPython 3.14 bytearray search methods acquire the receiver before
+    // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
+    // resize the storage under a borrowed slice.  Argument-clinic converted
+    // start/end above, before the implementation acquires that export.
     let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
-            let mut error = error;
-            let error_slot = error.pin(&_roots);
-            receiver.release();
-            error.reload(&_roots, error_slot);
+            // `descr_count` holds the receiver export across `_op_val`.
+            // `BytearrayBuffer.releasebuffer` closes it without
+            // `memoryview_release` so the conversion error can outlive
+            // the bracket.
+            receiver.releasebuffer();
             return Err(error);
         }
     };
-    let result = (|| {
+    let n = {
         let data = receiver.as_bytes();
-        let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
-            return Ok(pyre_object::w_int_new(0));
-        };
-        Ok(pyre_object::w_int_new(
-            bytes_count_subslices(&data[start..end], sub.as_bytes()) as i64,
-        ))
-    })();
-    receiver.release();
-    result
+        match bytes_idx_window(data.len(), bounds) {
+            None => 0,
+            Some((start, end)) => bytes_count_subslices(&data[start..end], sub.as_bytes()) as i64,
+        }
+    };
+    receiver.releasebuffer();
+    Ok(pyre_object::w_int_new(n))
 }
 
 /// `stringmethods.py:descr_startswith` / `descr_endswith` — test the

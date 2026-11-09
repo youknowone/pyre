@@ -1164,21 +1164,13 @@ mod context_methods {
                             false,
                         )
                     };
-                    let mut failure = match loaded {
-                        Ok(_) => None,
-                        Err(_) => Some(ssl_error(
-                            "not enough data: cadata does not contain a certificate",
-                        )),
-                    };
-                    if let Some(err) = failure.take() {
-                        let _roots = pyre_object::gc_roots::push_roots();
-                        let mut err = err;
-                        let slot = err.pin(&_roots);
-                        buffer.release();
-                        err.reload(&_roots, slot);
-                        return Err(err);
-                    }
+                    // `rffi.scoped_nonmovingbuffer`: close the export before
+                    // instantiating the exception so `pop_roots` cannot
+                    // discard a pin appended above it.
                     buffer.release();
+                    loaded.map_err(|_| {
+                        ssl_error("not enough data: cadata does not contain a certificate")
+                    })?;
                 }
             }
             Ok(())
@@ -1674,15 +1666,22 @@ mod memory_bio_methods {
         }
 
         fn write(&mut self, data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-            let buffer =
-                pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error("a bytes-like object is required")
-                })?;
-            let result =
-                unsafe { pyre_native::ssl::memory_bio_write(self.backend, buffer.as_bytes()) }
-                    .map_err(ssl_error);
-            buffer.release();
-            result
+            // `MemoryBIO.write`: `ffi.from_buffer` then
+            // `BIO_write(self.bio, buf, len(buf))` yields `nbytes`, the
+            // `with` closes, then `nbytes < 0` raises `ssl_error`.
+            // `acquire_readbuf` is `space.readbuf_w`. `readbuf_w` does not
+            // export, so there is no lease to close before the exception
+            // exists (`rffi.scoped_nonmovingbuffer`).
+            let bytes = unsafe { pyre_interpreter::builtins::acquire_readbuf(data)? };
+            let nbytes = unsafe {
+                pyre_native::ssl::memory_bio_write(self.backend, bytes.as_ptr(), bytes.len())
+            };
+            let result = if nbytes < 0 {
+                Err("cannot write() after write_eof()")
+            } else {
+                Ok(nbytes as usize)
+            };
+            result.map_err(ssl_error)
         }
 
         fn write_eof(&mut self) {
@@ -1850,8 +1849,15 @@ mod ssl_socket_methods {
             if !data.is_empty() {
                 let outgoing = W_MemoryBIO::from_obj(socket.outgoing)
                     .expect("_wrap_bio validated its outgoing MemoryBIO");
-                unsafe { pyre_native::ssl::memory_bio_write(outgoing.backend, &data) }
-                    .map_err(ssl_error)?;
+                let nbytes = unsafe {
+                    pyre_native::ssl::memory_bio_write(outgoing.backend, data.as_ptr(), data.len())
+                };
+                let result = if nbytes < 0 {
+                    Err("cannot write() after write_eof()")
+                } else {
+                    Ok(())
+                };
+                result.map_err(ssl_error)?;
             }
             return Ok(());
         }
@@ -2532,25 +2538,11 @@ mod ssl_socket_methods {
             if let Err((code, _)) = &result {
                 latch_eof_code(self, *code);
             }
-            let written_or_err = tls_result(result);
-            let mut failure = None;
-            let written = match written_or_err {
-                Ok(n) => Some(n),
-                Err(err) => {
-                    failure = Some(err);
-                    None
-                }
-            };
-            if let Some(err) = failure.take() {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let mut err = err;
-                let slot = err.pin(&_roots);
-                buffer.release();
-                err.reload(&_roots, slot);
-                return Err(err);
-            }
+            // `rffi.scoped_nonmovingbuffer`: close the export before
+            // instantiating the exception so `pop_roots` cannot discard a
+            // pin appended above it.
             buffer.release();
-            let written = written.unwrap();
+            let written = tls_result(result)?;
             flush_transport(self)?;
             Ok(written)
         }

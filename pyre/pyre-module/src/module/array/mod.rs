@@ -396,6 +396,17 @@ fn array_extend_iterable(
 
 /// Append raw bytes (`frombytes`); length must be a multiple of itemsize.
 fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
+    array_frombytes_with_exports(obj, bytes, unsafe { arr::w_array_exports(obj) } != 0)
+}
+
+/// PyPy `_frombytes`.  `exporting` is the caller's observation of
+/// `w_array_exports`; `array_frombytes_method` snapshots it while the source
+/// lease is still held so `a.frombytes(a)` stays BufferError.
+fn array_frombytes_with_exports(
+    obj: PyObjectRef,
+    bytes: &[u8],
+    exporting: bool,
+) -> Result<(), PyError> {
     let isz = unsafe { arr::w_array_itemsize(obj) };
     if !bytes.len().is_multiple_of(isz) {
         return Err(PyError::value_error(
@@ -409,7 +420,12 @@ fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
     if bytes.is_empty() {
         return Ok(());
     }
-    array_check_resize(obj)?;
+    if exporting {
+        return Err(PyError::new(
+            PyErrorKind::BufferError,
+            "cannot resize an array that is exporting buffers",
+        ));
+    }
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.try_reserve(bytes.len())
         .map_err(|_| PyError::memory_error(""))?;
@@ -1440,31 +1456,22 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     // though PyPy's `bufferstr_w` accepts its raw bytes.  The itemsize check is
     // observable for `memoryview(array('i'))` and `array('i')` exporters.
     if buffer.itemsize() != 1 {
-        let mut error = PyError::type_error("a bytes-like object is required");
-        let error_slot = error.pin(&_roots);
         buffer.release();
-        error.reload(&_roots, error_slot);
-        return Err(error);
+        return Err(PyError::type_error("a bytes-like object is required"));
     }
-    let bytes = buffer.as_bytes().to_vec();
     // [3.14-spec] CPython keeps the Py_buffer export active through
     // `array_resize`, so `a.frombytes(a)` raises BufferError for an itemsize-1
-    // array.  PyPy releases its copied buffer before `_frombytes`; retaining
-    // this lease is the minimal lifetime difference forced by that visible
-    // result.  Release errors remain unraisable and never replace `result`.
-    match array_frombytes(pyre_object::gc_roots::shadow_stack_get(base), &bytes) {
-        Ok(()) => {
-            buffer.release();
-            Ok(pyre_object::w_none())
-        }
-        Err(error) => {
-            let mut error = error;
-            let error_slot = error.pin(&_roots);
-            buffer.release();
-            error.reload(&_roots, error_slot);
-            Err(error)
-        }
-    }
+    // array.  Observe that export count while the lease is held, then close
+    // it (`descr_frombytes` `bufferstr_w`) before `_frombytes`.
+    let exporting =
+        unsafe { arr::w_array_exports(pyre_object::gc_roots::shadow_stack_get(base)) } != 0;
+    let bytes = buffer.into_bytes();
+    array_frombytes_with_exports(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        &bytes,
+        exporting,
+    )?;
+    Ok(pyre_object::w_none())
 }
 
 fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
