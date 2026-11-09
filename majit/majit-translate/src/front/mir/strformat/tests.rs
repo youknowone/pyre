@@ -1535,9 +1535,15 @@ fn we_are_jitted_lookup_in_type_where_real() {
 #[ignore]
 fn gc_alloc_failed_pending_front_fold_real() {
     use crate::model::{CallTarget, OpKind};
+    use std::collections::HashSet;
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    for fname in ["ll_list_int_resize_ge", "w_list_append_inner"] {
+    for fname in [
+        "ll_list_int_resize_ge",
+        "w_list_append_inner",
+        "alloc_items_block",
+        "alloc_items_block_gc",
+    ] {
         let graph = crate::test_support::lower_function(llbc, fname)
             .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
         let residual = graph
@@ -1555,6 +1561,58 @@ fn gc_alloc_failed_pending_front_fold_real() {
         assert_eq!(
             residual, 0,
             "{fname}: residual gc_alloc_failed_pending call after the front fold"
+        );
+        if fname != "alloc_items_block" && fname != "alloc_items_block_gc" {
+            continue;
+        }
+        // Reachable = startblock closure over `Block.exits`.
+        let mut reachable: HashSet<_> = HashSet::new();
+        let mut stack = vec![graph.startblock];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(block) = graph.blocks.get(id.0) {
+                for e in &block.exits {
+                    stack.push(e.target);
+                }
+            }
+        }
+        let mut null_gc_ptr = 0usize;
+        let mut null_mut_call = 0usize;
+        for id in &reachable {
+            let Some(block) = graph.blocks.get(id.0) else {
+                continue;
+            };
+            for op in &block.operations {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                // Null-pointer constant `push_null_gc_ptr_with_spelling`
+                // emits (`front/mir/desugar/num.rs`).
+                let is_null_gc_ptr = segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["core", "ptr", "null_mut"]);
+                if is_null_gc_ptr {
+                    null_gc_ptr += 1;
+                }
+                if super::fmt_path_ends_with(segments, &["null_mut"]) {
+                    null_mut_call += 1;
+                }
+            }
+        }
+        assert_eq!(
+            null_gc_ptr, 0,
+            "{fname}: reachable null ItemsBlock producer from push_null_gc_ptr_with_spelling"
+        );
+        assert_eq!(
+            null_mut_call, 0,
+            "{fname}: reachable FunctionPath call ending in null_mut"
         );
     }
 }
