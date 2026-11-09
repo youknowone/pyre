@@ -58,8 +58,6 @@ total = 0
 for n in range(200):
     total += entry(box, mapping, values, n)
 
-print(total, box[0], mapping["count"], len(values), sum(values))
-
 
 # The same handoff must preserve the innermost frame and pending exception
 # when the blackhole finishes by unwinding instead of returning a value.
@@ -90,10 +88,16 @@ for n in range(100):
     except ValueError as exc:
         raised_total += exc.args[0]
 
-print(raised_total, len(raised_values), sum(raised_values))
-
 # Keep the tiny trace limit inside this workload. Otherwise shutdown
 # importlib/atexit helpers become extra segmentation tests whose frame
-# boundaries depend on the target layout (interp_jit.set_param).
+# boundaries depend on the target layout (interp_jit.set_param).  The
+# checksums print after the reset for the same reason: app-level `sum` ->
+# `_int_sum` under the tiny limit cuts its own traces, inside the list
+# iterator helper or in the `_int_sum` frame depending on the target and on
+# how its callers are entered, and those cuts were counted with the
+# subject's handoffs.
 if pypyjit is not None:
     pypyjit.set_param("default")
+
+print(total, box[0], mapping["count"], len(values), sum(values))
+print(raised_total, len(raised_values), sum(raised_values))
