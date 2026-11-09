@@ -2110,9 +2110,13 @@ impl<'a> Lowering<'a> {
                 // `core::ptr::write` of a Copy scalar or thin pointer is a
                 // raw store into the already-allocated object.  An aggregate
                 // write is left for `lower_struct_ptr_writes`.
+                // A constant value has no place type; its declared type is
+                // the store's item type (`jtransform.py Transformer.rewrite_op_raw_store`).
                 if args.len() == 2
-                    && let Some((item_ty, itemsize, is_item_signed)) =
-                        self.ptr_write_store_descr(&reg, second_arg_ty.as_ref())
+                    && let Some((item_ty, itemsize, is_item_signed)) = self.ptr_write_store_descr(
+                        &reg,
+                        second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    )
                 {
                     let offset = self
                         .graph
