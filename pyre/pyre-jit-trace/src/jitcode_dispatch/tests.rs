@@ -3822,6 +3822,7 @@ fn call_trace_callee_prologue_walk_does_not_leave_helper_as_call_result() {
                     op.opcode,
                     majit_ir::OpCode::GuardValue
                         | majit_ir::OpCode::GuardFalse
+                        | majit_ir::OpCode::GuardTrue
                         | majit_ir::OpCode::GuardNotInvalidated
                 )
             })
