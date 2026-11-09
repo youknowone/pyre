@@ -53,20 +53,30 @@ pub fn sortkey_green_key(strategy_type: PyObjectRef, tp: PyObjectRef) -> GreenKe
     )
 }
 
+/// `listobject.py` `greens=['strategy_type','tp']` — two Ref greens.
+pub const SORTKEY_GREEN_TYPES: [GreenType; 2] = [GreenType::Ref, GreenType::Ref];
+
+/// Hash of the jd4 greens `(strategy_type, tp)`.
+#[inline]
 pub fn sortkey_green_hash(strategy_type: PyObjectRef, tp: PyObjectRef) -> u64 {
-    majit_metainterp::green_key_hash_typed(
-        &[strategy_type as i64, tp as i64],
-        &[GreenType::Ref, GreenType::Ref],
-    )
+    majit_metainterp::green_key_hash_typed(&[strategy_type as i64, tp as i64], &SORTKEY_GREEN_TYPES)
 }
 
+/// `warmstate.py JitCell.get_jitcell`: resolve once and carry the cell key.
+///
+/// `JitCell.get_jitcell(*greenargs)` compares the live greens in place, so
+/// this builds no [`GreenKey`]. Function-entry uses the same
+/// `resolve_cell_key_with_greenargs` door (`eval.rs`
+/// `tick_function_entry_from_portal`).
+#[inline]
 pub fn sortkey_resolved_cell_key(
     warm: &majit_metainterp::warmstate::WarmEnterState,
     strategy_type: PyObjectRef,
     tp: PyObjectRef,
 ) -> u64 {
+    let greenargs = [strategy_type as i64, tp as i64];
     let hash = sortkey_green_hash(strategy_type, tp);
-    warm.resolve_cell_key(hash, || sortkey_green_key(strategy_type, tp))
+    warm.resolve_cell_key_with_greenargs(hash, &greenargs, &SORTKEY_GREEN_TYPES)
 }
 
 /// Extracted reds: `list_w`, `keys_w`, `w_callable` (`red_r=[2, 3, 4]`).

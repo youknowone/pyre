@@ -444,6 +444,9 @@ pub fn root_stack_depth() -> usize {
 ///
 /// The guard is its `save_point` word (the JIT carries it as that Int, and
 /// `pop_roots` restores `root_stack_top` by value).
+/// Native jitcode graphs erase it (`shadow_stack_erase`); the
+/// gctransformer's `push_roots` / `pop_roots` run after the codewriter
+/// (`shadowstack.py`).
 #[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \

@@ -8547,6 +8547,9 @@ fn clone_result_hops(
     let mut pending: Option<(crate::model::BlockId, Vec<LinkArg>)> = None;
     for (index, hop) in hops.iter().enumerate() {
         let (id, inputs) = graph.create_block_with_arg_vars(hop.inputargs.len());
+        for (from, to) in hop.inputargs.iter().zip(inputs.iter()) {
+            copy_concretetype(from, to);
+        }
         if first.is_none() {
             first = Some(id);
         }
@@ -8566,6 +8569,7 @@ fn clone_result_hops(
             };
             let result = op.result.as_ref().map(|_| graph.alloc_value_var());
             if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                copy_concretetype(old, fresh);
                 map.push((old.clone(), fresh.clone()));
             }
             graph.blocks[id.0]
