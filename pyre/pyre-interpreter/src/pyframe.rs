@@ -2212,7 +2212,7 @@ impl FrameBox {
         // An old frame storing a nursery WEAKREF runs the write barrier.
         unsafe {
             let wref = pyre_object::weakref::w_weakref_new(generator);
-            if wref.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && wref.is_null() {
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
             let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
@@ -4201,7 +4201,7 @@ impl PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
         let w_locals = unsafe { pyre_object::w_dict_new() };
-        if w_locals.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && w_locals.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         let _ = roots.pin_root(w_locals);
@@ -4234,7 +4234,7 @@ impl PyFrame {
         let size =
             unsafe { (&*raw).varnames.len() + ncells(&*raw) + (&*raw).max_stackdepth as usize };
         let locals_cells_stack_w = unsafe { alloc_frame_locals_array(size, PY_NULL, allocation) };
-        if locals_cells_stack_w.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && locals_cells_stack_w.is_null() {
             // Storage-only hook has no Result; a refused locals array aborts
             // (`PyFrame.__init__`).
             pyre_object::gc_hook::gc_alloc_failed(
@@ -4342,7 +4342,7 @@ impl PyFrame {
             // mapping.  `newdict(module=True)` — the mapping a class body binds
             // names in carries `ModuleDictStrategy.version?`.
             let w_locals = pyre_object::w_module_dict_new();
-            if w_locals.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && w_locals.is_null() {
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
             self.getorcreate_debug_data(-1)?.w_locals = w_locals;
@@ -4415,7 +4415,7 @@ impl PyFrame {
                 crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, index)
             };
             let cell = pyre_object::w_cell_new(PY_NULL, family);
-            if cell.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && cell.is_null() {
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
             self.set_locals_w(index, cell);
@@ -4489,7 +4489,7 @@ impl PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let slot = roots.base();
         let w_extra = unsafe { pyre_object::w_dict_new() };
-        if w_extra.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && w_extra.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         let _ = roots.pin_root(w_extra);
@@ -4854,7 +4854,7 @@ impl PyFrame {
             if arr.is_null() { 0 } else { (*arr).len }
         };
         let array = unsafe { alloc_frame_locals_array(n, PY_NULL, allocation) };
-        if array.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && array.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         unsafe {
@@ -4871,7 +4871,7 @@ impl PyFrame {
             remember_frame_locals_array(array);
         }
         let debugdata = unsafe { clone_debugdata_ptr((*anchor.live()).debugdata, allocation) };
-        if debugdata.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && debugdata.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         let frame = unsafe { &*anchor.live() };
@@ -6638,7 +6638,7 @@ impl PyFrame {
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
         };
-        if locals_cells_stack_w.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && locals_cells_stack_w.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         // The allocation result is a translated livevar before it is stored in
@@ -6674,7 +6674,7 @@ impl PyFrame {
                     crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
                 };
                 let cell = pyre_object::w_cell_new(PY_NULL, family);
-                if cell.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && cell.is_null() {
                     return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
@@ -7190,7 +7190,7 @@ pub fn createframe_obj(
     ));
     let locals_cells_stack_w =
         unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::NurseryGc) };
-    if locals_cells_stack_w.is_null() {
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && locals_cells_stack_w.is_null() {
         return Err(crate::runtime_ops::fetch_memory_error());
     }
     let frame = PyFrame {

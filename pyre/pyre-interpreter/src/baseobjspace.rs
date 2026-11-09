@@ -20340,7 +20340,7 @@ unsafe fn list_iter_descr_next_locked(
     let item = list_iter_getitem_locked(seq, index);
     let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     if let Some(item) = item {
-        if item.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && item.is_null() {
             return PY_NULL;
         }
         pyre_object::w_list_iter_set_index(obj, index + 1);

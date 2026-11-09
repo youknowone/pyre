@@ -522,7 +522,7 @@ fn w_tuple_new_array_backed_impl(
     let items_block = unsafe { alloc_tuple_items_block_gc(save_point, len) };
     // W_TupleObject.__init__: a refused wrappeditems block is not stored
     // into an already allocated header. Length 0 keeps the empty representation.
-    if items_block.is_null() && len != 0 {
+    if crate::gc_hook::gc_alloc_failed_pending() && items_block.is_null() && len != 0 {
         return crate::PY_NULL;
     }
     let raw = raw_slot

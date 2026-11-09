@@ -719,7 +719,7 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
     let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return block;
         }
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -758,7 +758,7 @@ pub unsafe fn grow_instance_items_block(
         let old_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(old as PyObjectRef);
         let fresh = alloc_mapdict_storage_block(new_cap);
-        if fresh.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
             return fresh;
         }
         let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock;
@@ -903,7 +903,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let save = crate::gc_roots::pin_roots(values);
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
-    if block.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
         return std::ptr::null_mut();
     }
     // `alloc_items_block_gc` returns a fresh GCREF.  RPython's
@@ -978,7 +978,7 @@ pub unsafe fn grow_list_items_block_gc(
     let base = roots.base();
     let _ = roots.pin_root(old as PyObjectRef);
     let newitems = unsafe { ll_new_items_array(new_cap as i64) };
-    if newitems.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
         return std::ptr::null_mut();
     }
     if live_len > 0 {
@@ -1010,7 +1010,7 @@ pub(crate) unsafe fn ll_new_items_array(count: i64) -> *mut ItemsBlock {
     let count = count as usize;
     unsafe {
         let (block, _) = alloc_items_block_gc(count);
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return block;
         }
         let base = items_block_items_base(block);
@@ -1101,7 +1101,7 @@ pub unsafe fn try_grow_list_items_block_gc(
 pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut ItemsBlock {
     if !itemsblock_gc_enabled() {
         let block = unsafe { alloc_items_block(cap) };
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return block;
         }
         if cap > 0 {
@@ -1113,7 +1113,7 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
     let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
-    if block.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
         return std::ptr::null_mut();
     }
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -1193,7 +1193,7 @@ pub fn _ll_fixed_alloc_and_set_nonnull_r_trampoline(
     let _ = crate::gc_roots::pin_root(item);
     unsafe {
         let (block, _) = alloc_items_block_gc(count);
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return block;
         }
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -1639,7 +1639,7 @@ macro_rules! typed_items_block_grow {
                 let base = roots.base();
                 let _ = roots.pin_root(old as crate::PyObjectRef);
                 let newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
-                if newitems.is_null() {
+                if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
                     return std::ptr::null_mut();
                 }
                 // Nothing on the heap names `newitems` until the caller's

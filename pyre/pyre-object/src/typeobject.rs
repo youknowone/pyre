@@ -1989,7 +1989,7 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) -> bool {
     };
     // W_TypeObject.set_mro / compute_mro: keep the previous mro_w and
     // version tag when the block is refused.
-    if mro_w.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && mro_w.is_null() {
         return false;
     }
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -2610,7 +2610,7 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     // is None: self.weak_subclasses[i] = newref; return;
     // else: self.weak_subclasses.append(newref)`.
     let newref = crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(subclass_slot));
-    if newref.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && newref.is_null() {
         return;
     }
     let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);

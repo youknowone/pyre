@@ -3368,7 +3368,7 @@ pub unsafe fn store_attr_add_commit(
         Some(typ) => {
             let val = unsafe { unbox_value(typ, w_value) };
             let unboxed = erase_unboxed(&[val]);
-            if unboxed.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                 return;
             }
             inst._set_mapdict_increase_storage1(resolved.new_map, unboxed);
@@ -3925,7 +3925,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 // `erase_unboxed` allocates the replacement bank, so reload the
                 // receiver after it rather than before.
                 let unboxed = erase_unboxed(&new_list);
-                if unboxed.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return false;
                 }
                 let owner = unsafe {
@@ -3989,7 +3989,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             } else {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
-                if grown.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && grown.is_null() {
                     return;
                 }
                 let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
@@ -4044,7 +4044,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
             let fresh = pyre_object::object_array::alloc_instance_items_block(&storage, cap);
-            if fresh.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
                 return;
             }
             let _ = pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
@@ -4158,7 +4158,7 @@ impl MapdictObject for MapdictCarrier {
                 let slot = self._mapdict_read_storage(storageindex);
                 let new_list = unsafe { unboxed_items(slot)[..listindex].to_vec() };
                 let unboxed = erase_unboxed(&new_list);
-                if unboxed.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return false;
                 }
                 let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
@@ -4211,7 +4211,7 @@ impl MapdictObject for MapdictCarrier {
             } else {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
-                if grown.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && grown.is_null() {
                     return;
                 }
                 let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
@@ -4257,7 +4257,7 @@ impl MapdictObject for MapdictCarrier {
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
             let fresh = pyre_object::object_array::alloc_instance_items_block(&storage, cap);
-            if fresh.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
                 return;
             }
             let _ = pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
@@ -4343,7 +4343,7 @@ impl MapdictObject for Object {
                 let slot = self._mapdict_read_storage(storageindex);
                 let new_list: Vec<i64> = unsafe { unboxed_items(slot)[..listindex].to_vec() };
                 let unboxed = erase_unboxed(&new_list);
-                if unboxed.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return false;
                 }
                 self._mapdict_write_storage(storageindex, unboxed);
@@ -4396,7 +4396,7 @@ fn erase_unboxed(values: &[i64]) -> PyObjectRef {
             values.len(),
             pyre_object::object_array::gc_int_array_gc_type_id(),
         );
-        if block.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return pyre_object::PY_NULL;
         }
         std::ptr::copy_nonoverlapping(
@@ -5444,7 +5444,7 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
             if u.firstunwrapped {
                 // a fresh longlong list of one element occupies a new slot
                 let unboxed = erase_unboxed(&[val]);
-                if unboxed.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return;
                 }
                 // `erase_unboxed` hands back a block nothing references yet, so
@@ -5468,7 +5468,7 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 debug_assert_eq!(new_list.len(), u.listindex);
                 new_list.push(val);
                 let unboxed = erase_unboxed(&new_list);
-                if unboxed.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return;
                 }
                 obj._set_mapdict_map(attr);
@@ -5530,7 +5530,7 @@ unsafe fn reorder_and_add<O: MapdictObject>(
                     let slot = obj._mapdict_read_storage(storageindex);
                     let new_list = unsafe { unboxed_items(slot)[..listindex].to_vec() };
                     let unboxed = erase_unboxed(&new_list);
-                    if unboxed.is_null() {
+                    if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                         return false;
                     }
                     let _ = pyre_object::gc_roots::pin_root(unboxed);

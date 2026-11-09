@@ -157,7 +157,7 @@ fn alloc_lowlevel_string(
         // rstr.mallocstr: Failed stops; only NoRoute tries the non-moving
         // young allocator.
         let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size);
-        if young.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+        if crate::gc_hook::gc_alloc_failed_pending() && young.is_null() {
             return 0;
         }
         if young.is_null() {

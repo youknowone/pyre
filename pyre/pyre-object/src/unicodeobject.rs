@@ -901,7 +901,7 @@ fn intern_dict(
 ) -> Option<&mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>> {
     if table.0.is_null() {
         let dict = crate::rweakvaldict::ll_new_weakdict();
-        if dict.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
             return None;
         }
         table.0 = dict;
@@ -952,7 +952,7 @@ pub fn init_interned_strings() -> bool {
 /// in pyre-interpreter eval.rs tests).
 pub fn replace_interned_strings_dict() -> bool {
     let dict = crate::rweakvaldict::ll_new_weakdict();
-    if dict.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && dict.is_null() {
         return false;
     }
     let mut table = lock_intern();
@@ -1038,7 +1038,7 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     // `ll_set_nonnull`: `valueref = weakref_create(llvalue)` first.
     let valueref = unsafe { crate::weakref::w_weakref_new(obj) };
-    if valueref.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && valueref.is_null() {
         return PY_NULL;
     }
     let valueref_slot = crate::gc_roots::shadow_stack_len();

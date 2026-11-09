@@ -98,7 +98,7 @@ impl IntArray {
     pub fn from_vec(values: Vec<i64>) -> Self {
         let len = values.len();
         let block = unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) };
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return Self::empty();
         }
         let arr = Self {
@@ -150,7 +150,7 @@ impl IntArray {
             return Self::empty();
         }
         let block = unsafe { alloc_typed_items_block(capacity, gc_int_array_gc_type_id()) };
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return Self::empty();
         }
         Self {
@@ -167,7 +167,7 @@ impl IntArray {
             return Self::empty();
         }
         let block = unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) };
-        if block.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
             return Self::empty();
         }
         Self {
@@ -293,7 +293,7 @@ impl IntArray {
             .saturating_add(min_cap >> 3)
             .max(INT_ARRAY_INLINE_CAP);
         let fresh = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
-        if fresh.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
             return;
         }
         self.block = fresh;

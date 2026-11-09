@@ -1631,7 +1631,7 @@ pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
     let dst_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_frozendict_new());
     let copied = w_dict_copy(crate::gc_roots::shadow_stack_get(src_slot));
-    if copied.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && copied.is_null() {
         return crate::PY_NULL;
     }
     let copied_slot = crate::gc_roots::shadow_stack_len();
@@ -1745,7 +1745,7 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// strategy + a freshly cloned typed storage box.  Length is computed
 /// on demand by `strategy.length(self)` from the typed storage shape.
 pub fn w_dict_new_with(strategy: &'static DictStrategyRef, dstorage: GCREF) -> PyObjectRef {
-    if dstorage.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+    if crate::gc_hook::gc_alloc_failed_pending() && dstorage.is_null() {
         return crate::PY_NULL;
     }
     // The clone filled the host table before the box existed, so no entry
@@ -5380,7 +5380,7 @@ pub unsafe fn w_dict_copy_object_strategy(
     // this path (`w_dict_copy`); a born-old clone kept discarded types
     // alive at every minor.
     let new_storage = storage.clone_to_young_box(object_dict_storage_gc_type_id());
-    if new_storage.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
         return crate::PY_NULL;
     }
     w_dict_new_with(strategy, new_storage as GCREF)
@@ -8309,7 +8309,7 @@ impl DictStrategy for BytesDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::bytes_dict_storage_gc_type_id());
-        if new_storage.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
             return crate::PY_NULL;
         }
         crate::dictmultiobject::w_dict_new_with(bytes_dict_strategy_ref(), new_storage as GCREF)
@@ -8790,7 +8790,7 @@ impl DictStrategy for IntDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::int_dict_storage_gc_type_id());
-        if new_storage.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && new_storage.is_null() {
             return crate::PY_NULL;
         }
         crate::dictmultiobject::w_dict_new_with(int_dict_strategy_ref(), new_storage as GCREF)

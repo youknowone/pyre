@@ -2192,7 +2192,7 @@ fn new_builtin_module(
                 // local, and `module_ns_store` can allocate. Reload it from
                 // the shadow stack after that store.
                 let created = unsafe { crate::function::builtin_function_new_managed(value) };
-                if created.is_null() {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && created.is_null() {
                     return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 let created_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5035,7 +5035,7 @@ impl AppleveldefNamespace for PyObjectRef {
             name,
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
-        if stored.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && stored.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         let stored_slot = pyre_object::gc_roots::shadow_stack_len();

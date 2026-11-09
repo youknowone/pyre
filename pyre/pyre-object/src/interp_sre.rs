@@ -130,7 +130,7 @@ pub fn w_sre_match_new(
             crate::object_array::gc_int_array_gc_type_id(),
         )
     };
-    if flatten_cache.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && flatten_cache.is_null() {
         return PY_NULL;
     }
     unsafe {

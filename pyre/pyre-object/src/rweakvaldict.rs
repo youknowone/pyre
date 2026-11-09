@@ -396,7 +396,7 @@ fn store_entry<K>(entries: *mut WeakDictEntries<K>, i: usize, key: K, value: *mu
 #[majit_macros::dont_look_inside]
 pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
     let raw = alloc_raw(weakdict_gc_type_id(), std::mem::size_of::<WeakDict<K>>());
-    if raw.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
         return std::ptr::null_mut();
     }
     // `_ll_malloc_entries` may collect (`framework.py` `push_roots`). `d` is
@@ -405,7 +405,7 @@ pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
     let _roots = crate::gc_roots::push_roots();
     let _ = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
     let entries = alloc_entries::<K>(DICT_INITSIZE);
-    if entries.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
         return std::ptr::null_mut();
     }
     let d = raw as *mut WeakDict<K>;
@@ -628,7 +628,7 @@ impl WeakDict<StrKey> {
         };
         let valueref =
             unsafe { crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(val_slot)) };
-        if valueref.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && valueref.is_null() {
             return false;
         }
         let key = if has_key {
@@ -748,7 +748,7 @@ fn ll_dict_resize<K: WeakDictKey>(d: &mut WeakDict<K>) {
     let _roots = crate::gc_roots::push_roots();
     let old_entries_slot = pin_table_and_entries(d as *mut WeakDict<K>, old_entries);
     let new_entries = alloc_entries::<K>(new_size);
-    if new_entries.is_null() {
+    if crate::gc_hook::gc_alloc_failed_pending() && new_entries.is_null() {
         return;
     }
     old_entries = crate::gc_roots::shadow_stack_get(old_entries_slot) as *mut WeakDictEntries<K>;

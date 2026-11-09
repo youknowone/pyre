@@ -1456,7 +1456,7 @@ pub unsafe fn builtin_function_from_function(
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_module);
     let bltin = builtin_function_new_managed(pyre_object::gc_roots::shadow_stack_get(func_slot));
-    if bltin.is_null() {
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && bltin.is_null() {
         return pyre_object::PY_NULL;
     }
     if !py_type_check(bltin, &BUILTIN_FUNCTION_TYPE) {

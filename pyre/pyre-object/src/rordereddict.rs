@@ -423,7 +423,7 @@ impl<K, V, S> RDict<K, V, S> {
         }
         // `_ll_malloc_entries` for the estimate `ll_newdict_size` allocates.
         let entries = alloc_entries::<K, V>(capacity);
-        if entries.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
             return d;
         }
         d.entries = entries;
@@ -549,7 +549,7 @@ impl<K, V, S> RDict<K, V, S> {
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
-            if entries.is_null() {
+            if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
                 return;
             }
             unsafe {
@@ -566,7 +566,7 @@ impl<K, V, S> RDict<K, V, S> {
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(entries as PyObjectRef);
         let fresh = src.clone_index_block();
-        if fresh.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
             return;
         }
         let fresh_slot = crate::gc_roots::shadow_stack_len();
@@ -635,7 +635,7 @@ impl<K, V, S> RDict<K, V, S> {
         let _roots = crate::gc_roots::push_roots();
         let entries_slot = self.pin_table_and_entries();
         let newitems = alloc_entries::<K, V>(new_allocated);
-        if newitems.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
             return false;
         }
         self.entries = pinned_entries(entries_slot);
@@ -741,7 +741,7 @@ impl<K, V, S> RDict<K, V, S> {
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = Self::alloc_index_block(new_size);
-        if fresh.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
             return false;
         }
         let slot = crate::gc_roots::shadow_stack_len();
@@ -766,7 +766,7 @@ impl<K, V, S> RDict<K, V, S> {
         }
         let n = self.index_len();
         let fresh = Self::alloc_index_block(n);
-        if fresh.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.is_null() {
             return std::ptr::null_mut();
         }
         // `ll_dict_copy`: `rgc.ll_arraycopy(indexes, newindexes, 0, 0, n)`.
@@ -1633,7 +1633,7 @@ where
         let newitems = if shrink {
             let new_slot = crate::gc_roots::shadow_stack_len();
             let newitems = alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items));
-            if newitems.is_null() {
+            if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
                 return;
             }
             let _ = crate::gc_roots::pin_root(newitems as crate::pyobject::PyObjectRef);
@@ -2037,7 +2037,7 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = RDict::with_hasher(S2::default());
         dst.entries = alloc_entries::<K2, V>(n);
-        if dst.entries.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && dst.entries.is_null() {
             return RDict::with_hasher(S2::default());
         }
         let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
@@ -2120,7 +2120,7 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = Self::with_hasher(S::default());
         dst.entries = alloc_entries::<K, V>(n);
-        if dst.entries.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() && dst.entries.is_null() {
             return Self::with_hasher(S::default());
         }
         let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
@@ -2294,7 +2294,7 @@ where
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
-            if entries.is_null() {
+            if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
                 return Self::with_hasher(self.hash_builder.clone());
             }
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
@@ -2316,7 +2316,7 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(entries as crate::pyobject::PyObjectRef);
         let indexes = self.clone_index_block();
-        if indexes.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+        if crate::gc_hook::gc_alloc_failed_pending() && indexes.is_null() {
             return Self::with_hasher(self.hash_builder.clone());
         }
         let hash_builder = self.hash_builder.clone();
