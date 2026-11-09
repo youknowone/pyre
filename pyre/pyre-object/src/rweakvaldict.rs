@@ -405,6 +405,9 @@ pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
     let _roots = crate::gc_roots::push_roots();
     let _ = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
     let entries = alloc_entries::<K>(DICT_INITSIZE);
+    if entries.is_null() {
+        return std::ptr::null_mut();
+    }
     let d = raw as *mut WeakDict<K>;
     barrier_dict(d);
     unsafe {

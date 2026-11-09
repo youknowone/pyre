@@ -239,6 +239,9 @@ pub mod rbuilder_runtime {
     fn alloc_builder(value: StringBuilderBox) -> i64 {
         let tid = crate::rbuilder::stringbuilder_gc_type_id();
         let obj = crate::gc_storage::gc_alloc_storage_box::<StringBuilderBox>(value, tid) as i64;
+        if obj == 0 {
+            return 0;
+        }
         barrier_gc_fields(obj);
         obj
     }
@@ -247,6 +250,9 @@ pub mod rbuilder_runtime {
     fn alloc_piece(value: StringPieceBox) -> i64 {
         let tid = crate::rbuilder::stringpiece_gc_type_id();
         let obj = crate::gc_storage::gc_alloc_storage_box::<StringPieceBox>(value, tid) as i64;
+        if obj == 0 {
+            return 0;
+        }
         barrier_gc_fields(obj);
         obj
     }

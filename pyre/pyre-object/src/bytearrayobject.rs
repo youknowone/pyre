@@ -152,6 +152,9 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
+    if data.is_null() {
+        return crate::PY_NULL;
+    }
     let data_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
@@ -274,6 +277,9 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         bytes.to_vec(),
         crate::bytesobject::bytes_data_gc_type_id(),
     );
+    if data.is_null() {
+        return crate::PY_NULL;
+    }
     let data_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

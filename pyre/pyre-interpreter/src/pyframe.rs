@@ -4800,7 +4800,7 @@ impl PyFrame {
         // slot to read back.  Same allocation shape as
         // `snapshot_for_generator` below, for the same reason.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc))?;
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -4815,7 +4815,10 @@ impl PyFrame {
     /// write during recording would leak to the real heap and double-apply
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
-    fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
+    fn build_snapshot_frame(
+        &self,
+        allocation: FrameLocalsArrayAllocation,
+    ) -> Result<PyFrame, crate::PyError> {
         // `alloc_frame_locals_array` and `clone_debugdata_ptr` can minor-collect.
         // `FrameAnchor` is the shadow-stack slot the collector rewrites
         // (`FrameRoot` on the bridge path is the same slot). `live()` is that
@@ -4830,6 +4833,9 @@ impl PyFrame {
             if arr.is_null() { 0 } else { (*arr).len }
         };
         let array = unsafe { alloc_frame_locals_array(n, PY_NULL, allocation) };
+        if array.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         unsafe {
             let src = (*anchor.live()).locals_cells_stack_w;
             if !src.is_null() {
@@ -4844,8 +4850,11 @@ impl PyFrame {
             remember_frame_locals_array(array);
         }
         let debugdata = unsafe { clone_debugdata_ptr((*anchor.live()).debugdata, allocation) };
+        if debugdata.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let frame = unsafe { &*anchor.live() };
-        PyFrame {
+        Ok(PyFrame {
             ob_header: frame_ob_header(),
             pycode: frame.pycode,
             locals_cells_stack_w: array,
@@ -4859,7 +4868,7 @@ impl PyFrame {
             w_yielding_from: frame.w_yielding_from,
             f_backref: frame.f_backref,
             w_builtin: frame.w_builtin,
-        }
+        })
     }
 
     /// Snapshot a borrowed frame into a GC-managed owned frame for
@@ -4872,7 +4881,7 @@ impl PyFrame {
         // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
         // and write-barriers the frame before this returns.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc))?;
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
         frame.fix_array_ptrs();
         Ok(frame)
     }
@@ -8076,7 +8085,9 @@ x = 7
         let installed_slot = roots.base();
         let _ = roots.pin_root(pyre_object::w_dict_new());
         frame.w_builtin = roots.get(installed_slot);
-        let snapshot = frame.build_snapshot_frame(super::FrameLocalsArrayAllocation::StdAlloc);
+        let snapshot = frame
+            .build_snapshot_frame(super::FrameLocalsArrayAllocation::StdAlloc)
+            .expect("frame snapshot");
         YOUNG_FRAME_ALLOCS.with(|slots| {
             slots
                 .borrow_mut()

@@ -2077,6 +2077,9 @@ pub fn w_module_dict_new() -> PyObjectRef {
         crate::celldict::ModuleDictStrategy::new(),
         crate::celldict::module_dict_strategy_gc_type_id(),
     );
+    if strategy.is_null() {
+        return crate::PY_NULL;
+    }
     let strategy_slot = roots.publish(&[strategy as PyObjectRef]);
     let strategy = roots.get(strategy_slot) as *mut crate::celldict::ModuleDictStrategy;
     // The strategy box is non-moving and lives as long as this holder.  The
@@ -2093,6 +2096,9 @@ pub fn w_module_dict_new() -> PyObjectRef {
         },
         dict_strategy_ref_gc_type_id(),
     );
+    if strategy_ref.is_null() {
+        return crate::PY_NULL;
+    }
     let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
     // `dictmultiobject.py` `W_DictMultiObject.allocate_and_init_instance`:
     // `storage = strategy.get_empty_storage()`.

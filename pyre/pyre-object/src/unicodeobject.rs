@@ -1569,6 +1569,9 @@ pub unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8
             0
         };
         let storage = crate::gc_storage::gc_alloc_storage_box(storage, tid);
+        if storage.is_null() {
+            return std::ptr::null_mut();
+        }
         (*str_obj).index_storage = storage;
         crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         storage

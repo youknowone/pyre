@@ -569,6 +569,9 @@ pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     require_list_receiver(args, "append", true)?;
     arity_exact(args, "append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     Ok(w_none())
 }
 
