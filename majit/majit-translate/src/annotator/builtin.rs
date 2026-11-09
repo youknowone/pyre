@@ -382,6 +382,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "std.ptr.copy_nonoverlapping",
         std_ptr_copy_nonoverlapping,
     );
+    // `core.ptr.write` is the same `HostObject` as `std.ptr.write`
+    // (`flowspace/model.rs`), so this qualname covers both spellings
+    // and `core.ptr.mut_ptr.<Impl>.write`.
+    analyzer_for(&mut reg, "std.ptr.write", std_ptr_write);
     // `std::alloc::alloc` / `alloc_zeroed` — `ann_malloc` (`lltype.py`)
     // returns `SomePtr` for `lltype.malloc(..., flavor='raw')`. The
     // `alloc::alloc` re-export shares the HOST_ENV callable, so this
@@ -1722,6 +1726,24 @@ fn std_ptr_copy_nonoverlapping(
         return Err(AnnotatorError::new(
             "std.ptr.copy_nonoverlapping expects (src, dst, count)",
         ));
+    }
+    Ok(s_none())
+}
+
+/// `std::ptr::write(dst, src) -> ()`.
+///
+/// Same opaque-foreign shape as `copy_nonoverlapping`: a unique graph
+/// would `mergeinputargs` every pointee into one slot. The store is
+/// `llop.raw_store` or `llmemory.raw_memcopy` at rtype, chosen from the
+/// declared pointee of `dst`; this analyzer does not read that class:
+/// `()` is `s_None`.
+fn std_ptr_write(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new("std.ptr.write expects (dst, src)"));
     }
     Ok(s_none())
 }
@@ -6458,6 +6480,43 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("no analyser registered")
+        );
+    }
+
+    #[test]
+    fn ptr_write_returns_none_for_an_instance_and_a_string() {
+        let bk = bk();
+        let inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let text = SomeValue::String(SomeString::new(false, false));
+        for (dst, src) in [(&inst, &inst), (&text, &text), (&inst, &text)] {
+            let result = call_builtin(
+                &bk,
+                "std.ptr.write",
+                &[Some(dst.clone()), Some(src.clone())],
+                &no_kwds(),
+            )
+            .expect("write annotates");
+            assert!(
+                matches!(result, SomeValue::None_(_)),
+                "write returns (), got {result:?}"
+            );
+        }
+        let err = call_builtin(
+            &bk,
+            "std.ptr.write",
+            &[
+                Some(inst),
+                Some(text),
+                Some(SomeValue::Integer(SomeInteger::new(true, true))),
+            ],
+            &no_kwds(),
+        )
+        .expect_err("three arguments are not the signature");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("expects (dst, src)")
         );
     }
 

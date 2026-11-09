@@ -1403,7 +1403,7 @@ impl<'a> Lowering<'a> {
                 // `arg_locals` is `None` for a projection; follow the mark
                 // the same way `Rvalue::Len` does.
                 if args.len() == 1
-                    && is_deref_call(&reg, self.llbc)
+                    && is_deref_call_for(&reg, first_arg_ty.as_ref(), self.llbc)
                     && tyref_is_string_family(&call.dest.ty, self.llbc)
                 {
                     let from_string = first_arg_ty
@@ -1452,7 +1452,8 @@ impl<'a> Lowering<'a> {
                 // `str` derefs resolve no struct root and keep their
                 // ordinary lowering.
                 if args.len() == 1
-                    && let Some(root) = self.deref_cast_root(&reg, &call.dest.ty)
+                    && let Some(root) =
+                        self.deref_cast_root(&reg, &call.dest.ty, first_arg_ty.as_ref())
                 {
                     let res = self
                         .graph
@@ -1481,7 +1482,11 @@ impl<'a> Lowering<'a> {
                 // [`Self::pair_of_vec`] (`ll_vec_items` / `ll_vec_length`,
                 // `rlist.py` `ll_getitem_fast` on the same list).
                 if args.len() == 1
-                    && self.is_container_identity_deref(&reg)
+                    && self.is_container_identity_deref_for(
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        Some(&call.dest.ty),
+                    )
                     && first_arg_ty
                         .as_ref()
                         .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())

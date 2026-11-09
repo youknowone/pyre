@@ -5836,6 +5836,33 @@ mod tests {
     }
 
     #[test]
+    fn w_root_subclasses_union_to_common_base() {
+        // `binaryop.py` `pairtype(SomeInstance, SomeInstance).union` /
+        // `ClassDef.commonbase`: two subclasses of one base unify to that
+        // base. `space.get` returns `W_Root`; Method and W_IntObject both
+        // derive from it, so their union is `SomeInstance(W_Root)`.
+        let w_root = ClassDef::new_standalone("W_Root", None);
+        let method = ClassDef::new_standalone("Method", Some(&w_root));
+        let w_int = ClassDef::new_standalone("W_IntObject", Some(&w_root));
+        let a = SomeValue::Instance(SomeInstance::new(
+            Some(method),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let b = SomeValue::Instance(SomeInstance::new(
+            Some(w_int),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let u = union(&a, &b).expect("W_Root subclasses unify");
+        let SomeValue::Instance(inst) = u else {
+            panic!("expected SomeInstance, got {u:?}");
+        };
+        let merged = inst.classdef.expect("merged classdef");
+        assert_eq!(merged.borrow().name, "W_Root");
+    }
+
+    #[test]
     fn union_instances_with_no_common_base_raises() {
         // Two standalone classes carry classdefs and share no base.
         // binaryop.py union raises UnionError when both sides have a

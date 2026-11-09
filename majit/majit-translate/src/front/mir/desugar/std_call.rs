@@ -2889,13 +2889,10 @@ impl<'a> Lowering<'a> {
         &self,
         reg: &RegularCall,
         dest_ty: &TyRef,
+        first_arg_ty: Option<&TyRef>,
     ) -> Option<String> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let fd = self.llbc.fn_by_id(*id)?;
-        let np = fd.item_meta.name_path();
-        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+        let fd = deref_callee_fun_decl(reg, first_arg_ty, self.llbc)?;
+        if !is_deref_fundecl(fd, self.llbc) {
             return None;
         }
         // The body is the impl.  A one-word reinterpret would skip it.
@@ -2991,18 +2988,25 @@ impl<'a> Lowering<'a> {
     /// destination to the argument instead, the same alias shape as the
     /// blanket-`into` identity above.
     pub(in crate::front::mir) fn is_container_identity_deref(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        self.is_container_identity_deref_for(reg, None, None)
+    }
+
+    /// [`Self::is_container_identity_deref`] with a known receiver and
+    /// dest, so a Trait `Box<[T]>::deref` whose dest is a slice aliases.
+    pub(in crate::front::mir) fn is_container_identity_deref_for(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: Option<&TyRef>,
+    ) -> bool {
+        let Some(fd) = deref_callee_fun_decl(reg, first_arg_ty, self.llbc) else {
             return false;
         };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let np = fd.item_meta.name_path();
-        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+        if !is_deref_fundecl(fd, self.llbc) {
             return false;
         }
         deref_impl_owner_leaf(self.llbc, fd)
-            .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
+            .is_some_and(|leaf| container_identity_deref_owner(&leaf, dest_ty, self.llbc))
     }
 
     /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the

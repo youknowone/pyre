@@ -4954,6 +4954,296 @@ fn trait_method_on_known_receiver_names_the_impl_graph() {
 }
 
 #[test]
+fn trait_box_slice_deref_is_container_identity() {
+    // `description.py` `ClassDesc.lookup`: `<Box<[T]> as Deref>::deref`
+    // is that impl's FunDecl. The impl is bodyless (`Box::deref`); the
+    // dest is a slice, so the lifted list model aliases — same rule as
+    // `Vec`/`String`, not a `["Deref","deref"]` residual.
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let box_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Box", "generics": {"types": []}}
+    });
+    let box_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["alloc", "boxed", "Box"]),
+        "kind": {"Struct": []}
+    });
+    let deref_fd = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["boxed", 0]},
+                {"Ident": ["Box", 0]},
+                {"Impl": {
+                    "Ty": {"skip_binder": {"Value": [0, box_adt.clone()]}},
+                    "Trait": 0
+                }},
+                {"Ident": ["deref", 0]}
+            ],
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [{"Ref": [null, box_adt.clone(), "Shared"]}],
+            "output": {"Tuple": []}
+        },
+        "body": null
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [box_td],
+            "fun_decls": [null, deref_fd],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "ops", "deref", "Deref"]),
+                "methods": [{"skip_binder": {"name": "deref"}}]
+            }],
+            "trait_impls": [{
+                "impl_trait": {"id": 0, "generics": {"types": [box_adt.clone()]}},
+                "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                "methods": [{
+                    "kind": {"TraitMethod": [0, 0]},
+                    "skip_binder": {"id": 1}
+                }]
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": [null, box_adt, "Shared"]
+    }));
+    let slice_ty = TyRef::Other(serde_json::json!({
+        "Ref": [null, {"Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]}, "Shared"]
+    }));
+    let i64_ty = TyRef::Other(serde_json::json!({
+        "Ref": [null, {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
+    }));
+    let trait_impl_call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+        "kind": {"Trait": [{
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {"types": [], "const_generics": [], "trait_refs": []}
+            }}
+        }, 0]},
+        "generics": {}
+    }))
+    .expect("TraitImpl deref call parses");
+    let clause_call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+        "kind": {"Trait": [{
+            "kind": {"Clause": {"Bound": [0, 0]}},
+            "trait_decl_ref": {"skip_binder": {"id": 0}}
+        }, 0]},
+        "generics": {}
+    }))
+    .expect("Clause deref call parses");
+
+    let fd = super::deref_callee_fun_decl(&trait_impl_call, None, &llbc)
+        .expect("TraitImpl names Box::deref");
+    assert_eq!(
+        super::deref_impl_owner_leaf(&llbc, fd).as_deref(),
+        Some("Box")
+    );
+    assert!(super::is_deref_call(&trait_impl_call, &llbc));
+    assert!(super::is_deref_call_for(&clause_call, Some(&recv), &llbc));
+    assert!(super::tyref_strips_to_slice(&slice_ty, &llbc));
+    assert!(!super::tyref_strips_to_slice(&i64_ty, &llbc));
+    assert!(super::container_identity_deref_owner(
+        "Box",
+        Some(&slice_ty),
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "Box",
+        Some(&i64_ty),
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner("Box", None, &llbc));
+    assert!(!super::container_identity_deref_owner(
+        "Constants",
+        Some(&slice_ty),
+        &llbc
+    ));
+    assert!(super::container_identity_deref_owner("Vec", None, &llbc));
+    assert!(super::container_identity_deref_owner("String", None, &llbc));
+}
+
+#[test]
+fn user_trait_deref_method_is_not_ops_deref() {
+    // `description.py` `FunctionDesc.pycall` follows the selected
+    // implementation through `annotator.recursivecall`. A user trait
+    // `MyDeref::deref` on a string-family receiver keeps its body;
+    // only `<String as core::ops::deref::Deref>::deref` is the
+    // identity-deref rewrite.
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let string_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let string_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["alloc", "string", "String"]),
+        "kind": {"Struct": []}
+    });
+    let fundecl = |def_id: u64, impl_id: u64, segs: &[&str]| {
+        let mut name: Vec<serde_json::Value> = segs
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        name.push(serde_json::json!({
+            "Impl": {
+                "Ty": {"skip_binder": {"Value": [0, string_adt.clone()]}},
+                "Trait": impl_id
+            }
+        }));
+        name.push(serde_json::json!({"Ident": ["deref", 0]}));
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Ref": [null, string_adt.clone(), "Shared"]}],
+                "output": {"Ref": [null, {"Adt": {"id": 0, "builtin": "Str", "generics": {"types": []}}}, "Shared"]}
+            },
+            "body": null
+        })
+    };
+    let trait_impl = |trait_id: u64, fn_id: u64| {
+        serde_json::json!({
+            "impl_trait": {"id": trait_id, "generics": {"types": [string_adt.clone()]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [trait_id, 0]},
+                "skip_binder": {"id": fn_id}
+            }]
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [string_td],
+            "fun_decls": [
+                null,
+                fundecl(1, 0, &["alloc", "string"]),
+                fundecl(2, 1, &["fixture"])
+            ],
+            "global_decls": [],
+            "trait_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "ops", "deref", "Deref"]),
+                    "methods": [{"skip_binder": {"name": "deref"}}]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["MyDeref", 0]}],
+                        "span": span.clone(),
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "methods": [{"skip_binder": {"name": "deref"}}]
+                }
+            ],
+            "trait_impls": [trait_impl(0, 1), trait_impl(1, 2)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let ops_deref_fd = llbc.fn_by_id(1).expect("String as Deref::deref");
+    let my_deref_fd = llbc.fn_by_id(2).expect("String as MyDeref::deref");
+    assert!(super::is_deref_fundecl(ops_deref_fd, &llbc));
+    assert!(!super::is_deref_fundecl(my_deref_fd, &llbc));
+
+    let recv = TyRef::Other(serde_json::json!({
+        "Ref": [null, string_adt, "Shared"]
+    }));
+    let fun_call = |id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Fun": id},
+            "generics": {}
+        }))
+        .expect("Fun Regular call parses")
+    };
+    let trait_impl_call = |impl_id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{
+                "kind": {"TraitImpl": {
+                    "id": impl_id,
+                    "generics": {"types": [], "const_generics": [], "trait_refs": []}
+                }}
+            }, 0]},
+            "generics": {}
+        }))
+        .expect("TraitImpl call parses")
+    };
+    let clause_call = |trait_id: u64| {
+        serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{
+                "kind": {"Clause": {"Bound": [0, 0]}},
+                "trait_decl_ref": {"skip_binder": {"id": trait_id}}
+            }, 0]},
+            "generics": {}
+        }))
+        .expect("Clause call parses")
+    };
+
+    assert!(super::is_deref_call(&fun_call(1), &llbc));
+    assert!(!super::is_deref_call(&fun_call(2), &llbc));
+    assert!(super::is_deref_call(&trait_impl_call(0), &llbc));
+    assert!(!super::is_deref_call(&trait_impl_call(1), &llbc));
+    assert!(super::is_deref_call_for(
+        &clause_call(0),
+        Some(&recv),
+        &llbc
+    ));
+    assert!(!super::is_deref_call_for(
+        &clause_call(1),
+        Some(&recv),
+        &llbc
+    ));
+    // Unresolved Trait fallback: full declared path, not the last segment.
+    assert!(super::is_deref_call(&clause_call(0), &llbc));
+    assert!(!super::is_deref_call(&clause_call(1), &llbc));
+}
+
+#[test]
 fn trait_impl_for_ref_selects_on_double_ref_receiver() {
     // `impl Trait for &Foo` with `fn method(&self)`: the first
     // argument is `&&Foo`. `ClassDesc.lookup` matches the method's
@@ -10258,14 +10548,17 @@ fn deref_cast_root_is_one_word_handle_only() {
     let dest_ty = TyRef::Other(serde_json::json!({
         "Ref": [null, payload_adt.clone(), "Shared"]
     }));
-    let deref_fun = |def_id: u64, handle: serde_json::Value| {
+    let deref_fun = |def_id: u64, impl_id: u64, handle: serde_json::Value| {
         serde_json::json!({
             "def_id": def_id,
             "item_meta": {
                 "name": [
                     {"Ident": ["fixture", 0]},
                     {"Ident": ["Handle", 0]},
-                    {"Impl": {"Ty": {"skip_binder": {"Value": [0, handle.clone()]}}}},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, handle.clone()]}},
+                        "Trait": impl_id
+                    }},
                     {"Ident": ["deref", 0]}
                 ],
                 "span": fixture_span(),
@@ -10286,6 +10579,16 @@ fn deref_cast_root_is_one_word_handle_only() {
             "body": "Opaque"
         })
     };
+    let deref_trait_impl = |fn_id: u64, handle: serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [handle]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [0, 0]},
+                "skip_binder": {"id": fn_id}
+            }]
+        })
+    };
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -10300,14 +10603,39 @@ fn deref_cast_root_is_one_word_handle_only() {
             }],
             "type_decls": [payload, three_field, word, opaque_word],
             "fun_decls": [
-                deref_fun(0, three_field_adt),
-                deref_fun(1, box_adt),
-                deref_fun(2, word_adt),
-                deref_fun(3, opaque_word_adt)
+                deref_fun(0, 0, three_field_adt.clone()),
+                deref_fun(1, 1, box_adt.clone()),
+                deref_fun(2, 2, word_adt.clone()),
+                deref_fun(3, 3, opaque_word_adt.clone())
             ],
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": {
+                    "name": [
+                        {"Ident": ["core", 0]},
+                        {"Ident": ["ops", 0]},
+                        {"Ident": ["deref", 0]},
+                        {"Ident": ["Deref", 0]}
+                    ],
+                    "span": fixture_span(),
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [],
+                        "inline": null,
+                        "rename": null,
+                        "public": true
+                    },
+                    "is_local": false
+                },
+                "methods": [{"skip_binder": {"name": "deref"}}]
+            }],
+            "trait_impls": [
+                deref_trait_impl(0, three_field_adt),
+                deref_trait_impl(1, box_adt),
+                deref_trait_impl(2, word_adt),
+                deref_trait_impl(3, opaque_word_adt)
+            ]
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
@@ -10320,22 +10648,28 @@ fn deref_cast_root_is_one_word_handle_only() {
     };
     with_fixture_lowering(&llbc, |lowering| {
         assert_eq!(
-            lowering.deref_cast_root(&call(0), &dest_ty),
+            lowering.deref_cast_root(&call(0), &dest_ty, None),
             None,
             "a three-field non-transparent handle is not a one-word reinterpret"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(1), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(1), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "Box<T> keeps the one-word cast"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(2), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(2), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "a transparent one-word handle keeps the one-word cast"
         );
         assert_eq!(
-            lowering.deref_cast_root(&call(3), &dest_ty).as_deref(),
+            lowering
+                .deref_cast_root(&call(3), &dest_ty, None)
+                .as_deref(),
             Some("Payload"),
             "an opaque one-word guard (MutexGuard-shaped) keeps the one-word cast"
         );

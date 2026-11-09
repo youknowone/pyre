@@ -24905,7 +24905,10 @@ fn deref_decl() -> Value {
         "item_meta": str_builder_meta(vec![
             ident_seg("rustpython_wtf8"),
             ident_seg("Wtf8Buf"),
-            wtf8buf_impl_seg(),
+            json!({"Impl": {
+                "Ty": {"skip_binder": {"Value": [0, wtf8_adt()]}},
+                "Trait": 0
+            }}),
             ident_seg("deref"),
         ], false),
         "signature": {
@@ -24914,6 +24917,30 @@ fn deref_decl() -> Value {
             "output": ref_wtf8("Shared")
         },
         "body": "Opaque"
+    })
+}
+
+fn ops_deref_trait_decl() -> Value {
+    json!({
+        "def_id": 0,
+        "item_meta": str_builder_meta(vec![
+            ident_seg("core"),
+            ident_seg("ops"),
+            ident_seg("deref"),
+            ident_seg("Deref"),
+        ], false),
+        "methods": [{"skip_binder": {"name": "deref"}}]
+    })
+}
+
+fn wtf8buf_ops_deref_impl(fn_id: u64) -> Value {
+    json!({
+        "impl_trait": {"id": 0, "generics": {"types": [wtf8_adt()]}},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{
+            "kind": {"TraitMethod": [0, 0]},
+            "skip_binder": {"id": fn_id}
+        }]
     })
 }
 
@@ -24960,6 +24987,18 @@ fn lower_owned_concat(
     funs: Vec<Value>,
 ) -> crate::model::FunctionGraph {
     let llbc = llbc_with_types("fixture", types, funs);
+    crate::test_support::lower_function(&llbc, name)
+        .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
+}
+
+fn lower_owned_concat_with_traits(
+    name: &str,
+    types: Vec<Value>,
+    funs: Vec<Value>,
+    trait_decls: Vec<Value>,
+    trait_impls: Vec<Value>,
+) -> crate::model::FunctionGraph {
+    let llbc = llbc_with_types_traits("fixture", types, funs, trait_decls, trait_impls);
     crate::test_support::lower_function(&llbc, name)
         .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
 }
@@ -26042,7 +26081,7 @@ fn owned_ctor_push_str_deref_as_bytes_lowers_to_stringbuilder() {
     let borrow = ref_wtf8("Mut");
     let shared = ref_wtf8("Shared");
     let bytes = bytes_slice_ty();
-    let graph = lower_owned_concat(
+    let graph = lower_owned_concat_with_traits(
         "ctor_push_deref_as_bytes",
         vec![wtf8buf_decl()],
         vec![
@@ -26107,6 +26146,8 @@ fn owned_ctor_push_str_deref_as_bytes_lowers_to_stringbuilder() {
             as_bytes_decl(),
             deref_decl(),
         ],
+        vec![ops_deref_trait_decl()],
+        vec![wtf8buf_ops_deref_impl(4)],
     );
     assert_builder_identity_lowering(&graph, "ctor_push_deref_as_bytes");
 }
@@ -28802,6 +28843,60 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
         ops().any(|op| crate::model::cast_instance_root(&op.kind)
             .is_some_and(|root| root.contains("PyObject"))),
         "prebuilt bool is cast_gcref_to_instance onto PyObject"
+    );
+}
+
+/// `space.fromcache(ClassDictStrategy)` holder (`classdict.py`). The
+/// accessor is the same OnceLock+immortal malloc as `w_none`; the refs
+/// row is the GC object, so `get_or_init` is `Bookkeeper.immutablevalue`.
+#[test]
+#[ignore = "requires the extracted pyre-interpreter LLBC"]
+fn class_dict_strategy_ref_get_or_init_folds_to_prebuilt() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let addr = 0x1234_5678i64;
+    let refs = [("objspace::std::classdict::CLASS_DICT_STRATEGY_REF", addr)];
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
+        "pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref",
+        crate::HostStaticAddrs {
+            refs: &refs,
+            ..Default::default()
+        },
+    )
+    .expect("lower class_dict_strategy_ref");
+    let residual: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.iter().any(|s| s == "get_or_init") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "get_or_init survived lowering: {residual:?}"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr)),
+        "refs row must fold to ConstRefAddr"
+    );
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind,
+                OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
+                    if owner.contains("OnceLock"))),
+        "OnceLock cell is not a class instance"
     );
 }
 

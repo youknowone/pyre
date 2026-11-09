@@ -2553,6 +2553,15 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     {
         return Some(SKIP_PTR_COPY_NONOVERLAPPING);
     }
+    // `core::ptr::write` is an opaque foreign decl with the same unique-
+    // graph hazard: Layer-1 `call_registry.lookup` would mint one empty
+    // body whose `mergeinputargs` unions every pointee. The `write` leaf
+    // is shared (`io::Write::write`); decline only the `ptr` path, and
+    // a bare-leaf alias whose `source_identity` is this path via
+    // `registration_decline_graph_origin`.
+    if is_ptr_write(canonical_strip) {
+        return Some(SKIP_PTR_WRITE);
+    }
     // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
     // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
     // (`init_gc_object_immortal`), not graphs. Their bodies walk
@@ -2582,6 +2591,33 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
+
+/// [`registration_decline`] reason for `ptr::write`.
+const SKIP_PTR_WRITE: &str = "skip-ptr-write";
+
+/// `core::ptr::write` / `std::ptr::write` and the method form
+/// `core::ptr::mut_ptr::<Impl>::write`. The `write` leaf is not unique.
+fn is_ptr_write(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [crate_or_std, module, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && leaf == "write" =>
+        {
+            true
+        }
+        [crate_or_std, module, owner, impl_seg, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && owner == "mut_ptr"
+                && impl_seg == "<Impl>"
+                && leaf == "write" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 /// [`registration_decline`] reason for `std::alloc::alloc` / `alloc_zeroed`.
 const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
@@ -4359,7 +4395,9 @@ pub(crate) fn register_unsafe_fn_stubs(
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
         if let Some(reason) = registration_decline(&path.segments)
             .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
-            && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
+            && (reason == SKIP_PTR_COPY_NONOVERLAPPING
+                || reason == SKIP_STD_ALLOC_RAW
+                || reason == SKIP_PTR_WRITE)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
@@ -9360,6 +9398,146 @@ mod tests {
             &["core", "ptr", "copy_nonoverlapping"][..],
             &["std", "ptr", "copy_nonoverlapping"][..],
             &["copy_nonoverlapping"][..],
+        ] {
+            assert!(
+                stub_registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ptr_write_is_declined_and_unregistered() {
+        for segments in [
+            vec!["core".to_string(), "ptr".into(), "write".into()],
+            vec!["std".into(), "ptr".into(), "write".into()],
+            vec![
+                "core".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "write".into(),
+            ],
+            vec![
+                "std".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "write".into(),
+            ],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_PTR_WRITE),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["write".into()]),
+            None,
+            "the write leaf is shared with other functions"
+        );
+        assert_eq!(
+            registration_decline(&["core".into(), "ptr".into(), "write_unaligned".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "ptr::write");
+        fields.note_foreign_body_callable("std", "ptr::write");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["core", "ptr", "write"],
+            vec!["std", "ptr", "write"],
+            vec!["core", "ptr", "mut_ptr", "<Impl>", "write"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            };
+            let mut graph = LegacyGraph::new("write");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "ptr", "write"][..],
+            &["std", "ptr", "write"][..],
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "write"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.write resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        let mut_ptr_host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.mut_ptr.<Impl>.write resolves in HOST_ENV");
+        assert_eq!(host, mut_ptr_host);
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let mut stub_fields = crate::front::StructFieldRegistry::default();
+        stub_fields.note_foreign_body_callable("core", "ptr::write");
+        stub_fields.note_foreign_body_callable("std", "ptr::write");
+        stub_registry.set_struct_fields(std::rc::Rc::new(stub_fields));
+        let mut specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+            None,
+            None,
+        )];
+        for segments in [
+            vec!["core", "ptr", "write"],
+            vec!["std", "ptr", "write"],
+            vec!["core", "ptr", "mut_ptr", "<Impl>", "write"],
+        ] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(vec!["dst".to_string(), "src".to_string()], None, None),
+                None,
+                None,
+                None,
+            ));
+        }
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined ptr::write specs must not be registered"
+        );
+        assert!(
+            stub_registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        for segments in [
+            &["core", "ptr", "write"][..],
+            &["std", "ptr", "write"][..],
+            &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
         ] {
             assert!(
                 stub_registry

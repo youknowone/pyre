@@ -5927,6 +5927,16 @@ pub(in crate::front::mir) fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> boo
         == Some("Str")
 }
 
+/// Whether a `TyRef` resolves (behind `Ref`/dedup/hash-cons wrappers) to
+/// a slice: the top-level `{"Slice": [elem, …]}` node or the ADT
+/// `builtin: "Slice"`. Distinct from [`tyref_strips_to_str`].
+pub(in crate::front::mir) fn tyref_strips_to_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    node.get("Slice").is_some() || node.get("Adt").and_then(type_decl_ref_builtin) == Some("Slice")
+}
+
 /// `<String as AsRef<[u8]>>::as_ref` / `<str as AsRef<[u8]>>::as_ref`: std
 /// defines it as `self.as_bytes()`, so on a string-family receiver it is the
 /// same byte view as `as_bytes`.
@@ -6544,18 +6554,106 @@ pub(in crate::front::mir) fn node_is_string_value(node: &serde_json::Value, llbc
         .is_some_and(|td| is_rstr_str_layout_declaration(td.item_meta.name_path_str()))
 }
 
-/// Whether `reg` resolves to a `Deref::deref` / `DerefMut::deref_mut`
-/// leaf, by the callee's `name_path` suffix.  Unlike `deref_cast_root`
-/// this makes no claim about the dereferenced type — the caller pairs it
-/// with a `tyref_is_string_value` receiver / dest gate.
-pub(in crate::front::mir) fn is_deref_call(reg: &RegularCall, llbc: &Llbc) -> bool {
-    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-        return false;
+/// FunDecl a `deref` / `deref_mut` call names.
+///
+/// A Fun Regular call is that callee. A Trait call is the unique impl
+/// `description.py` `ClassDesc.lookup` selects: `trait_impl_method` when
+/// the payload already names a TraitImpl, else
+/// [`trait_impl_match_for_receiver`] when the receiver ADT is known.
+/// Bodyless impls still have a FunDecl (`Box::deref`); the caller
+/// decides identity vs `cast_pointer`.
+pub(in crate::front::mir) fn deref_callee_fun_decl<'a>(
+    reg: &RegularCall,
+    first_arg_ty: Option<&TyRef>,
+    llbc: &'a Llbc,
+) -> Option<&'a FunDecl> {
+    let fn_id = match &reg.kind {
+        CallKind::Fun(FunId::Regular { id }) => *id,
+        CallKind::Trait(payload) => crate::front::clause_spec::trait_impl_method(payload, llbc)
+            .map(|(id, _)| id)
+            .or_else(|| {
+                trait_impl_match_for_receiver(first_arg_ty?, payload, llbc).map(|(_, id, _)| id)
+            })?,
+        _ => return None,
     };
-    llbc.fn_by_id(*id).is_some_and(|fd| {
-        let np = fd.item_meta.name_path();
-        np.ends_with("::deref") || np.ends_with("::deref_mut")
-    })
+    llbc.fn_by_id(fn_id)
+}
+
+/// Declared `name_path` of the trait this FunDecl's impl implements,
+/// from the impl's `impl_trait` → trait decl. `None` for an inherent
+/// method or a free function.
+fn fundecl_impl_trait_decl_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let impl_id = trait_impl_id_for_fundecl(fd)?;
+    let trait_id = llbc
+        .trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("impl_trait")?
+        .get("id")?
+        .as_u64()?;
+    let path = llbc.trait_by_id(trait_id)?.item_meta.name_path();
+    (!path.is_empty()).then_some(path)
+}
+
+fn is_ops_deref_trait_path(path: &str) -> bool {
+    matches!(
+        path,
+        "core::ops::deref::Deref" | "core::ops::deref::DerefMut"
+    )
+}
+
+/// Whether `fd` is a method of an impl of `core::ops::deref::Deref`
+/// or `core::ops::deref::DerefMut`.
+///
+/// The impl id is the FunDecl's trait-impl name segment; the trait is
+/// that impl's `impl_trait` declaration `item_meta.name_path()`.
+/// `description.py` `FunctionDesc.pycall` follows the selected
+/// implementation through `annotator.recursivecall`.
+pub(in crate::front::mir) fn is_deref_fundecl(fd: &FunDecl, llbc: &Llbc) -> bool {
+    fundecl_impl_trait_decl_path(llbc, fd).is_some_and(|path| is_ops_deref_trait_path(&path))
+}
+
+/// Whether `reg` resolves to a method of `core::ops::deref::Deref` /
+/// `DerefMut`. Unlike `deref_cast_root` this makes no claim about the
+/// dereferenced type — the caller pairs it with a
+/// `tyref_is_string_value` receiver / dest gate.
+pub(in crate::front::mir) fn is_deref_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    is_deref_call_for(reg, None, llbc)
+}
+
+/// [`is_deref_call`] with a known receiver, so a `Clause` Trait call
+/// still names the impl `ClassDesc.lookup` would select. An unresolved
+/// Trait clause compares the trait declaration's full `name_path()`.
+pub(in crate::front::mir) fn is_deref_call_for(
+    reg: &RegularCall,
+    first_arg_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    if let Some(fd) = deref_callee_fun_decl(reg, first_arg_ty, llbc) {
+        return is_deref_fundecl(fd, llbc);
+    }
+    if let CallKind::Trait(payload) = &reg.kind
+        && let Some((trait_path, method_leaf)) = trait_payload_path_and_method(payload, llbc)
+    {
+        return is_ops_deref_trait_path(&trait_path)
+            && matches!(method_leaf.as_str(), "deref" | "deref_mut");
+    }
+    false
+}
+
+/// String/Vec deref is identity in the lifted model (`rpy_string` /
+/// `rpy_list`). Box is identity only when the dest is a slice
+/// (`Box<[T]>` → `&[T]`); `Box<Struct>` is [`deref_cast_root`] and
+/// `Box<i64>` is a thin integer pointer.
+pub(in crate::front::mir) fn container_identity_deref_owner(
+    owner_leaf: &str,
+    dest_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    match owner_leaf {
+        "String" | "Vec" => true,
+        "Box" => dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc)),
+        _ => false,
+    }
 }
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
@@ -6574,12 +6672,18 @@ pub(in crate::front::mir) fn tyref_is_fnptrcell(ty: &TyRef, llbc: &Llbc) -> bool
         .is_some_and(|p| path_ends_with_segments(&p, "majit_gc::hook_cell::FnPtrCell"))
 }
 
+/// `std::sync::OnceLock<T>` / `core::sync::once_lock::OnceLock<T>`.
+/// Keyed on the ADT path, never on the static's name.
+pub(in crate::front::mir) fn tyref_is_oncelock(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| path_ends_with_segments(&p, "sync::once_lock::OnceLock"))
+}
+
 /// `std::sync::OnceLock<F>` (or `core::sync::once_lock::OnceLock<F>`)
 /// whose `F` is a bare function pointer. Keyed on the ADT path and
 /// generic 0, never on the static's name.
 pub(in crate::front::mir) fn tyref_is_oncelock_fn(ty: &TyRef, llbc: &Llbc) -> bool {
-    adt_path_of_tyref(ty, llbc)
-        .is_some_and(|p| path_ends_with_segments(&p, "sync::once_lock::OnceLock"))
+    tyref_is_oncelock(ty, llbc)
         && tyref_adt_generics_type_arg(ty, 0, llbc)
             .is_some_and(|payload| tyref_is_bare_fn_ptr(&payload, llbc))
 }
