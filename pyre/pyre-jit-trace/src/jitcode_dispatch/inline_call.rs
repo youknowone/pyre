@@ -24487,13 +24487,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // `object` (`<object object at ...>`), so a compiled `abs(x - y)`
     // over complexes TypeErrors. Residualize the helper; the real
     // `complex_sub` builds a `W_ComplexObject`.
-    if is_binary_from_tag
+    let (callee_outcome, finishframe) = if is_binary_from_tag
         && ref_args.len() == 2
         && ref_args.iter().any(|&operand| {
             walker_concrete_ref_object(ctx, operand)
                 .is_some_and(|obj| unsafe { pyre_object::is_complex(obj) })
-        })
-    {
+        }) {
+        // `do_residual_call`: the residual's result lands in the op's dest
+        // and the frame continues; the SubReturn is not this frame's return.
         let residualized = residualize_inline_call_via_fnaddr(
             ctx,
             code,
@@ -24503,28 +24504,29 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             &ref_args,
             &[],
         )?;
-        return Ok((residualized.outcome, op.next_pc));
-    }
-
-    // Bracket the session-wide exception slot around the callee so a NULL
-    // return only reads as a raise when the callee installed the exception.
-    let exc_before_subwalk = ctx.last_exc_value();
-    let walked = run_inline_call_subwalk(
-        ctx,
-        code,
-        op.pc,
-        descr_index,
-        sub_index,
-        &sub_body,
-        &int_args,
-        &int_arg_concretes,
-        &ref_args,
-        &ref_arg_concretes,
-        &[],
-    )?;
-    let finishframe = walked.finishframe;
-    let callee_outcome =
-        promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk)?;
+        (residualized.outcome, residualized.finishframe)
+    } else {
+        // Bracket the session-wide exception slot around the callee so a NULL
+        // return only reads as a raise when the callee installed the exception.
+        let exc_before_subwalk = ctx.last_exc_value();
+        let walked = run_inline_call_subwalk(
+            ctx,
+            code,
+            op.pc,
+            descr_index,
+            sub_index,
+            &sub_body,
+            &int_args,
+            &int_arg_concretes,
+            &ref_args,
+            &ref_arg_concretes,
+            &[],
+        )?;
+        (
+            promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk)?,
+            walked.finishframe,
+        )
+    };
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {

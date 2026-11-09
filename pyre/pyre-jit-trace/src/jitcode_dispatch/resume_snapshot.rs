@@ -2031,6 +2031,14 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `[item0 .. item_{n-1}]`. `build_set` peeks each then
         // `dropvalues(count)` (`eval.rs`).
         pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
+        // `[value]`. `opcode_store_name` / `opcode_store_global`
+        // (`pyopcode.rs`) pop the value then call `store_name_value` /
+        // `store_global_value`.
+        pyre_interpreter::Instruction::StoreName { .. }
+        | pyre_interpreter::Instruction::StoreGlobal { .. } => 1,
+        // `[k0, v0 .. k_{n-1}, v_{n-1}]`. `opcode_build_map`
+        // (`shared_opcode.rs`) `pop_n(size * 2)`.
+        pyre_interpreter::Instruction::BuildMap { count } => 2 * count.get(op_arg) as usize,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(
@@ -2046,6 +2054,10 @@ fn caller_operand_slots<Sym: WalkSym>(
             return None;
         }
     };
+    // BUILD_SET/BUILD_MAP with count 0 pop nothing; no operand slot to prove.
+    if operand_count == 0 {
+        return Some(CallerOperandSlots::Empty);
+    }
     Some(CallerOperandSlots::Operands {
         deepest: stack_end.checked_sub(operand_count)?,
     })
