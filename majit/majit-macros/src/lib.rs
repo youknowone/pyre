@@ -1098,6 +1098,9 @@ fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
 fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
     match output {
         ReturnType::Default => HelperCallKind::Void,
+        // Bare `PyError` is one GC-ref word (`CallControl.guess_call_kind`
+        // residual; `Transformer.handle_residual_call`).
+        ReturnType::Type(_, ty) if is_project_error_type(ty) => HelperCallKind::Ref,
         ReturnType::Type(_, ty) => helper_call_kind_for_type(ty),
     }
 }
@@ -1974,6 +1977,14 @@ fn helper_return_to_i64(
     value: proc_macro2::TokenStream,
     ty: &Type,
 ) -> Option<proc_macro2::TokenStream> {
+    // Bare error-carrier return: one GC-ref word
+    // (`ErrorCarrierWord::into_return_word`). `ResidualError::publish_residual`
+    // is the `Result` Err raise path.
+    if is_project_error_type(ty) {
+        return Some(quote! {
+            ::majit_ir::helper_fnaddr::ErrorCarrierWord::into_return_word(#value)
+        });
+    }
     // A by-value `Vec` result is moved into a header the lowering owns:
     // `raw_malloc_varsize_char` of the three header words, which
     // `ll_vec_free_*` releases together with the buffer.
@@ -5756,6 +5767,7 @@ mod tests {
         assert_eq!(skip("fn f(a: f64, b: f64) -> f64 { a }"), None);
         assert_eq!(skip("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"), None);
         assert_eq!(skip("fn f() -> Result<(), PyError> { Ok(()) }"), None);
+        assert_eq!(skip("fn f(k: PyObjectRef) -> PyError { loop {} }"), None);
         assert_eq!(
             skip("fn f(x: i64) -> Result<bool, crate::PyError> { Ok(true) }"),
             None
