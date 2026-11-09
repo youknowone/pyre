@@ -3591,7 +3591,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                                     guard_exc as PyObjectRef,
                                     frame_ptr,
                                     (*frame_ptr).last_instr as i64,
-                                )
+                                );
                             },
                         }
                     }

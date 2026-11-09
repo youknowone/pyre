@@ -670,6 +670,9 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
             other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if let Some(item) = w_list_getitem(other, i as i64) {
                 pyre_object::listobject::w_list_append_preallocated(list, item);
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
             }
         }
     }
@@ -711,6 +714,9 @@ fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate:
                     pyre_object::gc_roots::shadow_stack_get(base),
                     item,
                 );
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
             }
         }
     }
@@ -752,6 +758,9 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
                 pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::gc_roots::shadow_stack_get(items_base + index),
             );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
         }
     }
     Ok(())
@@ -903,6 +912,9 @@ fn do_extend_from_iterable(
                 pyre_object::gc_roots::shadow_stack_get(root_base),
                 pyre_object::gc_roots::shadow_stack_get(item_slot),
             );
+        }
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         extended += 1;
     }

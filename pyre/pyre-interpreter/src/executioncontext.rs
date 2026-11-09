@@ -3952,20 +3952,24 @@ impl UserDelAction {
             }
             if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
                 let mut error = error;
-                let err_slot = error.pin(&_roots);
+                let mut err_slot = error.pin(&_roots);
                 // CPython 3.14 `_PyGen_Finalize` reports close failures with
                 // `PyErr_FormatUnraisable`, whose hook object is None and
                 // whose message names the generator itself.
                 let w_exc = error.to_exc_object();
                 let frame = crate::eval::current_frame();
                 if !frame.is_null() {
-                    unsafe {
+                    let recorded = unsafe {
                         crate::pytraceback::record_application_traceback(
                             w_exc,
                             frame,
                             (*frame).last_instr as i64,
                         )
                     };
+                    if !recorded {
+                        error = crate::runtime_ops::fetch_memory_error();
+                        err_slot = error.pin(&_roots);
+                    }
                 }
                 let repr = unsafe { crate::display::py_repr_wtf8(current()) }
                     .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));

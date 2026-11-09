@@ -636,8 +636,7 @@ impl WeakDict<StrKey> {
         } else {
             key
         };
-        self.ll_set_nonnull_valueref(key, valueref);
-        true
+        self.ll_set_nonnull_valueref(key, valueref)
     }
 
     /// Lookup/insert half of `WeakValueDictRepr.ll_set_nonnull` after
@@ -645,8 +644,10 @@ impl WeakDict<StrKey> {
     /// weakref_create(llvalue)` then lookup/store. The intern table has
     /// no GIL, so `unicodeobject.rs` `intern_publish` takes its mutex only
     /// around this half and must not run `weakref_create` under that lock.
+    /// A failed `ll_dict_resize` leaves MemoryError pending and returns false
+    /// (`ll_set_nonnull`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_nonnull_valueref(&mut self, key: StrKey, valueref: *mut Weakref) {
+    pub fn ll_set_nonnull_valueref(&mut self, key: StrKey, valueref: *mut Weakref) -> bool {
         debug_assert!(!valueref.is_null());
         let hash = key.ll_keyhash();
         let found = ll_dict_lookup(self, key, hash);
@@ -661,8 +662,12 @@ impl WeakDict<StrKey> {
                 // `valueref` are already in `entries` and dead afterwards;
                 // `framework.py` `push_roots` emits only livevars.
                 self.ll_weakdict_resize();
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return false;
+                }
             }
         }
+        true
     }
 }
 

@@ -1055,10 +1055,12 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     if let Some(existing) = dict.ll_get(key) {
         return existing;
     }
-    dict.ll_set_nonnull_valueref(
+    if !dict.ll_set_nonnull_valueref(
         key,
         crate::gc_roots::shadow_stack_get(valueref_slot) as *mut crate::weakref::Weakref,
-    );
+    ) {
+        return PY_NULL;
+    }
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 

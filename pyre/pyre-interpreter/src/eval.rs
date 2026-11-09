@@ -2260,12 +2260,17 @@ pub fn handle_exception_with_context(
         } else {
             frame.last_instr as i64
         };
-        unsafe {
+        let recorded = unsafe {
             crate::pytraceback::record_application_traceback(
                 pyre_object::gc_roots::shadow_stack_get(exc_slot),
                 frame as *mut PyFrame,
                 last_instruction,
-            );
+            )
+        };
+        if !recorded {
+            *err = crate::runtime_ops::fetch_memory_error();
+            err_slot = err.pin(&_exc_roots);
+            return false;
         }
         err.reload(&_exc_roots, err_slot);
         err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
@@ -2982,6 +2987,9 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
         unsafe { w_list_append(list, value) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         Ok(())
     }
 
@@ -5316,12 +5324,15 @@ impl OpcodeStepExecutor for PyFrame {
             // the entry made here.  Both values are on the value stack already,
             // so the node allocation cannot collect them.
             let frame = unsafe { &mut *anchor.live() };
-            unsafe {
+            let recorded = unsafe {
                 crate::pytraceback::record_application_traceback(
                     matching(),
                     frame as *mut PyFrame,
                     frame.last_instr as i64,
-                );
+                )
+            };
+            if !recorded {
+                return Err(crate::runtime_ops::fetch_memory_error());
             }
             // `record_application_traceback` publishes a propagating error in
             // `IN_FLIGHT_EXCEPTION`. This wrapper is no longer propagating:

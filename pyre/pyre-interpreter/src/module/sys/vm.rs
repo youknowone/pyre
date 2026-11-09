@@ -2767,7 +2767,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     return Err(crate::PyError::type_error(message));
                 }
-                Ok(unsafe { pyre_object::unicodeobject::intern_exact_str(s) })
+                crate::runtime_ops::obj_or_memory_error(unsafe {
+                    pyre_object::unicodeobject::intern_exact_str(s)
+                })
             },
             1,
         ),

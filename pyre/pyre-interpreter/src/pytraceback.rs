@@ -536,9 +536,9 @@ pub unsafe fn record_application_traceback(
     w_exc_object: PyObjectRef,
     frame: *mut crate::pyframe::PyFrame,
     last_instruction: i64,
-) {
+) -> bool {
     if w_exc_object.is_null() || frame.is_null() {
-        return;
+        return true;
     }
     unsafe {
         // `pycode.py self.hidden_applevel` — pyre's
@@ -546,10 +546,10 @@ pub unsafe fn record_application_traceback(
         // gateway / app_main bridge frames from the traceback.
         let pycode_ptr = (*frame).pycode as *const crate::pycode::PyCode;
         if !pycode_ptr.is_null() && (*pycode_ptr).hidden_applevel {
-            return;
+            return true;
         }
         if !pyre_object::is_exception(w_exc_object) {
-            return;
+            return true;
         }
         // `PyTraceback.__init__` allocates. `OperationError.set_traceback`
         // writes the operror, a GC object. The instance here is a native
@@ -580,10 +580,17 @@ pub unsafe fn record_application_traceback(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
         );
         let new_tb = w_pytraceback_for_frame(frame, last_instruction, prev_tb);
+        // `record_application_traceback`: `PyTraceback(...)` raises before
+        // `operror.set_traceback(tb)`. A failed constructor does not store
+        // into the traceback field.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && new_tb.is_null() {
+            return false;
+        }
         let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
         crate::eval::set_in_flight_exception(w_exc_object);
     }
+    true
 }
 
 #[cfg(test)]

@@ -5408,18 +5408,6 @@ unsafe fn pick_unbox_type(self_node: MapRef, w_value: PyObjectRef) -> Option<Unb
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
-unsafe fn pop_unboxed_coords(current_map: MapRef) -> Option<(usize, usize)> {
-    unsafe {
-        match &(*current_map).as_plain().unboxed {
-            Some(u) => match u.firstunwrapped {
-                true => None,
-                false => Some(((*current_map).as_plain().storageindex, u.listindex)),
-            },
-            None => None,
-        }
-    }
-}
-
 unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
     attr: MapRef,
     obj: &mut O,
@@ -5461,17 +5449,18 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 obj._set_mapdict_map(attr);
                 obj._mapdict_write_storage(p.storageindex, unboxed);
             } else {
-                // append to the existing shared list (a fresh list, matching
-                // PyPy's `unboxed + [val]`)
+                // `UnboxedPlainAttribute._switch_map_and_write_increase_storage1`:
+                // `_set_mapdict_map` before the bank-length check and
+                // `unboxed + [val]`.
                 let slot = obj._mapdict_read_storage(p.storageindex);
                 let mut new_list = unsafe { unboxed_items(slot).to_vec() };
+                obj._set_mapdict_map(attr);
                 debug_assert_eq!(new_list.len(), u.listindex);
                 new_list.push(val);
                 let unboxed = erase_unboxed(&new_list);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
                     return;
                 }
-                obj._set_mapdict_map(attr);
                 obj._mapdict_write_storage(p.storageindex, unboxed);
             }
         }
@@ -5517,43 +5506,18 @@ unsafe fn reorder_and_add<O: MapdictObject>(
         // values of the attributes we passed
         if number_to_readd != 0 {
             let mut current = self_node;
-            let mut planned: Vec<(MapRef, Option<usize>)> = Vec::with_capacity(number_to_readd);
             for _ in 0..number_to_readd {
                 // current is a PlainAttribute
+                // `AbstractAttribute._reorder_and_add`: read, then
+                // `_mapdict_pop_attribute` before the next read.
                 let w_self_value = unsafe { plain_direct_read(current, obj) };
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && w_self_value.is_null() {
+                    return false;
+                }
                 let _ = pyre_object::gc_roots::pin_root(w_self_value);
                 stack.push((current, pyre_object::gc_roots::shadow_stack_len() - 1));
-                let parent = unsafe { (*current).as_plain() }.back;
-                let bank_slot = if let Some((storageindex, listindex)) =
-                    unsafe { pop_unboxed_coords(current) }
-                {
-                    let slot = obj._mapdict_read_storage(storageindex);
-                    let new_list = unsafe { unboxed_items(slot)[..listindex].to_vec() };
-                    let unboxed = erase_unboxed(&new_list);
-                    if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
-                        return false;
-                    }
-                    let _ = pyre_object::gc_roots::pin_root(unboxed);
-                    Some(pyre_object::gc_roots::shadow_stack_len() - 1)
-                } else {
-                    None
-                };
-                planned.push((parent, bank_slot));
-                current = parent;
-            }
-            for (parent, bank_slot) in planned {
-                if let Some(slot) = bank_slot {
-                    let current_map = obj._get_mapdict_map();
-                    let Some((storageindex, _)) = (unsafe { pop_unboxed_coords(current_map) })
-                    else {
-                        return false;
-                    };
-                    obj._mapdict_write_storage(
-                        storageindex,
-                        pyre_object::gc_roots::shadow_stack_get(slot),
-                    );
-                    obj._set_mapdict_map(parent);
-                } else if !obj._mapdict_pop_attribute(parent) {
+                current = unsafe { (*current).as_plain() }.back;
+                if !obj._mapdict_pop_attribute(current) {
                     return false;
                 }
             }

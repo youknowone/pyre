@@ -22285,6 +22285,9 @@ pub(crate) fn cycle_next_w(obj: PyObjectRef) -> PyResult {
                     pyre_object::gc_roots::shadow_stack_get(saved_slot),
                     pyre_object::gc_roots::shadow_stack_get(w_obj_slot),
                 );
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
                 return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
             }
             Err(e) => {

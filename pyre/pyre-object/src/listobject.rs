@@ -1794,16 +1794,17 @@ pub unsafe fn w_list_materialize_range(obj: PyObjectRef) -> PyObjectRef {
 
 /// Replace a range strategy's immutable erased tuple.  Sharing means the old
 /// tuple is never mutated; a pop publishes a fresh tuple on this list only.
-unsafe fn install_range_state(
-    obj: PyObjectRef,
-    strategy: ListStrategy,
-    values: &[i64],
-) -> PyObjectRef {
+/// `SimpleRangeListStrategy.pop_end` / `RangeListStrategy.pop_end` assign
+/// `lstorage` only after the tuple exists.
+unsafe fn install_range_state(obj: PyObjectRef, strategy: ListStrategy, values: &[i64]) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
     let state_slot = crate::gc_roots::shadow_stack_len();
     let state = alloc_range_state(values);
+    if crate::gc_hook::gc_alloc_failed_pending() && state.is_null() {
+        return false;
+    }
     let _ = crate::gc_roots::pin_root(state as PyObjectRef);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     list_write_barrier(obj);
@@ -1811,7 +1812,7 @@ unsafe fn install_range_state(
     let list = &mut *(obj as *mut W_ListObject);
     list.strategy = strategy;
     list.items = crate::gc_roots::shadow_stack_get(state_slot) as *mut ItemsBlock;
-    obj
+    true
 }
 
 /// listobject.py EmptyListStrategy.switch_to_correct_strategy.
@@ -5277,6 +5278,9 @@ pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
                 };
                 let state_slot = crate::gc_roots::shadow_stack_len();
                 let state = alloc_sizehint_state(newsize as i64);
+                if crate::gc_hook::gc_alloc_failed_pending() && state.is_null() {
+                    return false;
+                }
                 let _ = crate::gc_roots::pin_root(state as PyObjectRef);
                 let obj = crate::gc_roots::shadow_stack_get(root_base);
                 list_write_barrier(obj);
@@ -6012,15 +6016,18 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
                 let result_slot = crate::gc_roots::shadow_stack_len();
                 let _ = crate::gc_roots::pin_root(result);
                 let obj = crate::gc_roots::shadow_stack_get(root_base);
-                let _ =
-                    install_range_state(obj, ListStrategy::Range, &[start + step, step, len - 1]);
+                if !install_range_state(obj, ListStrategy::Range, &[start + step, step, len - 1]) {
+                    return None;
+                }
                 Some(crate::gc_roots::shadow_stack_get(result_slot))
             } else if idx == len - 1 {
                 let result = w_int_new(start + idx * step);
                 let result_slot = crate::gc_roots::shadow_stack_len();
                 let _ = crate::gc_roots::pin_root(result);
                 let obj = crate::gc_roots::shadow_stack_get(root_base);
-                let _ = install_range_state(obj, ListStrategy::Range, &[start, step, len - 1]);
+                if !install_range_state(obj, ListStrategy::Range, &[start, step, len - 1]) {
+                    return None;
+                }
                 Some(crate::gc_roots::shadow_stack_get(result_slot))
             } else {
                 let obj = switch_range_to_integer_strategy(list);
@@ -6087,11 +6094,12 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             if idx < 0 || idx >= len {
                 return None;
             }
-            let wrapped = w_bytes_from_block(list.bytes_items.as_slice()[idx as usize]);
+            // `AbstractUnwrappedStrategy.pop`: remove first, then wrap.
+            let item = list.bytes_items.remove(idx as usize);
+            let wrapped = w_bytes_from_block(item);
             if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
                 return None;
             }
-            let _ = list.bytes_items.remove(idx as usize);
             Some(wrapped)
         }
         ListStrategy::Ascii => {
@@ -6100,11 +6108,12 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             if idx < 0 || idx >= len {
                 return None;
             }
-            let wrapped = w_str_from_storage(list.ascii_items.as_slice()[idx as usize] as *mut _);
+            // `AbstractUnwrappedStrategy.pop`: remove first, then wrap.
+            let item = list.ascii_items.remove(idx as usize);
+            let wrapped = w_str_from_storage(item as *mut _);
             if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
                 return None;
             }
-            let _ = list.ascii_items.remove(idx as usize);
             Some(wrapped)
         }
     };
@@ -6162,7 +6171,9 @@ unsafe fn pop_end_simple_range(obj: PyObjectRef) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(result);
     let obj = roots.get(obj_slot);
     if length > 1 {
-        let _ = install_range_state(obj, ListStrategy::SimpleRange, &[(length - 1) as i64]);
+        if !install_range_state(obj, ListStrategy::SimpleRange, &[(length - 1) as i64]) {
+            return PY_NULL;
+        }
     } else {
         let list = &mut *(obj as *mut W_ListObject);
         list.items = std::ptr::null_mut();
@@ -6183,11 +6194,13 @@ unsafe fn pop_end_range(obj: PyObjectRef) -> PyObjectRef {
     let result_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(result);
     let obj = roots.get(obj_slot);
-    let _ = install_range_state(
+    if !install_range_state(
         obj,
         ListStrategy::Range,
         &[start, step, (length - 1) as i64],
-    );
+    ) {
+        return PY_NULL;
+    }
     crate::gc_roots::shadow_stack_get(result_slot)
 }
 
@@ -6223,8 +6236,20 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         // `SimpleRangeListStrategy.pop` / `RangeListStrategy.pop` live in
         // their own helpers so the `[i64; 1]` / `[i64; 3]` slice buffers
         // stay off `w_list_pop_end_inner`'s Integer path.
-        ListStrategy::SimpleRange => pop_end_simple_range(obj),
-        ListStrategy::Range => pop_end_range(obj),
+        ListStrategy::SimpleRange => {
+            let wrapped = pop_end_simple_range(obj);
+            if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
+                return None;
+            }
+            wrapped
+        }
+        ListStrategy::Range => {
+            let wrapped = pop_end_range(obj);
+            if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
+                return None;
+            }
+            wrapped
+        }
         ListStrategy::Integer => {
             let length = ll_list_int_length(list);
             // rpython/rtyper/rlist.py ll_pop_default's internal precondition,
@@ -6259,21 +6284,21 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
             item
         }
         ListStrategy::Bytes => {
-            let last = list.bytes_items.as_slice()[length - 1];
+            // `AbstractUnwrappedStrategy.pop_end`: `self.wrap(l.pop())`.
+            let last = list.bytes_items.pop();
             let wrapped = w_bytes_from_block(last);
             if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
                 return None;
             }
-            let _ = list.bytes_items.pop();
             wrapped
         }
         ListStrategy::Ascii => {
-            let last = list.ascii_items.as_slice()[length - 1];
+            // `AbstractUnwrappedStrategy.pop_end`: `self.wrap(l.pop())`.
+            let last = list.ascii_items.pop();
             let wrapped = w_str_from_storage(last as *mut _);
             if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
                 return None;
             }
-            let _ = list.ascii_items.pop();
             wrapped
         }
     })

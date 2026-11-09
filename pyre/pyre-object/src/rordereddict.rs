@@ -927,15 +927,17 @@ impl<K, V, S> RDict<K, V, S> {
             return;
         }
         self.entries = std::ptr::null_mut();
-        self.num_ever_used_items = 0;
         // "we can't remove the index here, because it is possible that crazy
         // Python code calls d.clear() from the method __eq__() called from
         // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
         // has got an index, it will always have one."
-        self.num_live_items = 0;
+        // `ll_dict_clear` resets `num_live_items` and `num_ever_used_items`
+        // after `ll_malloc_indexes_and_choose_lookup`.
         if !self.install_index_block(DICT_INITSIZE) {
             return;
         }
+        self.num_live_items = 0;
+        self.num_ever_used_items = 0;
         self.resize_counter = (DICT_INITSIZE * 2) as isize;
         self.generation = self.generation.wrapping_add(1);
     }
@@ -1594,10 +1596,21 @@ where
         self.set_index_at(i, slot + VALID_OFFSET);
     }
 
+    /// `ll_clear_indexes` (rordereddict.py). Zero the existing probe table
+    /// in place so `ll_dict_reindex` can reuse a same-sized block.
+    fn clear_indexes(&mut self) {
+        let n = self.index_len();
+        for i in 0..n {
+            self.set_index_at(i, FREE);
+        }
+    }
+
     /// `ll_dict_reindex` (rordereddict.py).
     fn reindex(&mut self, new_size: usize) -> bool {
         debug_assert!(new_size.is_power_of_two());
-        if !self.install_index_block(new_size) {
+        if !self.indexes.is_null() && self.index_len() == new_size {
+            self.clear_indexes();
+        } else if !self.install_index_block(new_size) {
             return false;
         }
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
@@ -1687,7 +1700,9 @@ where
         }
         self.num_ever_used_items = self.num_live_items;
         let size = self.index_len();
-        let _ = self.reindex(size);
+        if !self.reindex(size) {
+            return;
+        }
     }
 
     fn resize_inner(&mut self) {
