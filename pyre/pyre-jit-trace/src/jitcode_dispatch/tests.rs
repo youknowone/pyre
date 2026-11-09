@@ -23783,15 +23783,12 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     };
     let pre_fold_pos = wc.trace_ctx.get_trace_position();
     let site = super::inline_call::BuiltinWrapperCallSite {
-        nested_helper: true,
         helper_return: HelperReturn::Converted,
         nested_helper_entry: None,
         call_site_py_pc: 0,
-        vsd_value: 0,
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         call_site_marker: Some(0),
         call_site_active: Vec::new(),
-        owns_virtualizable_shadow: false,
     };
     let result = super::inline_call::walk_translated_builtin_wrapper(
         &mut wc,
@@ -31674,92 +31671,6 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     );
 }
 
-/// A helper resume-image publishes `valuestackdepth` through
-/// `mirror_vable_static_to_boxes` (box + `synchronize_virtualizable_at`).
-/// Restore must pair that write: a boxes-only restore leaves the heap at
-/// the helper's on-entry depth, a heap reload (`load_fields_from_virtualizable`) then replaces the restored
-/// `ConstInt`.
-#[test]
-fn restored_valuestackdepth_survives_helper_publish() {
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let slot_count = info.num_static_extra_boxes;
-
-    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
-    let mut array_block =
-        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
-    let frame_ptr = frame.as_mut_ptr() as *mut u8;
-    let array_ptr = array_block.as_mut_ptr() as *mut u8;
-    unsafe {
-        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
-        *len_ptr = 0;
-        let slot =
-            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
-        *slot = array_ptr;
-        let last_instr =
-            frame_ptr.add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
-        *last_instr = 11;
-    }
-
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let vable = tc.const_ref(frame_ptr as i64);
-    let initial_boxes = vec![tc.const_null(); slot_count];
-    let initial_values = vec![Value::Int(0); slot_count];
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable,
-        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
-        &initial_boxes,
-        &initial_values,
-        &[0],
-    );
-    tc.set_virtualizable_heap_ptr(frame_ptr);
-
-    let vsd_idx = info
-        .static_field_index_by_name("valuestackdepth")
-        .expect("valuestackdepth is a declared static vable field");
-    let last_instr = tc.const_int(11);
-    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-        &mut tc,
-        "last_instr",
-        last_instr,
-        Value::Int(11),
-    );
-
-    const SAVED_DEPTH: i64 = 17;
-    let saved_op = tc.const_int(SAVED_DEPTH);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        &mut tc,
-        "valuestackdepth",
-        saved_op,
-        Value::Int(SAVED_DEPTH),
-    );
-    let saved = crate::trace_opcode::save_vable_resume_scalars(&tc);
-
-    let helper_op = tc.const_int(SAVED_DEPTH + 1);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        &mut tc,
-        "valuestackdepth",
-        helper_op,
-        Value::Int(SAVED_DEPTH + 1),
-    );
-    crate::trace_opcode::restore_vable_resume_scalars(&mut tc, saved);
-    tc.load_fields_from_virtualizable(&info, frame_ptr);
-
-    assert_eq!(
-        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
-        Some(Value::Int(SAVED_DEPTH)),
-        "restored valuestackdepth must reach the heap (load_fields_from_virtualizable)",
-    );
-    assert_eq!(
-        unsafe {
-            *(frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
-        },
-        SAVED_DEPTH as usize,
-        "restore_vable_resume_scalars must flush the saved valuestackdepth to the live frame",
-    );
-}
-
 /// Bridge setup seeds STANDARD `valuestackdepth` as the resume `ConstInt`
 /// (`setup_bridge_sym` / `consume_vable_info`). `rebuild_state_after_failure`
 /// then writes those boxes to the heap (`synchronize_virtualizable`);
@@ -33723,117 +33634,6 @@ fn setfield_vable_i_imm_fold_frame_updates_vsd_box() {
         "standard-vable fold arm must store the immediate in virtualizable_boxes"
     );
     assert_eq!(ops_after, ops_before, "the fold still elides SETFIELD_GC");
-}
-
-/// Portal jitcode pops before the helper CALL. Helper-entry mirroring then
-/// rewrites `valuestackdepth` to the opcode-entry image for guard snapshots.
-/// The abort-point pair recorded on the paused portal `LiveFrameRegs` is
-/// what a ForceQuasiImmutable latch must publish (`_copy_data_from_miframe`).
-#[test]
-fn paused_portal_mirror_uses_abort_point_not_entry_vstack() {
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let nlocals = 2usize;
-    let array_len = 5usize;
-    let vsd_idx = info
-        .static_field_index_by_name("valuestackdepth")
-        .expect("valuestackdepth is a static vable field");
-    let last_idx = info
-        .static_field_index_by_name("last_instr")
-        .expect("last_instr is a static vable field");
-    let nstatic = info.num_static_extra_boxes;
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let vable = tc.const_ref(1);
-    let iter = tc.const_ref(0xA11);
-    let companion = tc.const_null();
-    let leftover_tos = tc.const_ref(0xDEAD);
-    let local0 = tc.const_ref(0x10);
-    let local1 = tc.const_ref(0x20);
-    let mut boxes = vec![tc.const_null(); nstatic + array_len];
-    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic + array_len];
-    boxes[last_idx] = tc.const_int(7);
-    values[last_idx] = Value::Int(7);
-    boxes[vsd_idx] = tc.const_int(4);
-    values[vsd_idx] = Value::Int(4);
-    boxes[nstatic] = local0;
-    values[nstatic] = Value::Ref(majit_ir::GcRef(0x10));
-    boxes[nstatic + 1] = local1;
-    values[nstatic + 1] = Value::Ref(majit_ir::GcRef(0x20));
-    boxes[nstatic + 2] = iter;
-    values[nstatic + 2] = Value::Ref(majit_ir::GcRef(0xA11));
-    boxes[nstatic + 3] = companion;
-    values[nstatic + 3] = Value::Ref(majit_ir::GcRef::NULL);
-    boxes[nstatic + 4] = leftover_tos;
-    values[nstatic + 4] = Value::Ref(majit_ir::GcRef(0xDEAD));
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable,
-        Value::Ref(majit_ir::GcRef(1)),
-        &boxes,
-        &values,
-        &[array_len],
-    );
-
-    let mut snapshot_sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
-    snapshot_sym.nlocals = nlocals;
-    let mut mode = test_fbw_mode();
-    mode.snapshot_sym = &snapshot_sym;
-    mode.inline_caller_py_pc = Some(12);
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let stale_entry = vec![OpRef::NONE, leftover_tos, leftover_tos];
-    let frame_state = WalkFrameState::new(WalkFrameStateData {
-        vstack_boxes: stale_entry,
-        ..Default::default()
-    });
-    let regs_r = RegisterBank::default();
-    let regs_i = RegisterBank::default();
-    let regs_f = RegisterBank::default();
-    let mut portal = InlineFrame::portal();
-    portal.live = Some(LiveFrameRegs::new(&regs_r, &regs_i, &regs_f, &frame_state));
-    session.borrow_mut().framestack.push(portal);
-    super::vable_ops::record_paused_portal_abort_point(&session, &tc);
-    // Helper-entry mirroring: opcode-entry `valuestackdepth` (nlocals + 3).
-    let entry_vsd = tc.const_int(5);
-    tc.set_virtualizable_entry_at(vsd_idx, entry_vsd, Value::Int(5));
-    let wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
-        inline_callee_consts: None,
-        fbw_mode: mode,
-        session: &session,
-        registers_r: &regs_r,
-        registers_i: &regs_i,
-        registers_f: &regs_f,
-        concrete_registers_i: &mut [],
-        descr_refs: &[],
-        raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: false,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
-        pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
-    let mirror = capture_paused_portal_mirror_stack(&wc, "test-vable-abort")
-        .expect("paused portal publishes the abort-point stack");
-    drop(wc);
-    std::hint::black_box(&mut snapshot_sym);
-    assert_eq!(mirror.py_pc, 12);
-    assert_eq!(mirror.valuestackdepth, Some(4));
-    assert_eq!(mirror.last_instr, Some(7));
-    assert_eq!(
-        mirror.slots.iter().map(|&p| p as usize).collect::<Vec<_>>(),
-        vec![0xA11, 0],
-        "opcode-entry vstack_boxes (TOS present) must not win over the abort-point",
-    );
 }
 
 /// Portal jitcode stores `setfield_vable_i_imm` as a PerFn `VableField`.

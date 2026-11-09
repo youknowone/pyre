@@ -16650,14 +16650,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             )
         }
     };
-    // `_opimpl_setfield_vable` already left the abort-point scalars on the
-    // vable (`pyjitpl.py`); do not rewrite them for the helper walk (#245).
-    // Record the pair on the paused portal `LiveFrameRegs` so a
-    // ForceQuasiImmutable multi-frame blackhole can resume the CALL
-    // (`blackhole.py _setup_return_value_*` / `_copy_data_from_miframe`).
-    if !nested_helper && sym.owns_virtualizable_shadow() {
-        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
-    }
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
@@ -16702,8 +16694,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let saved_fbw_mode = ctx.fbw_mode.clone();
     // Pause this Python MIFrame (portal or inlined callee) with the banks
     // `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe` copy.
-    // `record_paused_portal_abort_point` may already have left abort-point
-    // scalars on a placeholder live; bind keeps those and fills the banks.
     // A nested helper walk already occupies a helper MIFrame — rebinding
     // would overwrite that frame with the inner helper's register file.
     if !saved_fbw_mode.transparent_helper_subwalk {
@@ -16738,9 +16728,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
-    if !nested_helper && sym.owns_virtualizable_shadow() {
-        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
-    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →

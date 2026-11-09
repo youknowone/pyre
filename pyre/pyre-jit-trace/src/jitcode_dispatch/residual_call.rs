@@ -1391,70 +1391,53 @@ pub(crate) fn helper_index_for_sub_body(sub_body: &SubJitCodeBody) -> Option<usi
 /// entered from the portal has only `framestack[0]` (`InlineFrame::portal`)
 /// plus `bind_paused_caller_regs` live banks.
 ///
-/// The paused `vstack_boxes` snapshot is the opcode-ENTRY stack. Portal
-/// jitcode that pops before the CALL has already run
-/// `_opimpl_setarrayitem_vable` / `_opimpl_setfield_vable`. Helper-entry
-/// mirroring rewrites the vable scalars to the opcode-entry image for
-/// guard snapshots; the abort-point pair is on the paused portal
-/// `LiveFrameRegs`. A ForceQuasiImmutable abort resumes that MIFrame at
-/// the CALL's `next_pc` (`blackhole.py _setup_return_value_*`), so the
-/// published image is the abort-point stack (`_copy_data_from_miframe`).
+/// Portal jitcode that pops before the CALL has already run
+/// `_opimpl_setarrayitem_vable` / `_opimpl_setfield_vable`. The published
+/// image is that post-pop stack from the ordinary vable boxes
+/// (`pyjitpl.py` `capture_resumedata` passes `virtualizable_boxes` as they
+/// stand; `blackhole.py` `_copy_data_from_miframe`).
 pub(crate) fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
-    let paused = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .last()
-            .and_then(|frame| frame.paused_live())
-    }?;
+    if ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .and_then(|frame| frame.paused_live())
+        .is_none()
+    {
+        return None;
+    }
     let py_pc = ctx.fbw_mode.inline_caller_py_pc.unwrap_or(0) as usize;
-    let (abort_vsd, abort_last) = paused.abort_point_scalars();
-    if let Some(valuestackdepth) = abort_vsd {
-        let nlocals = {
-            let sym = ctx.fbw_mode.snapshot_sym;
-            if sym.is_null() {
-                latchdbg!("origin={origin} paused-portal-mirror no-snapshot-sym");
-                return None;
-            }
-            // SAFETY: pointer live for the full-body walk; read-only.
-            let n = unsafe { (*sym).nlocals() };
-            let frame = unsafe { (*sym).live_vable_frame_addr() };
-            crate::state::concrete_nlocals(frame).unwrap_or(n)
-        };
-        if valuestackdepth < nlocals {
-            latchdbg!(
-                "origin={origin} paused-portal-mirror abort vsd={valuestackdepth} \
-                 below nlocals={nlocals}"
-            );
+    let nlocals = {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            latchdbg!("origin={origin} paused-portal-mirror no-snapshot-sym");
             return None;
         }
-        let height = valuestackdepth - nlocals;
-        let slots = stack_slots_from_vable_boxes(ctx.trace_ctx, nlocals, valuestackdepth).or_else(
-            || {
-                let boxes = paused.frame_state().borrow().vstack_boxes.clone();
-                resolve_operand_boxes(ctx, &boxes, height, origin)
-            },
-        )?;
-        return Some(MirrorStackImage {
-            py_pc,
-            slots,
-            valuestackdepth: Some(valuestackdepth),
-            last_instr: abort_last,
-            synchronized: true,
-        });
-    }
-    let boxes = paused.frame_state().borrow().vstack_boxes.clone();
-    let slots = resolve_operand_boxes(ctx, &boxes, boxes.len(), origin)?;
+        // SAFETY: pointer live for the full-body walk; read-only.
+        let n = unsafe { (*sym).nlocals() };
+        let frame = unsafe { (*sym).live_vable_frame_addr() };
+        crate::state::concrete_nlocals(frame).unwrap_or(n)
+    };
     let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
+    let valuestackdepth = valuestackdepth?;
+    if valuestackdepth < nlocals {
+        latchdbg!(
+            "origin={origin} paused-portal-mirror vsd={valuestackdepth} \
+             below nlocals={nlocals}"
+        );
+        return None;
+    }
+    let slots = stack_slots_from_vable_boxes(ctx.trace_ctx, nlocals, valuestackdepth)?;
     Some(MirrorStackImage {
         py_pc,
         slots,
-        valuestackdepth,
+        valuestackdepth: Some(valuestackdepth),
         last_instr,
-        synchronized: false,
+        synchronized: true,
     })
 }
 
