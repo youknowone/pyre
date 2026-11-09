@@ -5055,6 +5055,7 @@ fn trace_and_compile_from_bridge_body(
         driver.set_bridge_entered_at_guard_resume(true);
     }
     let mut snapshot_error = None;
+    let first_segment = std::cell::Cell::new(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -5096,6 +5097,7 @@ fn trace_and_compile_from_bridge_body(
                     trace_frame,
                     live_frame_addr,
                     false,
+                    first_segment.replace(false),
                 );
                 // pyjitpl.py raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed

@@ -21223,6 +21223,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             if abort_blackhole_latched() {
                 return Err(error);
             }
+            // An effect the walk already applied would run again in the
+            // residual call; propagate like the `OrthodoxSubWalkTraceUnsupported`
+            // arm below (`aborted_tracing`).
+            if !rewind.nothing_unrewindable_applied() {
+                return Err(error);
+            }
             cut_declined_subwalk(ctx, pre_fold_pos);
             residualize_inline_call_via_fnaddr(
                 ctx,

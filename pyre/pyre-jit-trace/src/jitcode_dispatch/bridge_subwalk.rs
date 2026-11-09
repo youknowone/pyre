@@ -360,9 +360,13 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // adjacent `catch_exception` (`handle_exception_in_frame` /
     // `finishframe_exception`). `prepare_resume_from_failure` left the grab
     // on walker `last_exc_value`; a later `finishframe` nulls it.
+    // `finishframe_exception` delivers the newest raise; the bridge grab
+    // only applies when no frame raised since.
+    let carrier_raise_seed = session.borrow_mut().carrier_raise_seed.take();
     let exc_edge_precondition = trace_ctx.is_bridge_trace
         && trace_ctx.bridge_source_is_exception_guard()
-        && !sym.last_exc_value().is_null();
+        && !sym.last_exc_value().is_null()
+        && carrier_raise_seed.is_none();
     // `finishframe_exception` (`pyjitpl.py`) reads the frame's
     // `catch_exception` and jumps to the handler with no further condition on
     // where the handler leads.  A handler that RETURNS out of the frame instead
@@ -496,10 +500,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // last_exc_value` is already the standing exception box, so the handler's
         // `last_exc_value/>r` reads it.  On the normal path, seed the mirror at
         // the first-walked pc as before.
-        // Carrier-boundary raise seed (`finishframe_exception`): a depth-2
-        // inlined callee's sub-walk raised and the root frame's handler covers
-        // the CALL (set by `drive_bridge_carrier_walk`).  Consumed once here.
-        let carrier_raise_seed = session.borrow_mut().carrier_raise_seed.take();
         // `finishframe_exception` already moved the top frame. A pc that
         // differs from the failing guard's resume pc is the handler;
         // otherwise keep the exception-table catch the unprepared path uses.
@@ -515,7 +515,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // pc applied to the outer body is not an instruction boundary.
         let prepared_handler = walked_jitcode_index
             .and_then(|index| prepared_handler_in(wc.trace_ctx, jitcode_code, index, position));
-        let handler_entry = prepared_handler.or(exc_edge_catch_target);
+        let handler_entry = if carrier_raise_seed.is_some() {
+            None
+        } else {
+            prepared_handler.or(exc_edge_catch_target)
+        };
         // Set by the carrier seed's no-handler arm: the root frame lets the
         // exception through, so the trace ends at bridge entry and the walk is
         // skipped entirely.

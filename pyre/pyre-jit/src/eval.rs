@@ -13651,6 +13651,7 @@ fn compile_and_run_once(
     let mut snapshot_error = None;
     let mut snapshot_saved_last_instr = None;
     let mut published_abort_image = false;
+    let first_segment = std::cell::Cell::new(true);
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
     let outcome = driver.jit_merge_point_keyed(
@@ -13739,6 +13740,7 @@ fn compile_and_run_once(
                     concrete_frame,
                     live_frame_addr,
                     true,
+                    first_segment.replace(false),
                 );
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
                 // A published abort image has not driven yet

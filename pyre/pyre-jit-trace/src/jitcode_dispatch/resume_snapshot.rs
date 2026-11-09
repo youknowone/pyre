@@ -3461,9 +3461,8 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
 /// no resume marker, or when a marked section can reach such a residual
 /// ([`helper_resume_reaches_blocker`]). Collapse is refused once a
 /// heap-writing residual or a journaled live-heap effect has executed
-/// since the level was entered; Frames is then the only sound resume,
-/// even with a blocker (`jit_ll_arraycopy` in
-/// `_orig_ll_list_int_resize_hint_really`).
+/// since the level was entered, and so is a blocker section then (the
+/// guard is refused).
 fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3508,8 +3507,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
-    // unless a heap write already ran, in which case collapse would
-    // re-run that write.
+    // unless a heap write already ran, in which case the guard is refused.
     let helper_level_count = {
         let session = ctx.session.borrow();
         session
@@ -3569,15 +3567,9 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
         (heap_moved, journal_delta, outer_index)
     };
-    if python_chain_complete
-        && sections_have_markers
-        && (!any_blocker || heap_moved || journal_delta != 0)
-    {
+    if python_chain_complete && sections_have_markers && !any_blocker {
         if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[numbered-helper-guard] frames op_pc={op_pc} blocker={any_blocker} \
-                 heap_moved={heap_moved} journal_delta={journal_delta}"
-            );
+            eprintln!("[numbered-helper-guard] frames op_pc={op_pc} blocker={any_blocker}");
         }
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }

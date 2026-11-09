@@ -1190,6 +1190,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
+    prepare_resume_from_failure: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox, bool) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -1292,9 +1293,14 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
     // `prepare_resume_from_failure` (`pyjitpl.py`): one-time copy of
-    // `cpu.grab_exc_value(deadframe)` onto walker `last_exc_value`. Both
-    // the live-frame walk and the carrier walk start after this call.
-    crate::jitcode_dispatch::seed_standing_exception_for_walk(sym, ctx);
+    // `cpu.grab_exc_value(deadframe)` onto walker `last_exc_value`. Runs
+    // on the first segment only (`prepare_resume_from_failure` precedes
+    // `interpret()`; later merge-point segments keep the walker's
+    // `last_exc_value`). Both the live-frame walk and the carrier walk
+    // start after this call.
+    if prepare_resume_from_failure {
+        crate::jitcode_dispatch::seed_standing_exception_for_walk(sym, ctx);
+    }
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
             unsafe { (*sym.jitcode()).index as i32 },
