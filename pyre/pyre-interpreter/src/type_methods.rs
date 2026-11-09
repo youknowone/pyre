@@ -634,10 +634,18 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
         list = pyre_object::listobject::w_list_materialize_range(list);
         other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let n = w_list_len(other);
-        if w_list_len(list) == 0 && pyre_object::listobject::w_list_is_range_strategy(other) {
-            // EmptyListStrategy._extend_from_list delegates to the
-            // donor's copy_into; BaseRangeListStrategy shares its
-            // immutable erased tuple rather than appending boxed ints.
+        // list_preallocate_exact sizes the emulated allocation for both arms.
+        pyre_object::listobject::w_list_reserve_for_extend(list, n);
+        if matches!(
+            pyre_object::listobject::w_list_strategy(list),
+            pyre_object::listobject::ListStrategy::Empty
+                | pyre_object::listobject::ListStrategy::Size
+        ) {
+            // EmptyListStrategy._extend_from_list (SizeListStrategy inherits
+            // it): `w_other.copy_into(w_list)`.  The receiver adopts the
+            // donor's strategy with a copy of its storage -- a range donor
+            // shares its immutable erased tuple -- instead of appending the
+            // items one by one.
             pyre_object::listobject::w_list_setslice_mode(
                 list,
                 0,
@@ -645,10 +653,9 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
                 other,
                 majit_metainterp::jit::we_are_jitted(),
             )
-            .expect("range copy_into an empty exact list");
+            .expect("copy_into an empty list");
             return Ok(());
         }
-        pyre_object::listobject::w_list_reserve_for_extend(list, n);
         for i in 0..n {
             list = pyre_object::gc_roots::shadow_stack_get(root_base);
             other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
