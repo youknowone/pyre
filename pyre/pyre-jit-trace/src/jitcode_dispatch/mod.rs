@@ -4698,11 +4698,15 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return Ok(None);
     };
-    let (green_spec, red_types) = {
+    let (green_spec, red_types, target_is_pypyjit_portal) = {
         let Some(jd) = driver.meta_interp().staticdata.jitdrivers_sd.get(jd_index) else {
             return Ok(None);
         };
-        (jd.green_args_spec(), jd.red_arg_types_as_ir_types())
+        (
+            jd.green_args_spec(),
+            jd.red_arg_types_as_ir_types(),
+            jd.name == "pypyjit",
+        )
     };
     let mut gi = 0usize;
     let mut gr = 0usize;
@@ -4897,13 +4901,23 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let allboxes = recursive_call_allboxes(
         funcbox, call_descr, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
-    // `gettrace()` / `profilefunc` in front of `CALL_ASSEMBLER`, at this
-    // recursive-call's pc — the inlined `execute_frame` read upstream
-    // places here.  This opcode is already inside `dispatch` of a frame
-    // whose `call_trace` ran; a hook already set records nothing
-    // (`record_call_trace_guards_before_assembler`) and the assembler call
-    // proceeds.
-    record_call_trace_guards_before_assembler(ctx, op.pc)?;
+    // `pyframe.py execute_frame` runs `ec.call_trace(frame)` before entering
+    // the `pypyjit` portal (`dispatch`), and the walker enters a recursive
+    // `pypyjit` callee at that portal's `jit_merge_point`, so the
+    // `call_trace` hook reads are recorded here, at the caller's CALL
+    // (`record_call_trace_guards_before_assembler`; nothing is recorded when
+    // a hook is already set). Only that driver's reds are
+    // `interp_jit.py reds = ['frame', 'ec']`; other targets
+    // (`generatorentry`, `unpackiterable`) run their own portal bodies.
+    if target_is_pypyjit_portal {
+        // interp_jit.py reds = ['frame', 'ec']: the callee PyFrame is the first ref red.
+        let frame_box = reds_r[0];
+        let concrete_frame = match ctx.trace_ctx.concrete_of_opref(frame_box) {
+            Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *mut pyre_interpreter::PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        record_call_trace_guards_before_assembler(ctx, op.pc, frame_box, concrete_frame)?;
+    }
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // Concrete portal runner first (`do_recursive_call` /
     // `execute_varargs`). `direct_assembler_call` then records
@@ -14862,23 +14876,24 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     )
 }
 
-/// `pyframe.py execute_frame` → `ec.call_trace(frame)` reads `gettrace()`
-/// (`jit.promote(self.w_tracefunc)`) and `profilefunc` before `dispatch`.
-/// Record those reads in front of a `CALL_ASSEMBLER` that jumps to compiled
-/// `dispatch`, with resume at the CALLER's CALL (`op_pc`) — the same
-/// snapshot that call's other pre-call guards use.
+/// Walk the generated `call_trace` JitCode (`call_trace_jit_abi(ec, frame)`).
 ///
-/// A hook installed later fails the guards and re-runs the call in the
-/// interpreter.  A hook already set is declined by the caller (residual
-/// portal runner / `CallFn`); this records nothing in that state.
+/// The caller of a fresh recursive portal `CALL_ASSEMBLER` records
+/// `pyframe.py execute_frame`'s `ec.call_trace(frame)` here: that portal
+/// starts at `dispatch`'s `jit_merge_point` (`interp_jit.py`), past the
+/// prologue. Resume stays at the CALLER's CALL (`op_pc`). A hook already
+/// set is declined here (`ec_hook_installed`); the walker debug-asserts
+/// no hook is installed.
 pub(crate) fn record_call_trace_guards_before_assembler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    frame_box: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
 ) -> Result<(), DispatchError> {
     if ec_hook_installed() {
         return Ok(());
     }
-    walker_call_trace_hook_reads(ctx, op_pc)
+    walker_call_trace_hook_reads(ctx, op_pc, frame_box, concrete_frame)
 }
 
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
