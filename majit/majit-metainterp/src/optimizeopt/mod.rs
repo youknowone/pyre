@@ -363,6 +363,26 @@ mod walk_live_op_quasiimmut_tests {
         });
         assert_eq!(descr.as_quasi_immut_descr().unwrap().struct_ptr(), 0x5100);
     }
+
+    #[test]
+    fn published_context_walks_imported_label_boxes() {
+        let old = GcRef(0x4100);
+        let new = GcRef(0x5100);
+        let label = Operand::const_from_value(Value::Ref(old));
+
+        let mut ctx = OptContext::new(0);
+        ctx.imported_label_args = Some(vec![label.clone()]);
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old {
+                *slot = new;
+            }
+        });
+
+        assert_eq!(label.const_value(), Some(Value::Ref(new)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
@@ -1422,8 +1442,8 @@ pub struct OptContext {
     /// store_final_boxes_in_guard to resolve NONE positions
     /// inherited from Phase 1 virtualization.
     pub(crate) imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
-    /// Phase 2 imported label args (OpRefs in Phase 2 namespace).
-    pub imported_label_args: Option<Vec<OpRef>>,
+    /// Phase 2 imported label boxes returned by `VirtualState::make_inputargs`.
+    pub imported_label_args: Option<Vec<Operand>>,
     /// RPython shortpreamble.py: active phase-2 short preamble builder.
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder:
@@ -1657,11 +1677,11 @@ pub struct OptContext {
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
-    /// because the Box object survives both phases (history.py:220 parity).
-    /// Pyre's flat `OpRef(u32)` requires explicit carry: Phase 1's emit ops
-    /// — at positions in `[num_inputs, phase2_inputarg_base)` — appear as
-    /// `imported_label_args`, fail-arg sources, and `record_same_as` source
-    /// arguments inside Phase 2, but never inside Phase 2's own `new_operations`.
+    /// because the Box object survives both phases (`history.py` box.type).
+    /// Phase 1's emit ops — at positions in `[num_inputs, phase2_inputarg_base)` —
+    /// appear as fail-arg sources and `record_same_as` source arguments inside
+    /// Phase 2, but never inside Phase 2's own `new_operations`.
+    /// `imported_label_args` carries the imported boxes themselves.
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<majit_ir::OpRc>,
@@ -5684,7 +5704,7 @@ impl OptContext {
     /// - `b-typetag`: a producer Op exists at the same RAW position under a
     ///   different type tag (the #97 type-tag divergence signal).
     /// - `b-rekey-*`: the OpRef is named by a carried Phase-1 registry
-    ///   (`inputargs` / `imported_label_args` / `imported_virtual_args`), so a
+    ///   (`inputargs` / `imported_label_args` via `to_opref()` / `imported_virtual_args`), so a
     ///   producer exists in Phase 1 but is not in a `find_producer_op` store.
     /// - `b-shortpure`: the OpRef is the `result` of a carried
     ///   `imported_short_pure_ops` entry — a short-preamble producer survives
@@ -5717,7 +5737,7 @@ impl OptContext {
             return "b-rekey-inputargs";
         }
         if let Some(label_args) = self.imported_label_args.as_ref()
-            && label_args.contains(&opref)
+            && label_args.iter().any(|arg| arg.to_opref() == opref)
         {
             return "b-rekey-label";
         }
@@ -8209,8 +8229,8 @@ impl OptContext {
     /// `Some(tp)` when `opref` falls in either the current context's
     /// own inputarg range `[inputarg_base, inputarg_base + num_inputs)`
     /// (RPython invariant) or the shared low range `[0, num_inputs)`
-    /// (Phase 1's inputarg slot OpRefs referenced from Phase 2 via
-    /// `imported_label_args`).  Returns `None` for constants, sentinels,
+    /// (Phase 1's inputarg slot OpRefs referenced from Phase 2 fail-arg
+    /// and other still-positional families).  Returns `None` for constants, sentinels,
     /// out-of-range OpRefs, Void-typed slots, or empty `inputarg_types`
     /// (test contexts that bypass `setup_optimizations`).
     ///
@@ -9814,6 +9834,11 @@ impl OptContext {
         }
         for inputarg in &self.inputargs {
             inputarg.walk_const_ptr_refs(visitor);
+        }
+        if let Some(label_args) = &self.imported_label_args {
+            for arg in label_args {
+                arg.walk_const_ptr_refs(visitor);
+            }
         }
         if let Some(end_args) = &self.preamble_end_args {
             for arg in end_args {

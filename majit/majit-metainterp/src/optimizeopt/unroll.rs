@@ -1153,8 +1153,7 @@ impl UnrollOptimizer {
                     // RPython Box type parity: Phase 1's emit ops carry
                     // `op.type_` intrinsically; Phase 2's `op_at` reads it
                     // directly to resolve cross-phase OpRefs that appear as
-                    // imported_label_args / fail_args / record_same_as
-                    // sources (history.py:220 parity).
+                    // fail_args / record_same_as sources (`history.py` box.type).
                     self.phase1_emit_ops = std::mem::take(&mut opt_p1.phase1_emit_ops);
                     // RPython: same Optimizer instance keeps patchguardop.
                     if self.phase1_patchguardop.is_none() {
@@ -1509,9 +1508,9 @@ impl UnrollOptimizer {
         }
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
-        // reference these via `imported_label_args`. They are NOT in the
-        // `p2_cache` (only raw trace positions are), so leave
-        // `phase1_emit_ops` untranslated.
+        // reference these via fail_args and other still-positional families.
+        // They are NOT in the `p2_cache` (only raw trace positions are), so
+        // leave `phase1_emit_ops` untranslated.
         // Hand opt_p2 the per-iter operand pool that the Phase 2
         // iter allocated. Disjoint from opt_p1's pool — _forwarded mutations
         // recorded against Phase 1 boxes do not alias Phase 2 boxes for the
@@ -1893,74 +1892,10 @@ impl UnrollOptimizer {
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
-            // RPython Box parity: each used_box is a distinct Box even
-            // when two virtuals share the same OpRef. Allocate fresh
-            // OpRefs for duplicates so the LABEL carries independent slots.
-            {
-                let mut seen_used: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
-                let mut next_fresh = current_label_args
-                    .iter()
-                    .copied()
-                    .chain(initial_sp.used_boxes.iter().copied())
-                    .map(|a| a.raw())
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1)
-                    .max(body_num_inputs as u32 + 100);
-                for ub in &initial_sp.used_boxes {
-                    let ub = *ub;
-                    if !seen_used.contains(&ub) {
-                        seen_used.insert(ub);
-                        current_label_args.push(ub);
-                    } else {
-                        // shortpreamble.py create_short_inputargs inputarg_from_tp parity:
-                        // when the short preamble needs a fresh label slot,
-                        // PyPy creates a new typed InputArg from the source
-                        // box's `.type`. Carry that into duplicate used_box
-                        // slots: typed parents produce a matching
-                        // `InputArg{Int,Float,Ref}` alias.
-                        //
-                        // history.py:220 `box.type` is the authoritative
-                        // source. Variant tag is the primary line-by-line
-                        // equivalent (resoperation.py
-                        // `AbstractValue.type`); legacy untyped paths fall
-                        // through to Phase 2's `final_ctx.opref_type` and
-                        // the recorder's `trace_inputargs`.
-                        let tp = ub
-                            .ty()
-                            .or_else(|| {
-                                opt_p2.final_ctx.as_ref().and_then(|ctx| ctx.opref_type(ub))
-                            })
-                            .or_else(|| {
-                                let raw = ub.raw() as usize;
-                                opt_p2.trace_inputargs.get(raw).map(Operand::type_)
-                            })
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "duplicate short-preamble used_box {:?} has untyped variant; \
-                                     RPython label/inputarg boxes carry Int/Ref/Float type \
-                                     intrinsically (resoperation.py:1544 inputarg_from_tp)",
-                                    ub
-                                )
-                            });
-                        if matches!(tp, Type::Void) {
-                            panic!(
-                                "duplicate short-preamble used_box {:?} has void type; \
-                                 RPython label/inputarg boxes must carry Int/Ref/Float \
-                                 type (resoperation.py:1544 inputarg_from_tp)",
-                                ub
-                            );
-                        }
-                        let alias = OpRef::input_arg_typed(next_fresh, tp);
-                        current_label_args.push(alias);
-                        next_fresh += 1;
-                    }
-                }
-            }
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
-                // opencoder.py:259 inputarg_from_tp parity — Phase 2 inputargs
+                // opencoder.py inputarg_from_tp parity — Phase 2 inputargs
                 // carry the same producer-side types as Phase 1's; fall back
                 // to Ref when types are unavailable.
                 let types: Vec<majit_ir::Type> = opt_p2
@@ -1970,6 +1905,65 @@ impl UnrollOptimizer {
                     .unwrap_or_else(|| vec![majit_ir::Type::Ref; body_num_inputs]);
                 crate::optimizeopt::OptContext::with_inputarg_types(32, &types)
             });
+            // RPython Box parity: each used_box is a distinct Box even
+            // when two virtuals share the same OpRef. Allocate fresh
+            // boxes for duplicates so the LABEL carries independent slots.
+            {
+                let mut seen_used: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
+                for ub in &initial_sp.used_boxes {
+                    let ub = *ub;
+                    if !seen_used.contains(&ub) {
+                        seen_used.insert(ub);
+                        current_label_args.push(
+                            jump_ctx
+                                .get_box_replacement_operand_opt(ub)
+                                .unwrap_or_else(|| jump_ctx.materialize_operand_at(ub)),
+                        );
+                    } else {
+                        // shortpreamble.py create_short_inputargs inputarg_from_tp parity:
+                        // when the short preamble needs a fresh label slot,
+                        // PyPy creates a new typed InputArg from the source
+                        // box's `.type`. Carry that into duplicate used_box
+                        // slots: typed parents produce a matching
+                        // `InputArg{Int,Float,Ref}` alias.
+                        //
+                        // `history.py` box.type is the authoritative source.
+                        // Variant tag is the primary line-by-line equivalent
+                        // (`resoperation.py` `AbstractValue.type`); legacy
+                        // untyped paths fall through to Phase 2's
+                        // `jump_ctx.opref_type` and the recorder's
+                        // `trace_inputargs`.
+                        let tp = ub
+                            .ty()
+                            .or_else(|| jump_ctx.opref_type(ub))
+                            .or_else(|| {
+                                let raw = ub.raw() as usize;
+                                opt_p2.trace_inputargs.get(raw).map(Operand::type_)
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "duplicate short-preamble used_box {:?} has untyped variant; \
+                                     RPython label/inputarg boxes carry Int/Ref/Float type \
+                                     intrinsically (`resoperation.py` inputarg_from_tp)",
+                                    ub
+                                )
+                            });
+                        if matches!(tp, Type::Void) {
+                            panic!(
+                                "duplicate short-preamble used_box {:?} has void type; \
+                                 RPython label/inputarg boxes must carry Int/Ref/Float \
+                                 type (`resoperation.py` inputarg_from_tp)",
+                                ub
+                            );
+                        }
+                        let alias_pos = jump_ctx.reserve_pos_typed(tp).raw();
+                        let alias = Operand::from_bound_inputarg(&majit_ir::InputArgRc::new(
+                            majit_ir::InputArg::from_type(tp, alias_pos),
+                        ));
+                        current_label_args.push(alias);
+                    }
+                }
+            }
 
             // unroll.py: jump_to_existing_trace(force_boxes=False)
             // RPython: except InvalidLoop → jump_to_preamble immediately,
@@ -2231,10 +2225,11 @@ impl UnrollOptimizer {
         let mut appended_label_args: Vec<OpRef> = Vec::new();
         let sp_used_boxes: Vec<OpRef> = sp.used_boxes.clone();
         let sp_jump_args: Vec<OpRef> = sp.jump_args.clone();
+        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
         let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
-            &label_args,
+            &label_arg_refs,
             &exported_renamed_inputargs,
             &sp_used_boxes,
             &sp_jump_args,
@@ -3792,7 +3787,7 @@ impl OptUnroll {
     pub fn jump_to_existing_trace(
         &self,
         jump_args: &[OpRef],
-        current_label_args: Option<&[OpRef]>,
+        current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -3821,7 +3816,7 @@ impl OptUnroll {
     pub fn jump_to_existing_trace_with_vs(
         &self,
         jump_args: &[OpRef],
-        current_label_args: Option<&[OpRef]>,
+        current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -3857,7 +3852,7 @@ impl OptUnroll {
     fn jump_to_existing_trace_impl(
         &self,
         jump_args: &[OpRef],
-        current_label_args: Option<&[OpRef]>,
+        current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -4085,11 +4080,9 @@ impl OptUnroll {
                         .is_some_and(|b| ctx.has_ptr_info(b));
                     if !resolved_has_info {
                         // Try label arg at same index
-                        if let Some(&label_arg) = label.get(i) {
-                            let label_box = ctx.get_box_replacement_operand_opt(label_arg);
-                            if let Some(info) =
-                                label_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-                            {
+                        if let Some(label_arg) = label.get(i) {
+                            let label_box = label_arg.get_box_replacement(false);
+                            if let Some(info) = ctx.peek_ptr_info(&label_box) {
                                 ctx.ensure_ptr_info_preserve_forwarding(jump_box.to_opref(), info);
                             }
                         }
@@ -4129,7 +4122,9 @@ impl OptUnroll {
                     // add_op_to_short returned None" path: drop the
                     // peeled trace and let the unroll caller raise
                     // InvalidLoop, falling back to jump_to_preamble.
-                    if !builder.setup(&sp, label_args, ctx) {
+                    let label_arg_refs: Vec<OpRef> =
+                        label_args.iter().map(Operand::to_opref).collect();
+                    if !builder.setup(&sp, &label_arg_refs, ctx) {
                         optimizer.short_preamble_producer = Some(builder);
                         // Drop the peeled trace and let the caller fall back
                         // to jump_to_preamble. Recorded as a deferred
@@ -4685,7 +4680,7 @@ impl OptUnroll {
         exported_state: &ExportedState,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-    ) -> Vec<OpRef> {
+    ) -> Vec<Operand> {
         // assert len(exported_state.next_iteration_args) == len(targetargs)
         assert_eq!(
             exported_state.next_iteration_args.len(),
@@ -4763,8 +4758,8 @@ impl OptUnroll {
             .virtual_state
             .make_inputargs(targetargs, optimizer, ctx, false)
         {
-            Ok(args) => args.iter().map(|b| b.to_opref()).collect(),
-            // unroll.py:483 `raise InvalidLoop`: the imported virtual state is
+            Ok(args) => args,
+            // unroll.py `raise InvalidLoop`: the imported virtual state is
             // incompatible. Recorded as a deferred signal (checked by the
             // caller) so the loop is abandoned without unwinding.
             Err(_) => {
@@ -4778,12 +4773,13 @@ impl OptUnroll {
                 .iter()
                 .map(|arg| arg.to_opref())
                 .collect();
+            let label_arg_refs: Vec<_> = label_args.iter().map(Operand::to_opref).collect();
             eprintln!(
                 "[callee-rca][import-state] targetargs={:?} next_iteration_args={:?} \
                  label_args={:?} num_boxes={} entries={}",
                 targetargs,
                 next_iteration_args,
-                label_args,
+                label_arg_refs,
                 exported_state.virtual_state.num_boxes(),
                 exported_state.virtual_state.num_entries(),
             );
@@ -4804,7 +4800,7 @@ impl OptUnroll {
     pub fn import_short_preamble_state(
         &self,
         targetargs: &[OpRef],
-        label_args: &[OpRef],
+        label_args: &[Operand],
         exported_state: &ExportedState,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -4828,7 +4824,8 @@ impl OptUnroll {
             .filter(|(_, info)| info.is_virtual())
             .filter_map(|(i, _)| targetargs.get(i).copied())
             .collect();
-        let mut short_args = label_args.to_vec();
+        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
+        let mut short_args = label_arg_refs;
         short_args.extend(virtuals);
         // unroll.py:486-489 ShortPreambleBuilder constructor parity.
         //
@@ -4979,14 +4976,14 @@ pub(crate) fn import_state(
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
-) -> Vec<OpRef> {
+) -> Vec<Operand> {
     OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx)
 }
 
 #[cfg(test)]
 pub(crate) fn import_short_preamble_state(
     targetargs: &[OpRef],
-    label_args: &[OpRef],
+    label_args: &[Operand],
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
@@ -5021,7 +5018,7 @@ pub(crate) fn import_state_full(
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
-) -> Vec<OpRef> {
+) -> Vec<Operand> {
     let label_args = OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx);
     // import_state records a deferred InvalidLoop signal on `ctx` when the
     // virtual states don't match; stop here (the caller observes the signal and
@@ -5031,6 +5028,7 @@ pub(crate) fn import_state_full(
         return label_args;
     }
     optimizer.imported_label_args = Some(label_args.clone());
+    ctx.imported_label_args = Some(label_args.clone());
     if !optimizer.imported_virtuals.is_empty() {
         optimizer.install_imported_virtuals(ctx);
     }
@@ -7695,7 +7693,11 @@ mod tests {
             &mut optimizer,
             &mut ctx2,
         );
-        assert_eq!(label_args, vec![OpRef::int_op(21)]);
+        assert_eq!(label_args.len(), 1);
+        assert!(
+            label_args[0].same_box(&exported.end_args[0]),
+            "import_state must retain the exported label box"
+        );
         // unroll.py:93-96: IntBound IS imported with widen() and stored
         // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
@@ -8157,7 +8159,9 @@ mod tests {
             &mut optimizer,
             &mut ctx2,
         );
-        assert_eq!(label_args, vec![OpRef::int_op(10), OpRef::int_op(11)]);
+        assert_eq!(label_args.len(), 2);
+        assert!(label_args[0].same_box(&exported.end_args[0]));
+        assert!(label_args[1].same_box(&exported.end_args[1]));
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
@@ -8368,7 +8372,9 @@ mod tests {
             &mut optimizer,
             &mut ctx2,
         );
-        assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
+        assert_eq!(label_args.len(), 2);
+        assert!(label_args[0].same_box(&exported.end_args[0]));
+        assert!(label_args[1].same_box(&exported.end_args[1]));
         // history.py ConstPtr.value inline: the imported constant
         // lands at `OpRef::ConstPtr(ptr)`, carrying the pointer
         // directly.
@@ -8482,6 +8488,7 @@ mod tests {
         let func = OpRef::const_int(func_ptr);
         let source = OpRef::int_op(11);
         let source_box = rooted_resop_operand(Type::Int, 11);
+        let phase2_result = rooted_resop_operand(Type::Int, 3);
         let call = {
             let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
             op.pos().set(source);
@@ -8521,7 +8528,7 @@ mod tests {
 
         import_short_preamble_state(
             &[OpRef::int_op(0)],
-            &[OpRef::int_op(3)],
+            std::slice::from_ref(&phase2_result),
             &exported,
             &mut optimizer,
             &mut ctx,

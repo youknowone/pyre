@@ -434,7 +434,7 @@ pub struct Optimizer {
     compile_live_op_roots_slot: Option<usize>,
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
-    pub imported_label_args: Option<Vec<OpRef>>,
+    pub imported_label_args: Option<Vec<Operand>>,
     /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
     pub patchguardop: Option<Op>,
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
@@ -862,7 +862,6 @@ impl Optimizer {
         }
     }
 
-    #[allow(deprecated)] // Phase 2 import_state forwards synthetic positions for imported virtual fields.
     pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
         // virtualstate.py make_inputargs + 627-634 _enum parity:
         // label_args are laid out by recursive _enum traversal where each
@@ -886,7 +885,7 @@ impl Optimizer {
         // RPython Box identity parity: Two-pass approach.
         //
         // Pass 1: process all fields with import_virtual_state_from_label_args.
-        //   Constant fields get alloc_op_position. Leaf fields get LABEL arg OpRefs.
+        //   Constant fields get alloc_op_position. Leaf fields get LABEL arg boxes.
         //   Record which leaf field positions need SameAs (skip_flush_mode = Phase 2).
         //
         // Pass 2: allocate SameAs positions and create ops for recorded leaves.
@@ -904,8 +903,8 @@ impl Optimizer {
             head_load_descr_index: Option<u32>,
         }
         let mut entries: Vec<VirtualEntry> = Vec::new();
-        // Track leaf field positions that need SameAs (position, entry_idx, field_idx).
-        let mut same_as_targets: Vec<(OpRef, usize, usize)> = Vec::new();
+        // Track leaf field boxes that need SameAs (box, entry_idx, field_idx).
+        let mut same_as_targets: Vec<(Operand, usize, usize)> = Vec::new();
 
         // RPython parity: traverse ALL states in order (not just virtuals).
         // Non-virtual states advance label_slot without creating entries.
@@ -1002,22 +1001,15 @@ impl Optimizer {
                         ctx,
                         &mut walk_visited,
                     );
-                    let field_ref = field_box.to_opref();
                     let field_idx = fields.len();
-                    let field_is_virtual = ctx
-                        .get_box_replacement_operand_opt(field_ref)
-                        .as_ref()
-                        .is_some_and(|b| ctx.is_virtual(b));
-                    let field_is_const = ctx
-                        .get_box_replacement_operand_opt(field_ref)
-                        .and_then(|cb| cb.const_value())
-                        .is_some();
+                    let field_is_virtual = ctx.is_virtual(&field_box);
+                    let field_is_const = field_box.const_value().is_some();
                     if ctx.skip_flush_mode
-                        && !field_ref.is_none()
+                        && !field_box.is_none()
                         && !field_is_const
                         && !field_is_virtual
                     {
-                        same_as_targets.push((field_ref, entries.len(), field_idx));
+                        same_as_targets.push((field_box.clone(), entries.len(), field_idx));
                     }
                     let field_idx = descr
                         .as_field_descr()
@@ -1028,7 +1020,7 @@ impl Optimizer {
                             )
                         })
                         .unwrap_or_else(|| descr.index());
-                    fields.push((field_idx, field_ref));
+                    fields.push((field_idx, field_box.to_opref()));
                     let _ = descr; // descr threading handled via SizeDescr.all_fielddescrs()
                 }
                 entries.push(VirtualEntry {
@@ -1066,17 +1058,13 @@ impl Optimizer {
         }
         for (label_arg, entry_idx, field_idx) in &same_as_targets {
             // RPython parity: Box.type carries the source type intrinsically.
-            // value_types[label_arg] is whatever the optimizer's emit() last
-            // recorded for that OpRef. A Type::Void here would be an upstream
-            // bookkeeping bug (a guard's pos collided with a Box position):
-            // letting it through reaches `same_as_for_type(Void)`, which is
-            // `unreachable!` and panics with a clear message.
-            let tp = ctx
-                .opref_type(*label_arg)
-                .expect("imported virtual leaf missing box.type");
+            let tp = label_arg.type_();
+            assert!(
+                !matches!(tp, Type::Void),
+                "imported virtual leaf missing box.type"
+            );
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-            let arg0 = ctx.materialize_operand_at(*label_arg);
-            let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(&arg0));
+            let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(label_arg));
             op.pos().set(ctx.reserve_pos_typed(tp));
             let fresh = op.pos().get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
@@ -1178,7 +1166,7 @@ impl Optimizer {
     /// `if op.get_forwarded() is not None: return` semantics).
     fn import_virtual_state_from_label_args_recurse(
         rc: &std::rc::Rc<crate::optimizeopt::virtualstate::VirtualStateInfoNode>,
-        imported_label_args: &[OpRef],
+        imported_label_args: &[Operand],
         label_slot: &mut usize,
         ctx: &mut OptContext,
         walk_visited: &mut crate::FxIndexMap<usize, Operand>,
@@ -1203,7 +1191,7 @@ impl Optimizer {
 
     fn import_virtual_state_from_label_args(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
-        imported_label_args: &[OpRef],
+        imported_label_args: &[Operand],
         label_slot: &mut usize,
         ctx: &mut OptContext,
         walk_visited: &mut crate::FxIndexMap<usize, Operand>,
@@ -1387,9 +1375,9 @@ impl Optimizer {
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
             | VirtualStateInfo::Unknown(_) => {
-                let opref = imported_label_args
+                let box_ = imported_label_args
                     .get(*label_slot)
-                    .copied()
+                    .cloned()
                     .unwrap_or_else(|| {
                         if crate::majit_log_enabled() {
                             eprintln!(
@@ -1398,20 +1386,13 @@ impl Optimizer {
                                 imported_label_args.len()
                             );
                         }
-                        OpRef::NONE
+                        Operand::None
                     });
                 *label_slot += 1;
-                // Imported label-arg leaf (KnownClass / NonNull / IntBounded
-                // / Unknown): resolve the already-materialized box for this
-                // label slot and write the imported state through it. An
-                // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
-                // above) yields `None` and the write no-ops — matching the
-                // prior `materialize_operand_at(OpRef::NONE) -> None` behavior.
-                let resolved = ctx.get_box_replacement_operand_opt(opref);
-                if let Some(box_) = &resolved {
-                    Self::apply_imported_virtual_state(info, box_, ctx);
+                if !box_.is_none() {
+                    Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
-                resolved.unwrap_or(Operand::None)
+                box_
             }
         }
     }
@@ -7753,8 +7734,8 @@ mod tests {
         // From a Phase-2-like context (`inputarg_base > 0`)
         // `OptContext::inputarg_type` must resolve low OpRefs in
         // `[0, num_inputs)` as Phase 1 inputarg slot lookups against the
-        // shared `inputarg_types` Vec (history.py:220 parity for
-        // `box.type` reads through `imported_label_args`).
+        // shared `inputarg_types` Vec (`history.py` box.type parity for
+        // remaining positional families).
         let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 3, 100, 103);
         ctx.inputargs = rooted_inputarg_operands(&[Type::Int, Type::Ref, Type::Float]);
         // Phase 2's own inputargs at [100..103) — own range still resolves.
