@@ -3226,14 +3226,23 @@ impl StoreCore {
     /// building a graph: the `code` object each `FunctionDesc` is made
     /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
     /// Same `CallPath.display_name` order as [`Self::iter`].
+    /// Aliases of one funcobj share one declaration `Rc`.
     pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
         let path_to_key = self.path_to_key.borrow();
         let graphs = self.graphs.borrow();
+        // Every spelling of one funcobj shares its declaration
+        // (`bookkeeper.py getdesc`: one desc per function object), so the
+        // header is built once per `GraphKey`, not once per alias.
+        let mut declarations: HashMap<&GraphKey, Option<std::rc::Rc<FunctionGraph>>> =
+            HashMap::new();
         let mut entries: Vec<_> = path_to_key
             .iter()
             .filter_map(|(path, key)| {
-                let declared = self.slot_declaration(graphs.get(key)?)?;
+                let declared = declarations
+                    .entry(key)
+                    .or_insert_with(|| graphs.get(key).and_then(|slot| self.slot_declaration(slot)))
+                    .clone()?;
                 Some((path.clone(), declared))
             })
             .collect();
