@@ -2380,7 +2380,11 @@ fn com_status(
     com: Option<(usize, usize)>,
     result: &CallValue,
 ) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
-    let (this_ptr, iid) = com_error_iid(obj, com)?;
+    let (this_ptr, iid) = match com_error_iid(obj, com) {
+        Err(err) => return Some(Err(err)),
+        Ok(None) => return None,
+        Ok(Some(pair)) => pair,
+    };
     let hresult = scalar_int_result(result);
     Some(if hresult < 0 {
         Err(super::com::error(hresult, iid, this_ptr))
@@ -2401,25 +2405,36 @@ fn com_status(
 /// The `this` pointer and interface id a failed COM call reports through, when
 /// the method was constructed with an id at all.
 #[cfg(windows)]
-fn com_error_iid(obj: PyObjectRef, com: Option<(usize, usize)>) -> Option<(usize, usize)> {
-    let (this_ptr, _) = com?;
-    let mut iid = instance_get(obj, IID_KEY)?;
+fn com_error_iid(
+    obj: PyObjectRef,
+    com: Option<(usize, usize)>,
+) -> Result<Option<(usize, usize)>, pyre_interpreter::PyError> {
+    let Some((this_ptr, _)) = com else {
+        return Ok(None);
+    };
+    let Some(mut iid) = instance_get(obj, IID_KEY) else {
+        return Ok(None);
+    };
     let (addr, len) = if unsafe { pyre_object::is_bytes(iid) } {
-        // `rffi.get_raw_address_of_string`: the address is a COM iid pointer.
+        // `rffi._get_raw_address_buf_from_string`: a failed allocation
+        // raises `MemoryError`; it does not mean "no interface id."
         let len = unsafe { pyre_object::bytesobject::w_bytes_len(iid) };
         let addr = pyre_object::with_roots!(iid => unsafe {
             pyre_object::bytesobject::w_bytes_raw_address(iid)
         });
         if addr.is_null() {
-            return None;
+            return Err(pyre_interpreter::PyError::memory_error(""));
         }
         (addr as usize, len)
     } else {
-        (cdata::cdata_addr(iid)?, cdata::cdata_len(iid)?)
+        match (cdata::cdata_addr(iid), cdata::cdata_len(iid)) {
+            (Some(addr), Some(len)) => (addr, len),
+            _ => return Ok(None),
+        }
     };
     // Anything that is not `GUID`-sized is not an interface id, and is passed
     // over the way an unrecognised one is.
-    (len == 16).then_some((this_ptr, addr))
+    Ok((len == 16).then_some((this_ptr, addr)))
 }
 
 /// The arguments a call is made with, and which of them the caller gets back.

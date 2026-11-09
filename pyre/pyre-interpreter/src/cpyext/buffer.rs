@@ -663,15 +663,11 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
             super::pyerrors::set_pending_error(crate::PyError::memory_error(""));
             return -1;
         }
-        // `buff_w` `except ValueError`: snapshot `as_str()`, `space.newbytes`,
+        // `buff_w` `except ValueError`: snapshot `buf.as_str()`, `space.newbytes`,
         // `make_ref` of that, `str2charp`, readonly.
         Err(pyre_object::buffer::RawAddressError::NoAddress) => {
-            let snapshot = unsafe {
-                pyre_object::memoryview::w_memoryview_view(reload(view_slot))
-                    .backing()
-                    .as_bytes()
-            }
-            .to_vec();
+            let snapshot =
+                unsafe { pyre_object::memoryview::w_memoryview_view(reload(view_slot)).gather() };
             let w_s = pyre_object::bytesobject::w_bytes_from_bytes(&snapshot);
             snapshot_slot = Some(pyre_object::gc_roots::shadow_stack_len());
             let _ = roots.pin_root(w_s);
@@ -718,7 +714,13 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     // empty `Vec` hands out a dangling address rather than one.
     let axes = carrier.ndim() != 0;
     unsafe {
-        (*view).buf = (first + carrier.offset() as usize) as *mut c_void;
+        // A snapshot of `as_str()` is already the logical bytes; the interior
+        // pointer of a live backing still needs the view offset.
+        (*view).buf = if force_readonly {
+            first as *mut c_void
+        } else {
+            (first + carrier.offset() as usize) as *mut c_void
+        };
         (*view).obj = exporter;
         (*view).len = carrier.length() as isize;
         (*view).itemsize = carrier.itemsize() as isize;

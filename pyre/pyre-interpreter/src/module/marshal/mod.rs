@@ -70,12 +70,19 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
 }
 
 /// The owning object `StringUnmarshaller` holds (`self.view` / `self.buf`).
+///
+/// A memoryview is accepted after `space.buffer_w(w_str, BUF_SIMPLE)` /
+/// `_check_released` at acquisition; `unmarshal_owned` then resolves it to
+/// the backing exporter so later `get` / `getslice` / `getitem` do not
+/// re-enter the caller's view.
 fn marshal_owner(obj: PyObjectRef, function: &str) -> Result<PyObjectRef, PyError> {
     if unsafe { bytesobject::is_bytes_like(obj) } {
         return Ok(obj);
     }
     if unsafe { memoryview::is_w_memoryview(obj) } {
-        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        // `StringUnmarshaller.__init__`: `space.buffer_w(w_str, BUF_SIMPLE)`
+        // / `_check_released` at acquisition. Later `get` / `getslice` /
+        // `getitem` do not re-check.
         crate::typedef::require_contiguous_buffer(obj)?;
         return Ok(obj);
     }
@@ -90,27 +97,24 @@ fn marshal_owner(obj: PyObjectRef, function: &str) -> Result<PyObjectRef, PyErro
     )))
 }
 
-/// `StringUnmarshaller.get` / `get1`: re-derive the slice from the rooted owner.
-///
-/// A memoryview released (or made non-contiguous) during unmarshal raises the
-/// same error `loads` already raises at entry (`W_MemoryView._check_released`
-/// / `require_contiguous_buffer`). Upstream `buf.getslice` / `getitem` go
-/// through that released check rather than reading an empty window.
-unsafe fn marshal_payload(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
-    unsafe {
-        if bytesobject::is_bytes_like(obj) {
-            Ok(bytesobject::bytes_like_data(obj))
-        } else if interp_array::is_array(obj) {
-            Ok(interp_array::w_array_bytes(obj))
-        } else if memoryview::is_w_memoryview(obj) {
-            crate::builtins::memoryview_check_released(obj)?;
-            crate::typedef::require_contiguous_buffer(obj)?;
-            Ok(memoryview::w_memoryview_view(obj)
-                .as_contiguous_bytes()
-                .unwrap_or(&[]))
-        } else {
-            Ok(&[])
-        }
+/// `StringUnmarshaller.limit` — `self.buf.getlength()` captured at `__init__`.
+unsafe fn marshal_acquired_limit(owner: PyObjectRef) -> Result<usize, PyError> {
+    Ok(unsafe { crate::builtins::acquire_readbuf(owner) }?.len())
+}
+
+/// `StringUnmarshaller.get` / `getslice` / `getitem`: live bytes of the
+/// rooted exporter's window (`buf.getslice` / `buf.getitem`). A read past
+/// the current window is EOF (`raise_eof`).
+unsafe fn marshal_getslice(
+    owner: PyObjectRef,
+    window_offset: usize,
+    window_len: usize,
+    pos: usize,
+    n: usize,
+) -> Result<Option<Vec<u8>>, PyError> {
+    match unsafe { crate::builtins::acquired_window_bytes(owner, window_offset, window_len)? } {
+        Some(window) => Ok(Some(window[pos..pos + n].to_vec())),
+        None => Ok(None),
     }
 }
 
@@ -744,44 +748,46 @@ fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalEr
 
 /// A marshal byte stream, wrapped so `read_wtf8` is the strict one.
 ///
-/// `owner_slot` is `StringUnmarshaller`'s rooted buffer: `get` / `get1`
-/// re-derive the slice per read (`buf.getslice` / `buf.getitem`). Host
-/// `data` is frozen / `loads_bytes` payload with no GC owner.
+/// `owner_slot` is the rooted exporter of `StringUnmarshaller.buf`:
+/// `get` / `get1` re-derive the acquired window per read (`buf.getslice` /
+/// `buf.getitem`). `limit` is `self.buf.getlength()` captured at `__init__`;
+/// later reads do not consult the owner's current length. Host `data` is a
+/// frozen `loads_bytes` slice when there is no owner.
 struct BytesReader<'a> {
     data: &'a [u8],
     owner_slot: Option<usize>,
+    window_offset: usize,
+    limit: usize,
     pos: usize,
     scratch: Vec<u8>,
     errors: ErrorSink,
-}
-
-impl BytesReader<'_> {
-    fn python_error<T>(&mut self, error: PyError) -> Result<T, wire::MarshalError> {
-        self.errors.remember(error);
-        Err(wire::MarshalError::BadType)
-    }
 }
 
 impl wire::Read for BytesReader<'_> {
     fn read_slice(&mut self, n: u32) -> Result<&[u8], wire::MarshalError> {
         if let Some(slot) = self.owner_slot {
             let owner = pyre_object::gc_roots::shadow_stack_get(slot);
-            let data = match unsafe { marshal_payload(owner) } {
-                Ok(data) => data,
-                Err(error) => return self.python_error(error),
-            };
             let n = n as usize;
             let end = self
                 .pos
                 .checked_add(n)
                 .ok_or(wire::MarshalError::DataTooShort)?;
-            if end > data.len() {
+            if end > self.limit {
                 return Err(wire::MarshalError::DataTooShort);
             }
-            self.scratch.clear();
-            self.scratch.extend_from_slice(&data[self.pos..end]);
-            self.pos = end;
-            Ok(&self.scratch)
+            match unsafe { marshal_getslice(owner, self.window_offset, self.limit, self.pos, n) } {
+                Ok(Some(data)) => {
+                    self.scratch.clear();
+                    self.scratch.extend_from_slice(&data);
+                    self.pos = end;
+                    Ok(&self.scratch)
+                }
+                Ok(None) => Err(wire::MarshalError::DataTooShort),
+                Err(error) => {
+                    self.errors.remember(error);
+                    Err(wire::MarshalError::BadType)
+                }
+            }
         } else {
             self.data.read_slice(n)
         }
@@ -1309,18 +1315,31 @@ fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     unmarshal_source(data, None, allow_code)
 }
 
-/// `StringUnmarshaller`: the owner is rooted here and re-derived per read.
+/// `StringUnmarshaller`: the owner is acquired here (`buffer_w` /
+/// `_check_released`) and a memoryview is resolved to its backing exporter
+/// (`W_MemoryView.buffer_w` / `NonOwningReleaseView`). Later reads go
+/// through that exporter's window (`buf.getslice` / `buf.getitem`).
 fn unmarshal_owned(owner: PyObjectRef, allow_code: bool) -> PyResult {
     unmarshal_source(&[], Some(owner), allow_code)
 }
 
 fn unmarshal_source(data: &[u8], owner: Option<PyObjectRef>, allow_code: bool) -> PyResult {
     let roots = pyre_object::gc_roots::push_roots();
-    let owner_slot = owner.map(|owner| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(owner);
-        slot
-    });
+    let (owner_slot, window_offset, limit) = match owner {
+        Some(owner) => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(owner);
+            let limit =
+                unsafe { marshal_acquired_limit(pyre_object::gc_roots::shadow_stack_get(slot)) }?;
+            let owner = pyre_object::gc_roots::shadow_stack_get(slot);
+            let exporter = unsafe { crate::builtins::acquired_exporter(owner) };
+            let window_offset = unsafe { crate::builtins::acquired_exporter_offset(owner) };
+            let exporter_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(exporter);
+            (Some(exporter_slot), window_offset, limit)
+        }
+        None => (None, 0, data.len()),
+    };
     let mut pending_error = None;
     let mut name_slots = Vec::with_capacity(64);
     let errors = ErrorSink::park(&roots, &mut pending_error);
@@ -1329,6 +1348,8 @@ fn unmarshal_source(data: &[u8], owner: Option<PyObjectRef>, allow_code: bool) -
     let mut reader = BytesReader {
         data,
         owner_slot,
+        window_offset,
+        limit,
         pos: 0,
         scratch: Vec::new(),
         errors: bag.errors,

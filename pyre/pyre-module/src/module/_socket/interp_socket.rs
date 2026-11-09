@@ -5799,11 +5799,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let args_roots = pyre_object::gc_roots::push_roots();
             let args_base = args_roots.pin_roots(args);
             let mut obj = args_roots.get(args_base);
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
             // `send_w` unwrap_spec(data='bufferstr', flags=int): copy the
             // buffer and close the export before flags conversion and send.
             // A pin above the export's RootScope would be truncated by
-            // `pop_roots`.
+            // `pop_roots`. `RSocket.send_raw` reads `self.fd` after that.
             let obj_roots = pyre_object::gc_roots::push_roots();
             let obj_slot = obj_roots.pin_roots(&[obj]);
             let acquired =
@@ -5820,6 +5819,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
+            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
             pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))?;
             let n = socket_send_bytes(obj, fd, &data, flags)?;
             Ok(pyre_object::w_int_new(n as i64))
@@ -5839,9 +5839,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let args_roots = pyre_object::gc_roots::push_roots();
             let args_base = args_roots.pin_roots(args);
             let mut obj = args_roots.get(args_base);
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
             // `sendall_w` unwrap_spec(data='bufferstr', flags=int): copy the
             // buffer and close the export before flags conversion and send.
+            // `RSocket.sendall` / `send_raw` read `self.fd` after that.
             let obj_roots = pyre_object::gc_roots::push_roots();
             let obj_slot = obj_roots.pin_roots(&[obj]);
             let acquired =
@@ -5869,6 +5869,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buf = data.as_slice();
             let mut off = 0usize;
             while off < buf.len() {
+                // `RSocket.send_raw` reads `self.fd` on every attempt.
+                let fd = socket_fd(obj_roots.get(obj_slot))?;
                 if let Some(deadline) = deadline {
                     socket_wait_writable_until(fd, deadline)?;
                 }
@@ -5973,9 +5975,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let args_roots = pyre_object::gc_roots::push_roots();
                 let args_base = args_roots.pin_roots(args);
                 let mut obj = args_roots.get(args_base);
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
                 // `sendto_w` `bufferstr_w`: copy the buffer and close the
                 // export before flags conversion, `pack_inet_addr`, and send.
+                // `RSocket.sendto` reads `self.fd` after that.
                 let obj_roots = pyre_object::gc_roots::push_roots();
                 let obj_slot = obj_roots.pin_roots(&[obj]);
                 let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(
@@ -6019,6 +6021,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     proto,
                     args_roots.get(args_base + addr_index),
                 )?;
+                let fd = socket_fd(obj_roots.get(obj_slot))?;
                 socket_wait_writable(obj_roots.get(obj_slot), fd)?;
                 loop {
                     #[cfg(unix)]
