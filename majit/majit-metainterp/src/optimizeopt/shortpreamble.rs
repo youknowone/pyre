@@ -3308,7 +3308,7 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
 /// in `unroll.rs`) can invoke the builder directly without
 /// re-running the rename + filter pass.
 pub(crate) fn build_short_preamble_from_produced_boxes(
-    label_args: &[OpRef],
+    label_args: &[Operand],
     short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
 ) -> ShortPreamble {
@@ -3330,7 +3330,8 @@ pub(crate) fn build_short_preamble_from_produced_boxes(
         .filter(|(_, p)| !p.res.to_opref().is_constant())
         .map(|(_, p)| (p.res.clone(), p.clone()))
         .collect();
-    let mut builder = ShortPreambleBuilder::new(label_args, &entries, short_inputargs);
+    let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
+    let mut builder = ShortPreambleBuilder::new(&label_arg_refs, &entries, short_inputargs);
     // history.py/268/314 — inline-Const variants carry the value on
     // the OpRef; `is_constant()` returns true intrinsically and the
     // `is_reachable` / `add_heap_op` checks short-circuit before
@@ -3351,7 +3352,12 @@ fn build_short_preamble_from_exported_boxes(
     exported_short_boxes: &[PreambleOp],
 ) -> ShortPreamble {
     let produced = produced_short_boxes_from_exported_boxes(exported_short_boxes);
-    build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced)
+    let label_arg_boxes: Vec<Operand> = label_args
+        .iter()
+        .copied()
+        .map(crate::history::test_support::rooted_operand_from_opref)
+        .collect();
+    build_short_preamble_from_produced_boxes(&label_arg_boxes, short_inputargs, &produced)
 }
 
 #[cfg(test)]
@@ -4712,7 +4718,11 @@ mod tests {
         );
         assert_eq!(getfield_prod.preamble_op.arg(0).to_opref(), call_pos);
         let short_inputargs = sb.create_short_inputargs(&[i0]);
-        let built = build_short_preamble_from_produced_boxes(&[i0], &short_inputargs, &produced);
+        let built = build_short_preamble_from_produced_boxes(
+            &[ctx.materialize_operand_at(i0)],
+            &short_inputargs,
+            &produced,
+        );
         let built_ops: Vec<OpCode> = built.ops.iter().map(|entry| entry.op.opcode).collect();
         let call_at = built_ops
             .iter()

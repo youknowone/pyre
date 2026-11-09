@@ -1722,7 +1722,7 @@ impl Optimizer {
     fn publish_preview_short_state(
         &mut self,
         mut ctx: &mut OptContext,
-        resolved_args: &[OpRef],
+        resolved_args: &[Operand],
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
         // VS is captured AFTER force + flush so its `Virtual` /
@@ -1731,62 +1731,17 @@ impl Optimizer {
         // forced into concrete instances by `force_at_the_end_of_preamble`
         // come back as `NotVirtualStateInfo` here, exactly as they
         // do in RPython.
-        let post_force_args: Vec<OpRef> = resolved_args
+        // unroll.py OptUnroll.export_state: `end_args = [get_box_replacement(arg)
+        // for arg in end_args]` keeps the resulting boxes.
+        let preview_end_args: Vec<Operand> = resolved_args
             .iter()
-            .map(|&a| {
-                let resolved = ctx.get_replacement_opref(a);
-                // bind-at-alloc: `export_state` below keys its
-                // `ExportCache` by these resolved positions. A producer-less
-                // value-bearing position resolves to a throwaway `from_opref`
-                // operand, so each `bound_from_opref` fallback returns a
-                // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
-                // unbound export key. Bind the canonical `_forwarded` host
-                // once via `materialize_operand_at` (a `SameAs*` synthetic
-                // in `resop_refs`) so the
-                // export key resolves to one ptr-stable host — the identity
-                // the #188 `OpRef`→operand `ExportCache` rekey requires. The
-                // returned `OpRef` is unchanged (synthetic and orphan share
-                // the position), so the exported state is byte-identical.
-                if !resolved.is_none()
-                    && !resolved.is_constant()
-                    && ctx.get_box_replacement_operand_opt(resolved).is_none()
-                {
-                    // Producer-less resop: mint at this write of the export
-                    // key (`mint_box_at`), matching `ResOperation(...)` at
-                    // allocation. InputArg slots still bind through
-                    // `materialize_operand_at`'s InputArg arm.
-                    match resolved {
-                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                            ctx.materialize_operand_at(resolved);
-                        }
-                        _ => {
-                            ctx.mint_box_at(resolved);
-                        }
-                    }
-                }
-                resolved
-            })
+            .map(|arg| arg.get_box_replacement(false))
             .collect();
-        // RPython's `end_args` are Box objects and the same objects are
-        // carried into `next_iteration_args`.  Preserve those exact
-        // operands before ShortBoxes production mutates forwarding;
-        // retaining only their OpRef positions loses Box identity.
-        let preview_end_arg_boxes: Vec<majit_ir::operand::Operand> = post_force_args
-            .iter()
-            .map(|&arg| {
-                ctx.get_box_replacement_operand_opt(arg)
-                    .unwrap_or_else(|| match arg {
-                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                            ctx.materialize_operand_at(arg)
-                        }
-                        _ => ctx.mint_box_at(arg),
-                    })
-            })
-            .collect();
+
         let preview_virtual_state =
-            crate::optimizeopt::virtualstate::export_state_operands(&preview_end_arg_boxes, ctx);
-        let vs_args = &post_force_args;
-        // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
+            crate::optimizeopt::virtualstate::export_state_operands(&preview_end_args, ctx);
+        // virtualstate.py `make_inputargs_and_virtuals` / unroll.py
+        // UnrollOptimizer.optimize_peeled_loop: a virtual-state
         // mismatch here raises `VirtualStatesCantMatch` and the outer
         // `compile_loop_body` catches it as an `InvalidLoop` to skip
         // jump-to-existing and either retrace or fall back to the
@@ -1796,12 +1751,9 @@ impl Optimizer {
         // `optimize_trace_with_constants_and_inputs_vable_out`) catches
         // and reroutes instead of crashing the worker thread.
         let (preview_label_args, preview_virtuals) = match preview_virtual_state
-            .make_inputargs_and_virtuals(vs_args, self, ctx, false)
+            .make_inputargs_and_virtuals_operands(&preview_end_args, self, ctx, false)
         {
-            Ok((label_boxes, virtuals)) => (
-                label_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
-                virtuals,
-            ),
+            Ok(result) => result,
             Err(_) => {
                 // unroll.py UnrollOptimizer.optimize_bridge: on the BRIDGE path the
                 // short-preamble/export preview does not exist — VS
@@ -1818,7 +1770,7 @@ impl Optimizer {
                 // keeps this fatal.
                 //
                 // Neither arm is reachable today: the preview exports
-                // its state from `post_force_args` and re-matches that
+                // its state from `preview_end_args` and re-matches that
                 // same list, so every `state[i]` was derived from
                 // `args[i]` and the walk is self-consistent. Probed
                 // with five virtual-carrying fixtures (escaping tuple,
@@ -1845,8 +1797,11 @@ impl Optimizer {
                 ));
             }
         };
-        let mut preview_short_args = preview_label_args.clone();
-        preview_short_args.extend_from_slice(&preview_virtuals);
+        let preview_short_args: Vec<OpRef> = preview_label_args
+            .iter()
+            .chain(preview_virtuals.iter())
+            .map(Operand::to_opref)
+            .collect();
         let mut short_boxes =
             crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
         for &arg in &preview_short_args {
@@ -1899,9 +1854,9 @@ impl Optimizer {
         // forwarding, so recomputing hereafter is observably different.
         let args_state = Some((
             preview_virtual_state.clone(),
-            preview_label_args.clone(),
-            preview_virtuals.clone(),
-            preview_end_arg_boxes,
+            preview_label_args,
+            preview_virtuals.iter().map(Operand::to_opref).collect(),
+            preview_end_args,
         ));
         // Single-object carry: each exported entry keeps the preview
         // ProducedShortOp's replay Rc, so the pos/arg canonicalization
@@ -3829,17 +3784,19 @@ impl Optimizer {
                 self.flush(&mut ctx)?;
 
                 // Now force all resolved (and dedup'd) args.
-                // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
-                // for a in original_label_args]`.
-                ctx.preamble_end_args = Some(
-                    resolved_args
-                        .iter()
-                        .map(|&arg| match ctx.get_box_replacement_operand_opt(arg) {
-                            Some(b) => self.force_box_for_end_of_preamble(&b, &mut ctx).to_opref(),
-                            None => arg,
-                        })
-                        .collect(),
-                );
+                // unroll.py OptUnroll.export_state:
+                //   end_args = [force_box_for_end_of_preamble(a)
+                //               for a in original_label_args]
+                let preamble_end_args: Vec<Operand> = resolved_args
+                    .iter()
+                    .map(|&arg| {
+                        let arg = ctx
+                            .get_box_replacement_operand_opt(arg)
+                            .unwrap_or_else(|| ctx.materialize_operand_at(arg));
+                        self.force_box_for_end_of_preamble(&arg, &mut ctx)
+                    })
+                    .collect();
+                ctx.preamble_end_args = Some(preamble_end_args.clone());
                 // unroll.py: `optimize_bridge` calls `export_state`
                 // only in its retrace arm, after `jump_to_existing_trace`
                 // found no match. Steps (1) and (2) stay eager so that arm
@@ -3853,7 +3810,7 @@ impl Optimizer {
                 if self.imported_loop_state.is_some() {
                     break 'export None;
                 }
-                self.publish_preview_short_state(&mut ctx, &resolved_args)?;
+                self.publish_preview_short_state(&mut ctx, &preamble_end_args)?;
                 let jump_arglist_oprefs: Vec<OpRef> =
                     jump.args_slice().iter().map(|a| a.to_opref()).collect();
                 let exported_int_bounds =
@@ -4147,16 +4104,9 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
-                // next_iteration_args carries the canonical Phase-1 operands
-                // that double as exported_infos keys. They need NO remap: a
-                // bound operand live-tracks its producer's `op.pos` (already
-                // moved to the new dense slot by the main loop above), a Const
-                // carries its value inline (no body position), and Operand has
-                // no position-only form — so every carried identity (the
-                // exported_infos key) is preserved untouched.
-                for arg in &mut state.end_args {
-                    remap_opref(arg);
-                }
+                // both `end_args` and `next_iteration_args` are bound operands
+                // whose positions live-track their producers; neither should be
+                // numerically rewritten.
                 for arg in &mut state.renamed_inputargs {
                     remap_opref(arg);
                 }
@@ -4764,10 +4714,15 @@ impl Optimizer {
             // unroll.py `export_state` (463-488) builds the short-preamble
             // preview internally; the eager path skipped it for this bridge.
             // `ctx.preamble_end_args` is the forced list from step (2).
-            let preview_args = ctx
-                .preamble_end_args
-                .clone()
-                .unwrap_or_else(|| jump_args.clone());
+            let preview_args = ctx.preamble_end_args.clone().unwrap_or_else(|| {
+                jump_args
+                    .iter()
+                    .map(|&arg| {
+                        ctx.get_box_replacement_operand_opt(arg)
+                            .unwrap_or_else(|| ctx.materialize_operand_at(arg))
+                    })
+                    .collect()
+            });
             // A mismatch is the empty-export outcome the eager bridge path
             // used to take (`break 'export None`); this late export then
             // recomputes from `ctx.preamble_end_args`.

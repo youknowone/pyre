@@ -1324,7 +1324,7 @@ pub struct PreviewShortState {
     /// VS capture; present whenever the preview ran to completion.
     pub args_state: Option<(
         crate::optimizeopt::virtualstate::VirtualState,
-        Vec<OpRef>,
+        Vec<majit_ir::operand::Operand>,
         Vec<OpRef>,
         Vec<majit_ir::operand::Operand>,
     )>,
@@ -1493,7 +1493,7 @@ pub struct OptContext {
     pub patchguardop: Option<Op>,
     /// RPython optimizer.py: end_args after force_at_the_end_of_preamble().
     /// export_state() prefers this over a raw get_replacement() snapshot.
-    pub preamble_end_args: Option<Vec<OpRef>>,
+    pub preamble_end_args: Option<Vec<majit_ir::operand::Operand>>,
     /// Phase-2 loop-body mode from optimizer.skip_flush.
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
@@ -9815,6 +9815,11 @@ impl OptContext {
         for inputarg in &self.inputargs {
             inputarg.walk_const_ptr_refs(visitor);
         }
+        if let Some(end_args) = &self.preamble_end_args {
+            for arg in end_args {
+                arg.walk_const_ptr_refs(visitor);
+            }
+        }
         // Fallback ownership: `inputarg_refs` still owns low-range,
         // carried, and position-materialized boxes that may not occur in
         // `inputargs`. Keep walking them until the later registry-removal
@@ -9858,8 +9863,8 @@ impl OptContext {
             }
             if let Some(state) = preview.args_state.as_mut() {
                 state.0.walk_const_ptr_refs_mut(visitor);
-                for r in &state.1 {
-                    r.trace_const_ptr(visitor);
+                for arg in &state.1 {
+                    arg.walk_const_ptr_refs(visitor);
                 }
                 for r in &state.2 {
                     r.trace_const_ptr(visitor);

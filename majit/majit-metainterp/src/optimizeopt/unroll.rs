@@ -2475,7 +2475,7 @@ pub(crate) fn merge_quasi_immutable_deps(
 #[derive(Debug)]
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
-    pub end_args: Vec<OpRef>,
+    pub end_args: Vec<Operand>,
     /// Args for the next iteration (before forcing). unroll.py:467
     /// `next_iteration_args = end_args` — the SAME canonical box objects
     /// (producer-bound / const [`Operand`]s) used as `exported_infos` keys,
@@ -2679,7 +2679,7 @@ impl ExportedState {
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
     )]
     pub fn new(
-        end_args: Vec<OpRef>,
+        end_args: Vec<Operand>,
         next_iteration_args: Vec<Operand>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
         exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
@@ -2810,7 +2810,7 @@ impl ExportedState {
             }
         }
 
-        visit_oprefs(&mut self.end_args, visitor);
+        visit_operands(&self.end_args, visitor);
         visit_operands(&self.next_iteration_args, visitor);
         self.virtual_state.walk_const_ptr_refs_mut(visitor);
         // Operand hashes by Rc pointer identity, so walking interior GcRefs
@@ -2882,7 +2882,7 @@ impl ExportedState {
             }
         };
         for arg in &self.end_args {
-            visit(*arg);
+            visit(arg.to_opref());
         }
         for arg in &self.next_iteration_args {
             visit(arg.to_opref());
@@ -3371,64 +3371,60 @@ impl OptUnroll {
             .preview_short_state
             .as_ref()
             .and_then(|preview| preview.args_state.clone());
-        // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...].
-        // The preview path carried the exact Box objects used for this single
-        // evaluation; their OpRefs are only the positional view of those boxes.
-        // Resolve boxes first so virtual-state export walks them
-        // (`VirtualStateConstructor.create_state`) instead of re-looking up
-        // each end_arg by OpRef.
-        let end_arg_boxes: Vec<Operand> = preview_args_state.as_ref().map_or_else(
+        // unroll.py OptUnroll.export_state:
+        //   end_args = [force_box_for_end_of_preamble(a) for a in original_label_args]
+        //   end_args = [get_box_replacement(arg) for arg in end_args]
+        // Forced boxes are stored on the context / preview and passed
+        // straight through; the no-preview fallback materializes the
+        // caller-supplied original_label_args positions.
+        let end_args: Vec<Operand> = preview_args_state.as_ref().map_or_else(
             || {
-                let src = ctx.preamble_end_args.clone().unwrap_or_else(|| {
+                ctx.preamble_end_args.clone().unwrap_or_else(|| {
                     original_label_args
                         .iter()
-                        .map(|&a| ctx.get_replacement_opref(a))
+                        .map(|&arg| {
+                            ctx.get_box_replacement_operand_opt(arg)
+                                .unwrap_or_else(|| match arg {
+                                    OpRef::InputArgInt(_)
+                                    | OpRef::InputArgFloat(_)
+                                    | OpRef::InputArgRef(_) => ctx.materialize_operand_at(arg),
+                                    _ => ctx.mint_box_at(arg),
+                                })
+                        })
                         .collect()
-                });
-                src.iter()
-                    .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
-                        Some(o) => o,
-                        // The None arm fires only for an unregistered ResOp
-                        // position (Const / InputArg always resolve); #157
-                        // drained those fires to zero. Mint at this export-key
-                        // write so the key identity is stable.
-                        None => match a {
-                            OpRef::InputArgInt(_)
-                            | OpRef::InputArgFloat(_)
-                            | OpRef::InputArgRef(_) => ctx.materialize_operand_at(a),
-                            _ => ctx.mint_box_at(a),
-                        },
-                    })
-                    .collect()
+                })
             },
-            |(_, _, _, end_arg_boxes)| end_arg_boxes.clone(),
+            |(_, _, _, end_args)| end_args.clone(),
         );
-        let end_args: Vec<OpRef> = end_arg_boxes.iter().map(Operand::to_opref).collect();
         // unroll.py `virtual_state = self.get_virtual_state(end_args)`
         // — VS captured AFTER `force_box_for_end_of_preamble` and AFTER
         // `flush()`. The caller (`Optimizer::optimize_with_constants_and_inputs_at`)
         // already ran both passes before invoking us, so `end_args` is in
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = preview_args_state.as_ref().map_or_else(
-            || crate::optimizeopt::virtualstate::export_state_operands(&end_arg_boxes, ctx),
+            || crate::optimizeopt::virtualstate::export_state_operands(&end_args, ctx),
             |(virtual_state, _, _, _)| virtual_state.clone(),
         );
-        // unroll.py: infos = {}; for arg in end_args: _expand_info(arg, infos)
+        // unroll.py OptUnroll.export_state: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo> =
             indexmap::IndexMap::new();
-        for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
-            self.expand_info(*arg, arg_box, ctx, exported_int_bounds, &mut infos);
+        for arg in &end_args {
+            self.expand_info(arg.to_opref(), arg, ctx, exported_int_bounds, &mut infos);
         }
-        // unroll.py:462-463 `label_args, virtuals =
-        //   virtual_state.make_inputargs_and_virtuals(end_args, self.optimizer)`.
+        // unroll.py OptUnroll.export_state:
+        //   label_args, virtuals =
+        //     virtual_state.make_inputargs_and_virtuals(end_args, self.optimizer)
         let (label_args, virtuals) = if let Some((_, label_args, virtuals, _)) = preview_args_state
         {
             (label_args, virtuals)
         } else {
-            let (label_boxes, virtuals) = virtual_state
-                .make_inputargs_and_virtuals(&end_args, optimizer, ctx, false)
+            let (label_boxes, virtual_boxes) = virtual_state
+                .make_inputargs_and_virtuals_operands(&end_args, optimizer, ctx, false)
                 .expect("export_state make_inputargs_and_virtuals failed");
-            (label_boxes.iter().map(|b| b.to_opref()).collect(), virtuals)
+            (
+                label_boxes,
+                virtual_boxes.iter().map(Operand::to_opref).collect(),
+            )
         };
         if crate::callee_rca_enabled() {
             eprintln!(
@@ -3447,24 +3443,12 @@ impl OptUnroll {
                 eprintln!("[callee-rca][export-vs] {line}");
             }
         }
-        // unroll.py: for arg in label_args: _expand_info(arg, infos)
-        for &arg in &label_args {
-            let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
-                Some(o) => o,
-                // Same canonical-key fallback as end_arg_boxes above: an
-                // unregistered ResOp position (drained to zero by #157) mints a
-                // canonical registered synthetic, keeping the exported_infos
-                // key identity-stable.
-                None => match arg {
-                    OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                        ctx.materialize_operand_at(arg)
-                    }
-                    _ => ctx.mint_box_at(arg),
-                },
-            };
-            self.expand_info(arg, &arg_box, ctx, exported_int_bounds, &mut infos);
+        // unroll.py OptUnroll.export_state: for arg in label_args: _expand_info(arg, infos)
+        for arg in &label_args {
+            self.expand_info(arg.to_opref(), arg, ctx, exported_int_bounds, &mut infos);
         }
-        let mut short_args = label_args.to_vec();
+        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
+        let mut short_args = label_arg_refs.clone();
         short_args.extend(virtuals);
         // unroll.py:466-480 `short_boxes` / `short_inputargs` — read the
         // ShortBoxes-derived lists off the published `PreviewShortState`. The
@@ -3570,31 +3554,12 @@ impl OptUnroll {
 
         // unroll.py `UnrollOptimizer.export_state`:
         // `self.optimizer._clean_optimization_info(end_args)`.
-        crate::optimizeopt::optimizer::Optimizer::clean_optimization_info_boxes(&end_arg_boxes);
+        crate::optimizeopt::optimizer::Optimizer::clean_optimization_info_boxes(&end_args);
 
-        // RPython unroll.py:467: next_iteration_args = end_args (post-force).
-        // Aliased boxes (same resolved OpRef) are handled by export_state's
-        // create_state cache + make_inputargs' position_in_notvirtuals dedup.
-        // RPython parity: store next_iteration_args in their post-forwarding
-        // form so the cache key invariant established by `export_single_value`
-        // (which uses `get_box_replacement` as the cache key, in `virtualstate.rs`)
-        // survives the phase boundary. `import_state` later runs in a fresh
-        // Phase 2 ctx that does NOT inherit Phase 1's forwarding map; if we
-        // stored raw `end_args[i]` here, two top-level entries that shared
-        // the same `VirtualStateInfoNode` Rc (because their post-resolution
-        // targets coincided in Phase 1) would `make_equal_to(source(i), raw_i)`
-        // to *different* raw OpRefs, and `make_inputargs` in Phase 2 would
-        // see divergent forwarding for the supposedly-shared state slot.
-        // RPython sidesteps this naturally because `box._forwarded` persists
-        // across phases. virtualstate.py make_inputargs assumes shared state
-        // ⇒ same forwarded target.
-        // unroll.py:458/467 `end_args = [get_box_replacement(arg) ...]`;
-        // `next_iteration_args = end_args`. Carry the SAME canonical box Rcs
-        // already resolved as the exported_infos keys (`end_arg_boxes`), so the
-        // import lookup is a ptr_eq hit. Each box's `.to_opref()` yields the
-        // resolved (post-forwarding) position, so consumers that read `.to_opref()`
-        // see the same value the prior `get_replacement_opref` form produced.
-        let resolved_next_iteration_args: Vec<Operand> = end_arg_boxes;
+        // unroll.py OptUnroll.export_state: `next_iteration_args = end_args`.
+        // Carry the same canonical boxes used as exported_infos keys so the
+        // import lookup is a ptr_eq hit. virtualstate.py make_inputargs
+        // assumes shared state ⇒ same forwarded target.
         // `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
         // (`build_short_preamble_from_produced_boxes` in `import_state`)
@@ -3602,8 +3567,8 @@ impl OptUnroll {
         // (in `shortpreamble.rs`). Storing both shapes on
         // `ExportedState` would risk drift across mutations.
         let mut state = ExportedState::new(
-            label_args.clone(),
-            resolved_next_iteration_args,
+            label_args,
+            end_args.clone(),
             virtual_state,
             infos,
             exported_short_boxes,
@@ -5295,7 +5260,7 @@ fn assemble_peeled_trace_with_jump_args(
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
-    _p1_end_args: &[OpRef],
+    _p1_end_args: &[Operand],
     appended_label_args: &mut Vec<OpRef>,
     ctx: &mut crate::optimizeopt::OptContext,
 ) -> Vec<majit_ir::OpRc> {
@@ -6650,7 +6615,7 @@ mod tests {
     #[test]
     fn test_exported_state_high_water_covers_retrace_namespace() {
         let exported = ExportedState::new(
-            vec![OpRef::int_op(52)],
+            vec![rooted_resop_operand(Type::Int, 52)],
             vec![
                 rooted_resop_operand(Type::Int, 109),
                 Operand::from_opref(OpRef::const_int(3)),
@@ -6876,8 +6841,9 @@ mod tests {
         let mut constants = majit_ir::ConstMap::default();
         constants.insert(0, majit_ir::Const::from_gcref(old));
 
+        let end_arg = Operand::from_opref(old_ref);
         let mut state = ExportedState::new(
-            vec![old_ref],
+            vec![end_arg.clone()],
             vec![Operand::from_opref(old_ref)],
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
@@ -6954,7 +6920,7 @@ mod tests {
         // move; `as_const_ptr` reads the forwarded address.
         assert_eq!(old_ref.as_const_ptr(), Some(new));
 
-        assert_eq!(state.end_args[0], old_ref);
+        assert!(state.end_args[0].same_box(&end_arg));
         assert_eq!(state.next_iteration_args[0].to_opref(), old_ref);
         assert_eq!(state.renamed_inputargs[0], old_ref);
         assert_eq!(state.short_inputargs[0], old_ref);
@@ -8087,12 +8053,15 @@ mod tests {
         // position at its source so every value reaching export_single_value
         // has a canonical box (virtualstate.py create_state receives
         // real AbstractValues, never bare positions).
-        ctx.materialize_operand_at(OpRef::int_op(21));
-        ctx.preamble_end_args = Some(vec![OpRef::int_op(21)]);
+        let forced = ctx.materialize_operand_at(OpRef::int_op(21));
+        ctx.preamble_end_args = Some(vec![forced.clone()]);
 
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
 
-        assert_eq!(exported.end_args.clone(), vec![OpRef::int_op(21)]);
+        assert!(
+            exported.end_args[0].same_box(&forced),
+            "export_state must retain the forced end-of-preamble box"
+        );
     }
 
     #[test]
@@ -8519,7 +8488,7 @@ mod tests {
             OpRc::new(op)
         };
         let exported = ExportedState::new(
-            vec![source],
+            vec![source_box.clone()],
             vec![source_box.clone()],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),

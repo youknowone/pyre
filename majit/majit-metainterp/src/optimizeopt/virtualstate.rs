@@ -803,8 +803,6 @@ impl VirtualState {
         ctx: &mut OptContext,
         force_boxes: bool,
     ) -> Result<Vec<Operand>, VirtualStatesCantMatch> {
-        // boxes = [None] * self.numnotvirtuals
-        let mut boxes = vec![Operand::None; self.num_boxes()];
         // virtualstate.py `enum_forced_boxes` receives the box. Build each
         // input box once; both passes walk the same objects. A NONE or const
         // has no producer to bind (`Operand::from_opref`).
@@ -818,12 +816,26 @@ impl VirtualState {
                 }
             })
             .collect();
-        // virtualstate.py:664-667 — first pass with `force_boxes=True`.
+        self.make_inputargs_operands(&concrete_boxes, optimizer, ctx, force_boxes)
+    }
+
+    /// virtualstate.py `make_inputargs` box walk. Callers that already hold
+    /// concrete boxes skip the positional materialization in `make_inputargs`.
+    pub fn make_inputargs_operands(
+        &self,
+        concrete_boxes: &[Operand],
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+    ) -> Result<Vec<Operand>, VirtualStatesCantMatch> {
+        // boxes = [None] * self.numnotvirtuals
+        let mut boxes = vec![Operand::None; self.num_boxes()];
+        // virtualstate.py `make_inputargs` first pass with `force_boxes=True`.
         // RPython writes into the SAME `boxes` array on both passes; the
         // values converge after force because subsequent
         // `get_box_replacement` reads return the forced opref.
         // Shared-substate dedup uses `position` cells assigned during
-        // `enum_top_level` (virtualstate.py:196, 274, 352).
+        // `enum_top_level`.
         if force_boxes {
             for (idx, node) in self.state.iter().enumerate() {
                 let box_ = concrete_boxes.get(idx).cloned().unwrap_or(Operand::None);
@@ -832,8 +844,8 @@ impl VirtualState {
                 )?;
             }
         }
-        // virtualstate.py:668-669 — second pass with `force_boxes=False`,
-        // unconditional. Mirrors RPython exactly.
+        // virtualstate.py `make_inputargs` second pass with `force_boxes=False`,
+        // unconditional.
         for (idx, node) in self.state.iter().enumerate() {
             let box_ = concrete_boxes.get(idx).cloned().unwrap_or(Operand::None);
             Self::enum_forced_boxes_for_entry(
@@ -868,6 +880,26 @@ impl VirtualState {
             .enumerate()
             .filter(|(_, info)| info.is_virtual())
             .filter_map(|(i, _)| concrete_refs.get(i).copied())
+            .collect();
+        Ok((inputargs, virtuals))
+    }
+
+    /// virtualstate.py `make_inputargs_and_virtuals` with concrete boxes.
+    pub fn make_inputargs_and_virtuals_operands(
+        &self,
+        concrete_boxes: &[Operand],
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+    ) -> Result<(Vec<Operand>, Vec<Operand>), VirtualStatesCantMatch> {
+        let inputargs =
+            self.make_inputargs_operands(concrete_boxes, optimizer, ctx, force_boxes)?;
+        let virtuals = self
+            .state
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| info.is_virtual())
+            .filter_map(|(i, _)| concrete_boxes.get(i).cloned())
             .collect();
         Ok((inputargs, virtuals))
     }
