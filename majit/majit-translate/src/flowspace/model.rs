@@ -3003,10 +3003,9 @@ pub(crate) fn is_host_env_conditional_call_leaf(leaf: &str) -> bool {
 }
 
 /// `rgc.py` `ll_arraycopy` residual named by the callable's real path:
-/// `pyre_object::object_array::jit_ll_arraycopy`, the local-crate-stripped
-/// `object_array::jit_ll_arraycopy`, or the `SemanticFunction.name` leaf
-/// alias. `@specialize.ll()` wrappers keep one ARRAY per graph; this
-/// shared residual body is not a look-inside graph.
+/// `pyre_object::object_array::jit_ll_arraycopy`, or the
+/// local-crate-stripped `object_array::jit_ll_arraycopy`. A bare leaf is
+/// some other function of that name.
 pub(crate) fn is_jit_ll_arraycopy_path(segs: &[String]) -> bool {
     let leaf = match segs {
         [crate_name, module, leaf]
@@ -3018,11 +3017,8 @@ pub(crate) fn is_jit_ll_arraycopy_path(segs: &[String]) -> bool {
         [module, leaf] if module == crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED => {
             leaf.as_str()
         }
-        [leaf] => leaf.as_str(),
         _ => return false,
     };
-    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
-    let leaf = leaf.rsplit("::").next().unwrap_or(leaf);
     leaf == "jit_ll_arraycopy"
 }
 
@@ -8508,5 +8504,29 @@ mod tests {
 
         let block_repr = format!("{:?}", blk.borrow());
         assert!(block_repr.contains("with 1 exits"), "got: {block_repr}");
+    }
+
+    #[test]
+    fn is_jit_ll_arraycopy_path_requires_object_array_owner() {
+        let crate_name = crate::runtime_names::crates::OBJECT;
+        let module = crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED;
+        assert!(is_jit_ll_arraycopy_path(&[
+            crate_name.into(),
+            module.into(),
+            "jit_ll_arraycopy".into()
+        ]));
+        assert!(is_jit_ll_arraycopy_path(&[
+            module.into(),
+            "jit_ll_arraycopy".into()
+        ]));
+        assert!(!is_jit_ll_arraycopy_path(&["jit_ll_arraycopy".into()]));
+        assert!(!is_jit_ll_arraycopy_path(&[
+            "helpers".into(),
+            "jit_ll_arraycopy".into()
+        ]));
+        assert!(!is_jit_ll_arraycopy_path(&[
+            module.into(),
+            "ll_arraycopy_int_items_block".into()
+        ]));
     }
 }

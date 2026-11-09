@@ -9410,7 +9410,6 @@ mod tests {
                 crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
                 "jit_ll_arraycopy".into(),
             ],
-            vec!["jit_ll_arraycopy".into()],
         ] {
             assert_eq!(
                 registration_decline(&segments),
@@ -9418,6 +9417,16 @@ mod tests {
                 "{segments:?}"
             );
         }
+        assert_eq!(
+            registration_decline(&["jit_ll_arraycopy".into()]),
+            None,
+            "bare leaf jit_ll_arraycopy is not the rgc residual"
+        );
+        assert_eq!(
+            registration_decline(&["helpers".into(), "jit_ll_arraycopy".into()]),
+            None,
+            "helpers::jit_ll_arraycopy is not the rgc residual"
+        );
         assert_eq!(
             registration_decline(&[
                 crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
