@@ -1761,7 +1761,8 @@ fn std_ptr_write(
 /// `@enforceargs(None, None, int, int, int)` does not constrain the
 /// ARRAY. The shared residual is `dont_look_inside` and returns
 /// nothing, so this analyzer does not read source/dest: `()` is
-/// `s_None`.
+/// `s_None`. `SomeBool` subclasses `SomeInteger` (`model.py`), so a
+/// bool start/length is an `int` for `@enforceargs`.
 fn jit_ll_arraycopy(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1779,10 +1780,10 @@ fn jit_ll_arraycopy(
                 index,
                 crate::runtime_names::modules::JIT_LL_ARRAYCOPY
             ),
-            SomeValue::Integer(_)
+            SomeValue::Integer(_) | SomeValue::Bool(_)
         ) {
             return Err(AnnotatorError::new(format!(
-                "object_array.jit_ll_arraycopy argument {index} must be SomeInteger"
+                "object_array.jit_ll_arraycopy argument {index} must be SomeInteger (SomeBool is a SomeInteger)"
             )));
         }
     }
@@ -7604,7 +7605,7 @@ mod tests {
         let err = call_builtin(
             &bk,
             crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
-            &[Some(inst), Some(count.clone())],
+            &[Some(inst.clone()), Some(count.clone())],
             &no_kwds(),
         )
         .expect_err("two arguments are not the signature");
@@ -7613,6 +7614,43 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("expects (source, dest, source_start, dest_start, length)")
+        );
+        let s_bool = SomeValue::Bool(SomeBool::new());
+        let result = call_builtin(
+            &bk,
+            crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
+            &[
+                Some(list.clone()),
+                Some(inst),
+                Some(s_bool.clone()),
+                Some(count.clone()),
+                Some(s_bool),
+            ],
+            &no_kwds(),
+        )
+        .expect("jit_ll_arraycopy annotates bool start/length");
+        assert!(
+            matches!(result, SomeValue::None_(_)),
+            "arraycopy returns (), got {result:?}"
+        );
+        let err = call_builtin(
+            &bk,
+            crate::runtime_names::modules::JIT_LL_ARRAYCOPY,
+            &[
+                Some(list.clone()),
+                Some(list),
+                Some(count.clone()),
+                Some(count),
+                Some(SomeValue::Float(SomeFloat::new())),
+            ],
+            &no_kwds(),
+        )
+        .expect_err("float length is not SomeInteger");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("must be SomeInteger")
         );
     }
 
