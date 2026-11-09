@@ -383,6 +383,38 @@ mod walk_live_op_quasiimmut_tests {
 
         assert_eq!(label.const_value(), Some(Value::Ref(new)));
     }
+
+    #[test]
+    fn published_context_walks_preview_short_inputarg_boxes() {
+        let old = GcRef(0x4100);
+        let new = GcRef(0x5100);
+        let short_box = Operand::const_from_value(Value::Ref(old));
+        let virtual_box = Operand::const_from_value(Value::Ref(old));
+
+        let mut ctx = OptContext::new(0);
+        ctx.preview_short_state = Some(PreviewShortState {
+            short_inputargs: vec![short_box.clone()],
+            short_inputarg_refs: Vec::new(),
+            short_boxes: Vec::new(),
+            args_state: Some((
+                crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
+                Vec::new(),
+                vec![virtual_box.clone()],
+                Vec::new(),
+            )),
+        });
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old {
+                *slot = new;
+            }
+        });
+
+        assert_eq!(short_box.const_value(), Some(Value::Ref(new)));
+        assert_eq!(virtual_box.const_value(), Some(Value::Ref(new)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
@@ -1327,14 +1359,12 @@ fn describe_operand_for_assert(b: &Operand) -> String {
 /// every one whose result folded to a `Const` — so its length is unrelated and
 /// `short_boxes[i]` pairs with nothing.
 pub struct PreviewShortState {
-    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args + virtuals)` — the ShortBoxes-stored renamed inputarg positions
-    /// themselves (measured identical to the export-site `label_args +
-    /// virtuals` recompute across the corpus, 2026-06-11).
-    pub short_inputargs: Vec<OpRef>,
+    /// unroll.py `short_inputargs = sb.create_short_inputargs(label_args + virtuals)`
+    /// — the ShortBoxes-stored renamed inputarg boxes themselves.
+    pub short_inputargs: Vec<majit_ir::operand::Operand>,
     /// Rooted `InputArgRc` carriers for `short_inputargs`, index-aligned with
     /// that vector. Keeping the strong Rc alive here preserves the renamed
-    /// inputarg producer across the export boundary; consumers that need an
-    /// operand bind the stored position directly.
+    /// inputarg producer across the export boundary.
     pub short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
     /// the exported loop-header inputargs.
@@ -1345,7 +1375,7 @@ pub struct PreviewShortState {
     pub args_state: Option<(
         crate::optimizeopt::virtualstate::VirtualState,
         Vec<majit_ir::operand::Operand>,
-        Vec<OpRef>,
+        Vec<majit_ir::operand::Operand>,
         Vec<majit_ir::operand::Operand>,
     )>,
 }
@@ -9883,16 +9913,16 @@ impl OptContext {
                     same.walk_const_ptr_refs(visitor);
                 }
             }
-            for r in &preview.short_inputargs {
-                r.trace_const_ptr(visitor);
+            for arg in &preview.short_inputargs {
+                arg.walk_const_ptr_refs(visitor);
             }
             if let Some(state) = preview.args_state.as_mut() {
                 state.0.walk_const_ptr_refs_mut(visitor);
                 for arg in &state.1 {
                     arg.walk_const_ptr_refs(visitor);
                 }
-                for r in &state.2 {
-                    r.trace_const_ptr(visitor);
+                for arg in &state.2 {
+                    arg.walk_const_ptr_refs(visitor);
                 }
                 for operand in &state.3 {
                     operand.walk_const_ptr_refs(visitor);

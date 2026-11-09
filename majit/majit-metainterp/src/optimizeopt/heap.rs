@@ -7403,15 +7403,15 @@ mod tests {
             .cache_field(&pos100, &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::ref_op(100),
-            OpRef::ref_op(101),
+            pos100.clone(),
+            val101.clone(),
         ]);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         // Register the objects the cache already names, before
-        // add_short_input_arg materializes those positions.
+        // add_short_input_arg consumes those interned boxes.
         ctx.seed_boxes_canonical(&[pos100.clone(), val101.clone()]);
-        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(100), majit_ir::Type::Ref);
-        sb.add_short_input_arg(&mut ctx, OpRef::ref_op(101), majit_ir::Type::Ref);
+        sb.add_short_input_arg(&mut ctx, pos100.clone());
+        sb.add_short_input_arg(&mut ctx, val101.clone());
         use crate::optimizeopt::info::PtrInfo;
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         // Seed the slot the reader will consult: `field_slot_index`, not the

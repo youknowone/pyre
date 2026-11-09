@@ -3405,12 +3405,14 @@ mod tests {
         pass.setup();
         pass.install_preamble_pure_ops(&mut ctx);
 
+        let b0 = ctx.materialize_operand_at(OpRef::int_op(0));
+        let b1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::int_op(0),
-            OpRef::int_op(1),
+            b0.clone(),
+            b1.clone(),
         ]);
-        for arg in [OpRef::int_op(0), OpRef::int_op(1)] {
-            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        for arg in [b0, b1] {
+            sb.add_short_input_arg(&mut ctx, arg);
         }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
@@ -3611,15 +3613,16 @@ mod tests {
         ctx.push_new_operation(op_rc.clone());
         pass.propagate_postprocess(&op, &op_rc, &mut ctx);
 
+        let a2 = ctx.materialize_operand_at(OpRef::int_op(2));
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::int_op(0),
-            OpRef::int_op(1),
-            OpRef::int_op(2),
+            a0.clone(),
+            a1.clone(),
+            a2,
         ]);
         // Seed the renamed ShortInputargs for the op's deps (0, 1); the op
         // result (pos 2) is not a ShortInputArg.
-        for arg in [OpRef::int_op(0), OpRef::int_op(1)] {
-            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        for arg in [a0, a1] {
+            sb.add_short_input_arg(&mut ctx, arg);
         }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
@@ -3678,12 +3681,12 @@ mod tests {
         // Deps are the call args (100, 0, 1); the call result (pos 2) is not a
         // label arg.
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::int_op(0),
-            OpRef::int_op(1),
-            OpRef::int_op(100),
+            a0.clone(),
+            a1.clone(),
+            a100.clone(),
         ]);
-        for arg in [OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(100)] {
-            sb.add_short_input_arg(&mut ctx, arg, majit_ir::Type::Int);
+        for arg in [a0, a1, a100] {
+            sb.add_short_input_arg(&mut ctx, arg);
         }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
@@ -3751,15 +3754,16 @@ mod tests {
         }
 
         // OptRewrite tracks loopinvariant for short preamble collection.
+        let a2 = ctx.materialize_operand_at(OpRef::int_op(2));
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::int_op(0),
-            OpRef::int_op(2),
-            OpRef::int_op(100),
+            a0.clone(),
+            a2,
+            func_box.clone(),
         ]);
         // The func arg 100 is a known constant (produce_arg returns it
         // unrenamed); only the real input 0 gets a renamed ShortInputArg.
         sb.note_known_constant(OpRef::int_op(100));
-        sb.add_short_input_arg(&mut ctx, OpRef::int_op(0), majit_ir::Type::Int);
+        sb.add_short_input_arg(&mut ctx, a0);
         rewrite.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
         let loopinv: Vec<_> = collected

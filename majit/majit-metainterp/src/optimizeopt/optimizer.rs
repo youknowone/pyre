@@ -1778,39 +1778,15 @@ impl Optimizer {
                 ));
             }
         };
-        let preview_short_args: Vec<OpRef> = preview_label_args
+        let preview_short_args: Vec<Operand> = preview_label_args
             .iter()
             .chain(preview_virtuals.iter())
-            .map(Operand::to_opref)
+            .cloned()
             .collect();
         let mut short_boxes =
             crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
-        for &arg in &preview_short_args {
-            // RPython shortpreamble.py:255-259 parity: each label arg
-            // is `box.type`, where Box objects intrinsically carry one
-            // of i / r / f. There is no `void` Box because Box always
-            // wraps a runtime value. Pyre recovers the same type from
-            // the typed OpRef variant or the trace's inputarg/op metadata.
-            let raw_type = ctx
-            .opref_type(arg)
-            .unwrap_or_else(|| {
-                panic!(
-                    "preview short arg missing box.type: arg={arg:?} preview_short_args={preview_short_args:?}"
-                )
-            });
-            if raw_type == majit_ir::Type::Void {
-                // shortpreamble.py reads `box.type` from a
-                // value Box and emits same_as_i/r/f. RPython has no
-                // Void value Box here; reaching Void means Rust-side
-                // OpRef/type bookkeeping lost Box identity and must not
-                // silently drop the short-preamble inputarg.
-                panic!(
-                    "preview short arg {arg:?} resolved to Type::Void; \
-                 short preamble inputargs must be int/ref/float value boxes \
-                 (shortpreamble.py:255-259)"
-                );
-            }
-            short_boxes.add_short_input_arg(ctx, arg, raw_type);
+        for arg in &preview_short_args {
+            short_boxes.add_short_input_arg(ctx, arg.clone());
         }
         self.produce_potential_short_preamble_ops(&mut short_boxes, ctx);
         let produced = short_boxes.produced_ops(ctx);
@@ -1836,7 +1812,7 @@ impl Optimizer {
         let args_state = Some((
             preview_virtual_state.clone(),
             preview_label_args,
-            preview_virtuals.iter().map(Operand::to_opref).collect(),
+            preview_virtuals,
             preview_end_args,
         ));
         // Single-object carry: each exported entry keeps the preview
@@ -3813,14 +3789,9 @@ impl Optimizer {
                 // (history.py:220). Mint typed variants from `inputarg_types`
                 // so the exported state's OpRefs match what Phase 2 will see
                 // under variant-aware Eq.
-                let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
-                    .map(|i| {
-                        // opencoder.py:259 inputarg_from_tp parity — strict
-                        // box.type lookup, no InputArgVoid fallback.
-                        let pos = ctx.inputarg_base + i as u32;
-                        OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
-                    })
-                    .collect();
+                // unroll.py `info.inputargs` — the fresh per-iteration
+                // InputArg boxes already living on this optimizer context.
+                let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
                 Some(crate::optimizeopt::unroll::export_state(
                     &original_jump_args,
                     &renamed_inputargs,
@@ -4087,13 +4058,10 @@ impl Optimizer {
                 };
                 // both `end_args` and `next_iteration_args` are bound operands
                 // whose positions live-track their producers; neither should be
-                // numerically rewritten.
-                for arg in &mut state.renamed_inputargs {
-                    remap_opref(arg);
-                }
-                for arg in &mut state.short_inputargs {
-                    remap_opref(arg);
-                }
+                // numerically rewritten. `renamed_inputargs` /
+                // `short_inputargs` are the existing InputArg boxes or fresh
+                // short-preamble InputArgs; their identity is not reconstructed
+                // from the compaction table.
                 // exported_infos is keyed by box identity (Rc::ptr_eq), so its keys
                 // need NO position remap — the lookup matches by Rc, not OpRef. The
                 // keys are the same Rcs as next_iteration_args (for end_args) /
@@ -4685,12 +4653,7 @@ impl Optimizer {
             // after the failed virtual-state match. Reusing a JUMP-time
             // `exported_loop_state` (or leaving it None) skips that late
             // export; `retrace_needed` then starts without a state.
-            let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
-                .map(|i| {
-                    let pos = ctx.inputarg_base + i as u32;
-                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
-                })
-                .collect();
+            let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
             let exported_int_bounds = self.collect_exported_int_bounds(&jump_args, &mut ctx);
             // unroll.py `export_state` (463-488) builds the short-preamble
             // preview internally; the eager path skipped it for this bridge.

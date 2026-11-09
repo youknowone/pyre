@@ -9923,10 +9923,10 @@ impl<M: Clone> MetaInterp<M> {
             match unroll_opt
                 .final_exported_state
                 .as_ref()
-                .map(|es| es.renamed_inputargs.as_slice())
+                .map(|es| &es.renamed_inputargs)
                 .filter(|args| args.len() == final_num_inputs)
             {
-                Some(args) => Some(args.to_vec()),
+                Some(args) => Some(args.iter().map(Operand::to_opref).collect::<Vec<OpRef>>()),
                 None => {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -15460,8 +15460,10 @@ impl<M: Clone> MetaInterp<M> {
             tok.set_retraced_count(retraced_count);
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
+                let renamed_inputarg_refs: Vec<_> =
+                    es.renamed_inputargs.iter().map(Operand::to_opref).collect();
                 let renamed_inputargs =
-                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
+                    retrace_inputarg_boxes(&renamed_inputarg_refs, &optimized_ops);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -16196,8 +16198,10 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             if let Some(es) = exported {
+                let renamed_inputarg_refs: Vec<_> =
+                    es.renamed_inputargs.iter().map(Operand::to_opref).collect();
                 let renamed_inputargs =
-                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
+                    retrace_inputarg_boxes(&renamed_inputarg_refs, &optimized_ops);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.

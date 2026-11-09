@@ -1758,7 +1758,10 @@ impl UnrollOptimizer {
             // ProducedShortOp list stored on ExportedState at export time.
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
-                &exported_short_inputargs,
+                &exported_short_inputargs
+                    .iter()
+                    .map(Operand::to_opref)
+                    .collect::<Vec<_>>(),
                 &exported_short_boxes_produced,
             )
         });
@@ -2164,9 +2167,13 @@ impl UnrollOptimizer {
                             .map(|op| op.num_args())
                     })
                     .unwrap_or(0);
+                let exported_renamed_inputarg_refs: Vec<_> = exported_renamed_inputargs
+                    .iter()
+                    .map(Operand::to_opref)
+                    .collect();
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} start_label_args={:?}",
-                    body_jump_arity, exported_renamed_inputargs,
+                    body_jump_arity, exported_renamed_inputarg_refs,
                 );
             }
             if let Some(end_jump) = body_terminal_op {
@@ -2226,11 +2233,15 @@ impl UnrollOptimizer {
         let sp_used_boxes: Vec<OpRef> = sp.used_boxes.clone();
         let sp_jump_args: Vec<OpRef> = sp.jump_args.clone();
         let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
+        let exported_renamed_inputarg_refs: Vec<OpRef> = exported_renamed_inputargs
+            .iter()
+            .map(Operand::to_opref)
+            .collect();
         let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
             &label_arg_refs,
-            &exported_renamed_inputargs,
+            &exported_renamed_inputarg_refs,
             &sp_used_boxes,
             &sp_jump_args,
             p2_ni,
@@ -2508,15 +2519,14 @@ pub struct ExportedState {
     pub short_boxes: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
-    /// Renamed inputargs from the preamble. Each OpRef is a typed
-    /// `InputArg{Int,Float,Ref}` variant carrying its `.type` intrinsically
-    /// (history.py:220), so consumers read the type via `OpRef::ty()` —
-    /// RPython `info.renamed_inputargs` Box parity, no parallel type array.
-    pub renamed_inputargs: Vec<OpRef>,
+    /// Renamed inputargs from the preamble. Each entry is a typed
+    /// InputArg box carrying its `.type` intrinsically (`history.py` Box.type),
+    /// matching `unroll.py ExportedState.renamed_inputargs`.
+    pub renamed_inputargs: Vec<Operand>,
     /// Short inputargs for the short preamble — the renamed inputarg
-    /// positions (shortpreamble.py:430 / unroll.py:480), shared with the
-    /// renamed operands inside `short_boxes`.
-    pub short_inputargs: Vec<OpRef>,
+    /// boxes (`ShortBoxes.create_short_inputargs` / `unroll.py OptUnroll.export_state`),
+    /// shared with the renamed operands inside `short_boxes`.
+    pub short_inputargs: Vec<Operand>,
     /// Rooted `InputArgRc` carriers for `short_inputargs`, index-aligned.
     /// Keeping the strong Rc alive across the cross-peel export boundary
     /// preserves the renamed inputarg producers for consumers that need a
@@ -2680,8 +2690,8 @@ impl ExportedState {
         exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         const_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
-        renamed_inputargs: Vec<OpRef>,
-        short_inputargs: Vec<OpRef>,
+        renamed_inputargs: Vec<Operand>,
+        short_inputargs: Vec<Operand>,
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     ) -> Self {
         // unroll.py:478-479 `sb.create_short_boxes(...)` parity: pyre
@@ -2830,8 +2840,8 @@ impl ExportedState {
         if let Some(short_preamble) = self.short_preamble.as_mut() {
             short_preamble.walk_const_ptr_refs_mut(visitor);
         }
-        visit_oprefs(&mut self.renamed_inputargs, visitor);
-        visit_oprefs(&mut self.short_inputargs, visitor);
+        visit_operands(&self.renamed_inputargs, visitor);
+        visit_operands(&self.short_inputargs, visitor);
         visit_oprefs(&mut self.runtime_boxes, visitor);
         if let Some(patchguardop) = self.patchguardop.as_ref() {
             visit_op(patchguardop, visitor);
@@ -2883,10 +2893,10 @@ impl ExportedState {
             visit(arg.to_opref());
         }
         for arg in &self.renamed_inputargs {
-            visit(*arg);
+            visit(arg.to_opref());
         }
         for arg in &self.short_inputargs {
-            visit(*arg);
+            visit(arg.to_opref());
         }
         // The original label/virtual positions that `short_inputargs` rename
         // are reached through the `exported_short_boxes` walk below: every
@@ -3339,7 +3349,7 @@ impl OptUnroll {
     pub fn export_state(
         &self,
         original_label_args: &[OpRef],
-        renamed_inputargs: &[OpRef],
+        renamed_inputargs: &[Operand],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> ExportedState {
@@ -3350,7 +3360,7 @@ impl OptUnroll {
     fn export_state_with_bounds(
         &self,
         original_label_args: &[OpRef],
-        renamed_inputargs: &[OpRef],
+        renamed_inputargs: &[Operand],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
@@ -3416,12 +3426,11 @@ impl OptUnroll {
             let (label_boxes, virtual_boxes) = virtual_state
                 .make_inputargs_and_virtuals_operands(&end_args, optimizer, ctx, false)
                 .expect("export_state make_inputargs_and_virtuals failed");
-            (
-                label_boxes,
-                virtual_boxes.iter().map(Operand::to_opref).collect(),
-            )
+            (label_boxes, virtual_boxes)
         };
         if crate::callee_rca_enabled() {
+            let renamed_inputarg_refs: Vec<_> =
+                renamed_inputargs.iter().map(Operand::to_opref).collect();
             eprintln!(
                 "[callee-rca][export-state] original_label_args={:?} end_args={:?} \
                  label_args={:?} virtuals={:?} \
@@ -3430,7 +3439,7 @@ impl OptUnroll {
                 end_args,
                 label_args,
                 virtuals,
-                renamed_inputargs,
+                renamed_inputarg_refs,
                 virtual_state.num_boxes(),
                 virtual_state.num_entries(),
             );
@@ -3442,9 +3451,8 @@ impl OptUnroll {
         for arg in &label_args {
             self.expand_info(arg.to_opref(), arg, ctx, exported_int_bounds, &mut infos);
         }
-        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
-        let mut short_args = label_arg_refs.clone();
-        short_args.extend(virtuals);
+        let mut short_args = label_args.clone();
+        short_args.extend(virtuals.iter().cloned());
         // unroll.py:466-480 `short_boxes` / `short_inputargs` — read the
         // ShortBoxes-derived lists off the published `PreviewShortState`. The
         // preview pass computed the inputargs from the same `label_args +
@@ -3471,13 +3479,12 @@ impl OptUnroll {
                 // rooted `InputArgRc` pool alongside, matching the preview pass.
                 let mut inputargs = Vec::with_capacity(short_args.len());
                 let mut refs = Vec::with_capacity(short_args.len());
-                for &a in &short_args {
-                    let ty = a.ty().unwrap_or_else(|| {
-                        panic!("short preamble inputarg {a:?} has no value type")
-                    });
+                for arg in &short_args {
+                    let ty = arg.type_();
+                    assert!(!matches!(ty, Type::Void));
                     let pos = ctx.alloc_op_position_typed(ty).raw();
                     let ia = majit_ir::InputArg::from_type_rc(ty, pos);
-                    inputargs.push(ia.opref());
+                    inputargs.push(Operand::from_bound_inputarg(&ia));
                     refs.push(ia);
                 }
                 (inputargs, refs, Vec::new())
@@ -4869,9 +4876,14 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
+        let short_inputarg_refs: Vec<OpRef> = exported_state
+            .short_inputargs
+            .iter()
+            .map(Operand::to_opref)
+            .collect();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
-            &exported_state.short_inputargs,
+            &short_inputarg_refs,
             &exported_state.short_boxes,
             &result_map,
             &exported_state.exported_infos,
@@ -4953,7 +4965,7 @@ impl OptUnroll {
 /// unroll.py: export_state — module-level entry point.
 pub(crate) fn export_state(
     jump_args: &[OpRef],
-    renamed_inputargs: &[OpRef],
+    renamed_inputargs: &[Operand],
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
@@ -6560,7 +6572,7 @@ mod tests {
     /// that broke out before the VS capture also takes.
     fn publish_preview_short_state(
         ctx: &mut crate::optimizeopt::OptContext,
-        short_inputargs: Vec<OpRef>,
+        short_inputargs: Vec<Operand>,
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
         short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     ) {
@@ -6590,13 +6602,13 @@ mod tests {
     fn mint_short_inputargs(
         ctx: &mut crate::optimizeopt::OptContext,
         types: &[Type],
-    ) -> (Vec<OpRef>, Vec<majit_ir::InputArgRc>) {
+    ) -> (Vec<Operand>, Vec<majit_ir::InputArgRc>) {
         let mut inputargs = Vec::with_capacity(types.len());
         let mut refs = Vec::with_capacity(types.len());
         for &ty in types {
             let pos = ctx.alloc_op_position_typed(ty).raw();
             let ia = majit_ir::InputArg::from_type_rc(ty, pos);
-            inputargs.push(ia.opref());
+            inputargs.push(Operand::from_bound_inputarg(&ia));
             refs.push(ia);
         }
         (inputargs, refs)
@@ -6622,10 +6634,10 @@ mod tests {
             indexmap::IndexMap::new(),
             Vec::new(),
             Vec::new(),
-            vec![OpRef::int_op(14)],
-            vec![OpRef::int_op(23)],
-            // short_inputarg_refs: this fixture stores plain OpRef positions,
-            // so no parallel InputArgRc pool is needed here.
+            vec![rooted_resop_operand(Type::Int, 14)],
+            vec![rooted_resop_operand(Type::Int, 23)],
+            // short_inputarg_refs: this fixture stores resop boxes, so no
+            // parallel InputArgRc pool is needed here.
             Vec::new(),
         );
 
@@ -6840,6 +6852,8 @@ mod tests {
         constants.insert(0, majit_ir::Const::from_gcref(old));
 
         let end_arg = Operand::from_opref(old_ref);
+        let renamed_box = Operand::const_from_value(Value::Ref(old));
+        let short_box = Operand::const_from_value(Value::Ref(old));
         let mut state = ExportedState::new(
             vec![end_arg.clone()],
             vec![Operand::from_opref(old_ref)],
@@ -6871,9 +6885,10 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             }],
-            vec![old_ref],
-            vec![old_ref],
-            // short_inputarg_refs: `old_ref` is a ConstPtr inline position.
+            vec![renamed_box.clone()],
+            vec![short_box.clone()],
+            // short_inputarg_refs: renamed/short boxes here are const-ref
+            // operands, so no parallel InputArgRc pool is needed.
             Vec::new(),
         );
         state.short_boxes.push((
@@ -6920,8 +6935,16 @@ mod tests {
 
         assert!(state.end_args[0].same_box(&end_arg));
         assert_eq!(state.next_iteration_args[0].to_opref(), old_ref);
-        assert_eq!(state.renamed_inputargs[0], old_ref);
-        assert_eq!(state.short_inputargs[0], old_ref);
+        assert!(state.renamed_inputargs[0].same_box(&renamed_box));
+        assert_eq!(
+            state.renamed_inputargs[0].const_value(),
+            Some(Value::Ref(new))
+        );
+        assert!(state.short_inputargs[0].same_box(&short_box));
+        assert_eq!(
+            state.short_inputargs[0].const_value(),
+            Some(Value::Ref(new))
+        );
         assert_eq!(state.runtime_boxes[0], old_ref);
         assert!(state.exported_infos.keys().any(|k| k.to_opref() == old_ref));
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), old_ref);
@@ -8101,7 +8124,7 @@ mod tests {
         let source_receiver = ctx.materialize_operand_at(OpRef::int_op(10));
         publish_preview_short_state(
             &mut ctx,
-            vec![si0.to_opref(), si1.to_opref()],
+            vec![si0.clone(), si1.clone()],
             vec![ia0, ia1],
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -8216,7 +8239,7 @@ mod tests {
         // the one fixture where the two halves are separable.
         publish_preview_short_state(
             &mut ctx,
-            vec![si0.to_opref(), si1.to_opref()],
+            vec![si0.clone(), si1.clone()],
             vec![ia0, ia1],
             Vec::new(),
         );
@@ -8298,9 +8321,10 @@ mod tests {
         // exported `preamble_op` itself: its receiver is the renamed
         // `short_inputargs[0]` that `produce_arg` returned at export, the box
         // `inline_short_preamble` maps to the jump arg.
-        assert_eq!(
-            pop.preamble_op.arg(0).to_opref(),
-            exported.short_inputargs[0]
+        assert!(
+            pop.preamble_op
+                .arg(0)
+                .same_box(&exported.short_inputargs[0])
         );
         drop(parent);
     }
@@ -8515,8 +8539,9 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
-            vec![source_box.to_opref()],
-            // short_inputarg_refs: this fixture stores plain OpRef positions.
+            vec![source_box.clone()],
+            // short_inputarg_refs: this fixture stores a resop box, so no
+            // parallel InputArgRc pool is needed here.
             Vec::new(),
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
@@ -8749,7 +8774,7 @@ mod tests {
         );
         publish_preview_short_state(
             &mut ctx,
-            vec![si0.to_opref(), si1.to_opref(), si2.to_opref()],
+            vec![si0.clone(), si1.clone(), si2.clone()],
             vec![ia0, ia1, ia2],
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -11277,10 +11302,10 @@ mod tests {
             Type::Ref,
             EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
         ));
-        let i0 = OpRef::input_arg_int(0);
-        let mut sb = ShortBoxes::with_label_args(&[i0]);
+        let i0 = ctx.inputargs[0].clone();
+        let mut sb = ShortBoxes::with_label_args(&[i0.clone()]);
         sb.add_pure_op(&mut ctx, &OpRc::new(call));
-        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0]);
         let pure = short_boxes
             .iter()
             .find(|produced| produced.kind == PreambleOpKind::Pure)
