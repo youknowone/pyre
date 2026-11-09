@@ -813,11 +813,36 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
             // is refused before the iterator is walked.
             return Err(crate::PyError::memory_error(""));
         }
+        // ListStrategy._extend_from_iterable: `w_list._resize_hint(newsize_hint)`.
+        if hint != 0
+            && !unsafe {
+                pyre_object::listobject::w_list_resize_hint(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    (current_size + hint) as i64,
+                )
+            }
+        {
+            return Err(crate::PyError::memory_error(""));
+        }
     }
     do_extend_from_iterable(
         pyre_object::gc_roots::shadow_stack_get(root_base),
         pyre_object::gc_roots::shadow_stack_get(root_base + 2),
     )?;
+    // "cut back if the length hint was too large":
+    // `if extended < length_hint: w_list._resize_hint(w_list.length())`.
+    let length =
+        unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base)) };
+    if length.saturating_sub(current_size) < hint
+        && !unsafe {
+            pyre_object::listobject::w_list_resize_hint(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                length as i64,
+            )
+        }
+    {
+        return Err(crate::PyError::memory_error(""));
+    }
     unsafe {
         pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
             root_base,
