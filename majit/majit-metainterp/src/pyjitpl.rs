@@ -1386,9 +1386,8 @@ mod byte_snapshot_map_tests {
         opt.trace_inputargs = rec
             .inputargs()
             .iter()
-            .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        opt.trace_inputarg_boxes = rec.inputargs().to_vec();
         let mut constants = Default::default();
         let optimized = opt
             .optimize_loop(&ops, &mut constants, 2, None, 0)
@@ -9566,10 +9565,8 @@ impl<M: Clone> MetaInterp<M> {
             .base
             .inputargs()
             .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -9740,10 +9737,11 @@ impl<M: Clone> MetaInterp<M> {
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
                         // needed (callers read via `OpRef::ty()`).
-                        let inputarg_types: Vec<majit_ir::Type> =
-                            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-                        simple_opt.trace_inputargs =
-                            majit_ir::OpRef::inputarg_refs(&inputarg_types);
+                        simple_opt.trace_inputargs = trace
+                            .inputargs
+                            .iter()
+                            .map(Operand::from_bound_inputarg)
+                            .collect();
                         // Move, not clone: keeps the rooted buffers in place so
                         // the slots collected above now point into simple_opt.
                         simple_opt.snapshot_boxes = snapshot_map;
@@ -9761,7 +9759,6 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
-                        simple_opt.trace_inputarg_boxes = trace.inputargs.clone();
                         // Consumed here and nowhere else, so the operations move
                         // into their `Rc`s instead of being copied into them.
                         // Unroll's TraceIterator allocates fresh operations
@@ -11401,8 +11398,11 @@ impl<M: Clone> MetaInterp<M> {
         // (`TraceIterator.__init__` / `inputarg_from_tp`). Their `.index` is
         // the position the rewritten ops name, including a hole-filtered
         // retrace whose original last live arg was `InputArg(2)`.
-        unroll_opt.trace_inputargs = trace.inputargs.iter().map(|ia| ia.opref()).collect();
-        unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
+        unroll_opt.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         // `compile.py compile_retrace` `trace.cut_trace_from` is a view over
         // the same opencoder buffer, so `get_iter` seeds `_cache` at the
         // original `get_position()` and snapshots stay in that coordinate
@@ -12475,9 +12475,11 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
-        let inputarg_types: Vec<majit_ir::Type> =
-            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
+        optimizer.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself; no raw-u32 type side-table
         // propagation is needed.
@@ -12510,7 +12512,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
@@ -12967,9 +12968,11 @@ impl<M: Clone> MetaInterp<M> {
         // `store_final_boxes_in_guard` with nothing to bind it to
         // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
         // Same seeding as the no-unroll retry inside `compile_loop`.
-        let inputarg_types: Vec<majit_ir::Type> =
-            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
-        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
+        optimizer.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
 
         let (
             mut snapshot_map,
@@ -12988,7 +12991,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
@@ -15390,10 +15392,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
+            .map(Operand::from_bound_inputarg)
             .collect();
-        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -16020,11 +16020,6 @@ impl<M: Clone> MetaInterp<M> {
         let (enable_opts, _pureop_historylength) = self.snapshot_compiling_opt_params();
         let bridge_inline_short_preamble = inline_short_preamble;
         let bridge_call_pure_results = call_pure_results.clone();
-        let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
-            .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
-            .collect();
         let bridge_inputargs = prepared_inputargs.as_slice();
         let bridge_ops = bridge_trace_data.ops.as_slice();
         // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
@@ -16055,11 +16050,10 @@ impl<M: Clone> MetaInterp<M> {
                 recorder, cache,
             ));
         }
-        // Store bridge inputarg types so export_state can mint typed
-        // `renamed_inputargs` OpRefs that carry their type intrinsically
-        // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
-        optimizer.trace_inputargs = bridge_inputarg_types;
-        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
+        optimizer.trace_inputargs = prepared_inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -35824,8 +35818,11 @@ mod tests {
         );
         assert_eq!(prepared.inputargs[1].get_value(), Some(Value::Int(22)));
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
-        unroll_opt.trace_inputargs = prepared.inputargs.iter().map(|ia| ia.opref()).collect();
-        unroll_opt.trace_inputarg_boxes = prepared.inputargs.clone();
+        unroll_opt.trace_inputargs = prepared
+            .inputargs
+            .iter()
+            .map(Operand::from_bound_inputarg)
+            .collect();
         let mut phase1_out = None;
         unroll_opt
             .optimize_trace_with_constants_and_inputs_vable_out(

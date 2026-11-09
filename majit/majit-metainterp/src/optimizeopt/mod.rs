@@ -1599,8 +1599,8 @@ pub struct OptContext {
     /// Byte-mode bridge resume. See `Optimizer::byte_bridge_resume`.
     pub(crate) byte_bridge_resume: Option<crate::recorder::ByteBridgeResume>,
     /// optimizer.py `self.inputargs = inputargs` parity.
-    /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
-    pub inputargs: Vec<majit_ir::OpRef>,
+    /// Bound InputArg boxes; slot `i` is the trace's own inputarg.
+    pub inputargs: Vec<majit_ir::operand::Operand>,
     /// Strong `InputArgRc` ownership for the inputargs seeded by
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
     /// via `TreeLoop.inputargs`; the test-and-fallback helper
@@ -2624,21 +2624,24 @@ impl OptContext {
         // lifetime. Production traces own these via
         // `TreeLoop.inputargs`; this test-and-fallback helper has no upstream
         // `TreeLoop`.
-        ctx.inputarg_refs = inputarg_types
+        ctx.inputargs = inputarg_types
             .iter()
             .enumerate()
             .map(|(i, &tp)| {
-                (
-                    i as u32,
-                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, i as u32)),
-                )
+                let inputarg =
+                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, i as u32));
+                Operand::from_bound_inputarg(&inputarg)
             })
             .collect();
-        // Seed `ctx.inputargs` so strict accessors like
-        // `inputarg_type_at_strict` return `Some(tp)` matching slot i. Each
-        // entry is `OpRef::input_arg_typed(i, tp)` so the variant tag IS the
-        // type (resoperation.py InputArgInt/727/739).
-        ctx.inputargs = majit_ir::OpRef::inputarg_refs(inputarg_types);
+        ctx.inputarg_refs = ctx
+            .inputargs
+            .iter()
+            .filter_map(|inputarg| {
+                inputarg
+                    .bound_inputarg()
+                    .map(|inputarg| (inputarg.index, inputarg))
+            })
+            .collect();
         ctx
     }
 
@@ -2673,38 +2676,18 @@ impl OptContext {
                 }
             }
         }
-        // Derive the materialized InputArg positions from `ctx` state.
-        // The InputArg positions are exactly the
-        // canonical/inherited set (`self.inputargs` = `optimizer.py
-        // self.inputargs`, positions `[0, num_inputs)` carried across Phase 1 →
-        // Phase 2 by `opt_p2.trace_inputargs = self.trace_inputargs`) UNION the
-        // fresh per-iteration label set at `[inputarg_base, inputarg_base +
-        // num_inputs)` (`TraceIterator` allocates these; their types match
-        // `self.inputargs` because Phase 2 walks the body half with the same
-        // per-arg types). Pre-populating `inputarg_refs` for both subsets makes
-        // every InputArg OpRef resolve through `inputarg_refs` (read path:
-        // `resolve_to_operand` / `read_forwarded`; write path: `materialize_operand_at`'s
-        // InputArg branch). `materialize_operand_at` type-repairs any position this derive
-        // misses. Both loops no-op when `self.inputargs` is empty
-        // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
-        // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
-        // encoding (resoperation.py InputArgInt/727/739), so a Void sentinel in
-        // `inputargs` is not a real input-arg host and carries no binding.
-        for op in self.inputargs.clone() {
-            match op.ty() {
-                Some(tp) if tp != majit_ir::Type::Void => {
-                    self.bind_canonical_inputarg(op.raw() as usize, tp);
-                }
-                _ => {}
+        // Register the bound InputArg boxes already stored on
+        // `self.inputargs` (`optimizer.py self.inputargs`). A nonzero
+        // `inputarg_base` still needs the temporary low-range fallback
+        // required by position-only imported state.
+        for inputarg in self.inputargs.clone() {
+            if let Some(inputarg) = inputarg.bound_inputarg() {
+                self.inputarg_refs.entry(inputarg.index).or_insert(inputarg);
             }
         }
-        let base = self.inputarg_base as usize;
-        for i in 0..self.num_inputs as usize {
-            match self.inputargs.get(i).and_then(|op| op.ty()) {
-                Some(tp) if tp != majit_ir::Type::Void => {
-                    self.bind_canonical_inputarg(base + i, tp);
-                }
-                _ => {}
+        if self.inputarg_base > 0 {
+            for (index, inputarg) in self.inputargs.clone().iter().enumerate() {
+                self.bind_canonical_inputarg(index, inputarg.type_());
             }
         }
     }
@@ -5726,7 +5709,11 @@ impl OptContext {
         if raw_hit {
             return "b-typetag";
         }
-        if self.inputargs.contains(&opref) {
+        if self
+            .inputargs
+            .iter()
+            .any(|inputarg| inputarg.to_opref() == opref)
+        {
             return "b-rekey-inputargs";
         }
         if let Some(label_args) = self.imported_label_args.as_ref()
@@ -8272,8 +8259,7 @@ impl OptContext {
         if idx >= ni {
             return None;
         }
-        let opref = *self.inputargs.get(idx)?;
-        let tp = opref.ty()?;
+        let tp = self.inputargs.get(idx)?.type_();
         if tp == majit_ir::Type::Void {
             None
         } else {
@@ -8284,11 +8270,10 @@ impl OptContext {
     /// Look up the declared type of inputarg slot `idx` (zero-based) from
     /// the `inputargs` Vec seeded by `setup_optimizations`. Returns
     /// `None` if the slot is out of range, the type is `Void`, or the Vec
-    /// has not been populated. Reads `inputargs[idx].ty()` — each entry
-    /// is a typed `OpRef::input_arg_*` (optimizer.py:34 parity).
+    /// has not been populated. Reads `inputargs[idx].type_()` —
+    /// `optimizer.py self.inputargs` box.type.
     pub fn inputarg_type_at(&self, idx: usize) -> Option<majit_ir::Type> {
-        let opref = *self.inputargs.get(idx)?;
-        let tp = opref.ty()?;
+        let tp = self.inputargs.get(idx)?.type_();
         if tp == majit_ir::Type::Void {
             None
         } else {
@@ -8299,12 +8284,12 @@ impl OptContext {
     /// Strict counterpart to `inputarg_type_at`. Panics when the slot is
     /// out of range, the variant yields `Void`, or `inputargs` was not
     /// populated by `setup_optimizations`. Mirrors RPython's
-    /// `box.type` invariant (history.py:220).
+    /// `box.type` invariant (`history.py` `box.type`).
     pub fn inputarg_type_at_strict(&self, idx: usize) -> majit_ir::Type {
-        match self.inputargs.get(idx).and_then(|o| o.ty()) {
+        match self.inputargs.get(idx).map(Operand::type_) {
             Some(majit_ir::Type::Void) => panic!(
                 "inputarg_type_at_strict: slot {idx} is Void; \
-                 RPython invariant violated (history.py:220 box.type)"
+                 RPython invariant violated (history.py box.type)"
             ),
             Some(tp) => tp,
             None => panic!(
@@ -8316,11 +8301,11 @@ impl OptContext {
         }
     }
 
-    /// Read-only access to the inputarg slot's typed `OpRef` (variant tag
-    /// is `box.type`). Returns `None` when the slot is out of range.
-    /// Mirrors PyPy `self.inputargs[idx]` (optimizer.py:34).
-    pub fn inputarg_at(&self, idx: usize) -> Option<majit_ir::OpRef> {
-        self.inputargs.get(idx).copied()
+    /// Read-only access to the inputarg slot's bound box.
+    /// Returns `None` when the slot is out of range.
+    /// Mirrors PyPy `self.inputargs[idx]` (`optimizer.py`).
+    pub fn inputarg_at(&self, idx: usize) -> Option<Operand> {
+        self.inputargs.get(idx).cloned()
     }
 
     /// info.py `getrawptrinfo(op)` parity (line-by-line port).
@@ -9827,12 +9812,13 @@ impl OptContext {
         if let Some(pending) = &self.pending_mark_last_guard {
             pending.walk_const_ptr_refs(visitor);
         }
-        for r in &self.inputargs {
-            r.trace_const_ptr(visitor);
+        for inputarg in &self.inputargs {
+            inputarg.walk_const_ptr_refs(visitor);
         }
-        // `resoperation.py` `RefOp._resref` is a GC field of the box. The
-        // canonical InputArg boxes live in `inputarg_refs`; a bridge's are
-        // reminted copies no recorder walk visits, so forward `.value` here.
+        // Fallback ownership: `inputarg_refs` still owns low-range,
+        // carried, and position-materialized boxes that may not occur in
+        // `inputargs`. Keep walking them until the later registry-removal
+        // stage.
         for ia in self.inputarg_refs.values() {
             if let Some(Value::Ref(mut r)) = ia.get_value() {
                 visitor(&mut r);

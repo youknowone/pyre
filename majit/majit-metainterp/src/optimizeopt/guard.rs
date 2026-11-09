@@ -787,6 +787,7 @@ impl Default for GuardStrengthenOpt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::test_support::rooted_inputarg_operands;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::operand::Operand;
 
@@ -850,7 +851,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         // Overflow guards and IntMulOvf work on Int-typed args — override
         // the test default so the renamed inputargs are minted Int, not Ref.
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
+        opt.trace_inputargs = rooted_inputarg_operands(&vec![majit_ir::Type::Int; 1024]);
         let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
         for (op, seed) in ops.iter().zip(seeded.iter()) {
@@ -890,7 +891,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[majit_ir::Type::Int; 2]);
+        opt.trace_inputargs = rooted_inputarg_operands(&[majit_ir::Type::Int; 2]);
 
         use crate::history::test_support::rooted_inputarg_operand;
         use majit_ir::{OpRc, Type, Value};

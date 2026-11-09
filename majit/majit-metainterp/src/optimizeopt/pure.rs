@@ -1818,6 +1818,7 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::test_support::rooted_inputarg_operands;
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,
@@ -1995,7 +1996,7 @@ mod tests {
     ) -> Vec<Op> {
         let (producers, inputs) = build_trace(num_inputs, specs);
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         for make in extra_passes {
             opt.add_pass(make());
         }
@@ -2286,7 +2287,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -2312,7 +2313,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -2417,7 +2418,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -2443,7 +2444,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
@@ -2483,7 +2484,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
@@ -2540,7 +2541,7 @@ mod tests {
         let (ops, inputs) = build_trace(num_inputs, &specs);
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(OptPure::with_history_limit(16)));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -2781,7 +2782,7 @@ mod tests {
         let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -3108,7 +3109,7 @@ mod tests {
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::heap::OptHeap::new()));
-        opt.trace_inputargs = OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
+        opt.trace_inputargs = rooted_inputarg_operands(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
@@ -3852,7 +3853,7 @@ mod tests {
             )],
         );
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
@@ -3923,7 +3924,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         // Seed the cross-call result keyed on [funcptr, ref_arg] (Ref
         // value), as record_result_of_call_pure does at trace time.
         opt.record_call_pure_result(

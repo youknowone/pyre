@@ -398,6 +398,14 @@ pub(crate) mod test_support {
         operand
     }
 
+    pub(crate) fn rooted_inputarg_operands(types: &[Type]) -> Vec<Operand> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(index, &tp)| rooted_inputarg_operand(tp, index as u32))
+            .collect()
+    }
+
     pub(crate) fn rooted_operand_from_opref(a: OpRef) -> Operand {
         if a.is_none() || a.is_constant() {
             return Operand::from_opref(a);

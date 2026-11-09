@@ -281,7 +281,7 @@ pub trait LoopInfo {
 /// optimizer.py `BasicLoopInfo`.
 #[derive(Clone, Debug)]
 pub struct BasicLoopInfo {
-    pub inputargs: Vec<OpRef>,
+    pub inputargs: Vec<Operand>,
     pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     pub jump_op: Option<Op>,
     pub extra_same_as: Vec<Op>,
@@ -291,7 +291,7 @@ pub struct BasicLoopInfo {
 
 impl BasicLoopInfo {
     pub fn new(
-        inputargs: Vec<OpRef>,
+        inputargs: Vec<Operand>,
         quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
         jump_op: Option<Op>,
     ) -> Self {
@@ -393,9 +393,9 @@ pub struct Optimizer {
     /// description of the virtual's field values.
     pub(crate) imported_virtuals: Vec<ImportedVirtual>,
     /// optimizer.py `self.inputargs = inputargs` parity.
-    /// Typed InputArg OpRefs (InputArgInt/InputArgRef/InputArgFloat)
-    /// carrying `box.type` (history.py:220) intrinsically via variant tag.
-    pub trace_inputargs: Vec<OpRef>,
+    /// Bound InputArg boxes (`optimizer.py Optimizer._propagate_all_forward`
+    /// / `BasicLoopInfo` store `trace.inputargs` directly).
+    pub trace_inputargs: Vec<Operand>,
     /// unroll.py / compile.py parity: original live values at the jump
     /// point, threaded into export_state as `runtime_boxes`. Dormant
     /// until the export/import pair starts reading it.
@@ -566,12 +566,6 @@ pub struct Optimizer {
     /// Phase-1 `_forwarded` it carries is the authoritative one. Consumed
     /// (`take`) by the run.
     pub explicit_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
-    /// optimizer.py `self.inputargs`: the box objects of the trace being
-    /// optimized (`trace.get_iter().inputargs`), not only their positions.
-    /// A box that only a guard snapshot names is still this object, so
-    /// `import_state` forwards the same box `ResumeDataLoopMemo.number`
-    /// reads through `_cache`. Consumed by the run.
-    pub(crate) trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
 }
 
 /// RPython unroll.py: import_state virtual info for Phase 2.
@@ -1478,7 +1472,6 @@ impl Optimizer {
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
             explicit_input_ops_seed: None,
-            trace_inputarg_boxes: Vec::new(),
         }
     }
 
@@ -2997,7 +2990,7 @@ impl Optimizer {
                     }
                 }
             }
-            self.trace_inputargs = OpRef::inputarg_refs(&types);
+            self.trace_inputargs = crate::history::test_support::rooted_inputarg_operands(&types);
         }
         self.imported_label_args = None;
         self.terminal_op = None;
@@ -3079,8 +3072,10 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
-        for ia in std::mem::take(&mut self.trace_inputarg_boxes) {
-            ctx.inputarg_refs.entry(ia.index).or_insert(ia);
+        for inputarg in &ctx.inputargs {
+            if let Some(inputarg) = inputarg.bound_inputarg() {
+                ctx.inputarg_refs.entry(inputarg.index).or_insert(inputarg);
+            }
         }
         // The `&[Op]` wrap carries the fixture's InputArg objects. Install
         // those before `ensure_inputarg_bindings` mints a second host per
@@ -3120,10 +3115,7 @@ impl Optimizer {
         // adding release-build work.
         debug_assert!(
             !self.building_bridge
-                || crate::optimizeopt::unroll::UnrollOptimizer::check_no_forwarding(
-                    &ctx,
-                    &ctx.inputargs,
-                )
+                || crate::optimizeopt::unroll::UnrollOptimizer::check_no_forwarding(&ctx.inputargs)
         );
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
@@ -3535,7 +3527,7 @@ impl Optimizer {
                 let resolved_box = ctx.resolve_operand_operand(&arg);
                 let expected_ref = inputargs_are_the_jump_target
                     && i < inputargs.len()
-                    && inputargs[i].ty() == Some(majit_ir::Type::Ref);
+                    && inputargs[i].type_() == majit_ir::Type::Ref;
                 // setup_optimizations seeds `trace_inputargs` into
                 // ctx.inputargs (`optimizer.py Optimizer.__init__`).
                 // The replacement box carries `Box.type` (`Operand::type_`);
@@ -4603,11 +4595,7 @@ impl Optimizer {
                     let types: Vec<majit_ir::Type> = self
                         .trace_inputargs
                         .get(..ni)
-                        .map(|s| {
-                            s.iter()
-                                .map(|o| o.ty().unwrap_or(majit_ir::Type::Ref))
-                                .collect()
-                        })
+                        .map(|s| s.iter().map(Operand::type_).collect())
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
@@ -4632,11 +4620,7 @@ impl Optimizer {
             let types: Vec<majit_ir::Type> = self
                 .trace_inputargs
                 .get(..ni)
-                .map(|s| {
-                    s.iter()
-                        .map(|o| o.ty().unwrap_or(majit_ir::Type::Ref))
-                        .collect()
-                })
+                .map(|s| s.iter().map(Operand::type_).collect())
                 .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
             OptContext::with_inputarg_types(32, &types)
         });
@@ -6351,7 +6335,7 @@ fn exported_short_box_replay_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_resop_operand;
+    use crate::history::test_support::{rooted_inputarg_operands, rooted_resop_operand};
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -6830,7 +6814,7 @@ mod tests {
     fn test_restart_from_extra_operation_rediscovers_first_pass() {
         let hits = Rc::new(Cell::new(0));
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int; 8]);
+        opt.trace_inputargs = rooted_inputarg_operands(&[majit_ir::Type::Int; 8]);
         opt.add_pass(Box::new(SendRestartCandidate {
             queued: Cell::new(false),
         }));
@@ -7225,7 +7209,7 @@ mod tests {
         b.op(OpCode::IntAdd, &[x, y]);
         b.op(OpCode::Jump, &[]);
         let (ops, inputs) = b.build();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -7365,7 +7349,7 @@ mod tests {
         let mut finish = Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 0)]);
         finish.pos().set(OpRef::void_op(1));
         let ops = vec![OpRc::new(finish)];
-        opt.trace_inputargs = OpRef::inputarg_refs(&[Type::Int]);
+        opt.trace_inputargs = rooted_inputarg_operands(&[Type::Int]);
         let mut constants = majit_ir::ConstMap::default();
         let result = opt
             .optimize_loop(&ops, &mut constants, 1, None, 0)
@@ -7390,7 +7374,7 @@ mod tests {
     /// rather than mint a second one that `import_state` would forward
     /// instead.
     #[test]
-    fn trace_inputarg_boxes_bind_an_inputarg_no_operation_reads() {
+    fn trace_inputargs_keep_an_unread_inputarg_box() {
         use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         let mut b = TraceBuilder::new();
@@ -7398,10 +7382,7 @@ mod tests {
         let y = b.input(Type::Int, 1);
         b.op(OpCode::Finish, std::slice::from_ref(&x));
         let (ops, inputs) = b.build();
-        let x_box = x.bound_inputarg().expect("x is an inputarg");
-        let y_box = y.bound_inputarg().expect("y is an inputarg");
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
-        opt.trace_inputarg_boxes = vec![x_box.clone(), y_box.clone()];
+        opt.trace_inputargs = vec![x.clone(), y.clone()];
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         opt.optimize_with_constants_and_inputs_oprc(
             &ops,
@@ -7410,9 +7391,8 @@ mod tests {
         )
         .expect("test: unexpected InvalidLoop");
         let ctx = opt.final_ctx.as_ref().expect("optimize stores its context");
-        let bound = ctx.inputarg_refs.get(&1).expect("y is bound");
         assert!(
-            majit_ir::InputArgRc::ptr_eq(bound, &y_box),
+            ctx.inputargs[1].same_box(&y),
             "the unread inputarg must stay the trace's own box"
         );
     }
@@ -7439,7 +7419,7 @@ mod tests {
         b.op(OpCode::GuardNonnull, &[x]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
@@ -7796,11 +7776,7 @@ mod tests {
         // (history.py:220 parity) against the shared `inputarg_types`
         // Vec, so they are NOT carried here.
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = vec![
-            OpRef::void_op(0),
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_ref(2),
-        ];
+        opt.trace_inputargs = rooted_inputarg_operands(&[Type::Ref, Type::Int, Type::Ref]);
         opt.phase1_emit_ops.push(OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
             &[rooted_resop_operand(Type::Int, 50)],
@@ -7825,7 +7801,7 @@ mod tests {
         // shared `inputarg_types` Vec (history.py:220 parity for
         // `box.type` reads through `imported_label_args`).
         let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 3, 100, 103);
-        ctx.inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Ref, Type::Float]);
+        ctx.inputargs = rooted_inputarg_operands(&[Type::Int, Type::Ref, Type::Float]);
         // Phase 2's own inputargs at [100..103) — own range still resolves.
         assert_eq!(ctx.inputarg_type(OpRef::int_op(100)), Some(Type::Int));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(101)), Some(Type::Ref));
@@ -7847,7 +7823,7 @@ mod tests {
         // In Phase 1 (`inputarg_base == 0`) the low-range fallback must
         // NOT trigger — only the canonical own-range path applies.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref, Type::Ref]);
-        ctx.inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Ref, Type::Float]);
+        ctx.inputargs = rooted_inputarg_operands(&[Type::Int, Type::Ref, Type::Float]);
         // OpRefs in [0..3) resolve through the own range (inputarg_base=0).
         assert_eq!(ctx.inputarg_type(OpRef::int_op(0)), Some(Type::Int));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(2)), Some(Type::Float));
@@ -8259,7 +8235,7 @@ mod tests {
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
         ops[1].setfailargs(vec![x.clone(), y.clone()].into());
-        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
@@ -8363,7 +8339,7 @@ mod tests {
         let ops = vec![cmp, guard_true, guard_value, jump];
         let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
         let mut unroll = UnrollOptimizer::new();
-        unroll.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int]);
+        unroll.trace_inputargs = rooted_inputarg_operands(&[Type::Int, Type::Int]);
         unroll.snapshot_boxes = snapshots;
         let (result, _) = unroll.optimize_trace_with_constants_and_inputs(
             &ops,
