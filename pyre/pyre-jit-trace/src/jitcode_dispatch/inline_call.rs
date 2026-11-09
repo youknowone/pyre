@@ -1676,11 +1676,42 @@ fn descent_decline(
     summary.blocker_after_effect.map(DescentDecline::Helper)
 }
 
+/// Callee answer for a blackhole `inline_call_*`: a callable `fnaddr` runs
+/// natively (`bhimpl_inline_call_*`) and contributes only its effect;
+/// otherwise the callee is interpreted. `recursive` is the in-progress
+/// blackhole scan's `seen` / `cycle_hits`; without it the callee starts a
+/// fresh memoized summary.
+fn blackhole_inline_callee_summary(
+    payload_descrs: Option<&[DescrRef]>,
+    descr_index: usize,
+    recursive: Option<(&mut Vec<usize>, &mut u64)>,
+) -> Option<DescentBlockerSummary> {
+    helper_resume_descr_at(payload_descrs, descr_index)
+        .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+        .map(|callee_index| {
+            // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does not
+            // interpret this body; the native call can still allocate, raise
+            // or write the heap.
+            let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
+                .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
+            if calls_native {
+                DescentBlockerSummary {
+                    may_execute_effect: true,
+                    ..DescentBlockerSummary::default()
+                }
+            } else if let Some((seen, cycle_hits)) = recursive {
+                summarize_blackhole_blockers_cached(callee_index, seen, cycle_hits)
+            } else {
+                blackhole_blocker_summary(callee_index)
+            }
+        })
+}
+
 /// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
 /// can reach a residual or conditional call whose funcbox may be a symbolic
 /// placeholder (`is_symbolic_fnaddr`), an `abort` opcode (`bhimpl_abort`),
 /// an `inline_call_*` callee the blackhole would interpret
-/// (`interpret_unresolved_inline_call`) whose whole-body summary can reach
+/// (`interpret_unresolved_inline_call`) whose blackhole summary can reach
 /// an `abort`, or a region the scan cannot read.
 ///
 /// `reject_unresolved_call` bails at a symbolic placeholder. A runtime
@@ -1692,8 +1723,9 @@ fn descent_decline(
 /// scan proves there (`entry_array_len`, the length of a gateway's argument
 /// array), so an arm those facts exclude on every path to `pc` is not
 /// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary. An inline callee with a callable `fnaddr` contributes
+/// blackhole summary. An inline callee with a callable `fnaddr` contributes
 /// no body blockers: the blackhole calls it natively (`bhimpl_inline_call_*`).
+/// A nested callee with a callable `fnaddr` contributes only its effect.
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1727,23 +1759,7 @@ pub(crate) fn helper_resume_reaches_blocker(
             jitcode.num_regs_i(),
             jitcode.constants_i.as_slice(),
             |descr_index, _caller_effect, _entry_lens| {
-                helper_resume_descr_at(payload_descrs, descr_index)
-                    .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    .map(|callee_index| {
-                        // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
-                        // not interpret this body; the native call can still
-                        // allocate, raise or write the heap.
-                        let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
-                            .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
-                        if calls_native {
-                            DescentBlockerSummary {
-                                may_execute_effect: true,
-                                ..DescentBlockerSummary::default()
-                            }
-                        } else {
-                            descent_blocker_summary(callee_index)
-                        }
-                    })
+                blackhole_inline_callee_summary(payload_descrs, descr_index, None)
             },
             &mut |_blocker, _effect| true,
             &mut call_effect_free,
@@ -2089,6 +2105,82 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
         return body_not_walked();
     };
     jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
+}
+
+/// Whole-body summary under blackhole execution: an `inline_call_*` callee
+/// with a callable fnaddr runs natively (`bhimpl_inline_call_*`) and
+/// contributes only its effect.
+pub(crate) fn blackhole_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return body_not_walked();
+    };
+    jitcode.blackhole_blocker_summary(|| {
+        let mut cycle_hits = 0;
+        summarize_blackhole_blockers_inner(jitcode_index, &mut Vec::new(), &mut cycle_hits)
+    })
+}
+
+/// [`summarize_blackhole_blockers_inner`] for a callee, memoized on the
+/// callee's body when the answer belongs to that body.
+///
+/// Cycle-safe the same way [`summarize_descent_blockers_cached`] is: a body
+/// already on the stack answers "executes an effect, names no blocker" for
+/// the occurrence that opened the cycle, and that answer is not stored.
+fn summarize_blackhole_blockers_cached(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    cycle_hits: &mut u64,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        return summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    };
+    if let Some(cached) = jitcode.blackhole_blocker_summary_if_computed() {
+        return cached;
+    }
+    let cycles_before = *cycle_hits;
+    let summary = summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    if *cycle_hits == cycles_before {
+        jitcode.blackhole_blocker_summary(|| summary);
+    }
+    summary
+}
+
+fn summarize_blackhole_blockers_inner(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    cycle_hits: &mut u64,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        *cycle_hits += 1;
+        return DescentBlockerSummary {
+            may_execute_effect: true,
+            ..DescentBlockerSummary::default()
+        };
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return body_not_walked();
+    };
+    seen.push(jitcode_index);
+    let summary = summarize_body_blockers_from(
+        None,
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index, _caller_effect, _entry_lens| {
+            blackhole_inline_callee_summary(None, descr_index, Some((&mut *seen, &mut *cycle_hits)))
+        },
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
+        &[],
+        &mut jitcode_fnaddr_for_descr,
+        descr_refs_for_jitcode_index(jitcode_index),
+    );
+    seen.pop();
+    summary
 }
 
 /// One reachable point of [`summarize_descent_blockers`]'s dataflow.

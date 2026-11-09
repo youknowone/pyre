@@ -644,6 +644,11 @@ pub struct DerivedBodyFacts {
     /// by the symbolic hash standing in for its funcbox. Read through
     /// [`JitCode::descent_blocker_summary`].
     descent_blocker_summary: OnceLock<DescentBlockerSummary>,
+    /// The whole-body summary under blackhole execution, where an
+    /// `inline_call_*` callee with a callable fnaddr runs natively
+    /// (`bhimpl_inline_call_*`). Read through
+    /// [`JitCode::blackhole_blocker_summary`].
+    blackhole_blocker_summary: OnceLock<DescentBlockerSummary>,
     /// The same answer computed with the argument-array length a call site
     /// knows, indexed by that length. Read through
     /// [`JitCode::descent_blocker_summary_for_entry_len`].
@@ -805,6 +810,31 @@ impl JitCode {
     /// yet entitled to commit.
     pub fn descent_blocker_summary_if_computed(&self) -> Option<DescentBlockerSummary> {
         self.derived.descent_blocker_summary.get().copied()
+    }
+
+    /// The un-lowered helpers a blackhole executing this body can reach,
+    /// computing the answer with `compute` the first time it is asked. An
+    /// `inline_call_*` callee with a callable fnaddr is native
+    /// (`bhimpl_inline_call_*`), so this summary does not walk that body.
+    /// The property is fixed by the assembled body and the published
+    /// `fnaddr` table, so the first answer is the only one this instance
+    /// gives: `body_mut` needs `&mut self`, which `runtime_fnaddr_patch`
+    /// can only take before the jitcode is published behind an `Arc`.
+    pub fn blackhole_blocker_summary(
+        &self,
+        compute: impl FnOnce() -> DescentBlockerSummary,
+    ) -> DescentBlockerSummary {
+        *self.derived.blackhole_blocker_summary.get_or_init(compute)
+    }
+
+    /// The already-computed answer of [`Self::blackhole_blocker_summary`], or
+    /// `None` when nothing has asked for it yet.
+    ///
+    /// A caller that must decide whether its answer may be stored reads the
+    /// slot without filling it: `get_or_init` would take a closure it is not
+    /// yet entitled to commit.
+    pub fn blackhole_blocker_summary_if_computed(&self) -> Option<DescentBlockerSummary> {
+        self.derived.blackhole_blocker_summary.get().copied()
     }
 
     /// The same answer as [`Self::descent_blocker_summary`], for a caller that
