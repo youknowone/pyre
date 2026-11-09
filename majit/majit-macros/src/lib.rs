@@ -5776,6 +5776,10 @@ mod tests {
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
         );
+        assert_eq!(
+            skip("fn f(o: PyObjectRef, p: fn(PyObjectRef) -> i64) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
     }
 
     #[test]

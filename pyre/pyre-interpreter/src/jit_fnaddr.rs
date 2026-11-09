@@ -7979,6 +7979,19 @@ mod tests {
             call_impl, raw_call,
             "must not publish the raw slice/Result item"
         );
+
+        assert!(
+            bindings.contains_key("pyre_interpreter::type_methods::set_lookup_checked"),
+            "missing pyre_interpreter::type_methods::set_lookup_checked"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::type_methods::set_contains_checked"),
+            "missing pyre_interpreter::type_methods::set_contains_checked"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::typedef::set_type_error_matched"),
+            "missing pyre_interpreter::typedef::set_type_error_matched"
+        );
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
