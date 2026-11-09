@@ -2786,8 +2786,12 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     if depth == 0 && !call_is_void && depth_read.is_none() {
         return Err(unavail("Unavail::Top/DepthZero"));
     }
-    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc)
-        .ok_or_else(|| unavail("Unavail::Top/CallStack"))?;
+    // The JitCode banks already hold every live box
+    // (`get_list_of_active_boxes(in_a_call=True)`); a missing Python
+    // operand shape is not a missing live value, so the paused caller is
+    // built from those banks at its post-call pc with no overrides.
+    let call_stack_overrides =
+        collect_call_stack_overrides(caller_sym, ctx, call_jit_pc).unwrap_or_default();
     let result_register = super::residual_call::parent_call_result_color(
         unsafe { &(*caller_sym.jitcode()).payload },
         call_jit_pc,
@@ -3487,8 +3491,9 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
                 .outer_resume_marker_jit_pc
                 .ok_or(DispatchError::callee_inline_unsupported(op_pc))?,
         };
+        // A caller re-executing its CALL and a callee returning into a
+        // paused CALL are different frame states (`rebuild_from_resumedata`).
         let python = compute_inline_caller_frame(ctx, call_jit_pc)
-            .or_else(|_| compute_inline_helper_call_entry_frame(ctx, call_jit_pc))
             .map_err(|_| DispatchError::callee_inline_unsupported(op_pc))?;
         let mut frames = vec![python];
         frames.extend(parent_frames);

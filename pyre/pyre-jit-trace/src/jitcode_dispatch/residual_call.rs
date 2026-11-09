@@ -2843,6 +2843,99 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
     }
     let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
+    // `blackhole.py _copy_data_from_miframe` copies the three typed banks
+    // independently. A transparent helper's `parent.boxes` is the compact
+    // live list in JitCode bank/color order (Int, then Ref, then Float —
+    // `state.rs` `recipe_live_boxes`), not a dense Ref bank.
+    if crate::state::jitcode_is_transparent_helper(parent.jitcode_index as i32) {
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            parent.jitcode_index as i32,
+            resume_pc as i32,
+        )?;
+        if parent.boxes.len() > live.total_len() {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: continuation \
+                     helper boxes {} exceed live colors {}",
+                    parent.boxes.len(),
+                    live.total_len()
+                );
+            }
+            return None;
+        }
+        let result = super::call_result_register(parent.jitcode_index, resume_pc);
+        let mut position = 0usize;
+        for (bank, colors) in [
+            ('i', live.int.as_slice()),
+            ('r', live.ref_.as_slice()),
+            ('f', live.float.as_slice()),
+        ] {
+            for &color in colors {
+                let color = color as usize;
+                let Some(&boxed) = parent.boxes.get(position) else {
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[s2-build-decline] origin={origin} frame {index}: continuation \
+                             live {bank} color {color} is missing or NO_CONCRETE"
+                        );
+                    }
+                    return None;
+                };
+                position += 1;
+                if matches!(
+                    result,
+                    super::CallResultRegister::Reg(b, c) if b == bank && c == color
+                ) {
+                    continue;
+                }
+                let value = ctx.trace_ctx.concrete_of_opref(boxed);
+                let mut pin = None;
+                let (bank_regs, word) = match (bank, value) {
+                    ('i', Some(majit_ir::Value::Int(value))) => (&mut banks.registers_i, value),
+                    ('r', Some(majit_ir::Value::Ref(value)))
+                        if value != majit_ir::GcRef::NO_CONCRETE =>
+                    {
+                        pin = owner_root_if_gc(value.0);
+                        (
+                            &mut banks.registers_r,
+                            pin.as_ref().map_or(value.0, |p| p.get().0) as i64,
+                        )
+                    }
+                    ('f', Some(majit_ir::Value::Float(value))) => {
+                        (&mut banks.registers_f, value.to_bits() as i64)
+                    }
+                    _ => {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[s2-build-decline] origin={origin} frame {index}: continuation \
+                                 live {bank} color {color} is missing or NO_CONCRETE"
+                            );
+                        }
+                        return None;
+                    }
+                };
+                let Some(slot) = bank_regs.get_mut(color) else {
+                    if fbw_debug_abort_enabled() {
+                        let bank_name = match bank {
+                            'i' => "int",
+                            'r' => "ref",
+                            'f' => "float",
+                            _ => unreachable!(),
+                        };
+                        eprintln!(
+                            "[s2-build-decline] origin={origin} frame {index}: continuation \
+                             {bank_name} color {color} out of range (len {})",
+                            bank_regs.len()
+                        );
+                    }
+                    return None;
+                };
+                *slot = Some(word);
+                drop(pin);
+            }
+        }
+        return Some(AbortHandoffFrame { miframe, banks });
+    }
     // `_copy_data_from_miframe` (`blackhole.py`) copies every live box the
     // MIFrame holds. The only register that may still be empty is the
     // pending call result `_setup_return_value_r` has not written

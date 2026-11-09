@@ -9292,28 +9292,12 @@ pub(crate) fn reconstruct_inline_recipe(
             match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
                 Some(slot) => Some(slot),
                 None => {
-                    // Interior `-live-` (`floor_segment_for_jitcode_pc`
-                    // start != `frame.pc`, same test as
-                    // `LiveRefColorUnmapped` below): the CALL dest is
-                    // pushed after the residual, so it has no stack slot
-                    // yet. `get_list_of_active_boxes` (`pyjitpl.py`)
-                    // under `in_a_call` clears that color;
-                    // `MIFrame.make_result_of_lastop` writes the callee
-                    // return into `registers_r[color]`. Opcode-start
-                    // floor still declines a truly unmapped dest.
-                    let interior_live = pyjitcode_for_jitcode_index(frame.jitcode_index)
-                        .and_then(|p| {
-                            crate::pyjitcode::floor_segment_for_jitcode_pc(
-                                &p.metadata.py_floor_by_jit_pc,
-                                frame.pc as usize,
-                            )
-                        })
-                        .is_some_and(|(start, _)| start != frame.pc as usize);
-                    if interior_live {
-                        None
-                    } else {
-                        decline!("PendingResultColorUnmapped")
-                    }
+                    // The CALL dest is pushed after the call returns, so it
+                    // may have no stack slot yet. `get_list_of_active_boxes`
+                    // (`pyjitpl.py`) under `in_a_call` clears that color, and
+                    // `BlackholeInterpreter._setup_return_value_r`
+                    // (`blackhole.py`) writes the return into it.
+                    None
                 }
             }
         }
