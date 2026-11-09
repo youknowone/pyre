@@ -1524,6 +1524,41 @@ fn we_are_jitted_lookup_in_type_where_real() {
     );
 }
 
+/// Real-LLBC anchor for the `gc_alloc_failed_pending()` → `ConstBool(false)`
+/// front fold: `ll_list_int_resize_ge` and `w_list_append_inner` both call
+/// that helper after a resize that may malloc (`exceptiontransform.py`
+/// `rpyexc_occurred`).  After the front fold the residual `FunctionPath`
+/// call is gone.  `#[ignore]`d (loads the real object LLBC); run with
+/// `cargo test -p majit-translate --lib gc_alloc_failed_pending_front_fold_real
+/// -- --ignored`.
+#[test]
+#[ignore]
+fn gc_alloc_failed_pending_front_fold_real() {
+    use crate::model::{CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    for fname in ["ll_list_int_resize_ge", "w_list_append_inner"] {
+        let graph = crate::test_support::lower_function(llbc, fname)
+            .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if super::fmt_path_ends_with(segments, &["gc_alloc_failed_pending"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "{fname}: residual gc_alloc_failed_pending call after the front fold"
+        );
+    }
+}
+
 /// Real-LLBC anchor for the fieldless-enum `Debug` `format!` collapse:
 /// `call_intrinsic_1`'s unknown-intrinsic arm renders `func`
 /// (`IntrinsicFunction1`, a fieldless enum) with `{:?}`, which lowers to
