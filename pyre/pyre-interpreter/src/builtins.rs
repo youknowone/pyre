@@ -22001,10 +22001,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
-    // Exact int/bool: `W_IntObject.descr_hash` is `_hash_int(self.intval)`;
-    // `W_BoolObject` inherits it. Written out so the graph has no loop.
+    // `W_IntObject.descr_hash` (intobject.py) for the int layout;
+    // `W_LongObject.descr_hash` (longobject.py) takes the LONG arm.
+    // Exact class is int's typedef; LONG_TYPE instances share that class,
+    // so the int layout (`is_int`, including tagged immediates) is required.
     unsafe {
-        if is_exact_type(obj, &pyre_object::INT_TYPE) {
+        if is_exact_type(obj, &pyre_object::INT_TYPE) && pyre_object::is_int(obj) {
             return Ok(_hash_int(w_int_get_value(obj)));
         }
         if is_exact_type(obj, &pyre_object::BOOL_TYPE) {

@@ -30425,21 +30425,25 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
     let interpreter =
         crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
     let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
-    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[interpreter, object],
-        crate::HostStaticAddrs {
-            error_carrier: crate::ErrorCarrierSpec {
-                carrier_path: "pyre_interpreter::error::PyError",
-                carrier_class: "",
-                carrier_wrappers: &[],
-                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-                from_exc_object: Some(("PyError", "from_exc_object")),
+    let program = crate::test_support::with_shared_link_write([interpreter, object], || {
+        let touching = crate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[interpreter, object],
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_class: "",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        },
-        &["error"],
-        &["oefmt"],
-    )
+            &["error"],
+            &["oefmt"],
+        )
+    })
     .expect("lower oefmt");
     let graph = program
         .functions

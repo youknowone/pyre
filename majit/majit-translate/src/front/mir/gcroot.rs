@@ -2054,20 +2054,21 @@ impl<'a> RootStackAnalyzer<'a> {
             || self.analyze_fn_values(c, seen)
     }
 
-    /// A function item passed to a callee that will invoke a pointer
-    /// (`jit.conditional_call`, an opaque residual): the `_callbacks`
-    /// walk of `GraphAnalyzer.analyze_external_call`. `unwrap_or` of a
-    /// function item is not that walk; taking `f as *const () as usize`
-    /// is not a call (`GraphAnalyzer.analyze` charges `direct_call` /
-    /// `indirect_call` only).
+    /// A function item passed to a callee that may invoke that argument
+    /// (`graphanalyze.py` `GraphAnalyzer.analyze_external_call` `_callbacks`,
+    /// joined through `analyze_direct_call` / `analyze_indirect_call`).
+    /// `unwrap_or` of a function item is not that walk; taking
+    /// `f as *const () as usize` is not a call (`GraphAnalyzer.analyze`
+    /// charges `direct_call` / `indirect_call` only). `invokes` is the
+    /// per-argument answer from [`Self::callee_invokes_callback_arg`].
     fn callback_operand_touches(
         &self,
-        callee: &RegularCall,
+        invokes: bool,
         op: &Operand,
-        fn_locals: &[Option<RegularCall>],
+        fn_locals: &[Vec<RegularCall>],
         seen: &mut RootStackTracker,
     ) -> bool {
-        if !self.callee_invokes_fn_pointer(callee) {
+        if !invokes {
             return false;
         }
         let Some(local) = operand_local(Some(op)) else {
@@ -2075,20 +2076,124 @@ impl<'a> RootStackAnalyzer<'a> {
         };
         fn_locals
             .get(local)
-            .and_then(|slot| slot.as_ref())
-            .is_some_and(|cb| self.analyze_regular_call(cb, seen))
+            .is_some_and(|targets| targets.iter().any(|cb| self.analyze_regular_call(cb, seen)))
     }
 
-    fn callee_invokes_fn_pointer(&self, callee: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &callee.kind else {
-            return matches!(callee.kind, CallKind::Ptr(_) | CallKind::Unknown);
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
+    /// Whether `callee` may invoke the argument at `arg_index`
+    /// (`graphanalyze.py` `GraphAnalyzer.analyze_direct_call` /
+    /// `analyze_indirect_call` / `analyze_external_call` `_callbacks`).
+    /// `CallKind::Ptr` / `CallKind::Unknown`, or a Regular fn with no
+    /// FunDecl or no body, is unknown and answers true. `visiting` is the
+    /// cycle guard: a `(fn id, arg_index)` already on it answers false.
+    fn callee_invokes_callback_arg(
+        &self,
+        callee: &RegularCall,
+        arg_index: usize,
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        match &callee.kind {
+            CallKind::Ptr(_) | CallKind::Unknown => true,
+            CallKind::Fun(FunId::Regular { id }) => {
+                if visiting
+                    .iter()
+                    .any(|&(fid, aidx)| fid == *id && aidx == arg_index)
+                {
+                    return false;
+                }
+                let Some(fd) = self.llbc.fn_by_id(*id) else {
+                    return true;
+                };
+                let Some(body) = fd.unstructured_shared() else {
+                    return true;
+                };
+                visiting.push((*id, arg_index));
+                let result = self.body_invokes_callback_arg(&body, arg_index, visiting);
+                visiting.pop();
+                result
+            }
+            // Trait / Fun Other: no FunDecl on this kind, same as a missing graph.
+            _ => true,
+        }
+    }
+
+    fn body_invokes_callback_arg(
+        &self,
+        body: &Unstructured,
+        arg_index: usize,
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        let forward_blocks = forward_reachable_mask(self.llbc, body);
+        let mut aliases = vec![false; body.locals.locals.len()];
+        let param = arg_index + 1;
+        if param >= aliases.len() {
             return true;
-        };
-        match fd.unstructured() {
-            Some(body) => body_invokes_fn_pointer(self.llbc, &body),
-            None => true,
+        }
+        aliases[param] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (bb_idx, bb) in body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
+                for stmt in &bb.statements {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        continue;
+                    };
+                    let PlaceKind::Local(dest) = place.kind else {
+                        continue;
+                    };
+                    let dest = dest as usize;
+                    if dest >= aliases.len() || aliases[dest] {
+                        continue;
+                    }
+                    if rvalue_aliases_callback(rvalue, &aliases) {
+                        aliases[dest] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+                continue;
+            };
+            if self.call_invokes_callback_arg(call, &aliases, visiting) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn call_invokes_callback_arg(
+        &self,
+        call: &CallPayload,
+        aliases: &[bool],
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        match &call.func {
+            CallFunc::Regular(reg) => match &reg.kind {
+                CallKind::Ptr(func_op) => ptr_operand_is_alias(func_op, aliases),
+                _ => {
+                    let name = regular_call_name_path(reg, self.llbc);
+                    if name.as_deref().is_some_and(is_ops_function_call) {
+                        call.args.iter().any(|op| operand_is_alias(op, aliases))
+                    } else {
+                        call.args.iter().enumerate().any(|(q, op)| {
+                            operand_is_alias(op, aliases)
+                                && self.callee_invokes_callback_arg(reg, q, visiting)
+                        })
+                    }
+                }
+            },
+            CallFunc::Dynamic(func_op, _) => {
+                operand_is_alias(func_op, aliases)
+                    || call.args.iter().any(|op| operand_is_alias(op, aliases))
+            }
+            CallFunc::Unknown => call.args.iter().any(|op| operand_is_alias(op, aliases)),
         }
     }
 
@@ -2140,18 +2245,22 @@ impl<'a> RootStackAnalyzer<'a> {
                         match &call.func {
                             CallFunc::Regular(reg) => {
                                 // A Const `FnDef` argument is a callback
-                                // only when this callee will invoke a
-                                // pointer (`analyze_external_call`
-                                // `_callbacks`). `unwrap_or(f)` is not
-                                // that walk (`GraphAnalyzer.analyze`
-                                // charges `direct_call` /
-                                // `indirect_call` only).
-                                let invokes = self.callee_invokes_fn_pointer(reg);
+                                // only when this callee may invoke that
+                                // argument (`analyze_direct_call` /
+                                // `analyze_indirect_call` /
+                                // `analyze_external_call` `_callbacks`).
+                                // `unwrap_or(f)` is not that walk
+                                // (`GraphAnalyzer.analyze` charges
+                                // `direct_call` / `indirect_call` only).
+                                let mut visiting = Vec::new();
                                 self.analyze_regular_call(reg, seen)
-                                    || call.args.iter().any(|op| {
+                                    || call.args.iter().enumerate().any(|(q, op)| {
+                                        let invokes =
+                                            self.callee_invokes_callback_arg(reg, q, &mut visiting);
                                         (invokes && self.analyze_fn_operand(op, seen))
-                                            || self
-                                                .callback_operand_touches(reg, op, &fn_locals, seen)
+                                            || self.callback_operand_touches(
+                                                invokes, op, &fn_locals, seen,
+                                            )
                                     })
                             }
                             // `dyn Trait` dispatch: the pointer arm's reasoning.
@@ -2322,41 +2431,62 @@ fn cast_exposes_fn_addr(kind: &serde_json::Value) -> bool {
     }
 }
 
-fn operand_fn_item(
-    llbc: &Llbc,
-    op: &Operand,
-    holds: &[Option<RegularCall>],
-) -> Option<RegularCall> {
+fn operand_fn_items(llbc: &Llbc, op: &Operand, holds: &[Vec<RegularCall>]) -> Vec<RegularCall> {
     match op {
-        Operand::Const(c) => fn_def_of_const(llbc, c),
+        Operand::Const(c) => fn_def_of_const(llbc, c).into_iter().collect(),
         Operand::Copy(place) | Operand::Move(place) => match place.kind {
-            PlaceKind::Local(i) => holds.get(i as usize).and_then(Option::clone),
-            _ => None,
+            PlaceKind::Local(i) => holds.get(i as usize).cloned().unwrap_or_default(),
+            _ => Vec::new(),
         },
     }
 }
 
-fn rvalue_fn_item(
-    llbc: &Llbc,
-    rvalue: &Rvalue,
-    holds: &[Option<RegularCall>],
-) -> Option<RegularCall> {
+fn rvalue_fn_items(llbc: &Llbc, rvalue: &Rvalue, holds: &[Vec<RegularCall>]) -> Vec<RegularCall> {
     match rvalue {
-        Rvalue::Use(op, _) => operand_fn_item(llbc, op, holds),
+        Rvalue::Use(op, _) => operand_fn_items(llbc, op, holds),
         Rvalue::UnaryOp(kind, op) | Rvalue::Cast(kind, op, _) => {
             if cast_exposes_fn_addr(kind) {
-                None
+                Vec::new()
             } else {
-                operand_fn_item(llbc, op, holds)
+                operand_fn_items(llbc, op, holds)
             }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
+fn regular_call_same(a: &RegularCall, b: &RegularCall) -> bool {
+    if a.generics != b.generics {
+        return false;
+    }
+    match (&a.kind, &b.kind) {
+        (CallKind::Fun(FunId::Regular { id: a }), CallKind::Fun(FunId::Regular { id: b })) => {
+            a == b
+        }
+        (CallKind::Fun(FunId::Other(a)), CallKind::Fun(FunId::Other(b))) => a == b,
+        (CallKind::Trait(a), CallKind::Trait(b)) => a == b,
+        (CallKind::Ptr(a), CallKind::Ptr(b)) => a == b,
+        (CallKind::Unknown, CallKind::Unknown) => true,
+        _ => false,
+    }
+}
+
+fn add_fn_items(dest: &mut Vec<RegularCall>, items: &[RegularCall]) -> bool {
+    let mut changed = false;
+    for item in items {
+        if !dest.iter().any(|have| regular_call_same(have, item)) {
+            dest.push(item.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Locals that still hold a function item, not an exposed address word.
-fn fn_item_locals(llbc: &Llbc, body: &Unstructured) -> Vec<Option<RegularCall>> {
-    let mut holds = vec![None; body.locals.locals.len()];
+/// MIR is not SSA: every assignment is unioned (`analyze_indirect_call`
+/// joins every possible target).
+fn fn_item_locals(llbc: &Llbc, body: &Unstructured) -> Vec<Vec<RegularCall>> {
+    let mut holds = vec![Vec::new(); body.locals.locals.len()];
     let mut changed = true;
     while changed {
         changed = false;
@@ -2369,11 +2499,11 @@ fn fn_item_locals(llbc: &Llbc, body: &Unstructured) -> Vec<Option<RegularCall>> 
                     continue;
                 };
                 let dest = dest as usize;
-                if dest >= holds.len() || holds[dest].is_some() {
+                if dest >= holds.len() {
                     continue;
                 }
-                if let Some(reg) = rvalue_fn_item(llbc, rvalue, &holds) {
-                    holds[dest] = Some(reg);
+                let items = rvalue_fn_items(llbc, rvalue, &holds);
+                if add_fn_items(&mut holds[dest], &items) {
                     changed = true;
                 }
             }
@@ -2382,15 +2512,48 @@ fn fn_item_locals(llbc: &Llbc, body: &Unstructured) -> Vec<Option<RegularCall>> 
     holds
 }
 
-fn body_invokes_fn_pointer(llbc: &Llbc, body: &Unstructured) -> bool {
-    body.body.iter().any(|bb| match bb.term_ref(llbc) {
-        Ok(TermKind::Call { call, .. }) => match &call.func {
-            CallFunc::Regular(reg) => matches!(reg.kind, CallKind::Ptr(_)),
-            CallFunc::Dynamic(..) => true,
-            CallFunc::Unknown => false,
-        },
+fn operand_is_alias(op: &Operand, aliases: &[bool]) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_is_alias(place, aliases),
+        Operand::Const(_) => false,
+    }
+}
+
+fn place_is_alias(place: &Place, aliases: &[bool]) -> bool {
+    match &place.kind {
+        PlaceKind::Local(i) => aliases.get(*i as usize).copied().unwrap_or(false),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(s)) if s == "Deref" => {
+            match &inner.kind {
+                PlaceKind::Local(i) => aliases.get(*i as usize).copied().unwrap_or(false),
+                _ => false,
+            }
+        }
         _ => false,
-    })
+    }
+}
+
+fn rvalue_aliases_callback(rvalue: &Rvalue, aliases: &[bool]) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_is_alias(op, aliases),
+        Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => operand_is_alias(op, aliases),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_is_alias(place, aliases),
+        _ => false,
+    }
+}
+
+fn ptr_operand_is_alias(func_op: &serde_json::Value, aliases: &[bool]) -> bool {
+    serde_json::from_value::<Operand>(func_op.clone())
+        .ok()
+        .is_some_and(|op| operand_is_alias(&op, aliases))
+}
+
+fn is_ops_function_call(path: &str) -> bool {
+    matches!(
+        path,
+        "core::ops::function::Fn::call"
+            | "core::ops::function::FnMut::call_mut"
+            | "core::ops::function::FnOnce::call_once"
+    )
 }
 
 /// The brackets a body opens on a guard it keeps, and the blocks that run

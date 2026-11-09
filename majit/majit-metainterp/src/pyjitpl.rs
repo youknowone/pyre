@@ -33249,7 +33249,8 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         jitcode.set_jitdriver_sd(idx1);
 
-        let mut obj = ResidualCallVableObj::new(0, 0);
+        const PC: i64 = 0x51;
+        let mut obj = ResidualCallVableObj::new(0, PC);
         let obj_ptr = &mut obj as *mut ResidualCallVableObj;
         let frame = Value::Ref(majit_ir::GcRef(obj_ptr as usize));
         let jd1_desc = meta.staticdata.jitdrivers_sd[idx1].clone();
@@ -33296,17 +33297,30 @@ mod tests {
             "novable driver must not grow a virtualizable section"
         );
         let ops = ctx.recorder.ops();
-        let found = ops.iter().any(|op| {
+        let matching = ops.iter().find(|op| {
             op.opcode == OpCode::GetfieldGcR
                 && op
                     .getdescr()
                     .as_ref()
                     .is_some_and(|d| std::sync::Arc::ptr_eq(d, &expected_descr))
         });
-        assert!(
-            found,
-            "expected GetfieldGcR with the VTYPE static field descr, ops={ops:?}"
+        let Some(op) = matching else {
+            panic!("expected GetfieldGcR with the VTYPE static field descr, ops={ops:?}");
+        };
+        assert_eq!(
+            op.args_slice().first().map(|a| a.to_opref()),
+            Some(OpRef::input_arg_ref(0)),
+            "GetfieldGcR base must be the novable box, ops={ops:?}"
         );
+        match op.get_value() {
+            Some(Value::Ref(r)) => {
+                assert_eq!(r.as_usize() as i64, PC, "GetfieldGcR result must be obj.pc");
+            }
+            Some(other) => panic!("GetfieldGcR result stamped {other:?}, expected Ref(obj.pc)"),
+            None => {
+                // Residual GetfieldGcR result is not observable on this recorder.
+            }
+        }
     }
 
     #[test]

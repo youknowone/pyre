@@ -3380,6 +3380,229 @@ fn leftover_push_roots_paths(graph: &crate::model::FunctionGraph) -> Vec<String>
         .collect()
 }
 
+/// Unique look-inside leftover of `push_roots` is `>i`. `RootScope` peels
+/// to the save-point word (`shadow_stack_len()`); a GCREF dest puts that
+/// length in `registers_r` and `walk_immortal_rec` loads it as a PyObject.
+fn leftover_push_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    leftover_named_call_dest_summaries(graph, "push_roots")
+}
+
+/// Unique look-inside leftover of `RootScope::pin_roots` is `ri>i`.
+/// Self is the save-point word; dest is the first shadow-stack index.
+fn leftover_pin_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    leftover_named_call_dest_summaries(graph, "pin_roots")
+}
+
+fn leftover_named_call_dest_summaries(
+    graph: &crate::model::FunctionGraph,
+    leaf: &str,
+) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let dest = match op.result.as_ref() {
+                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                None => "_".into(),
+            };
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some(leaf) => {
+                    Some(format!("Call dest={dest} ty={result_ty:?}"))
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    result_ty,
+                    ..
+                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
+                    Some(format!("Method dest={dest} ty={result_ty:?}"))
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    result_kind,
+                    ..
+                } => {
+                    let is_named = leftover_residual_leaf_is(graph, funcptr, leaf);
+                    is_named.then(|| format!("CallResidual dest={dest} res={result_kind}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn leftover_residual_leaf_is(
+    graph: &crate::model::FunctionGraph,
+    funcptr: &crate::model::CallFuncPtr,
+    leaf: &str,
+) -> bool {
+    use crate::model::{CallFuncPtr, CallTarget, OpKind};
+    match funcptr {
+        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+            segments.last().map(String::as_str) == Some(leaf)
+        }
+        CallFuncPtr::Target(CallTarget::Method { name, .. }) => {
+            crate::front::clause_spec::unspecialized_leaf(name) == leaf
+        }
+        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
+            b.operations.iter().any(|prev| {
+                prev.result.as_ref() == Some(v)
+                    && matches!(
+                        &prev.kind,
+                        OpKind::ConstFnAddr { path, .. }
+                            if path.rsplit("::").next() == Some(leaf)
+                    )
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// Leftover `RootScope::pin_roots` self is the save-point word. A GCREF
+/// self banks `shadow_stack_len()` in `args_r`.
+fn leftover_pin_roots_arg_summaries(graph: &crate::model::FunctionGraph) -> String {
+    leftover_named_call_arg_summaries(graph, "pin_roots")
+}
+
+fn leftover_named_call_arg_summaries(graph: &crate::model::FunctionGraph, leaf: &str) -> String {
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some(leaf) => {
+                    let args = args
+                        .iter()
+                        .map(|arg| match arg {
+                            LinkArg::Value(v) => {
+                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!("Call args=[{args}]"));
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    args,
+                    ..
+                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
+                    let args = args
+                        .iter()
+                        .map(|arg| match arg {
+                            LinkArg::Value(v) => {
+                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!("Method args=[{args}]"));
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    args_i,
+                    args_r,
+                    result_kind,
+                    ..
+                } if leftover_residual_leaf_is(graph, funcptr, leaf) => {
+                    let i = args_i
+                        .iter()
+                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let r = args_r
+                        .iter()
+                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!("CallResidual i=[{i}] r=[{r}] res={result_kind}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    out.join(" | ")
+}
+
+/// Leftover `__cast_instance_intrinsic` of leftover `push_roots` dest.
+/// A GCREF recast of the save-point word is the same crash as a GCREF dest.
+fn leftover_cast_of_push_roots_dest(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+    let Some(dest_id) = leftover_named_call_dest_id(graph, "push_roots") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let uses_dest = match &op.kind {
+                OpKind::Call { args, .. } => args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v.id() == dest_id)),
+                OpKind::UnaryOp { operand, .. } => operand.id() == dest_id,
+                _ => false,
+            };
+            if !uses_dest {
+                continue;
+            }
+            let is_cast = match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments
+                    .last()
+                    .is_some_and(|s| s.contains("cast_instance") || s.contains("cast_ptr")),
+                OpKind::UnaryOp { op: name, .. } => {
+                    name.contains("cast_instance") || name.contains("cast_ptr")
+                }
+                _ => false,
+            };
+            if !is_cast {
+                continue;
+            }
+            let dest = match op.result.as_ref() {
+                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                None => "_".into(),
+            };
+            out.push(format!(
+                "cast dest={dest} of leftover push_roots v{dest_id}"
+            ));
+        }
+    }
+    out
+}
+
+fn leftover_named_call_dest_id(graph: &crate::model::FunctionGraph, leaf: &str) -> Option<u64> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some(leaf) => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+    })
+}
+
 /// RED dump: leftover residual of unique look-inside is a Call whose
 /// fnaddr never rebinds. List FunctionPath and Method so a leftover
 /// `push_roots` assertion names the combinator (`map_err` / `inspect_err`)
@@ -3407,6 +3630,363 @@ fn leftover_call_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Leftover `enter_recursive_frame` dest bank. Unique look-inside is `r>i`;
+/// a GCREF dest puts the TLS stack-height token (`stack.len()`) in the
+/// jitframe gcmap and `walk_immortal_rec` loads it as a PyObject.
+fn leftover_enter_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let dest = match op.result.as_ref() {
+                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                None => "_".into(),
+            };
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some("enter_recursive_frame") => {
+                    Some(format!("Call dest={dest} ty={result_ty:?}"))
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    result_kind,
+                    ..
+                } => {
+                    let is_enter = match funcptr {
+                        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                            segments.last().map(String::as_str) == Some("enter_recursive_frame")
+                        }
+                        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
+                            b.operations.iter().any(|prev| {
+                                prev.result.as_ref() == Some(v)
+                                    && matches!(
+                                        &prev.kind,
+                                        OpKind::ConstFnAddr { path, .. }
+                                            if path.contains("enter_recursive_frame")
+                                    )
+                            })
+                        }),
+                        _ => false,
+                    };
+                    is_enter.then(|| format!("CallResidual dest={dest} res={result_kind}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Leftover `release_recursive_frame` takes the usize token. A GCREF arg
+/// puts that TLS stack-height (`stack.len()`) in the jitframe gcmap.
+fn leftover_release_arg_summaries(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind};
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("release_recursive_frame") => {
+                    let args = args
+                        .iter()
+                        .map(|arg| match arg {
+                            LinkArg::Value(v) => {
+                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!("Call args=[{args}]"));
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    args_i,
+                    args_r,
+                    result_kind,
+                    ..
+                } => {
+                    let is_release = match funcptr {
+                        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                            segments.last().map(String::as_str) == Some("release_recursive_frame")
+                        }
+                        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
+                            b.operations.iter().any(|prev| {
+                                prev.result.as_ref() == Some(v)
+                                    && matches!(
+                                        &prev.kind,
+                                        OpKind::ConstFnAddr { path, .. }
+                                            if path.contains("release_recursive_frame")
+                                    )
+                            })
+                        }),
+                        _ => false,
+                    };
+                    if is_release {
+                        let i = args_i
+                            .iter()
+                            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let r = args_r
+                            .iter()
+                            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        out.push(format!("CallResidual i=[{i}] r=[{r}] res={result_kind}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.join(" | ")
+}
+
+fn leftover_release_arg_producers(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+    let mut args = Vec::new();
+    let mut release_blocks = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for op in &block.operations {
+            if let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args: call_args,
+                ..
+            } = &op.kind
+                && segments.last().map(String::as_str) == Some("release_recursive_frame")
+            {
+                release_blocks.push(bi);
+                for arg in call_args {
+                    if let Some(v) = arg.as_variable() {
+                        args.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &bi in &release_blocks {
+        let ins = graph.blocks[bi]
+            .inputargs
+            .iter()
+            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(format!("release_block={bi} inputargs=[{ins}]"));
+    }
+    for want in &args {
+        let mut found = false;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                if op.result.as_ref() == Some(want) {
+                    found = true;
+                    out.push(format!(
+                        "v{}:{:?} <- {bi}.{oi} {:?}",
+                        want.id(),
+                        FunctionGraph::concretetype_of(want),
+                        op.kind
+                    ));
+                }
+            }
+            for (pos, v) in block.inputargs.iter().enumerate() {
+                if v == want {
+                    found = true;
+                    let preds = graph
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(pi, pred)| {
+                            pred.exits.iter().filter_map(move |link| {
+                                (link.target.0 == bi).then(|| {
+                                    let forwarded = link
+                                        .args
+                                        .get(pos)
+                                        .map(|a| match a {
+                                            LinkArg::Value(src) => format!(
+                                                "v{}:{:?}",
+                                                src.id(),
+                                                FunctionGraph::concretetype_of(src)
+                                            ),
+                                            other => format!("{other:?}"),
+                                        })
+                                        .unwrap_or_else(|| "?".into());
+                                    format!("pred={pi} arg{pos}={forwarded}")
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    out.push(format!(
+                        "v{}:{:?} <- block{bi} input{pos} [{preds}]",
+                        want.id(),
+                        FunctionGraph::concretetype_of(want)
+                    ));
+                }
+            }
+        }
+        if !found {
+            out.push(format!(
+                "v{}:{:?} <- (no producer)",
+                want.id(),
+                FunctionGraph::concretetype_of(want)
+            ));
+        }
+    }
+    out.join(" | ")
+}
+
+fn leftover_enter_window(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallTarget, OpKind};
+    let ops = dump_graph_ops(graph);
+    let mut hits = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let is_enter = matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("enter_recursive_frame")
+            );
+            if is_enter {
+                let start = oi.saturating_sub(2);
+                let end = (oi + 8).min(block.operations.len());
+                for k in start..end {
+                    let prefix = format!("{bi}.{k} ");
+                    hits.push(
+                        ops.iter()
+                            .find(|s| s.starts_with(&prefix))
+                            .cloned()
+                            .unwrap_or_else(|| format!("{bi}.{k} ?")),
+                    );
+                }
+                for (ei, link) in block.exits.iter().enumerate() {
+                    let succ = link.target.0;
+                    let ins = graph.blocks[succ]
+                        .inputargs
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, v)| {
+                            let src = match link.args.get(pos) {
+                                Some(crate::model::LinkArg::Value(s)) => format!(
+                                    "v{}:{:?}",
+                                    s.id(),
+                                    crate::model::FunctionGraph::concretetype_of(s)
+                                ),
+                                other => format!("{other:?}"),
+                            };
+                            format!(
+                                "in{pos}=v{}:{:?}<= {src}",
+                                v.id(),
+                                crate::model::FunctionGraph::concretetype_of(v)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    hits.push(format!("exit{ei}->b{succ} [{ins}]"));
+                    for (k, sop) in graph.blocks[succ].operations.iter().take(12).enumerate() {
+                        let _ = sop;
+                        let prefix = format!("{succ}.{k} ");
+                        hits.push(
+                            ops.iter()
+                                .find(|s| s.starts_with(&prefix))
+                                .cloned()
+                                .unwrap_or_else(|| format!("{succ}.{k} ?")),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    hits.join(" || ")
+}
+
+/// Successor inputarg that receives leftover enter dest. FrameState.copy
+/// must inherit Signed; Unknown here banks the token as GCREF.
+fn leftover_enter_successor_input_kinds(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{FunctionGraph, LinkArg};
+    let Some(dest_id) = leftover_enter_dest_id(graph) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for (pos, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(src) = arg else {
+                    continue;
+                };
+                if src.id() != dest_id {
+                    continue;
+                }
+                let Some(input) = graph.blocks[link.target.0].inputargs.get(pos) else {
+                    continue;
+                };
+                out.push(format!(
+                    "v{}:{:?}<= v{dest_id}:{:?}",
+                    input.id(),
+                    FunctionGraph::concretetype_of(input),
+                    FunctionGraph::concretetype_of(src)
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn leftover_enter_dest_id(graph: &crate::model::FunctionGraph) -> Option<u64> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("enter_recursive_frame") => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+    })
+}
+
+fn leftover_var_uses(graph: &crate::model::FunctionGraph, id: u64) -> String {
+    use crate::model::{FunctionGraph, LinkArg};
+    let needle = format!("v{id}");
+    let mut out = dump_graph_ops(graph)
+        .into_iter()
+        .filter(|s| s.contains(&needle))
+        .collect::<Vec<_>>();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (pos, v) in block.inputargs.iter().enumerate() {
+            if v.id() == id {
+                out.push(format!(
+                    "input {bi}.{pos} v{}:{:?}",
+                    v.id(),
+                    FunctionGraph::concretetype_of(v)
+                ));
+            }
+        }
+        for (ei, link) in block.exits.iter().enumerate() {
+            for (pos, arg) in link.args.iter().enumerate() {
+                if matches!(arg, LinkArg::Value(v) if v.id() == id) {
+                    out.push(format!(
+                        "{bi} exit{ei} arg{pos}->{} {needle}",
+                        link.target.0
+                    ));
+                }
+            }
+        }
+    }
+    out.join(" | ")
 }
 
 /// Unique look-inside of `getcode` / `co_flags` residualizes
@@ -11792,19 +12372,25 @@ fn harvested_enter_recursive_frame_is_dont_look_inside() {
     let mut found_header = 0usize;
     let mut found_graph = 0usize;
     let mut hits: Vec<String> = Vec::new();
+    let mut return_types: Vec<(String, Option<String>)> = Vec::new();
+    let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
     for f in &program.functions {
         if !f.name.contains("enter_recursive_frame") {
             continue;
         }
         found_header += 1;
+        return_types.push((f.name.clone(), f.return_type.clone()));
         let Some(graph) = f.lazy_graph().get() else {
             continue;
         };
         found_graph += 1;
+        let look = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, graph);
         let leftover = leftover_cast_ptr_to_int_summaries(graph);
         hits.push(format!(
-            "{} leftover={leftover:?} ops={:?}",
+            "{} look={look} jit_look_inside={:?} hints={:?} leftover={leftover:?} ops={:?}",
             f.name,
+            graph.func.jit_look_inside,
+            graph.hints,
             dump_graph_ops(graph)
         ));
     }
@@ -11813,9 +12399,20 @@ fn harvested_enter_recursive_frame_is_dont_look_inside() {
         "harvested enter_recursive_frame header, functions={}",
         program.functions.len()
     );
-    assert_eq!(
-        found_graph, 0,
-        "dont_look_inside enter_recursive_frame must be graphless so unique look-inside residual-calls native; CAST of a heap GCREF is bhimpl_cast_ptr_to_int: {hits:#?}"
+    // Unique look-inside leftover is `r>i`: RecursionDepthGuard is
+    // `repr(transparent)` over usize, so FUNC.RESULT is the int word.
+    // A `"ref"` stamp puts the TLS stack-height token in the jitframe
+    // gcmap and `walk_immortal_rec` loads it as a PyObject.
+    assert!(
+        return_types
+            .iter()
+            .any(|(_, ty)| { matches!(ty.as_deref(), Some("u64" | "i64" | "usize" | "uSize")) }),
+        "enter_recursive_frame FUNC.RESULT must be the usize token, not a GCREF: {return_types:?}"
+    );
+    let looks_inside = hits.iter().any(|h| h.contains("look=true"));
+    assert!(
+        found_graph == 0 || !looks_inside,
+        "dont_look_inside enter_recursive_frame must residualize native; CAST of a heap GCREF is bhimpl_cast_ptr_to_int: {hits:#?}"
     );
 }
 
@@ -11928,9 +12525,6 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
             graph.hints,
         );
         if leaf == "execute_frame_portal" {
-            eprintln!("execute_frame_portal front leftover={calls:?}");
-            let ops = dump_graph_ops(&xf);
-            eprintln!("execute_frame_portal xf ops={ops:?}");
             portal_calls_resume += xf
                 .blocks
                 .iter()
@@ -11953,6 +12547,144 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
         }
         if leaf != "eval_frame_with_resume" {
             continue;
+        }
+        let front_enter = leftover_enter_dest_summaries(graph);
+        let xf_enter = leftover_enter_dest_summaries(&xf);
+        if front_enter
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+            || !front_enter.iter().any(|s| s.contains("Signed"))
+        {
+            hits.push(format!(
+                "{} leftover enter dest must be Signed/Unsigned: {front_enter:?}",
+                f.name
+            ));
+        }
+        if xf_enter
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
+        {
+            hits.push(format!(
+                "{} leftover enter dest is a GCREF (TLS stack-height token walked as PyObject): front={front_enter:?} xf={xf_enter:?}",
+                f.name
+            ));
+        }
+        let successor = leftover_enter_successor_input_kinds(graph);
+        if successor.is_empty()
+            || successor
+                .iter()
+                .any(|s| s.contains("Unknown") || s.contains("GcRef") || !s.contains("Signed"))
+        {
+            hits.push(format!(
+                "{} leftover enter successor inputarg must inherit Signed: {successor:?} window={} uses={}",
+                f.name,
+                leftover_enter_window(graph),
+                leftover_enter_dest_id(graph)
+                    .map(|id| leftover_var_uses(graph, id))
+                    .unwrap_or_default(),
+            ));
+        }
+        let front_release = leftover_release_arg_summaries(graph);
+        let xf_release = leftover_release_arg_summaries(&xf);
+        if front_release.is_empty()
+            || front_release.contains("Unknown")
+            || front_release.contains("GcRef")
+            || !front_release.contains("Signed")
+        {
+            hits.push(format!(
+                "{} leftover release arg must be Signed: front={front_release} producers={}",
+                f.name,
+                leftover_release_arg_producers(graph),
+            ));
+        }
+        if xf_release.is_empty()
+            || !xf_release.contains("r=[]")
+            || !xf_release.contains("Signed")
+            || xf_release.contains("Unknown")
+            || xf_release.contains("GcRef")
+        {
+            hits.push(format!(
+                "{} leftover release CallResidual must bank the token as INT: xf={xf_release}",
+                f.name
+            ));
+        }
+        let front_push = leftover_push_roots_dest_summaries(graph);
+        let xf_push = leftover_push_roots_dest_summaries(&xf);
+        if leftover_push_roots_paths(graph).is_empty() {
+            hits.push(format!(
+                "{} leftover push_roots is missing (erase refused on leftover eval_frame_after_enter): leftover={calls:?}",
+                f.name
+            ));
+        }
+        if front_push.is_empty()
+            || front_push
+                .iter()
+                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+            || !front_push.iter().any(|s| s.contains("Signed"))
+        {
+            hits.push(format!(
+                "{} leftover push_roots dest must be Signed: {front_push:?}",
+                f.name
+            ));
+        }
+        if xf_push
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
+            || !xf_push
+                .iter()
+                .any(|s| s.contains("Signed") || s.contains("res=i"))
+        {
+            hits.push(format!(
+                "{} leftover push_roots dest is a GCREF (save-point walked as PyObject): front={front_push:?} xf={xf_push:?}",
+                f.name
+            ));
+        }
+        let front_pin = leftover_pin_roots_dest_summaries(graph);
+        let xf_pin = leftover_pin_roots_dest_summaries(&xf);
+        let xf_pin_args = leftover_pin_roots_arg_summaries(&xf);
+        if !front_pin.is_empty()
+            && (front_pin
+                .iter()
+                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+                || !front_pin.iter().any(|s| s.contains("Signed")))
+        {
+            hits.push(format!(
+                "{} leftover pin_roots dest must be Signed: {front_pin:?}",
+                f.name
+            ));
+        }
+        if xf_pin
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
+        {
+            hits.push(format!(
+                "{} leftover pin_roots dest is a GCREF: front={front_pin:?} xf={xf_pin:?}",
+                f.name
+            ));
+        }
+        if !xf_pin_args.is_empty()
+            && xf_pin_args.contains("Signed")
+            && xf_pin_args.contains("r=[")
+            && !xf_pin_args.contains("r=[]")
+        {
+            hits.push(format!(
+                "{} leftover pin_roots Signed self must sit in args_i: xf={xf_pin_args}",
+                f.name
+            ));
+        }
+        let front_cast = leftover_cast_of_push_roots_dest(graph);
+        let xf_cast = leftover_cast_of_push_roots_dest(&xf);
+        if front_cast
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+            || xf_cast
+                .iter()
+                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+        {
+            hits.push(format!(
+                "{} leftover CAST of leftover push_roots dest recasts INT to GCREF: front={front_cast:?} xf={xf_cast:?}",
+                f.name
+            ));
         }
         let has_enter = calls.iter().any(|s| s.contains("enter_recursive_frame"));
         let has_release = calls.iter().any(|s| s.contains("release_recursive_frame"));

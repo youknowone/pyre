@@ -441,6 +441,10 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+///
+/// RootScope is the native shadow-stack guard. Jitcode graphs erase it
+/// (`shadow_stack_erase`), as the gctransformer's `push_roots` /
+/// `pop_roots` run after the codewriter.
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]

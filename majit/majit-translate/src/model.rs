@@ -10615,6 +10615,44 @@ impl FunctionGraph {
         self.recloseblock(block, exits);
     }
 
+    /// Fill unset target inputarg `concretetype` from the matching link
+    /// source (`Variable.copy` in `flowspace/model.py`). Never overwrite a
+    /// cell that is already set: a merge of disagreeing types stays unset
+    /// until `copy_agreed_concretetypes`. `create_block_with_arg_vars`
+    /// mints Unknown; leftover INT dests such as `enter_recursive_frame`
+    /// become GCREF (`get_value_kind_var(Unknown) == 'r'`) unless the
+    /// hop inherits Signed.
+    pub fn inherit_inputarg_concretetypes(&self, target: BlockId, args: &[LinkArg]) {
+        let inputs = &self.blocks[target.0].inputargs;
+        for (input, arg) in inputs.iter().zip(args.iter()) {
+            if input.concretetype().is_some() {
+                continue;
+            }
+            if let LinkArg::Value(src) = arg
+                && let Some(ct) = src.concretetype()
+            {
+                input.set_concretetype(Some(ct));
+            }
+        }
+    }
+
+    /// [`Self::inherit_inputarg_concretetypes`] for a Variable-only Link.
+    pub fn inherit_inputarg_concretetypes_from_vars(
+        &self,
+        target: BlockId,
+        args: &[crate::flowspace::model::Variable],
+    ) {
+        let inputs = &self.blocks[target.0].inputargs;
+        for (input, src) in inputs.iter().zip(args.iter()) {
+            if input.concretetype().is_some() {
+                continue;
+            }
+            if let Some(ct) = src.concretetype() {
+                input.set_concretetype(Some(ct));
+            }
+        }
+    }
+
     /// Shorthand for the single-exit fall-through shape — one Link to
     /// `target` carrying `args`, `exitswitch = None`.  Upstream
     /// equivalent: `block.closeblock(Link(args, target))`
@@ -10649,6 +10687,7 @@ impl FunctionGraph {
             target,
             self.name,
         );
+        self.inherit_inputarg_concretetypes_from_vars(target, &args);
         let link = Link::from_variables(self, args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
@@ -10668,6 +10707,7 @@ impl FunctionGraph {
             target,
             self.name,
         );
+        self.inherit_inputarg_concretetypes(target, &args);
         let link = Link::new_mixed(args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
@@ -10740,6 +10780,7 @@ impl FunctionGraph {
             target_block,
             self.name,
         );
+        self.inherit_inputarg_concretetypes(target_block, &outputargs);
         let link = Link::new_mixed(outputargs, target_block, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
@@ -10772,6 +10813,7 @@ impl FunctionGraph {
             target_block,
             self.name,
         );
+        self.inherit_inputarg_concretetypes(target_block, &outputargs);
         let link = Link::new_mixed(outputargs, target_block, None);
         self.closeblock(block, vec![link]);
     }
@@ -23531,6 +23573,34 @@ mod tests {
         assert!(
             merged.locals_w[1].is_none() && merged.locals_w[2].is_none(),
             "None-killed slots stay None in locals_w",
+        );
+    }
+
+    /// `create_block_with_arg_vars` mints Unknown; `set_goto` fills the
+    /// matching inputarg from a Signed source and does not overwrite a
+    /// cell that is already set.
+    #[test]
+    fn set_goto_inherits_concretetype_onto_unknown_inputargs() {
+        let mut graph = FunctionGraph::new("inherit_inputarg");
+        let pred = graph.create_block();
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let (succ, inputs) = graph.create_block_with_arg_vars(1);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&inputs[0]),
+            ConcreteType::Unknown
+        );
+        graph.set_goto(pred, succ, vec![src]);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&graph.block(succ).inputargs[0]),
+            ConcreteType::Signed
+        );
+        let pred2 = graph.create_block();
+        let other = graph.alloc_value_var_with_type(ConcreteType::Float);
+        graph.set_goto(pred2, succ, vec![other]);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&graph.block(succ).inputargs[0]),
+            ConcreteType::Signed,
+            "fill-only inherit must not overwrite a stamped inputarg"
         );
     }
 

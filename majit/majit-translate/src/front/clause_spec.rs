@@ -809,10 +809,58 @@ fn ref_class(v: &Value, llbc: &Llbc, depth: usize) -> RefClass {
     if kind.get("ParentClause").is_some() {
         return match resolve_trait_ref(v, llbc, depth) {
             Some(resolved) => ref_class(&resolved, llbc, depth + 1),
-            None => RefClass::Other,
+            None => {
+                // Open parent impl (caller `Clause` or a free type
+                // variable): an inherited ref that depends on the
+                // caller's clauses is refused by
+                // `concrete_trait_refs_or_empty`. Malformed / not-found
+                // stays Other.
+                if parent_clause_is_open(v, llbc, depth) {
+                    RefClass::Clause
+                } else {
+                    RefClass::Other
+                }
+            }
         };
     }
     RefClass::Other
+}
+
+/// True when `resolve_trait_ref` returned None because the parent impl's
+/// generics are still open, not because the ParentClause is malformed.
+fn parent_clause_is_open(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+    let Some(obj) = unwrap_ref(v, llbc, depth) else {
+        return false;
+    };
+    let Some(pair) = obj
+        .get("kind")
+        .and_then(|kind| kind.get("ParentClause"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(parent_ref) = pair.first() else {
+        return false;
+    };
+    let resolved_parent = resolve_trait_ref(parent_ref, llbc, depth + 1);
+    let parent = resolved_parent.as_ref().unwrap_or(parent_ref);
+    let Some(inner) = unwrap_ref(parent, llbc, depth + 1) else {
+        return false;
+    };
+    let Some(kind) = inner.get("kind") else {
+        return false;
+    };
+    if kind.get("Clause").is_some() {
+        return true;
+    }
+    let Some(generics) = kind
+        .get("TraitImpl")
+        .and_then(|impl_| impl_.get("generics"))
+    else {
+        return false;
+    };
+    concrete_trait_refs_or_empty(generics, llbc).is_none()
+        || concrete_type_args(generics, llbc).is_none()
 }
 
 fn trait_impl_id(v: &Value, llbc: &Llbc, depth: usize) -> Option<u64> {

@@ -6880,6 +6880,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ) {
         return None;
     }
+    // A linked transparent scalar is one word too: its field spells as the
+    // scalar, so the owner's layout carries no dotted leaf beneath it.
+    if llbc
+        .transparent_scalar_kind(&td.item_meta.name_path())
+        .is_some()
+    {
+        return None;
+    }
     Some(td)
 }
 

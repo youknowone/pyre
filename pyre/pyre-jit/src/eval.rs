@@ -8537,6 +8537,9 @@ fn sortkey_merge_point_jit(
     {
         return;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[strategy_type, tp, list_w, keys_w, w_callable]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         pyre_jit_trace::sortkey_state::SORTKEY_PORTAL_KEY,
     ) else {
@@ -8548,14 +8551,14 @@ fn sortkey_merge_point_jit(
             &driver
                 .meta_interp_mut()
                 .warm_state_for_driver(pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX),
-            strategy_type,
-            tp,
+            roots.get(base),
+            roots.get(base + 1),
         )
     };
     if majit_metainterp::loop_census::enabled() {
         majit_metainterp::loop_census::note_formatted(
             green_key,
-            get_printable_location_sortkey(strategy_type, tp),
+            get_printable_location_sortkey(roots.get(base), roots.get(base + 1)),
         );
     }
     let hot = {
@@ -8564,7 +8567,11 @@ fn sortkey_merge_point_jit(
         let reds = confirm_reds_if_installed(
             driver,
             jd_no,
-            pyre_jit_trace::sortkey_state::sortkey_live_values(list_w, keys_w, w_callable),
+            pyre_jit_trace::sortkey_state::sortkey_live_values(
+                roots.get(base + 2),
+                roots.get(base + 3),
+                roots.get(base + 4),
+            ),
         );
         driver
             .meta_interp_mut()
@@ -8578,7 +8585,14 @@ fn sortkey_merge_point_jit(
     ) {
         return;
     }
-    drive_sortkey_trace(green_key, strategy_type, tp, list_w, keys_w, w_callable);
+    drive_sortkey_trace(
+        green_key,
+        roots.get(base),
+        roots.get(base + 1),
+        roots.get(base + 2),
+        roots.get(base + 3),
+        roots.get(base + 4),
+    );
 }
 
 fn get_printable_location_sortkey(
@@ -9913,6 +9927,9 @@ fn drive_sortkey_trace(
 ) {
     use majit_metainterp::BackEdgeAction;
 
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[strategy_type, tp, list_w, keys_w, w_callable]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(false);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
@@ -9945,9 +9962,12 @@ fn drive_sortkey_trace(
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt. Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
-    let live_values =
-        pyre_jit_trace::sortkey_state::sortkey_live_values(list_w, keys_w, w_callable);
-    let gk = pyre_jit_trace::sortkey_state::sortkey_green_key(strategy_type, tp);
+    let live_values = pyre_jit_trace::sortkey_state::sortkey_live_values(
+        roots.get(base + 2),
+        roots.get(base + 3),
+        roots.get(base + 4),
+    );
+    let gk = pyre_jit_trace::sortkey_state::sortkey_green_key(roots.get(base), roots.get(base + 1));
     let mut descriptor =
         pyre_jit_trace::sortkey_state::SortkeyJitState::sortkey_driver_descriptor();
     descriptor.index = Some(jd_no);
@@ -9972,12 +9992,22 @@ fn drive_sortkey_trace(
         // NestedTraceGuard still holds the driver; drop it before the
         // compiled runner re-acquires `driver_pair()`.
         drop(driver);
+        let live_values = pyre_jit_trace::sortkey_state::sortkey_live_values(
+            roots.get(base + 2),
+            roots.get(base + 3),
+            roots.get(base + 4),
+        );
         run_compiled_sortkey(green_key, live_values);
         return;
     }
     if !matches!(action, BackEdgeAction::StartedTracing) {
         return;
     }
+    let strategy_type = roots.get(base);
+    let tp = roots.get(base + 1);
+    let list_w = roots.get(base + 2);
+    let keys_w = roots.get(base + 3);
+    let w_callable = roots.get(base + 4);
     let meta = driver.meta_interp_mut();
     {
         use majit_metainterp::JitState;
@@ -10136,10 +10166,6 @@ fn run_compiled_sortkey(green_key: u64, mut live_values: Vec<majit_ir::Value>) {
             break;
         }
         if !has_storage {
-            break;
-        }
-        if let Some(err) = portal_error_from_exc_ref(guard_exc) {
-            pending_err = Some(err);
             break;
         }
         let bh = resume_in_blackhole(
@@ -11039,18 +11065,10 @@ fn portal_return_trace_then_leave(
 /// order.  `?` on any of the three would flatten the nesting and drop the hooks
 /// after it.
 ///
-/// The resume payload is consumed HERE, inside the bracket, not by the caller
-/// ahead of it.  `execute_frame` runs `self.resume_execute_frame(w_arg_or_err)`
-/// in the inner `try`, after `call_trace`, and a suspended `yield from` /
-/// `await` delegate that yields again ends the activation right there — which is
-/// upstream's `except pyopcode.Yield: w_exitvalue = self.popvalue()`, still
-/// inside both `finally`s.  Consuming it before the bracket made a delegating
-/// resume return without ever running `call_trace`, `return_trace`,
-/// `leaveframe_trace` or the frame-chain leave: measured on an `await` chain
-/// that re-suspends, where a `sys.setprofile` hook saw 2 of the 6 events
-/// CPython, pypy3 and `PYRE_JIT=0` all report.  It also ran the delegate's own
-/// Python — and therefore the delegate's whole call/return pair — ahead of this
-/// frame's `call`, inverting the nesting a pairing profiler accounts on.
+/// The interpreter positions the frame and prepares any resume payload before
+/// `frame_dispatch`. This function dispatches that already positioned frame:
+/// `call_trace`, then `portal_runner_dispatch`, then `return_trace` and the
+/// leave hook. It does not receive or consume a resume payload.
 fn portal_activation_bracketed(
     frame_root: &mut FrameRoot,
     leave_owner: PortalLeaveOwner,
@@ -11068,19 +11086,16 @@ fn portal_activation_bracketed(
     // Same shape, and the same assign-only-what-came-back-live rule, as
     // `eval::eval_frame_with_resume`.
     let mut w_exitvalue = w_none();
-    // `call_trace` runs before `resume_execute_frame`. A thrown
-    // `OperationError` (`error.py`) is a GC object on that path.
+    // `call_trace` runs before the already positioned frame is dispatched.
+    // A thrown `OperationError` (`error.py`) is a GC object on that path.
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
-            // `self.resume_execute_frame(w_arg_or_err)` and its
-            // `except pyopcode.Yield` arm, in `execute_frame`'s inner `try`: a
-            // resumed frame is positioned mid-body and the sent value belongs
-            // on the operand stack at that pc, so the payload is consumed
-            // before the merge point is consulted.  A delegate that yields
-            // again finishes the resumption itself and this frame never runs —
-            // but it still owes `return_trace` and the leave below, so the
-            // value is assigned rather than returned.
+            // `portal_runner_dispatch` of the already positioned frame, in
+            // `execute_frame`'s inner `try`. The resume payload was prepared
+            // before `frame_dispatch`; this bracket still owes `return_trace`
+            // and the leave below, so the value is assigned rather than
+            // returned.
             let result = portal_runner_dispatch(frame_root);
             portal_activation_return_trace(frame_root, ec, result, &mut w_exitvalue)
         }

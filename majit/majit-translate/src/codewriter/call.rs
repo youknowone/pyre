@@ -2732,7 +2732,10 @@ impl FuncObjAttrs {
 #[derive(Clone)]
 enum StorePass {
     /// [`CallControl::materialize_deferred_indirect_families`].
-    MaterializeIndirectFamilies(std::rc::Rc<TraitMethodImpls>),
+    MaterializeIndirectFamilies {
+        trait_method_impls: std::rc::Rc<TraitMethodImpls>,
+        builtin_fastfunc_2: std::rc::Rc<[CallPath]>,
+    },
     /// [`CallControl::lower_registered_indirect_calls`].
     LowerIndirectCalls {
         trait_method_impls: std::rc::Rc<TraitMethodImpls>,
@@ -3034,8 +3037,11 @@ impl StoreCore {
 
     fn apply_pass(&self, pass: &StorePass, graph: &mut FunctionGraph) {
         match pass {
-            StorePass::MaterializeIndirectFamilies(trait_method_impls) => {
-                materialize_indirect_families(graph, trait_method_impls);
+            StorePass::MaterializeIndirectFamilies {
+                trait_method_impls,
+                builtin_fastfunc_2,
+            } => {
+                materialize_indirect_families(graph, trait_method_impls, builtin_fastfunc_2);
             }
             StorePass::LowerIndirectCalls {
                 trait_method_impls,
@@ -8536,8 +8542,13 @@ impl CallControl {
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
         let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        let builtin_fastfunc_2: std::rc::Rc<[CallPath]> =
+            self.builtin_fastfunc_2_indirect_graphs().into();
         self.function_graphs
-            .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
+            .run_pass(StorePass::MaterializeIndirectFamilies {
+                trait_method_impls,
+                builtin_fastfunc_2,
+            });
     }
 
     /// Variable ids whose annotation carries `access_directly`.
@@ -10511,7 +10522,15 @@ fn declared_result_type(
 }
 
 /// [`CallControl::materialize_deferred_indirect_families`] on one graph.
-fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: &TraitMethodImpls) {
+///
+/// `FunctionReprBase.call` (rpbc.py): the family's graph set is the
+/// registered one. The keyed `BuiltinCode::fastfunc_2` marker is filled
+/// from `builtin_fastfunc_2`, never collapsed to `None`.
+fn materialize_indirect_families(
+    graph: &mut FunctionGraph,
+    trait_method_impls: &TraitMethodImpls,
+    builtin_fastfunc_2: &[CallPath],
+) {
     for op in graph
         .blocks
         .iter_mut()
@@ -10535,6 +10554,12 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
         let Some((trait_root, method_name)) = family_key.clone() else {
             continue;
         };
+        if trait_root == crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT
+            && method_name == crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD
+        {
+            *graphs = Some(builtin_fastfunc_2.to_vec());
+            continue;
+        }
         let family = trait_method_impls
             .get(&(trait_root.clone(), method_name.clone()))
             .cloned()
@@ -29017,6 +29042,56 @@ mod tests {
             graphs.as_ref().map(Vec::len),
             Some(2),
             "the registered source graph must carry the complete PBC family"
+        );
+    }
+
+    /// `FunctionReprBase.call`: the keyed `BuiltinCode::fastfunc_2` marker
+    /// (`Some([])`) is the registered family, never collapsed to `None`.
+    #[test]
+    fn materialize_indirect_families_keeps_the_fastfunc_2_family() {
+        let mut cc = CallControl::new();
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let funcptr = caller.alloc_value_var();
+        caller
+            .block_mut(caller.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr,
+                    args: Vec::new(),
+                    graphs: Some(Vec::new()),
+                    family_key: Some((
+                        crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT.to_string(),
+                        crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD.to_string(),
+                    )),
+                    result_ty: ValueType::Void,
+                },
+            });
+        cc.register_function_graph(caller_path.clone(), caller);
+        cc.materialize_deferred_indirect_families();
+        let caller = cc
+            .function_graphs
+            .get(&caller_path)
+            .expect("registered caller");
+        let op = &caller.block(caller.startblock).operations[0];
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &op.kind
+        else {
+            panic!("caller operation must remain an indirect call");
+        };
+        assert_eq!(
+            family_key.as_ref().map(|(t, m)| (t.as_str(), m.as_str())),
+            Some((
+                crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT,
+                crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD
+            )),
+        );
+        assert!(
+            graphs.is_some(),
+            "fastfunc_2 marker must not collapse to None, got {graphs:?}"
         );
     }
 

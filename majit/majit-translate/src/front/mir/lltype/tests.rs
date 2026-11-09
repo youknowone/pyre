@@ -10255,6 +10255,56 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
     );
 }
 
+/// A linked transparent scalar is one word even when its field is named.
+/// `integer_newtype_inner_field` rejects a named payload (`RangeFrom.start`),
+/// so `RootScope.save_point` would otherwise expand as a dotted leaf that
+/// the owner layout does not have.
+#[test]
+fn linked_transparent_scalar_with_named_field_is_not_a_by_value_struct() {
+    let decls = vec![(
+        1,
+        struct_decl(
+            1,
+            ident_path(&["fixture", "Scope"]),
+            serde_json::json!([{
+                "name": "save_point",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+                "attr_info": null
+            }]),
+            false,
+        ),
+    )];
+    let (llbc, scope_ty) = load_handle(decls, serde_json::json!([null]), 1);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &scope_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_some(),
+        "named one-field wrapper is an inlined STRUCT before linking"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Scope".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &scope_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_none(),
+        "a linked transparent scalar is one word, not an inlined STRUCT"
+    );
+}
+
 /// `&self` of a one-integer tuple struct is an address. `self.0` is
 /// that integer (`history.getkind` of the field), not the Ref receiver.
 #[test]

@@ -8014,6 +8014,10 @@ impl<'a> Lowering<'a> {
         } else {
             op_kind
         };
+        let stamp_result_ty = match &op_kind {
+            OpKind::Call { result_ty, .. } => Some(result_ty.clone()),
+            _ => None,
+        };
 
         // Allocate the result Variable now. Bind it to the destination
         // local after copy-in so `p = f(&mut p)` still reads the previous
@@ -8100,6 +8104,29 @@ impl<'a> Lowering<'a> {
         } else {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
+        }
+        // Integer leftover dests such as `enter_recursive_frame`
+        // (`RecursionDepthGuard` peels to Unsigned) must be Signed before
+        // `FrameState.copy`. Minting Unknown leaves the cell unset; copies
+        // then stay Unknown and `get_value_kind_var` banks them as GCREF,
+        // so leftover `release_recursive_frame` walks `stack.len()` as a
+        // PyObject. Stamp after rust-vec / CCHARP / fn-ptr overlays — those
+        // arms are gated on `concretetype().is_none()`.
+        if result_var.concretetype().is_none()
+            && let Some(ty) = stamp_result_ty.as_ref()
+        {
+            let concrete = crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+                ty,
+                &self.raw_alloc_flavor_structs,
+            );
+            if matches!(
+                concrete,
+                crate::model::ConcreteType::Signed
+                    | crate::model::ConcreteType::Float
+                    | crate::model::ConcreteType::Void
+            ) {
+                crate::model::FunctionGraph::set_concretetype_of_inline(&result_var, concrete);
+            }
         }
         // Carrier `Result::expect` via FunDecl / FunctionPath spelling.
         // `core::result::<Impl>::expect` on the `Method` spelling, and
