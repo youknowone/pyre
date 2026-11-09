@@ -3687,6 +3687,14 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
     if let Some(raw) = raw_field_address_value_type(place_ty, field_ty, owner_declared_gc, llbc) {
         return raw;
     }
+    // FrameAnchor is the frame GCREF (`tyref_is_frame_anchor`). A
+    // struct-field / closure-env getfield of the by-value anchor or of
+    // `&FrameAnchor` is that word, so the load unifies with the stored
+    // local (`annotator/model.py` `unionof`; `rclass.py`
+    // `InstanceRepr.getfield`).
+    if tyref_is_frame_anchor(place_ty, llbc) || tyref_is_frame_anchor(field_ty, llbc) {
+        return ValueType::Ref(Some("GCREF".to_string()));
+    }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(
             place_ty,
@@ -5658,6 +5666,14 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
+    // Matching [`tyref_to_value_type`]: FrameAnchor is the frame. The
+    // transparent peel below would seed Unsigned from `depth: usize`;
+    // FORCE of a struct / closure-env field of `&FrameAnchor` must be
+    // the frame so setattr unions with the stored local
+    // (`rclass.py` `InstanceRepr.setfield`; `annotator/model.py` `unionof`).
+    if tyref_is_frame_anchor(ty, llbc) {
+        return ValueType::Ref(Some("GCREF".to_string()));
+    }
     if let Some(inner) = tyref_transparent_inner_value_type(
         ty,
         llbc,
@@ -5831,6 +5847,13 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
 ) -> ValueType {
     if tyref_is_type_parameter(ty, llbc) {
         return ValueType::Unknown;
+    }
+    // FrameAnchor is the frame, including a closure-env capture of
+    // `&FrameAnchor`. The borrowed-scalar peel below does not claim it
+    // (`tyref_is_borrowed_transparent_scalar`); seed the frame here so
+    // FORCE matches the value-site word.
+    if tyref_is_frame_anchor(ty, llbc) {
+        return ValueType::Ref(Some("GCREF".to_string()));
     }
     if type_decl_is_closure_env(owner)
         && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc).or_else(|| {
@@ -13624,6 +13647,17 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // would otherwise keep `&E` as a pointer row against an Int FORCE.
     if let Some(spelling) = fieldless_enum_field_layout_spelling(ty, llbc) {
         return spelling;
+    }
+    // FrameAnchor is the frame GCREF (`tyref_is_frame_anchor`). A struct
+    // field of the by-value anchor or of `&FrameAnchor` is that GC pointer
+    // (`rclass.py` `InstanceRepr._setup_repr` llfields from
+    // `attrdef.s_value`; `llmemory.py` `GCREF`). The reference arm
+    // below would spell `&FrameAnchor` and `raw_struct_ptr_annotation`
+    // would mint `Ptr(eval::FrameAnchor)`; the transparent peel would
+    // spell `usize`. Either unions with the frame local
+    // (`annotator/model.py` `unionof`).
+    if tyref_is_frame_anchor(ty, llbc) {
+        return "GCREF".to_string();
     }
     // A borrow of a `repr(transparent)` scalar wrapper is that inner
     // word (`tyref_to_value_type` / `tyref_is_borrowed_transparent_scalar`;
