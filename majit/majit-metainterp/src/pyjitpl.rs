@@ -30880,10 +30880,11 @@ mod tests {
             .getconst_ref(memo_dead.0 as i64)
             .expect("pool the parked memo const");
 
+        let prod_box = majit_ir::operand::Operand::from_opref(prod_const);
         let sb = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
-            &[prod_const],
+            std::slice::from_ref(&prod_box),
             &[],
-            &[prod_const],
+            std::slice::from_ref(&prod_box),
         );
         let tt = crate::history::TargetToken::new_loop(15);
         let mut producer = Some(

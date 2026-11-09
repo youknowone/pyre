@@ -1758,10 +1758,7 @@ impl UnrollOptimizer {
             // ProducedShortOp list stored on ExportedState at export time.
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
-                &exported_short_inputargs
-                    .iter()
-                    .map(Operand::to_opref)
-                    .collect::<Vec<_>>(),
+                &exported_short_inputargs,
                 &exported_short_boxes_produced,
             )
         });
@@ -4817,24 +4814,7 @@ impl OptUnroll {
         //     exported_state.short_inputargs, exported_state.exported_infos,
         //     self.optimizer)
         //
-        // majit's `ShortPreambleBuilder` constructor is the
-        // `initialize_imported_short_preamble_builder_from_exported_ops`
-        // call below. The majit serialization keys short ops by slot index
-        // over the combined `label_args + virtuals` slot space (the same
-        // space `collect_exported_short_ops` built against), so we compute
-        // the virtuals tail inline before calling the initializer.
-        let virtuals: Vec<OpRef> = exported_state
-            .virtual_state
-            .state
-            .iter()
-            .enumerate()
-            .filter(|(_, info)| info.is_virtual())
-            .filter_map(|(i, _)| targetargs.get(i).copied())
-            .collect();
-        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
-        let mut short_args = label_arg_refs;
-        short_args.extend(virtuals);
-        // unroll.py:486-489 ShortPreambleBuilder constructor parity.
+        // `ShortPreambleBuilder.__init__(label_args, short_boxes, short_inputargs, ...)`
         //
         // RPython already has all Box identities before this point, so the
         // ShortPreambleBuilder can be constructed before the produce_op loop.
@@ -4876,14 +4856,9 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let short_inputarg_refs: Vec<OpRef> = exported_state
-            .short_inputargs
-            .iter()
-            .map(Operand::to_opref)
-            .collect();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
-            &short_args,
-            &short_inputarg_refs,
+            label_args,
+            &exported_state.short_inputargs,
             &exported_state.short_boxes,
             &result_map,
             &exported_state.exported_infos,
@@ -7998,8 +7973,9 @@ mod tests {
         let mask_box = ctx.materialize_operand_at(masked);
         let dep_box = ctx.materialize_operand_at(dependent);
         ctx.setintbound(&mask_box, &IntBound::bounded(0, MASK));
+        let short_input = rooted_inputarg_operand(Type::Int, 8);
         ctx.imported_short_preamble_builder = Some(ShortPreambleBuilder::new(
-            &[masked, dependent],
+            &[mask_box.clone(), dep_box.clone()],
             &[
                 (
                     mask_box.clone(),
@@ -8026,7 +8002,7 @@ mod tests {
                     },
                 ),
             ],
-            &[OpRef::input_arg_int(8)],
+            std::slice::from_ref(&short_input),
         ));
 
         let mask_pop = crate::optimizeopt::info::PreambleOp {
@@ -8583,9 +8559,19 @@ mod tests {
             10,
             &[Type::Ref, Type::Ref, Type::Ref],
         );
+        let labels = [
+            rooted_resop_operand(Type::Int, 0),
+            rooted_resop_operand(Type::Int, 1),
+            rooted_resop_operand(Type::Int, 2),
+        ];
+        let shorts = [
+            rooted_inputarg_operand(Type::Int, 10),
+            rooted_inputarg_operand(Type::Int, 11),
+            rooted_inputarg_operand(Type::Int, 12),
+        ];
         ctx.initialize_imported_short_preamble_builder(
-            &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
-            &[OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)],
+            &labels,
+            &shorts,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(
@@ -8666,19 +8652,21 @@ mod tests {
             32,
             &[Type::Ref, Type::Ref, Type::Ref, Type::Ref],
         );
+        let labels = [
+            rooted_resop_operand(Type::Ref, 0),
+            rooted_resop_operand(Type::Ref, 1),
+            rooted_resop_operand(Type::Ref, 2),
+            rooted_resop_operand(Type::Ref, 3),
+        ];
+        let shorts = [
+            rooted_inputarg_operand(Type::Ref, 10),
+            rooted_inputarg_operand(Type::Ref, 11),
+            rooted_inputarg_operand(Type::Ref, 12),
+            rooted_inputarg_operand(Type::Ref, 13),
+        ];
         ctx.initialize_imported_short_preamble_builder(
-            &[
-                OpRef::ref_op(0),
-                OpRef::ref_op(1),
-                OpRef::ref_op(2),
-                OpRef::ref_op(3),
-            ],
-            &[
-                OpRef::ref_op(10),
-                OpRef::ref_op(11),
-                OpRef::ref_op(12),
-                OpRef::ref_op(13),
-            ],
+            &labels,
+            &shorts,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(

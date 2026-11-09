@@ -415,6 +415,47 @@ mod walk_live_op_quasiimmut_tests {
         assert_eq!(short_box.const_value(), Some(Value::Ref(new)));
         assert_eq!(virtual_box.const_value(), Some(Value::Ref(new)));
     }
+
+    #[test]
+    fn published_context_walks_imported_short_preamble_builder_boxes() {
+        let old_input = GcRef(0x4100);
+        let new_input = GcRef(0x5100);
+        let old_used = GcRef(0x4200);
+        let new_used = GcRef(0x5200);
+        let short_input = Operand::const_from_value(Value::Ref(old_input));
+        let used_box = Operand::const_from_value(Value::Ref(old_used));
+
+        let mut builder = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
+            std::slice::from_ref(&short_input),
+            &[],
+            std::slice::from_ref(&short_input),
+        );
+        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&short_input));
+        replay_op.pos().set(OpRef::ref_op(14));
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: used_box.clone(),
+            invented_name: false,
+            preamble_op: OpRc::new(replay_op),
+            same_as_source: None,
+        };
+        builder.add_preamble_op_from_pop(&pop, used_box.clone());
+
+        let mut ctx = OptContext::new(0);
+        ctx.imported_short_preamble_builder = Some(builder);
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old_input {
+                *slot = new_input;
+            } else if *slot == old_used {
+                *slot = new_used;
+            }
+        });
+
+        assert_eq!(short_input.const_value(), Some(Value::Ref(new_input)));
+        assert_eq!(used_box.const_value(), Some(Value::Ref(new_used)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
@@ -4029,8 +4070,8 @@ impl OptContext {
 
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
-        label_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        label_args: &[Operand],
+        short_inputargs: &[Operand],
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(
@@ -4087,8 +4128,8 @@ impl OptContext {
     /// `self.res.getarg(0).getint()`).
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
-        short_args: &[OpRef],
-        short_inputargs: &[OpRef],
+        short_args: &[Operand],
+        short_inputargs: &[Operand],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         result_map: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
         exported_infos: &indexmap::IndexMap<
@@ -9875,6 +9916,12 @@ impl OptContext {
                 arg.walk_const_ptr_refs(visitor);
             }
         }
+        if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+            builder.walk_const_ptr_refs_mut(visitor);
+        }
+        if let Some(builder) = self.active_short_preamble_producer.as_mut() {
+            builder.walk_const_ptr_refs_mut(visitor);
+        }
         // Fallback ownership: `inputarg_refs` still owns low-range,
         // carried, and position-materialized boxes that may not occur in
         // `inputargs`. Keep walking them until the later registry-removal
@@ -12873,11 +12920,15 @@ mod imported_short_preamble_fallback_tests {
         // 2 Ref inputargs for the body label — typical loop-body shape.
         let mut ctx =
             OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
-        ctx.initialize_imported_short_preamble_builder(
-            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
-            &[OpRef::int_op(7), OpRef::int_op(8)],
-            &[],
-        );
+        let labels = [
+            crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Ref, 0),
+            crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Ref, 1),
+        ];
+        let shorts = [
+            crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Int, 7),
+            crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Int, 8),
+        ];
+        ctx.initialize_imported_short_preamble_builder(&labels, &shorts, &[]);
 
         let mut replay_op = Op::new(
             OpCode::IntAdd,

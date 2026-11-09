@@ -6234,7 +6234,9 @@ fn exported_short_box_replay_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{rooted_inputarg_operands, rooted_resop_operand};
+    use crate::history::test_support::{
+        rooted_inputarg_operand, rooted_inputarg_operands, rooted_resop_operand,
+    };
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -8069,9 +8071,11 @@ mod tests {
         preamble_op.pos().set(OpRef::int_op(14));
         let b = ctx.materialize_operand_at(OpRef::int_op(10_000));
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
+        let label = rooted_resop_operand(Type::Int, 0);
+        let short_input = rooted_inputarg_operand(Type::Int, 0);
         ctx.initialize_imported_short_preamble_builder(
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(0)],
+            std::slice::from_ref(&label),
+            std::slice::from_ref(&short_input),
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: OpRc::new(preamble_op.clone()),
                 source_op: None,

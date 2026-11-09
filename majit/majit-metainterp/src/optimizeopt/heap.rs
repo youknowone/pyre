@@ -5192,9 +5192,10 @@ mod tests {
         ctx.seed_boxes_canonical(std::slice::from_ref(object));
         let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
         preamble_op.pos().set(source);
+        let resolved_box = bound_arg(resolved);
         ctx.initialize_imported_short_preamble_builder(
-            &[object_ref, resolved],
-            &[object_ref, resolved],
+            &[object.clone(), resolved_box.clone()],
+            &[object.clone(), resolved_box],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: OpRc::new(preamble_op.clone()),
                 source_op: None,
@@ -5406,7 +5407,7 @@ mod tests {
             same_as_source: None,
             label_arg_idx: None,
         };
-        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], object_descr(1));
+        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], object_descr(1));
         outer.pos().set(outer_pos);
         let mut inner = Op::with_descr(OpCode::GetfieldGcR, &[outer_box.clone()], object_descr(2));
         inner.pos().set(inner_pos);
@@ -5421,8 +5422,8 @@ mod tests {
 
         assert!(
             ctx.initialize_imported_short_preamble_builder_from_short_boxes(
-                &[p0],
-                &[p0],
+                std::slice::from_ref(&p0_box),
+                std::slice::from_ref(&p0_box),
                 &short_boxes,
                 &result_map,
                 &indexmap::IndexMap::new(),

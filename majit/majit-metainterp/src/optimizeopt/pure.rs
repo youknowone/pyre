@@ -1818,7 +1818,7 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operands;
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_inputarg_operands};
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,
@@ -1826,9 +1826,11 @@ mod tests {
         label_arg_idx: Option<usize>,
     ) {
         let source = preamble_op.pos().get();
-        let short_inputargs: Vec<OpRef> = match label_arg_idx {
-            Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
-            None => vec![OpRef::int_op(0)],
+        let short_inputargs: Vec<Operand> = match label_arg_idx {
+            Some(idx) => (0..=idx as u32)
+                .map(|i| rooted_inputarg_operand(Type::Int, i))
+                .collect(),
+            None => vec![rooted_inputarg_operand(Type::Int, 0)],
         };
         let res = ctx.materialize_operand_at(source);
         ctx.initialize_imported_short_preamble_builder(
