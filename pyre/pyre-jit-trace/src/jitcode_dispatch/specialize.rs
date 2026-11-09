@@ -15612,6 +15612,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     if !unsafe { pyre_object::is_exact_type(concrete_spec, &pyre_object::STR_TYPE) } {
         return Ok(None);
     }
+    if walker_promote_of_virtual(ctx, r_args[1]) {
+        return Ok(None);
+    }
     let Some(spec_text) = (unsafe { pyre_object::w_str_get_value_opt(concrete_spec) }) else {
         return Ok(None);
     };
