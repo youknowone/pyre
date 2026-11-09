@@ -5870,6 +5870,7 @@ mod tests {
         assert_eq!(skip("fn f(a: f64, b: f64) -> f64 { a }"), None);
         assert_eq!(skip("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"), None);
         assert_eq!(skip("fn f() -> Result<(), PyError> { Ok(()) }"), None);
+        assert_eq!(skip("fn f(k: PyObjectRef) -> PyError { loop {} }"), None);
         assert_eq!(
             skip("fn f(x: i64) -> Result<bool, crate::PyError> { Ok(true) }"),
             None
@@ -5879,6 +5880,10 @@ mod tests {
             None
         );
         assert_eq!(skip("fn f(o: PyObjectRef) -> PyError { todo!() }"), None);
+        assert_eq!(
+            skip("fn f(o: PyObjectRef, p: fn(PyObjectRef) -> i64) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
     }
 
     #[test]

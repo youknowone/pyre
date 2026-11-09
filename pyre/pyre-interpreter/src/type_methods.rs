@@ -6705,7 +6705,8 @@ pub(crate) fn dict_store_checked(
     }
 }
 
-/// Hash `item` with it rooted, then look it up with `probe`.
+/// Hash `item` with it rooted, then test membership (`W_BaseSetObject.has_key`
+/// → `strategy.has_key`).
 ///
 /// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
 /// pointer, so hashing inside the key build (`object_key_for_checked`) captures
@@ -6716,15 +6717,9 @@ pub(crate) fn dict_store_checked(
 /// The set is rooted too: `CONTAINS_OP` pops the container off the operand
 /// stack before dispatching here, so on `x in {...}` the hash below runs with
 /// nothing else referring to the set at all.  The body relocates, so the
-/// probe reloads it after `__hash__`.
-unsafe fn set_lookup_checked(
-    set: PyObjectRef,
-    item: PyObjectRef,
-    probe: unsafe fn(
-        PyObjectRef,
-        pyre_object::dictmultiobject::ObjectKey,
-    ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
-) -> Result<bool, crate::PyError> {
+/// lookup reloads it after `__hash__`.
+#[majit_macros::getfunctionptr]
+unsafe fn set_has_key_checked(set: PyObjectRef, item: PyObjectRef) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::pin_roots(&[item, set]);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
@@ -6738,7 +6733,39 @@ unsafe fn set_lookup_checked(
         pyre_object::gc_roots::shadow_stack_get(sp),
         hash,
     );
-    probe(pyre_object::gc_roots::shadow_stack_get(sp + 1), key)
+    let set = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    pyre_object::setobject::w_set_contains_key_checked(set, key)
+        .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+}
+
+/// Hash `item` with it rooted, then remove it (`_discard_from_set` →
+/// `strategy.remove`).
+///
+/// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
+/// pointer, so hashing inside the key build (`object_key_for_checked`) captures
+/// the pre-move pointer — the reason `object_key_hashed` exists. The element is
+/// rooted across the hash and reloaded, matching the add path
+/// (`builtin_set_add_items`).
+///
+/// The set is rooted too: `__hash__` can collect and the body relocates, so
+/// the removal reloads it after `__hash__`.
+#[majit_macros::getfunctionptr]
+unsafe fn set_remove_checked(set: PyObjectRef, item: PyObjectRef) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::pin_roots(&[item, set]);
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
+        .map_err(|err| {
+            crate::baseobjspace::wrap_set_element_hash_error(
+                pyre_object::gc_roots::shadow_stack_get(sp),
+                err,
+            )
+        })?;
+    let key = pyre_object::dictmultiobject::object_key_hashed(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        hash,
+    );
+    let set = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    pyre_object::setobject::w_set_discard_key_checked(set, key)
         .map_err(|_| crate::baseobjspace::take_pending_hash_error())
 }
 
@@ -6747,10 +6774,11 @@ pub(crate) fn set_discard_checked(
     set: PyObjectRef,
     item: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    unsafe { set_lookup_checked(set, item, pyre_object::setobject::w_set_discard_key_checked) }
+    unsafe { set_remove_checked(set, item) }
 }
 
 /// Test membership in a set, hashing the element through the protocol.
+#[majit_macros::getfunctionptr]
 pub(crate) fn set_contains_checked(
     set: PyObjectRef,
     item: PyObjectRef,
@@ -6774,10 +6802,9 @@ pub(crate) fn set_contains_checked(
                 return Ok(found != 0);
             }
         }
-        set_lookup_checked(
+        set_has_key_checked(
             pyre_object::gc_roots::shadow_stack_get(pair),
             pyre_object::gc_roots::shadow_stack_get(pair + 1),
-            pyre_object::setobject::w_set_contains_key_checked,
         )
     }
 }
