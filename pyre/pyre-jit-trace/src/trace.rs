@@ -416,6 +416,10 @@ pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError>
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+pub fn set_walk_end_propagated_exception(err: pyre_interpreter::PyError) {
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
+}
+
 /// Capture this mutator's raw walk-end carrier address for STW root walking.
 pub fn capture_walk_end_root_area() -> *const () {
     WALK_END_ROOT_AREA.with(|area| area as *const _ as *const ())
@@ -918,11 +922,17 @@ fn try_commit_midbody_abort_inner(
         pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
         Ok(frame) => frame,
-        Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
+        Err(err) => {
+            set_walk_end_propagated_exception(err);
+            return Err(MidBodyDecline::BeforeRun("callee frame allocation failed"));
+        }
     };
     let mut frame = match pyre_interpreter::pyframe::FrameBox::new(frame) {
         Ok(frame) => frame,
-        Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
+        Err(err) => {
+            set_walk_end_propagated_exception(err);
+            return Err(MidBodyDecline::BeforeRun("callee frame allocation failed"));
+        }
     };
     frame.fix_array_ptrs();
     let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());

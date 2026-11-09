@@ -931,6 +931,9 @@ pub fn descr_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             pyre_object::gc_roots::shadow_stack_get(base + 2),
         )
     };
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::PyError::memory_error(""));
+    }
     Ok(w_none())
 }
 
@@ -969,19 +972,31 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // general list.pop(index) path.
     if index == -1 {
         return match unsafe { pyre_object::listobject::w_list_pop_end(list) } {
-            Some(v) => Ok(v),
-            None => Err(crate::error::oefmt_noargs(
-                crate::PyErrorKind::IndexError,
-                "pop index out of range",
-            )),
+            Some(v) => crate::runtime_ops::obj_or_memory_error(v),
+            None => {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    Err(crate::PyError::memory_error(""))
+                } else {
+                    Err(crate::error::oefmt_noargs(
+                        crate::PyErrorKind::IndexError,
+                        "pop index out of range",
+                    ))
+                }
+            }
         };
     }
     match unsafe { pyre_object::listobject::w_list_pop(list, index) } {
-        Some(v) => Ok(v),
-        None => Err(crate::error::oefmt_noargs(
-            crate::PyErrorKind::IndexError,
-            "pop index out of range",
-        )),
+        Some(v) => crate::runtime_ops::obj_or_memory_error(v),
+        None => {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                Err(crate::PyError::memory_error(""))
+            } else {
+                Err(crate::error::oefmt_noargs(
+                    crate::PyErrorKind::IndexError,
+                    "pop index out of range",
+                ))
+            }
+        }
     }
 }
 

@@ -2791,11 +2791,11 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // `W_ListObject.descr_getitem`: an empty slice is `make_empty_list`
         // before `getslice`. The length is already the post-`__index__` value.
         if slicelength == 0 {
-            return Ok(w_list_new(Vec::new()));
+            return crate::runtime_ops::obj_or_memory_error(w_list_new(Vec::new()));
         }
         // `W_ListObject.getslice` → `strategy.getslice`. Range strategies
         // materialise inside that call (`BaseRangeListStrategy.getslice`).
-        return Ok(pyre_object::listobject::w_list_getslice(
+        return crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_getslice(
             obj,
             start,
             stop,
@@ -2859,11 +2859,17 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         pyre_object::w_list_getitem_inner(obj, idx)
     };
     match item {
-        Some(val) => Ok(val),
-        None => Err(crate::error::oefmt_noargs(
-            PyErrorKind::IndexError,
-            "list index out of range",
-        )),
+        Some(val) => crate::runtime_ops::obj_or_memory_error(val),
+        None => {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                Err(crate::PyError::memory_error(""))
+            } else {
+                Err(crate::error::oefmt_noargs(
+                    PyErrorKind::IndexError,
+                    "list index out of range",
+                ))
+            }
+        }
     }
 }
 
@@ -5689,15 +5695,19 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let w_other = if obj == value {
-        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+        let items = pyre_object::listobject::w_list_items_copy_as_vec_mode(
             value,
             majit_metainterp::jit::we_are_jitted(),
-        ))
+        );
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::PyError::memory_error(""));
+        }
+        crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new(items))?
     } else if pyre_object::is_list(value) {
         value
     } else {
         let items = crate::builtins::collect_iterable(value)?;
-        pyre_object::listobject::w_list_new(items)
+        crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new(items))?
     };
     let other_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_other = pyre_object::gc_roots::pin_root(w_other);
@@ -5778,7 +5788,11 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         if !pyre_object::w_list_setitem(obj, idx, item) {
-            return Err(PyError::index_error("list assignment index out of range"));
+            return if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                Err(crate::PyError::memory_error(""))
+            } else {
+                Err(PyError::index_error("list assignment index out of range"))
+            };
         }
         k += 1;
     }
@@ -14262,7 +14276,9 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
                     "mro() returned a result without the new class",
                 ));
             }
-            pyre_object::w_type_set_mro(w_self, (0..mro_len).map(mro_at).collect());
+            if !pyre_object::w_type_set_mro(w_self, (0..mro_len).map(mro_at).collect()) {
+                return Err(PyError::memory_error(""));
+            }
 
             // typeobject.py `_add_mro_classes_as_subclasses`: custom
             // MRO entries outside the default hierarchy participate
@@ -14281,7 +14297,9 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
         }
     }
     let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
-    pyre_object::w_type_set_mro(w_self, (0..default_mro_len).map(default_mro).collect());
+    if !pyre_object::w_type_set_mro(w_self, (0..default_mro_len).map(default_mro).collect()) {
+        return Err(PyError::memory_error(""));
+    }
     Ok(pyre_object::w_none())
 }
 
@@ -16437,13 +16455,17 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
         crate::objspace::std::mapdict::has_mapdict_storage(obj)
             && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
     } {
-        return Ok(unsafe {
+        let ok = unsafe {
             crate::objspace::std::mapdict::instance_node_setdictvalue(
                 obj,
                 rustpython_wtf8::Wtf8::new(name),
                 value,
             )
-        });
+        };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::PyError::memory_error(""));
+        }
+        return Ok(ok);
     }
     // `getdict` may allocate the instance dict.  A nursery receiver and
     // the stored value both relocate across that window, so they are
@@ -16868,6 +16890,9 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let w_dict = pyre_object::with_roots!(obj, w_descr_obj => getdict_backing(obj))?;
     if !w_dict.is_null() {
         let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::PyError::memory_error(""));
+        }
         if removed {
             return Ok(w_none());
         }
@@ -20253,6 +20278,9 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
     }
     let item = pyre_object::w_list_iter_item(seq, pyre_object::seq_index_to_i64(index));
     if item.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return PY_NULL;
+        }
         return list_iter_stop(obj, index);
     }
     pyre_object::w_list_iter_set_index(obj, index + 1);
@@ -20312,8 +20340,14 @@ unsafe fn list_iter_descr_next_locked(
     let item = list_iter_getitem_locked(seq, index);
     let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     if let Some(item) = item {
+        if item.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return PY_NULL;
+        }
         pyre_object::w_list_iter_set_index(obj, index + 1);
         return item;
+    }
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return PY_NULL;
     }
     pyre_object::w_list_iter_set_seq(obj, PY_NULL);
     PY_NULL
@@ -22825,6 +22859,9 @@ unsafe fn shortcut_next(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, PyErr
     if pyre_object::is_list_iter(w_obj) {
         let item = list_iter_descr_next(w_obj);
         if item.is_null() {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::PyError::memory_error(""));
+            }
             return Err(PyError::stop_iteration());
         }
         return Ok(Some(item));

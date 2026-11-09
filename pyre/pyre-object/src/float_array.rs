@@ -218,12 +218,19 @@ impl FloatArray {
             .saturating_add(extra)
             .saturating_add(min_cap >> 3)
             .max(FLOAT_ARRAY_INLINE_CAP);
-        self.block = unsafe { grow_float_items_block(self.block, target_cap, self.len_relaxed()) };
+        let fresh = unsafe { grow_float_items_block(self.block, target_cap, self.len_relaxed()) };
+        if fresh.is_null() {
+            return;
+        }
+        self.block = fresh;
     }
 
     pub fn push(&mut self, value: f64) {
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             *self.base().add(self.len_relaxed()) = value;
@@ -257,6 +264,9 @@ impl FloatArray {
         assert!(index <= self.len_relaxed());
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             let p = self.base().add(index);
@@ -297,6 +307,9 @@ impl FloatArray {
         if len2 > slicelength {
             if new_len > self.capacity() {
                 self.grow(new_len);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
             }
             unsafe {
                 let base = self.base();

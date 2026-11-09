@@ -1168,6 +1168,9 @@ where
         (),
         crate::dictmultiobject::ObjectKeyBuildHasher,
     >::from_preserved_slots(&slot_keys, &snap.live, index_len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
     // `from_preserved_slots` pins the wrapped keys across `_ll_malloc_entries`.
     // The box malloc below is stable and does not collect; the keys stay on
     // the shadow stack until that box, which traces them, is installed.
@@ -1203,6 +1206,9 @@ where
             unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
         unsafe { (*strategy.storage_ptr(set)).insert(unwrapped, ()).is_none() }
     };
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
     if inserted {
         publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(obj_slot));
     }
@@ -1527,7 +1533,11 @@ where
         let storage = unsafe { &mut *strategy.storage_ptr(&*(dst as *mut W_SetObject)) };
         let mut grew = false;
         for key in keys {
-            if storage.insert(key, ()).is_none() {
+            let fresh = storage.insert(key, ()).is_none();
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                break;
+            }
+            if fresh {
                 grew = true;
             }
         }

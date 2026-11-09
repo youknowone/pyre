@@ -66,6 +66,12 @@ impl UnicodeArray {
     }
 
     pub fn from_vec(values: Vec<*const UnicodeValueStorage>) -> Self {
+        Self::try_from_vec(values).unwrap_or_else(Self::empty)
+    }
+
+    /// Donor copy of `AsciiListStrategy` storage. A refused block leaves the
+    /// receiver unchanged; empty input is the empty array.
+    pub fn try_from_vec(values: Vec<*const UnicodeValueStorage>) -> Option<Self> {
         let mut refs = Vec::with_capacity(values.len());
         for value in values {
             refs.push(value as PyObjectRef);
@@ -73,12 +79,15 @@ impl UnicodeArray {
         let len = refs.len();
         let block = unsafe { alloc_list_items_block_gc(&refs) };
         if block.is_null() {
-            return Self::empty();
+            if len == 0 {
+                return Some(Self::empty());
+            }
+            return None;
         }
-        Self {
+        Some(Self {
             block,
             len: crate::object_array::length_cell(len),
-        }
+        })
     }
 
     /// The block word and the length, so a `dont_look_inside` helper can take

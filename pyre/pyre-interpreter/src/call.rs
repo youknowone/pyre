@@ -7908,9 +7908,11 @@ fn build_class_inner(
         // typeobject.py `ready` is a later livevar use of that same `w_self`;
         // `gct_fv_gc_malloc` reloads it, so every use after the malloc rereads
         // the slot rather than the pre-collection word.
-        unsafe {
+        if !unsafe {
             pyre_object::w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(w_root), mro)
-        };
+        } {
+            return Err(PyError::memory_error(""));
+        }
         unsafe {
             pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(w_root))
         };

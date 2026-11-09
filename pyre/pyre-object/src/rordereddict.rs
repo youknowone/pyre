@@ -422,12 +422,19 @@ impl<K, V, S> RDict<K, V, S> {
             return d;
         }
         // `_ll_malloc_entries` for the estimate `ll_newdict_size` allocates.
-        d.entries = alloc_entries::<K, V>(capacity);
+        let entries = alloc_entries::<K, V>(capacity);
+        if entries.is_null() {
+            return d;
+        }
+        d.entries = entries;
         let mut size = DICT_INITSIZE;
         while size <= (capacity + 1) * 2 {
             size *= 2;
         }
-        d.install_index_block(size);
+        if !d.install_index_block(size) {
+            d.entries = std::ptr::null_mut();
+            return d;
+        }
         d.resize_counter = (size * 2) as isize;
         d
     }
@@ -536,12 +543,15 @@ impl<K, V, S> RDict<K, V, S> {
         let _roots = crate::gc_roots::push_roots();
         self.pin_table_and_entries();
         let src_slot = src.pin_table_and_entries();
+        // `ll_dict_copy`: both replacement arrays complete before `self` is
+        // published. A null index is legitimate when `src.num_live_items == 0`.
         let entries = if n == 0 {
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
-            // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
-            // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
+            if entries.is_null() {
+                return;
+            }
             unsafe {
                 ll_arraycopy(
                     pinned_entries(src_slot),
@@ -553,20 +563,20 @@ impl<K, V, S> RDict<K, V, S> {
             }
             entries
         };
-        self.barrier_self();
-        self.entries = entries;
         let entries_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
+        let _ = crate::gc_roots::pin_root(entries as PyObjectRef);
         let fresh = src.clone_index_block();
-        if fresh.is_null() {
+        if fresh.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
             return;
         }
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
-        let old = self.indexes;
-        self.indexes = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
-        unsafe { dealloc_typed_items_block(old) };
-        self.indexes = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
+        let fresh_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(fresh as PyObjectRef);
+        self.barrier_self();
+        let old_indexes = self.indexes;
+        self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
+        self.indexes = crate::gc_roots::shadow_stack_get(fresh_slot) as *mut TypedItemsBlock;
+        unsafe { dealloc_typed_items_block(old_indexes) };
+        self.indexes = crate::gc_roots::shadow_stack_get(fresh_slot) as *mut TypedItemsBlock;
         self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
         self.num_live_items = src.num_live_items;
         self.num_ever_used_items = src.num_ever_used_items;
@@ -616,7 +626,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// 0, 0, len(d.entries))`. The table and old array stay on the shadow
     /// stack across `_ll_malloc_entries`; `setfield_gc` on this dicttable
     /// remembers an old table that now holds a young array.
-    fn replace_entries_array(&mut self, new_allocated: usize)
+    fn replace_entries_array(&mut self, new_allocated: usize) -> bool
     where
         K: Copy + GcRefOffsets,
         V: Copy + GcRefOffsets,
@@ -625,6 +635,9 @@ impl<K, V, S> RDict<K, V, S> {
         let _roots = crate::gc_roots::push_roots();
         let entries_slot = self.pin_table_and_entries();
         let newitems = alloc_entries::<K, V>(new_allocated);
+        if newitems.is_null() {
+            return false;
+        }
         self.entries = pinned_entries(entries_slot);
         unsafe {
             ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
@@ -632,6 +645,7 @@ impl<K, V, S> RDict<K, V, S> {
         self.barrier_self();
         self.entries = newitems;
         self.barrier_dicttable();
+        true
     }
 
     /// `AbstractTypedStrategy.copy`: clone this dicttable into a young box.
@@ -649,6 +663,9 @@ impl<K, V, S> RDict<K, V, S> {
         let _roots = crate::gc_roots::push_roots();
         self.pin_table_and_entries();
         let mut cloned = self.clone();
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         if !cloned.entries.is_null() {
             cloned.entries =
                 crate::gc_roots::pin_root(cloned.entries as crate::pyobject::PyObjectRef)
@@ -719,13 +736,13 @@ impl<K, V, S> RDict<K, V, S> {
     /// `GCFLAG_VISITED`. Until `self.indexes` holds it, `visit_indexes`
     /// cannot mark it, and `dealloc_typed_items_block` on the outgoing
     /// table is a safepoint (`IntArray::install` / `IntArray::pin_block`).
-    fn install_index_block(&mut self, new_size: usize) {
+    fn install_index_block(&mut self, new_size: usize) -> bool {
         let _roots = crate::gc_roots::push_roots();
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = Self::alloc_index_block(new_size);
         if fresh.is_null() {
-            return;
+            return false;
         }
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as PyObjectRef);
@@ -734,6 +751,7 @@ impl<K, V, S> RDict<K, V, S> {
         unsafe { dealloc_typed_items_block(old) };
         self.indexes = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
         self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
+        true
     }
 
     fn release_index_block(&mut self) {
@@ -914,8 +932,10 @@ impl<K, V, S> RDict<K, V, S> {
         // Python code calls d.clear() from the method __eq__() called from
         // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
         // has got an index, it will always have one."
-        self.install_index_block(DICT_INITSIZE);
         self.num_live_items = 0;
+        if !self.install_index_block(DICT_INITSIZE) {
+            return;
+        }
         self.resize_counter = (DICT_INITSIZE * 2) as isize;
         self.generation = self.generation.wrapping_add(1);
     }
@@ -1259,7 +1279,9 @@ where
         return true;
     }
     let new_allocated = overallocate_entries_len(d.allocated_len());
-    d.replace_entries_array(new_allocated);
+    if !d.replace_entries_array(new_allocated) {
+        return false;
+    }
     d.generation = d.generation.wrapping_add(1);
     false
 }
@@ -1333,10 +1355,16 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
         d.pin_table_and_entries();
         if d.num_ever_used_items == d.allocated_len() {
             reindexed = ll_dict_grow(d);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         rc = d.resize_counter - 3;
         if rc <= 0 {
             ll_dict_resize(d);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
             reindexed = true;
             rc = d.resize_counter - 3;
         }
@@ -1567,11 +1595,10 @@ where
     }
 
     /// `ll_dict_reindex` (rordereddict.py).
-    fn reindex(&mut self, new_size: usize) {
+    fn reindex(&mut self, new_size: usize) -> bool {
         debug_assert!(new_size.is_power_of_two());
-        self.install_index_block(new_size);
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            return;
+        if !self.install_index_block(new_size) {
+            return false;
         }
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
         let mut slot = 0usize;
@@ -1583,6 +1610,7 @@ where
             slot += 1;
         }
         self.generation = self.generation.wrapping_add(1);
+        true
     }
 
     /// `rpython/rtyper/lltypesystem/rordereddict.py::ll_dict_remove_deleted_items`
@@ -1605,10 +1633,11 @@ where
         let newitems = if shrink {
             let new_slot = crate::gc_roots::shadow_stack_len();
             let newitems = alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items));
-            let _ = crate::gc_roots::pin_root(newitems as crate::pyobject::PyObjectRef);
-            if !newitems.is_null() {
-                crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
+            if newitems.is_null() {
+                return;
             }
+            let _ = crate::gc_roots::pin_root(newitems as crate::pyobject::PyObjectRef);
+            crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
             self.entries = pinned_entries(entries_slot);
             crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>
         } else {
@@ -1658,7 +1687,7 @@ where
         }
         self.num_ever_used_items = self.num_live_items;
         let size = self.index_len();
-        self.reindex(size);
+        let _ = self.reindex(size);
     }
 
     fn resize_inner(&mut self) {
@@ -1671,7 +1700,7 @@ where
         if new_size < self.index_len() {
             ll_dict_remove_deleted_items(self);
         } else {
-            self.reindex(new_size);
+            let _ = self.reindex(new_size);
         }
     }
 
@@ -1746,8 +1775,8 @@ where
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
         let hash = self.hash_of(&key);
-        if self.index_len() == 0 {
-            self.reindex(DICT_INITSIZE);
+        if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
+            return None;
         }
         let index_slot = match self.lookup_for_store(hash, &key) {
             Ok(slot) => {
@@ -1789,8 +1818,8 @@ where
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
         let hash = self.hash_of(&key);
-        if self.index_len() == 0 {
-            self.reindex(DICT_INITSIZE);
+        if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
+            return;
         }
         reload_gcrefs(&_roots, &mut value, value_slot);
         reload_gcrefs(&_roots, &mut key, key_slot);
@@ -2008,10 +2037,11 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = RDict::with_hasher(S2::default());
         dst.entries = alloc_entries::<K2, V>(n);
-        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
-        if !dst.entries.is_null() {
-            crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
+        if dst.entries.is_null() {
+            return RDict::with_hasher(S2::default());
         }
+        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
+        crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
         dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K2, V>;
         let mut live = 0usize;
         for slot in 0..n {
@@ -2053,7 +2083,9 @@ where
         } else {
             DICT_INITSIZE
         };
-        dst.reindex(index_size);
+        if !dst.reindex(index_size) {
+            return RDict::with_hasher(S2::default());
+        }
 
         dst
     }
@@ -2088,10 +2120,11 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = Self::with_hasher(S::default());
         dst.entries = alloc_entries::<K, V>(n);
-        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
-        if !dst.entries.is_null() {
-            crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
+        if dst.entries.is_null() {
+            return Self::with_hasher(S::default());
         }
+        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
+        crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
         dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>;
         let mut nlive = 0usize;
         for slot in 0..n {
@@ -2121,7 +2154,9 @@ where
         } else {
             DICT_INITSIZE
         };
-        dst.reindex(index_size);
+        if !dst.reindex(index_size) {
+            return Self::with_hasher(S::default());
+        }
 
         dst
     }
@@ -2136,7 +2171,9 @@ where
         let need = self.num_ever_used_items.saturating_add(additional);
         if need > entries_capacity {
             let new_n = need.max(overallocate_entries_len(entries_capacity));
-            self.replace_entries_array(new_n);
+            if !self.replace_entries_array(new_n) {
+                return;
+            }
             self.generation = self.generation.wrapping_add(1);
         }
         let want = (self.num_live_items + additional) * 2;
@@ -2145,7 +2182,7 @@ where
             new_size *= 2;
         }
         if new_size > self.index_len() {
-            self.reindex(new_size);
+            let _ = self.reindex(new_size);
         }
     }
 }
@@ -2257,6 +2294,9 @@ where
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
+            if entries.is_null() {
+                return Self::with_hasher(self.hash_builder.clone());
+            }
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
             // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
             unsafe {
@@ -2276,6 +2316,9 @@ where
         let new_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(entries as crate::pyobject::PyObjectRef);
         let indexes = self.clone_index_block();
+        if indexes.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+            return Self::with_hasher(self.hash_builder.clone());
+        }
         let hash_builder = self.hash_builder.clone();
         Self {
             indexes,
@@ -2385,7 +2428,7 @@ mod tests {
         // The tenth distinct slot is reached after 20 probes, despite the
         // index table having only 16 slots. The perturb prefix revisits slots.
         assert_eq!(d.remove(&9), Some(9));
-        d.reindex(16);
+        assert!(d.reindex(16));
         check_invariants(&d);
         for key in 0..9 {
             assert_eq!(d.remove(&key), Some(key));
@@ -2570,7 +2613,7 @@ mod tests {
         check_invariants(&d);
         // Reindexing uses the same clean-insert probe, without changing
         // the hash or the number of free index slots in this fixture.
-        d.reindex(16);
+        assert!(d.reindex(16));
         check_invariants(&d);
         assert_eq!(
             d.keys().copied().collect::<Vec<_>>(),

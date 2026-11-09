@@ -2187,8 +2187,13 @@ pub fn handle_exception_with_context(
             let saved_trace_slot = pyre_object::gc_roots::shadow_stack_len();
             let saved_trace = pyre_object::gc_roots::pin_root(saved_trace);
             if !saved_trace.is_null() {
-                if let Ok(d) = frame.getorcreatedebug(-1) {
-                    d.w_f_trace = pyre_object::PY_NULL;
+                match frame.getorcreatedebug(-1) {
+                    Ok(d) => d.w_f_trace = pyre_object::PY_NULL,
+                    Err(debug_err) => {
+                        *err = debug_err;
+                        err_slot = err.pin(&_exc_roots);
+                        return false;
+                    }
                 }
             }
             let after_exc_result =
@@ -2199,8 +2204,13 @@ pub fn handle_exception_with_context(
             let frame = unsafe { &mut *frame_anchor.live() };
             let saved_trace = pyre_object::gc_roots::shadow_stack_get(saved_trace_slot);
             if !saved_trace.is_null() {
-                if let Ok(d) = frame.getorcreatedebug(-1) {
-                    d.w_f_trace = saved_trace;
+                match frame.getorcreatedebug(-1) {
+                    Ok(d) => d.w_f_trace = saved_trace,
+                    Err(debug_err) => {
+                        *err = debug_err;
+                        err_slot = err.pin(&_exc_roots);
+                        return false;
+                    }
                 }
             }
             match after_exc_result {

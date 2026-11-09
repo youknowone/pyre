@@ -13414,6 +13414,7 @@ fn compile_and_run_once(
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
+    let mut snapshot_error = None;
     let mut published_abort_image = false;
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
@@ -13480,7 +13481,10 @@ fn compile_and_run_once(
                     Some(frame) => frame,
                     None => match frame_root.frame().snapshot_for_tracing() {
                         Ok(frame) => frame,
-                        Err(_) => return majit_metainterp::TraceAction::Abort,
+                        Err(err) => {
+                            snapshot_error = Some(err);
+                            return majit_metainterp::TraceAction::Abort;
+                        }
                     },
                 };
                 let saved_last_instr = frame_root.frame().last_instr;
@@ -13590,6 +13594,9 @@ fn compile_and_run_once(
     // the walk staged without publishing an abort image has no driver on
     // this leg; `finish_cancel_tracing` drops it with the scope.
     driver.meta_interp_mut().finish_cancel_tracing();
+    if let Some(err) = snapshot_error {
+        return Some(LoopResult::Done(Err(err)));
+    }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished && dynasm_exec_diag_enabled() {

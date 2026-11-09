@@ -114,7 +114,9 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         raw as PyObjectRef
     } else {
         if crate::gc_hook::gc_alloc_failed_pending() {
-            PY_NULL
+            // W_MemoryView.__init__ / copy: a refused header is fatal; NoRoute
+            // still uses the host fallback.
+            crate::gc_hook::gc_alloc_failed(<W_MemoryView as crate::lltype::GcType>::SIZE);
         } else {
             crate::lltype::malloc_typed(payload) as PyObjectRef
         }

@@ -292,12 +292,19 @@ impl IntArray {
             .saturating_add(extra)
             .saturating_add(min_cap >> 3)
             .max(INT_ARRAY_INLINE_CAP);
-        self.block = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
+        let fresh = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
+        if fresh.is_null() {
+            return;
+        }
+        self.block = fresh;
     }
 
     pub fn push(&mut self, value: i64) {
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             *self.base().add(self.len_relaxed()) = value;
@@ -331,6 +338,9 @@ impl IntArray {
         assert!(index <= self.len_relaxed());
         if self.len_relaxed() == self.capacity() {
             self.grow(self.len_relaxed() + 1);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
         }
         unsafe {
             let p = self.base().add(index);
@@ -371,6 +381,9 @@ impl IntArray {
         if len2 > slicelength {
             if new_len > self.capacity() {
                 self.grow(new_len);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
             }
             unsafe {
                 let base = self.base();

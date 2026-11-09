@@ -4915,7 +4915,11 @@ fn trace_and_compile_from_bridge_body(
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = match bridge_frame_root.frame().snapshot_for_tracing() {
         Ok(frame) => frame,
-        Err(_) => return BridgeResolution::ResumeBlackhole,
+        Err(mut err) => {
+            return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+                err.to_exc_object(),
+            ));
+        }
     };
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
@@ -4955,6 +4959,7 @@ fn trace_and_compile_from_bridge_body(
         let (driver, _) = crate::eval::driver_pair();
         driver.set_bridge_entered_at_guard_resume(true);
     }
+    let mut snapshot_error = None;
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -4973,7 +4978,12 @@ fn trace_and_compile_from_bridge_body(
                 // stack root guard and cannot be cloned.
                 let trace_frame = match bridge_frame_root.frame().snapshot_for_tracing() {
                     Ok(frame) => frame,
-                    Err(_) => return majit_metainterp::TraceAction::Abort,
+                    Err(mut err) => {
+                        snapshot_error = Some(pyre_jit_trace::state::ConcreteValue::Ref(
+                            err.to_exc_object(),
+                        ));
+                        return majit_metainterp::TraceAction::Abort;
+                    }
                 };
                 // `sym.set_live_vable_frame_addr` records this word as the
                 // virtualizable the walk writes back through, so it has to be
@@ -5016,6 +5026,23 @@ fn trace_and_compile_from_bridge_body(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
+
+    if let Some(err) = snapshot_error {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return BridgeResolution::FinishedException(err);
+    }
+    if let Some(mut err) = pyre_jit_trace::trace::take_walk_end_propagated_exception() {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            err.to_exc_object(),
+        ));
+    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
@@ -8552,8 +8579,8 @@ pub extern "C" fn bh_delete_name_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef
 /// `LOAD_LOCALS` residual using the frame receiver.
 /// `pyopcode.py` — `pushvalue(getorcreatedebug().w_locals)`, which
 /// must hand back the frame's own mapping so a metaclass `__prepare__` result
-/// keeps its type. Infallible, so unlike the name residuals there is no
-/// exception-publishing arm.
+/// keeps its type. A refused mapping is published through the residual
+/// exception cells so `GUARD_NO_EXCEPTION` takes the handler.
 pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     assert!(
         !frame_ptr.is_null(),
@@ -8561,9 +8588,13 @@ pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
          site must thread portal_frame_reg as its ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    frame
-        .get_or_create_w_locals()
-        .unwrap_or(pyre_object::PY_NULL)
+    match frame.get_or_create_w_locals() {
+        Ok(value) => value,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// `LOAD_BUILD_CLASS` residual using the frame receiver.

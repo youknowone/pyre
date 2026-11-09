@@ -586,11 +586,12 @@ impl WeakDict<StrKey> {
     /// `WeakValueDictRepr.ll_set`. A null `llvalue` is `None` and
     /// dispatches to `ll_set_null`.
     #[majit_macros::dont_look_inside]
-    pub fn ll_set(&mut self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) {
+    pub fn ll_set(&mut self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
         if !llvalue.is_null() {
-            self.ll_set_nonnull(llkey, llvalue);
+            self.ll_set_nonnull(llkey, llvalue)
         } else {
             self.ll_set_null(llkey);
+            true
         }
     }
 
@@ -611,7 +612,7 @@ impl WeakDict<StrKey> {
     /// `llvalue` are livevars across that malloc (`framework.py`
     /// `push_roots`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) {
+    pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
         let _roots = crate::gc_roots::push_roots();
         // `write_barrier` first (not a collect), then `d` / `llvalue` /
         // `llkey` as one livevar set (`framework.py` `push_roots`) across
@@ -627,12 +628,16 @@ impl WeakDict<StrKey> {
         };
         let valueref =
             unsafe { crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(val_slot)) };
+        if valueref.is_null() {
+            return false;
+        }
         let key = if has_key {
             StrKey(crate::gc_roots::shadow_stack_get(val_slot + 1) as *mut Utf8Str)
         } else {
             key
         };
         self.ll_set_nonnull_valueref(key, valueref);
+        true
     }
 
     /// Lookup/insert half of `WeakValueDictRepr.ll_set_nonnull` after
@@ -743,6 +748,9 @@ fn ll_dict_resize<K: WeakDictKey>(d: &mut WeakDict<K>) {
     let _roots = crate::gc_roots::push_roots();
     let old_entries_slot = pin_table_and_entries(d as *mut WeakDict<K>, old_entries);
     let new_entries = alloc_entries::<K>(new_size);
+    if new_entries.is_null() {
+        return;
+    }
     old_entries = crate::gc_roots::shadow_stack_get(old_entries_slot) as *mut WeakDictEntries<K>;
     barrier_dict(d as *mut WeakDict<K>);
     d.entries = new_entries;

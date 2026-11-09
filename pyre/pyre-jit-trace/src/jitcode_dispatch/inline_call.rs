@@ -11390,11 +11390,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             ) {
                 Ok(frame) => frame,
-                Err(_) => return resolved_inline_decline(op.pc, line!()),
+                Err(err) => {
+                    crate::trace::set_walk_end_propagated_exception(err);
+                    return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+                }
             },
         ) {
             Ok(frame) => frame,
-            Err(_) => return resolved_inline_decline(op.pc, line!()),
+            Err(err) => {
+                crate::trace::set_walk_end_propagated_exception(err);
+                return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+            }
         };
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();

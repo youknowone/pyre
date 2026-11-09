@@ -2212,6 +2212,9 @@ impl FrameBox {
         // An old frame storing a nursery WEAKREF runs the write barrier.
         unsafe {
             let wref = pyre_object::weakref::w_weakref_new(generator);
+            if wref.is_null() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
             (*frame_ptr).f_generator_wref = wref as PyObjectRef;
             if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF) {
@@ -4197,7 +4200,11 @@ impl PyFrame {
         // observable instead of faulting.
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
-        let _ = roots.pin_root(unsafe { pyre_object::w_dict_new() });
+        let w_locals = unsafe { pyre_object::w_dict_new() };
+        if w_locals.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        let _ = roots.pin_root(w_locals);
         let frame = unsafe { &mut *frame_anchor.live() };
         // `getorcreate_debug_data` allocates the debug block this frame does not
         // have yet, and an assignment evaluates its value before its place, so
@@ -4224,13 +4231,17 @@ impl PyFrame {
         {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
         }
-        self.locals_cells_stack_w = unsafe {
-            alloc_frame_locals_array(
-                (&*raw).varnames.len() + ncells(&*raw) + (&*raw).max_stackdepth as usize,
-                PY_NULL,
-                allocation,
-            )
-        };
+        let size =
+            unsafe { (&*raw).varnames.len() + ncells(&*raw) + (&*raw).max_stackdepth as usize };
+        let locals_cells_stack_w = unsafe { alloc_frame_locals_array(size, PY_NULL, allocation) };
+        if locals_cells_stack_w.is_null() {
+            // Storage-only hook has no Result; a refused locals array aborts
+            // (`PyFrame.__init__`).
+            pyre_object::gc_hook::gc_alloc_failed(
+                size * std::mem::size_of::<pyre_object::PyObjectRef>(),
+            );
+        }
+        self.locals_cells_stack_w = locals_cells_stack_w;
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(&*raw) };
         self.last_instr = -1;
         self.flags = 0;
@@ -4331,6 +4342,9 @@ impl PyFrame {
             // mapping.  `newdict(module=True)` — the mapping a class body binds
             // names in carries `ModuleDictStrategy.version?`.
             let w_locals = pyre_object::w_module_dict_new();
+            if w_locals.is_null() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             self.getorcreate_debug_data(-1)?.w_locals = w_locals;
         } else {
             let w_globals = self.get_w_globals();
@@ -4401,6 +4415,9 @@ impl PyFrame {
                 crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, index)
             };
             let cell = pyre_object::w_cell_new(PY_NULL, family);
+            if cell.is_null() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             self.set_locals_w(index, cell);
             index += 1;
         }
@@ -4471,7 +4488,11 @@ impl PyFrame {
         // the payload has been installed and then reload its forwarded value.
         let roots = pyre_object::gc_roots::push_roots();
         let slot = roots.base();
-        let _ = roots.pin_root(unsafe { pyre_object::w_dict_new() });
+        let w_extra = unsafe { pyre_object::w_dict_new() };
+        if w_extra.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        let _ = roots.pin_root(w_extra);
         let debug = self.getorcreate_debug_data(-1)?;
         debug.w_extra_locals = roots.get(slot);
         Ok(roots.get(slot))
@@ -6653,6 +6674,9 @@ impl PyFrame {
                     crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
                 };
                 let cell = pyre_object::w_cell_new(PY_NULL, family);
+                if cell.is_null() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
                 let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 arr.set_ref(num_locals + i, cell);
             }
@@ -6714,13 +6738,23 @@ impl PyFrame {
             // around `initialize_frame_scopes`.
             let _locals_root = FrameLocalsRoot::new(&mut frame);
             if frame_stores_global {
-                frame.set_w_globals(_roots.get(root_base + 1))?;
+                if let Err(err) = frame.set_w_globals(_roots.get(root_base + 1)) {
+                    drop(_locals_root);
+                    // GC-owned locals must not run `Drop::free_owned_contents`
+                    // (`FrameBox::new`).
+                    std::mem::forget(frame);
+                    return Err(err);
+                }
             }
             // This constructor bypasses `initialize_frame_scopes`, so apply the
             // scope binding it would have done.  `FunctionType(co, globals)` over
             // a module-level code object arrives here, and without the binding its
             // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
-            frame.bind_unoptimized_locals_scope()?;
+            if let Err(err) = frame.bind_unoptimized_locals_scope() {
+                drop(_locals_root);
+                std::mem::forget(frame);
+                return Err(err);
+            }
             frame.init_cells();
         }
         // `bind_unoptimized_locals_scope` allocates the class-body mapping, and
@@ -6732,6 +6766,7 @@ impl PyFrame {
             store_locals_cells_stack_w(&mut frame, _roots.get(locals_idx) as *mut FixedObjectArray);
         }
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            std::mem::forget(frame);
             return Err(crate::runtime_ops::fetch_memory_error());
         }
         Ok(frame)
@@ -7155,6 +7190,9 @@ pub fn createframe_obj(
     ));
     let locals_cells_stack_w =
         unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::NurseryGc) };
+    if locals_cells_stack_w.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
     let frame = PyFrame {
         ob_header: frame_ob_header(),
         pycode: _roots.get(root_base) as *const (),

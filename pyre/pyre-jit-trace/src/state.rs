@@ -18110,11 +18110,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ) {
                 Ok(frame) => frame,
-                Err(_) => return None,
+                Err(err) => {
+                    crate::trace::set_walk_end_propagated_exception(err);
+                    return None;
+                }
             },
         ) {
             Ok(frame) => frame,
-            Err(_) => return None,
+            Err(err) => {
+                crate::trace::set_walk_end_propagated_exception(err);
+                return None;
+            }
         };
         // The `drop(concrete_frame)` below relinquishes only the host handle for a
         // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the

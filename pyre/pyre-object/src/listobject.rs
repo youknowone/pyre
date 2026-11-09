@@ -1069,7 +1069,8 @@ impl W_ListObject {
 
     /// Free the current `items` block and install a freshly allocated
     /// one populated with `values`. `length` is reset to `values.len()`.
-    unsafe fn set_object_items_from_vec(&mut self, values: Vec<PyObjectRef>) {
+    /// `_ll_list_resize_really` installs only a successful allocation.
+    unsafe fn set_object_items_from_vec(&mut self, values: Vec<PyObjectRef>) -> bool {
         let _roots = crate::gc_roots::push_roots();
         let root_base = crate::gc_roots::shadow_stack_len();
         crate::gc_roots::publish_roots(&[self as *mut W_ListObject as PyObjectRef]);
@@ -1086,6 +1087,9 @@ impl W_ListObject {
         }
         let new_items_slot = crate::gc_roots::shadow_stack_len();
         let new_items = alloc_list_items_block_gc(&rooted_values);
+        if new_items.is_null() {
+            return false;
+        }
         let _ = crate::gc_roots::pin_root(new_items as PyObjectRef);
         // `_ll_list_resize_really` installs the freshly allocated GcArray
         // through SETFIELD_GC.  Run the owner barrier before publishing the
@@ -1097,9 +1101,13 @@ impl W_ListObject {
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         let old_items = list.items;
+        let was_object = list.strategy == ListStrategy::Object;
         list.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
         list.set_length_relaxed(rooted_values.len());
-        dealloc_list_items_block(old_items);
+        if was_object {
+            dealloc_list_items_block(old_items);
+        }
+        true
     }
 
     /// Drop the object-strategy backing (used when switching to a typed
@@ -1585,7 +1593,7 @@ fn all_ascii(items: &[PyObjectRef]) -> bool {
 ///
 /// # Safety
 /// `obj_slot` must hold a live `W_ListObject` in the Bytes strategy.
-unsafe fn boxed_from_bytes(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObjectRef> {
+unsafe fn boxed_from_bytes(obj_slot: usize, we_are_jitted: bool) -> Result<Vec<PyObjectRef>, ()> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let bytes_items = |slot: usize| -> &BytesArray {
@@ -1607,16 +1615,19 @@ unsafe fn boxed_from_bytes(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObject
             let value = bytes_items(obj_slot).as_slice()[i];
             w_bytes_from_block(value)
         };
+        if item.is_null() {
+            return Err(());
+        }
         let _ = crate::gc_roots::pin_root(item);
     }
-    (0..len)
+    Ok((0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+        .collect())
 }
 
 /// Box each erased UTF-8 `rpython str` of the Ascii strategy, re-reading the
 /// array through the rooted list after every allocating wrap.
-unsafe fn boxed_from_ascii(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObjectRef> {
+unsafe fn boxed_from_ascii(obj_slot: usize, we_are_jitted: bool) -> Result<Vec<PyObjectRef>, ()> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let ascii_items = |slot: usize| -> &UnicodeArray {
@@ -1637,11 +1648,14 @@ unsafe fn boxed_from_ascii(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObject
             let value = ascii_items(obj_slot).as_slice()[i];
             w_str_from_storage(value as *mut _)
         };
+        if item.is_null() {
+            return Err(());
+        }
         let _ = crate::gc_roots::pin_root(item);
     }
-    (0..len)
+    Ok((0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+        .collect())
 }
 
 /// Cold list strategy dehomogenization: a typed int/float list gained a
@@ -1666,36 +1680,36 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     let _ = crate::gc_roots::pin_root(list as *mut W_ListObject as PyObjectRef);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    let seed: Vec<PyObjectRef> = match list.strategy {
+    let seed: Result<Vec<PyObjectRef>, ()> = match list.strategy {
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let values = range_list_values(list);
-            boxed_from_ints(&values, false)
+            Ok(boxed_from_ints(&values, false))
         }
         ListStrategy::Integer => {
             let values = list.int_items.as_slice().to_vec();
-            boxed_from_ints(&values, false)
+            Ok(boxed_from_ints(&values, false))
         }
         ListStrategy::IntOrFloat => {
             let values = list.int_items.as_slice().to_vec();
-            boxed_from_int_or_float(&values, false)
+            Ok(boxed_from_int_or_float(&values, false))
         }
         ListStrategy::Float => {
             let values = list.float_items.as_slice().to_vec();
-            boxed_from_floats(&values, false)
+            Ok(boxed_from_floats(&values, false))
         }
         ListStrategy::Bytes => boxed_from_bytes(obj_slot, false),
         ListStrategy::Ascii => boxed_from_ascii(obj_slot, false),
-        ListStrategy::Object | ListStrategy::Empty | ListStrategy::Size => Vec::new(),
+        ListStrategy::Object | ListStrategy::Empty | ListStrategy::Size => Ok(Vec::new()),
+    };
+    let seed = match seed {
+        Ok(values) => values,
+        Err(()) => return crate::PY_NULL,
     };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    if matches!(
-        list.strategy,
-        ListStrategy::Size | ListStrategy::SimpleRange | ListStrategy::Range
-    ) {
-        list.items = std::ptr::null_mut();
+    if !list.set_object_items_from_vec(seed) {
+        return crate::PY_NULL;
     }
-    list.set_object_items_from_vec(seed);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     // Take the strategy together with the block, ahead of the two `install`
@@ -1742,7 +1756,7 @@ unsafe fn switch_range_to_integer_strategy(list: &mut W_ListObject) -> PyObjectR
     let values = range_list_values(&*(obj as *const W_ListObject));
     let fresh = IntArray::from_vec(values);
     if fresh.block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
-        return crate::gc_roots::shadow_stack_get(obj_slot);
+        return crate::PY_NULL;
     }
     let fresh_slot = fresh.pin_block();
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -1820,8 +1834,6 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
     } else {
         0
     };
-    list.set_length_relaxed(0);
-    list.items = std::ptr::null_mut();
     if is_plain_int1(w_item) {
         // `get_empty_storage(sizehint)`: `ll_newemptylist` when there is no
         // hint, else `ll_newlist_hint`'s `malloc(ITEMS, lengthhint)`.
@@ -1830,8 +1842,13 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         } else {
             crate::object_array::ll_new_int_items(sizehint as i64)
         };
+        if items.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::gc_roots::shadow_stack_get(root_base);
+        }
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
+        list.set_length_relaxed(0);
+        list.items = std::ptr::null_mut();
         ll_list_int_set_items(list, items);
         ll_list_int_set_len(list, 0);
         list.strategy = ListStrategy::Integer;
@@ -1841,8 +1858,13 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         } else {
             crate::object_array::ll_new_float_items(sizehint as i64) as *mut TypedItemsBlock
         };
+        if items.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::gc_roots::shadow_stack_get(root_base);
+        }
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
+        list.set_length_relaxed(0);
+        list.items = std::ptr::null_mut();
         ll_list_float_set_items(list, items);
         ll_list_float_set_len(list, 0);
         list.strategy = ListStrategy::Float;
@@ -1856,9 +1878,16 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         let (block, len) = if sizehint == 0 {
             (crate::object_array::ll_prebuilt_empty_items_block(), 0)
         } else {
-            BytesArray::with_capacity(sizehint).into_raw_parts()
+            let fresh = BytesArray::with_capacity(sizehint);
+            if fresh.block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+                return crate::gc_roots::shadow_stack_get(root_base);
+            }
+            fresh.into_raw_parts()
         };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        list.set_length_relaxed(0);
+        list.items = std::ptr::null_mut();
         let _ = W_ListObject::install_bytes_items(obj, block, len);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
@@ -1868,9 +1897,16 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         let (block, len) = if sizehint == 0 {
             (crate::object_array::ll_prebuilt_empty_items_block(), 0)
         } else {
-            UnicodeArray::with_capacity(sizehint).into_raw_parts()
+            let fresh = UnicodeArray::with_capacity(sizehint);
+            if fresh.block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+                return crate::gc_roots::shadow_stack_get(root_base);
+            }
+            fresh.into_raw_parts()
         };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
+        let list = &mut *(obj as *mut W_ListObject);
+        list.set_length_relaxed(0);
+        list.items = std::ptr::null_mut();
         let _ = W_ListObject::install_ascii_items(obj, block, len);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
@@ -1884,6 +1920,9 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         } else {
             crate::object_array::ll_new_items_array(sizehint as i64)
         };
+        if block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+            return crate::gc_roots::shadow_stack_get(root_base);
+        }
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         list_write_barrier(obj);
         let list = &mut *(obj as *mut W_ListObject);
@@ -2641,9 +2680,6 @@ unsafe fn w_list_from_storage_and_strategy(
     mut bytes_items: BytesArray,
     mut ascii_items: UnicodeArray,
 ) -> PyObjectRef {
-    if crate::gc_hook::gc_alloc_failed_pending() {
-        return crate::PY_NULL;
-    }
     let _roots = crate::gc_roots::push_roots();
     let items_base = crate::gc_roots::pin_roots(&object_items);
     let object_items: Vec<PyObjectRef> = (0..object_items.len())
@@ -2669,6 +2705,9 @@ unsafe fn w_list_from_storage_and_strategy(
     } else {
         (0usize, std::ptr::null_mut())
     };
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
+    }
     let block_root = if !items_block.is_null() {
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(items_block as PyObjectRef);
@@ -3258,6 +3297,9 @@ pub unsafe fn w_list_getslice(
         ListStrategy::Empty | ListStrategy::Size => w_list_new(Vec::new()),
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let obj = w_list_materialize_range(obj);
+            if obj.is_null() {
+                return crate::PY_NULL;
+            }
             w_list_getslice(obj, start, stop, step, length)
         }
         ListStrategy::Integer | ListStrategy::IntOrFloat => {
@@ -4111,14 +4153,22 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
         ListStrategy::Bytes => {
             let len = ll_list_bytes_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_bytes_from_block(ll_list_bytes_getitem_fast(list, idx)))
+            let wrapped = w_bytes_from_block(ll_list_bytes_getitem_fast(list, idx));
+            if wrapped.is_null() {
+                None
+            } else {
+                Some(wrapped)
+            }
         }
         ListStrategy::Ascii => {
             let len = ll_list_ascii_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_str_from_storage(
-                ll_list_ascii_getitem_fast(list, idx) as *mut _
-            ))
+            let wrapped = w_str_from_storage(ll_list_ascii_getitem_fast(list, idx) as *mut _);
+            if wrapped.is_null() {
+                None
+            } else {
+                Some(wrapped)
+            }
         }
     }
 }
@@ -4256,7 +4306,11 @@ pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) ->
                 // `BaseRangeListStrategy.getslice`: `switch_to_integer_strategy`
                 // then `IntegerListStrategy.getslice`.
                 let obj = switch_range_to_integer_strategy(&mut *(obj as *mut W_ListObject));
-                ll_listslice_ints(obj, start, newlength)
+                if obj.is_null() {
+                    crate::PY_NULL
+                } else {
+                    ll_listslice_ints(obj, start, newlength)
+                }
             }
             _ => ll_listslice_boxed(obj, start, newlength),
         }
@@ -4555,7 +4609,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
             let roots = crate::gc_roots::push_roots();
             let _ = roots.pin_root(value);
             let obj = switch_range_to_integer_strategy(list);
-            w_list_setitem_inner(obj, index, roots.get(roots.base()))
+            if obj.is_null() {
+                false
+            } else {
+                w_list_setitem_inner(obj, index, roots.get(roots.base()))
+            }
         }
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
@@ -4602,7 +4660,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                     false
                 } else {
                     let obj = switch_to_object_strategy(list);
-                    w_list_setitem_inner(obj, index, roots.get(base + 1))
+                    if obj.is_null() {
+                        false
+                    } else {
+                        w_list_setitem_inner(obj, index, roots.get(base + 1))
+                    }
                 }
             }
         }
@@ -4619,7 +4681,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                if obj.is_null() {
+                    false
+                } else {
+                    w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                }
             }
         }
         ListStrategy::Float => {
@@ -4647,7 +4713,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                     false
                 } else {
                     let obj = switch_to_object_strategy(list);
-                    w_list_setitem_inner(obj, index, roots.get(base + 1))
+                    if obj.is_null() {
+                        false
+                    } else {
+                        w_list_setitem_inner(obj, index, roots.get(base + 1))
+                    }
                 }
             }
         }
@@ -4666,7 +4736,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                if obj.is_null() {
+                    false
+                } else {
+                    w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                }
             }
         }
         ListStrategy::Ascii => {
@@ -4685,7 +4759,11 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
-                w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                if obj.is_null() {
+                    false
+                } else {
+                    w_list_setitem_inner(obj, index, roots.get(roots.base()))
+                }
             }
         }
     }
@@ -4809,6 +4887,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             let roots = crate::gc_roots::push_roots();
             let _ = roots.pin_root(value);
             let obj = switch_to_correct_strategy(list, value);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
             w_list_append_inner(obj, roots.get(roots.base()));
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
@@ -4819,6 +4900,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             } else {
                 switch_to_object_strategy(list)
             };
+            if obj.is_null() {
+                return;
+            }
             w_list_append_inner(obj, roots.get(roots.base()));
         }
         // AbstractUnwrappedStrategy.append (listobject.py):
@@ -4874,6 +4958,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                     return;
                 } else {
                     let obj = switch_to_object_strategy(list);
+                    if obj.is_null() {
+                        return;
+                    }
                     let list = &mut *(obj as *mut W_ListObject);
                     list.object_push(roots.get(base + 1));
                 }
@@ -4915,6 +5002,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                     return;
                 } else {
                     let obj = switch_to_object_strategy(list);
+                    if obj.is_null() {
+                        return;
+                    }
                     let list = &mut *(obj as *mut W_ListObject);
                     list.object_push(roots.get(base + 1));
                 }
@@ -4923,10 +5013,16 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::IntOrFloat => {
             if let Some(item) = int_or_float_encode_item(value) {
                 list.int_items.push(item);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
             } else {
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
                 let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
@@ -4958,6 +5054,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
                 let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
@@ -4989,6 +5088,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
                 let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
                 let value = roots.get(roots.base());
                 let list = &mut *(obj as *mut W_ListObject);
                 list.object_push(value);
@@ -5675,7 +5777,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject, we_are_jitted: bool) -> Ve
                 (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
             );
             let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
-            boxed_from_bytes(obj_slot, we_are_jitted)
+            boxed_from_bytes(obj_slot, we_are_jitted).unwrap_or_default()
         }
         ListStrategy::Ascii => {
             let _roots = crate::gc_roots::push_roots();
@@ -5683,7 +5785,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject, we_are_jitted: bool) -> Ve
                 (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
             );
             let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
-            boxed_from_ascii(obj_slot, we_are_jitted)
+            boxed_from_ascii(obj_slot, we_are_jitted).unwrap_or_default()
         }
     }
 }
@@ -5717,6 +5819,9 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         // via append. Mirror by switching first then re-dispatching.
         ListStrategy::Empty | ListStrategy::Size => {
             switch_to_correct_strategy(list, value);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return;
+            }
             w_list_insert(
                 crate::gc_roots::shadow_stack_get(root_base),
                 index,
@@ -5725,12 +5830,18 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let obj = switch_range_to_integer_strategy(list);
+            if obj.is_null() {
+                return;
+            }
             w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
                 let idx = normalize_insert_index(index, list.int_items.len());
                 list.int_items.insert(idx, plain_int_w(value));
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
                 list.sync_allocated(old_size);
                 return;
             }
@@ -5745,32 +5856,36 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             } else if crate::gc_hook::gc_alloc_failed_pending() {
                 return;
             } else {
-                switch_to_object_strategy(list);
-                w_list_insert(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                );
+                let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
+                w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
             }
         }
         ListStrategy::IntOrFloat => {
             if let Some(value) = int_or_float_encode_item(value) {
                 let idx = normalize_insert_index(index, list.int_items.len());
                 list.int_items.insert(idx, value);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
                 list.sync_allocated(old_size);
                 return;
             }
-            switch_to_object_strategy(list);
-            w_list_insert(
-                crate::gc_roots::shadow_stack_get(root_base),
-                index,
-                crate::gc_roots::shadow_stack_get(root_base + 1),
-            );
+            let obj = switch_to_object_strategy(list);
+            if obj.is_null() {
+                return;
+            }
+            w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
         }
         ListStrategy::Float => {
             if is_float_strategy_item(value) {
                 let idx = normalize_insert_index(index, list.float_items.len());
                 list.float_items.insert(idx, w_float_get_value(value));
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return;
+                }
                 list.sync_allocated(old_size);
                 return;
             }
@@ -5786,12 +5901,11 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             } else if crate::gc_hook::gc_alloc_failed_pending() {
                 return;
             } else {
-                switch_to_object_strategy(list);
-                w_list_insert(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                );
+                let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
+                w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
             }
         }
         ListStrategy::Object => {
@@ -5824,12 +5938,11 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 list.bytes_items.insert(idx, w_bytes_block(value));
                 list.sync_allocated(old_size);
             } else {
-                switch_to_object_strategy(list);
-                w_list_insert(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                );
+                let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
+                w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
             }
         }
         ListStrategy::Ascii => {
@@ -5852,12 +5965,11 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                     .insert(idx, w_str_storage(value) as *const _);
                 list.sync_allocated(old_size);
             } else {
-                switch_to_object_strategy(list);
-                w_list_insert(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                );
+                let obj = switch_to_object_strategy(list);
+                if obj.is_null() {
+                    return;
+                }
+                w_list_insert(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1));
             }
         }
     }
@@ -5883,6 +5995,9 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             // SimpleRangeListStrategy.pop always materialises; only the
             // separate pop_end hook preserves the strategy.
             let obj = switch_range_to_integer_strategy(list);
+            if obj.is_null() {
+                return None;
+            }
             return w_list_pop(obj, index);
         }
         ListStrategy::Range => {
@@ -5909,6 +6024,9 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
                 Some(crate::gc_roots::shadow_stack_get(result_slot))
             } else {
                 let obj = switch_range_to_integer_strategy(list);
+                if obj.is_null() {
+                    return None;
+                }
                 return w_list_pop(obj, index);
             }
         }
@@ -5969,7 +6087,12 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(w_bytes_from_block(list.bytes_items.remove(idx as usize)))
+            let wrapped = w_bytes_from_block(list.bytes_items.as_slice()[idx as usize]);
+            if wrapped.is_null() {
+                return None;
+            }
+            let _ = list.bytes_items.remove(idx as usize);
+            Some(wrapped)
         }
         ListStrategy::Ascii => {
             let len = list.ascii_items.len() as i64;
@@ -5977,9 +6100,12 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(w_str_from_storage(
-                list.ascii_items.remove(idx as usize) as *mut _
-            ))
+            let wrapped = w_str_from_storage(list.ascii_items.as_slice()[idx as usize] as *mut _);
+            if wrapped.is_null() {
+                return None;
+            }
+            let _ = list.ascii_items.remove(idx as usize);
+            Some(wrapped)
         }
     };
     if result.is_some() {
@@ -6132,8 +6258,24 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
             ll_list_obj_set_len(list, index);
             item
         }
-        ListStrategy::Bytes => w_bytes_from_block(list.bytes_items.pop()),
-        ListStrategy::Ascii => w_str_from_storage(list.ascii_items.pop() as *mut _),
+        ListStrategy::Bytes => {
+            let last = list.bytes_items.as_slice()[length - 1];
+            let wrapped = w_bytes_from_block(last);
+            if wrapped.is_null() {
+                return None;
+            }
+            let _ = list.bytes_items.pop();
+            wrapped
+        }
+        ListStrategy::Ascii => {
+            let last = list.ascii_items.as_slice()[length - 1];
+            let wrapped = w_str_from_storage(last as *mut _);
+            if wrapped.is_null() {
+                return None;
+            }
+            let _ = list.ascii_items.pop();
+            wrapped
+        }
     })
 }
 
@@ -6169,7 +6311,10 @@ pub unsafe fn w_list_sort_range(obj: PyObjectRef, reverse: bool) -> bool {
     }
     let (_, step) = range_list_start_step(list);
     if (step > 0 && reverse) || (step < 0 && !reverse) {
-        let _ = switch_range_to_integer_strategy(list);
+        let obj = switch_range_to_integer_strategy(list);
+        if obj.is_null() {
+            return false;
+        }
         false
     } else {
         true
@@ -6389,15 +6534,24 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
     // allocation discipline: retain the old block only as an allocation
     // input, and reload the possibly moved list before publishing the result.
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return obj;
+    }
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         ListStrategy::Integer => {
             let fresh = crate::object_array::grow_int_items_block(list.int_items.block, 4, 0);
+            if fresh.is_null() {
+                return crate::gc_roots::shadow_stack_get(root_base);
+            }
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             (*(obj as *mut W_ListObject)).int_items.block = fresh;
         }
         ListStrategy::Float => {
             let fresh = crate::object_array::grow_float_items_block(list.float_items.block, 4, 0);
+            if fresh.is_null() {
+                return crate::gc_roots::shadow_stack_get(root_base);
+            }
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             (*(obj as *mut W_ListObject)).float_items.block = fresh;
         }
@@ -6436,6 +6590,9 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
         ListStrategy::Empty | ListStrategy::Size => {}
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let obj = switch_range_to_integer_strategy(list);
+            if obj.is_null() {
+                return;
+            }
             w_list_reverse(obj);
         }
         ListStrategy::Integer => list.int_items.as_mut_slice().reverse(),
@@ -6464,6 +6621,9 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
         ListStrategy::Empty | ListStrategy::Size => {}
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let obj = switch_range_to_integer_strategy(list);
+            if obj.is_null() {
+                return;
+            }
             w_list_delslice(obj, start, end);
             return;
         }
@@ -7013,6 +7173,9 @@ unsafe fn w_list_setslice_inner(
         ListStrategy::SimpleRange | ListStrategy::Range
     ) {
         let obj = switch_range_to_integer_strategy(list);
+        if obj.is_null() {
+            return Err("MemoryError");
+        }
         return w_list_setslice_inner(
             obj,
             start,
@@ -7079,7 +7242,9 @@ unsafe fn w_list_setslice_inner(
                 ListStrategy::Bytes => {
                     let other =
                         &*(crate::gc_roots::shadow_stack_get(root_base + 1) as *const W_ListObject);
-                    let fresh = BytesArray::from_vec(other.bytes_items.to_vec());
+                    let Some(fresh) = BytesArray::try_from_vec(other.bytes_items.to_vec()) else {
+                        return Err("MemoryError");
+                    };
                     let (block, len) = fresh.into_raw_parts();
                     let obj = W_ListObject::install_bytes_items(
                         crate::gc_roots::shadow_stack_get(root_base),
@@ -7093,7 +7258,9 @@ unsafe fn w_list_setslice_inner(
                 ListStrategy::Ascii => {
                     let other =
                         &*(crate::gc_roots::shadow_stack_get(root_base + 1) as *const W_ListObject);
-                    let fresh = UnicodeArray::from_vec(other.ascii_items.to_vec());
+                    let Some(fresh) = UnicodeArray::try_from_vec(other.ascii_items.to_vec()) else {
+                        return Err("MemoryError");
+                    };
                     let (block, len) = fresh.into_raw_parts();
                     let obj = W_ListObject::install_ascii_items(
                         crate::gc_roots::shadow_stack_get(root_base),
@@ -7105,7 +7272,9 @@ unsafe fn w_list_setslice_inner(
                     return Ok(());
                 }
                 ListStrategy::Object => {
-                    list.set_object_items_from_vec(other.object_to_vec());
+                    if !list.set_object_items_from_vec(other.object_to_vec()) {
+                        return Err("MemoryError");
+                    }
                     let obj = crate::gc_roots::shadow_stack_get(root_base);
                     let list = &mut *(obj as *mut W_ListObject);
                     list.strategy = ListStrategy::Object;
@@ -7122,6 +7291,9 @@ unsafe fn w_list_setslice_inner(
             let s = start.min(list.int_items.len());
             let e = end.min(list.int_items.len());
             list.int_items.splice(s, e - s, &donated);
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return Err("MemoryError");
+            }
             return Ok(());
         }
         if list.strategy == ListStrategy::Integer
@@ -7173,6 +7345,9 @@ unsafe fn w_list_setslice_inner(
                 let s = start.min(list.int_items.len());
                 let e = end.min(list.int_items.len());
                 list.int_items.splice(s, e - s, &converted);
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return Err("MemoryError");
+                }
                 return Ok(());
             }
         }
@@ -7206,6 +7381,9 @@ unsafe fn w_list_setslice_inner(
                         // RPython AbstractUnwrappedStrategy.setslice mutates
                         // the unerased typed storage directly.
                         list.int_items.splice(s, e - s, new_items);
+                        if crate::gc_hook::gc_alloc_failed_pending() {
+                            return Err("MemoryError");
+                        }
                     }
                     return Ok(());
                 }
@@ -7227,6 +7405,9 @@ unsafe fn w_list_setslice_inner(
                         list.int_items.install(fresh);
                     } else {
                         list.int_items.splice(s, e - s, new_items);
+                        if crate::gc_hook::gc_alloc_failed_pending() {
+                            return Err("MemoryError");
+                        }
                     }
                     return Ok(());
                 }
@@ -7250,6 +7431,9 @@ unsafe fn w_list_setslice_inner(
                         // RPython AbstractUnwrappedStrategy.setslice mutates
                         // the unerased typed storage directly.
                         list.float_items.splice(s, e - s, new_items);
+                        if crate::gc_hook::gc_alloc_failed_pending() {
+                            return Err("MemoryError");
+                        }
                     }
                     return Ok(());
                 }
@@ -7265,10 +7449,9 @@ unsafe fn w_list_setslice_inner(
                         let mut values = list.bytes_items.to_vec();
                         let donated = values.clone();
                         values.splice(s..e, donated.into_iter());
-                        let fresh = BytesArray::from_vec(values);
-                        if fresh.block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+                        let Some(fresh) = BytesArray::try_from_vec(values) else {
                             return Err("MemoryError");
-                        }
+                        };
                         let (block, len) = fresh.into_raw_parts();
                         W_ListObject::install_bytes_items(obj, block, len);
                         return Ok(());
@@ -7294,6 +7477,9 @@ unsafe fn w_list_setslice_inner(
                         &[]
                     };
                     list.bytes_items.splice(s, e - s, new_items);
+                    if crate::gc_hook::gc_alloc_failed_pending() {
+                        return Err("MemoryError");
+                    }
                     return Ok(());
                 }
                 ListStrategy::Ascii => {
@@ -7308,10 +7494,9 @@ unsafe fn w_list_setslice_inner(
                         let mut values = list.ascii_items.to_vec();
                         let donated = values.clone();
                         values.splice(s..e, donated);
-                        let fresh = UnicodeArray::from_vec(values);
-                        if fresh.block.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+                        let Some(fresh) = UnicodeArray::try_from_vec(values) else {
                             return Err("MemoryError");
-                        }
+                        };
                         let (block, len) = fresh.into_raw_parts();
                         W_ListObject::install_ascii_items(obj, block, len);
                         return Ok(());
@@ -7334,6 +7519,9 @@ unsafe fn w_list_setslice_inner(
                         &[]
                     };
                     list.ascii_items.splice(s, e - s, new_items);
+                    if crate::gc_hook::gc_alloc_failed_pending() {
+                        return Err("MemoryError");
+                    }
                     return Ok(());
                 }
                 ListStrategy::Object => {
@@ -7357,6 +7545,9 @@ unsafe fn w_list_setslice_inner(
                     let obj = crate::gc_roots::shadow_stack_get(root_base);
                     let list = &mut *(obj as *mut W_ListObject);
                     list.object_splice(s, e - s, &donated);
+                    if crate::gc_hook::gc_alloc_failed_pending() {
+                        return Err("MemoryError");
+                    }
                     return Ok(());
                 }
             }
@@ -7370,13 +7561,19 @@ unsafe fn w_list_setslice_inner(
     } else {
         return Err("non-list iterable");
     };
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err("MemoryError");
+    }
     let _new_item_roots = crate::gc_roots::push_roots();
     let new_item_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::publish_roots(&new_items);
     crate::gc_roots::normalize_roots(new_item_base, new_items.len());
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
-    switch_to_object_strategy(list);
+    let obj = switch_to_object_strategy(list);
+    if obj.is_null() {
+        return Err("MemoryError");
+    }
     let mut rooted_new_items = Vec::with_capacity(new_items.len());
     for i in 0..new_items.len() {
         rooted_new_items.push(crate::gc_roots::shadow_stack_get(new_item_base + i));
@@ -7386,6 +7583,9 @@ unsafe fn w_list_setslice_inner(
     let s = start.min(list.length_relaxed());
     let e = end.min(list.length_relaxed());
     list.object_splice(s, e - s, &rooted_new_items);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return Err("MemoryError");
+    }
     Ok(())
 }
 

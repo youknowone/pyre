@@ -719,6 +719,9 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
     let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
+        if block.is_null() {
+            return block;
+        }
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let block =
             crate::gc_roots::shadow_stack_get(values_base + values.len()) as *mut ItemsBlock;
@@ -755,6 +758,9 @@ pub unsafe fn grow_instance_items_block(
         let old_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(old as PyObjectRef);
         let fresh = alloc_mapdict_storage_block(new_cap);
+        if fresh.is_null() {
+            return fresh;
+        }
         let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock;
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);

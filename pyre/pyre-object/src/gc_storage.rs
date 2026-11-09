@@ -48,7 +48,8 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
             return raw as *mut T;
         }
         if crate::gc_hook::gc_alloc_failed_pending() {
-            return std::ptr::null_mut();
+            // Wide callers have no error channel; a refused request aborts as `alloc_co_consts_array`.
+            crate::gc_hook::gc_alloc_failed(std::mem::size_of::<T>());
         }
     }
     crate::lltype::malloc_raw(value)
@@ -92,7 +93,8 @@ pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
             return raw as *mut T;
         }
         if crate::gc_hook::gc_alloc_failed_pending() {
-            return std::ptr::null_mut();
+            // Wide callers have no error channel; a refused request aborts as `alloc_co_consts_array`.
+            crate::gc_hook::gc_alloc_failed(std::mem::size_of::<T>());
         }
     }
     crate::lltype::malloc_raw(value)

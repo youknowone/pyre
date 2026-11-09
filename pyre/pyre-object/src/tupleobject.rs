@@ -520,6 +520,11 @@ fn w_tuple_new_array_backed_impl(
     // snapshot taken here would still hold pre-move addresses across that
     // allocation. Gate off it is the std::alloc block.
     let items_block = unsafe { alloc_tuple_items_block_gc(save_point, len) };
+    // W_TupleObject.__init__: a refused wrappeditems block is not stored
+    // into an already allocated header. Length 0 keeps the empty representation.
+    if items_block.is_null() && len != 0 {
+        return crate::PY_NULL;
+    }
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
         .unwrap_or(std::ptr::null_mut()) as crate::gc_hook::GCREF;

@@ -306,7 +306,9 @@ fn alloc_rbigint_nursery_collecting_impl(
             return raw as *mut RBigInt;
         }
         if majit_gc::gc_alloc_failed_pending() {
-            return std::ptr::null_mut();
+            // rbigint.add / rbigint.divmod box through this leaf; a refused
+            // payload is fatal, matching the co_consts array allocator.
+            majit_gc::gc_alloc_failed(RBIGINT_PAYLOAD_SIZE);
         }
     }
     alloc_rbigint_nursery_impl(value, canonicalize_prebuilt)
@@ -425,9 +427,17 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
     let item0 = RBigIntGcRoot::new(item0);
     let item1 = RBigIntGcRoot::new(item1);
 
+    // rbigint.divmod allocates each half before the tuple2; a failed half is
+    // not published and the second half is not allocated.
     let mut item0 = alloc_rbigint_nursery_collecting(item0.translated_alias());
+    if item0.is_null() {
+        return std::ptr::null_mut();
+    }
     let _item0_root = unsafe { PendingPairItemRoot::new(&mut item0) };
     let mut item1 = alloc_rbigint_nursery_collecting(item1.translated_alias());
+    if item1.is_null() {
+        return std::ptr::null_mut();
+    }
     let _item1_root = unsafe { PendingPairItemRoot::new(&mut item1) };
 
     let tid = rbigint_pair_gc_type_id();

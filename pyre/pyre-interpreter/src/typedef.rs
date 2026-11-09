@@ -3111,7 +3111,9 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         pyre_object::w_type_set_weakrefable(type_obj, false);
         crate::objspace::std::mapdict::install_type_terminator(type_obj);
     }
-    unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    if !unsafe { w_type_set_mro(type_obj, vec![type_obj]) } {
+        return PY_NULL;
+    }
     let type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
@@ -3713,7 +3715,9 @@ fn new_typeobject_with_metatype_and_layout(
     } else {
         mro.push(pyre_object::gc_roots::shadow_stack_get(param_base));
     }
-    unsafe { w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(type_slot), mro) };
+    if !unsafe { w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(type_slot), mro) } {
+        return PY_NULL;
+    }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, pyre_object::gc_roots::shadow_stack_get(type_slot)) };
     // `typeobject.py TypeCache.ready(w_type)` runs `w_type.ready()`
@@ -3835,7 +3839,9 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
 
     // MRO = C3 linearization over the recorded `__bases__`.
     let mro = unsafe { crate::baseobjspace::compute_default_mro(type_obj) };
-    unsafe { w_type_set_mro(type_obj, mro) };
+    if !unsafe { w_type_set_mro(type_obj, mro) } {
+        return PY_NULL;
+    }
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
     // Readying registers the new type on every entry of `__bases__`, so a
@@ -11207,7 +11213,7 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let next = pyre_object::gc_roots::shadow_stack_get(next_slot);
     let w_code = unsafe { (*frame).fget_f_code() };
 
-    Ok(crate::pytraceback::w_pytraceback_new(
+    crate::runtime_ops::obj_or_memory_error(crate::pytraceback::w_pytraceback_new(
         frame, lasti, next, lineno, w_code,
     ))
 }

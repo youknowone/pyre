@@ -279,7 +279,9 @@ pub(crate) fn jit_clear_published_exception() {
 /// the interpreter's error value.
 #[inline]
 pub(crate) fn fetch_memory_error() -> crate::PyError {
-    jit_clear_published_exception();
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        jit_clear_published_exception();
+    }
     crate::PyError::memory_error("")
 }
 

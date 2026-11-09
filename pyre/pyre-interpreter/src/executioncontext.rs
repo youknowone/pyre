@@ -2137,7 +2137,7 @@ impl ExecutionContext {
         let _roots = pyre_object::gc_roots::push_roots();
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_func);
-        self.force_all_frames(false);
+        let _ = self.force_all_frames(false);
         let w_func = pyre_object::gc_roots::shadow_stack_get(func_slot);
         pyre_object::gc_hook::try_gc_write_barrier(
             self as *const Self as pyre_object::gc_hook::GCREF,
@@ -2208,7 +2208,7 @@ impl ExecutionContext {
             let _roots = pyre_object::gc_roots::push_roots();
             let arg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_arg);
-            self.force_all_frames(true);
+            self.force_all_frames(true)?;
             pyre_object::gc_roots::shadow_stack_get(arg_slot)
         } else {
             w_arg
@@ -2238,7 +2238,7 @@ impl ExecutionContext {
     /// names the frame directly instead of a vref — the identity force again,
     /// on precisely the frame "running in assembler" that this consumer exists
     /// for.  Hence the direct call.
-    pub fn force_all_frames(&mut self, is_being_profiled: bool) {
+    pub fn force_all_frames(&mut self, is_being_profiled: bool) -> Result<(), crate::PyError> {
         let mut frame = self.gettopframe_nohidden();
         while !frame.is_null() {
             let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
@@ -2246,13 +2246,12 @@ impl ExecutionContext {
             frame = anchor.live();
             if is_being_profiled {
                 unsafe {
-                    if let Ok(d) = (*frame).getorcreatedebug(-1) {
-                        d.is_being_profiled = true;
-                    }
+                    (*frame).getorcreatedebug(-1)?.is_being_profiled = true;
                 }
             }
             frame = Self::getnextframe_nohidden(frame);
         }
+        Ok(())
     }
 
     pub fn call_tracing(&mut self, w_func: PyObjectRef, w_args: PyObjectRef) -> PyObjectRef {

@@ -1631,6 +1631,9 @@ pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
     let dst_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_frozendict_new());
     let copied = w_dict_copy(crate::gc_roots::shadow_stack_get(src_slot));
+    if copied.is_null() {
+        return crate::PY_NULL;
+    }
     let copied_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(copied);
     w_dict_adopt_regular_copy_for_empty_update(
@@ -1742,6 +1745,9 @@ pub fn w_dict_new_kwargs() -> PyObjectRef {
 /// strategy + a freshly cloned typed storage box.  Length is computed
 /// on demand by `strategy.length(self)` from the typed storage shape.
 pub fn w_dict_new_with(strategy: &'static DictStrategyRef, dstorage: GCREF) -> PyObjectRef {
+    if dstorage.is_null() && crate::gc_hook::gc_alloc_failed_pending() {
+        return crate::PY_NULL;
+    }
     // The clone filled the host table before the box existed, so no entry
     // store ran `dict_write_barrier`. Remember the box before
     // `alloc_dict_object`, which can collect.
@@ -2077,9 +2083,6 @@ pub fn w_module_dict_new() -> PyObjectRef {
         crate::celldict::ModuleDictStrategy::new(),
         crate::celldict::module_dict_strategy_gc_type_id(),
     );
-    if strategy.is_null() {
-        return crate::PY_NULL;
-    }
     let strategy_slot = roots.publish(&[strategy as PyObjectRef]);
     let strategy = roots.get(strategy_slot) as *mut crate::celldict::ModuleDictStrategy;
     // The strategy box is non-moving and lives as long as this holder.  The
@@ -2096,9 +2099,6 @@ pub fn w_module_dict_new() -> PyObjectRef {
         },
         dict_strategy_ref_gc_type_id(),
     );
-    if strategy_ref.is_null() {
-        return crate::PY_NULL;
-    }
     let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
     // `dictmultiobject.py` `W_DictMultiObject.allocate_and_init_instance`:
     // `storage = strategy.get_empty_storage()`.
@@ -5380,6 +5380,9 @@ pub unsafe fn w_dict_copy_object_strategy(
     // this path (`w_dict_copy`); a born-old clone kept discarded types
     // alive at every minor.
     let new_storage = storage.clone_to_young_box(object_dict_storage_gc_type_id());
+    if new_storage.is_null() {
+        return crate::PY_NULL;
+    }
     w_dict_new_with(strategy, new_storage as GCREF)
 }
 
@@ -5398,6 +5401,9 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
     let entries = &mut *(dict.dstorage as *mut IntDictStorage);
     let k = crate::listobject::plain_int_w(key);
     let fresh = entries.insert(k, value).is_none();
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
     if fresh {
         let dict = &mut *(_dict_guard.root(0) as *mut W_DictObject);
         dict.keys_version = dict.keys_version.wrapping_add(1);
@@ -5706,10 +5712,12 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     }
     // The empty box is allocated before the fill so the last collection point
     // is behind the pairs being copied out of their slots.
-    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-        object_dict_storage_with_capacity(len),
-        object_dict_storage_gc_type_id(),
-    );
+    let table = object_dict_storage_with_capacity(len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
+    let new_storage =
+        crate::gc_storage::gc_alloc_young_storage_box(table, object_dict_storage_gc_type_id());
     let new_map = &mut *new_storage;
     // `ll_getitem_fast` on the hash/pair arrays, not `Enumerate`.
     let hash_p = hashes.as_ptr();
@@ -5745,7 +5753,11 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut BytesDictStorage);
     let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
-    if entries.insert(k, value).is_none() {
+    let fresh = entries.insert(k, value).is_none();
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
+    if fresh {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
 }
@@ -5894,10 +5906,12 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
         roots.publish(&[object_key.obj, v]);
         next = i + 1;
     }
-    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-        object_dict_storage_with_capacity(len),
-        object_dict_storage_gc_type_id(),
-    );
+    let table = object_dict_storage_with_capacity(len);
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
+    }
+    let new_storage =
+        crate::gc_storage::gc_alloc_young_storage_box(table, object_dict_storage_gc_type_id());
     let new_map = &mut *new_storage;
     let hash_p = hashes.as_ptr();
     let mut i = 0usize;
@@ -7099,6 +7113,9 @@ pub trait DictStrategy {
                 roots.get(pairs_base + 2 * i),
                 roots.get(pairs_base + 2 * i + 1),
             );
+            if crate::gc_hook::gc_alloc_failed_pending() {
+                return crate::PY_NULL;
+            }
         }
         roots.get(new_slot)
     }
@@ -8292,6 +8309,9 @@ impl DictStrategy for BytesDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::bytes_dict_storage_gc_type_id());
+        if new_storage.is_null() {
+            return crate::PY_NULL;
+        }
         crate::dictmultiobject::w_dict_new_with(bytes_dict_strategy_ref(), new_storage as GCREF)
     }
 }
@@ -8770,6 +8790,9 @@ impl DictStrategy for IntDictStrategy {
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
         let new_storage =
             storage.clone_to_young_box(crate::dictmultiobject::int_dict_storage_gc_type_id());
+        if new_storage.is_null() {
+            return crate::PY_NULL;
+        }
         crate::dictmultiobject::w_dict_new_with(int_dict_strategy_ref(), new_storage as GCREF)
     }
 }

@@ -1973,7 +1973,7 @@ pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
+pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) -> bool {
     let purely_of_types = is_mro_purely_of_types(&mro);
     // The MRO malloc may collect. Pin the type and reload it after; a
     // nursery-born heap type would otherwise keep the pre-collection
@@ -1987,6 +1987,11 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     } else {
         crate::object_array::alloc_mro_block_gc(&mro)
     };
+    // W_TypeObject.set_mro / compute_mro: keep the previous mro_w and
+    // version tag when the block is refused.
+    if mro_w.is_null() {
+        return false;
+    }
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let t = obj as *mut W_TypeObject;
     // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
@@ -2002,6 +2007,7 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     if !purely_of_types {
         w_type_set_version_tag(obj, 0);
     }
+    true
 }
 
 /// Store an already-allocated MRO block without copying it.
@@ -2604,6 +2610,9 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     // is None: self.weak_subclasses[i] = newref; return;
     // else: self.weak_subclasses.append(newref)`.
     let newref = crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(subclass_slot));
+    if newref.is_null() {
+        return;
+    }
     let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);
     let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
     let parent = &mut *(w_parent as *mut W_TypeObject);
