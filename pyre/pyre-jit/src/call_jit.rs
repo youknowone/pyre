@@ -7226,11 +7226,8 @@ bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 /// frame, like [`bh_call_fn_impl`]: `pyopcode.py CALL_FUNCTION_KW`
 /// settles the C-profile question against its own frame and then calls the
 /// frameless `space.call_args(w_function, args)`, which is what a residual
-/// reaches.  Keyword resolution + the dispatched call run under
-/// `force_plain_eval` (blackhole.py `bhimpl_residual_call_*` is an
-/// opaque CPU call — no JIT re-entry; `call_kw`'s
-/// `call_user_function_resolved` fast path routes through the JIT-aware
-/// `get_eval_fn()`, so the guard is what keeps it on `eval_frame_plain`).
+/// reaches.  The dispatched call may enter the JIT, as in [`bh_call_fn_impl`];
+/// the caller's exception pair is parked across it.
 /// `positional` is `arg0..argN-1` in positional order (keyword tail
 /// included); `kwnames` is the constant kwnames tuple.  MayForce: keyword
 /// binding and the dispatched call may run Python.
@@ -7258,8 +7255,8 @@ fn bh_call_kw_impl(
         let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
+    let parked = park_residual_call_exception();
     let result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
         if profile_frame.is_null() {
             pyre_interpreter::call::call_kw_in_ctx(ec, callable, null_or_self, positional, kwnames)
         } else {
@@ -7272,6 +7269,7 @@ fn bh_call_kw_impl(
             )
         }
     };
+    unpark_residual_call_exception(parked);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
@@ -7560,12 +7558,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         }
     }
     // llmodel.py bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
-    // Hot path: Function callables dispatched directly here (builtin or user
-    // code), matching call_user_function_plain so eval_frame_plain is used
-    // and JIT is not re-entered from the blackhole.
-    // Cold path: type/method/staticmethod/classmethod/callable-instance are
-    // delegated to call_function_impl_result under ForcePlainEvalGuard, which
-    // mirrors baseobjspace.py dispatch without re-entering the JIT.
+    // Function callables are dispatched directly here (builtin code, or user
+    // code with the callee free to enter the JIT); type/method/staticmethod/
+    // classmethod/callable-instance are delegated to
+    // `call_function_impl_result`, which mirrors baseobjspace.py dispatch.
     let callable = _roots.get(root_base);
     if unsafe { is_function(callable) } {
         let code = unsafe { pyre_interpreter::getcode(callable) };
@@ -7656,6 +7652,9 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         };
     }
     // Cold path: type/method/staticmethod/classmethod/callable-instance.
+    // The delegated call may re-enter the JIT the same way the Function path
+    // does (see the comment on that path), so the caller's exception pair is
+    // parked across it.
     // Ensure LAST_EXEC_CTX reflects the calling context before delegating to
     // `call_function_impl_result`. `type_descr_call_impl` →
     // `call_user_function_with_args` reads LAST_EXEC_CTX as the fallback
@@ -7668,10 +7667,11 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
-    let _plain_guard = pyre_interpreter::call::force_plain_eval();
     let callable = _roots.get(root_base);
     let call_args = reload_args();
+    let parked = park_residual_call_exception();
     let result = pyre_interpreter::call::call_function_impl_result(callable, &call_args);
+    unpark_residual_call_exception(parked);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
@@ -7689,8 +7689,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
 /// [`bh_call_fn_impl`]: `pyopcode.py CALL_FUNCTION_EX` settles the
 /// C-profile question against its own frame and then calls the frameless
 /// `space.call_args(w_function, args)`, which is what a residual reaches.
-/// The nested Python call runs under `force_plain_eval` (blackhole.py bhimpl_residual_call_r_i
-/// `bhimpl_residual_call_*` is an opaque CPU call — no JIT re-entry).
+/// The nested Python call may enter the JIT, as in [`bh_call_fn_impl`]; the
+/// caller's exception pair is parked across it.
 /// MayForce: unpacking an arbitrary iterable / mapping and the dispatched
 /// call may run Python.
 pub extern "C" fn bh_call_function_ex_fn(
@@ -7715,8 +7715,8 @@ pub extern "C" fn bh_call_function_ex_fn(
         let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
     }
     pyre_interpreter::call::set_last_exec_ctx(ec);
+    let parked = park_residual_call_exception();
     let result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
         if profile_frame.is_null() {
             pyre_interpreter::call::call_function_ex_in_ctx(
                 ec,
@@ -7735,6 +7735,7 @@ pub extern "C" fn bh_call_function_ex_fn(
             )
         }
     };
+    unpark_residual_call_exception(parked);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result,
