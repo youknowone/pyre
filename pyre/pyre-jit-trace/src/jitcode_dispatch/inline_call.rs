@@ -4799,14 +4799,6 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
-    // A `CALL_ASSEMBLER` jumps straight into the callee's compiled
-    // `dispatch`, past `pyframe.py execute_frame`'s `call_trace`.
-    // While a hook is installed there is nothing that can report those
-    // events from here, so decline before the first recorded op.
-    // Same test as `try_walker_call_assembler_self_recursive`.
-    if super::ec_hook_installed() {
-        return Ok(None);
-    }
     // The bridge resume captures its after-call guards on the paused callers;
     // decline before the first recorded op when they cannot take the result.
     if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
@@ -4926,13 +4918,6 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             concrete_callee_frame as usize,
         )
     });
-
-    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
-    // `dispatch`.  `CALL_ASSEMBLER` jumps to compiled `dispatch`;
-    // record the reads at the CALLER's CALL (`pc`).  A hook already
-    // set declined above, so this only runs when the assembler call
-    // is recorded.
-    super::record_call_trace_guards_before_assembler(ctx, pc)?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -17644,12 +17629,6 @@ fn descend_generatorentry<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // `CALL_ASSEMBLER` jumps to compiled `generatorentry` past
-    // `pyframe.py execute_frame`'s `call_trace`.  A hook already
-    // installed residualizes `jit_next`, which still runs the bracket.
-    if super::ec_hook_installed() {
-        return Ok(None);
-    }
     let Some(canonical) =
         crate::jitcode_runtime::portal_jitcode_for_key(crate::genentry_state::GENENTRY_PORTAL_KEY)
     else {
@@ -17743,10 +17722,6 @@ fn descend_generatorentry<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
-    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
-    // `dispatch`.  Record those reads at this `next()` CALL (`op.pc`)
-    // in front of `CALL_ASSEMBLER`.
-    super::record_call_trace_guards_before_assembler(ctx, op.pc)?;
     // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` records `CALL_ASSEMBLER` after
