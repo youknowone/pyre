@@ -2215,13 +2215,17 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // continuation form one bridge body).
     // Other shapes / outcomes log + abort (trace discarded).
     let subwalk_result = match &walk {
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
-            Some(*r)
-        }
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _)))
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                result: Some(r),
+                result_concrete,
+            },
+            _,
+        ))) => Some((*r, *result_concrete)),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _)))
             if crate::state::jitcode_is_transparent_helper(recipe.jitcode_index) =>
         {
-            Some(majit_ir::OpRef::NONE)
+            Some((majit_ir::OpRef::NONE, crate::state::ConcreteValue::Null))
         }
         _ => None,
     };
@@ -2510,7 +2514,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     root_frame_box: majit_ir::OpRef,
     carrier: &majit_metainterp::BridgeInlineCarrier,
     middles: &[majit_metainterp::ReconstructRecipe],
-    mut result: majit_ir::OpRef,
+    mut result: (majit_ir::OpRef, crate::state::ConcreteValue),
 ) -> Option<TraceAction> {
     finishframe_clear_last_exc(session, sym);
     for i in (0..middles.len()).rev() {
@@ -2554,7 +2558,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
         code_slot,
         root_pc,
         carrier,
-        result,
+        result.0,
     )
 }
 
@@ -2829,6 +2833,8 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     Some(action)
 }
 
+type ThreadedBridgeValue = (majit_ir::OpRef, crate::state::ConcreteValue);
+
 /// Reconstruct `middle` and walk it from its `catch_exception` target, the
 /// `ChangeFrame` half of `finishframe_exception`. `Ok` is `finishframe`
 /// (`SubReturn`); `Err` is a handler that raised again; `None` is a
@@ -2846,7 +2852,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     exc: majit_ir::OpRef,
     exc_concrete: crate::state::ConcreteValue,
     catch_target: usize,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let is_being_profiled =
         crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
@@ -2942,9 +2948,10 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -2974,8 +2981,8 @@ fn walk_len_operator_tail<Sym: WalkSym>(
     root_pc: usize,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
         middle.jitcode_index,
@@ -3008,9 +3015,10 @@ fn walk_len_operator_tail<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -3036,8 +3044,8 @@ fn walk_transparent_helper_middle<Sym: WalkSym>(
     root_pc: usize,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle = ctx.reconstruct_recipe_with_current_refs(middle);
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
@@ -3071,11 +3079,15 @@ fn walk_transparent_helper_middle<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
-            Some(Ok(majit_ir::OpRef::NONE))
+        ))) => Some(Ok((mid_result, result_concrete))),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
+            Some(Ok((
+                majit_ir::OpRef::NONE,
+                crate::state::ConcreteValue::Null,
+            )))
         }
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
@@ -3104,7 +3116,7 @@ fn walk_transparent_helper_middle_from_handler<Sym: WalkSym>(
     exc: majit_ir::OpRef,
     exc_concrete: crate::state::ConcreteValue,
     catch_target: usize,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle = ctx.reconstruct_recipe_with_current_refs(middle);
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
@@ -3140,11 +3152,15 @@ fn walk_transparent_helper_middle_from_handler<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
-            Some(Ok(majit_ir::OpRef::NONE))
+        ))) => Some(Ok((mid_result, result_concrete))),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
+            Some(Ok((
+                majit_ir::OpRef::NONE,
+                crate::state::ConcreteValue::Null,
+            )))
         }
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
@@ -3187,8 +3203,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     root_ec_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let is_being_profiled =
         crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     if middle.len_tail {
@@ -3310,9 +3326,10 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -3320,7 +3337,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
             },
             _,
         ))) => Some(Err((raised, raised_concrete))),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
             crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveVoid");
             None
         }
