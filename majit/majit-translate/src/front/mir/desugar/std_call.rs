@@ -12,6 +12,22 @@ fn is_source_write_barrier_name_path(path: &str) -> bool {
     leaf == "type_write_barrier" || leaf == "list_write_barrier"
 }
 
+/// Fresh empty array aggregate: a 0-arg `SyntheticTransparentCtor`.
+/// A fresh `[]` value has no address a program may rely on (it is folded
+/// to the prebuilt zero-length GC array); any reference, constant or not,
+/// keeps its address through `cast_ptr_to_int`
+/// (`jtransform.py rewrite_op_cast_ptr_to_int`).
+fn opkind_is_empty_array_aggregate(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            args,
+            ..
+        } if args.is_empty()
+    )
+}
+
 /// Static class of a local an atomic `load` / `store` arm cares about
 /// (`rptr.py InteriorPtrRepr`). Indexed by MIR local.
 #[derive(Clone, Debug)]
@@ -4203,6 +4219,15 @@ impl<'a> Lowering<'a> {
     }
 
     /// `[u8; N]` / `&[u8; N]` unsized onto a window: `{array, N}`.
+    ///
+    /// A fresh empty array aggregate `[]` does not read the array local:
+    /// a fresh `[]` has no address a program may rely on (it is folded to
+    /// the prebuilt zero-length GC array). `jtransform.py
+    /// rewrite_op_cast_ptr_to_int` keeps `cast_ptr_to_int` for any
+    /// reference, constant or not. rustc's empty-slice data word is
+    /// `NonNull::dangling` (`align_of::<u8>() == 1`) only for that fresh
+    /// `[]`. A live or constant `&[u8; 0]` keeps its address through the
+    /// cast path below.
     pub(in crate::front::mir) fn u8_array_unsize_source(
         &mut self,
         mir_bb: usize,
@@ -4221,11 +4246,45 @@ impl<'a> Lowering<'a> {
             .get(local as usize)
             .and_then(|slot| slot.as_ref())
             .and_then(|value| value.one().ok())?;
+        if len == 0 && self.var_is_empty_array_aggregate(&ptr) {
+            // A fresh `[]` has no address a program may rely on; any
+            // reference, constant or not, keeps its address.
+            // `jtransform.py rewrite_op_cast_ptr_to_int` keeps
+            // `cast_ptr_to_int` for a tagged GC value.
+            // `emit_const_uint` is Unknown; `push_cast_ptr_to_int` stamps
+            // Signed (`rtype_cast_ptr_to_int`). ConstInt(1) Signed is
+            // `NonNull::<u8>::dangling`.
+            return Some(self.emit_dangling_empty_u8_window(mir_bb));
+        }
         let bb_id = self.emit_bb(mir_bb);
         let ptr = push_cast_ptr_to_int(&mut self.graph, bb_id, ptr);
         let ptr = self.ensure_window_ccharp(mir_bb, ptr);
         let len = self.emit_const_uint(mir_bb, len);
         Some((ptr, len))
+    }
+
+    /// `NonNull::<u8>::dangling()` data word with length 0.
+    fn emit_dangling_empty_u8_window(&mut self, mir_bb: usize) -> (Variable, Variable) {
+        let bb_id = self.emit_bb(mir_bb);
+        let ptr = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(ptr.clone()),
+            kind: OpKind::ConstInt(1),
+        });
+        let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+        let len = self.emit_const_uint(mir_bb, 0);
+        (ptr, len)
+    }
+
+    /// True when `var` is defined by a fresh empty array aggregate in this
+    /// graph (0-arg `SyntheticTransparentCtor`). `w_bytes_empty` assigns
+    /// `[]` as that ctor; `unit_variant_fold` later folds it to a GC
+    /// `ConstRef`.
+    fn var_is_empty_array_aggregate(&self, var: &Variable) -> bool {
+        self.producer_op(var)
+            .is_some_and(|op| opkind_is_empty_array_aggregate(&op.kind))
     }
 
     /// Subslice of a window: `{data + start, end - start}` (byte stride).

@@ -7747,6 +7747,253 @@ fn window_join_empty_array_unsize_and_str_view_is_ccharp() {
     );
 }
 
+/// Unsize of an `&[u8; 0]` *argument* keeps the source address:
+/// `cast_ptr_to_int` of the live reference, like a non-empty array.
+#[test]
+fn empty_u8_array_argument_unsize_keeps_its_address() {
+    let shared = window_shared_slice();
+    let usize_zero = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [window_u8(), usize_zero, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty, "Shared"]});
+    let usize_lit = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "empty_u8_array_argument_unsize"], true),
+        "signature": {"is_unsafe": false, "inputs": [array_ref.clone()], "output": shared.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &shared),
+                window_local(1, &array_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &shared),
+                            {"UnaryOp": [
+                                {"Cast": {"Unsize": [
+                                    array_ref.clone(),
+                                    shared.clone(),
+                                    {"Length": usize_lit}
+                                ]}},
+                                {"Move": window_place(serde_json::json!({"Local": 1}), &array_ref)}
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 2}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(Vec::new(), vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "empty_u8_array_argument_unsize")
+        .expect("lower [u8; 0] argument unsize to &[u8]");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_ptr_to_int"),
+        "empty [u8; 0] argument unsize keeps its address via cast_ptr_to_int; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        graph_ops(&graph).iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+        )),
+        "empty [u8; 0] argument unsize keeps its address via cast_ptr_to_int; graph={}",
+        graph.dump()
+    );
+}
+
+/// Unsize of a fresh empty array aggregate `[]` must not emit
+/// `cast_ptr_to_int`. `jtransform.py rewrite_op_cast_ptr_to_int` /
+/// `NonNull::dangling`.
+#[test]
+fn empty_u8_array_aggregate_unsize_has_no_cast_ptr_to_int() {
+    let shared = window_shared_slice();
+    let usize_zero = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [window_u8(), usize_zero, null]});
+    let usize_lit = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]
+    });
+    let empty_array = serde_json::json!({
+        "Aggregate": [{"Array": [window_u8(), usize_lit.clone()]}, []]
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "empty_u8_array_aggregate_unsize"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": shared.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &shared),
+                window_local(1, &array_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 1}), &array_ty),
+                                empty_array
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &shared),
+                                {"UnaryOp": [
+                                    {"Cast": {"Unsize": [
+                                        array_ty.clone(),
+                                        shared.clone(),
+                                        {"Length": usize_lit}
+                                    ]}},
+                                    {"Move": window_place(serde_json::json!({"Local": 1}), &array_ty)}
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 2}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(Vec::new(), vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "empty_u8_array_aggregate_unsize")
+        .expect("lower empty [u8; 0] aggregate unsize to &[u8]");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        !leafs.iter().any(|leaf| leaf == "cast_ptr_to_int"),
+        "empty [u8; 0] aggregate unsize must not emit cast_ptr_to_int; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        !graph_ops(&graph).iter().any(|op| matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+        )),
+        "empty [u8; 0] aggregate unsize must not emit cast_ptr_to_int unop; graph={}",
+        graph.dump()
+    );
+}
+
+/// Unsize of a constant `&[u8; 0]` reference keeps the source address:
+/// `cast_ptr_to_int` of that reference, like a live argument.
+#[test]
+fn empty_u8_array_constant_reference_unsize_keeps_its_address() {
+    let shared = window_shared_slice();
+    let usize_zero = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [window_u8(), usize_zero, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty, "Shared"]});
+    let usize_lit = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]
+    });
+    let array_const = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            array_ref.clone()
+        ]
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "empty_u8_array_constant_reference_unsize"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": shared.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 0, "locals": [
+                window_local(0, &shared),
+                window_local(1, &array_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 1}), &array_ref),
+                                {"Use": [array_const, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &shared),
+                                {"UnaryOp": [
+                                    {"Cast": {"Unsize": [
+                                        array_ref.clone(),
+                                        shared.clone(),
+                                        {"Length": usize_lit}
+                                    ]}},
+                                    {"Move": window_place(serde_json::json!({"Local": 1}), &array_ref)}
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Goto": {"target": 2}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(Vec::new(), vec![caller]);
+    let graph =
+        crate::test_support::lower_function(&llbc, "empty_u8_array_constant_reference_unsize")
+            .expect("lower constant [u8; 0] reference unsize to &[u8]");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_ptr_to_int"),
+        "constant [u8; 0] reference unsize keeps its address via cast_ptr_to_int; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        graph_ops(&graph).iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+        )),
+        "constant [u8; 0] reference unsize keeps its address via cast_ptr_to_int; graph={}",
+        graph.dump()
+    );
+}
+
 /// A shared `&[u8]` reborrow of `&Box<[u8]>` stays the list: `len` /
 /// index are `__len` / `ArrayRead`, never the resizable-list raw ptr.
 #[test]
