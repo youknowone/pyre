@@ -3597,7 +3597,7 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
         crate::object_array::ll_arraycopy_float_items_block(
             old as *mut FloatItemsBlock,
-            newitems as *mut FloatItemsBlock,
+            newitems,
             0,
             0,
             p as i64,
@@ -3612,7 +3612,7 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     // uses, immediately before it; `drop_guarded_gc_write_barriers` drops
     // it when that GC-ref setfield follows.
     crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
-    ll_list_float_set_items(list, newitems);
+    ll_list_float_set_items(list, newitems as *mut TypedItemsBlock);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
     if !majit_rlib::jit::we_are_jitted() {
@@ -4566,14 +4566,15 @@ unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
 }
 
 /// [`int_ll_newlist`] for FloatListStrategy storage (`GcArray(Float)`).
+/// The result type is `GcArray(Float)` so `do_fixed_newlist` picks the float array descr.
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+unsafe fn float_ll_newlist(count: i64) -> *mut FloatItemsBlock {
     let count = count as usize;
     if count == 0 {
         return std::ptr::null_mut();
     }
-    typed_ll_newlist(count, gc_float_array_gc_type_id())
+    typed_ll_newlist(count, gc_float_array_gc_type_id()) as *mut FloatItemsBlock
 }
 
 /// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the
