@@ -34948,8 +34948,8 @@ fn diamond_threaded_words(
 }
 
 /// `PyError(ptr)` is the payload pointer. Construction peels to that
-/// word; `retag_error_carrier` recasts once to the handle class
-/// (`error::PyError`). No FieldWrite / synthetic ctor / malloc of
+/// word; `retag_error_carrier` recasts once to the carrier's inner
+/// class (`PyErrorObject`). No FieldWrite / synthetic ctor / malloc of
 /// `__pos_0`.
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
@@ -35066,8 +35066,8 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
     );
     assert_eq!(
         roots,
-        ["error::PyError"],
-        "PyError(ptr) recasts the payload to the handle class; graph={}",
+        ["PyErrorObject"],
+        "PyError(ptr) recasts the payload to the inner class; graph={}",
         graph.dump()
     );
     assert!(
@@ -46086,6 +46086,7 @@ fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
 
 /// Object-list length stays `rlist.py` `ll_length` (the LIST.length
 /// field), not `ll_strlen` of a str-family payload.
+/// The Object arm reaches the list.obj_len oopspec leaf (rlist.py ll_length / jtransform.py do_resizable_list_len).
 #[test]
 fn object_list_len_reads_list_length_field() {
     use crate::model::OpKind;
@@ -46112,8 +46113,11 @@ fn object_list_len_reads_list_length_field() {
         _ => false,
     });
     assert!(
-        has_list_length || calls_leaf(&graph, "__len") || has_live_len,
-        "w_list_len must read LIST.length / __len / live_len; graph={}",
+        has_list_length
+            || calls_leaf(&graph, "__len")
+            || calls_leaf(&graph, "ll_list_obj_length")
+            || has_live_len,
+        "w_list_len must read LIST.length / __len / live_len / the ll_list_obj_length oopspec leaf; graph={}",
         graph.dump()
     );
     assert!(
