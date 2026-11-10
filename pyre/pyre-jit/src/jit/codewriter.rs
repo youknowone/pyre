@@ -11695,20 +11695,22 @@ impl CodeWriter {
 
                         // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                         Instruction::StoreSubscr => {
-                            // Pass stack slots directly as call args,
-                            // retiring obj_tmp0/obj_tmp1/arg_regs_start staging.
-                            // Inputs are read by the backend ABI into call regs
-                            // before the call executes; no write-back conflicts
-                            // because ResKind::Void.
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
-                            let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
-                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
-                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // pyopcode.py STORE_SUBSCR: three popvalue() reads of the frame array.
+                            let key_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let obj_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let stored_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(
+                                py_pc,
+                                [stored_value.clone(), obj_value.clone(), key_value.clone()]
+                            );
                             emit_frontend_setitem(
                                 &mut graph,
                                 &current_block.block(),
@@ -14909,12 +14911,17 @@ impl CodeWriter {
 
                         // DeleteSubscr: pops 2 (index, obj). Net: -2.
                         Instruction::DeleteSubscr => {
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
-                            let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
-                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // pyopcode.py DELETE_SUBSCR: two popvalue() reads of the frame array.
+                            let key_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let obj_value = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            emit_after_pop_live!(py_pc, [obj_value.clone(), key_value.clone()]);
                             emit_frontend_delsubscr(
                                 &mut graph,
                                 &current_block.block(),
