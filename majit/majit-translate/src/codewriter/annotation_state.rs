@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str};
 use crate::model::ValueType;
-use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
 /// Classdef-less `Ref` shells are not counted in a thread-local.
 /// A `SomeInstance` carries its `classdef` only when the caller has a
@@ -252,10 +252,16 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         }
         // `history.getkind` / `codewriter/support.py` (via `getkind`): a
         // `Ptr` whose `TO` is `FuncType` (`FuncType._gckind == 'raw'`) is
-        // `'int'`. GC pointees stay `Ref`. Raw non-function pointees stay
-        // `Ref` here; that kind is a separate decision.
+        // `'int'`. GC pointees stay `Ref`. A raw `Ptr(Struct)` keeps the
+        // struct name so `named_ref_is_raw_int` answers that kind
+        // (`history.py getkind` of that `Ptr` is `'int'`). Skip
+        // `concrete_from_annotation` projects a SomePtr through
+        // `getkind(ll_ptrtype)` and does not come through this arm.
         SomeValue::Ptr(p) => match &p.ll_ptrtype.TO {
             PtrTarget::Func(_) => ValueType::Int,
+            PtrTarget::Struct(st) if st._gckind == GcKind::Raw => {
+                ValueType::Ref(Some(st._name.clone()))
+            }
             _ => ValueType::Ref(None),
         },
         SomeValue::PBC(_) => ValueType::Ref(None),
@@ -426,5 +432,31 @@ mod tests {
         };
         assert!(integer.nonneg);
         assert_eq!(integer.base.knowntype, KnownType::ULongLongLong);
+    }
+
+    #[test]
+    fn someptr_of_raw_struct_keeps_the_struct_name() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+
+        let raw = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new(
+                "gc_roots::RootScope",
+                vec![("save_point".into(), LowLevelType::Unsigned)],
+            )),
+        }));
+        assert_eq!(
+            somevalue_to_valuetype(&raw),
+            ValueType::Ref(Some("gc_roots::RootScope".into())),
+            "raw Ptr keeps the struct name so Skip reaches named_ref_is_raw_int"
+        );
+        let gc = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("pyobject::PyObject", vec![])),
+        }));
+        assert_eq!(
+            somevalue_to_valuetype(&gc),
+            ValueType::Ref(None),
+            "a GC Ptr still flattens to unnamed Ref"
+        );
     }
 }

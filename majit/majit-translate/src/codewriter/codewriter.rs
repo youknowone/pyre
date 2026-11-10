@@ -548,9 +548,10 @@ impl CodeWriter {
                 // the only source of types for these graphs.  Reads
                 // annotations off `Variable.annotation` populated by
                 // the preceding `annotate` post-loop publish.
-                crate::translator::rtyper::legacy_resolve::resolve_types(
+                crate::translator::rtyper::legacy_resolve::resolve_types_with_layouts(
                     graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 );
                 // Skip commits `GcRef` as `rclass.OBJECTPTR`
                 // (`concrete_to_canonical_lltype`). A Call dest whose
@@ -852,6 +853,7 @@ impl CodeWriter {
                 crate::codewriter::type_state::authoritative_result_types(
                     &rewritten.graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 )
             },
         );
@@ -1042,7 +1044,24 @@ impl CodeWriter {
         // is `s_ImpossibleValue` / `impossible_repr`, not FUNC.RESULT.
         {
             let arg_classes = match callcontrol.declared_non_void_arg_classes(path) {
-                Some(classes) => classes,
+                Some(declared) => {
+                    let cfg = cfg_non_void_arg_classes(rewritten_graph);
+                    let declared_bank: String =
+                        declared.chars().map(crate::call::kind_bank_char).collect();
+                    let cfg_bank: String = cfg.chars().map(crate::call::kind_bank_char).collect();
+                    if declared_bank.len() != cfg_bank.len() {
+                        eprintln!(
+                            "KINDSPLIT-ARITY graph {} declared FUNC.ARGS={declared:?} but CFG inputarg kinds are {cfg:?}",
+                            rewritten_graph.name
+                        );
+                    } else if declared_bank != cfg_bank {
+                        eprintln!(
+                            "KINDSPLIT graph {} declared FUNC.ARGS={declared:?} but CFG inputarg kinds are {cfg:?}",
+                            rewritten_graph.name
+                        );
+                    }
+                    declared
+                }
                 None => cfg_non_void_arg_classes(rewritten_graph),
             };
             let cfg_kind = graph_result_kind(rewritten_graph);
@@ -1179,6 +1198,7 @@ impl CodeWriter {
                 crate::codewriter::type_state::authoritative_result_types(
                     &rewritten.graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 )
             },
         );

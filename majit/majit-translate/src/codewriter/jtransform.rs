@@ -4233,19 +4233,32 @@ impl<'a> Transformer<'a> {
     }
 
     /// Front `Ref(Some(flavor))` is still a raw `Ptr` at `history.getkind`
-    /// (`rclass.py getgcflavor`). Residual/regular rewrite must not restamp
-    /// that dest as GcRef: a later elidable (`npure_cellvars`) then sees
-    /// actual Ref against FUNC.ARGS Int.
+    /// (`rclass.py getgcflavor`) when [`named_ref_is_raw_int`] says so.
+    /// A by-value `Vec` / `String` field makes that owner a GC object, so
+    /// residual/regular rewrite must not restamp the dest as Signed.
     fn flavor_raw_ref_is_int_banked(&self, ty: &ValueType) -> bool {
-        match ty {
-            ValueType::Ref(Some(name)) => self.callcontrol.as_deref().is_some_and(|cc| {
-                crate::front::llbc_hints::alloc_flavor_raw_contains(
+        self.callcontrol.as_deref().is_some_and(|cc| {
+            crate::annotator::bookkeeper::named_ref_is_raw_int(
+                cc.raw_adt_layouts(),
+                &cc.raw_alloc_flavor_structs,
+                None,
+                ty,
+            )
+        })
+    }
+
+    /// Named Ref dest whose [`named_ref_is_raw_int`] is false: a GC
+    /// object, so `rewrite_op_getfield` must not restamp it Signed.
+    fn named_ref_dest_is_gc(&self, ty: &ValueType) -> bool {
+        crate::annotator::bookkeeper::named_ref_root(None, ty).is_some()
+            && self.callcontrol.as_deref().is_some_and(|cc| {
+                !crate::annotator::bookkeeper::named_ref_is_raw_int(
+                    cc.raw_adt_layouts(),
                     &cc.raw_alloc_flavor_structs,
-                    name,
+                    None,
+                    ty,
                 )
-            }),
-            _ => false,
-        }
+            })
     }
 
     /// A GC-owner field whose MIR type is a GC pointer stays in the ref
@@ -4288,7 +4301,12 @@ impl<'a> Transformer<'a> {
         owner: &str,
     ) -> bool {
         let harvest = self.callcontrol.as_deref().is_some_and(|cc| {
-            crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+            crate::annotator::bookkeeper::named_ref_is_raw_int(
+                cc.raw_adt_layouts(),
+                &cc.raw_alloc_flavor_structs,
+                Some(owner),
+                &crate::model::ValueType::Ref(None),
+            )
         });
         if let Some(var) = result {
             if let Some(ct) = var.concretetype()
@@ -9429,7 +9447,9 @@ impl<'a> Transformer<'a> {
         // recorded gckind. When that base is already Int, stamp the loaded
         // word into the int bank so assemble emits `getfield_raw_i`.
         // Immutable fields already returned `_pure` above
-        // (`MapNodeTerminatorView.w_cls`).
+        // (`MapNodeTerminatorView.w_cls`). A named dest that
+        // [`named_ref_is_raw_int`] classifies as GC stays ref: that word
+        // is a GC pointer (`rstr.STR` holder), not a raw address.
         //
         // A GC owner with a Signed base is not that raw-struct arm:
         // `promote_gc_field_bases` rehomes the base (`cast_int_to_ptr` /
@@ -9443,6 +9463,7 @@ impl<'a> Transformer<'a> {
                 .result
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
+            && !self.named_ref_dest_is_gc(ty)
         {
             if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref()) {
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
@@ -10414,25 +10435,41 @@ impl<'a> Transformer<'a> {
                 // (`rclass.py getgcflavor`) has `history.getkind` int.
                 // A GC source (`*const ()`) is still ref; that crossing
                 // is `cast_ptr_to_int` (`lltype.py`), not `same_as`.
+                // A GC dest (`named_ref_is_raw_int` false) from an int
+                // source is `cast_int_to_ptr`.
                 let src = resolve_alias(&args[0], &self.aliases);
                 if is_identity_cast_path(segments)
                     && segments.last().map(String::as_str)
                         == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                    && let ValueType::Ref(Some(name)) = result_ty
-                    && self.callcontrol.as_deref().is_some_and(|cc| {
-                        crate::front::llbc_hints::alloc_flavor_raw_contains(
-                            &cc.raw_alloc_flavor_structs,
-                            name,
-                        )
-                    })
-                    && self.get_value_kind_var(&src) == 'r'
                 {
-                    self.stamp_value_kind(
-                        graph,
-                        op.result.clone(),
-                        crate::codewriter::type_state::ConcreteType::Signed,
-                    );
-                    return rewrite_as_unary_llop(op, &src, "cast_ptr_to_int", ValueType::Int);
+                    if self.flavor_raw_ref_is_int_banked(result_ty) {
+                        if self.get_value_kind_var(&src) == 'r' {
+                            self.stamp_value_kind(
+                                graph,
+                                op.result.clone(),
+                                crate::codewriter::type_state::ConcreteType::Signed,
+                            );
+                            return rewrite_as_unary_llop(
+                                op,
+                                &src,
+                                "cast_ptr_to_int",
+                                ValueType::Int,
+                            );
+                        }
+                    } else if self.get_value_kind_var(&src) == 'i' {
+                        self.stamp_value_kind(
+                            graph,
+                            Some(src.clone()),
+                            crate::codewriter::type_state::ConcreteType::Signed,
+                        );
+                        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+                        return rewrite_as_unary_llop(
+                            op,
+                            &src,
+                            "cast_int_to_ptr",
+                            result_ty.clone(),
+                        );
+                    }
                 }
                 return RewriteResult::Identity(src);
             }
@@ -14119,9 +14156,13 @@ impl<'a> Transformer<'a> {
             )))
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
-        // Split args by kind (RPython make_three_lists)
+        // `make_three_lists(op.args[1:])`: `args` is FUNC.ARGS (the funcptr
+        // is the jitcode initialarg, not a three-list slot).
         let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
+        if let Some(cc) = self.callcontrol.as_deref() {
+            cc.assert_call_arg_kinds_match_declared(graph_name, target, &arg_classes);
+        }
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_call_result(graph, op.result.clone(), result_ty);
 
@@ -14566,12 +14607,16 @@ impl<'a> Transformer<'a> {
             "conditional_call target must not force virtualizable: \
              graph={graph_name} callee={func_target} op={op:?}"
         );
-        // jtransform.py: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f, _) = self.rewrite_call_three_lists(
+        // jtransform.py `_rewrite_op_cond_call`: rewrite_call(...,
+        // op.args[:2], args=op.args[2:]). `func_args` is FUNC.ARGS.
+        let (args_i, args_r, args_f, arg_classes) = self.rewrite_call_three_lists(
             func_args,
             graph_name,
             "call argument (conditional_call)",
         );
+        if let Some(cc) = self.callcontrol.as_deref() {
+            cc.assert_call_arg_kinds_match_declared(graph_name, &func_target, &arg_classes);
+        }
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
@@ -15014,12 +15059,24 @@ impl<'a> Transformer<'a> {
         );
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
-        // jtransform.py: rewrite_call with force_ir=True
+        // jtransform.py rewrite_op_jit_record_known_result:
+        // rewrite_call(..., op.args[:2], args=op.args[2:]).
+        // `func_args` is op.args[1:] = [function, ...FUNC.ARGS]; the
+        // function is initialargs, not FUNC.ARGS.
         let (args_i, args_r, args_f, _) = self.rewrite_call_three_lists(
             func_args,
             graph_name,
             "call argument (record_known_result)",
         );
+        if let Some(cc) = self.callcontrol.as_deref() {
+            let func_arg_vars = func_args.get(1..).unwrap_or(&[]);
+            let (_, _, _, func_arg_classes) = self.rewrite_call_three_lists(
+                func_arg_vars,
+                graph_name,
+                "call argument (record_known_result FUNC.ARGS)",
+            );
+            cc.assert_call_arg_kinds_match_declared(graph_name, target, &func_arg_classes);
+        }
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in record_known_result"
@@ -15192,9 +15249,15 @@ impl<'a> Transformer<'a> {
             detail: note_detail,
         });
         self.calls_classified += 1;
-        // RPython jtransform.py: rewrite_call(op, 'residual_call', ...)
-        let (args_i, args_r, args_f, _) =
+        // RPython jtransform.py handle_residual_call:
+        // rewrite_call(..., [op.args[0]]+extraargs) with default
+        // `args=op.args[1:]`. `args` is FUNC.ARGS; the funcptr is
+        // `direct_funcptr_value`, not a three-list slot.
+        let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
+        if let Some(cc) = self.callcontrol.as_deref() {
+            cc.assert_call_arg_kinds_match_declared(graph_name, target, &arg_classes);
+        }
         // RPython reads `op.result.concretetype` directly because rtyper
         // has typed every Variable. Pyre's front-end can leave a callee's
         // declared return as `ValueType::Unknown` (re-export shadowing,
@@ -15284,8 +15347,16 @@ impl<'a> Transformer<'a> {
             .map(|cc| cc.non_void_actual_args_for_graphs(graphs, args))
             .unwrap_or_else(|| args.to_vec());
         let args = filtered_args.as_slice();
-        let (args_i, args_r, args_f, _) =
+        // jtransform.py rewrite_call default `args=op.args[1:]`: `args`
+        // is FUNC.ARGS. The funcptr is `funcptr_value`, not a three-list
+        // slot.
+        let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
+        if let (Some(cc), Some(graphs)) = (self.callcontrol.as_deref(), graphs)
+            && let Some(path) = graphs.first()
+        {
+            cc.assert_call_arg_kinds_match_path(graph_name, path, &arg_classes);
+        }
         // `call.py getcalldescr`: RESULT is FUNC.RESULT of the called
         // function, for `indirect_call` as for `direct_call`. A vtable
         // method returning `()` has Void RESULT; `front::mir` still types
@@ -19450,6 +19521,7 @@ mod tests {
                 size: 24,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "ob_header".into(),
@@ -19479,6 +19551,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "ob_type".into(),
@@ -19574,6 +19647,82 @@ mod tests {
         );
     }
 
+    /// A field whose type is `#[repr(transparent)]` gets the inner
+    /// field's flag from `field_metadata`. Taking its address is a load,
+    /// the same path a pointer-typed field (`PyObjectRef`) takes, not
+    /// `getsubstruct`.
+    #[test]
+    fn transparent_field_borrow_is_not_interior_address() {
+        use crate::call::{CallControl, StructLayout};
+        use crate::model::FieldDescriptor;
+        use std::collections::{HashMap, HashSet};
+
+        let owner = "jtransform_transparent_field::Entry";
+        let wrapper = "jtransform_transparent_field::StrKey";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let wrapper_id = majit_ir::descr::StructId::from_canonical(wrapper);
+        let _guard = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            (owner.to_string(), Some(owner_id)),
+            (wrapper.to_string(), Some(wrapper_id)),
+        ]));
+        let word = crate::layout::target_word_size();
+        let mut known = HashSet::new();
+        known.insert(wrapper.to_string());
+        known.insert(owner.to_string());
+        let mut transparent = HashSet::new();
+        transparent.insert(wrapper.to_string());
+        let mut fields_by_struct = HashMap::new();
+        fields_by_struct.insert(
+            wrapper.to_string(),
+            vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())],
+        );
+        fields_by_struct.insert(
+            owner.to_string(),
+            vec![("key".to_string(), wrapper.to_string())],
+        );
+        let sizes = HashMap::from([(wrapper.to_string(), word), (owner.to_string(), word)]);
+        let aligns = sizes.clone();
+        let owner_layout = StructLayout::from_type_strings(
+            &[("key".into(), wrapper.to_string())],
+            &known,
+            &sizes,
+            &aligns,
+            &HashMap::new(),
+            &HashSet::new(),
+            &transparent,
+            Some(&fields_by_struct),
+        );
+        assert_eq!(owner_layout.fields.len(), 1);
+        assert_ne!(
+            owner_layout.fields[0].flag,
+            majit_ir::descr::ArrayFlag::Struct
+        );
+        assert_eq!(
+            owner_layout.fields[0].flag,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
+
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(owner_id, owner_layout);
+
+        let key = FieldDescriptor::new("key", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &key),
+            None,
+            "a repr(transparent) field is a load, not an interior address"
+        );
+        assert_eq!(
+            inline_struct_field_offset(&key, Some(&cc)),
+            None,
+            "inline_struct_field_offset follows the field-row flag"
+        );
+        assert_eq!(
+            inline_aggregate_offset(&key, Some(&cc)),
+            None,
+            "a one-word transparent field is not a wide inline aggregate"
+        );
+    }
+
     /// `(*raw).tags.buf` reads `tags` by place, without `taken_by_address`.
     /// On a raw holder that is still `rewrite_op_getsubstruct` (`int_add`).
     /// A GC holder keeps the value read.
@@ -19591,6 +19740,7 @@ mod tests {
                     size: 32,
                     align: 8,
                     gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -19737,6 +19887,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
@@ -19766,6 +19917,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".into(),
                     offset: field_offset,
@@ -19914,6 +20066,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "count".into(),
                     offset: 0,
@@ -19956,6 +20109,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "roots".into(),
@@ -20042,6 +20196,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "roots".into(),
                     offset: 0,
@@ -20121,6 +20276,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "cell".into(),
                     offset: 0,
@@ -20386,6 +20542,7 @@ mod tests {
                     size: 32,
                     align: 8,
                     gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -20578,6 +20735,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
@@ -20771,6 +20929,7 @@ mod tests {
                 size: 24,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "cell".to_string(),
@@ -27288,6 +27447,7 @@ mod tests {
                 size: 12,
                 align: 4,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -35836,6 +35996,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: vec![StructFieldLayout {
                 name: "f".into(),
                 offset: 0,
@@ -36629,6 +36790,49 @@ mod tests {
         }
     }
 
+    /// Flavor-raw dest stays int (`rmodel.py getgcflavor` of
+    /// `_alloc_flavor_`). A by-value `Vec` field does not flip it to GC,
+    /// so the same-bank narrow is `rewrite_op_cast_pointer` (`same_as`).
+    #[test]
+    fn cast_instance_flavor_raw_by_value_vec_aliases() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        let holder = "names::Holder";
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            holder.to_string(),
+            vec![(
+                "argnames".into(),
+                "alloc::vec::Vec<alloc::string::String>".into(),
+            )],
+        );
+        cc.set_struct_fields(fields);
+        cc.raw_alloc_flavor_structs.insert(holder.to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("narrow_holder");
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]);
+        let dest_ty = ValueType::Ref(Some(holder.to_string()));
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: crate::model::cast_instance_call(holder, src.clone()),
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&src),
+            &dest_ty,
+            "narrow_holder",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, src),
+            RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Identity, got Constant"),
+        }
+    }
+
     /// Looked-inside `PyFrame::code` returns front `Ref(Some(CodeObject))`.
     /// Residual/regular rewrite must stamp that dest Signed (`history.getkind`
     /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.
@@ -36739,7 +36943,8 @@ mod tests {
             .with_callcontrol(&mut cc)
             .transform(&graph)
             .graph;
-        let post_result = authoritative_result_types(&graph, &cc.raw_alloc_flavor_structs);
+        let post_result =
+            authoritative_result_types(&graph, &cc.raw_alloc_flavor_structs, cc.raw_adt_layouts());
         for (var, kind) in &post_result {
             if !matches!(kind, ConcreteType::Unknown) {
                 FunctionGraph::set_concretetype_of_inline(var, *kind);

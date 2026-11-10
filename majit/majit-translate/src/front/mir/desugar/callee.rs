@@ -3290,6 +3290,44 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
     segments
 }
 
+/// True when a Method-hint receiver is a `FunctionRepr` Void: a fn-item
+/// or a capture-less closure env. `getattr` of the method name has no
+/// classdict (`rpbc.py`). Routing `call_once` as `CallTarget::Method`
+/// then blocks at annotate.
+///
+/// A fieldless marker struct (`UnpackIterableJitDriver`) is layout-ZST
+/// and [`tyref_is_void_zst`], but it still has a classdef; `jit_merge_point`
+/// stays a Method on that receiver.
+pub(in crate::front::mir) fn method_hint_receiver_is_void_zst(
+    ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    ty.is_some_and(|ty| {
+        tyref_is_fn_item(ty, llbc)
+            || (tyref_is_closure_env(ty, llbc) && !tyref_closure_env_has_captures(ty, llbc))
+    })
+}
+
+/// Registry key a spec body uses for a trait-impl method with no ADT
+/// owner. Charon's `name_path` is `<Impl>::leaf` for every width
+/// (`impl CastFrom<i64> for u16`, `impl PartialOrd<char> for char`);
+/// `registered_path_for_fun_decl` already keys on [`spec_segments`].
+/// `None` when the FunDecl is not that shape, so a non-spec Regular
+/// call keeps the `<Impl>` spelling std matchers read.
+pub(in crate::front::mir) fn spec_body_trait_impl_segments(
+    llbc: &Llbc,
+    fd: &FunDecl,
+) -> Option<Vec<String>> {
+    if impl_method_owner_for_fundecl(llbc, fd).is_some() {
+        return None;
+    }
+    let impl_id = trait_impl_id_for_fundecl(fd)?;
+    crate::front::clause_spec::render_trait_impl(llbc, impl_id)?;
+    let name = fd.item_meta.name_path();
+    let leaf = name.rsplit("::").next().unwrap_or("fn");
+    Some(spec_segments(llbc, fd, leaf))
+}
+
 /// The `CallPath` `lib.rs` registers for this FunDecl: the same
 /// segments [`spec_segments`] emits, so a Fun call and a Trait call
 /// that resolve to this declaration share one registry key.

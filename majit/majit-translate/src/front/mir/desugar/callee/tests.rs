@@ -331,6 +331,184 @@ fn fundecl_fn_item_segments_uses_the_registered_instance_leaf() {
     assert_ne!(leaf.as_str(), "f");
 }
 
+/// A spec body names a primitive-Self trait impl by the registry key
+/// (`spec_segments`), not Charon's shared `<Impl>::leaf` name_path.
+#[test]
+fn spec_body_trait_impl_segments_uses_the_registered_identity() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let le_fd = |def_id: u64, impl_id: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("core"),
+                ident("cmp"),
+                ident("impls"),
+                serde_json::json!({"Impl": {"Trait": impl_id}}),
+                ident("le"),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Scalar": "Bool"}],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 2, "locals": []},
+                "body": []
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [null, le_fd(1, 0), le_fd(2, 1)],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![ident("core"), ident("cmp"), ident("PartialOrd")]),
+                "methods": [{"skip_binder": {"name": "le"}}]
+            }],
+            "trait_impls": [
+                {"impl_trait": {"id": 0, "generics": {"types": [char_ty.clone(), char_ty.clone()]}}, "methods": []},
+                {"impl_trait": {"id": 0, "generics": {"types": [i64_ty.clone(), i64_ty.clone()]}}, "methods": []}
+            ]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let char_le = llbc.fn_by_id(1).expect("char le");
+    let i64_le = llbc.fn_by_id(2).expect("i64 le");
+    let char_path = super::spec_segments(&llbc, char_le, "le");
+    let i64_path = super::spec_segments(&llbc, i64_le, "le");
+    let char_name: Vec<String> = char_le
+        .item_meta
+        .name_path()
+        .split("::")
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        char_le.item_meta.name_path(),
+        i64_le.item_meta.name_path(),
+        "Charon collapses both impls onto <Impl>::le"
+    );
+    assert_ne!(char_path, char_name);
+    assert_ne!(char_path, i64_path);
+    assert_eq!(
+        super::spec_body_trait_impl_segments(&llbc, char_le).as_ref(),
+        Some(&char_path)
+    );
+    assert_eq!(
+        super::spec_body_trait_impl_segments(&llbc, i64_le).as_ref(),
+        Some(&i64_path)
+    );
+}
+
+/// A Method hint on a `FunctionRepr` Void getattr's the leaf off a
+/// type with no classdict: a capture-less closure env. Unit and a
+/// fieldless marker struct (`JitDriver`) keep the Method hint.
+#[test]
+fn method_hint_receiver_is_void_zst_for_unit_and_captureless_env() {
+    use majit_charon_reader::ullbc::TyRef;
+
+    let empty = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let empty_llbc = Llbc::from_slice(empty.to_string().as_bytes()).expect("empty fixture");
+    let unit: TyRef = serde_json::from_value(unit_ty()).expect("unit TyRef");
+    let i64_ty: TyRef = serde_json::from_value(serde_json::json!({
+        "Scalar": {"Integer": {"Signed": "I64"}}
+    }))
+    .expect("i64 TyRef");
+    assert!(!super::method_hint_receiver_is_void_zst(
+        Some(&unit),
+        &empty_llbc
+    ));
+    assert!(!super::method_hint_receiver_is_void_zst(
+        Some(&i64_ty),
+        &empty_llbc
+    ));
+    assert!(!super::method_hint_receiver_is_void_zst(None, &empty_llbc));
+
+    let type_file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": item_meta_json(&["fixture", "map", "closure"], "", true),
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 0,
+                            "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"transparent": false}
+                        }
+                    }],
+                    "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": item_meta_json(&["fixture", "UnpackIterableJitDriver"], "", true),
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 0,
+                            "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }
+            ],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let type_llbc = Llbc::from_slice(type_file.to_string().as_bytes()).expect("type fixture");
+    let env = crate::front::mir::tests::adt_ty(0);
+    let driver = crate::front::mir::tests::adt_ty(1);
+    assert!(super::method_hint_receiver_is_void_zst(
+        Some(&env),
+        &type_llbc
+    ));
+    assert!(!super::method_hint_receiver_is_void_zst(
+        Some(&driver),
+        &type_llbc
+    ));
+}
+
 /// A monomorphized vtable keeps its method slots as `*const ()`, so the
 /// `dyn` call casts the slot into a temporary and calls that; the slot
 /// read is recovered from the temporary's single producer.

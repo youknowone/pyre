@@ -1928,12 +1928,20 @@ impl<'a> Lowering<'a> {
         // `_1 = const C; _0 = &_1; return` — rustc's promoted form of a
         // `&str` / integer / fn-item literal. The by-value model is the
         // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
-        // `fn_const`).
+        // Void `FnDef` / `__fn_const` `FnPtr`).
         if let Some(value) = promoted_const_copied_const(&body)
             && let Ok(decoded) = decode_constant(self.llbc, &value)
         {
             let bb_id = self.block_id[mir_bb];
-            let res = self.emit_decoded_const(bb_id, decoded);
+            let res = if let DecodedConst::FnPath(segments) = decoded {
+                let dest_ty = self
+                    .llbc
+                    .const_expr_ty(&value)
+                    .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok());
+                self.emit_fn_path_const(bb_id, segments, dest_ty.as_ref())
+            } else {
+                self.emit_decoded_const(bb_id, decoded)
+            };
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
@@ -3255,9 +3263,13 @@ impl<'a> Lowering<'a> {
             .then(|| crate::front::clause_spec::concrete_type_args(generics, self.llbc))
             .flatten()
             .map(|(types, consts)| {
+                let trait_refs =
+                    crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                        .unwrap_or_default();
                 crate::front::clause_spec::substituted_signature(
                     &fd.signature,
                     self.llbc,
+                    &trait_refs,
                     &types,
                     &consts,
                 )

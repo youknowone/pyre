@@ -30331,6 +30331,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            raw_struct: false,
         }],
     })
 }
@@ -30379,6 +30380,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            raw_struct: false,
         }],
     })
 }
@@ -30634,6 +30636,83 @@ fn declared_gc_layout_gckind_follows_gctype_or_template() {
     assert!(
         super::struct_id_is_declared_gc(&gc, inst, "GG<i64>"),
         "GG<i64> is declared gc via the template seed"
+    );
+}
+
+/// Builtin enum variant payloads are not TypeDecls, so harvest leaves
+/// them off `gc_struct_ids`. `derived_layout_gckind` still applies
+/// `lltype.py` `GcStruct` / `_first_struct` to field 0.
+#[test]
+fn builtin_enum_variant_payload_gckind_follows_field0() {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    use majit_ir::descr::ArrayFlag;
+    let owner = "option::Option<baseobjspace::SimpleBufferBytes>::Some";
+    let sid = majit_ir::descr::StructId::from_canonical(owner);
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+    assert_eq!(
+        super::derived_layout_gckind(
+            &gc,
+            sid,
+            owner,
+            true,
+            Some((
+                "__pos_0",
+                "baseobjspace::SimpleBufferBytes",
+                ArrayFlag::Struct
+            )),
+            &raw,
+        ),
+        GcKind::Gc
+    );
+    let mut raw_scope = std::collections::HashSet::new();
+    raw_scope.insert("rawref::Scope".to_string());
+    assert_eq!(
+        super::derived_layout_gckind(
+            &gc,
+            sid,
+            owner,
+            true,
+            Some(("__pos_0", "rawref::Scope", ArrayFlag::Struct)),
+            &raw_scope,
+        ),
+        GcKind::Raw
+    );
+    assert_eq!(
+        super::derived_layout_gckind(
+            &gc,
+            sid,
+            owner,
+            true,
+            Some(("__pos_0", "i32", ArrayFlag::Signed)),
+            &raw,
+        ),
+        GcKind::Raw
+    );
+    assert_eq!(
+        super::derived_layout_gckind(
+            &gc,
+            sid,
+            owner,
+            true,
+            Some(("__discriminant", "i64", ArrayFlag::Signed)),
+            &raw,
+        ),
+        GcKind::Raw
+    );
+    let sbb = "baseobjspace::SimpleBufferBytes";
+    let sbb_sid = majit_ir::descr::StructId::from_canonical(sbb);
+    assert_eq!(
+        super::derived_layout_gckind(
+            &gc,
+            sbb_sid,
+            sbb,
+            false,
+            Some(("_roots", "rawref::Scope", ArrayFlag::Struct)),
+            &raw,
+        ),
+        GcKind::Raw,
+        "a non-payload struct is not classified by this field-0 arm"
     );
 }
 

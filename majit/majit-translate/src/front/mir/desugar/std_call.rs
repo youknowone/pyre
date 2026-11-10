@@ -7006,12 +7006,22 @@ impl<'a> Lowering<'a> {
     /// iff T implements `GcType` or is a first-field ancestor of one
     /// (`PyObject`). Same predicate as
     /// [`Self::is_raw_ptr_is_null_keeps_is_none`].
+    ///
+    /// `registered_gc_ptr_class_root_with` gates the RawPtr arm on
+    /// `gc_struct_ids` so intern of `*mut Entry` stays classdef-less.
+    /// That gate is intern identity, not gckind: a fixture `*mut PyObject`
+    /// has no `GcType` seed, so gckind still follows the classed-instance
+    /// spelling (`is_raw_ptr_to_classed_instance_spelling` /
+    /// `rnone.py` `rtype_is_None`). A flavor-raw pointee
+    /// (`rmodel.py getgcflavor`) is int-kind (`history.py getkind` of
+    /// `Ptr(TO raw)`), including `*const CodeObject`.
     pub(in crate::front::mir) fn ptr_pointee_is_gc(&self, ptr_ty: Option<&TyRef>) -> bool {
         let Some(ty) = ptr_ty else {
             return false;
         };
         if tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
             .is_some_and(|root| is_str_family_class_root(&root))
+            || tyref_raw_ptr_to_str_family_spelling(ty, self.llbc).is_some()
         {
             return true;
         }
@@ -7019,6 +7029,19 @@ impl<'a> Lowering<'a> {
             == Some(false)
         {
             return false;
+        }
+        if flavor_raw_pointer_class_root(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
+            return false;
+        }
+        if tyref_raw_ptr_to_classed_instance_spelling(ty, self.llbc).is_some() {
+            return true;
         }
         registered_gc_ptr_class_root_with(
             ty,

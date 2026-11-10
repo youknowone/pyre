@@ -155,6 +155,19 @@ pub fn layout_sidecar_filename(crate_stem: &str, target: &str) -> String {
     format!("{crate_stem}.{target}.layouts.ullbc")
 }
 
+/// Whether `path` is a cross-target layout sidecar (`*.layouts.ullbc`).
+///
+/// The production frontend loads these beside the host artefacts so
+/// Charon-resolved field offsets apply, but they are not a second
+/// program: intern and `DuplicateLeafFacts` stay on the host
+/// `name_path` identities.
+pub fn is_layout_sidecar_path(path: impl AsRef<std::path::Path>) -> bool {
+    path.as_ref()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".layouts.ullbc"))
+}
+
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
 /// Supplies struct layouts for the codewriter pipeline. Each struct is
@@ -200,6 +213,14 @@ pub struct HeuristicLayoutProvider {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: HashSet<String>,
+    /// Spellings whose `ExactLayout.repr_transparent` is set. A field
+    /// typed as one of these peels to the inner field's lltype in
+    /// `field_metadata`.
+    transparent_structs: HashSet<String>,
+    /// Harvested field rows for [`crate::annotator::bookkeeper::named_ref_is_raw_int`].
+    /// Built once from `fields_by_struct`; the layout walk must not clone
+    /// that map per struct.
+    field_registry: crate::front::StructFieldRegistry,
 }
 
 impl HeuristicLayoutProvider {
@@ -212,16 +233,25 @@ impl HeuristicLayoutProvider {
     /// `immutable_fields_by_struct`: parsed `#[jit_immutable_fields(...)]`
     /// per struct (RPython `_immutable_fields_`). Used to set
     /// `StructFieldLayout.is_immutable` and `StructFieldLayout.rank`.
+    ///
+    /// `transparent_structs`: spellings whose `ExactLayout.repr_transparent`
+    /// is set. `field_metadata` peels a field typed as one of these to
+    /// the inner field's lltype.
     pub fn from_struct_fields(
         fields_by_struct: &HashMap<String, Vec<(String, String)>>,
         known_struct_names: &HashSet<String>,
         immutable_fields_by_struct: &HashMap<String, Vec<(String, ImmutableRank)>>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
     ) -> Self {
         let immutable: HashMap<String, HashMap<String, ImmutableRank>> = immutable_fields_by_struct
             .iter()
             .map(|(k, v)| (k.clone(), v.iter().map(|(n, r)| (n.clone(), *r)).collect()))
             .collect();
+        let field_registry = crate::front::StructFieldRegistry {
+            fields: fields_by_struct.clone().into(),
+            ..Default::default()
+        };
         let mut known_sizes: HashMap<String, usize> = HashMap::new();
         let mut known_aligns: HashMap<String, usize> = fields_by_struct
             .keys()
@@ -231,13 +261,16 @@ impl HeuristicLayoutProvider {
             let mut changed = false;
             for (struct_name, fields) in fields_by_struct {
                 let imm_ranks = immutable.get(struct_name).cloned().unwrap_or_default();
-                let layout = StructLayout::from_type_strings(
+                let layout = layout_from_harvested_rows(
                     fields,
                     &HashSet::new(),
                     &known_sizes,
                     &known_aligns,
                     &imm_ranks,
                     raw_alloc_flavor_structs,
+                    transparent_structs,
+                    fields_by_struct,
+                    &field_registry,
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size)
                     || known_aligns.get(struct_name) != Some(&layout.align)
@@ -258,8 +291,43 @@ impl HeuristicLayoutProvider {
             fields_by_struct: fields_by_struct.clone(),
             immutable_fields_by_struct: immutable,
             raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
+            transparent_structs: transparent_structs.clone(),
+            field_registry,
         }
     }
+}
+
+/// [`StructLayout::from_type_strings_with`] against one stored field-row
+/// registry. The layout table is empty so this walk does not borrow the
+/// live `struct_layouts` map; the by-value `Vec` / `String` gate still
+/// runs (`bind_raw_adt`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors StructLayout::from_type_strings_with"
+)]
+fn layout_from_harvested_rows(
+    fields: &[(String, String)],
+    known_structs: &HashSet<String>,
+    known_struct_sizes: &HashMap<String, usize>,
+    known_struct_aligns: &HashMap<String, usize>,
+    immutable_field_ranks: &HashMap<String, ImmutableRank>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    transparent_structs: &HashSet<String>,
+    fields_by_struct: &HashMap<String, Vec<(String, String)>>,
+    field_registry: &crate::front::StructFieldRegistry,
+) -> StructLayout {
+    let empty_layouts = crate::call::StructLayoutTable::default();
+    StructLayout::from_type_strings_with(
+        fields,
+        known_structs,
+        known_struct_sizes,
+        known_struct_aligns,
+        immutable_field_ranks,
+        raw_alloc_flavor_structs,
+        transparent_structs,
+        Some(fields_by_struct),
+        Some((field_registry, &empty_layouts)),
+    )
 }
 
 impl LayoutProvider for HeuristicLayoutProvider {
@@ -270,13 +338,16 @@ impl LayoutProvider for HeuristicLayoutProvider {
             .get(struct_name)
             .cloned()
             .unwrap_or_default();
-        Some(StructLayout::from_type_strings(
+        Some(layout_from_harvested_rows(
             fields,
             &self.known_struct_names,
             &self.known_struct_sizes,
             &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.transparent_structs,
+            &self.fields_by_struct,
+            &self.field_registry,
         ))
     }
 
@@ -293,7 +364,8 @@ impl LayoutProvider for HeuristicLayoutProvider {
             .get(struct_name)
             .cloned()
             .unwrap_or_default();
-        layout.apply_exact_layout(
+        let empty_layouts = crate::call::StructLayoutTable::default();
+        layout.apply_exact_layout_with(
             rows,
             exact_offsets,
             exact_size,
@@ -301,6 +373,9 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_sizes,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.transparent_structs,
+            Some(&self.fields_by_struct),
+            Some((&self.field_registry, &empty_layouts)),
         );
         Some(layout)
     }
@@ -325,6 +400,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
         );
         let layout = provider.get_struct_layout("MyStruct").unwrap();
         assert_eq!(layout.size, 16);
@@ -338,12 +414,41 @@ mod tests {
     }
 
     #[test]
+    fn flavor_raw_by_value_vec_holder_pointer_field_is_int() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "names::Holder".to_string(),
+            vec![(
+                "argnames".to_string(),
+                "alloc::vec::Vec<alloc::borrow::Cow<str>>".to_string(),
+            )],
+        );
+        fields.insert(
+            "code::Builtin".to_string(),
+            vec![("sig".to_string(), "*const names::Holder".to_string())],
+        );
+        let mut raw = HashSet::new();
+        raw.insert("names::Holder".to_string());
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &raw,
+            &HashSet::new(),
+        );
+        let layout = provider.get_struct_layout("code::Builtin").unwrap();
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].flag, majit_ir::descr::ArrayFlag::Unsigned);
+    }
+
+    #[test]
     fn test_heuristic_provider_unknown_struct() {
         let fields = HashMap::new();
         let provider = HeuristicLayoutProvider::from_struct_fields(
             &fields,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert!(provider.get_struct_layout("NoSuchStruct").is_none());
@@ -370,6 +475,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &immutable,
+            &HashSet::new(),
             &HashSet::new(),
         );
         let layout = provider.get_struct_layout("Storage").unwrap();
@@ -399,6 +505,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &immutable,
+            &HashSet::new(),
             &HashSet::new(),
         );
         let layout = provider.get_struct_layout("Cell").unwrap();
@@ -442,6 +549,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
 
@@ -492,5 +600,14 @@ mod tests {
         assert_eq!(signed_size_for("x86", 4), 4);
         assert_eq!(signed_size_for("x86_64", 8), 8);
         assert_eq!(signed_size_for("aarch64", 8), 8);
+    }
+
+    #[test]
+    fn layout_sidecar_path_is_the_layouts_ullbc_filename() {
+        assert!(is_layout_sidecar_path(
+            "target/llbc/pyre-object.wasm32-unknown-unknown.layouts.ullbc"
+        ));
+        assert!(!is_layout_sidecar_path("target/llbc/pyre-object.ullbc"));
+        assert!(!is_layout_sidecar_path("target/llbc/layouts.ullbc"));
     }
 }

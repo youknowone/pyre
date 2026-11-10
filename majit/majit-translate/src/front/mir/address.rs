@@ -28,6 +28,15 @@ pub(in crate::front::mir) struct RawScalarBorrowSpill {
     pub(in crate::front::mir) item_ty: ValueType,
     pub(in crate::front::mir) itemsize: usize,
     pub(in crate::front::mir) is_item_signed: bool,
+    /// `Array(Char)` of `itemsize` bytes when the pointee is a by-value
+    /// storage-raw struct wider than [`RAW_SCALAR_SPILL_BYTES`]. The
+    /// `Tuple<i64>` cell is the residual copy-word spill.
+    pub(in crate::front::mir) char_cell: bool,
+    /// Residual `&T` of a by-value storage-raw ADT. The per-call
+    /// `Tuple<i64>` / Char cell is the same spill `&Scalar` uses; a
+    /// function-scope extra slot at entry would be live across
+    /// `jit_merge_point`.
+    pub(in crate::front::mir) storage_raw: bool,
 }
 
 pub(in crate::front::mir) struct RawScalarReload {
@@ -54,6 +63,7 @@ pub(in crate::front::mir) struct RawScalarAddressGroup {
     pub(in crate::front::mir) item_ty: ValueType,
     pub(in crate::front::mir) itemsize: usize,
     pub(in crate::front::mir) is_item_signed: bool,
+    pub(in crate::front::mir) char_cell: bool,
 }
 
 /// Where an address-sized integer's bits came from.
@@ -172,9 +182,9 @@ pub(in crate::front::mir) struct CellScalarPlan {
     pub(in crate::front::mir) has_storage_live: bit_set::BitSet,
 }
 
-/// Residual `&T` of a parameter or field: one Char-varsize cell for the
-/// enclosing function (`ScopedAlloc` of caller storage). Slot is filled
-/// when the extra local is numbered.
+/// Residual `&T` of a parameter or field: one Char-varsize cell for
+/// the enclosing function (`ScopedAlloc` of caller storage). Slot is
+/// filled when the extra local is numbered.
 pub(in crate::front::mir) struct FunctionScopeCellPlan {
     pub(in crate::front::mir) place: Place,
     pub(in crate::front::mir) itemsize: usize,
@@ -224,9 +234,17 @@ fn call_substituted_inputs(
     llbc: &Llbc,
 ) -> Option<Vec<TyRef>> {
     let (types, consts) = crate::front::clause_spec::concrete_type_args(generics, llbc)?;
+    let trait_refs =
+        crate::front::clause_spec::concrete_trait_refs_or_empty(generics, llbc).unwrap_or_default();
     Some(
-        crate::front::clause_spec::substituted_signature(&fd.signature, llbc, &types, &consts)
-            .inputs,
+        crate::front::clause_spec::substituted_signature(
+            &fd.signature,
+            llbc,
+            &trait_refs,
+            &types,
+            &consts,
+        )
+        .inputs,
     )
 }
 
@@ -256,6 +274,71 @@ fn tyref_is_ref_of_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
     }
     tyref_peel_one_ref_node(ty, llbc)
         .is_some_and(|pointee| tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone()), llbc))
+}
+
+/// By-value storage-raw ADT (`storage_raw_by_value_class_root`). A pointer
+/// or borrow is not this (`one_word_pointer_pointee`).
+fn tyref_is_storage_raw_by_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    storage_raw_by_value_class_root(ty, llbc, tombstoned, gc_struct_ids).is_some()
+}
+
+/// `&T` / `&mut T` of a by-value storage-raw ADT. A raw pointer is the
+/// other path (`raw_scalar_address_value_type`).
+fn tyref_is_ref_of_storage_raw_by_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| {
+        tyref_is_storage_raw_by_value(
+            &TyRef::Other(pointee.clone()),
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+        )
+    })
+}
+
+/// Residual `&T` whose referent is a by-value storage-raw local. A
+/// payload that is already `&T` (`Option<&OwnedFd>`) is an address
+/// word and is not this. A raw-enum borrow is already an address
+/// (`ty_is_raw_address`).
+fn residual_storage_raw_struct_borrow(
+    declared: &TyRef,
+    referent: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    tyref_is_ref_of_storage_raw_by_value(declared, llbc, tombstoned, gc_struct_ids)
+        && !ty_is_raw_address(declared, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        && tyref_is_storage_raw_by_value(referent, llbc, tombstoned, gc_struct_ids)
+}
+
+/// Residual store of a by-value storage-raw ADT: the layout size, int bank.
+/// `rewrite_op_raw_store` stores the integer image of that word.
+pub(in crate::front::mir) fn storage_raw_by_value_store_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<(ValueType, usize, bool)> {
+    let _root = storage_raw_by_value_class_root(ty, llbc, tombstoned, gc_struct_ids)?;
+    let size = json_ty_byte_size(tyref_node(ty, llbc)?, llbc)? as usize;
+    if size == 0 {
+        return None;
+    }
+    Some((ValueType::Int, size, true))
 }
 
 fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
@@ -436,10 +519,10 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
     }
 }
 
-/// Residual `&T` of a parameter or field: one Char-varsize cell for the
-/// enclosing function, freed on every modeled exit (`scoped_alloc` of
-/// caller storage). A function-local primitive already in `cell_locals`
-/// keeps that local's storage scope.
+/// Residual `&T` of a parameter or field: one Char-varsize cell for
+/// the enclosing function, freed on every modeled exit (`scoped_alloc`
+/// of caller storage). A function-local primitive already in
+/// `cell_locals` keeps that local's storage scope.
 pub(in crate::front::mir) fn collect_function_scope_spill_cells(
     llbc: &Llbc,
     body: &Unstructured,
@@ -1515,9 +1598,12 @@ impl<'a> Lowering<'a> {
     /// callee is the word on both sides and is left alone. A residual
     /// callee's `&T` of a copy word is a pointer in the residual
     /// ABI (`ResidualSlot` for `&T`), so the aliased word is stored
-    /// in the same cell and the address is passed. A callee with an
-    /// `oopspec:jit.*` hint is skipped: jtransform rewrites that call
-    /// to a box query. A byte pointer stays `Ref`.
+    /// in the same cell and the address is passed. A residual `&T` of
+    /// a by-value storage-raw ADT is the same store: `history.py`
+    /// `getkind` of that `Ptr` is `'int'`, and `Rvalue::Ref` aliases
+    /// the aggregate's unnamed-Ref word rather than an address.
+    /// A callee with an `oopspec:jit.*` hint is skipped: jtransform
+    /// rewrites that call to a box query. A byte pointer stays `Ref`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -1541,16 +1627,34 @@ impl<'a> Lowering<'a> {
             residual_scalar_ref_callee(fd, self.dont_look_inside, &self.oopspec_fns);
         let mut spills = Vec::new();
         for (index, declared) in inputs.iter().enumerate() {
-            let residual_ref =
-                residual_ref_callee && declared_residual_scalar_ref(declared, self.llbc);
+            let residual_ref = residual_ref_callee
+                && (declared_residual_scalar_ref(declared, self.llbc)
+                    || tyref_is_ref_of_storage_raw_by_value(
+                        declared,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    ));
             if raw_scalar_address_value_type(declared, self.llbc).is_none() && !residual_ref {
                 continue;
             }
             let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, self.llbc);
-            let passed_value = tyref_is_residual_scalar_word(passed, self.llbc);
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, self.llbc)
+                || tyref_is_ref_of_storage_raw_by_value(
+                    passed,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                );
+            let passed_value = tyref_is_residual_scalar_word(passed, self.llbc)
+                || tyref_is_storage_raw_by_value(
+                    passed,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                );
             // Residual `&T` / `*const T`: the aliased word (a `&i64`
             // parameter banked as Int, a specialized `i64` local, or a
             // one-word Copy ADT) is stored in a cell and the address
@@ -1568,6 +1672,32 @@ impl<'a> Lowering<'a> {
                             arg_locals.get(index).copied().flatten(),
                         ))
                 {
+                    continue;
+                }
+            }
+            if tyref_is_ref_of_storage_raw_by_value(
+                declared,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ) {
+                let referent = if passed_value {
+                    Some(clone_tyref(passed))
+                } else {
+                    self.spill_source_place(arg_locals.get(index).copied().flatten())
+                        .map(|place| place.ty)
+                };
+                let Some(referent) = referent else {
+                    continue;
+                };
+                if !residual_storage_raw_struct_borrow(
+                    declared,
+                    &referent,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                ) {
                     continue;
                 }
             }
@@ -1595,10 +1725,26 @@ impl<'a> Lowering<'a> {
             let arg_pointee = TyRef::Other(arg_node.clone());
             let arg_descr = self
                 .raw_word_descr(&arg_pointee)
-                .or_else(|| residual_scalar_word_descr(&arg_pointee, self.llbc));
+                .or_else(|| residual_scalar_word_descr(&arg_pointee, self.llbc))
+                .or_else(|| {
+                    storage_raw_by_value_store_descr(
+                        &arg_pointee,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    )
+                });
             let Some((item_ty, itemsize, is_item_signed)) = self
                 .raw_word_descr(&param_pointee)
                 .or_else(|| residual_scalar_word_descr(&param_pointee, self.llbc))
+                .or_else(|| {
+                    storage_raw_by_value_store_descr(
+                        &param_pointee,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    )
+                })
                 .or_else(|| arg_descr.clone())
             else {
                 continue;
@@ -1611,12 +1757,23 @@ impl<'a> Lowering<'a> {
             // synthesizes that layout, and `jtransform.py`
             // `_rewrite_raw_malloc` residualizes `ll_raw_malloc_fixedsize`.
             // A wider pointee (128-bit) never reaches
-            // [`raw_scalar_address_value_type`].
-            if itemsize == 0
-                || itemsize > RAW_SCALAR_SPILL_BYTES
-                || arg_size != itemsize
-                || arg_ty != item_ty
-            {
+            // [`raw_scalar_address_value_type`]. A by-value storage-raw
+            // ADT wider than that word uses an `Array(Char)` cell.
+            let storage_raw = tyref_is_storage_raw_by_value(
+                &param_pointee,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ) || tyref_is_storage_raw_by_value(
+                &arg_pointee,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            );
+            if itemsize == 0 || arg_size != itemsize || arg_ty != item_ty {
+                continue;
+            }
+            if !storage_raw && itemsize > RAW_SCALAR_SPILL_BYTES {
                 continue;
             }
             let copy_out = if residual_ref {
@@ -1641,6 +1798,8 @@ impl<'a> Lowering<'a> {
                 item_ty,
                 itemsize,
                 is_item_signed,
+                char_cell: storage_raw && itemsize > RAW_SCALAR_SPILL_BYTES,
+                storage_raw,
             });
         }
         spills
@@ -1729,6 +1888,7 @@ impl<'a> Lowering<'a> {
                 }) {
                     group.indices.push(spill.index);
                     group.copy_out |= spill.copy_out;
+                    group.char_cell |= spill.char_cell;
                     continue;
                 }
                 groups.push(RawScalarAddressGroup {
@@ -1739,6 +1899,7 @@ impl<'a> Lowering<'a> {
                     item_ty: spill.item_ty.clone(),
                     itemsize: spill.itemsize,
                     is_item_signed: spill.is_item_signed,
+                    char_cell: spill.char_cell,
                 });
             }
             groups
@@ -1755,6 +1916,8 @@ impl<'a> Lowering<'a> {
                 item_ty: spill.item_ty.clone(),
                 itemsize: spill.itemsize,
                 is_item_signed: spill.is_item_signed,
+                char_cell: spill.char_cell,
+                storage_raw: spill.storage_raw,
             })
             .collect::<Vec<_>>();
         if !groups.is_empty() {
@@ -1782,6 +1945,8 @@ impl<'a> Lowering<'a> {
                 item_ty: spill.item_ty.clone(),
                 itemsize: spill.itemsize,
                 is_item_signed: spill.is_item_signed,
+                char_cell: spill.char_cell,
+                storage_raw: spill.storage_raw,
             });
             if let Some(template) = template {
                 for index in alias_indices {
@@ -1793,6 +1958,8 @@ impl<'a> Lowering<'a> {
                         item_ty: template.item_ty.clone(),
                         itemsize: template.itemsize,
                         is_item_signed: template.is_item_signed,
+                        char_cell: template.char_cell,
+                        storage_raw: template.storage_raw,
                     });
                 }
             } else if !alias_indices.is_empty() {
@@ -1815,7 +1982,14 @@ impl<'a> Lowering<'a> {
             // (`identity(&x)`). A raw `*const T` uses the full walk.
             // Uninspectable is a refusal only when no cell outlives
             // the call: an opaque helper may stash a residual `&T`.
+            // Residual `&T` of a by-value storage-raw uses the per-call
+            // cell (`&Scalar`); the opaque callee reads it during the
+            // call. A function-scope extra slot at entry would be live
+            // across `jit_merge_point`.
             let call_scoped = tracked.iter().all(|spill| spill.call_scoped);
+            let storage_raw_call_scoped = tracked
+                .iter()
+                .all(|spill| spill.call_scoped && spill.storage_raw);
             let result_escapes = if call_scoped {
                 self.call_scoped_spill_result_escapes(dest_ty)
             } else {
@@ -1824,7 +1998,7 @@ impl<'a> Lowering<'a> {
             if result_escapes
                 || verdict.leaked
                 || verdict.returned
-                || (!scope_group && verdict.uninspectable)
+                || (!scope_group && verdict.uninspectable && !storage_raw_call_scoped)
             {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -1876,31 +2050,27 @@ impl<'a> Lowering<'a> {
                 });
                 continue;
             }
-            let ptr = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(ptr.clone()),
-                kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
-            });
-            let offset = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(offset.clone()),
-                kind: OpKind::ConstInt(0),
-            });
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::RawStore {
-                    base: ptr.clone(),
-                    offset,
-                    value: group.word,
-                    item_ty: group.item_ty.clone(),
-                    itemsize: group.itemsize,
-                    is_item_signed: group.is_item_signed,
-                },
-            });
+            let ptr = if group.char_cell {
+                emit_raw_cell_malloc(&mut self.graph, bb_id, group.itemsize)
+            } else {
+                let ptr = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(ptr.clone()),
+                    kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
+                });
+                ptr
+            };
+            emit_raw_cell_store(
+                &mut self.graph,
+                bb_id,
+                ptr.clone(),
+                group.word,
+                group.item_ty.clone(),
+                group.itemsize,
+                group.is_item_signed,
+            );
             for index in group.indices {
                 replacements.push((index, ptr.clone()));
             }
@@ -1921,6 +2091,45 @@ impl<'a> Lowering<'a> {
             args[index] = LinkArg::Value(ptr);
         }
         Ok(reloads)
+    }
+
+    /// Per-call residual `&T` of a by-value storage-raw word: store the
+    /// aggregate in a `Tuple<i64>` / Char cell and return that address.
+    /// `history.py` `getkind` of the `Ptr` is `'int'`.
+    pub(in crate::front::mir) fn emit_storage_raw_borrow_address(
+        &mut self,
+        bb_id: BlockId,
+        word: Variable,
+        ty: &TyRef,
+    ) -> Option<Variable> {
+        let (item_ty, itemsize, is_item_signed) = storage_raw_by_value_store_descr(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        )?;
+        let ptr = if itemsize > RAW_SCALAR_SPILL_BYTES {
+            emit_raw_cell_malloc(&mut self.graph, bb_id, itemsize)
+        } else {
+            let ptr = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
+            });
+            ptr
+        };
+        emit_raw_cell_store(
+            &mut self.graph,
+            bb_id,
+            ptr.clone(),
+            word,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        );
+        Some(ptr)
     }
 
     /// The spill is freed on this block. The call result is that address

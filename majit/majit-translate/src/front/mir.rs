@@ -114,7 +114,8 @@
 //!     (`__majit_unichr`), so a Rust `char` annotates as
 //!     `SomeUnicodeCodePoint` while staying in the Int bank
 //!     (`getkind` of UniChar).
-//!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
+//!   - `FnDef` function item → `ConstNone` / `Void` (`FunctionRepr`).
+//!     A `FnPtr` (`fn(..)`) value stays `__fn_const` / `ConstFnAddr` int.
 //!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
 //!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
 //!     (`resolved_trait_const_op`). A `Clause` that names no impl stays
@@ -403,6 +404,9 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            acc.struct_fields
+                .builtin_enum_variant_payloads
+                .extend(prog.struct_fields.builtin_enum_variant_payloads);
             for root in prog.struct_fields.foreign_body_roots {
                 acc.struct_fields.note_foreign_body_crate_root(&root);
             }
@@ -469,6 +473,138 @@ pub(crate) fn absorb_semantic_program(
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
+}
+
+/// Overlay Charon-resolved layouts from a cross-target sidecar onto host
+/// declaration identities.
+///
+/// Sidecars are `type_decls` plus the SerDedup prelude; they are not a
+/// second program. Identity is the TypeDecl `name_path` the host already
+/// interned. A sidecar-only spelling (`unrelated_crate::unicodeobject::Utf8Str`)
+/// is ignored, so it cannot tombstone the host leaf or flip
+/// [`is_rstr_str_layout_declaration`] / [`is_str_oopspec_class_root`]
+/// (`jtransform.py` `Transformer._handle_stroruni_call` tests
+/// `SoU.TO == rstr.STR`).
+pub(crate) fn overlay_sidecar_layouts(
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    sidecar: &mut Llbc,
+    host_decl_paths: &std::collections::HashSet<String>,
+) {
+    if host_decl_paths.is_empty() {
+        return;
+    }
+    for td in sidecar.type_decls_mut() {
+        if td.item_meta.name_path().is_empty()
+            || !host_decl_paths.contains(td.item_meta.name_path_str())
+        {
+            td.published_struct_copy = true;
+        }
+    }
+    let gc_struct_ids = harvest_declared_gc_facts(sidecar).gc_struct_ids();
+    let raw_alloc_flavor_structs = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(sidecar),
+    );
+    let (_, _, _, _, _, _, sidecar_exact, sidecar_ids) = derive_program_metadata(
+        sidecar,
+        &gc_struct_ids,
+        no_immutable_fields(),
+        &raw_alloc_flavor_structs,
+        &[],
+    );
+    for td in sidecar.iter_type_decls() {
+        if td.published_struct_copy {
+            continue;
+        }
+        // An Opaque / Unknown copy is not the defining declaration. Its
+        // intern keys (and the hardcoded Vec / Layout fallbacks isolated
+        // derive may insert) must not replace the host body's layout.
+        // `jtransform.py` `Transformer._handle_stroruni_call` tests
+        // `SoU.TO == rstr.STR` against that body.
+        if matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        let name = td.item_meta.name_path();
+        copy_sidecar_exact_layout(
+            exact_layouts,
+            struct_ids,
+            &sidecar_exact,
+            &sidecar_ids,
+            &name,
+        );
+        let stripped = strip_crate_prefix(&name);
+        if stripped != name && stripped.contains("::") {
+            copy_sidecar_exact_layout(
+                exact_layouts,
+                struct_ids,
+                &sidecar_exact,
+                &sidecar_ids,
+                &stripped,
+            );
+        }
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        for variant in variants {
+            copy_sidecar_exact_layout(
+                exact_layouts,
+                struct_ids,
+                &sidecar_exact,
+                &sidecar_ids,
+                &format!("{name}::{}", variant.name),
+            );
+            if stripped != name && stripped.contains("::") {
+                copy_sidecar_exact_layout(
+                    exact_layouts,
+                    struct_ids,
+                    &sidecar_exact,
+                    &sidecar_ids,
+                    &format!("{stripped}::{}", variant.name),
+                );
+            }
+        }
+    }
+}
+
+fn copy_sidecar_exact_layout(
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    host_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    sidecar_exact: &std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    sidecar_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    key: &str,
+) {
+    let Some(sidecar_sid) = sidecar_ids.get(key).copied().flatten() else {
+        return;
+    };
+    let Some(layout) = sidecar_exact.get(&sidecar_sid) else {
+        return;
+    };
+    let host_sid = host_ids.get(key).copied().flatten().or_else(|| {
+        let stripped = strip_crate_prefix(key);
+        (stripped != key && stripped.contains("::"))
+            .then(|| host_ids.get(&stripped).copied().flatten())
+            .flatten()
+    });
+    let Some(host_sid) = host_sid else {
+        return;
+    };
+    if layout.field_offsets.is_empty()
+        && exact_layouts
+            .get(&host_sid)
+            .is_some_and(|existing| !existing.field_offsets.is_empty())
+    {
+        return;
+    }
+    exact_layouts.insert(host_sid, layout.clone());
 }
 
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::Borrow<Llbc>>(
@@ -865,6 +1001,7 @@ fn collect_ref_enum_instantiations(
         let sig = crate::front::clause_spec::substituted_signature(
             &callee.signature,
             llbc,
+            &trait_refs,
             &types,
             &const_generics,
         );
@@ -1149,7 +1286,7 @@ fn substitute_field_type(
 /// multi-field variant, mixed scalar widths could reorder under
 /// `repr(Rust)` away from the textual offset accumulator, so a primitive
 /// field there stays fail-closed (offset ambiguity).
-fn is_primitive_payload_type(s: &str) -> bool {
+pub(crate) fn is_primitive_payload_type(s: &str) -> bool {
     matches!(
         s.trim(),
         "i8" | "i16"
@@ -1355,6 +1492,13 @@ fn register_ref_enum_instantiation_rows(
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
+                // Not a TypeDecl; field-0 `_gckind` (`GcStruct` / `_first_struct`).
+                struct_fields
+                    .builtin_enum_variant_payloads
+                    .insert(key.clone());
+                struct_fields
+                    .builtin_enum_variant_payloads
+                    .insert(majit_ir::descr::strip_generic_args(&key).into_owned());
                 // Layout id stays the crate-stripped spelling
                 // (`StructId::from_canonical_spelling`). Class identity
                 // is not published here: `Bookkeeper.getdesc` of a
@@ -1796,6 +1940,10 @@ pub(crate) struct CrateLoweringState {
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+    /// Defining-crate artefacts already lowered in this translation.
+    /// `declare_spec` copies a local-crate generic's Unstructured body from
+    /// here when this artefact's FunDecl is Opaque (`enqueue_spec`).
+    prior_llbcs: Vec<std::rc::Rc<Llbc>>,
     skipped: LoweringSkips,
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
@@ -2059,6 +2207,7 @@ impl CrateLoweringState {
             func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            prior_llbcs: Vec::new(),
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
@@ -2103,6 +2252,20 @@ impl CrateLoweringState {
         other: &std::collections::HashSet<String>,
     ) {
         self.raw_alloc_flavor_structs.extend(other.iter().cloned());
+    }
+
+    /// Keep a defining artefact so a later crate's Opaque generic can copy
+    /// that Unstructured body (`unstructured_template`).
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn absorb_prior_llbc(&mut self, llbc: std::rc::Rc<Llbc>) {
+        self.prior_llbcs.push(llbc);
+    }
+
+    /// Share `FunctionDesc.cachedgraph` with a crate already lowered.
+    /// Pending stays empty; `seen` is the same map.
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn absorb_spec_seen(&mut self, other: &Self) {
+        self.spec = std::cell::RefCell::new(other.spec.borrow().share_seen());
     }
 
     #[cfg(any(test, feature = "mir-frontend"))]
@@ -2458,6 +2621,7 @@ impl<'l> CrateLowering<'l> {
             &accum,
             root_stack,
             Some(spec),
+            &self.state.prior_llbcs,
             false,
             None,
         ) {
@@ -2524,9 +2688,12 @@ impl<'l> CrateLowering<'l> {
         } = self.state;
         let llbc = self.llbc;
         let fd = llbc.fn_by_id(req.fn_id)?;
-        let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
+        // This artefact's FunDecl, or the defining crate's generic template
+        // when this one is Opaque (`enqueue_spec` of a local-crate item).
+        let Some((mut body, signature)) = crate::front::clause_spec::spec_copy(
             fd,
             llbc,
+            self.state.prior_llbcs.iter().map(|prior| prior.as_ref()),
             &req.trait_refs,
             &req.types,
             &req.const_generics,
@@ -2539,12 +2706,6 @@ impl<'l> CrateLowering<'l> {
         clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
-        let signature = crate::front::clause_spec::substituted_signature(
-            &fd.signature,
-            llbc,
-            &req.types,
-            &req.const_generics,
-        );
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
@@ -2690,6 +2851,7 @@ impl<'l> CrateLowering<'l> {
             &accum,
             root_stack,
             Some(spec_queue),
+            &self.state.prior_llbcs,
             true,
             Some(spec.segments.join("::")),
         ) {
@@ -3622,6 +3784,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Vec<")
         && !ty.starts_with("Option<")
         && !is_rust_heap_string_root(ty)
+        && !matches!(gc_container_ctor(ty), Some("Vec" | "Rc" | "Arc" | "String"))
     {
         format!("&{ty}")
     } else {
@@ -3669,7 +3832,14 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
-        s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
+        s if is_rust_heap_string_root(s) => {
+            let root = if gc_container_ctor(s) == Some("String") {
+                "String"
+            } else {
+                s
+            };
+            ValueType::Ref(Some(root.into()))
+        }
         "str"
         | "Wtf8"
         | "Wtf8Buf"
@@ -3847,8 +4017,29 @@ fn annotation_struct_field_type(
         None => {
             let layout =
                 tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
-            field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
+            let layout = field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout);
+            spell_by_value_gc_container_field(ty, llbc, layout)
         }
+    }
+}
+
+/// Harvest `FieldRow.ty` of a by-value GC-container ADT uses Charon
+/// `name_path()` so [`gc_container_path`] can match it. `charon_adt_to_ast_string`
+/// otherwise emits the leaf (`Vec<T>`), which is not a full path.
+fn spell_by_value_gc_container_field(ty: &TyRef, llbc: &Llbc, layout: String) -> String {
+    if layout.starts_with('*') || layout.starts_with('&') {
+        return layout;
+    }
+    let stripped = layout.split('<').next().unwrap_or(layout.as_str()).trim();
+    if gc_container_path(stripped) {
+        return layout;
+    }
+    let Some(path) = tyref_gc_container_name_path(ty, llbc) else {
+        return layout;
+    };
+    match layout.find('<') {
+        Some(i) => format!("{}{}", path, &layout[i..]),
+        None => path,
     }
 }
 
@@ -4052,6 +4243,7 @@ fn register_type_alias_struct(
             align: layout.align,
             field_offsets,
             host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+            repr_transparent: td.is_repr_transparent(),
         },
     );
     let segs: Vec<&str> = name.split("::").collect();
@@ -4481,6 +4673,7 @@ fn derive_program_metadata(
                         align: layout.align,
                         field_offsets,
                         host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+                        repr_transparent: td.is_repr_transparent(),
                     };
                     exact_layouts.insert(sid, exact);
                 }
@@ -4827,6 +5020,7 @@ fn derive_program_metadata(
                                 align: Some(8),
                                 field_offsets: base_offsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             },
                         );
                     } else if let Some(l) = enum_layout.as_ref() {
@@ -4840,6 +5034,7 @@ fn derive_program_metadata(
                             align: l.align,
                             field_offsets: base_offsets,
                             host: host.clone(),
+                            repr_transparent: false,
                         };
                         exact_layouts.insert(base_sid, base_exact);
                     }
@@ -5024,6 +5219,7 @@ fn derive_program_metadata(
                                 align: Some(8),
                                 field_offsets: voffsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             };
                             exact_layouts.insert(vsid, exact);
                         } else if let Some(l) = enum_layout.as_ref() {
@@ -5032,6 +5228,7 @@ fn derive_program_metadata(
                                 align: l.align,
                                 field_offsets: voffsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             };
                             exact_layouts.insert(vsid, exact);
                         }
@@ -5231,6 +5428,7 @@ fn derive_program_metadata(
                 align: Some(word),
                 field_offsets,
                 host: None,
+                repr_transparent: false,
             },
         );
     }
@@ -5272,6 +5470,7 @@ fn derive_program_metadata(
                 align: Some(word),
                 field_offsets,
                 host: None,
+                repr_transparent: false,
             },
         );
     }
@@ -5395,6 +5594,49 @@ pub(crate) fn spelling_is_declared_gc(
     [template.as_ref(), stripped.as_str(), leaf]
         .into_iter()
         .any(|cand| gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(cand)))
+}
+
+/// Instantiated variant payloads are not TypeDecls (`declared_adt_struct_id`).
+/// `lltype.py` `GcStruct` / `_first_struct`: a struct whose first field is a GcStruct is GC.
+pub(crate) fn derived_layout_gckind(
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+    is_builtin_enum_variant_payload: bool,
+    field0: Option<(&str, &str, majit_ir::descr::ArrayFlag)>,
+    raw_word_owners: &std::collections::HashSet<String>,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
+        return GcKind::Gc;
+    }
+    if is_builtin_enum_variant_payload && field0_is_inlined_gc_struct(field0, raw_word_owners) {
+        return GcKind::Gc;
+    }
+    GcKind::Raw
+}
+
+/// `_first_struct` yields the first field only when it is a Struct whose
+/// `_gckind` matches. A raw-storage owner is not a GcStruct; a pointer or
+/// scalar field is not the inlined parent.
+fn field0_is_inlined_gc_struct(
+    field0: Option<(&str, &str, majit_ir::descr::ArrayFlag)>,
+    raw_word_owners: &std::collections::HashSet<String>,
+) -> bool {
+    let Some((fname, fty, flag)) = field0 else {
+        return false;
+    };
+    if fname == "__discriminant" {
+        return false;
+    }
+    if flag != majit_ir::descr::ArrayFlag::Struct {
+        return false;
+    }
+    let fty = fty.trim();
+    if fty.is_empty() || is_primitive_payload_type(fty) {
+        return false;
+    }
+    !raw_word_owners.contains(fty)
 }
 
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
@@ -5638,6 +5880,9 @@ impl DuplicateLeafFacts {
         self.struct_fields
             .gc_struct_ids
             .extend(other.struct_fields.gc_struct_ids);
+        self.struct_fields
+            .builtin_enum_variant_payloads
+            .extend(other.struct_fields.builtin_enum_variant_payloads);
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)
@@ -6434,6 +6679,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &accum,
         &RootStackAnalyzer::new(llbc, root_stack_state),
         None,
+        &[],
         false,
         None,
     )
@@ -6601,8 +6847,9 @@ pub use self::gcroot::{
 };
 pub(crate) use self::gcroot::{
     ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
-    harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
-    is_shadow_stack_bracket_close, is_slice_buffer_free_call,
+    harvest_scope_owning_identities_with, is_call_scoped_raw_spill_op,
+    is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
+    is_slice_buffer_free_call,
 };
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
@@ -6611,14 +6858,14 @@ pub(crate) use self::lltype::{
     adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
     charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
     collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
-    host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    gc_container_ctor, gc_container_path, host_rthread_threadlocalref_llop,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
+    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt,
+    strip_crate_prefix, strip_gc_container_ctor, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6746,14 +6993,10 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     if fun_decl_name_path_is_host_env(fd) {
         return None;
     }
-    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
-        let sibling = fd.item_meta.name.first().is_some_and(|seg| {
-            matches!(seg, NameSeg::Ident { ident: (root, _) }
-                if crate::local_crates::is_local_crate_root(root))
-        });
-        if !sibling {
-            return None;
-        }
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+        && !crate::front::clause_spec::decl_is_local_crate_item(fd)
+    {
+        return None;
     }
     let name = fd.item_meta.name_path();
     let leaf = name.rsplit("::").next().unwrap_or(&name);
@@ -6811,6 +7054,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     accum: &AccumulatorFacts,
     root_stack: &RootStackAnalyzer<'_>,
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    prior_llbcs: &[std::rc::Rc<Llbc>],
     spec_body: bool,
     graph_name: Option<String>,
 ) -> Result<FunctionGraph, LowerError> {
@@ -7716,6 +7960,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        lo.set_prior_llbcs(prior_llbcs);
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -7776,6 +8021,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    lo.set_prior_llbcs(prior_llbcs);
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -7822,6 +8068,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     lo.set_spec_body();
                 }
             }
+            lo.set_prior_llbcs(prior_llbcs);
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)

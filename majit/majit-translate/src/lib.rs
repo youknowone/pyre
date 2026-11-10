@@ -225,6 +225,16 @@ fn build_semantic_program_via_active_frontend(
                     .filter(|paths: &Vec<String>| !paths.is_empty())
             });
         if let Some(paths) = resolved_paths {
+            // Sidecars are Charon-resolved layouts for a cross target.
+            // They are not a second program: intern, DuplicateLeafFacts,
+            // published structs, and graph lowering stay on the host
+            // TypeDecl `name_path` (`jtransform.py`
+            // `Transformer._handle_stroruni_call` tests `SoU.TO == rstr.STR`).
+            let (host_paths, sidecar_paths): (Vec<String>, Vec<String>) = paths
+                .iter()
+                .cloned()
+                .partition(|p| !crate::layout::is_layout_sidecar_path(p));
+            let mut host_decl_paths = std::collections::HashSet::new();
             // The harvest loop parses one artefact at a time and drops it.
             // The second loop reloads each file after
             // `register_transparent_scalar_kinds` so cross-crate
@@ -259,10 +269,16 @@ fn build_semantic_program_via_active_frontend(
             let mut stack_observes: Vec<String> = Vec::new();
             let mut scope_owning_identities: Vec<String> = Vec::new();
             let mut published_structs: Vec<front::mir::PublishedStructBody> = Vec::new();
-            for p in &paths {
+            for p in &host_paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
+                for td in llbc.iter_type_decls() {
+                    let name = td.item_meta.name_path();
+                    if !name.is_empty() {
+                        host_decl_paths.insert(name);
+                    }
+                }
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -354,7 +370,7 @@ fn build_semantic_program_via_active_frontend(
             let gc_struct_ids = declared_gc.gc_struct_ids();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
             published_structs.dedup_by(|a, b| a.path == b.path);
-            for (ord, p) in paths.iter().enumerate() {
+            for (ord, p) in host_paths.iter().enumerate() {
                 let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
@@ -430,6 +446,17 @@ fn build_semantic_program_via_active_frontend(
                 &mut program.enum_variant_by_discriminant,
                 Some(&program.struct_ids),
             );
+            for p in &sidecar_paths {
+                let mut sidecar = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                front::mir::overlay_sidecar_layouts(
+                    &mut program.exact_layouts,
+                    &program.struct_ids,
+                    &mut sidecar,
+                    &host_decl_paths,
+                );
+                prof.mark(&format!("    overlay {p}"));
+            }
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
@@ -1865,6 +1892,22 @@ fn analyze_pipeline_from_module_paths(
     // spelling of a declared struct the declaration first.
     let immutable_fields =
         expand_immutable_fields_to_all_spellings(&program.immutable_fields, &program.struct_fields);
+    let mut transparent_structs = std::collections::HashSet::new();
+    for name in program
+        .struct_fields
+        .fields
+        .keys()
+        .chain(program.known_struct_names.iter())
+    {
+        if let Some(sid) = majit_ir::descr::struct_id_for_name(name)
+            && program
+                .exact_layouts
+                .get(&sid)
+                .is_some_and(|exact| exact.repr_transparent)
+        {
+            transparent_structs.insert(name.clone());
+        }
+    }
     let heuristic;
     let provider: &dyn layout::LayoutProvider = match layout_provider {
         Some(p) => p,
@@ -1876,6 +1919,7 @@ fn analyze_pipeline_from_module_paths(
                 &program.known_struct_names,
                 &immutable_fields,
                 &program.raw_alloc_flavor_structs,
+                &transparent_structs,
             );
             &heuristic
         }
@@ -1887,6 +1931,7 @@ fn analyze_pipeline_from_module_paths(
     call_control.immutable_fields_by_struct = immutable_fields;
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
+    call_control.transparent_structs = transparent_structs;
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the
@@ -2104,12 +2149,28 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind =
-                if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, struct_name) {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-                } else {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-                };
+            let gckind = {
+                let field0 = layout.fields.first().and_then(|field| {
+                    program
+                        .struct_fields
+                        .exact_field_type(struct_name, &field.name)
+                        .map(|ty| (field.name.as_str(), ty, field.flag))
+                });
+                crate::front::mir::derived_layout_gckind(
+                    &declared_gc,
+                    sid,
+                    struct_name,
+                    program
+                        .struct_fields
+                        .is_builtin_enum_variant_payload(struct_name),
+                    field0,
+                    &program.struct_fields.raw_word_owners,
+                )
+            };
+            layout.gckind = gckind;
+            if let Some(exact) = exact {
+                layout.repr_transparent = exact.repr_transparent;
+            }
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {

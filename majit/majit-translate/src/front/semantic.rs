@@ -400,6 +400,12 @@ pub struct StructFieldRegistry {
     /// `_arrayfld` until a test seeds the declared fact.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Layout keys of interned generic-enum variant payloads
+    /// (`register_ref_enum_instantiation_rows`). Those keys are not
+    /// TypeDecls, so harvest never assigns `_gckind`;
+    /// [`crate::front::mir::derived_layout_gckind`] uses field 0.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub(crate) builtin_enum_variant_payloads: std::collections::HashSet<String>,
     /// Crate roots of FunDecls that lowered a body and are not local
     /// alias roots. Intern and field lookup strip these prefixes
     /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
@@ -606,6 +612,21 @@ impl StructFieldRegistry {
             .map(|row| row.ty.as_str())
     }
 
+    /// Type string of `field_name` on the exact registry key `owner`.
+    ///
+    /// [`Self::field_type`] goes through [`Self::lookup_fields`], which
+    /// strips `<…>` so a suffixed variant payload
+    /// (`Option<SimpleBufferBytes>::Some`) would miss its own rows and
+    /// see the unsuffixed template (or nothing: harvest skips builtin
+    /// ADT TypeDecls). Layout assignment has the exact key.
+    pub(crate) fn exact_field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
+        self.fields
+            .get(owner)?
+            .iter()
+            .find(|row| row.name == field_name)
+            .map(|row| row.ty.as_str())
+    }
+
     /// True when the harvested row for `owner.field_name` came from a
     /// `FieldDecl` whose `name` was `None`. False for a declared name,
     /// including a declared `__pos_N`, and when the owner has no such row.
@@ -645,6 +666,21 @@ impl StructFieldRegistry {
     /// is not registered.
     pub(crate) fn field_rows(&self, owner: &str) -> Option<&[FieldRow]> {
         self.lookup_fields(owner)
+    }
+
+    /// True when `name` is an interned generic-enum variant payload
+    /// (`{enum}::{variant}`). Instantiations share the unsuffixed
+    /// template (`Option<T>::Some` → `Option::Some`); harvest records
+    /// both.
+    pub(crate) fn is_builtin_enum_variant_payload(&self, name: &str) -> bool {
+        if self.builtin_enum_variant_payloads.contains(name) {
+            return true;
+        }
+        let template = majit_ir::descr::strip_generic_args(name);
+        template.as_ref() != name
+            && self
+                .builtin_enum_variant_payloads
+                .contains(template.as_ref())
     }
 
     pub fn is_enum_base(&self, owner: &str) -> bool {
@@ -780,7 +816,7 @@ impl StructFieldRegistry {
         removed
     }
 
-    fn lookup_fields(&self, owner: &str) -> Option<&[FieldRow]> {
+    pub(crate) fn lookup_fields(&self, owner: &str) -> Option<&[FieldRow]> {
         // A per-instantiation enum spelling (`Result<Tuple>`,
         // `Result<Tuple>::Ok`) shares the bare template's rows: the
         // reference-payload split exists only to separate annotator attr
@@ -1037,6 +1073,10 @@ pub struct ExactLayout {
     /// serde: it is rebuilt from Charon whenever metadata is derived.
     #[serde(skip)]
     pub host: Option<crate::front::host_layout::HostLayout>,
+    /// `TypeDecl::is_repr_transparent`. Copied onto
+    /// `StructLayout.repr_transparent` when the layout is registered.
+    #[serde(default)]
+    pub repr_transparent: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1580,6 +1620,43 @@ mod tests {
         );
         assert_eq!(reg.field_type("Foo", "x"), Some("u8"));
         assert_eq!(reg.field_type("Foo", "missing"), None);
+    }
+
+    #[test]
+    fn exact_field_type_keeps_suffixed_variant_payload_rows() {
+        let mut reg = StructFieldRegistry::default();
+        let owner = "option::Option<baseobjspace::SimpleBufferBytes>::Some";
+        reg.fields.insert(
+            owner.to_string(),
+            vec![(
+                "__pos_0".to_string(),
+                "baseobjspace::SimpleBufferBytes".to_string(),
+            )],
+        );
+        // A second `::Some` key makes the stripped suffix match
+        // ambiguous, matching harvest (many Option instantiations).
+        reg.fields.insert(
+            "option::Option<i64>::Some".to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        assert_eq!(
+            reg.exact_field_type(owner, "__pos_0"),
+            Some("baseobjspace::SimpleBufferBytes")
+        );
+        assert_eq!(reg.field_type(owner, "__pos_0"), None);
+    }
+
+    #[test]
+    fn builtin_enum_variant_payload_matches_unsuffixed_template() {
+        let mut reg = StructFieldRegistry::default();
+        reg.builtin_enum_variant_payloads
+            .insert("option::Option::Some".to_string());
+        assert!(
+            reg.is_builtin_enum_variant_payload("option::Option<SimpleBufferBytes>::Some"),
+            "an instantiated builtin variant shares the template key"
+        );
+        assert!(reg.is_builtin_enum_variant_payload("option::Option::Some"));
+        assert!(!reg.is_builtin_enum_variant_payload("baseobjspace::SimpleBufferBytes"));
     }
 
     #[test]

@@ -7360,6 +7360,65 @@ mod tests {
     }
 
     #[test]
+    fn getgcflavor_flavor_raw_by_value_vec_stays_raw() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::front::StructFieldRegistry;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "Holder".to_string(),
+            vec![(
+                "argnames".to_string(),
+                "alloc::vec::Vec<alloc::string::String>".to_string(),
+            )],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let pyobj = HostObject::new_class("Holder", vec![]);
+        pyobj.class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "Holder".into(),
+        )));
+        let classdef = ClassDef::new(&bk, &desc);
+        assert_eq!(getgcflavor(&classdef).unwrap(), Flavor::Raw);
+        let repr = getinstancerepr(&fresh_rtyper(), Some(&classdef), Flavor::Gc).expect("repr");
+        assert_eq!(repr.gcflavor(), Flavor::Raw);
+    }
+
+    #[test]
+    fn getgcflavor_flavor_raw_pointer_fields_stays_raw() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::front::StructFieldRegistry;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "MapNode".to_string(),
+            vec![
+                ("w_cls".to_string(), "*mut pyobject::PyObject".to_string()),
+                (
+                    "items".to_string(),
+                    "*mut alloc::vec::Vec<usize>".to_string(),
+                ),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let pyobj = HostObject::new_class("MapNode", vec![]);
+        pyobj.class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "MapNode".into(),
+        )));
+        let classdef = ClassDef::new(&bk, &desc);
+        assert_eq!(getgcflavor(&classdef).unwrap(), Flavor::Raw);
+    }
+
+    #[test]
     fn instance_repr_basedef_recursion_threads_parent_object_type_into_super_field() {
         let rtyper = fresh_rtyper();
         let base = ClassDef::new_standalone("pkg.Base", None);

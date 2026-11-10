@@ -361,9 +361,9 @@ pub(crate) fn dual_gate_check_with_registry(
             legacy_graph,
             Some(call_registry.bookkeeper()),
         );
-        super::legacy_resolve::resolve_types(
+        super::legacy_resolve::resolve_types_from_bookkeeper(
             legacy_graph,
-            &call_registry.bookkeeper().raw_alloc_flavor_structs(),
+            call_registry.bookkeeper().as_ref(),
         );
     }));
     if let Err(payload) = baseline {
@@ -8221,6 +8221,12 @@ fn reconcile_elided_phi_inputargs(
 /// `getinstancerepr`; `Impossible` / a classdef-less instance is
 /// `llmemory.GCREF`, never `OBJECTPTR`. `getuniqueclassdef_for_struct_root`
 /// is not called on an unknown name (that would mint a shell).
+///
+/// A storage-raw owner is `SomePtr` (`raw_struct_ptr_annotation` /
+/// `named_ref_is_raw_int`). `history.py getkind` of that `Ptr` is
+/// `'int'`; matching only `SomeInstance` fell through to GCREF and
+/// painted the dest Ref. Flavor-raw without a layout is Signed, the
+/// Skip overlay, never `Flavor::Gc`.
 fn lltype_for_named_ref(
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
     name: &str,
@@ -8235,17 +8241,42 @@ fn lltype_for_named_ref(
     let Some(ann) = rtyper.annotator.upgrade() else {
         return GCREF.clone();
     };
-    let SomeValue::Instance(inst) = ann.bookkeeper.project_struct_field_type(name) else {
-        return GCREF.clone();
-    };
-    let Some(classdef) = inst.classdef.as_ref() else {
-        return GCREF.clone();
-    };
-    let repr = getinstancerepr(rtyper, Some(classdef), Flavor::Gc)
-        .unwrap_or_else(|e| panic!("lltype_for_named_ref: getinstancerepr({name}): {e}"));
-    Repr::setup(repr.as_ref())
-        .unwrap_or_else(|e| panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}"));
-    repr.lowleveltype().clone()
+    if let Some(SomeValue::Ptr(s_ptr)) = ann.bookkeeper.raw_struct_ptr_annotation(name) {
+        return LowLevelType::Ptr(Box::new(s_ptr.ll_ptrtype));
+    }
+    match ann.bookkeeper.project_struct_field_type(name) {
+        SomeValue::Ptr(s_ptr) => LowLevelType::Ptr(Box::new(s_ptr.ll_ptrtype)),
+        projected => {
+            let ty = crate::model::ValueType::Ref(Some(name.to_string()));
+            let is_raw_int = {
+                let flavors = ann.bookkeeper.raw_alloc_flavor_structs();
+                let fields = ann.bookkeeper.struct_fields.borrow();
+                let layouts = ann.bookkeeper.struct_layouts.borrow();
+                let empty_layouts = Default::default();
+                let raw_adt = crate::annotator::bookkeeper::bind_raw_adt(
+                    fields.as_ref().map(|f| f.as_ref()),
+                    layouts.as_ref(),
+                    &empty_layouts,
+                );
+                crate::annotator::bookkeeper::named_ref_is_raw_int(raw_adt, &flavors, None, &ty)
+            };
+            if is_raw_int {
+                return LowLevelType::Signed;
+            }
+            let SomeValue::Instance(inst) = projected else {
+                return GCREF.clone();
+            };
+            let Some(classdef) = inst.classdef.as_ref() else {
+                return GCREF.clone();
+            };
+            let repr = getinstancerepr(rtyper, Some(classdef), Flavor::Gc)
+                .unwrap_or_else(|e| panic!("lltype_for_named_ref: getinstancerepr({name}): {e}"));
+            Repr::setup(repr.as_ref()).unwrap_or_else(|e| {
+                panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}")
+            });
+            repr.lowleveltype().clone()
+        }
+    }
 }
 
 /// Backfill the low-level type of a call-result Variable the real path
@@ -8268,10 +8299,10 @@ fn lltype_for_named_ref(
 /// `RPythonTyper.setconcretetype` (`bindingrepr` → `getrepr` →
 /// `SomeInstance.rtyper_makerepr` → `getinstancerepr`). Only a
 /// variable with **no** binding may use the front-end `result_ty`:
-/// - `Ref(Some(name))`: `project_struct_field_type(name)` then
-///   `getinstancerepr` when that is `SomeInstance(classdef)`. An alias
-///   (`PyObjectRef`) resolves to the same classdef as the pointee.
-///   No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
+/// - `Ref(Some(name))`: [`lltype_for_named_ref`]. A storage-raw owner
+///   is `SomePtr` (`named_ref_is_raw_int` / `raw_struct_ptr_annotation`).
+///   A GC classdef is `getinstancerepr`. No classdef → `llmemory.GCREF`,
+///   never `OBJECTPTR`.
 /// - `Ref(None)` is `llmemory.GCREF` (`Ptr(Opaque)`).
 ///
 /// One equally erased scalar shape is admitted, but only at the producer
@@ -8694,9 +8725,9 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::legacy_annotator::annotate_with_bookkeeper(legacy, Some(call_registry.bookkeeper()));
-        super::legacy_resolve::resolve_types(
+        super::legacy_resolve::resolve_types_from_bookkeeper(
             legacy,
-            &call_registry.bookkeeper().raw_alloc_flavor_structs(),
+            call_registry.bookkeeper().as_ref(),
         );
     }));
     if let Err(payload) = baseline {
@@ -14302,6 +14333,93 @@ mod tests {
     }
 
     #[test]
+    fn backfill_untyped_call_results_stamps_raw_ptr_for_storage_raw_named_ref() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind};
+
+        let owner = "gc_roots::RootScope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        bk.set_struct_fields(Rc::new(fields));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+        let registry = CallRegistry::new(bk.clone());
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["erased_raw_scope_ref".to_string()],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some(owner.to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        let ll = value_to_var
+            .get(&result)
+            .expect("twin")
+            .concretetype()
+            .expect("stamped");
+        assert_ne!(
+            ll,
+            GCREF.clone(),
+            "storage-raw named Ref is not llmemory.GCREF"
+        );
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::Signed,
+            "storage-raw named Ref is int (`history.py getkind`)"
+        );
+        let SomeValue::Ptr(s_ptr) = bk
+            .raw_struct_ptr_annotation(owner)
+            .expect("SomePtr of the storage-raw owner")
+        else {
+            panic!("raw_struct_ptr_annotation must return SomePtr");
+        };
+        assert_eq!(
+            ll,
+            LowLevelType::Ptr(Box::new(s_ptr.ll_ptrtype)),
+            "storage-raw named Ref is the raw Struct Ptr"
+        );
+    }
+
+    #[test]
     fn stamp_named_ref_call_dests_replaces_skip_objectptr_with_instancerepr() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::front::StructFieldRegistry;
@@ -16985,6 +17103,7 @@ mod tests {
             size,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![crate::call::StructFieldLayout {
                 name: name.into(),
                 offset,
@@ -17244,6 +17363,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "x".into(),
                     offset: 0,
@@ -18840,6 +18960,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,

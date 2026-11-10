@@ -117,6 +117,7 @@ fn layout_from(size: u64, align: u64, fields: &[(&str, u64)]) -> ExactLayout {
         align: Some(align),
         field_offsets,
         host: None,
+        repr_transparent: false,
     }
 }
 

@@ -5690,7 +5690,7 @@ pub(crate) fn derive_subject_inputcells(
             // `args.len()` is `len` of a list, not `getattr("__len__")`
             // on a classdef-less `SomeInstance`.
             if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
-                && majit_ir::descr::is_list_container_spelling(root)
+                && crate::annotator::bookkeeper::is_list_container_field(root)
             {
                 cells.push(bk.project_struct_field_type(root));
                 continue;
@@ -5794,6 +5794,24 @@ pub(crate) fn derive_subject_inputcells(
                 {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
+                }
+                // `history.py getkind` of a raw `Ptr` is int. Seed SomePtr
+                // from [`named_ref_root`] so an unnamed `Ref(None)` with
+                // `class_root` and a `Ref(Some(name))` without one hit the
+                // same layout as FUNC.ARGS.
+                if let Some(bk) = bookkeeper {
+                    let substituted = class_root
+                        .as_deref()
+                        .and_then(|root| bk.trait_unique_impls.borrow().get(root).cloned());
+                    let root = substituted.as_deref().or_else(|| {
+                        crate::annotator::bookkeeper::named_ref_root(class_root.as_deref(), ty)
+                    });
+                    if let Some(root) = root
+                        && let Some(cell) = bk.raw_struct_ptr_annotation(root)
+                    {
+                        cells.push(cell);
+                        continue;
+                    }
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
                     // A marked enum parameter is the minted base class.
@@ -5901,17 +5919,6 @@ pub(crate) fn derive_subject_inputcells(
                         // struct-field rows, interned by qualname like its constructor.
                         || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
                     if known {
-                        // A `&RawStruct` is the address of that struct
-                        // (`Ptr` of a raw `Struct`, `history.getkind`).
-                        // FieldRead of the same owner already seeds
-                        // SomePtr (`project_struct_field_type`); minting
-                        // SomeInstance here made mergeinputargs raise
-                        // Instance(X) ∪ Ptr(X) (`llannotation.py`
-                        // pairtype(SomePtr, SomeObject).union).
-                        if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
-                            cells.push(cell);
-                            continue;
-                        }
                         let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
                             TyperError::message(format!(
                                 "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -8414,6 +8421,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -8592,6 +8600,76 @@ mod tests {
             "suffixed GcEntries must seed SomeList, got {:?}",
             cells[0]
         );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_named_raw_ref_without_class_root() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "rawref::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut graph = LegacyGraph::new("scope_get_named");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "scope".to_string(),
+                    ty: ValueType::Ref(Some(owner.to_string())),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        bk.set_struct_fields(Rc::new(fields));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("named raw Ref input must seed");
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!("named raw Ref must seed SomePtr, got {:?}", cells[0]);
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("named raw Ref input must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Raw);
     }
 
     #[test]

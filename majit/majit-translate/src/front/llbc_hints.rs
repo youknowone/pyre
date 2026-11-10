@@ -834,7 +834,7 @@ fn resolve_exception_class_enum(
 /// is left whole: it is two words, not a raw address.
 /// `history.getkind` / `descr.py get_type_flag` classify `Ptr` from
 /// `TO._gckind`, so the flavor matcher has to name `T`.
-fn peel_pointer_spelling(path: &str) -> &str {
+pub(crate) fn peel_pointer_spelling(path: &str) -> &str {
     let path = path.trim();
     if crate::fat_ptr_layout::spelling_is_fat_ptr(path) {
         return path;

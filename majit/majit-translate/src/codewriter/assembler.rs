@@ -2661,8 +2661,8 @@ impl AssemblerEncode for Assembler {
                 if !is_gc && value_kind == 'r' {
                     panic!(
                         "setfield_raw_r not supported (jtransform.py rewrite_op_setfield) \
-                         — graph {:?}",
-                        self.current_graph_name,
+                         — graph {:?} field {} ty {:?}",
+                        self.current_graph_name, field.name, ty,
                     );
                 }
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));
@@ -5427,6 +5427,8 @@ fn describe_v_inst_from_base(
 /// struct flag denotes the `getsubstruct` shape. Size is the layout row's
 /// byte size, so `rewrite_op_getfield` can tell a transparent one-word
 /// newtype (an ordinary load) from the first nested parent struct (identity).
+/// `field_metadata` already peels a `#[repr(transparent)]` field type to
+/// the inner lltype, so `FLAG_STRUCT` here is `rewrite_op_getsubstruct`.
 pub(crate) fn inline_substruct_field_layout(
     cc: &crate::codewriter::call::CallControl,
     field: &crate::model::FieldDescriptor,
@@ -7332,6 +7334,7 @@ mod tests {
                 size: 6 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "bytes".into(),
@@ -7369,6 +7372,7 @@ mod tests {
                 size: 3 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "buf".into(),
@@ -8059,6 +8063,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "visible_zero".to_string(),
@@ -8220,6 +8225,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 0,
@@ -8239,6 +8245,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "inner".to_string(),
                     offset: 0,
@@ -8286,6 +8293,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "visible".to_string(),
                     offset: 0,
@@ -8354,6 +8362,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "__pos_0");
@@ -8458,6 +8468,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "visible_zero".to_string(),
                     offset: 0,
@@ -10031,6 +10042,7 @@ mod tests {
                 size: 0,
                 align: 1,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: Vec::new(),
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -10060,6 +10072,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "value".into(),
                     offset: 0,
@@ -11209,6 +11222,7 @@ mod tests {
                 size,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields,
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -11325,6 +11339,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "ptr".into(),
@@ -11409,6 +11424,7 @@ mod tests {
                 size: 8,
                 align: 4,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: Vec::new(),
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -11587,6 +11603,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "code".into(),
                     offset: 0,
@@ -12268,6 +12285,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "a".into(),
@@ -12559,6 +12577,7 @@ mod tests {
                 size: 24,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![shell_field("__pos_0", 8, 4), shell_field("__pos_1", 16, 8)],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -12571,6 +12590,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![shell_field("__discriminant", 0, 8)],
                 host: Some(crate::front::host_layout::HostLayout {
                     size: 16,
@@ -12965,6 +12985,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: vec![StructFieldLayout {
                 name: "f".into(),
                 offset: 0,

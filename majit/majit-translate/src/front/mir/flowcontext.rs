@@ -402,6 +402,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// whole-program walk.
     pub(in crate::front::mir) spec:
         Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    /// Defining-crate artefacts already lowered. `enqueue_spec` copies a
+    /// local-crate Opaque generic from here (`spec_copy`).
+    pub(in crate::front::mir) prior_llbcs: &'a [std::rc::Rc<Llbc>],
     /// This body is a `cachedgraph` copy, so clause refs have been
     /// replaced and a `TraitImpl` call names the impl method.
     pub(in crate::front::mir) spec_body: bool,
@@ -835,6 +838,11 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             Some(root.clone())
         } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
+        } else if storage_raw_by_value_class_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
+            .is_some()
+        {
+            // By-value storage-raw is the aggregate unnamed `Ref`.
+            None
         } else {
             match &ty {
                 ValueType::Ref(_) => {
@@ -846,6 +854,14 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                     )
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
+                    .or_else(|| {
+                        flavor_raw_pointer_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            raw_alloc_flavor_structs,
+                        )
+                    })
                     .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
                     })
@@ -1587,6 +1603,16 @@ impl<'a> Lowering<'a> {
                 Some(root.clone())
             } else if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
+            } else if storage_raw_by_value_class_root(
+                &local.ty,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+            )
+            .is_some()
+            {
+                // By-value storage-raw is the aggregate unnamed `Ref`.
+                None
             } else {
                 match &ty {
                     ValueType::Ref(_) => tyref_niche_option_gc_payload_spelling(
@@ -1598,7 +1624,27 @@ impl<'a> Lowering<'a> {
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
+                        flavor_raw_pointer_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            raw_alloc_flavor_structs,
+                        )
+                    })
+                    .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                    })
+                    .or_else(|| {
+                        // Same Box / NonNull flavor-raw fallback as
+                        // `pygraph_initial_block`: `tyref_ref_param_class_root`
+                        // declines the alloc wrapper.
+                        raw_address_owner_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            gc_struct_ids,
+                            raw_alloc_flavor_structs,
+                        )
                     }),
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no
@@ -2106,6 +2152,7 @@ impl<'a> Lowering<'a> {
             function_scope_cells,
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
+            prior_llbcs: &[],
             spec_body: false,
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
