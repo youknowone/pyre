@@ -152,35 +152,37 @@ pub trait Optimization {
     }
 
     /// heap.py serialize_optheap — export struct field triples. The
-    /// `available_boxes` filter (heap.py:836,845) is applied in bridgeopt.
+    /// `available_boxes` filter (`OptHeap.serialize_optheap`) is applied in
+    /// bridgeopt.
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
-    ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
+    ) -> Vec<(Operand, majit_ir::DescrRef, Operand)> {
         Vec::new()
     }
 
     /// heap.py deserialize_optheap — import struct fields.
     fn import_cached_fields(
         &self,
-        _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
+        _entries: &[(Operand, majit_ir::DescrRef, Operand)],
         _ctx: &mut OptContext,
     ) {
     }
 
     /// heap.py serialize_optheap — export array item triples. The
-    /// `available_boxes` filter (heap.py:855,866) is applied in bridgeopt.
+    /// `available_boxes` filter (`OptHeap.serialize_optheap`) is applied in
+    /// bridgeopt.
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
-    ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
+    ) -> Vec<(Operand, i64, majit_ir::DescrRef, Operand)> {
         Vec::new()
     }
 
     /// heap.py deserialize_optheap — import array item triples.
     fn import_cached_arrayitems(
         &self,
-        _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
+        _entries: &[(Operand, i64, majit_ir::DescrRef, Operand)],
         _ctx: &mut OptContext,
     ) {
     }
@@ -1487,8 +1489,8 @@ impl Optimizer {
     /// bridgeopt.py optimizer.optheap.deserialize_optheap(result_struct, result_array)
     pub fn import_heap_knowledge(
         &mut self,
-        result_struct: &[(OpRef, majit_ir::DescrRef, OpRef)],
-        result_array: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
+        result_struct: &[(Operand, majit_ir::DescrRef, Operand)],
+        result_array: &[(Operand, i64, majit_ir::DescrRef, Operand)],
         ctx: &mut OptContext,
     ) {
         if !result_struct.is_empty() {
@@ -6000,8 +6002,8 @@ impl Optimizer {
         ctx: &mut OptContext,
         failargs: &[OpRef],
     ) -> crate::resume::OptimizerKnowledgeForResume {
-        let mut heap_fields_raw = Vec::new();
-        let mut heap_arrayitems_raw = Vec::new();
+        let mut heap_fields_raw: Vec<(Operand, DescrRef, Operand)> = Vec::new();
+        let mut heap_arrayitems_raw: Vec<(Operand, i64, DescrRef, Operand)> = Vec::new();
         // Guard resume: export all cached fields. The available_boxes filter
         // (serialize_optheap, bridgeopt.py) is applied later in bridgeopt once
         // the live-box set is known; this raw export accepts every cached field.
@@ -6031,14 +6033,14 @@ impl Optimizer {
             .into_iter()
             .map(|(obj, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj, idx, val)
+                (obj.to_opref(), idx, val.to_opref())
             })
             .collect();
         let heap_arrayitems: Vec<(OpRef, i64, i32, OpRef)> = heap_arrayitems_raw
             .into_iter()
             .map(|(obj, index, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj, index, idx, val)
+                (obj.to_opref(), index, idx, val.to_opref())
             })
             .collect();
 

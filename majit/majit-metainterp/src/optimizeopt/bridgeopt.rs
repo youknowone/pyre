@@ -16,9 +16,8 @@
 //!
 //! `decode_box` lives with the resume tag helpers, but is re-exported here
 //! because the upstream import path is `optimizeopt.bridgeopt.decode_box`.
-//! `decoded_box_to_opref` is a small helper for folding a typed
-//! `Const{Int,Float,Ptr}` from that decoded form back into the optimizer's
-//! constant pool.
+//! `decoded_box_to_operand` folds a tagged livebox or `Const` into the
+//! optimizer's bound `Operand` (the live InputArg or a `Const` box).
 
 use majit_ir::OpRef;
 use majit_ir::operand::Operand;
@@ -297,9 +296,9 @@ pub fn deserialize_optimizer_knowledge(
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
         // bridgeopt.py:155: descr = metainterp_sd.all_descrs[descr_index]
         let descr = &all_descrs[descr_index as usize];
-        let opref1 = decoded_box_to_opref(&box1, ctx);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
-        result_struct.push((opref1, descr.clone(), opref2));
+        let object = decoded_box_to_operand(&box1, ctx);
+        let value = decoded_box_to_operand(&box2, ctx);
+        result_struct.push((object, descr.clone(), value));
     }
     // bridgeopt.py:159-169: heap knowledge (array items)
     let length = reader.next_item();
@@ -313,9 +312,9 @@ pub fn deserialize_optimizer_knowledge(
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
         // bridgeopt.py:166: descr = metainterp_sd.all_descrs[descr_index]
         let descr = &all_descrs[descr_index as usize];
-        let opref1 = decoded_box_to_opref(&box1, ctx);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
-        result_array.push((opref1, index, descr.clone(), opref2));
+        let object = decoded_box_to_operand(&box1, ctx);
+        let value = decoded_box_to_operand(&box2, ctx);
+        result_array.push((object, index, descr.clone(), value));
     }
     // bridgeopt.py:170-171: optimizer.optheap.deserialize_optheap(...)
     if !result_struct.is_empty() || !result_array.is_empty() {
@@ -355,20 +354,5 @@ fn decoded_box_to_operand(decoded: &crate::resume::DecodedBox, ctx: &OptContext)
             .get_box_replacement_operand_opt(*opref)
             .expect("decoded livebox must retain its bound bridge InputArg"),
         DecodedBox::Const(constant) => Operand::const_(constant.clone()),
-    }
-}
-
-/// Convert a DecodedBox to an OpRef for the bridge optimizer context.
-///
-/// RPython's deserialize path passes Const/Box objects directly. In majit,
-/// constants must be registered in the optimizer's context to get an OpRef.
-fn decoded_box_to_opref(decoded: &crate::resume::DecodedBox, ctx: &mut OptContext) -> OpRef {
-    use crate::resume::DecodedBox;
-    use majit_ir::Const;
-    match decoded {
-        DecodedBox::LiveBox(opref) => *opref,
-        DecodedBox::Const(Const::Int(v)) => ctx.make_constant_int(*v),
-        DecodedBox::Const(Const::Ref(r)) => ctx.make_constant_ref(*r),
-        DecodedBox::Const(Const::Float(f)) => ctx.make_constant_float(*f),
     }
 }
