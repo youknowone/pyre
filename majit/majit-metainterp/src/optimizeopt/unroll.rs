@@ -87,13 +87,13 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::ConstMap<majit_ir::V
 /// postprocess may install those after emit, and baking them as the
 /// first-iteration value is a 0-fill.
 ///
-/// Walks the box at `opref` (`resoperation.py AbstractValue.get_box_replacement`).
+/// Walks the box (`resoperation.py AbstractValue.get_box_replacement`).
 /// An InputArgRef is its own box (`InputArgRef` / `AbstractInputArg`); the
 /// Const, if any, lives on that InputArg (`op.set_forwarded(const)`). A
 /// sibling `RefOp` at the same raw is a different position class
 /// (`AbstractResOp`) and is not minted for a red inputarg.
-fn const_ref_replacement(ctx: &OptContext, opref: OpRef) -> Option<Operand> {
-    let term = ctx.get_box_replacement_operand(opref);
+fn const_ref_replacement(box_: &Operand) -> Option<Operand> {
+    let term = box_.get_box_replacement(false);
     match term.const_value() {
         Some(Value::Ref(gcref)) if !gcref.is_null() => Some(term),
         _ => None,
@@ -2163,21 +2163,14 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
-        let mut appended_label_args: Vec<OpRef> = Vec::new();
-        let sp_used_boxes: Vec<OpRef> = sp.used_boxes.iter().map(Operand::to_opref).collect();
-        let sp_jump_args: Vec<OpRef> = sp.jump_args.iter().map(Operand::to_opref).collect();
-        let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
-        let exported_renamed_inputarg_refs: Vec<OpRef> = exported_renamed_inputargs
-            .iter()
-            .map(Operand::to_opref)
-            .collect();
+        let mut appended_label_args: Vec<Operand> = Vec::new();
         let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
-            &label_arg_refs,
-            &exported_renamed_inputarg_refs,
-            &sp_used_boxes,
-            &sp_jump_args,
+            &label_args,
+            &exported_renamed_inputargs,
+            &sp.used_boxes,
+            &sp.jump_args,
             p2_ni,
             phase2_inputarg_base,
             jump_was_redirected,
@@ -2246,15 +2239,16 @@ impl UnrollOptimizer {
                     let first = 1 + config.vable_input_offset;
                     appended_label_args
                         .iter()
-                        .map(|&arg| {
+                        .map(|arg| {
+                            let arg_ref = arg.to_opref();
                             let slot = arg
-                                .is_input_arg()
-                                .then(|| arg.raw() as usize)
+                                .is_inputarg()
+                                .then(|| arg_ref.raw() as usize)
                                 .filter(|&raw| raw >= first)
                                 .map(|raw| raw - first)
                                 .filter(|&slot| slot < config.static_field_offsets.len())?;
                             let descr = config.static_field_descrs.get(slot).cloned()?;
-                            Some((majit_ir::OpCode::getfield_for_type(arg.ty()?), descr))
+                            Some((majit_ir::OpCode::getfield_for_type(arg.type_()), descr))
                         })
                         .collect::<Option<Vec<_>>>()
                         .unwrap_or_default()
@@ -5038,11 +5032,11 @@ fn build_imported_virtuals_from_state(
     reason = "this parity-test helper exposes every segment and mapping of RPython's peeled-trace assembly independently so failures identify the exact upstream phase input"
 )]
 fn assemble_peeled_trace(
-    p1_ops: &[Op],
-    p2_ops: &[Op],
-    label_args: &[OpRef],
-    start_label_args: &[OpRef],
-    extra_label_args: &[OpRef],
+    p1_ops: &[OpRc],
+    p2_ops: &[OpRc],
+    label_args: &[Operand],
+    start_label_args: &[Operand],
+    extra_label_args: &[Operand],
     body_num_inputs: usize,
     jump_was_redirected: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
@@ -5051,11 +5045,9 @@ fn assemble_peeled_trace(
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<majit_ir::OpRc> {
     let mut ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
-    let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops.iter().map(|op| OpRc::new(op.clone())).collect();
-    let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops.iter().map(|op| OpRc::new(op.clone())).collect();
     assemble_peeled_trace_with_jump_args(
-        &p1_ops_rc,
-        &p2_ops_rc,
+        p1_ops,
+        p2_ops,
         label_args,
         start_label_args,
         extra_label_args,
@@ -5074,7 +5066,7 @@ fn assemble_peeled_trace(
 }
 
 #[cfg(test)]
-fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -> OptContext {
+fn assemble_test_context(p1_ops: &[OpRc], p2_ops: &[OpRc], body_num_inputs: usize) -> OptContext {
     // Test helper — caller provides only the body inputarg count, so seed
     // every slot as Ref (matches the common loop-body shape; fixtures that
     // need typed inputargs construct ctx directly).
@@ -5119,40 +5111,29 @@ fn emit_alias_same_as_for_imports(
 /// never received.
 fn push_fallthrough_same_as(
     fallthrough_aliases: &mut Vec<Op>,
-    stream_defs: &crate::FxIndexSet<OpRef>,
-    arg: OpRef,
+    stream_defs: &crate::FxIndexSet<Operand>,
+    arg: &Operand,
     constants: &majit_ir::ConstMap<majit_ir::Value>,
-    ctx: &mut crate::optimizeopt::OptContext,
 ) {
-    if !is_trace_runtime_ref(arg, constants) || stream_defs.contains(&arg) {
+    if !is_trace_runtime_ref(arg.to_opref(), constants) || stream_defs.contains(arg) {
         return;
     }
-    let Some(source) = stream_defs
-        .iter()
-        .copied()
-        .find(|&source| source != arg && ctx.get_replacement_opref(source) == arg)
-    else {
+    let Some(source) = stream_defs.iter().find(|source| {
+        !(*source).eq(arg)
+            && source
+                .get_box_replacement(false)
+                .same_box(&arg.get_box_replacement(false))
+    }) else {
         return;
     };
-    let tp = ctx
-        .opref_type(arg)
-        .or_else(|| ctx.opref_type(source))
-        .or_else(|| arg.ty())
-        .unwrap_or_else(|| {
-            panic!(
-                "assemble_peeled_trace_with_jump_args: cannot type \
-                 fallthrough SameAs alias arg={:?} source={:?}; \
-                 ctx.opref_type(arg), ctx.opref_type(source), and \
-                 arg.ty() all returned None",
-                arg, source
-            )
-        });
+
+    let tp = arg.type_();
     if tp == Type::Void {
         return;
     }
-    let arg_source = ctx.materialize_operand_at(source);
-    let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
-    same_as.pos().set(arg);
+
+    let mut same_as = Op::new(OpCode::same_as_for_type(tp), std::slice::from_ref(source));
+    same_as.pos().set(arg.to_opref());
     fallthrough_aliases.push(same_as);
 }
 
@@ -5163,10 +5144,10 @@ fn push_fallthrough_same_as(
 fn assemble_peeled_trace_with_jump_args(
     p1_ops: &[majit_ir::OpRc],
     p2_ops: &[majit_ir::OpRc],
-    label_args: &[OpRef],
-    start_label_args: &[OpRef],
-    extra_label_args: &[OpRef],
-    extra_jump_args: &[OpRef],
+    label_args: &[Operand],
+    start_label_args: &[Operand],
+    extra_label_args: &[Operand],
+    extra_jump_args: &[Operand],
     body_num_inputs: usize,
     inputarg_base: u32,
     jump_was_redirected: bool,
@@ -5175,7 +5156,7 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[Operand],
-    appended_label_args: &mut Vec<OpRef>,
+    appended_label_args: &mut Vec<Operand>,
     ctx: &mut crate::optimizeopt::OptContext,
 ) -> Vec<majit_ir::OpRc> {
     let mut result =
@@ -5208,12 +5189,15 @@ fn assemble_peeled_trace_with_jump_args(
     // a stale backend-constants entry must not make us drop a live runtime
     // Box from the LABEL/JUMP contract (e.g. an imported short-preamble
     // HeapField result that still has optimizer constant knowledge attached).
-    for (idx, &label_arg) in extra_label_args.iter().enumerate() {
-        let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if !short_extra_is_carried(label_arg) {
+    for (idx, label_arg) in extra_label_args.iter().enumerate() {
+        let jump_arg = extra_jump_args
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| label_arg.clone());
+        if !short_extra_box_is_carried(label_arg) {
             continue;
         }
-        filtered_extra_label_args.push(label_arg);
+        filtered_extra_label_args.push(label_arg.clone());
         filtered_extra_jump_args.push(jump_arg);
     }
     let next_free_pos = |mut next: u32| {
@@ -5230,12 +5214,7 @@ fn assemble_peeled_trace_with_jump_args(
     // producerless and `stream_defs` would hide the hole.
     let emit_start_label = start_label_descr.is_some();
     if let Some(start_label_descr) = start_label_descr {
-        let mut start_label_args_box_operand: Vec<majit_ir::operand::Operand> =
-            Vec::with_capacity(start_label_args.len());
-        for a in start_label_args {
-            start_label_args_box_operand.push(ctx.materialize_operand_at(*a));
-        }
-        let mut start_label = Op::new(OpCode::Label, &start_label_args_box_operand);
+        let mut start_label = Op::new(OpCode::Label, start_label_args);
         start_label.pos().set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
         result.push(OpRc::new(start_label));
@@ -5282,45 +5261,35 @@ fn assemble_peeled_trace_with_jump_args(
     // `<=0 ∧ >=0 ⇒ ==0`), and dropping that label slot while the jump keeps
     // rebinding it desyncs the label/jump contract and orphans the head guard's
     // operand. RPython performs no such filter.
-    let mut full_label_args: Vec<OpRef> = label_args.to_vec();
+    let mut full_label_args: Vec<Operand> = label_args.to_vec();
     debug_assert!(
         full_label_args.iter().all(|arg| !arg.is_constant()),
         "base label arg is an inline-Const OpRef; LEVEL_CONSTANT virtual-state \
          slots must be dropped at make_inputargs enum time, not at assembly"
     );
 
-    // Collect preamble-defined OpRefs BEFORE adding extra label args,
+    // Collect preamble-defined boxes BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
     //
-    // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: preamble-defined
-    // inputargs carry `box.type` intrinsically (history.py:220). Mint
-    // typed variants from `inputarg_types` so this set's OpRefs match the
-    // typed mints used at trace start / Phase 2 import under variant-aware
-    // Eq.
-    let preamble_defs: crate::FxIndexSet<OpRef> = {
-        let mut s: crate::FxIndexSet<OpRef> = (0..body_num_inputs)
-            .map(|i| {
-                let pos = inputarg_base + i as u32;
-                // history.py:220 box.type / resoperation.py InputArgInt/727/739  allow-line-citation
-                // InputArgInt/Float/Ref invariant: every label / inputarg
-                // carries a value-box class. RPython has no InputArgVoid;
-                // a missing type at this site is a structural bookkeeping
-                // bug. `inputarg_type_at_strict` panics on miss with the
-                // RPython-citation message rather than recovering into
-                // VoidOp / a guessed default.
-                let tp = ctx.inputarg_type_at_strict(i);
-                OpRef::input_arg_typed(pos, tp)
-            })
-            .collect();
+    // resoperation.py InputArgInt/Float/Ref: preamble-defined
+    // inputargs carry `box.type` intrinsically (`history.py` box.type).
+    let preamble_defs: crate::FxIndexSet<Operand> = {
+        let mut defs = crate::FxIndexSet::default();
+        for i in 0..body_num_inputs {
+            defs.insert(
+                ctx.inputarg_at(i)
+                    .expect("phase-2 input must have a bound InputArg box"),
+            );
+        }
         for op in &result {
             if !op.pos().get().is_none()
                 && op.opcode != OpCode::Jump
                 && op.result_type() != Type::Void
             {
-                s.insert(op.pos().get());
+                defs.insert(Operand::from_bound_op(op));
             }
         }
-        s
+        defs
     };
 
     // Append non-constant extra label args. The caller (unroll pass)
@@ -5334,14 +5303,14 @@ fn assemble_peeled_trace_with_jump_args(
     // positions/args/fail_args — each of those may be referenced by the
     // body. A single colliding OpRef aliases two distinct values and
     // corrupts the loop.
-    for &la in &full_label_args {
-        if is_trace_runtime_ref(la, constants) {
-            max_pos = max_pos.max(la.raw().saturating_add(1));
+    for la in &full_label_args {
+        if is_trace_runtime_ref(la.to_opref(), constants) {
+            max_pos = max_pos.max(la.to_opref().raw().saturating_add(1));
         }
     }
-    for &la in &filtered_extra_label_args {
-        if is_trace_runtime_ref(la, constants) {
-            max_pos = max_pos.max(la.raw().saturating_add(1));
+    for la in &filtered_extra_label_args {
+        if is_trace_runtime_ref(la.to_opref(), constants) {
+            max_pos = max_pos.max(la.to_opref().raw().saturating_add(1));
         }
     }
     for op in p2_ops.iter() {
@@ -5362,7 +5331,7 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
     let extra_label_start_idx = full_label_args.len();
-    full_label_args.extend(filtered_extra_label_args.iter().copied());
+    full_label_args.extend(filtered_extra_label_args.iter().cloned());
 
     // RPython compile.py parity: after the loop label, the loop-header
     // contract is `label_op` + `sb.used_boxes`. A preamble-defined box
@@ -5372,33 +5341,28 @@ fn assemble_peeled_trace_with_jump_args(
     // Those become extra_before_label SameAs ops, not extra LABEL args:
     // `_jump_to_existing_trace` JUMP extras are only the remapped
     // `used_boxes`. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
-    carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
-    // `label_set` tracks which OpRefs are already carried by the label so
-    // that the body-use-before-def pass doesn't add the same OpRef twice
+    let mut carried_source_slots: crate::FxIndexSet<Operand> = crate::FxIndexSet::default();
+    carried_source_slots.extend(filtered_extra_jump_args.iter().cloned());
+    // `label_set` tracks which boxes are already carried by the label so
+    // that the body-use-before-def pass doesn't add the same Box twice
     // (which would inflate label arity without adding new information).
     // RPython's Box identity makes this a correctness filter: two
     // references to the same Box collapse into one live-in slot. This
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: crate::FxIndexSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: crate::FxIndexSet<Operand> = full_label_args.iter().cloned().collect();
     let mut fallthrough_aliases = Vec::new();
-    let remap_dsts: &[OpRef] = if emit_start_label {
-        start_label_args
-    } else {
-        full_label_args.as_slice()
-    };
     // Values available BEFORE the loop LABEL. The start LABEL's args are
     // live only when that LABEL is actually emitted; the loop LABEL's
     // args are destinations of that LABEL, not producers. Seeding them
     // here drops the fallthrough SameAs that binds a preamble box onto
     // a remapped LABEL slot.
-    let mut stream_defs: crate::FxIndexSet<OpRef> = if emit_start_label {
+    let mut stream_defs: crate::FxIndexSet<Operand> = if emit_start_label {
         start_label_args
             .iter()
-            .copied()
-            .filter(|a| is_trace_runtime_ref(*a, constants))
+            .filter(|arg| is_trace_runtime_ref(arg.to_opref(), constants))
+            .cloned()
             .collect()
     } else {
         crate::FxIndexSet::default()
@@ -5406,7 +5370,7 @@ fn assemble_peeled_trace_with_jump_args(
     for op in &result {
         if !op.pos().get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void
         {
-            stream_defs.insert(op.pos().get());
+            stream_defs.insert(Operand::from_bound_op(op));
         }
     }
     // Phase 2 optimizer inputargs live at `[inputarg_base, inputarg_base+n)`.
@@ -5414,23 +5378,25 @@ fn assemble_peeled_trace_with_jump_args(
     // used to do this translation; assembly now owns it). A Phase-2
     // InputArg that is not rewritten here is appended as a LABEL live-in
     // with no producer (`InputArgRef(99)` with token inputs `[0, 1]`).
-    let mut phase2_input_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
-        rustc_hash::FxHashMap::default();
-    if inputarg_base > 0 {
-        for i in 0..body_num_inputs {
-            let tp = ctx.inputarg_type_at_strict(i);
-            let src = OpRef::input_arg_typed(inputarg_base + i as u32, tp);
-            let dst = remap_dsts
-                .get(i)
-                .copied()
-                .unwrap_or_else(|| OpRef::input_arg_typed(i as u32, tp));
-            if src != dst {
-                phase2_input_remap.insert(src, dst);
-            }
+    let mut phase2_input_remap: crate::FxIndexMap<Operand, Operand> = crate::FxIndexMap::default();
+    for i in 0..body_num_inputs {
+        let src = ctx
+            .inputarg_at(i)
+            .expect("phase-2 input must have a bound InputArg box");
+        let dst = if emit_start_label {
+            start_label_args.get(i).cloned()
+        } else {
+            full_label_args.get(i).cloned()
+        }
+        .unwrap_or_else(|| OptUnroll::inputarg_from_tp(ctx, src.type_()));
+
+        if !src.eq(&dst) {
+            phase2_input_remap.insert(src, dst);
         }
     }
+    let mut body_source_boxes: crate::FxIndexSet<Operand> = crate::FxIndexSet::default();
     {
-        let mut seen_body_defs = crate::FxIndexSet::default();
+        let mut seen_body_defs: crate::FxIndexSet<Operand> = crate::FxIndexSet::default();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -5441,14 +5407,14 @@ fn assemble_peeled_trace_with_jump_args(
             if op.opcode == OpCode::Jump {
                 continue;
             }
-            let mut consider_arg = |arg: OpRef| {
-                if !is_trace_runtime_ref(arg, constants) {
+            let mut consider_arg = |arg: &Operand| {
+                if !is_trace_runtime_ref(arg.to_opref(), constants) {
                     return; // skip NONE and constants
                 }
-                if label_set.contains(&arg)
-                    || carried_source_slots.contains(&arg)
-                    || seen_body_defs.contains(&arg)
-                    || phase2_input_remap.contains_key(&arg)
+                if label_set.contains(arg)
+                    || carried_source_slots.contains(arg)
+                    || seen_body_defs.contains(arg)
+                    || phase2_input_remap.contains_key(arg)
                 {
                     return;
                 }
@@ -5456,23 +5422,15 @@ fn assemble_peeled_trace_with_jump_args(
                 // preamble rather than carrying it on the header.
                 // `forget_optimization_info` then clears `_forwarded`,
                 // so the backend only sees the SameAs + Const.
-                if let Some(const_op) = const_ref_replacement(ctx, arg) {
-                    let tp = const_op.type_();
-                    if tp != Type::Void {
-                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
-                        same_as.pos().set(arg);
-                        fallthrough_aliases.push(same_as);
-                    }
+                if let Some(const_op) = const_ref_replacement(arg) {
+                    let mut same_as =
+                        Op::new(OpCode::same_as_for_type(const_op.type_()), &[const_op]);
+                    same_as.pos().set(arg.to_opref());
+                    fallthrough_aliases.push(same_as);
                     return;
                 }
                 let aliases_before = fallthrough_aliases.len();
-                push_fallthrough_same_as(
-                    &mut fallthrough_aliases,
-                    &stream_defs,
-                    arg,
-                    constants,
-                    ctx,
-                );
+                push_fallthrough_same_as(&mut fallthrough_aliases, &stream_defs, arg, constants);
                 // unroll.py `finalize_short_preamble`:
                 //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
                 // compile.py `compile_loop` splices `extra_same_as` and
@@ -5502,21 +5460,28 @@ fn assemble_peeled_trace_with_jump_args(
                 // `label_tail_unrebuildable` and
                 // `_jump_to_existing_trace` skips it.
                 let just_pushed_alias = fallthrough_aliases.len() > aliases_before
-                    && fallthrough_aliases.last().is_some_and(|op| {
-                        op.pos().get() == arg && stream_defs.contains(&op.arg(0).to_opref())
+                    && fallthrough_aliases.last().is_some_and(|same_as| {
+                        same_as.pos().get() == arg.to_opref()
+                            && stream_defs.contains(&same_as.arg(0))
                     });
-                if stream_defs.contains(&arg) || just_pushed_alias {
-                    full_label_args.push(arg);
-                    appended_label_args.push(arg);
+                if stream_defs.contains(arg) || just_pushed_alias {
+                    full_label_args.push(arg.clone());
+                    appended_label_args.push(arg.clone());
                 }
-                label_set.insert(arg);
+                label_set.insert(arg.clone());
             };
-            for a in op.args_slice().iter() {
-                consider_arg(a.to_opref());
+            for arg in op.args_slice() {
+                consider_arg(arg);
             }
-            op.visit_failarg_oprefs(&mut consider_arg);
+            if let Some(fail_args) = op.guard_fail_args() {
+                for arg in fail_args {
+                    consider_arg(arg);
+                }
+            }
             if op.result_type() != Type::Void && !op.pos().get().is_none() {
-                seen_body_defs.insert(op.pos().get());
+                let source = Operand::from_bound_op(op);
+                seen_body_defs.insert(source.clone());
+                body_source_boxes.insert(source);
             }
         }
     }
@@ -5526,43 +5491,44 @@ fn assemble_peeled_trace_with_jump_args(
     // reminted producerless RefOp loses that identity — recover it when
     // the arg still forwards to an InputArg so `patch_new_loop` can
     // rewrite the slot to the GETARRAYITEM it installs on that inputarg.
-    for a in &mut full_label_args {
-        let resolved = ctx.get_replacement_opref(*a);
-        if resolved.is_input_arg() {
-            *a = resolved;
+    for arg in &mut full_label_args {
+        let resolved = arg.get_box_replacement(false);
+        if resolved.is_inputarg() {
+            *arg = resolved;
         }
     }
 
     // SameAs for every LABEL arg that is a forwarded preamble box, not
     // only extras discovered from a body use-before-def. Base label_args
     // sit in `label_set` from the start, so the scan above never saw them.
-    for &arg in &full_label_args {
+    for arg in &full_label_args {
         if arg.is_none() {
             continue;
         }
-        if fallthrough_aliases.iter().any(|op| op.pos().get() == arg) {
+        if fallthrough_aliases
+            .iter()
+            .any(|op| op.pos().get() == arg.to_opref())
+        {
             continue;
         }
-        push_fallthrough_same_as(&mut fallthrough_aliases, &stream_defs, arg, constants, ctx);
-        if fallthrough_aliases.iter().any(|op| op.pos().get() == arg) {
+        push_fallthrough_same_as(&mut fallthrough_aliases, &stream_defs, arg, constants);
+        if fallthrough_aliases
+            .iter()
+            .any(|op| op.pos().get() == arg.to_opref())
+        {
             continue;
         }
-        if let Some(const_op) = const_ref_replacement(ctx, arg) {
+        if let Some(const_op) = const_ref_replacement(arg) {
             let tp = const_op.type_();
             if tp != Type::Void {
                 let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
-                same_as.pos().set(arg);
+                same_as.pos().set(arg.to_opref());
                 fallthrough_aliases.push(same_as);
             }
         }
     }
 
-    let mut full_label_args_box_operand: Vec<majit_ir::operand::Operand> =
-        Vec::with_capacity(full_label_args.len());
-    for a in &full_label_args {
-        full_label_args_box_operand.push(ctx.materialize_operand_at(*a));
-    }
-    let mut label_op = Op::new(OpCode::Label, &full_label_args_box_operand);
+    let mut label_op = Op::new(OpCode::Label, &full_label_args);
     // resoperation.py AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
     // a stray Int tag. `op_index` filters Void ops so this OpRef never
@@ -5578,10 +5544,10 @@ fn assemble_peeled_trace_with_jump_args(
     result.extend(fallthrough_aliases.into_iter().map(OpRc::new));
     result.push(OpRc::new(label_op));
 
-    // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
+    // Body: remap (inputarg boxes -> label args, body results -> cloned boxes)
     let max_label_arg_pos = full_label_args
         .iter()
-        .map(|a| a.raw())
+        .map(|a| a.to_opref().raw())
         .max()
         .unwrap_or(label_pos);
     let max_emitted_pos = result
@@ -5612,58 +5578,24 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    // Keyed lookup only (`get`/`insert`, never iterated — codegen order comes
-    // from the `p2_ops` walk below), so a hash map keeps each per-op remap O(1)
-    // instead of the IndexMap linear `get_index_of` scan on long peeled traces.
-    let mut body_result_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
-        rustc_hash::FxHashMap::default();
-    let visible_before_label: crate::FxIndexSet<OpRef> = full_label_args
-        .iter()
-        .copied()
-        .chain(preamble_defs.iter().copied())
-        .collect();
+    let mut body_result_remap: crate::FxIndexMap<Operand, Operand> = crate::FxIndexMap::default();
 
-    let mut assembly_alias_remap: rustc_hash::FxHashMap<OpRef, OpRef> = phase2_input_remap;
-    for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
+    let mut assembly_alias_remap: crate::FxIndexMap<Operand, Operand> = phase2_input_remap;
+    for (i, source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
         }
-        let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) else {
+        let Some(extended_label_arg) = full_label_args.get(extra_label_start_idx + i) else {
             continue;
         };
-        if let Some(&jump_source) = filtered_extra_jump_args.get(i)
+        if let Some(jump_source) = filtered_extra_jump_args.get(i)
             && !jump_source.is_none()
             && jump_source != source_slot
         {
-            let b_js = ctx.materialize_operand_at(jump_source);
-            let b_ela = match ctx.get_box_replacement_operand_opt(extended_label_arg) {
-                Some(b) => b,
-                None => ctx.materialize_operand_at(extended_label_arg),
-            };
-            ctx.make_equal_to(&b_js, &b_ela);
+            let jump_source = jump_source.clone();
+            let extended_label_arg = extended_label_arg.clone();
+            ctx.make_equal_to(&jump_source, &extended_label_arg);
             assembly_alias_remap.insert(jump_source, extended_label_arg);
-        }
-    }
-    for op in p2_ops.iter() {
-        // Only map non-Void ops that actually produce a result.
-        // Void ops (SetfieldGc, guards, Jump) don't define values at
-        // their position — mapping them creates phantom OpRefs.
-        if op.pos().get().raw() != u32::MAX && op.result_type() != Type::Void {
-            // history.py:220 box.type / resoperation.py/589/615 IntOp /
-            // RefOp / FloatOp.type — the fresh result Box inherits the
-            // producing op's type tag so downstream readers (`opref_type`
-            // typed-first arm + variant-aware HashMap/HashSet lookups)
-            // see the correct `box.type` instead of a default-int guess.
-            //
-            // OptUnroll's peel/body copy reserves with `reserve_virtual_box`
-            // (`ResOperation(...)` at allocation). Assembly uses a private
-            // `next_body_pos` to stay above preamble/label slots, so mint
-            // the box at that position (`mint_box_at`) instead of leaving a
-            // producer-less `*Op` for later `materialize_operand_at`.
-            let fresh = OpRef::op_typed(next_body_pos, op.result_type());
-            next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
-            ctx.mint_box_at(fresh);
-            body_result_remap.insert(op.pos().get(), fresh);
         }
     }
     // unroll.py `_map_args` rewrites body uses by explicit Box mapping,
@@ -5671,40 +5603,44 @@ fn assemble_peeled_trace_with_jump_args(
     // body-local box before its producer is a splice/forwarding defect;
     // do not infer the LABEL live-in from JUMP[i] (`.find()` is first-slot
     // on duplicates).
-    let mut seen_body_defs = crate::FxIndexSet::default();
-    // Combined-trace position → emitted clone, so remap hits bind to the
-    // body clone producer instead of re-minting a position-only box (SSA:
-    // a remapped arg's target clone was pushed in an earlier iteration).
-    let mut emitted_at: rustc_hash::FxHashMap<OpRef, majit_ir::OpRc> =
-        rustc_hash::FxHashMap::default();
     for op in p2_ops.iter() {
         if op.opcode == OpCode::Label {
             panic!("LABEL unexpected in peel assembly p2_ops: {:?}", op,);
         }
+        let source_result = (op.result_type() != Type::Void && !op.pos().get().is_none())
+            .then(|| Operand::from_bound_op(op));
+
         let mut new_op = (**op).clone();
-        if let Some(&mapped_pos) = body_result_remap.get(&op.pos().get()) {
-            new_op.pos().set(mapped_pos);
+
+        if source_result.is_some() {
+            new_op
+                .pos()
+                .set(OpRef::op_typed(next_body_pos, new_op.result_type()));
+            next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
         }
         // Body op args were already resolved at emit time by
         // optimizer.py / Optimizer::emit_operation. Do not walk
         // forwarding chains again here: postprocess_GUARD_TRUE/FALSE may have
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
-        let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
-                              body_result_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
-                              seen_body_defs: &crate::FxIndexSet<OpRef>,
-                              visible_before_label: &crate::FxIndexSet<OpRef>|
-         -> OpRef {
-            if let Some(&mapped) = assembly_alias_remap.get(&arg) {
-                return mapped;
+        let remap_body_arg = |arg: &Operand,
+                              assembly_alias_remap: &crate::FxIndexMap<Operand, Operand>,
+                              body_result_remap: &crate::FxIndexMap<Operand, Operand>,
+                              body_source_boxes: &crate::FxIndexSet<Operand>|
+         -> Operand {
+            if let Some(mapped) = assembly_alias_remap.get(arg) {
+                return mapped.clone();
             }
-            if let Some(&mapped) = body_result_remap.get(&arg)
-                && (seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg))
-            {
-                return mapped;
+            if let Some(mapped) = body_result_remap.get(arg) {
+                return mapped.clone();
             }
-            arg
+            if body_source_boxes.contains(arg) {
+                panic!(
+                    "peeled body uses result box before its cloned definition: {:?}",
+                    arg
+                );
+            }
+            arg.clone()
         };
         // optimizer.py force_box loop pattern:
         //   for i in range(op.numargs()): op.setarg(i, ...)
@@ -5712,27 +5648,15 @@ fn assemble_peeled_trace_with_jump_args(
         // (a bound operand stays live-tracking instead of degrading to a
         // position-only re-mint of the same position).
         for i in 0..new_op.num_args() {
-            let arg = new_op.arg(i).to_opref();
+            let arg = new_op.arg(i);
             let mapped = remap_body_arg(
-                arg,
+                &arg,
                 &assembly_alias_remap,
                 &body_result_remap,
-                &seen_body_defs,
-                &visible_before_label,
+                &body_source_boxes,
             );
-            if mapped != arg {
-                // A remap hit whose target clone was already pushed binds to
-                // that producer; otherwise route through the canonical
-                // "box always exists" materializer (parity with the start_label
-                // / jump_source / extended_label_arg sites above) so the arg
-                // carries a bound `Operand::Op`/`InputArg` instead of a
-                // position-only box. `materialize_operand_at(mapped).to_opref() ==
-                // mapped`, so the rewritten arg is OpRef-identical.
-                let boxed = match emitted_at.get(&mapped) {
-                    Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
-                    None => ctx.materialize_operand_at(mapped),
-                };
-                new_op.setarg(i, boxed);
+            if !mapped.eq(&arg) {
+                new_op.setarg(i, mapped);
             }
         }
         if new_op.opcode == OpCode::Jump {
@@ -5740,30 +5664,27 @@ fn assemble_peeled_trace_with_jump_args(
             // force_box / send_extra_operation rewrites. Body args reference
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
-            let mapped_base_args: Vec<OpRef> = new_op
+            let mapped_base_args: Vec<Operand> = new_op
                 .args_slice()
                 .iter()
                 .map(|arg| {
-                    let arg = arg.to_opref();
-                    if jump_was_redirected {
-                        return arg;
+                    if jump_was_redirected || arg.is_constant() {
+                        return arg.clone();
                     }
-                    // unroll.py `_map_args` passes Const through unchanged.
-                    // Inline-Const variants (history.py/268/314) panic on
-                    // `.raw()`; the inline payload IS the value and has no
-                    // positional remap target.
-                    if arg.is_constant() {
-                        return arg;
+                    if let Some(mapped) = assembly_alias_remap.get(arg) {
+                        return mapped.clone();
                     }
-                    if let Some(&mapped) = assembly_alias_remap.get(&arg) {
-                        return mapped;
-                    }
-                    let i = if arg.is_input_arg() && arg.raw() >= inputarg_base {
-                        (arg.raw() - inputarg_base) as usize
+
+                    let arg_ref = arg.to_opref();
+                    let index = if arg.is_inputarg() && arg_ref.raw() >= inputarg_base {
+                        (arg_ref.raw() - inputarg_base) as usize
                     } else {
-                        arg.raw() as usize
+                        arg_ref.raw() as usize
                     };
-                    start_label_args.get(i).copied().unwrap_or(arg)
+                    start_label_args
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| arg.clone())
                 })
                 .collect();
             let jump_target_id = new_op.getdescr().as_ref().map(majit_ir::descr_identity);
@@ -5807,7 +5728,7 @@ fn assemble_peeled_trace_with_jump_args(
                 if jump_args.len() < full_label_args.len() {
                     let have = jump_args.len() - extra_label_start_idx;
                     if have < filtered_extra_jump_args.len() {
-                        jump_args.extend(filtered_extra_jump_args[have..].iter().copied());
+                        jump_args.extend(filtered_extra_jump_args[have..].iter().cloned());
                     }
                     // consider_arg used_boxes appended to the LABEL
                     // after `inline_short_preamble` ran: JUMP extra is
@@ -5818,7 +5739,7 @@ fn assemble_peeled_trace_with_jump_args(
                     if have >= filtered_extra_jump_args.len() {
                         let consider_have = have - filtered_extra_jump_args.len();
                         if consider_have < appended_label_args.len() {
-                            jump_args.extend(appended_label_args[consider_have..].iter().copied());
+                            jump_args.extend(appended_label_args[consider_have..].iter().cloned());
                         }
                     }
                 }
@@ -5832,41 +5753,27 @@ fn assemble_peeled_trace_with_jump_args(
                     );
                 }
             }
-            // unroll.py-style bulk replace: jump arity is finalized here.
-            // A remapped body result is the clone already pushed to
-            // `emitted_at`; mint-at-alloc stand-ins cover a forward ref.
-            let mut jump_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
-                smallvec::SmallVec::with_capacity(jump_args.len());
-            for a in &jump_args {
-                jump_args_box.push(match emitted_at.get(a) {
-                    Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
-                    None => ctx.materialize_operand_at(*a),
-                });
-            }
-            new_op.initarglist(jump_args_box);
+            new_op.initarglist(jump_args);
         }
         // RPython resume.py parity: fail_args capture guard-point state
-        // (the snapshot), not the body's final state. body_result_remap
-        // applies only to values body-defined AND not visible before the
-        // label, so snapshot refs to label args stay intact.
-        if let Some(fa) = new_op.fail_args_mut() {
-            for a in fa.iter_mut() {
-                let current = a.to_opref();
-                if let Some(&mapped) = assembly_alias_remap.get(&current) {
-                    *a = match emitted_at.get(&mapped) {
-                        Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
-                        None => ctx.materialize_operand_at(mapped),
-                    };
+        // (the snapshot), not the body's final state. A body result
+        // available at that guard maps to the already-created clone; a
+        // later body result is invalid SSA.
+        if let Some(fail_args) = new_op.fail_args_mut() {
+            for arg in fail_args {
+                if let Some(mapped) = assembly_alias_remap.get(arg) {
+                    *arg = mapped.clone();
                     continue;
                 }
-                if let Some(&mapped) = body_result_remap.get(&current)
-                    && seen_body_defs.contains(&current)
-                    && !visible_before_label.contains(&current)
-                {
-                    *a = match emitted_at.get(&mapped) {
-                        Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
-                        None => majit_ir::operand::Operand::from_opref(mapped),
-                    };
+                if let Some(mapped) = body_result_remap.get(arg) {
+                    *arg = mapped.clone();
+                    continue;
+                }
+                if body_source_boxes.contains(arg) {
+                    panic!(
+                        "guard snapshot uses result box before its cloned definition: {:?}",
+                        arg
+                    );
                 }
             }
         }
@@ -5881,18 +5788,13 @@ fn assemble_peeled_trace_with_jump_args(
         // therefore emit body guards with unique descrs already; no
         // post-process re-stamping is needed.
         let new_rc = OpRc::new(new_op);
-        if new_rc.result_type() != Type::Void && !new_rc.pos().get().is_none() {
-            // `emit` adopts the mint-at-alloc stand-in onto the real
-            // producer (`adopt_live_synthetic`). Assembly writes a local
-            // clone rather than `ctx.emit`, so register it as the
-            // canonical box at this position.
-            ctx.register_extra_producer(&new_rc);
-            emitted_at.insert(new_rc.pos().get(), new_rc.clone());
+
+        if let Some(source_result) = source_result {
+            let clone_result = Operand::from_bound_op(&new_rc);
+            body_result_remap.insert(source_result, clone_result);
         }
+
         result.push(new_rc);
-        if op.result_type() != Type::Void && !op.pos().get().is_none() {
-            seen_body_defs.insert(op.pos().get());
-        }
     }
 
     if crate::callee_rca_enabled() {
@@ -6314,10 +6216,6 @@ impl Optimization for OptUnroll {
 /// The loop assembler and the bridge close both consult this, so a
 /// constant virtualizable field cannot make the bridge JUMP one arg
 /// longer than the loop LABEL.
-fn short_extra_is_carried(arg: OpRef) -> bool {
-    !arg.is_constant()
-}
-
 fn short_extra_box_is_carried(arg: &Operand) -> bool {
     !arg.is_constant()
 }
@@ -8803,36 +8701,31 @@ mod tests {
     fn test_assemble_peeled_trace_does_not_snapshot_every_body_arglist() {
         // compile.py never builds a Vec of every body's args. Nine
         // setfields + a JUMP (regex-shaped) must still assemble.
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let p10 = rooted_resop_operand(Type::Ref, 10);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let mut p2_ops: Vec<Op> = (0..9)
+            OpRc::new(op)
+        };
+        let p1_box = Operand::from_bound_op(&p1_add);
+        let mut p2_ops: Vec<OpRc> = (0..9)
             .map(|i| {
                 let mut op = Op::new(
                     OpCode::SetfieldGc,
-                    &[
-                        rooted_resop_operand(Type::Ref, 10),
-                        rooted_resop_operand(Type::Int, 3 + i),
-                    ],
+                    &[p10.clone(), rooted_resop_operand(Type::Int, 3 + i)],
                 );
                 op.pos().set(OpRef::void_op(20 + i as u32));
-                op
+                OpRc::new(op)
             })
             .collect();
-        p2_ops.push(Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 3)]));
+        p2_ops.push(OpRc::new(Op::new(OpCode::Jump, &[p1_box.clone()])));
         let combined = assemble_peeled_trace(
-            &p1_ops,
+            &[p1_add],
             &p2_ops,
-            &[OpRef::int_op(3)],
-            &[OpRef::int_op(0)],
+            &[p1_box.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -8854,43 +8747,33 @@ mod tests {
 
     #[test]
     fn test_assemble_peeled_trace_emits_extra_same_as_before_label() {
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntMul,
-                    &[
-                        rooted_resop_operand(Type::Int, 50),
-                        rooted_resop_operand(Type::Int, 0),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(1));
-                op
-            },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 50)]),
-        ];
+            OpRc::new(op)
+        };
+        let p2_mul = {
+            let mut op = Op::new(OpCode::IntMul, &[i50.clone(), i0.clone()]);
+            op.pos().set(OpRef::int_op(1));
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i50.clone()]));
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &[p1_add],
+            &[p2_mul, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: rooted_resop_operand(Type::Int, 50),
-                same_as_source: rooted_resop_operand(Type::Int, 10),
+                result: i50.clone(),
+                same_as_source: i10.clone(),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::ConstMap::default(),
@@ -8900,18 +8783,14 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10)]
-        );
+        assert!(combined[1].arg(0).same_box(&i10));
+        assert_eq!(combined[1].arg(0).to_opref(), i10.to_opref());
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
+        assert!(combined[3].arg(0).same_box(&i50));
         assert_eq!(combined[3].arg(0).to_opref(), combined[1].pos().get());
         assert_eq!(combined[4].opcode, OpCode::Jump);
+        assert!(combined[4].arg(0).same_box(&i50));
         assert_eq!(combined[4].arg(0).to_opref(), combined[1].pos().get());
     }
 
@@ -8919,49 +8798,32 @@ mod tests {
     fn test_assemble_peeled_trace_emits_same_as_for_remapped_label_arg() {
         // The LABEL contract is a Phase-2 forwarded box (50), not the
         // preamble producer (3). Fall-through only has 3; emit SameAs.
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 50),
-                        rooted_resop_operand(Type::Int, 0),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(4));
-                op
-            },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 4)]),
-        ];
-        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
+            OpRc::new(op)
+        };
+        let p1_box = Operand::from_bound_op(&p1_add);
+        let p2_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i50.clone(), i0.clone()]);
+            op.pos().set(OpRef::int_op(4));
+            OpRc::new(op)
+        };
+        let p2_add_box = Operand::from_bound_op(&p2_add);
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[p2_add_box.clone()]));
+        let p1_ops = [p1_add];
+        let p2_ops = [p2_add, p2_jump];
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let src = ctx.materialize_operand_at(OpRef::int_op(3));
-        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_equal_to(&src, &dst);
+        ctx.make_equal_to(&p1_box, &i50);
 
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops_rc,
-            &p2_ops_rc,
-            &[OpRef::int_op(50)],
-            &[OpRef::int_op(0)],
+            &p1_ops,
+            &p2_ops,
+            &[i50.clone()],
+            &[i0.clone()],
             &[],
             &[],
             1,
@@ -8978,19 +8840,12 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(combined[1].pos().get(), OpRef::int_op(50));
-        assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(3)]
-        );
+        assert_eq!(combined[1].pos().get(), i50.to_opref());
+        assert!(combined[1].arg(0).same_box(&p1_box));
         assert_eq!(combined[2].opcode, OpCode::Label);
-        assert_eq!(combined[2].arg(0).to_opref(), OpRef::int_op(50));
+        assert!(combined[2].arg(0).same_box(&i50));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_eq!(combined[3].arg(0).to_opref(), OpRef::int_op(50));
+        assert!(combined[3].arg(0).same_box(&i50));
     }
 
     #[test]
@@ -8998,39 +8853,26 @@ mod tests {
         // A forwarded Phase-2 inputarg slot is not in the assembled
         // preamble. SameAs from it would hand dynasm an InputArgRef
         // the compiled loop never received.
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[rooted_resop_operand(Type::Int, 50)],
-        )];
-        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i50.clone()]));
+        let p1_ops = [p1_add];
+        let p2_ops = [p2_jump];
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let src = ctx.materialize_operand_at(OpRef::input_arg_int(100));
-        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_equal_to(&src, &dst);
+        let src = rooted_inputarg_operand(Type::Int, 100);
+        ctx.make_equal_to(&src, &i50);
 
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops_rc,
-            &p2_ops_rc,
-            &[OpRef::int_op(50)],
-            &[OpRef::int_op(0)],
+            &p1_ops,
+            &p2_ops,
+            &[i50.clone()],
+            &[i0.clone()],
             &[],
             &[],
             1,
@@ -9059,39 +8901,28 @@ mod tests {
     fn test_assemble_peeled_trace_resolves_residual_label_refop_to_inputarg() {
         // compile.py emit_op / get_box_replacement: a reminted residual
         // slot on the body LABEL is the same Box as the expanded inputarg.
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let reminted = rooted_resop_operand(Type::Ref, 85);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[rooted_resop_operand(Type::Ref, 85)],
-        )];
-        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[reminted.clone()]));
+        let p1_ops = [p1_add];
+        let p2_ops = [p2_jump];
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let reminted = ctx.materialize_operand_at(OpRef::ref_op(85));
-        let input = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let input = ctx
+            .inputarg_at(0)
+            .expect("phase-2 input must have a bound InputArg box");
         ctx.make_equal_to(&reminted, &input);
 
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops_rc,
-            &p2_ops_rc,
-            &[OpRef::ref_op(85)],
-            &[OpRef::input_arg_ref(0)],
+            &p1_ops,
+            &p2_ops,
+            &[reminted.clone()],
+            &[input.clone()],
             &[],
             &[],
             1,
@@ -9110,63 +8941,49 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Label)
             .expect("assembled peel has a body LABEL");
-        assert_eq!(
-            label
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::input_arg_ref(0)],
+        assert!(
+            label.arg(0).same_box(&input),
             "residual LABEL RefOp must recover the forwarded InputArg identity"
         );
+        assert_eq!(label.arg(0).to_opref(), OpRef::input_arg_ref(0));
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_label_arg_until_body_redef() {
-        let p1_ops = vec![{
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            op.pos().set(OpRef::int_op(11));
+            OpRc::new(op)
+        };
+        let label_box = Operand::from_bound_op(&p1_add);
+        let p2_ge = {
+            let mut op = Op::new(
+                OpCode::IntGe,
+                &[label_box.clone(), Operand::from_opref(OpRef::const_int(2))],
+            );
+            op.pos().set(OpRef::int_op(4));
+            OpRc::new(op)
+        };
+        let p2_add = {
             let mut op = Op::new(
                 OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
+                &[label_box.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
             op.pos().set(OpRef::int_op(11));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntGe,
-                    &[
-                        rooted_resop_operand(Type::Int, 11),
-                        Operand::from_opref(OpRef::const_int(2)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(4));
-                op
-            },
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 11),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(11));
-                op
-            },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 11)]),
-        ];
+            OpRc::new(op)
+        };
+        let p2_add_box = Operand::from_bound_op(&p2_add);
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[p2_add_box.clone()]));
 
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(11)],
-            &[OpRef::int_op(0)],
+            &[p1_add],
+            &[p2_ge, p2_add, p2_jump],
+            &[label_box.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -9177,27 +8994,27 @@ mod tests {
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(11)]
-        );
+        assert!(combined[1].arg(0).same_box(&label_box));
         assert_eq!(combined[2].opcode, OpCode::IntGe);
-        assert_eq!(combined[2].arg(0).to_opref(), OpRef::int_op(11));
+        assert!(combined[2].arg(0).same_box(&label_box));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_eq!(combined[3].arg(0).to_opref(), OpRef::int_op(11));
-        assert_ne!(combined[3].pos().get(), OpRef::int_op(11));
+        assert!(combined[3].arg(0).same_box(&label_box));
+        assert_ne!(combined[3].pos().get(), label_box.to_opref());
         assert_eq!(combined[4].opcode, OpCode::Jump);
+        let emitted_add = Operand::from_bound_op(&combined[3]);
+        assert!(combined[4].arg(0).same_box(&emitted_add));
+        assert!(!label_box.same_box(&emitted_add));
+        assert!(!p2_add_box.same_box(&emitted_add));
         assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos().get());
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Int, 3)]);
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i3 = rooted_resop_operand(Type::Int, 3);
+        let i25 = rooted_resop_operand(Type::Int, 25);
+        let p1_get = {
+            let mut op = Op::new(OpCode::GetfieldGcR, &[i3.clone()]);
             op.pos().set(OpRef::int_op(19));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
@@ -9206,47 +9023,38 @@ mod tests {
                 Type::Ref,
                 false,
             ));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        rooted_resop_operand(Type::Int, 25),
-                        rooted_resop_operand(Type::Int, 19),
-                    ],
-                );
-                op.setdescr(majit_ir::descr::make_field_descr_full(
-                    57,
-                    8,
-                    8,
-                    Type::Ref,
-                    false,
-                ));
-                op
-            },
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 0),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(19));
-                op
-            },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 19)]),
-        ];
+            OpRc::new(op)
+        };
+        let preamble_box = Operand::from_bound_op(&p1_get);
+        let p2_set = {
+            let mut op = Op::new(OpCode::SetfieldGc, &[i25.clone(), preamble_box.clone()]);
+            op.setdescr(majit_ir::descr::make_field_descr_full(
+                57,
+                8,
+                8,
+                Type::Ref,
+                false,
+            ));
+            OpRc::new(op)
+        };
+        let p2_add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[i0.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(19));
+            OpRc::new(op)
+        };
+        let p2_add_box = Operand::from_bound_op(&p2_add);
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[p2_add_box.clone()]));
 
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(0)],
+            &[p1_get],
+            &[p2_set, p2_add, p2_jump],
+            &[i0.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -9258,10 +9066,13 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].arg(1).to_opref(), OpRef::int_op(19));
+        assert!(combined[2].arg(1).same_box(&preamble_box));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_ne!(combined[3].pos().get(), OpRef::int_op(19));
+        assert_ne!(combined[3].pos().get(), preamble_box.to_opref());
         assert_eq!(combined[4].opcode, OpCode::Jump);
+        let emitted_add = Operand::from_bound_op(&combined[3]);
+        assert!(combined[4].arg(0).same_box(&emitted_add));
+        assert!(!preamble_box.same_box(&emitted_add));
         assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos().get());
     }
 
@@ -9272,49 +9083,33 @@ mod tests {
         // `propagate_from_pass_range` forwarding-resolve pass). We mirror that here by writing the
         // resolved label_arg (OpRef::int_op(10)) directly into the body op rather
         // than the raw inputarg position OpRef::int_op(0).
-        let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p1_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntMul,
-                    &[
-                        rooted_resop_operand(Type::Int, 50),
-                        rooted_resop_operand(Type::Int, 10),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(1));
-                op
-            },
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 10),
-                    rooted_resop_operand(Type::Int, 50),
-                ],
-            ),
-        ];
+            OpRc::new(op)
+        };
+        let p2_mul = {
+            let mut op = Op::new(OpCode::IntMul, &[i50.clone(), i10.clone()]);
+            op.pos().set(OpRef::int_op(1));
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i10.clone(), i50.clone()]));
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(50)],
+            &[p1_add],
+            &[p2_mul, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
+            &[i50.clone()],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: rooted_resop_operand(Type::Int, 50),
-                same_as_source: rooted_resop_operand(Type::Int, 10),
+                result: i50.clone(),
+                same_as_source: i10.clone(),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::ConstMap::default(),
@@ -9323,23 +9118,13 @@ mod tests {
         );
 
         assert_eq!(combined[2].opcode, OpCode::Label);
-        assert_eq!(
-            combined[2]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), combined[1].pos().get()]
-        );
+        assert!(combined[2].arg(0).same_box(&i10));
+        assert!(combined[2].arg(1).same_box(&i50));
+        assert_eq!(combined[2].arg(1).to_opref(), combined[1].pos().get());
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(
-            combined[4]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), combined[1].pos().get()]
-        );
+        assert!(combined[4].arg(0).same_box(&i10));
+        assert!(combined[4].arg(1).same_box(&i50));
+        assert_eq!(combined[4].arg(1).to_opref(), combined[1].pos().get());
     }
 
     #[test]
@@ -9348,48 +9133,42 @@ mod tests {
         // (history.py `ConstInt.value`) untouched as the GuardValue
         // immediate, and the box-namespace entries in the constants
         // snapshot must round-trip unchanged.
-        let p1_ops = vec![{
-            let mut op = Op::new(OpCode::SameAsI, &[rooted_resop_operand(Type::Int, 37)]);
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i22 = rooted_resop_operand(Type::Int, 22);
+        let i37 = rooted_resop_operand(Type::Int, 37);
+        let i150 = rooted_resop_operand(Type::Int, 150);
+        let i850 = rooted_resop_operand(Type::Int, 850);
+        let i853 = rooted_resop_operand(Type::Int, 853);
+        let p1_same = {
+            let mut op = Op::new(OpCode::SameAsI, &[i37.clone()]);
             op.pos().set(OpRef::void_op(857));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[
-                        rooted_resop_operand(Type::Void, 857),
-                        Operand::from_opref(OpRef::const_int(2)),
-                    ],
-                );
-                op.setfailargs(vec![rooted_resop_operand(Type::Void, 857)].into());
-                op
-            },
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 10),
-                    rooted_resop_operand(Type::Int, 853),
-                    rooted_resop_operand(Type::Void, 857),
-                    rooted_resop_operand(Type::Int, 850),
-                ],
-            ),
-        ];
+            OpRc::new(op)
+        };
+        let v857 = Operand::from_bound_op(&p1_same);
+        let const2 = Operand::from_opref(OpRef::const_int(2));
+        let p2_guard = {
+            let mut op = Op::new(OpCode::GuardValue, &[v857.clone(), const2.clone()]);
+            op.setfailargs(vec![v857.clone()].into());
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(
+            OpCode::Jump,
+            &[i10.clone(), i853.clone(), v857.clone(), i850.clone()],
+        ));
+        let p1_ops = [p1_same];
+        let p2_ops = [p2_guard, p2_jump];
         let constants =
             majit_ir::ConstMap::from_iter([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let p1_ops_rc: Vec<majit_ir::OpRc> =
-            p1_ops.iter().map(|op| OpRc::new(op.clone())).collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> =
-            p2_ops.iter().map(|op| OpRc::new(op.clone())).collect();
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops_rc,
-            &p2_ops_rc,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(22), OpRef::void_op(857), OpRef::int_op(150)],
-            &[OpRef::int_op(853), OpRef::void_op(857), OpRef::int_op(850)],
+            &p1_ops,
+            &p2_ops,
+            &[i10.clone()],
+            &[i0.clone()],
+            &[i22.clone(), v857.clone(), i150.clone()],
+            &[i853.clone(), v857.clone(), i850.clone()],
             1,
             0,
             true,
@@ -9403,42 +9182,18 @@ mod tests {
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[
-                OpRef::int_op(10),
-                OpRef::int_op(22),
-                OpRef::void_op(857),
-                OpRef::int_op(150)
-            ]
-        );
+        assert!(combined[1].arg(0).same_box(&i10));
+        assert!(combined[1].arg(1).same_box(&i22));
+        assert!(combined[1].arg(2).same_box(&v857));
+        assert!(combined[1].arg(3).same_box(&i150));
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
-        assert_eq!(
-            combined[2]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::void_op(857), OpRef::const_int(2)]
-        );
+        assert!(combined[2].arg(0).same_box(&v857));
+        assert!(combined[2].arg(1).same_box(&const2));
         assert_eq!(combined[3].opcode, OpCode::Jump);
-        assert_eq!(
-            combined[3]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[
-                OpRef::int_op(10),
-                OpRef::int_op(22),
-                OpRef::void_op(857),
-                OpRef::int_op(150)
-            ]
-        );
+        assert!(combined[3].arg(0).same_box(&i10));
+        assert!(combined[3].arg(1).same_box(&i22));
+        assert!(combined[3].arg(2).same_box(&v857));
+        assert!(combined[3].arg(3).same_box(&i150));
     }
 
     #[test]
@@ -9446,39 +9201,34 @@ mod tests {
         // Production caller pre-resolves body args through
         // ctx.get_box_replacement; OpRef::int_op(0) (Phase 2 inputarg slot) is
         // pre-replaced with OpRef::int_op(10) (the corresponding label_arg).
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::GetfieldGcI, &[rooted_resop_operand(Type::Int, 50)]);
-                op.pos().set(OpRef::int_op(1));
-                op.setdescr(majit_ir::descr::make_field_descr_full(
-                    0,
-                    0,
-                    8,
-                    majit_ir::Type::Int,
-                    true,
-                ));
-                op
-            },
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 10),
-                    rooted_resop_operand(Type::Int, 50),
-                ],
-            ),
-        ];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p2_get = {
+            let mut op = Op::new(OpCode::GetfieldGcI, &[i50.clone()]);
+            op.pos().set(OpRef::int_op(1));
+            op.setdescr(majit_ir::descr::make_field_descr_full(
+                0,
+                0,
+                8,
+                majit_ir::Type::Int,
+                true,
+            ));
+            OpRc::new(op)
+        };
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i10.clone(), i50.clone()]));
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(50)],
+            &[p2_get, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
+            &[i50.clone()],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: rooted_resop_operand(Type::Int, 50),
-                same_as_source: rooted_resop_operand(Type::Int, 10),
+                result: i50.clone(),
+                same_as_source: i10.clone(),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::ConstMap::default(),
@@ -9492,24 +9242,11 @@ mod tests {
             .expect("label");
         let label = &combined[label_idx];
         let extra_label_arg = label.arg(1);
-        assert_eq!(
-            label
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), extra_label_arg.to_opref()]
-        );
+        assert!(label.arg(0).same_box(&i10));
+        assert!(extra_label_arg.same_box(&i50));
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcI);
-        assert_eq!(
-            body_getfield
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![extra_label_arg.to_opref()]
-        );
+        assert!(body_getfield.arg(0).same_box(&extra_label_arg));
     }
 
     fn assert_assembled_loop_ssa_and_label_contract(
@@ -9615,36 +9352,34 @@ mod tests {
         // box. A GuardTrue of the later IntAdd's result box before that
         // def is a splice/forwarding defect, not an assemble rewrite.
         let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 10)]);
-                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
-                op
-            },
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 10),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(64));
-                op
-            },
-            {
-                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]);
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let label_box = rooted_resop_operand(Type::Int, 10);
+        let p2_guard = {
+            let mut op = Op::new(OpCode::GuardTrue, &[label_box.clone()]);
+            op.setfailargs(vec![label_box.clone()].into());
+            OpRc::new(op)
+        };
+        let p2_add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[label_box.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(64));
+            OpRc::new(op)
+        };
+        let p2_add_box = Operand::from_bound_op(&p2_add);
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[p2_add_box.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &[p2_guard, p2_add, p2_jump],
+            &[label_box.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -9660,13 +9395,8 @@ mod tests {
             .iter()
             .position(|op| op.opcode == OpCode::Label)
             .expect("Label");
-        assert_eq!(
-            combined[label_idx]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10)],
+        assert!(
+            combined[label_idx].arg(0).same_box(&label_box),
             "loop-carried use stays the existing LABEL slot, not a new used_box"
         );
         assert!(
@@ -9681,31 +9411,26 @@ mod tests {
             .position(|op| op.opcode == OpCode::GuardTrue)
             .expect("GuardTrue");
         assert!(body_start > label_idx);
-        assert_eq!(
-            combined[body_start].arg(0).to_opref(),
-            OpRef::int_op(10),
+        assert!(
+            combined[body_start].arg(0).same_box(&label_box),
             "GuardTrue reads the LABEL arg JUMP feeds, not the later IntAdd"
         );
-        assert_eq!(
-            combined[body_start]
-                .guard_fail_args()
-                .expect("guard fail args")
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(10)]
-        );
+        let fail_args = combined[body_start]
+            .guard_fail_args()
+            .expect("guard fail args");
+        assert!(fail_args[0].same_box(&label_box));
         assert_eq!(combined[body_start + 1].opcode, OpCode::IntAdd);
-        assert_ne!(combined[body_start + 1].pos().get(), OpRef::int_op(64));
+        assert_ne!(combined[body_start + 1].pos().get(), p2_add_box.to_opref());
         let jump_idx = combined
             .iter()
             .position(|op| op.opcode == OpCode::Jump)
             .expect("Jump");
-        assert_eq!(
-            combined[jump_idx].arg(0).to_opref(),
-            combined[body_start + 1].pos().get(),
+        let emitted_add = Operand::from_bound_op(&combined[body_start + 1]);
+        assert!(
+            combined[jump_idx].arg(0).same_box(&emitted_add),
             "JUMP feeds the reminted IntAdd into LABEL slot 0"
         );
+        assert!(!label_box.same_box(&emitted_add));
         assert_eq!(
             combined[jump_idx].num_args(),
             combined[label_idx].num_args()
@@ -9720,46 +9445,42 @@ mod tests {
         // on the LABEL; a preamble-defined box used after the LABEL is a used_box
         // even when the short-preamble builder did not record it.
         let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
-        let p1_ops = vec![{
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let p1_add = {
             let mut op = Op::new(
                 OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    Operand::from_opref(OpRef::const_int(1)),
-                ],
+                &[i0.clone(), Operand::from_opref(OpRef::const_int(1))],
             );
             op.pos().set(OpRef::int_op(20));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntGe,
-                    &[
-                        rooted_resop_operand(Type::Int, 20),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(30));
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 30)]);
-                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
-                op
-            },
-            {
-                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
+            OpRc::new(op)
+        };
+        let v20 = Operand::from_bound_op(&p1_add);
+        let p2_ge = {
+            let mut op = Op::new(
+                OpCode::IntGe,
+                &[v20.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(30));
+            OpRc::new(op)
+        };
+        let v30 = Operand::from_bound_op(&p2_ge);
+        let p2_guard = {
+            let mut op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
+            op.setfailargs(vec![i10.clone()].into());
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &[p1_add],
+            &[p2_ge, p2_guard, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -9773,28 +9494,20 @@ mod tests {
             .iter()
             .position(|op| op.opcode == OpCode::Label)
             .expect("Label");
-        let label_args: Vec<_> = combined[label_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
-        assert!(label_args.contains(&OpRef::int_op(10)));
+        let label_args = combined[label_idx].args_slice();
+        assert!(label_args.iter().any(|a| a.same_box(&i10)));
         assert!(
-            label_args.contains(&OpRef::int_op(20)),
+            label_args.iter().any(|a| a.same_box(&v20)),
             "preamble-defined body-used box must be a LABEL slot, got {label_args:?}"
         );
         let jump_idx = combined
             .iter()
             .position(|op| op.opcode == OpCode::Jump)
             .expect("Jump");
-        let jump_args: Vec<_> = combined[jump_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
+        let jump_args = combined[jump_idx].args_slice();
         assert_eq!(jump_args.len(), label_args.len());
         assert!(
-            jump_args.contains(&OpRef::int_op(20)),
+            jump_args.iter().any(|a| a.same_box(&v20)),
             "JUMP must carry the preamble box into the LABEL slot, got {jump_args:?}"
         );
     }
@@ -9806,7 +9519,10 @@ mod tests {
         // invented-name SameAs and puts that box on the LABEL
         // (`finalize_short_preamble` `used_boxes`).
         let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
-        let p1_ops = vec![{
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let p1_add = {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
@@ -9815,45 +9531,33 @@ mod tests {
                 ],
             );
             op.pos().set(OpRef::int_op(3));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 50),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(4));
-                op
-            },
-            {
-                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
-        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-            .iter()
-            .map(|op| majit_ir::OpRc::new(op.clone()))
-            .collect();
+            OpRc::new(op)
+        };
+        let p1_box = Operand::from_bound_op(&p1_add);
+        let p2_add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[i50.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(4));
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
+        let p1_ops = [p1_add];
+        let p2_ops = [p2_add, p2_jump];
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let src = ctx.materialize_operand_at(OpRef::int_op(3));
-        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_equal_to(&src, &dst);
+        ctx.make_equal_to(&p1_box, &i50);
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace_with_jump_args(
-            &p1_ops_rc,
-            &p2_ops_rc,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &p1_ops,
+            &p2_ops,
+            &[i10.clone()],
+            &[i0.clone()],
             &[],
             &[],
             1,
@@ -9874,28 +9578,20 @@ mod tests {
             .iter()
             .position(|op| op.opcode == OpCode::Label)
             .expect("Label");
-        let label_args: Vec<_> = combined[label_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
-        assert!(label_args.contains(&OpRef::int_op(10)));
+        let label_args = combined[label_idx].args_slice();
+        assert!(label_args.iter().any(|a| a.same_box(&i10)));
         assert!(
-            label_args.contains(&OpRef::int_op(50)),
+            label_args.iter().any(|a| a.same_box(&i50)),
             "forwarded alias must be a LABEL slot, got {label_args:?}"
         );
         let jump_idx = combined
             .iter()
             .position(|op| op.opcode == OpCode::Jump)
             .expect("Jump");
-        let jump_args: Vec<_> = combined[jump_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
+        let jump_args = combined[jump_idx].args_slice();
         assert_eq!(jump_args.len(), label_args.len());
         assert!(
-            jump_args.contains(&OpRef::int_op(50)),
+            jump_args.iter().any(|a| a.same_box(&i50)),
             "JUMP must carry the forwarded alias into the LABEL slot, got {jump_args:?}"
         );
     }
@@ -9909,7 +9605,9 @@ mod tests {
         // not. A non-redirected JUMP that still targets the local loop
         // LABEL used to keep its Phase-2 args and was one slot short.
         let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
-        let p1_ops = vec![{
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let p1_add = {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
@@ -9918,38 +9616,35 @@ mod tests {
                 ],
             );
             op.pos().set(OpRef::int_op(20));
-            op
-        }];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntGe,
-                    &[
-                        rooted_resop_operand(Type::Int, 20),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(30));
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 30)]);
-                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
-                op
-            },
-            {
-                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
+            OpRc::new(op)
+        };
+        let v20 = Operand::from_bound_op(&p1_add);
+        let p2_ge = {
+            let mut op = Op::new(
+                OpCode::IntGe,
+                &[v20.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(30));
+            OpRc::new(op)
+        };
+        let v30 = Operand::from_bound_op(&p2_ge);
+        let p2_guard = {
+            let mut op = Op::new(OpCode::GuardTrue, &[v30.clone()]);
+            op.setfailargs(vec![i10.clone()].into());
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i10.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &[p1_add],
+            &[p2_ge, p2_guard, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
             &[],
             1,
             false,
@@ -9969,18 +9664,10 @@ mod tests {
             .iter()
             .position(|op| op.opcode == OpCode::Jump)
             .expect("Jump");
-        let label_args: Vec<_> = combined[label_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
-        let jump_args: Vec<_> = combined[jump_idx]
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
+        let label_args = combined[label_idx].args_slice();
+        let jump_args = combined[jump_idx].args_slice();
         assert!(
-            label_args.contains(&OpRef::int_op(20)),
+            label_args.iter().any(|a| a.same_box(&v20)),
             "preamble-defined body-used box must be a LABEL slot, got {label_args:?}"
         );
         assert_eq!(
@@ -9991,39 +9678,51 @@ mod tests {
         // Producer stays in the preamble: the back-edge value is the LABEL
         // arg itself (shortpreamble.py ExtendedShortPreambleBuilder.add_preamble_op
         // loop-carried unchanged).
-        assert_eq!(jump_args, label_args);
+        assert!(
+            label_args
+                .iter()
+                .zip(jump_args.iter())
+                .all(|(l, j)| l.same_box(j))
+        );
     }
 
     #[test]
     fn test_assemble_peeled_trace_does_not_route_jump_by_preamble_descr() {
         let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
-        let p2_ops = vec![{
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i2 = rooted_resop_operand(Type::Int, 2);
+        let i3 = rooted_resop_operand(Type::Int, 3);
+        let i4 = rooted_resop_operand(Type::Int, 4);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i11 = rooted_resop_operand(Type::Int, 11);
+        let i12 = rooted_resop_operand(Type::Int, 12);
+        let i13 = rooted_resop_operand(Type::Int, 13);
+        let i14 = rooted_resop_operand(Type::Int, 14);
+        let i100 = rooted_resop_operand(Type::Int, 100);
+        let i101 = rooted_resop_operand(Type::Int, 101);
+        let i102 = rooted_resop_operand(Type::Int, 102);
+        let p2_jump = {
             let mut jump = Op::new(
                 OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                    rooted_resop_operand(Type::Int, 2),
-                    rooted_resop_operand(Type::Int, 3),
-                    rooted_resop_operand(Type::Int, 4),
-                ],
+                &[i0.clone(), i1.clone(), i2.clone(), i3.clone(), i4.clone()],
             );
             jump.setdescr(start_descr.clone());
-            jump
-        }];
+            OpRc::new(jump)
+        };
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
+            &[p2_jump],
             &[
-                OpRef::int_op(10),
-                OpRef::int_op(11),
-                OpRef::int_op(12),
-                OpRef::int_op(13),
-                OpRef::int_op(14),
+                i10.clone(),
+                i11.clone(),
+                i12.clone(),
+                i13.clone(),
+                i14.clone(),
             ],
-            &[OpRef::int_op(100), OpRef::int_op(101), OpRef::int_op(102)],
-            &[OpRef::int_op(13), OpRef::int_op(14)],
+            &[i100.clone(), i101.clone(), i102.clone()],
+            &[i13.clone(), i14.clone()],
             5,
             false,
             &[],
@@ -10035,60 +9734,43 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::Jump);
-        // RPython parity: unroll.py `jump_to_preamble` retargets the
-        // Jump before compile.py assembles the trace, and this assembly helper
+        // unroll.py `jump_to_preamble` retargets the Jump before
+        // compile.py assembles the trace, and this assembly helper
         // must not derive a different arg contract by inspecting that descr.
         // The caller is responsible for constructing the preamble-shaped Jump.
-        assert_eq!(
-            combined[2]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[
-                OpRef::int_op(100),
-                OpRef::int_op(101),
-                OpRef::int_op(102),
-                OpRef::int_op(3),
-                OpRef::int_op(4)
-            ]
-        );
+        let jump_args = combined[2].args_slice();
+        assert_eq!(jump_args.len(), 5);
+        assert!(jump_args[0].same_box(&i100));
+        assert!(jump_args[1].same_box(&i101));
+        assert!(jump_args[2].same_box(&i102));
+        assert!(jump_args[3].same_box(&i3));
+        assert!(jump_args[4].same_box(&i4));
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_preamble_jump_arity_when_body_label_is_shorter() {
         let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 0),
-                        rooted_resop_operand(Type::Int, 1),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(2));
-                op
-            },
-            {
-                let mut jump = Op::new(
-                    OpCode::Jump,
-                    &[
-                        rooted_resop_operand(Type::Int, 0),
-                        rooted_resop_operand(Type::Int, 1),
-                    ],
-                );
-                jump.setdescr(start_descr.clone());
-                jump
-            },
-        ];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i100 = rooted_resop_operand(Type::Int, 100);
+        let i101 = rooted_resop_operand(Type::Int, 101);
+        let p2_add = {
+            let mut op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+            op.pos().set(OpRef::int_op(2));
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i0.clone(), i1.clone()]);
+            jump.setdescr(start_descr.clone());
+            OpRc::new(jump)
+        };
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(0)],
-            &[OpRef::int_op(100), OpRef::int_op(101)],
+            &[p2_add, p2_jump],
+            &[i0.clone()],
+            &[i100.clone(), i101.clone()],
             &[],
             2,
             false,
@@ -10100,51 +9782,41 @@ mod tests {
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
-        assert_eq!(
-            jump.args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(100), OpRef::int_op(101)]
-        );
+        assert_eq!(jump.args_slice().len(), 2);
+        assert!(jump.arg(0).same_box(&i100));
+        assert!(jump.arg(1).same_box(&i101));
     }
 
     #[test]
     fn test_assemble_peeled_trace_does_not_extend_body_label_with_preamble_jump_only_args() {
         let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 10),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(20));
-                op
-            },
-            {
-                let mut jump = Op::new(
-                    OpCode::Jump,
-                    &[
-                        rooted_resop_operand(Type::Int, 10),
-                        rooted_resop_operand(Type::Int, 50),
-                        rooted_resop_operand(Type::Int, 60),
-                    ],
-                );
-                jump.setdescr(start_descr.clone());
-                jump
-            },
-        ];
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let i50 = rooted_resop_operand(Type::Int, 50);
+        let i60 = rooted_resop_operand(Type::Int, 60);
+        let i100 = rooted_resop_operand(Type::Int, 100);
+        let i101 = rooted_resop_operand(Type::Int, 101);
+        let i102 = rooted_resop_operand(Type::Int, 102);
+        let p2_add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[i10.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(20));
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i10.clone(), i50.clone(), i60.clone()]);
+            jump.setdescr(start_descr.clone());
+            OpRc::new(jump)
+        };
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(100), OpRef::int_op(101), OpRef::int_op(102)],
+            &[p2_add, p2_jump],
+            &[i10.clone()],
+            &[i100.clone(), i101.clone(), i102.clone()],
             &[],
             1,
             false,
@@ -10162,43 +9834,29 @@ mod tests {
                         == Some(majit_ir::descr_identity(&loop_descr))
             })
             .expect("body label");
-        assert_eq!(
-            body_label
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10)]
-        );
+        assert_eq!(body_label.args_slice().len(), 1);
+        assert!(body_label.arg(0).same_box(&i10));
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
-        assert_eq!(
-            jump.args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)]
-        );
+        assert_eq!(jump.args_slice().len(), 3);
+        assert!(jump.arg(0).same_box(&i10));
+        assert!(jump.arg(1).same_box(&i50));
+        assert!(jump.arg(2).same_box(&i60));
     }
 
     #[test]
     fn test_assemble_peeled_trace_skips_constant_slots_for_new_body_positions() {
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::New, &[]);
-                op.pos().set(OpRef::ref_op(1));
-                op
-            },
-            Op::new(
-                OpCode::SetfieldGc,
-                &[
-                    rooted_resop_operand(Type::Ref, 1),
-                    rooted_resop_operand(Type::Int, 0),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
-        ];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let new_op = {
+            let mut op = Op::new(OpCode::New, &[]);
+            op.pos().set(OpRef::ref_op(1));
+            OpRc::new(op)
+        };
+        let new_box = Operand::from_bound_op(&new_op);
+        let p2_setfield = OpRc::new(Op::new(OpCode::SetfieldGc, &[new_box.clone(), i0.clone()]));
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i0.clone()]));
         let constants = majit_ir::ConstMap::from_iter([
             (2_u32, majit_ir::Value::Int(606)),
             (4_u32, majit_ir::Value::Int(611)),
@@ -10206,9 +9864,9 @@ mod tests {
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
+            &[new_op, p2_setfield, p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
             &[],
             1,
             true,
@@ -10223,33 +9881,36 @@ mod tests {
         assert_ne!(combined[1].pos().get(), OpRef::int_op(2));
         assert_ne!(combined[1].pos().get(), OpRef::int_op(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].arg(0).to_opref(), combined[1].pos().get());
+        assert!(
+            combined[2]
+                .arg(0)
+                .same_box(&Operand::from_bound_op(&combined[1]))
+        );
     }
 
     #[test]
     fn test_assemble_peeled_trace_skips_constant_extra_label_args() {
-        // Production caller pre-resolves the Jump's body inputarg ref
-        // (OpRef::int_op(0)) to label_args[0] = OpRef::int_op(10) before it reaches the
-        // assembler.
+        // Production caller pre-resolves the Jump's body inputarg to
+        // the LABEL's first box before it reaches the assembler.
         //
         // `extra_label_args` holds one literal Const entry and one Box.
         // The filter keeps Boxes (they still back runtime slots) and drops
         // literal Const entries (their value is emitted inline at use
         // sites). Mirrors `assemble_peeled_trace_with_jump_args`'s
         // `label_arg.is_constant()` predicate.
-        let const_extra = OpRef::const_int(606);
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[rooted_resop_operand(Type::Int, 10)],
-        )];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i8 = rooted_resop_operand(Type::Int, 8);
+        let i10 = rooted_resop_operand(Type::Int, 10);
+        let const_extra = Operand::from_opref(OpRef::const_int(606));
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i10.clone()]));
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(10)],
-            &[OpRef::int_op(0)],
-            &[const_extra, OpRef::int_op(8)],
+            &[p2_jump],
+            &[i10.clone()],
+            &[i0.clone()],
+            &[const_extra, i8.clone()],
             1,
             true,
             &[],
@@ -10259,35 +9920,31 @@ mod tests {
         );
 
         assert_eq!(combined[0].opcode, OpCode::Label);
-        assert_eq!(
-            combined[0]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), OpRef::int_op(8)]
-        );
+        assert_eq!(combined[0].args_slice().len(), 2);
+        assert!(combined[0].arg(0).same_box(&i10));
+        assert!(combined[0].arg(1).same_box(&i8));
     }
 
     #[test]
     fn loop_label_and_bridge_jump_drop_the_same_constant_extra() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i8 = rooted_resop_operand(Type::Int, 8);
+        let i9 = rooted_resop_operand(Type::Int, 9);
+        let i10 = rooted_resop_operand(Type::Int, 10);
         let extras = [
-            OpRef::const_int(16),
-            OpRef::int_op(8),
-            OpRef::const_int(0),
-            OpRef::int_op(9),
+            Operand::from_opref(OpRef::const_int(16)),
+            i8.clone(),
+            Operand::from_opref(OpRef::const_int(0)),
+            i9.clone(),
         ];
-        let base = [OpRef::int_op(10)];
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[rooted_resop_operand(Type::Int, 10)],
-        )];
+        let base = [i10.clone()];
+        let p2_jump = OpRc::new(Op::new(OpCode::Jump, &[i10.clone()]));
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
+            &[p2_jump],
             &base,
-            &[OpRef::int_op(0)],
+            &[i0.clone()],
             &extras,
             1,
             true,
@@ -10296,19 +9953,24 @@ mod tests {
             None,
             None,
         );
-        let label_args: Vec<_> = combined[0]
-            .getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
+        let label_args = combined[0].getarglist();
         let mut jump_args = base.to_vec();
         jump_args.extend(
             extras
-                .into_iter()
-                .filter(|arg| short_extra_is_carried(*arg)),
+                .iter()
+                .filter(|arg| short_extra_box_is_carried(arg))
+                .cloned(),
         );
         assert_eq!(
-            jump_args, label_args,
+            jump_args.len(),
+            label_args.len(),
+            "a bridge JUMP and its loop LABEL carry the same boxes"
+        );
+        assert!(
+            jump_args
+                .iter()
+                .zip(label_args.iter())
+                .all(|(j, l)| j.same_box(l)),
             "a bridge JUMP and its loop LABEL carry the same boxes"
         );
     }
@@ -10316,47 +9978,38 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_passes_through_resolved_body_inputs() {
         // Production caller pre-resolves Phase 2 body op args through
-        // ctx.get_box_replacement (`optimizer.rs`'s
-        // `propagate_from_pass_range`), so by the time
+        // get_box_replacement (`propagate_from_pass_range`), so by the time
         // they reach assemble_peeled_trace they already match label_args.
-        // The assembler is therefore a passthrough for inputarg references
+        // The assembler is therefore a passthrough for those boxes
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        rooted_resop_operand(Type::Int, 200),
-                        Operand::from_opref(OpRef::const_int(1)),
-                    ],
-                );
-                op.pos().set(OpRef::int_op(20));
-                op
-            },
-            {
-                // `_jump_to_existing_trace` already emits `args + extra`.
-                // Assembly does not invent a missing virtual-state slot
-                // from the LABEL's own input.
-                let mut jump = Op::new(
-                    OpCode::Jump,
-                    &[
-                        rooted_resop_operand(Type::Int, 200),
-                        rooted_resop_operand(Type::Int, 300),
-                    ],
-                );
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i200 = rooted_resop_operand(Type::Int, 200);
+        let i300 = rooted_resop_operand(Type::Int, 300);
+        let p2_add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[i200.clone(), Operand::from_opref(OpRef::const_int(1))],
+            );
+            op.pos().set(OpRef::int_op(20));
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            // `_jump_to_existing_trace` already emits `args + extra`.
+            // Assembly does not invent a missing virtual-state slot
+            // from the LABEL's own input.
+            let mut jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(200), OpRef::int_op(300)],
-            &[OpRef::int_op(0)],
+            &[p2_add, p2_jump],
+            &[i200.clone(), i300.clone()],
+            &[i0.clone()],
             &[],
             6,
             true,
@@ -10367,25 +10020,15 @@ mod tests {
         );
 
         assert_eq!(combined[0].opcode, OpCode::Label);
-        assert_eq!(
-            combined[0]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(200), OpRef::int_op(300)]
-        );
+        assert_eq!(combined[0].args_slice().len(), 2);
+        assert!(combined[0].arg(0).same_box(&i200));
+        assert!(combined[0].arg(1).same_box(&i300));
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
-        assert_eq!(combined[1].arg(0).to_opref(), OpRef::int_op(200));
+        assert!(combined[1].arg(0).same_box(&i200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
-        assert_eq!(
-            combined[2]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(200), OpRef::int_op(300)]
-        );
+        assert_eq!(combined[2].args_slice().len(), 2);
+        assert!(combined[2].arg(0).same_box(&i200));
+        assert!(combined[2].arg(1).same_box(&i300));
     }
 
     #[test]
@@ -10396,31 +10039,30 @@ mod tests {
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let base = 99u32;
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, base)]);
-                op.pos().set(OpRef::ref_op(200));
-                op
-            },
-            {
-                let mut jump = Op::new(
-                    OpCode::Jump,
-                    &[
-                        rooted_inputarg_operand(Type::Ref, base),
-                        rooted_inputarg_operand(Type::Ref, base + 1),
-                    ],
-                );
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
-        ];
-        let mut ctx = assemble_test_context(&[], &p2_ops, 2);
-        let p2_ops_rc: Vec<majit_ir::OpRc> =
-            p2_ops.iter().cloned().map(majit_ir::OpRc::new).collect();
-        let start = [OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
+        let mut ctx = assemble_test_context(&[], &[], 2);
+        let p2_i0 = ctx
+            .inputarg_at(0)
+            .expect("phase-2 input must have a bound InputArg box");
+        let p2_i1 = ctx
+            .inputarg_at(1)
+            .expect("phase-2 input must have a bound InputArg box");
+        let start0 = rooted_inputarg_operand(Type::Ref, 0);
+        let start1 = rooted_inputarg_operand(Type::Ref, 1);
+        let start = [start0.clone(), start1.clone()];
+        let p2_same = {
+            let mut op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
+            op.pos().set(OpRef::ref_op(200));
+            OpRc::new(op)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
+        let p2_ops = [p2_same, p2_jump];
         let combined = assemble_peeled_trace_with_jump_args(
             &[],
-            &p2_ops_rc,
+            &p2_ops,
             &start,
             &start,
             &[],
@@ -10440,19 +10082,21 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Label)
             .expect("assembled loop LABEL");
-        let label_args: Vec<OpRef> = label.args_slice().iter().map(|a| a.to_opref()).collect();
         assert!(
-            !label_args
+            !label
+                .args_slice()
                 .iter()
-                .any(|a| a.is_input_arg() && a.raw() >= base),
-            "Phase-2 InputArg({base}+i) must not remain on the LABEL: {label_args:?}"
+                .any(|a| a.to_opref().is_input_arg() && a.to_opref().raw() >= base),
+            "Phase-2 InputArg({base}+i) must not remain on the LABEL: {:?}",
+            label.args_slice()
         );
         let jump = combined
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
             .expect("assembled JUMP");
-        let jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
-        assert_eq!(jump_args, start.to_vec());
+        assert_eq!(jump.args_slice().len(), 2);
+        assert!(jump.arg(0).same_box(&start0));
+        assert!(jump.arg(1).same_box(&start1));
     }
 
     #[test]
@@ -10463,40 +10107,39 @@ mod tests {
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let base = 99u32;
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, base)]);
-                op.pos().set(OpRef::ref_op(200));
-                op
-            },
-            {
-                let mut guard = Op::new(
-                    OpCode::GuardTrue,
-                    &[rooted_inputarg_operand(Type::Ref, base)],
-                );
-                guard.setfailargs(vec![rooted_inputarg_operand(Type::Ref, base)].into());
-                guard
-            },
-            {
-                let mut jump = Op::new(
-                    OpCode::Jump,
-                    &[
-                        rooted_inputarg_operand(Type::Ref, base),
-                        rooted_inputarg_operand(Type::Ref, base + 1),
-                    ],
-                );
-                jump.setdescr(loop_descr.clone());
-                jump
-            },
+        let mut ctx = assemble_test_context(&[], &[], 2);
+        let p2_i0 = ctx
+            .inputarg_at(0)
+            .expect("phase-2 input must have a bound InputArg box");
+        let p2_i1 = ctx
+            .inputarg_at(1)
+            .expect("phase-2 input must have a bound InputArg box");
+        let start = [
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
         ];
-        let mut ctx = assemble_test_context(&[], &p2_ops, 2);
-        let p2_ops_rc: Vec<majit_ir::OpRc> =
-            p2_ops.iter().cloned().map(majit_ir::OpRc::new).collect();
-        let start = [OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
-        let loop_label = [OpRef::ref_op(10), OpRef::ref_op(11)];
+        let loop0 = rooted_resop_operand(Type::Ref, 10);
+        let loop1 = rooted_resop_operand(Type::Ref, 11);
+        let loop_label = [loop0.clone(), loop1.clone()];
+        let p2_same = {
+            let mut op = Op::new(OpCode::SameAsR, &[p2_i0.clone()]);
+            op.pos().set(OpRef::ref_op(200));
+            OpRc::new(op)
+        };
+        let p2_guard = {
+            let mut guard = Op::new(OpCode::GuardTrue, &[p2_i0.clone()]);
+            guard.setfailargs(vec![p2_i0.clone()].into());
+            OpRc::new(guard)
+        };
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[p2_i0.clone(), p2_i1.clone()]);
+            jump.setdescr(loop_descr.clone());
+            OpRc::new(jump)
+        };
+        let p2_ops = [p2_same, p2_guard, p2_jump];
         let combined = assemble_peeled_trace_with_jump_args(
             &[],
-            &p2_ops_rc,
+            &p2_ops,
             &loop_label,
             &start,
             &[],
@@ -10516,19 +10159,21 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::SameAsR)
             .expect("assembled SameAsR");
-        assert_eq!(
-            same.arg(0).to_opref(),
-            OpRef::ref_op(10),
+        assert!(
+            same.arg(0).same_box(&loop0),
             "retrace must remap Phase-2 InputArg onto the emitted loop LABEL"
         );
         let guard = combined
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("assembled guard");
+        assert!(
+            guard.arg(0).same_box(&loop0),
+            "retrace guard arg must use the emitted loop LABEL slot"
+        );
         let fa = guard.getfailargs().expect("guard failargs");
-        assert_eq!(
-            fa[0].to_opref(),
-            OpRef::ref_op(10),
+        assert!(
+            fa[0].same_box(&loop0),
             "retrace failarg must use the emitted loop LABEL slot"
         );
         assert!(
@@ -10542,33 +10187,31 @@ mod tests {
     }
 
     /// A JUMP redirected onto ANOTHER trace's target token already carries the
-    /// arity that token's virtual state produced (unroll.py:346-357), so the
-    /// assembler must pass it through. compile.py:334 asserts equal JUMP and
-    /// LABEL arity for the same-label close only; applying that coercion to an
-    /// external close cut the trailing arg and left the backend comparing a
-    /// short JUMP against the target LABEL.
+    /// arity that token's virtual state produced (`unroll.py`
+    /// `_jump_to_existing_trace`), so the assembler must pass it through.
+    /// `compile.py` `compile_loop` asserts equal JUMP and LABEL arity for the
+    /// same-label close only; applying that coercion to an external close cut
+    /// the trailing arg and left the backend comparing a short JUMP against
+    /// the target LABEL.
     #[test]
     fn test_assemble_peeled_trace_keeps_external_target_jump_arity() {
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let external_descr = TargetToken::new_loop(2).as_jump_target_descr();
-        let p2_ops = vec![{
-            let mut jump = Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 200),
-                    rooted_resop_operand(Type::Int, 300),
-                    Operand::from_opref(OpRef::const_int(1)),
-                ],
-            );
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i200 = rooted_resop_operand(Type::Int, 200);
+        let i300 = rooted_resop_operand(Type::Int, 300);
+        let const1 = Operand::from_opref(OpRef::const_int(1));
+        let p2_jump = {
+            let mut jump = Op::new(OpCode::Jump, &[i200.clone(), i300.clone(), const1.clone()]);
             jump.setdescr(external_descr);
-            jump
-        }];
+            OpRc::new(jump)
+        };
 
         let combined = assemble_peeled_trace(
             &[],
-            &p2_ops,
-            &[OpRef::int_op(200), OpRef::int_op(300)],
-            &[OpRef::int_op(0)],
+            &[p2_jump],
+            &[i200.clone(), i300.clone()],
+            &[i0.clone()],
             &[],
             6,
             true,
@@ -10580,13 +10223,10 @@ mod tests {
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
-        assert_eq!(
-            jump.args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(200), OpRef::int_op(300), OpRef::const_int(1)]
-        );
+        assert_eq!(jump.args_slice().len(), 3);
+        assert!(jump.arg(0).same_box(&i200));
+        assert!(jump.arg(1).same_box(&i300));
+        assert!(jump.arg(2).same_box(&const1));
     }
 
     #[test]
