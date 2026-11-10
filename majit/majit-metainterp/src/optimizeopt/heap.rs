@@ -5398,26 +5398,43 @@ mod tests {
         let inner_pos = OpRef::ref_op(101);
         let outer_box = ctx.materialize_operand_at(outer_pos);
         let inner_box = ctx.materialize_operand_at(inner_pos);
-        let heap_entry = |op: Op, res: &Operand| ProducedShortOp {
-            kind: PreambleOpKind::Heap,
-            res: res.clone(),
-            source_op: OpRc::new(op.clone()),
-            preamble_op: OpRc::new(op),
-            invented_name: false,
-            same_as_source: None,
-            label_arg_idx: None,
+        let heap_entry = |op: Op, res: &Operand| {
+            let preamble_op = OpRc::new(op.clone());
+            let replay_box = Operand::from_bound_op(&preamble_op);
+            (
+                replay_box,
+                ProducedShortOp {
+                    kind: PreambleOpKind::Heap,
+                    res: res.clone(),
+                    source_op: OpRc::new(op),
+                    preamble_op,
+                    invented_name: false,
+                    same_as_source: None,
+                    label_arg_idx: None,
+                },
+            )
         };
         let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], object_descr(1));
         outer.pos().set(outer_pos);
-        let mut inner = Op::with_descr(OpCode::GetfieldGcR, &[outer_box.clone()], object_descr(2));
+        let outer_entry = heap_entry(outer, &outer_box);
+        // `HeapOp.add_op_to_short` stores `sb.produce_arg(sop.getarg(0))` on
+        // the replay op: a dependent getfield names the producer's replay box.
+        let mut inner = Op::with_descr(
+            OpCode::GetfieldGcR,
+            &[outer_entry.0.clone()],
+            object_descr(2),
+        );
         inner.pos().set(inner_pos);
-        let short_boxes = vec![
-            (outer_pos, heap_entry(outer, &outer_box)),
-            (inner_pos, heap_entry(inner, &inner_box)),
-        ];
+        let short_boxes = vec![outer_entry, heap_entry(inner, &inner_box)];
         let mut result_map = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        for &(source, _) in &short_boxes {
-            result_map.insert(source, ctx.alloc_op_position_typed(Type::Ref));
+        for (source, produced) in &short_boxes {
+            let pos = ctx.alloc_op_position_typed(Type::Ref).raw();
+            let inputarg = majit_ir::InputArg::from_type_rc(Type::Ref, pos);
+            let result = Operand::from_bound_inputarg(&inputarg);
+            assert!(result.bound_inputarg().is_some());
+            assert_eq!(result.type_(), produced.preamble_op.result_type());
+            assert!(!result.same_box(source));
+            result_map.insert(source.clone(), result);
         }
 
         assert!(

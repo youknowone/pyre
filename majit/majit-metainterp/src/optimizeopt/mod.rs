@@ -4129,17 +4129,10 @@ impl OptContext {
         )> = exported_short_boxes
             .iter()
             .map(|entry| {
-                // `materialize_operand_at`, not `from_bound_op`: a
-                // const-folded entry carries an inline-Const pos,
-                // which resolves to its Const operand. The map keys by this
-                // res operand; the single-op re-export lookup
-                // (pure.rs) reproduces it via `materialize_operand_at(source)`.
-                // The operand's identity is the canonical `_forwarded` host
-                // Rc (a synthetic producer registered on first
-                // materialization), stable across calls, so no warm-up is
-                // needed for the lookup keys to be ptr_eq.
-                let pos = entry.op.pos().get();
-                let res = self.materialize_operand_at(pos);
+                // Bound to the exported replay op itself. The map keys by this
+                // res operand; the produce loop looks the same box up via
+                // `produced_short_op(&self.res)`.
+                let res = Operand::from_bound_op(&entry.op);
                 (
                     res.clone(),
                     crate::optimizeopt::shortpreamble::ProducedShortOp {
@@ -4165,10 +4158,10 @@ impl OptContext {
     /// shortpreamble.py `ShortPreambleBuilder.__init__` parity.
     ///
     /// Reads `exported_state.short_boxes` (`ExportedState.short_boxes`)
-    /// directly and rebuilds the `ShortPreambleBuilder` keyed by Phase 2
-    /// OpRefs. `short_args` is the builder's `label_args`.
+    /// directly and rebuilds the `ShortPreambleBuilder` keyed by the carried
+    /// res boxes. `short_args` is the builder's `label_args`.
     ///
-    /// The Phase-2 result OpRef for each entry is read from `result_map`,
+    /// The Phase-2 result box for each entry is read from `result_map`,
     /// computed before this constructor just as the target `Box` identities
     /// exist before `ProducedShortOp.produce_op` runs. Replay args stay the
     /// exported `preamble_op` args (`rebind_arg` rewrites a dependency to the
@@ -4179,8 +4172,8 @@ impl OptContext {
         &mut self,
         short_args: &[Operand],
         short_inputargs: &[Operand],
-        short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        result_map: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
+        short_boxes: &[(Operand, crate::optimizeopt::shortpreamble::ProducedShortOp)],
+        result_map: &indexmap::IndexMap<Operand, Operand, rustc_hash::FxBuildHasher>,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -4233,7 +4226,7 @@ impl OptContext {
         // Every ProducedShortOp carries two Boxes: `short_op.res` (body)
         // and `preamble_op` (replay, minted by `add_op_to_short`). Guards
         // and short-op args name `preamble_op`, not `res`.
-        for (source, produced_op) in short_boxes {
+        for (_, produced_op) in short_boxes {
             // shortpreamble.py:417-421: op = produced_op.short_op.res;
             //     if isinstance(op, Const): info = optimizer.getinfo(op)
             //     else: info = exported_infos.get(op, None)
@@ -4256,16 +4249,16 @@ impl OptContext {
             }
         }
 
-        // `produced` pairs each exported entry's position with the replay op
+        // `produced` pairs each exported entry's replay box with the replay op
         // minted for it, so `rebind_arg` below can rebind a dependency arg
-        // (which carries the exported entry's position) to that replay op.
+        // (which carries the exported entry's box) to that replay op.
         // `builder_entries` is the
         // builder map: ONE entry per short box keyed by the Phase-1
         // carried res box (`produced_op.res`, the same Rc the produce loop
         // reads as `self.res`). The carried box is invariant to the
         // invented-name replay-position aliasing the dual key compensates for,
         // so the builder map collapses to a single box-identity key.
-        let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
+        let mut produced: Vec<(Operand, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
@@ -4297,15 +4290,14 @@ impl OptContext {
         // first two are carried unchanged; a dependency is rebound to the
         // replay op this builder minted for it, so `use_box` appends that op
         // rather than the exporting phase's producer.
-        let rebind_arg = |produced: &[(OpRef, ProducedShortOp)], arg: Operand| -> Operand {
-            let r = arg.to_opref();
-            if r.is_constant() {
+        let rebind_arg = |produced: &[(Operand, ProducedShortOp)], arg: Operand| -> Operand {
+            if arg.is_constant() {
                 return arg;
             }
             produced
                 .iter()
                 .rev()
-                .find(|(k, _)| *k == r)
+                .find(|(key, _)| key.same_box(&arg))
                 .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
                 .unwrap_or(arg)
         };
@@ -4333,11 +4325,12 @@ impl OptContext {
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
-                    let res = self.materialize_operand_at(op.pos().get());
+                    let preamble_op = OpRc::new(op);
+                    let res = Operand::from_bound_op(&preamble_op);
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
-                        preamble_op: OpRc::new(op),
+                        preamble_op,
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -4345,9 +4338,9 @@ impl OptContext {
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
-                    let replay = produced_op.preamble_op.pos().get();
-                    produced.push((*source, new_pop.clone()));
-                    if *source != replay {
+                    produced.push((source.clone(), new_pop.clone()));
+                    let replay = Operand::from_bound_op(&produced_op.preamble_op);
+                    if !source.same_box(&replay) {
                         produced.push((replay, new_pop));
                     }
                 }
@@ -4377,11 +4370,12 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos().get());
+                            let preamble_op = OpRc::new(op);
+                            let res = Operand::from_bound_op(&preamble_op);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: OpRc::new(op),
+                                preamble_op,
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -4405,11 +4399,12 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos().get());
+                            let preamble_op = OpRc::new(op);
+                            let res = Operand::from_bound_op(&preamble_op);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: OpRc::new(op),
+                                preamble_op,
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -4420,9 +4415,9 @@ impl OptContext {
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
-                    let replay = produced_op.preamble_op.pos().get();
-                    produced.push((*source, new_pop.clone()));
-                    if *source != replay {
+                    produced.push((source.clone(), new_pop.clone()));
+                    let replay = Operand::from_bound_op(&produced_op.preamble_op);
+                    if !source.same_box(&replay) {
                         produced.push((replay, new_pop));
                     }
                 }
@@ -4436,11 +4431,12 @@ impl OptContext {
                     let func_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos().set(produced_op.preamble_op.pos().get());
-                    let res = self.materialize_operand_at(op.pos().get());
+                    let preamble_op = OpRc::new(op);
+                    let res = Operand::from_bound_op(&preamble_op);
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,
-                        preamble_op: OpRc::new(op),
+                        preamble_op,
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -4448,9 +4444,9 @@ impl OptContext {
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
-                    let replay = produced_op.preamble_op.pos().get();
-                    produced.push((*source, new_pop.clone()));
-                    if *source != replay {
+                    produced.push((source.clone(), new_pop.clone()));
+                    let replay = Operand::from_bound_op(&produced_op.preamble_op);
+                    if !source.same_box(&replay) {
                         produced.push((replay, new_pop));
                     }
                 }
@@ -4492,8 +4488,9 @@ impl OptContext {
         };
         // unroll.py:28: assert self.short_preamble_producer is not None
         if let Some(mut builder) = self.active_short_preamble_producer.take() {
+            let replay_box = Operand::from_bound_op(&preamble_op.preamble_op);
             builder.use_box(
-                preamble_source,
+                &replay_box,
                 &preamble_op.preamble_op,
                 &arg_guards,
                 &result_guards,
