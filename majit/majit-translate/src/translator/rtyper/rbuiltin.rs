@@ -4868,7 +4868,8 @@ fn rtype_jit_ll_arraycopy_specialized(
 }
 
 /// Both endpoints are erased (`PyObjectRef`); residualize the native
-/// `jit_ll_arraycopy`. Each lowleveltype is a `Ptr`.
+/// `jit_ll_arraycopy`. Each lowleveltype is a `Ptr`. Both erased
+/// endpoints must have the same lowleveltype.
 fn rtype_jit_ll_arraycopy_erased(
     hop: &HighLevelOp,
     r_source: &dyn Repr,
@@ -4881,6 +4882,13 @@ fn rtype_jit_ll_arraycopy_erased(
 
     arraycopy_require_ptr(r_source.lowleveltype(), "erased source")?;
     arraycopy_require_ptr(r_dest.lowleveltype(), "erased dest")?;
+    if r_source.lowleveltype() != r_dest.lowleveltype() {
+        return Err(TyperError::message(format!(
+            "jit_ll_arraycopy: source and dest name different ARRAYs: erased endpoints {:?} vs {:?}",
+            r_source.lowleveltype(),
+            r_dest.lowleveltype()
+        )));
+    }
     let funcptr = functionptr_with_external_name(
         FuncType {
             args: vec![
@@ -7855,6 +7863,31 @@ mod tests {
             .translate_hl_to_ll(&fx.hop, &mut varmapping)
             .expect_err("erased non-Ptr endpoints must not residualize");
         assert!(err.to_string().contains("is not a Ptr"), "{err}");
+    }
+
+    /// `rgc.py` `ll_arraycopy` `TP == typeOf(dest).TO`: both erased
+    /// endpoints must have the same lowleveltype.
+    #[test]
+    fn jit_ll_arraycopy_erased_endpoints_must_match() {
+        use crate::annotator::model::{SomeInstance, SomePtr};
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Ptr(SomePtr::new(Ptr {
+                TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
+            })),
+            SomeValue::Instance(SomeInstance::new(None, false, Default::default())),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("mismatched erased endpoints must not residualize");
+        assert!(
+            err.to_string()
+                .contains("source and dest name different ARRAYs"),
+            "{err}"
+        );
     }
 
     #[test]

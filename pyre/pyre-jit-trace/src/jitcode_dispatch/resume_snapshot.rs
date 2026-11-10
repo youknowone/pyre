@@ -3540,6 +3540,23 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
             .collect();
         let mut sections_have_markers = true;
         let mut any_blocker = false;
+        // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
+        for frame in &parent_frames[..split] {
+            if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
+                continue;
+            }
+            match frame.resume_marker_jit_pc {
+                Some(pc) => {
+                    if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
+                        any_blocker = true;
+                    }
+                }
+                None => {
+                    sections_have_markers = false;
+                    any_blocker = true;
+                }
+            }
+        }
         for (frame, level) in parent_frames[split..].iter().zip(levels.iter().rev()) {
             match frame.resume_marker_jit_pc {
                 Some(pc) => {
