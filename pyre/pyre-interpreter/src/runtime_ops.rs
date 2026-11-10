@@ -278,13 +278,13 @@ pub(crate) fn jit_clear_published_exception() {
 /// `rpyexc_clear`, return that value.  The value half is
 /// `BH_LAST_EXC_VALUE` (`object_residual_raise`); the backend type/value
 /// pair is then cleared.  A nonzero saved word is returned even when it
-/// is not `MemoryError`.
+/// is not `MemoryError`.  A zero saved word is the no-value `MemoryError`
+/// path (`PyFrame.handle_asynchronous_error`): the allocation-free
+/// `memory_error_singleton`.
 ///
-/// A zero saved word is the no-value `MemoryError` path
-/// (`PyFrame.handle_asynchronous_error`): wrap the allocation-free
-/// `memory_error_singleton` rather than a fresh text carrier.
-#[inline]
-pub fn fetch_memory_error() -> crate::PyError {
+/// Opaque: it reads a thread-local cell and a OnceLock.
+#[majit_macros::dont_look_inside]
+pub fn rpyexc_fetch_exception() -> PyObjectRef {
     let value = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
         let v = c.get();
         c.set(0);
@@ -292,12 +292,17 @@ pub fn fetch_memory_error() -> crate::PyError {
     });
     jit_clear_published_exception();
     if value != 0 {
-        unsafe { crate::PyError::from_exc_object(value as PyObjectRef) }
+        value as PyObjectRef
     } else {
-        unsafe {
-            crate::PyError::from_exc_object(pyre_object::interp_exceptions::memory_error_singleton())
-        }
+        pyre_object::interp_exceptions::memory_error_singleton()
     }
+}
+
+/// The pending allocation exception as a `PyError`
+/// ([`rpyexc_fetch_exception`]).
+#[inline]
+pub fn fetch_memory_error() -> crate::PyError {
+    unsafe { crate::PyError::from_exc_object(rpyexc_fetch_exception()) }
 }
 
 /// llmodel.py _store_exception: publish `exc_obj` into the

@@ -2353,6 +2353,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "w_list_new_empty",
         pyre_object::listobject::w_list_new_empty
     );
+    // `rpyexc_fetch_exception` is a `dont_look_inside` residual.
+    p0!(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::rpyexc_fetch_exception",
+        crate::runtime_ops::rpyexc_fetch_exception,
+    );
+    p0!(
+        &mut entries,
+        "runtime_ops::rpyexc_fetch_exception",
+        crate::runtime_ops::rpyexc_fetch_exception,
+    );
     pa1!(
         &mut entries,
         "pyre_object::listobject::w_list_allocate_instance",
