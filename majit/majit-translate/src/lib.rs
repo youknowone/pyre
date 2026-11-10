@@ -225,6 +225,16 @@ fn build_semantic_program_via_active_frontend(
                     .filter(|paths: &Vec<String>| !paths.is_empty())
             });
         if let Some(paths) = resolved_paths {
+            // Sidecars are Charon-resolved layouts for a cross target.
+            // They are not a second program: intern, DuplicateLeafFacts,
+            // published structs, and graph lowering stay on the host
+            // TypeDecl `name_path` (`jtransform.py`
+            // `Transformer._handle_stroruni_call` tests `SoU.TO == rstr.STR`).
+            let (host_paths, sidecar_paths): (Vec<String>, Vec<String>) = paths
+                .iter()
+                .cloned()
+                .partition(|p| !crate::layout::is_layout_sidecar_path(p));
+            let mut host_decl_paths = std::collections::HashSet::new();
             // The harvest loop parses one artefact at a time and drops it.
             // The second loop reloads each file after
             // `register_transparent_scalar_kinds` so cross-crate
@@ -259,10 +269,16 @@ fn build_semantic_program_via_active_frontend(
             let mut stack_observes: Vec<String> = Vec::new();
             let mut scope_owning_identities: Vec<String> = Vec::new();
             let mut published_structs: Vec<front::mir::PublishedStructBody> = Vec::new();
-            for p in &paths {
+            for p in &host_paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
+                for td in llbc.iter_type_decls() {
+                    let name = td.item_meta.name_path();
+                    if !name.is_empty() {
+                        host_decl_paths.insert(name);
+                    }
+                }
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -354,7 +370,7 @@ fn build_semantic_program_via_active_frontend(
             let gc_struct_ids = declared_gc.gc_struct_ids();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
             published_structs.dedup_by(|a, b| a.path == b.path);
-            for (ord, p) in paths.iter().enumerate() {
+            for (ord, p) in host_paths.iter().enumerate() {
                 let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
@@ -430,6 +446,17 @@ fn build_semantic_program_via_active_frontend(
                 &mut program.enum_variant_by_discriminant,
                 Some(&program.struct_ids),
             );
+            for p in &sidecar_paths {
+                let mut sidecar = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                front::mir::overlay_sidecar_layouts(
+                    &mut program.exact_layouts,
+                    &program.struct_ids,
+                    &mut sidecar,
+                    &host_decl_paths,
+                );
+                prof.mark(&format!("    overlay {p}"));
+            }
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;

@@ -191,6 +191,182 @@ fn crate_prefixed_utf8str_is_str_family() {
     ));
 }
 
+fn utf8str_layout_decl(
+    def_id: u64,
+    path: &[&str],
+    len_offset: u64,
+    size: u64,
+    align: u64,
+) -> serde_json::Value {
+    let mut decl = type_decl_struct(
+        def_id,
+        path,
+        vec![
+            serde_json::json!({
+                "name": "hash",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "len",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }),
+        ],
+    );
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-one-target",
+        "value": {
+            "size": size,
+            "align": align,
+            "variant_layouts": [{"field_offsets": [0, len_offset]}]
+        }
+    }]);
+    decl
+}
+
+/// A layout sidecar may spell a STR-shaped TypeDecl the host artefacts
+/// never interned (`unrelated_crate::unicodeobject::Utf8Str`). Overlay
+/// copies Charon offsets onto the host declaration's identity (full
+/// `name_path`) and ignores that extra spelling, so STR-ness and the
+/// oopspec class root stay the host's (`jtransform.py`
+/// `Transformer._handle_stroruni_call` tests `SoU.TO == rstr.STR`).
+#[test]
+fn sidecar_only_spelling_does_not_change_host_str_layout_identity() {
+    let host = llbc_with_types(
+        "pyre_object",
+        vec![utf8str_layout_decl(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            8,
+            16,
+            8,
+        )],
+        vec![],
+    );
+    let mut sidecar = llbc_with_types(
+        "pyre_object",
+        vec![
+            utf8str_layout_decl(0, &["pyre_object", "unicodeobject", "Utf8Str"], 4, 8, 4),
+            utf8str_layout_decl(1, &["unrelated_crate", "unicodeobject", "Utf8Str"], 4, 8, 4),
+        ],
+        vec![],
+    );
+    let host_paths: std::collections::HashSet<String> = host
+        .iter_type_decls()
+        .map(|td| td.item_meta.name_path())
+        .collect();
+    let host_gc = super::harvest_declared_gc_facts(&host).gc_struct_ids();
+    let raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&host));
+    let (_, _, _, _, _, _, mut exact_layouts, struct_ids) =
+        super::derive_program_metadata(&host, &host_gc, super::no_immutable_fields(), &raw, &[]);
+    let host_sid = struct_ids
+        .get("pyre_object::unicodeobject::Utf8Str")
+        .copied()
+        .flatten()
+        .expect("host interned Utf8Str by full path");
+    assert_eq!(
+        exact_layouts
+            .get(&host_sid)
+            .and_then(|exact| exact.field_offsets.get("len"))
+            .copied(),
+        Some(8),
+        "host extraction keeps native offsets before overlay"
+    );
+    let host_only_tombstones = super::DuplicateLeafFacts::discover(&host).tombstoned_leaves();
+    let host_spelling = super::class_identity_spelling(
+        "pyre_object::unicodeobject::Utf8Str",
+        &host_only_tombstones,
+    );
+    assert_eq!(host_spelling, "unicodeobject::Utf8Str");
+    assert!(is_rstr_str_layout_declaration(&host_spelling));
+    assert!(super::is_str_oopspec_class_root(&host_spelling));
+
+    super::overlay_sidecar_layouts(&mut exact_layouts, &struct_ids, &mut sidecar, &host_paths);
+
+    assert_eq!(
+        exact_layouts
+            .get(&host_sid)
+            .and_then(|exact| exact.field_offsets.get("len"))
+            .copied(),
+        Some(4),
+        "sidecar layout facts land on the host declaration identity"
+    );
+    assert!(
+        struct_ids
+            .get("unrelated_crate::unicodeobject::Utf8Str")
+            .is_none(),
+        "a sidecar-only spelling must not intern a second STR identity"
+    );
+    let after = super::class_identity_spelling(
+        "pyre_object::unicodeobject::Utf8Str",
+        &host_only_tombstones,
+    );
+    assert_eq!(after, host_spelling);
+    assert!(is_rstr_str_layout_declaration(&after));
+    assert!(super::is_str_oopspec_class_root(&after));
+    assert!(!is_rstr_str_layout_declaration(
+        "unrelated_crate::unicodeobject::Utf8Str"
+    ));
+}
+
+/// A later sidecar may repeat the host TypeDecl as Opaque (the
+/// interpreter artefact's copy of `pyre_object::unicodeobject::Utf8Str`).
+/// Overlay must not intern that copy or replace the defining body's
+/// field offsets with an empty Opaque record.
+#[test]
+fn sidecar_opaque_copy_does_not_replace_host_str_layout() {
+    let host = llbc_with_types(
+        "pyre_object",
+        vec![utf8str_layout_decl(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            8,
+            16,
+            8,
+        )],
+        vec![],
+    );
+    let mut sidecar = llbc_with_types(
+        "pyre_interpreter",
+        vec![opaque_type_decl(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+        )],
+        vec![],
+    );
+    let host_paths: std::collections::HashSet<String> = host
+        .iter_type_decls()
+        .map(|td| td.item_meta.name_path())
+        .collect();
+    let host_gc = super::harvest_declared_gc_facts(&host).gc_struct_ids();
+    let raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&host));
+    let (_, _, _, _, _, _, mut exact_layouts, struct_ids) =
+        super::derive_program_metadata(&host, &host_gc, super::no_immutable_fields(), &raw, &[]);
+    let host_sid = struct_ids
+        .get("pyre_object::unicodeobject::Utf8Str")
+        .copied()
+        .flatten()
+        .expect("host interned Utf8Str by full path");
+    super::overlay_sidecar_layouts(&mut exact_layouts, &struct_ids, &mut sidecar, &host_paths);
+    assert_eq!(
+        exact_layouts
+            .get(&host_sid)
+            .and_then(|exact| exact.field_offsets.get("len"))
+            .copied(),
+        Some(8),
+        "an Opaque sidecar copy must not replace the host STR layout"
+    );
+    let spelling = super::class_identity_spelling(
+        "pyre_object::unicodeobject::Utf8Str",
+        &super::DuplicateLeafFacts::discover(&host).tombstoned_leaves(),
+    );
+    assert!(is_rstr_str_layout_declaration(&spelling));
+    assert!(super::is_str_oopspec_class_root(&spelling));
+}
+
 #[test]
 fn raw_ptr_to_str_family_spelling_is_the_star_prefix() {
     assert!(is_raw_ptr_to_str_family_spelling(

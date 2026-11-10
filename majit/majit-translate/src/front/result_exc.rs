@@ -879,9 +879,7 @@ fn raise_merged_err_ctor(
         format!("{name}: merged continue Err in block {block} cannot replay closes ({e})")
     })?;
     let block_id = BlockId(block);
-    for close in closes {
-        push_bracket_close(graph, block_id, close);
-    }
+    replay_bracket_closes(graph, block_id, closes, Default::default());
     // The merged-continue payload's class is not known at this site.
     // A marked instance converts unless its own ops already name the class.
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, payload);
@@ -2151,7 +2149,7 @@ fn lower_result_exc_returns_inner(
         // call otherwise. RootScope closes (`drop_in_place` or the named
         // `root_scope_close` residual) and FrameAnchor closes are re-emitted
         // at the raise site rather than left in a tail the rewrite bypasses.
-        let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
+        let (forward_err, root_scope_closes): (Option<String>, Vec<SpaceOperation>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
                 Err(e) => (Some(format!("Err shell: {e}")), Vec::new()),
@@ -2277,9 +2275,7 @@ fn lower_result_exc_returns_inner(
             // (`codewriter::error_carrier_edges`).
             //
             // Before the raise: the order the guard's destructor runs in.
-            for close in root_scope_closes {
-                push_bracket_close(graph, block_id, close);
-            }
+            replay_bracket_closes(graph, block_id, root_scope_closes, Default::default());
             if let Some(class_name) = raised_class.as_deref() {
                 raised = carry_raised_exception_class(graph, block_id, raised, class_name);
             }
@@ -5205,9 +5201,7 @@ fn raise_returned_from_residual(
             value
         };
         let block_id = crate::model::BlockId(block);
-        for close in closes {
-            graph.push_op_var(block_id, close, true);
-        }
+        replay_bracket_closes(graph, block_id, closes, Default::default());
         let raised = if let Some(class_name) = class_name.as_deref() {
             carry_raised_exception_class(graph, block_id, raised, class_name)
         } else {
@@ -5223,9 +5217,7 @@ fn raise_returned_from_residual(
     // `return from_residual(e)` → `raise e`. The codewriter converts
     // the raised carrier (`codewriter::error_carrier_edges`). Closes on
     // the tail run at the raise, the same way an `Err` shell does.
-    for close in closes {
-        push_bracket_close(graph, block_id, close);
-    }
+    replay_bracket_closes(graph, block_id, closes, Default::default());
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
     Ok(())
 }
@@ -8520,7 +8512,7 @@ fn break_arm_closes(
     path: &[usize],
     break_link: &Link,
     name: &str,
-) -> Result<Vec<OpKind>, String> {
+) -> Result<Vec<SpaceOperation>, String> {
     let e_block = break_link.target.0;
     let Some(residual_result) =
         graph.blocks[e_block]
@@ -8553,7 +8545,7 @@ fn break_arm_closes(
         let hops = [(e_block, break_link), (b, a_to_b)];
         return closes
             .iter()
-            .map(|close| remap_root_scope_close_through_links(graph, close, &hops, name))
+            .map(|close| remap_close_op(graph, close, &hops, name))
             .collect();
     }
     let mut owned: Vec<(usize, Link)> = Vec::new();
@@ -8573,7 +8565,7 @@ fn break_arm_closes(
     // the raise edge; the enclosing rewrite declines.
     closes
         .iter()
-        .map(|close| remap_root_scope_close_through_links(graph, close, &hops, name))
+        .map(|close| remap_close_op(graph, close, &hops, name))
         .collect()
 }
 
@@ -8603,68 +8595,140 @@ fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Con
 }
 
 /// Close-chain acceptance for [`raise_link_through_closes`]: every close
-/// is a Call or `RawFree`. Callers run this before remint so a decline
-/// leaves the call result in place.
-fn accept_bracket_closes(closes: &[OpKind], name: &str) -> Result<(), String> {
+/// is a Call, `RawFree`, or the per-call residual `&T` spill around them.
+/// Callers run this before remint so a decline leaves the call result in place.
+fn accept_bracket_closes(closes: &[SpaceOperation], name: &str) -> Result<(), String> {
     for close in closes {
-        close_value_vars(close, name)?;
+        accept_close_kind(&close.kind, name)?;
     }
     Ok(())
 }
 
-/// Variables a raise-edge close still names. RootScope closes are Calls;
-/// a call-scoped raw cell is `RawFree` (`ScopedAlloc.__exit__`).
-fn close_value_vars(close: &OpKind, name: &str) -> Result<Vec<Variable>, String> {
-    match close {
-        OpKind::Call { args, .. } => Ok(args
-            .iter()
-            .filter_map(|arg| arg.as_variable().cloned())
-            .collect()),
-        OpKind::RawFree { ptr } => Ok(vec![ptr.clone()]),
+fn accept_close_kind(kind: &OpKind, name: &str) -> Result<(), String> {
+    match kind {
+        OpKind::Call { .. }
+        | OpKind::RawFree { .. }
+        | OpKind::RawMalloc { .. }
+        | OpKind::RawStore { .. }
+        | OpKind::RawLoad { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
+        | OpKind::ConstNone => Ok(()),
         other => Err(format!(
-            "{name}: a bracket close is not a call or RawFree ({other:?})"
+            "{name}: a bracket close is not a call, RawFree, or call-scoped spill ({other:?})"
         )),
     }
 }
 
-fn remap_close_onto_raise(
-    graph: &mut FunctionGraph,
-    close: OpKind,
-    close_vars: &[Variable],
-    r_inputs: &[Variable],
-    r_id: BlockId,
-    name: &str,
-) -> Result<OpKind, String> {
-    let map_var = |v: &Variable| {
-        let pos = close_vars
-            .iter()
-            .position(|x| x == v)
-            .expect("collected above");
-        r_inputs[pos].clone()
-    };
-    match close {
-        OpKind::RawFree { ptr } => Ok(OpKind::RawFree { ptr: map_var(&ptr) }),
+/// Variables a close cluster still names after subtracting results it
+/// defines. The guard word is one; a per-call spill pointer is not.
+fn cluster_external_vars(closes: &[SpaceOperation]) -> Vec<Variable> {
+    let defined: std::collections::HashSet<Variable> =
+        closes.iter().filter_map(|op| op.result.clone()).collect();
+    let mut used = Vec::new();
+    for op in closes {
+        for var in op_operand_vars(&op.kind) {
+            if !defined.contains(&var) && !used.contains(&var) {
+                used.push(var);
+            }
+        }
+    }
+    used
+}
+
+fn map_op_kind_vars(kind: OpKind, map: &impl Fn(&Variable) -> Variable) -> OpKind {
+    match kind {
         OpKind::Call {
             target,
             args,
             result_ty,
         } => {
-            let args: Vec<Variable> = args
+            let args = args
                 .into_iter()
                 .map(|arg| match arg {
-                    LinkArg::Value(v) => map_var(&v),
-                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, &c),
+                    LinkArg::Value(v) => LinkArg::Value(map(&v)),
+                    other => other,
                 })
                 .collect();
-            Ok(OpKind::Call {
+            OpKind::Call {
                 target,
-                args: crate::model::call_args(args),
+                args,
                 result_ty,
-            })
+            }
         }
-        other => Err(format!(
-            "{name}: a bracket close is not a call or RawFree ({other:?})"
-        )),
+        OpKind::RawFree { ptr } => OpKind::RawFree { ptr: map(&ptr) },
+        OpKind::RawMalloc {
+            owner,
+            TYPE,
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        } => OpKind::RawMalloc {
+            owner,
+            TYPE,
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length: length.map(|v| map(&v)),
+        },
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawStore {
+            base: map(&base),
+            offset: map(&offset),
+            value: map(&value),
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+        OpKind::RawLoad {
+            base,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawLoad {
+            base: map(&base),
+            offset: map(&offset),
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+        other => other,
+    }
+}
+
+/// Re-emit a close cluster, minting fresh results for defining ops so a
+/// per-call spill cell is allocated on this edge rather than sharing the
+/// bypassed block's `RawMalloc`.
+fn replay_bracket_closes(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    closes: Vec<SpaceOperation>,
+    mut subst: std::collections::HashMap<Variable, Variable>,
+) {
+    for op in closes {
+        let kind = map_op_kind_vars(op.kind, &|v| {
+            subst.get(v).cloned().unwrap_or_else(|| v.clone())
+        });
+        let new_result = op.result.as_ref().map(|old| {
+            let new = graph.alloc_value_var();
+            copy_concretetype(old, &new);
+            subst.insert(old.clone(), new.clone());
+            new
+        });
+        graph.blocks[block.0].operations.push(SpaceOperation {
+            result: new_result,
+            kind,
+        });
     }
 }
 
@@ -8674,7 +8738,7 @@ fn remap_close_onto_raise(
 /// to a block that re-emits them in order and then raises the caught value.
 fn raise_link_through_closes(
     graph: &mut FunctionGraph,
-    closes: Vec<OpKind>,
+    closes: Vec<SpaceOperation>,
     name: &str,
 ) -> Result<Link, String> {
     accept_bracket_closes(&closes, name)?;
@@ -8690,14 +8754,7 @@ fn raise_link_through_closes(
             Some(crate::model::exception_exitcase()),
         )
     } else {
-        let mut close_vars: Vec<Variable> = Vec::new();
-        for close in &closes {
-            for var in close_value_vars(close, name)? {
-                if !close_vars.contains(&var) {
-                    close_vars.push(var);
-                }
-            }
-        }
+        let close_vars = cluster_external_vars(&closes);
         // R: `[close args..., etype, evalue]`; re-emit the closes, then
         // raise the caught value.
         let n = close_vars.len();
@@ -8705,11 +8762,11 @@ fn raise_link_through_closes(
         for (input, src) in r_inputs.iter().zip(close_vars.iter()) {
             copy_concretetype(src, input);
         }
-        for close in closes {
-            let remapped =
-                remap_close_onto_raise(graph, close, &close_vars, &r_inputs, r_id, name)?;
-            push_bracket_close(graph, r_id, remapped);
+        let mut subst = std::collections::HashMap::new();
+        for (src, input) in close_vars.iter().zip(r_inputs.iter()) {
+            subst.insert(src.clone(), input.clone());
         }
+        replay_bracket_closes(graph, r_id, closes, subst);
         // `r_inputs[n + 1]` is the caught value, a block input. It may be
         // the carrier. This planner does not know a minted class, so the
         // fresh `type()` raise stays unstamped.
@@ -10865,7 +10922,7 @@ fn verify_drain_reraise_returns_err_payload(
     reraise_target: usize,
     e_payload: &Variable,
     name: &str,
-) -> Result<Vec<OpKind>, String> {
+) -> Result<Vec<SpaceOperation>, String> {
     let ops = &graph.blocks[reraise_target].operations;
     // `outer = Result::Err()` shell ctor.
     let ctor = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
@@ -10913,9 +10970,11 @@ fn verify_drain_reraise_returns_err_payload(
     // in a later empty forward. It is re-emitted at the substituted raise.
     let mut closes = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        if crate::front::mir::is_root_scope_drop_glue_call(&op.kind) {
+        if crate::front::mir::is_root_scope_drop_glue_call(&op.kind)
+            || crate::front::mir::is_call_scoped_raw_spill_op(&op.kind)
+        {
             recognized.push(i);
-            closes.push(op.kind.clone());
+            closes.push(op.clone());
         }
     }
     // Only these ops may carry an effect; any other side-effecting op
@@ -11657,11 +11716,9 @@ fn try_fuse_drain_match(
         .iter()
         .map(|(block, link)| (*block, link))
         .collect();
-    let reraise_closes_a: Vec<OpKind> = reraise_closes
+    let reraise_closes_a: Vec<SpaceOperation> = reraise_closes
         .iter()
-        .map(|close| {
-            remap_root_scope_close_through_links(graph, close, &close_hops, "drain reraise close")
-        })
+        .map(|close| remap_close_op(graph, close, &close_hops, "drain reraise close"))
         .collect::<Result<_, _>>()?;
 
     // Build the normal (Ok) edge args (A scope), no mutation yet.
@@ -11961,20 +12018,10 @@ fn try_fuse_drain_match(
             }
         }
     }
-    let mut close_vars_a = Vec::new();
-    for close in &reraise_closes_a {
-        let OpKind::Call { args, .. } = close else {
-            unreachable!("validated RootScope close is a call")
-        };
-        for arg in args {
-            if let Some(var) = arg.as_variable() {
-                if !close_vars_a.contains(var) {
-                    close_vars_a.push(var.clone());
-                }
-                if !forwarded.contains(var) {
-                    forwarded.push(var.clone());
-                }
-            }
+    let close_vars_a = cluster_external_vars(&reraise_closes_a);
+    for var in &close_vars_a {
+        if !forwarded.contains(var) {
+            forwarded.push(var.clone());
         }
     }
 
@@ -12083,36 +12130,11 @@ fn try_fuse_drain_match(
     // residual to the arm a guard-failure resume walks.
     // The rewind the substituted tail would have run, re-emitted before the
     // raise: the order the guard's destructor ran in.
-    for close in reraise_closes_a {
-        let OpKind::Call {
-            target,
-            args,
-            result_ty,
-        } = close
-        else {
-            unreachable!("validated RootScope close is a call")
-        };
-        let args = args
-            .iter()
-            .map(|arg| match arg {
-                LinkArg::Value(v) => close_vars_a
-                    .iter()
-                    .position(|x| x == v)
-                    .map(|i| r_inputs[i + 1].clone())
-                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument")),
-                LinkArg::Const(c) => Ok(materialize_call_arg_constant(graph, r_id, c)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        graph.push_op_var(
-            r_id,
-            OpKind::Call {
-                target,
-                args: crate::model::call_args(args),
-                result_ty,
-            },
-            true,
-        );
+    let mut close_subst = std::collections::HashMap::new();
+    for (i, src) in close_vars_a.iter().enumerate() {
+        close_subst.insert(src.clone(), r_inputs[i + 1].clone());
     }
+    replay_bracket_closes(graph, r_id, reraise_closes_a, close_subst);
     crate::front::exc_from_raise::set_raise_from_instance(graph, r_id, r_vb);
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
@@ -12286,15 +12308,31 @@ pub(crate) fn build_shell(
     shell
 }
 
-/// RootScope closes are Calls (they produce a result). A call-scoped
-/// raw-cell `RawFree` is the same lifetime close and has no result.
-fn close_has_result(kind: &OpKind) -> bool {
-    matches!(kind, OpKind::Call { .. })
+fn remap_close_op(
+    graph: &FunctionGraph,
+    close: &SpaceOperation,
+    hops: &[(usize, &Link)],
+    name: &str,
+) -> Result<SpaceOperation, String> {
+    Ok(SpaceOperation {
+        result: close.result.clone(),
+        kind: remap_root_scope_close_through_links(graph, &close.kind, hops, name, true)?,
+    })
 }
 
-fn push_bracket_close(graph: &mut FunctionGraph, block: BlockId, close: OpKind) {
-    let has_result = close_has_result(&close);
-    graph.push_op_var(block, close, has_result);
+fn remap_var_through_links(
+    graph: &FunctionGraph,
+    var: &Variable,
+    hops: &[(usize, &Link)],
+    name: &str,
+    keep_local: bool,
+) -> Result<Variable, String> {
+    let remapped =
+        remap_close_arg_through_links(graph, &LinkArg::Value(var.clone()), hops, name, keep_local)?;
+    remapped
+        .as_variable()
+        .cloned()
+        .ok_or_else(|| format!("{name}: remapped operand is not a value"))
 }
 
 fn remap_root_scope_close_through_links(
@@ -12302,32 +12340,86 @@ fn remap_root_scope_close_through_links(
     close: &OpKind,
     hops: &[(usize, &Link)],
     name: &str,
+    keep_local: bool,
 ) -> Result<OpKind, String> {
-    if let OpKind::RawFree { ptr } = close {
-        let remapped =
-            remap_close_arg_through_links(graph, &LinkArg::Value(ptr.clone()), hops, name)?;
-        let Some(ptr) = remapped.as_variable() else {
-            return Err(format!("{name}: RawFree ptr is not a value"));
-        };
-        return Ok(OpKind::RawFree { ptr: ptr.clone() });
+    match close {
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstNone => Ok(close.clone()),
+        OpKind::RawFree { ptr } => {
+            let ptr = remap_var_through_links(graph, ptr, hops, name, keep_local)?;
+            Ok(OpKind::RawFree { ptr })
+        }
+        OpKind::RawMalloc {
+            owner,
+            TYPE,
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        } => {
+            let length = match length {
+                Some(var) => Some(remap_var_through_links(graph, var, hops, name, keep_local)?),
+                None => None,
+            };
+            Ok(OpKind::RawMalloc {
+                owner: owner.clone(),
+                TYPE: TYPE.clone(),
+                zero: *zero,
+                track_allocation: *track_allocation,
+                add_memory_pressure: *add_memory_pressure,
+                extra_flags: extra_flags.clone(),
+                length,
+            })
+        }
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => Ok(OpKind::RawStore {
+            base: remap_var_through_links(graph, base, hops, name, keep_local)?,
+            offset: remap_var_through_links(graph, offset, hops, name, keep_local)?,
+            value: remap_var_through_links(graph, value, hops, name, keep_local)?,
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        }),
+        OpKind::RawLoad {
+            base,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => Ok(OpKind::RawLoad {
+            base: remap_var_through_links(graph, base, hops, name, keep_local)?,
+            offset: remap_var_through_links(graph, offset, hops, name, keep_local)?,
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        }),
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } => {
+            let mut remapped = Vec::with_capacity(args.len());
+            for arg in args {
+                remapped.push(remap_close_arg_through_links(
+                    graph, arg, hops, name, keep_local,
+                )?);
+            }
+            Ok(OpKind::Call {
+                target: target.clone(),
+                args: remapped,
+                result_ty: result_ty.clone(),
+            })
+        }
+        other => Err(format!(
+            "{name}: expected a shadow-stack bracket close ({other:?})"
+        )),
     }
-    let OpKind::Call {
-        target,
-        args,
-        result_ty,
-    } = close
-    else {
-        return Err(format!("{name}: expected a shadow-stack bracket close"));
-    };
-    let mut remapped = Vec::with_capacity(args.len());
-    for arg in args {
-        remapped.push(remap_close_arg_through_links(graph, arg, hops, name)?);
-    }
-    Ok(OpKind::Call {
-        target: target.clone(),
-        args: remapped,
-        result_ty: result_ty.clone(),
-    })
 }
 
 fn remap_close_arg_through_links(
@@ -12335,6 +12427,7 @@ fn remap_close_arg_through_links(
     arg: &LinkArg,
     hops: &[(usize, &Link)],
     name: &str,
+    keep_local: bool,
 ) -> Result<LinkArg, String> {
     let mut current = arg.clone();
     if let Some(&(target_block, _)) = hops.first() {
@@ -12356,6 +12449,13 @@ fn remap_close_arg_through_links(
                 .iter()
                 .any(|op| op.result.as_ref() == current.as_variable());
             if local {
+                // Per-call spill cell: the address is produced in this
+                // block (`RawMalloc`) and is not a forwarded guard word.
+                // A keepalive of a plumbing-local is still a decline
+                // (`model.py` `checkgraph` `usevar`).
+                if keep_local {
+                    break;
+                }
                 return Err(format!(
                     "{name}: close argument is not forwarded in block {target_block}"
                 ));
@@ -12390,7 +12490,7 @@ fn root_scope_closes_to_returnblock(
     graph: &FunctionGraph,
     block: usize,
     var: &Variable,
-) -> Result<Vec<OpKind>, String> {
+) -> Result<Vec<SpaceOperation>, String> {
     forwards_to_returnblock_inner(graph, block, var, true)
 }
 
@@ -12399,7 +12499,7 @@ fn forwards_to_returnblock_inner(
     block: usize,
     var: &Variable,
     past_bracket_closes: bool,
-) -> Result<Vec<OpKind>, String> {
+) -> Result<Vec<SpaceOperation>, String> {
     let mut current = block;
     let mut tracked = var.clone();
     let mut closes = Vec::new();
@@ -12421,6 +12521,7 @@ fn forwards_to_returnblock_inner(
             let carries_work = if past_bracket_closes {
                 !b.operations.iter().all(|op| {
                     crate::front::mir::is_shadow_stack_bracket_close(&op.kind)
+                        || crate::front::mir::is_call_scoped_raw_spill_op(&op.kind)
                         || is_recast_narrow(&op.kind)
                         || is_gc_root_reload(&op.kind)
                         || is_keepalive_or_nop(op)
@@ -12449,12 +12550,7 @@ fn forwards_to_returnblock_inner(
                     if matches!(op.kind, OpKind::ConstNone) {
                         continue;
                     }
-                    closes.push(remap_root_scope_close_through_links(
-                        graph,
-                        &op.kind,
-                        &reverse_hops,
-                        "return close",
-                    )?);
+                    closes.push(remap_close_op(graph, op, &reverse_hops, "return close")?);
                 }
             }
             if b.exitswitch.is_some() {
@@ -13052,6 +13148,7 @@ fn is_forwarding_restore_op(kind: &OpKind) -> bool {
                 || crate::front::mir::is_shadow_stack_bracket_close(kind)
         }
         OpKind::ConstUInt(_) | OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => true,
+        _ if crate::front::mir::is_call_scoped_raw_spill_op(kind) => true,
         _ => false,
     }
 }
@@ -13285,6 +13382,7 @@ fn collect_keepalive_until_here_from_bypassed(
                 &op.kind,
                 &hops,
                 "keepalive",
+                false,
             )?);
         }
         for op in &mut graph.blocks[block].operations {

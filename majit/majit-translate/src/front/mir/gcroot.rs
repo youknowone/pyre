@@ -10,7 +10,9 @@ impl<'a> Lowering<'a> {
     /// rewind needs, so this arm reads no field of it. A crate that only
     /// imports the guard sees an opaque stub with no fields, and a
     /// field-keyed close would silently confine itself to the crate that
-    /// defines one.
+    /// defines one. `history.py` `getkind` of that `Ptr` is `'int'`; the
+    /// by-value SSA is the save-point word, so the argument is the same
+    /// per-call cell address a residual `&Scalar` passes.
     pub(in crate::front::mir) fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
             return;
@@ -52,14 +54,19 @@ impl<'a> Lowering<'a> {
         let void = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        let spilled = self.emit_storage_raw_borrow_address(bb_id, base.clone(), &place.ty);
+        let arg = spilled.clone().unwrap_or(base);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(void),
             kind: OpKind::Call {
                 target: CallTarget::function_path(segments),
-                args: crate::model::call_args(vec![base]),
+                args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Void,
             },
         });
+        if let Some(ptr) = spilled {
+            emit_raw_cell_free(&mut self.graph, bb_id, ptr);
+        }
     }
 
     /// Count a bracket this pass left open, against the graph that holds it.
@@ -1004,6 +1011,23 @@ pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
         || is_set_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
         || is_rust_vec_free_call(kind)
+}
+
+/// Per-call residual `&T` spill of a by-value storage-raw word: the
+/// `Tuple<i64>` / Char cell `install_raw_scalar_address_call` and
+/// [`Lowering::emit_root_scope_close`] emit around the residual.
+pub(crate) fn is_call_scoped_raw_spill_op(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::RawMalloc { owner, .. } => {
+            owner == super::RAW_SCALAR_SPILL_OWNER || owner == super::RAW_SCALAR_CELL_OWNER
+        }
+        OpKind::RawStore { .. }
+        | OpKind::RawLoad { .. }
+        | OpKind::RawFree { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_) => true,
+        _ => false,
+    }
 }
 
 /// Match the `ll_slice_buffer_free` a raw array's frame exit emits.

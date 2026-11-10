@@ -475,6 +475,138 @@ pub(crate) fn absorb_semantic_program(
     }
 }
 
+/// Overlay Charon-resolved layouts from a cross-target sidecar onto host
+/// declaration identities.
+///
+/// Sidecars are `type_decls` plus the SerDedup prelude; they are not a
+/// second program. Identity is the TypeDecl `name_path` the host already
+/// interned. A sidecar-only spelling (`unrelated_crate::unicodeobject::Utf8Str`)
+/// is ignored, so it cannot tombstone the host leaf or flip
+/// [`is_rstr_str_layout_declaration`] / [`is_str_oopspec_class_root`]
+/// (`jtransform.py` `Transformer._handle_stroruni_call` tests
+/// `SoU.TO == rstr.STR`).
+pub(crate) fn overlay_sidecar_layouts(
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    sidecar: &mut Llbc,
+    host_decl_paths: &std::collections::HashSet<String>,
+) {
+    if host_decl_paths.is_empty() {
+        return;
+    }
+    for td in sidecar.type_decls_mut() {
+        if td.item_meta.name_path().is_empty()
+            || !host_decl_paths.contains(td.item_meta.name_path_str())
+        {
+            td.published_struct_copy = true;
+        }
+    }
+    let gc_struct_ids = harvest_declared_gc_facts(sidecar).gc_struct_ids();
+    let raw_alloc_flavor_structs = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(sidecar),
+    );
+    let (_, _, _, _, _, _, sidecar_exact, sidecar_ids) = derive_program_metadata(
+        sidecar,
+        &gc_struct_ids,
+        no_immutable_fields(),
+        &raw_alloc_flavor_structs,
+        &[],
+    );
+    for td in sidecar.iter_type_decls() {
+        if td.published_struct_copy {
+            continue;
+        }
+        // An Opaque / Unknown copy is not the defining declaration. Its
+        // intern keys (and the hardcoded Vec / Layout fallbacks isolated
+        // derive may insert) must not replace the host body's layout.
+        // `jtransform.py` `Transformer._handle_stroruni_call` tests
+        // `SoU.TO == rstr.STR` against that body.
+        if matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        let name = td.item_meta.name_path();
+        copy_sidecar_exact_layout(
+            exact_layouts,
+            struct_ids,
+            &sidecar_exact,
+            &sidecar_ids,
+            &name,
+        );
+        let stripped = strip_crate_prefix(&name);
+        if stripped != name && stripped.contains("::") {
+            copy_sidecar_exact_layout(
+                exact_layouts,
+                struct_ids,
+                &sidecar_exact,
+                &sidecar_ids,
+                &stripped,
+            );
+        }
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        for variant in variants {
+            copy_sidecar_exact_layout(
+                exact_layouts,
+                struct_ids,
+                &sidecar_exact,
+                &sidecar_ids,
+                &format!("{name}::{}", variant.name),
+            );
+            if stripped != name && stripped.contains("::") {
+                copy_sidecar_exact_layout(
+                    exact_layouts,
+                    struct_ids,
+                    &sidecar_exact,
+                    &sidecar_ids,
+                    &format!("{stripped}::{}", variant.name),
+                );
+            }
+        }
+    }
+}
+
+fn copy_sidecar_exact_layout(
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    host_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    sidecar_exact: &std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    sidecar_ids: &std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    key: &str,
+) {
+    let Some(sidecar_sid) = sidecar_ids.get(key).copied().flatten() else {
+        return;
+    };
+    let Some(layout) = sidecar_exact.get(&sidecar_sid) else {
+        return;
+    };
+    let host_sid = host_ids.get(key).copied().flatten().or_else(|| {
+        let stripped = strip_crate_prefix(key);
+        (stripped != key && stripped.contains("::"))
+            .then(|| host_ids.get(&stripped).copied().flatten())
+            .flatten()
+    });
+    let Some(host_sid) = host_sid else {
+        return;
+    };
+    if layout.field_offsets.is_empty()
+        && exact_layouts
+            .get(&host_sid)
+            .is_some_and(|existing| !existing.field_offsets.is_empty())
+    {
+        return;
+    }
+    exact_layouts.insert(host_sid, layout.clone());
+}
+
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::Borrow<Llbc>>(
     llbcs: &[L],
     static_addrs: crate::HostStaticAddrs<'_>,
@@ -6715,8 +6847,9 @@ pub use self::gcroot::{
 };
 pub(crate) use self::gcroot::{
     ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
-    harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
-    is_shadow_stack_bracket_close, is_slice_buffer_free_call,
+    harvest_scope_owning_identities_with, is_call_scoped_raw_spill_op,
+    is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
+    is_slice_buffer_free_call,
 };
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;

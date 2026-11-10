@@ -838,6 +838,11 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             Some(root.clone())
         } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
+        } else if storage_raw_by_value_class_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
+            .is_some()
+        {
+            // By-value storage-raw is the aggregate unnamed `Ref`.
+            None
         } else {
             match &ty {
                 ValueType::Ref(_) => {
@@ -1598,6 +1603,16 @@ impl<'a> Lowering<'a> {
                 Some(root.clone())
             } else if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
+            } else if storage_raw_by_value_class_root(
+                &local.ty,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+            )
+            .is_some()
+            {
+                // By-value storage-raw is the aggregate unnamed `Ref`.
+                None
             } else {
                 match &ty {
                     ValueType::Ref(_) => tyref_niche_option_gc_payload_spelling(

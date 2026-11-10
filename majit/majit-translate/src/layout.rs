@@ -155,6 +155,19 @@ pub fn layout_sidecar_filename(crate_stem: &str, target: &str) -> String {
     format!("{crate_stem}.{target}.layouts.ullbc")
 }
 
+/// Whether `path` is a cross-target layout sidecar (`*.layouts.ullbc`).
+///
+/// The production frontend loads these beside the host artefacts so
+/// Charon-resolved field offsets apply, but they are not a second
+/// program: intern and `DuplicateLeafFacts` stay on the host
+/// `name_path` identities.
+pub fn is_layout_sidecar_path(path: impl AsRef<std::path::Path>) -> bool {
+    path.as_ref()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".layouts.ullbc"))
+}
+
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
 /// Supplies struct layouts for the codewriter pipeline. Each struct is
@@ -587,5 +600,14 @@ mod tests {
         assert_eq!(signed_size_for("x86", 4), 4);
         assert_eq!(signed_size_for("x86_64", 8), 8);
         assert_eq!(signed_size_for("aarch64", 8), 8);
+    }
+
+    #[test]
+    fn layout_sidecar_path_is_the_layouts_ullbc_filename() {
+        assert!(is_layout_sidecar_path(
+            "target/llbc/pyre-object.wasm32-unknown-unknown.layouts.ullbc"
+        ));
+        assert!(!is_layout_sidecar_path("target/llbc/pyre-object.ullbc"));
+        assert!(!is_layout_sidecar_path("target/llbc/layouts.ullbc"));
     }
 }

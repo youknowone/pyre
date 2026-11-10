@@ -2767,10 +2767,9 @@ pub(in crate::front::mir) fn flavor_raw_pointer_class_root(
     adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
-/// Class root of a by-value storage-raw ADT. `history.py getkind` of a
-/// `Ptr` whose `TO._gckind == 'raw'` is `'int'`. A borrow of that struct
-/// stays unnamed `Ref` with `class_root` on the Input (`ty_is_raw_address`
-/// stays false for `&RootScope`).
+/// Class root of a by-value storage-raw ADT. A by-value struct is the
+/// aggregate unnamed `Ref`, not a `Ptr`. Pointers and borrows are not
+/// this function (`one_word_pointer_pointee`).
 pub(in crate::front::mir) fn storage_raw_by_value_class_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -4793,17 +4792,6 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             if tyref_is_gcref_spelling(kind_src, llbc) {
                 return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
             }
-            // By-value storage-raw (`RootScope`): same `raw:<owner>` token.
-            // A borrow of that struct stays the unnamed `ref` token with
-            // `class_root` on the Input.
-            if let Some(root) = storage_raw_by_value_class_root(
-                kind_src,
-                llbc,
-                no_tombstoned_leaves(),
-                gc_struct_ids,
-            ) {
-                return Some(format!("raw:{root}"));
-            }
             "ref"
         }
         ValueType::StringBuilder => "ref",
@@ -4836,6 +4824,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    // By-value storage-raw is the aggregate unnamed `Ref` (`tyref_to_value_type`
+    // / the `"ref"` token). Naming it would let `named_ref_is_raw_int` rewrite
+    // FUNC.RESULT to Int. A pointer or borrow is not this ADT.
+    if storage_raw_by_value_class_root(ty, llbc, tombstoned, gc_struct_ids).is_some() {
         return None;
     }
     if let Some(root) =
