@@ -2024,35 +2024,18 @@ fn densify_root_loop_inputargs(
 
 /// compile.py compile_new_bridge `new_trace.inputargs = info.renamed_inputargs`.
 ///
-/// Reuse the same `InputArgRc` boxes the ops already carry, instead of
-/// minting a second InputArg for the same OpRef.
-fn retrace_inputarg_boxes(renamed: &[OpRef], ops: &[majit_ir::OpRc]) -> Vec<InputArgRc> {
-    let mut bound: crate::FxIndexMap<OpRef, InputArgRc> = crate::FxIndexMap::default();
-    for op in ops {
-        for arg in op
-            .args_slice()
-            .iter()
-            .chain(op.guard_fail_args().unwrap_or(&[]))
-        {
-            if arg.is_inputarg()
-                && let Some(ia) = arg.bound_inputarg()
-            {
-                bound.entry(arg.to_opref()).or_insert(ia);
-            }
-        }
-    }
+/// Recover the bound `InputArgRc` already stored on each exported
+/// `ExportedState.renamed_inputargs` box.
+fn retrace_inputarg_boxes(renamed: &[Operand]) -> Vec<InputArgRc> {
     renamed
         .iter()
-        .map(|&opref| {
-            bound.get(&opref).cloned().unwrap_or_else(|| {
-                let tp = opref.ty().unwrap_or_else(|| {
-                    panic!(
-                        "renamed inputarg {:?} has no intrinsic type \
-                         (history.py:220 Box.type invariant)",
-                        opref
-                    )
-                });
-                InputArgRc::new(InputArg::from_type(tp, opref.raw()))
+        .map(|box_| {
+            box_.bound_inputarg().unwrap_or_else(|| {
+                panic!(
+                    "renamed inputarg {:?} is not the typed InputArg box \
+                     stored by VirtualState.make_inputargs",
+                    box_.to_opref(),
+                )
             })
         })
         .collect()
@@ -15460,10 +15443,7 @@ impl<M: Clone> MetaInterp<M> {
             tok.set_retraced_count(retraced_count);
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
-                let renamed_inputarg_refs: Vec<_> =
-                    es.renamed_inputargs.iter().map(Operand::to_opref).collect();
-                let renamed_inputargs =
-                    retrace_inputarg_boxes(&renamed_inputarg_refs, &optimized_ops);
+                let renamed_inputargs = retrace_inputarg_boxes(&es.renamed_inputargs);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -16198,10 +16178,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             if let Some(es) = exported {
-                let renamed_inputarg_refs: Vec<_> =
-                    es.renamed_inputargs.iter().map(Operand::to_opref).collect();
-                let renamed_inputargs =
-                    retrace_inputarg_boxes(&renamed_inputarg_refs, &optimized_ops);
+                let renamed_inputargs = retrace_inputarg_boxes(&es.renamed_inputargs);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -30122,6 +30099,21 @@ mod tests {
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    #[test]
+    fn test_retrace_inputarg_boxes_preserves_exported_identity() {
+        let (exported, exported_root) =
+            crate::history::test_support::bound_inputarg_operand(Type::Int, 17);
+        let (same_position_decoy, _decoy_root) =
+            crate::history::test_support::bound_inputarg_operand(Type::Int, 17);
+
+        assert!(!exported.same_box(&same_position_decoy));
+
+        let rebuilt = retrace_inputarg_boxes(std::slice::from_ref(&exported));
+
+        assert_eq!(rebuilt.len(), 1);
+        assert!(InputArgRc::ptr_eq(&rebuilt[0], &exported_root));
+    }
 
     /// A resume that starts while another resume is running (a residual call
     /// re-entering the driver) acquires from the same builder.
