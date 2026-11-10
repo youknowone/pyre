@@ -1650,6 +1650,43 @@ fn inject_root_call_result<Sym: WalkSym>(
             else {
                 return false;
             };
+            if op.opname.starts_with("inline_call_") {
+                // `MIFrame.make_result_of_lastop` and blackhole
+                // `_setup_return_value_i` / `_setup_return_value_r` /
+                // `_setup_return_value_f` write only the dest register.
+                // `Transformer.handle_regular_call` is always
+                // `[inline_call, -live-]`; no Python operand-stack depth is
+                // touched for an inline call's return.
+                return match dest {
+                    crate::jitcode_dispatch::CallResultRegister::Void => true,
+                    crate::jitcode_dispatch::CallResultRegister::Reg('r', result_reg) => {
+                        if let Some(bridge_regs) = sym.bridge_registers_r_mut().as_mut() {
+                            if bridge_regs.len() <= result_reg {
+                                bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+                            }
+                            bridge_regs.set(result_reg, result);
+                        }
+                        true
+                    }
+                    crate::jitcode_dispatch::CallResultRegister::Reg(
+                        bank @ ('i' | 'f'),
+                        result_reg,
+                    ) => {
+                        let regs = if bank == 'i' {
+                            sym.registers_i_mut()
+                        } else {
+                            sym.registers_f_mut()
+                        };
+                        if regs.len() <= result_reg {
+                            regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+                        }
+                        regs[result_reg] = result;
+                        true
+                    }
+                    crate::jitcode_dispatch::CallResultRegister::Reg(..)
+                    | crate::jitcode_dispatch::CallResultRegister::Unknown => false,
+                };
+            }
             match dest {
                 crate::jitcode_dispatch::CallResultRegister::Void => {
                     // `_setup_return_value_v`: a void helper (list setitem) has no
@@ -8726,6 +8763,32 @@ mod tests {
             sym.bridge_stack_oprefs.is_none(),
             "an int dest is a typed register, not an operand-stack slot"
         );
+    }
+
+    #[test]
+    fn inject_root_call_result_inline_call_writes_only_the_register() {
+        let dest = 3_u8;
+        let byte = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("inline_call_r_i/dR>i")
+            .expect("inline_call_r_i/dR>i must be in the insns table");
+        // d(2) + empty R varlist (len byte) + dest.
+        let code = vec![byte, 0, 0, 0, dest];
+        let root_pc = code.len();
+        let (_wrapper, mut sym) = inject_root_fixture(code);
+        let valuestackdepth_before = sym.valuestackdepth;
+        let stack_before = sym.bridge_stack_oprefs.to_vec();
+        let result = majit_ir::OpRef::const_int(1);
+        assert!(
+            super::inject_root_call_result(&mut sym, root_pc, result),
+            "inline-call result at root_pc must resolve like make_result_of_lastop"
+        );
+        assert_eq!(
+            sym.registers_i.get(dest as usize).copied(),
+            Some(result),
+            "inline_call 'i' dest lands in registers_i[color]"
+        );
+        assert_eq!(sym.valuestackdepth, valuestackdepth_before);
+        assert_eq!(sym.bridge_stack_oprefs.to_vec(), stack_before);
     }
 
     #[test]
