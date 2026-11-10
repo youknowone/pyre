@@ -3849,6 +3849,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// `[u8; N]` / `&[u8; N]` unsized onto a window: `{array, N}`.
+    ///
+    /// Length 0 does not read the array local. `jtransform.py
+    /// rewrite_op_cast_ptr_to_int` keeps `cast_ptr_to_int` only for a
+    /// GC-kind tagged value; a zero-length `[u8; 0]` is folded to a GC
+    /// `ConstRef` (`unit_variant_fold`), and rustc's empty-slice data
+    /// word is `NonNull::dangling` (`align_of::<u8>() == 1`).
     pub(in crate::front::mir) fn u8_array_unsize_source(
         &mut self,
         mir_bb: usize,
@@ -3861,6 +3867,22 @@ impl<'a> Lowering<'a> {
         let (item, len) = tyref_raw_array_parts(&array_ty, self.llbc)?;
         if json_ty_scalar_element_spelling(item, self.llbc).as_deref() != Some("u8") {
             return None;
+        }
+        if len == 0 {
+            // `emit_const_uint` is Unknown; `push_cast_ptr_to_int` stamps
+            // Signed (`rtype_cast_ptr_to_int`). ConstInt(1) Signed is
+            // `NonNull::<u8>::dangling`.
+            let bb_id = self.emit_bb(mir_bb);
+            let ptr = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: OpKind::ConstInt(1),
+            });
+            let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+            let len = self.emit_const_uint(mir_bb, 0);
+            return Some((ptr, len));
         }
         let ptr = self
             .local_var
