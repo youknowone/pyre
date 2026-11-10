@@ -21,6 +21,7 @@
 //! constant pool.
 
 use majit_ir::OpRef;
+use majit_ir::operand::Operand;
 
 use crate::optimizeopt::OptContext;
 pub use crate::resume::decode_box;
@@ -336,14 +337,24 @@ pub fn deserialize_optimizer_knowledge(
         };
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        let opref2 = decoded_box_to_opref(&box2, ctx);
+        let result = decoded_box_to_operand(&box2, ctx);
         // bridgeopt.py:183: result_loopinvariant.append((i, box))
         // No sentinel check — ConstInt(0) is a valid func_ptr value.
-        result_loopinvariant.push((const_int, opref2));
+        result_loopinvariant.push((const_int, result));
     }
     // bridgeopt.py:184-185: optimizer.optrewrite.deserialize_optrewrite(...)
     if !result_loopinvariant.is_empty() {
         optimizer.import_loopinvariant_knowledge(&result_loopinvariant);
+    }
+}
+
+fn decoded_box_to_operand(decoded: &crate::resume::DecodedBox, ctx: &OptContext) -> Operand {
+    use crate::resume::DecodedBox;
+    match decoded {
+        DecodedBox::LiveBox(opref) => ctx
+            .get_box_replacement_operand_opt(*opref)
+            .expect("decoded livebox must retain its bound bridge InputArg"),
+        DecodedBox::Const(constant) => Operand::const_(constant.clone()),
     }
 }
 

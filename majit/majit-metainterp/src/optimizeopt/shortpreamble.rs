@@ -1813,14 +1813,15 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         result_map: &FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
-        let source = self.preamble_op.pos().get();
+        let source = Operand::from_bound_op(&self.preamble_op);
         // shortpreamble.py `LoopInvariantOp.produce_op` reads
         // `self.res.getarg(0).getint()`.
         let func_ptr = self.res.bound_op()?.arg(0).const_int()?;
-        // shortpreamble.py LoopInvariantOp.produce_op stores `self.res` as the
-        // body-visible Box and the replay call separately in PreambleOp.
-        // Only a LoopInvariant op the label actually carries is imported.
-        result_map.get(&source)?;
+        // shortpreamble.py stores `self.res` as the body-visible Box
+        // and the replay call separately in PreambleOp.
+        // Membership stays positional while `result_map` is still OpRef-keyed.
+        let source_pos = self.preamble_op.pos().get();
+        result_map.get(&source_pos)?;
         let replay = ctx
             .imported_short_preamble_builder
             .as_ref()
@@ -1834,13 +1835,12 @@ impl ProducedShortOp {
             same_as_source: self.same_as_source.clone(),
         };
         // `rewrite.py` `self.opt.loop_invariant_results[key] = old_op` —
-        // dict-as-map semantics; pyre's Vec-backed parity overwrites the
-        // entry when `func_ptr` already exists (PyPy dict behavior),
-        // otherwise appends.
+        // dict-as-map semantics; overwrite when `func_ptr` already exists,
+        // otherwise append.
         if let Some(entry) = ctx
             .imported_loop_invariant_results
             .iter_mut()
-            .find(|(k, _)| *k == func_ptr)
+            .find(|(key, _)| *key == func_ptr)
         {
             entry.1 = pop;
         } else {
@@ -1848,7 +1848,7 @@ impl ProducedShortOp {
         }
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
-        Some(source)
+        Some(source.to_opref())
     }
 }
 

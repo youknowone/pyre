@@ -205,12 +205,12 @@ pub trait Optimization {
     }
 
     /// rewrite.py serialize_optrewrite
-    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
+    fn serialize_optrewrite(&self) -> Vec<(i64, Operand)> {
         Vec::new()
     }
 
     /// rewrite.py deserialize_optrewrite
-    fn deserialize_optrewrite(&self, _entries: &[(i64, OpRef)]) {}
+    fn deserialize_optrewrite(&self, _entries: &[(i64, Operand)]) {}
 
     /// shortpreamble.py: PureOp.produce_op / LoopInvariantOp.produce_op
     /// Transfer imported PreambleOp entries from OptContext to this pass.
@@ -1504,7 +1504,7 @@ impl Optimizer {
     }
 
     /// bridgeopt.py:184-185 optimizer.optrewrite.deserialize_optrewrite(result_loopinvariant)
-    pub fn import_loopinvariant_knowledge(&mut self, result_loopinvariant: &[(i64, OpRef)]) {
+    pub fn import_loopinvariant_knowledge(&mut self, result_loopinvariant: &[(i64, Operand)]) {
         for pass in &self.passes {
             pass.deserialize_optrewrite(result_loopinvariant);
         }
@@ -6017,8 +6017,8 @@ impl Optimizer {
         let mut loopinvariant_results = Vec::new();
         for pass in &self.passes {
             for (func_ptr, result) in pass.serialize_optrewrite() {
-                let replaced = ctx.get_replacement_opref(result);
-                loopinvariant_results.push((func_ptr, replaced));
+                let replaced = result.get_box_replacement(false);
+                loopinvariant_results.push((func_ptr, replaced.to_opref()));
             }
         }
 

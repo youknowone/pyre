@@ -8370,13 +8370,14 @@ mod tests {
             op.pos().set(OpRef::int_op(11));
             OpRc::new(op)
         };
+        let call_box = Operand::from_bound_op(&call);
         publish_preview_short_state(
             &mut ctx,
             short_inputargs,
             short_inputarg_refs,
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
-                res: Operand::from_bound_op(&call),
+                res: call_box.clone(),
                 op: call,
                 source_op: None,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -8418,8 +8419,8 @@ mod tests {
             ctx2.imported_loop_invariant_results
                 .iter()
                 .find(|(k, _)| *k == func_ptr)
-                .map(|(_, v)| v.op.to_opref()),
-            Some(OpRef::int_op(11))
+                .map(|(_, pop)| pop.op.same_box(&call_box)),
+            Some(true)
         );
         // history.py ConstInt.value inline — the imported func
         // address lands at `OpRef::ConstInt(func_ptr)`, which
@@ -8446,6 +8447,7 @@ mod tests {
             op.pos().set(source);
             OpRc::new(op)
         };
+        let call_box = Operand::from_bound_op(&call);
         let exported = ExportedState::new(
             vec![source_box.clone()],
             vec![source_box.clone()],
@@ -8453,7 +8455,7 @@ mod tests {
             indexmap::IndexMap::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
-                res: Operand::from_bound_op(&call),
+                res: call_box.clone(),
                 op: {
                     let replay = OpRc::new((*call).clone());
                     replay.pos().set(OpRef::int_op(12));

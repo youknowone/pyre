@@ -456,6 +456,56 @@ mod walk_live_op_quasiimmut_tests {
         assert_eq!(short_input.const_value(), Some(Value::Ref(new_input)));
         assert_eq!(used_box.const_value(), Some(Value::Ref(new_used)));
     }
+
+    #[test]
+    fn published_context_walks_imported_loop_invariant_results() {
+        let old_op = GcRef(0x4100);
+        let new_op = GcRef(0x5100);
+        let old_preamble = GcRef(0x4200);
+        let new_preamble = GcRef(0x5200);
+        let old_same = GcRef(0x4300);
+        let new_same = GcRef(0x5300);
+
+        let op_box = Operand::const_from_value(Value::Ref(old_op));
+        let preamble_arg = Operand::const_from_value(Value::Ref(old_preamble));
+        let same_as_source = Operand::const_from_value(Value::Ref(old_same));
+        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
+        replay_op.pos().set(OpRef::ref_op(14));
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: op_box.clone(),
+            invented_name: true,
+            preamble_op: OpRc::new(replay_op),
+            same_as_source: Some(same_as_source.clone()),
+        };
+
+        let mut ctx = OptContext::new(0);
+        ctx.imported_loop_invariant_results.push((0xCAFE, pop));
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old_op {
+                *slot = new_op;
+            } else if *slot == old_preamble {
+                *slot = new_preamble;
+            } else if *slot == old_same {
+                *slot = new_same;
+            }
+        });
+
+        let imported = &ctx.imported_loop_invariant_results[0].1;
+        assert!(imported.op.same_box(&op_box));
+        assert_eq!(op_box.const_value(), Some(Value::Ref(new_op)));
+        assert!(imported.preamble_op.arg(0).same_box(&preamble_arg));
+        assert_eq!(preamble_arg.const_value(), Some(Value::Ref(new_preamble)));
+        assert!(
+            imported
+                .same_as_source
+                .as_ref()
+                .is_some_and(|source| source.same_box(&same_as_source))
+        );
+        assert_eq!(same_as_source.const_value(), Some(Value::Ref(new_same)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
@@ -1503,11 +1553,10 @@ pub struct OptContext {
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
     /// `rewrite.py` `self.loop_invariant_results = {}` — keyed by
-    /// constant function pointer. PyPy uses a dict; pyre replaces it
-    /// with a Vec of `(func_ptr, PreambleOp)` pairs (`LoopInvariantOp.produce_op`'s
-    /// result Box and replay op) and linear-scan
-    /// dedup. CALL_LOOPINVARIANT is rare and the live set per trace is
-    /// tiny, so O(n) lookup is acceptable.
+    /// constant function pointer. Staging vector of imported
+    /// `PreambleOp` objects (`shortpreamble.py LoopInvariantOp.produce_op`)
+    /// with linear-scan dedup. CALL_LOOPINVARIANT is rare and the live
+    /// set per trace is tiny, so O(n) lookup is acceptable.
     pub imported_loop_invariant_results: Vec<(i64, crate::optimizeopt::info::PreambleOp)>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
     /// store_final_boxes_in_guard to resolve NONE positions
@@ -9918,6 +9967,13 @@ impl OptContext {
         }
         if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
             builder.walk_const_ptr_refs_mut(visitor);
+        }
+        for (_, pop) in &self.imported_loop_invariant_results {
+            pop.op.walk_const_ptr_refs(visitor);
+            walk_live_op(&pop.preamble_op, visitor);
+            if let Some(source) = &pop.same_as_source {
+                source.walk_const_ptr_refs(visitor);
+            }
         }
         if let Some(builder) = self.active_short_preamble_producer.as_mut() {
             builder.walk_const_ptr_refs_mut(visitor);
