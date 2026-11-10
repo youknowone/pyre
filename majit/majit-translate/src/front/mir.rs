@@ -436,8 +436,17 @@ pub(crate) fn absorb_semantic_program(
                     acc.known_trait_names.insert(n);
                 }
             }
+            // One STRUCT per key (`descr.py get_field_descr` caches on the
+            // STRUCT object); a crate that cannot see a payload's TypeDecl
+            // contributes a partial view, so views are merged, not first-wins.
             for (key, fields) in prog.struct_fields.fields {
-                acc.struct_fields.fields.entry(key).or_insert(fields);
+                let existing = acc.struct_fields.fields.entry(key).or_insert(Vec::new());
+                for row in fields {
+                    if existing.iter().any(|have| have.name == row.name) {
+                        continue;
+                    }
+                    existing.push(row);
+                }
             }
             acc.struct_fields
                 .raw_word_owners
@@ -469,8 +478,22 @@ pub(crate) fn absorb_semantic_program(
             for (key, rows) in prog.struct_field_attrs {
                 acc.struct_field_attrs.entry(key).or_insert(rows);
             }
+            // One STRUCT per key (`descr.py get_field_descr` caches on the
+            // STRUCT object); a crate that cannot see a payload's TypeDecl
+            // contributes a partial view, so views are merged, not last-wins.
             for (key, layout) in prog.exact_layouts {
-                acc.exact_layouts.insert(key, layout);
+                if let Some(dest) = acc.exact_layouts.get_mut(&key) {
+                    for (name, offset) in layout.field_offsets {
+                        dest.field_offsets.entry(name).or_insert(offset);
+                    }
+                    dest.size = dest.size.or(layout.size);
+                    dest.align = dest.align.or(layout.align);
+                    if dest.host.is_none() {
+                        dest.host = layout.host;
+                    }
+                } else {
+                    acc.exact_layouts.insert(key, layout);
+                }
             }
             for (key, id) in prog.struct_ids {
                 acc.struct_ids
@@ -823,12 +846,30 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 ///
 /// Ordered by `(name_path, suffix, args, def_id)` so intern registration
 /// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Identity is `(def_id, suffix)` (the name path and rendered arguments follow
+/// from them) so equality does not depend on the retained [`TyRef`].
+/// `tyref_by_value_struct_decl` reads `instantiated` when a variant payload is
+/// an inlined STRUCT (`heaptracker.all_fielddescrs`).
+#[derive(Clone)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+    instantiated: TyRef,
+}
+
+impl PartialEq for RefEnumInst {
+    fn eq(&self, other: &Self) -> bool {
+        self.def_id == other.def_id && self.suffix == other.suffix
+    }
+}
+impl Eq for RefEnumInst {}
+impl std::hash::Hash for RefEnumInst {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.def_id.hash(state);
+        self.suffix.hash(state);
+    }
 }
 
 impl PartialOrd for RefEnumInst {
@@ -915,6 +956,7 @@ fn ref_enum_instantiation_of_adt(
         name_path,
         args,
         suffix,
+        instantiated: TyRef::Other(serde_json::json!({"Adt": adt.clone()})),
     })
 }
 
@@ -1478,6 +1520,13 @@ fn register_ref_enum_instantiation_rows(
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    inline_variant_fields: &mut Vec<lltype::InlineVariantField>,
+    tombstoned: &std::collections::HashSet<String>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     for inst in insts {
         let Some(td) = llbc.type_by_id(inst.def_id) else {
@@ -1521,6 +1570,10 @@ fn register_ref_enum_instantiation_rows(
             let mut rows: Vec<crate::front::semantic::FieldRow> =
                 Vec::with_capacity(v.fields.len());
             let mut registrable = true;
+            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
+            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
+            let instantiated_node =
+                tyref_node(&inst.instantiated, llbc).and_then(|node| strip_ty_wrappers(node, llbc));
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
                 let concrete = intern_payload_registry_spelling(
@@ -1534,6 +1587,84 @@ fn register_ref_enum_instantiation_rows(
                     ),
                     struct_fields,
                 );
+                let payload_ty = instantiated_node
+                    .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
+                    .unwrap_or_else(|| clone_tyref(&f.ty));
+                if let Some(nested) = tyref_by_value_struct_decl(
+                    &payload_ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ) {
+                    // The variant payload sits past the discriminant word, and a GcStruct inlines only as the first field (`lltype.GcStruct` / `rclass` `super`).
+                    if !gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+                        // `heaptracker.all_fielddescrs` emits the payload's
+                        // non-Struct leaves. The logical `fname` row stays in
+                        // `struct_fields` without an ExactLayout offset
+                        // (`GcStructLayout::apply_exact_layout`).
+                        let spec = lltype::InlineVariantField {
+                            owner: identity.clone(),
+                            owner_is_gc: true,
+                            field: fname.clone(),
+                            payload_offset: 8,
+                            payload_ty: clone_tyref(&payload_ty),
+                        };
+                        let Some(expansion) = lltype::expand_inline_field(
+                            llbc,
+                            tombstoned,
+                            gc_struct_ids,
+                            raw_alloc_flavor_structs,
+                            std::slice::from_ref(&spec),
+                            &identity,
+                            &fname,
+                        ) else {
+                            registrable = false;
+                            break;
+                        };
+
+                        rows.push(field_row_from_decl(i, f, concrete.clone(), llbc));
+                        let exact = exact_layouts.entry(sid).or_default();
+                        exact.align = Some(8.max(expansion.align));
+                        exact.field_offsets.insert("__discriminant".into(), 0);
+                        for leaf in &expansion.leaves {
+                            let dotted =
+                                format!("{}.{}{}", fname, leaf.super_path, leaf.field.name);
+                            let row_ty = tyref_to_field_layout_string(
+                                &leaf.source_ty,
+                                llbc,
+                                gc_struct_ids,
+                                raw_alloc_flavor_structs,
+                            );
+                            rows.push(crate::front::semantic::FieldRow::named(
+                                dotted.clone(),
+                                row_ty,
+                            ));
+                            exact
+                                .field_offsets
+                                .insert(dotted, expansion.offset + leaf.offset);
+                        }
+                        let extent = expansion
+                            .leaves
+                            .iter()
+                            .map(|leaf| expansion.offset + leaf.offset + leaf.size)
+                            .max()
+                            .unwrap_or(8);
+                        let align = exact.align.unwrap_or(8);
+                        exact.size = Some((extent + align - 1) & !(align - 1));
+                        for base in &bases {
+                            let key = format!("{base}{}::{}", inst.suffix, v.name);
+                            inline_variant_fields.push(lltype::InlineVariantField {
+                                owner: key,
+                                owner_is_gc: true,
+                                field: fname.clone(),
+                                payload_offset: 8,
+                                payload_ty: clone_tyref(&payload_ty),
+                            });
+                        }
+                        continue;
+                    }
+                }
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
                 // under the same rule as a sole scalar.
@@ -1597,8 +1728,6 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
-            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
-            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
             for base in &bases {
                 let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
@@ -2240,6 +2369,9 @@ pub(crate) struct CrateLoweringState {
     tombstoned_leaves: std::collections::HashSet<String>,
     /// Gc structs and enums visible to every body of this artefact.
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Declaration-ordered inlined variant-payload records. Exact-key lookup
+    /// is sufficient (`tyref_by_value_struct_decl`); not a semantic side table.
+    inline_variant_fields: Vec<lltype::InlineVariantField>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -2443,6 +2575,7 @@ impl CrateLoweringState {
         // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
         // narrowing-only reference-payload receiver its concrete payload type
         // so the suffixed variant classdef does not stay `Impossible` → Skip.
+        let mut inline_variant_fields = Vec::new();
         register_ref_enum_instantiation_rows(
             llbc,
             &ref_enum_insts,
@@ -2451,6 +2584,10 @@ impl CrateLoweringState {
             &mut struct_ids,
             gc_struct_ids,
             program_exception_class_hints,
+            &mut exact_layouts,
+            &mut inline_variant_fields,
+            &tombstoned_leaves,
+            &raw_alloc_flavor_structs,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
         // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
@@ -2547,6 +2684,7 @@ impl CrateLoweringState {
             }),
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
+            inline_variant_fields,
             raw_alloc_flavor_structs,
             value_type_by_id: std::cell::RefCell::new(Vec::new()),
             exception_class_hints,
@@ -2944,6 +3082,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             value_type_by_id,
+            inline_variant_fields,
             dont_look_inside,
             oopspec_fns,
             spec,
@@ -2990,6 +3129,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -3218,6 +3358,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             value_type_by_id,
+            inline_variant_fields,
             dont_look_inside,
             oopspec_fns,
             spec: spec_queue,
@@ -3251,6 +3392,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -7395,6 +7537,9 @@ pub struct LowerContext<'a> {
     /// Structs and enums declared Gc across this one artefact.
     /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Declaration-ordered inlined variant-payload records. Exact-key lookup
+    /// is sufficient (`tyref_by_value_struct_decl`); not a semantic side table.
+    inline_variant_fields: Vec<lltype::InlineVariantField>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -7433,20 +7578,48 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
+        let exception_class_hints = llbc_exception_class_hints(llbc);
+        let (
+            _,
+            _,
+            mut struct_fields,
+            enum_variant_by_discriminant,
+            _,
+            struct_field_attrs,
+            mut exact_layouts,
+            mut struct_ids,
+        ) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            llbc_exception_class_hints(llbc),
+            exception_class_hints,
+        );
+        let tombstoned_leaves = tombstoned_leaves_of(llbc);
+        let ref_enum_insts =
+            collect_ref_enum_instantiations(llbc, &gc_struct_ids, None, None, &tombstoned_leaves);
+        let mut inline_variant_fields = Vec::new();
+        register_ref_enum_instantiation_rows(
+            llbc,
+            &ref_enum_insts,
+            &enum_variant_by_discriminant,
+            &mut struct_fields,
+            &mut struct_ids,
+            &gc_struct_ids,
+            exception_class_hints,
+            &mut exact_layouts,
+            &mut inline_variant_fields,
+            &tombstoned_leaves,
+            &raw_alloc_flavor_structs,
         );
         Self {
             llbc,
             struct_field_attrs,
             struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
-            tombstoned_leaves: tombstoned_leaves_of(llbc).clone(),
+            tombstoned_leaves: tombstoned_leaves.clone(),
             gc_struct_ids,
+            inline_variant_fields,
             raw_alloc_flavor_structs,
             immutable_fields,
         }
@@ -7525,6 +7698,7 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            &context.inline_variant_fields,
             root_stack_state,
         )
     })
@@ -7600,6 +7774,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let mut u = fd.unstructured().ok_or_else(|| {
@@ -7627,6 +7802,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         gc_struct_ids,
         immutable_fields,
         raw_alloc_flavor_structs,
+        inline_variant_fields,
         builder_mode,
         &accum,
         &RootStackAnalyzer::new(llbc, root_stack_state),
@@ -7657,6 +7833,7 @@ fn lower_fat_dyn_callee(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
 ) -> Option<FunctionGraph> {
     if crate::front::dyn_fat::splice_in_progress(def_id) {
         return None;
@@ -7681,6 +7858,7 @@ fn lower_fat_dyn_callee(
         gc_struct_ids,
         immutable_fields,
         raw_alloc_flavor_structs,
+        inline_variant_fields,
         &RootStackState::new(llbc),
     )
     .ok()
@@ -7703,6 +7881,7 @@ fn splice_recorded_fat_dyn_returns(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
 ) {
     let dyn_results = lo.dyn_return_calls.clone();
     let cache =
@@ -7726,6 +7905,7 @@ fn splice_recorded_fat_dyn_returns(
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
         );
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
@@ -8015,6 +8195,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -8099,14 +8280,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             static_addrs.error_carrier,
             gc_struct_ids,
         );
-        let expand_inline_struct = |owner: &str, field: &str| {
-            inline_struct_field_leaves(
+        let expand_inline_field = |owner: &str, field: &str| {
+            lltype::expand_inline_field(
                 llbc,
                 tombstoned_leaves,
                 gc_struct_ids,
+                raw_alloc_flavor_structs,
+                inline_variant_fields,
                 owner,
                 field,
-                raw_alloc_flavor_structs,
             )
         };
         // MIR framestate argument threading must finish before adding native
@@ -8245,7 +8427,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 struct_field_attrs,
                 false,
                 &guard_words,
-                &expand_inline_struct,
+                false,
+                &expand_inline_field,
             )?;
         }
         lo.next_call_results.extend(map_collect_synthesized);
@@ -8803,7 +8986,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             struct_field_attrs,
             true,
             &guard_words,
-            &expand_inline_struct,
+            true,
+            &expand_inline_field,
         )?;
         // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
         // message construction.  Runs before the live `format!` collapsers
@@ -8874,7 +9058,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 struct_field_attrs,
                 true,
                 &guard_words,
-                &expand_inline_struct,
+                true,
+                &expand_inline_field,
             )?;
         }
         splice_recorded_fat_dyn_returns(
@@ -8890,6 +9075,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
         );
         // Field reads emitted while blocks were still being closed name a
         // base defined only in a predecessor. Thread once every edge exists.

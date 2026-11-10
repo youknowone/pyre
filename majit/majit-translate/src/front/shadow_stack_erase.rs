@@ -1809,15 +1809,22 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         cx.reach(bb, *target, depth, lo, open)?;
                         continue;
                     }
-                    // Observes at Known(0) reads the caller's slots.
-                    // Inside our Open the callee reads our pins, which
-                    // become slot locals (`eval_slice_index` / `getindex_w`).
+                    // A callee that leaves slots, indexes through a
+                    // parameter or returns an index while this function's
+                    // bracket is open refuses, because after the rewrite
+                    // nothing rewinds a leftover (`_fix_graph_after_inlining`).
+                    // Observes at Known(0) while a bracket is open reads
+                    // this function's pins through a slice-only Open
+                    // (`eval_slice_index` / `getindex_w` after Pin are
+                    // depth > 0 and stay allowed). Outside every open
+                    // bracket the native stack effect is unchanged by
+                    // erasing another region.
                     let effect =
                         resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
-                    if effect.observes && depth == 0 {
+                    if open != 0 && (effect.refuses_erase() || (effect.observes && depth == 0)) {
                         if crate::decline::enabled() {
                             eprintln!(
-                                "[erase] observes-at-entry {} as {}",
+                                "[erase] calls-stack-sensitive-fn {} as {}",
                                 callee_path(call, llbc).as_deref().unwrap_or(""),
                                 effect.as_str()
                             );
@@ -2279,31 +2286,6 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     }
     if !llbc.stack_sensitive_fns_complete() {
         return Err("callee-stack-effects-unknown");
-    }
-    // A callee that leaves slots, indexes through a parameter or returns
-    // an index refuses here, whether or not it also reads below entry:
-    // after the rewrite nothing rewinds a leftover
-    // (`_fix_graph_after_inlining`). A callee that only reads below entry
-    // is checked against the entry depth in the walk below.
-    for (bb, block) in body.body.iter().enumerate() {
-        if !forward_blocks[bb] {
-            continue;
-        }
-        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
-            && classify_call(call, llbc).is_none()
-        {
-            let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
-            if effect.refuses_erase() {
-                if crate::decline::enabled() {
-                    eprintln!(
-                        "[erase] refuses_erase {} as {}",
-                        callee_path(call, llbc).as_deref().unwrap_or(""),
-                        effect.as_str()
-                    );
-                }
-                return Err("calls-stack-sensitive-fn");
-            }
-        }
     }
     if classified
         .values()
@@ -5029,26 +5011,48 @@ mod tests {
     }
 
     fn stack_ops_llbc_with_callee() -> Llbc {
+        stack_ops_llbc_with_callee_funs(Vec::new())
+    }
+
+    fn stack_ops_llbc_with_callee_funs(extra: Vec<Value>) -> Llbc {
+        let mut fun_decls = vec![
+            Value::Null,
+            opaque_fun(
+                1,
+                &["pyre_object", "gc_roots", "push_roots"],
+                json!("Opaque"),
+            ),
+            opaque_fun(
+                2,
+                &["pyre_object", "gc_roots", "shadow_stack_get"],
+                json!("Opaque"),
+            ),
+            opaque_fun(
+                3,
+                &["pyre_object", "gc_roots", "shadow_stack_len"],
+                json!("Opaque"),
+            ),
+            opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+            opaque_fun(5, &["other", "unproven_callee"], json!("Opaque")),
+            opaque_fun(
+                6,
+                &["pyre_object", "gc_roots", "pin_roots"],
+                json!("Opaque"),
+            ),
+            opaque_fun(7, &["other", "leaves_above_callee"], json!("Opaque")),
+            opaque_fun(8, &["other", "reload_slot"], json!("Opaque")),
+            opaque_fun(9, &["other", "pin_helper"], json!("Opaque")),
+            opaque_fun(10, &["other", "storage_helper"], json!("Opaque")),
+            opaque_fun(11, &["other", "observes_and_leaves"], json!("Opaque")),
+            opaque_fun(12, &["core", "mem", "drop"], json!("Opaque")),
+        ];
+        fun_decls.extend(extra);
         let file = json!({
             "charon_version": "t",
             "has_errors": false,
             "translated": {
                 "crate_name": "c",
-                "fun_decls": [
-                    null,
-                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
-                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
-                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
-                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
-                    opaque_fun(5, &["other", "unproven_callee"], json!("Opaque")),
-                    opaque_fun(6, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
-                    opaque_fun(7, &["other", "leaves_above_callee"], json!("Opaque")),
-                    opaque_fun(8, &["other", "reload_slot"], json!("Opaque")),
-                    opaque_fun(9, &["other", "pin_helper"], json!("Opaque")),
-                    opaque_fun(10, &["other", "storage_helper"], json!("Opaque")),
-                    opaque_fun(11, &["other", "observes_and_leaves"], json!("Opaque")),
-                    opaque_fun(12, &["core", "mem", "drop"], json!("Opaque"))
-                ]
+                "fun_decls": fun_decls
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
@@ -5704,6 +5708,58 @@ mod tests {
             Ok(Some(_)) => {}
             Ok(None) => panic!("expected erasure of Open/Pin/mem::drop"),
             Err(reason) => panic!("expected erasure of Open/Pin/mem::drop, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn sensitive_call_outside_bracket_does_not_refuse_erase() {
+        let copy = |i| json!({"Read": place(i)});
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(7, vec![], 5, 1)),
+                bb(call_fun(1, vec![], 1, 2)),
+                bb(call_fun(4, vec![copy(0)], 2, 3)),
+                bb(call_fun(3, vec![], 3, 4)),
+                bb_stmts(
+                    vec![assign_local(
+                        4,
+                        json!({"BinaryOp": ["Sub", copy(3), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![copy(4)], 5, 5),
+                ),
+                bb(drop_local(1, 6)),
+                bb(json!("Return")),
+            ],
+        );
+        let unstructured = unstructured_json_from_body(&body);
+        let llbc = stack_ops_llbc_with_callee_funs(vec![opaque_fun(
+            13,
+            &["other", "subject"],
+            json!({ "Unstructured": unstructured }),
+        )]);
+        let fd = llbc.fn_by_id(13).expect("subject");
+        let body = fd.unstructured().expect("body");
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        for block in &erased.body {
+            let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) else {
+                continue;
+            };
+            if classify_call(call, &llbc).is_some() {
+                panic!(
+                    "RootScope/shadow-stack leaf survived erase: {:?}",
+                    callee_path(call, &llbc)
+                );
+            }
         }
     }
 
@@ -7143,10 +7199,7 @@ mod tests {
     /// `push_roots`.
     #[test]
     fn w_module_dict_setitem_str_internal_bracket_is_scalar_replaced() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         if !std::path::Path::new(path).is_file() {
             return;
         }

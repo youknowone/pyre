@@ -1891,7 +1891,7 @@ impl<'a> Lowering<'a> {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
-                    field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
+                    field: container_leaf_descriptor(container_field, at_offset_zero, 0, &leaf),
                     value: LinkArg::Value(read),
                     ty: leaf.ty,
                 },

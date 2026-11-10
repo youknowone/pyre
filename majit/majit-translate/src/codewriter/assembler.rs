@@ -6374,35 +6374,29 @@ fn bh_result_variant_field_specs(
     let Some(fields) = cc.struct_field_entries(owner) else {
         return Vec::new();
     };
+    let sid = majit_ir::descr::struct_id_for_name(owner);
     let mut specs = Vec::new();
-    let mut offset = 8usize;
     for row in fields {
-        let field_name = &row.name;
-        let field_type_str = &row.ty;
-        // This builder lays out the variant's own payload rows, which start
-        // past the inherited tag at byte 8.  The registry can also carry the
-        // enum base's synthetic `__discriminant` row (`layout.rs`,
-        // `front/semantic.rs`); emitting it here would place the tag at
-        // offset 8 alongside the payload AND make the caller's
-        // `any(field_key() == "__discriminant")` check skip the slot-0 /
-        // offset-0 tag it synthesizes.  Leave the tag to the caller.
-        if field_name == "__discriminant" {
+        if row.name == "__discriminant" {
             continue;
         }
+        let Some(offset) = cc.layout_field_offset(sid, owner, &row.name) else {
+            // A row without an exact offset is an annotation-only logical
+            // Struct field; all_fielddescrs emits its exact leaf rows instead.
+            continue;
+        };
         let (field_flag, field_type, field_size) =
-            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs);
+            type_flag_from_str(&row.ty, &cc.raw_alloc_flavor_structs);
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
-        let align = scalar_align(field_size);
-        offset = (offset + align - 1) & !(align - 1);
         let index = specs.len() + 1;
-        let rank = cc.field_immutability(Some(owner), field_name);
+        let rank = cc.field_immutability(Some(owner), &row.name);
         let is_quasi = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
         specs.push(bh_field_spec_from_parts(
             index as u32,
             owner,
-            field_name,
+            &row.name,
             offset,
             field_size,
             field_type,
@@ -6413,7 +6407,6 @@ fn bh_result_variant_field_specs(
             is_quasi && row.is_atomic,
             is_quasi && row.is_atomic,
         ));
-        offset += field_size;
     }
     specs
 }
@@ -8613,6 +8606,39 @@ mod tests {
         ids
     }
 
+    fn set_exact_field_offsets(
+        cc: &mut crate::call::CallControl,
+        owner: &str,
+        fields: &[(&str, usize, usize)],
+        size: usize,
+    ) {
+        use crate::call::{StructFieldLayout, StructLayout};
+        let sid = majit_ir::descr::struct_id_for_name(owner)
+            .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical_spelling(owner));
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: fields
+                    .iter()
+                    .map(|(name, offset, field_size)| StructFieldLayout {
+                        name: (*name).to_string(),
+                        offset: *offset,
+                        size: *field_size,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    })
+                    .collect(),
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+    }
+
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -9137,6 +9163,12 @@ mod tests {
             vec![("__pos_0".to_string(), "??TypeVar".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(
+            &mut cc,
+            "core::result::Result::Ok",
+            &[("__pos_0", 8, 8)],
+            16,
+        );
 
         let spec = bh_size_spec_from_callcontrol(&cc, "core::result::Result<i64,PyError>::Ok")
             .expect("explicit Result variant size");
@@ -9168,6 +9200,15 @@ mod tests {
             vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        // Layout on the queried owner must keep `__discriminant` so
+        // `bh_size_spec_from_callcontrol` still treats this as an explicit
+        // Result shell (`is_none_or` any discriminant field).
+        set_exact_field_offsets(
+            &mut cc,
+            owner,
+            &[("__discriminant", 0, 8), ("__pos_0", 8, 8)],
+            16,
+        );
 
         let spec =
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Result variant size");
@@ -9202,11 +9243,46 @@ mod tests {
             vec![("__pos_0".to_string(), "i64".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(&mut cc, template_name, &[("__pos_0", 8, 8)], 16);
 
         let spec =
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
         assert_eq!(spec.type_id, concrete_id.as_u64());
         assert_eq!(spec.all_fielddescrs.len(), 2);
+    }
+
+    #[test]
+    fn inline_variant_struct_payload_field_specs_skip_logical_row() {
+        use crate::call::CallControl;
+
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
+        let owner = "core::result::Result<Pair,()>::Ok";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__pos_0".to_string(), "Pair".to_string()),
+                ("__pos_0.a".to_string(), "i64".to_string()),
+                ("__pos_0.b".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(
+            &mut cc,
+            owner,
+            &[("__pos_0.a", 8, 8), ("__pos_0.b", 16, 8)],
+            24,
+        );
+
+        let specs = bh_result_variant_field_specs(&cc, owner);
+        let names_offsets: Vec<(&str, usize)> = specs
+            .iter()
+            .map(|spec| (spec.field_key(), spec.offset))
+            .collect();
+        assert_eq!(names_offsets, vec![("__pos_0.a", 8), ("__pos_0.b", 16)]);
+        let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("inline variant size");
+        assert_eq!(spec.size, 24);
     }
 
     #[test]

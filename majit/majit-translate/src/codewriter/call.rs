@@ -6804,7 +6804,7 @@ impl CallControl {
     }
 
     /// Offset of `field` in the registered layout of `owner`, when one is.
-    fn layout_field_offset(
+    pub(crate) fn layout_field_offset(
         &self,
         sid: Option<majit_ir::descr::StructId>,
         owner: &str,

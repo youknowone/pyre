@@ -81,6 +81,7 @@ fn simplify_lowered_graph(
         struct_field_attrs,
         sweep_dead_vars,
         guard_words,
+        sweep_dead_vars,
         &|_, _| None,
     )
     .expect("inline-struct expansion is off");
@@ -204,6 +205,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            &[],
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
@@ -3380,159 +3382,94 @@ fn leftover_push_roots_paths(graph: &crate::model::FunctionGraph) -> Vec<String>
         .collect()
 }
 
-/// Unique look-inside leftover of `push_roots` is `>i`. `RootScope` peels
-/// to the save-point word (`shadow_stack_len()`); a GCREF dest puts that
-/// length in `registers_r` and `walk_immortal_rec` loads it as a PyObject.
-fn leftover_push_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
-    leftover_named_call_dest_summaries(graph, "push_roots")
-}
-
-/// Unique look-inside leftover of `RootScope::pin_roots` is `ri>i`.
-/// Self is the save-point word; dest is the first shadow-stack index.
-fn leftover_pin_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
-    leftover_named_call_dest_summaries(graph, "pin_roots")
-}
-
-fn leftover_named_call_dest_summaries(
-    graph: &crate::model::FunctionGraph,
-    leaf: &str,
-) -> Vec<String> {
-    use crate::model::{CallTarget, FunctionGraph, OpKind};
+fn leftover_root_scope_bracket_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallFuncPtr, CallTarget, OpKind};
+    fn is_leaf(leaf: &str, path: &str) -> bool {
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        let in_roots = path.contains("gc_roots") || path.contains("RootScope");
+        match base {
+            "pin_root" | "pin_roots" | "root_scope_close" | "push_roots" => true,
+            "publish" | "publish_roots" | "normalize" | "normalize_moved" | "normalize_roots" => {
+                in_roots
+            }
+            "get" | "shadow_stack_get" => in_roots,
+            "drop" | "drop_in_place" => in_roots,
+            _ => false,
+        }
+    }
+    fn path_of_segments(segments: &[String]) -> String {
+        segments.join("::")
+    }
     graph
         .blocks
         .iter()
         .flat_map(|block| block.operations.iter())
-        .filter_map(|op| {
-            let dest = match op.result.as_ref() {
-                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
-                None => "_".into(),
-            };
-            match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    result_ty,
-                    ..
-                } if segments.last().map(String::as_str) == Some(leaf) => {
-                    Some(format!("Call dest={dest} ty={result_ty:?}"))
-                }
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    result_ty,
-                    ..
-                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
-                    Some(format!("Method dest={dest} ty={result_ty:?}"))
-                }
-                OpKind::CallResidual {
-                    funcptr,
-                    result_kind,
-                    ..
-                } => {
-                    let is_named = leftover_residual_leaf_is(graph, funcptr, leaf);
-                    is_named.then(|| format!("CallResidual dest={dest} res={result_kind}"))
-                }
-                _ => None,
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let path = path_of_segments(segments);
+                let leaf = segments.last().map(String::as_str)?;
+                is_leaf(leaf, &path).then_some(path)
             }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } => {
+                let path = match resolved_path {
+                    Some(p) => p.segments.join("::"),
+                    None => receiver_root
+                        .clone()
+                        .unwrap_or_else(|| format!("Method({name})")),
+                };
+                is_leaf(name, &path).then(|| format!("Method({name}, path={resolved_path:?})"))
+            }
+            OpKind::CallResidual { funcptr, .. } => match funcptr {
+                CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                    let path = path_of_segments(segments);
+                    let leaf = segments.last().map(String::as_str)?;
+                    is_leaf(leaf, &path).then_some(format!("CallResidual({path})"))
+                }
+                CallFuncPtr::Target(CallTarget::Method {
+                    name,
+                    resolved_path,
+                    receiver_root,
+                    ..
+                }) => {
+                    let path = match resolved_path {
+                        Some(p) => p.segments.join("::"),
+                        None => receiver_root
+                            .clone()
+                            .unwrap_or_else(|| format!("Method({name})")),
+                    };
+                    is_leaf(name, &path)
+                        .then(|| format!("CallResidual Method({name}, path={resolved_path:?})"))
+                }
+                CallFuncPtr::Value(v) => graph.blocks.iter().find_map(|b| {
+                    b.operations.iter().find_map(|prev| {
+                        (prev.result.as_ref() == Some(v))
+                            .then(|| match &prev.kind {
+                                OpKind::ConstFnAddr { path, .. } => {
+                                    let leaf = path.rsplit("::").next().unwrap_or(path);
+                                    is_leaf(leaf, path).then(|| format!("CallResidual({path})"))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                    })
+                }),
+                _ => None,
+            },
+            _ => None,
         })
         .collect()
-}
-
-fn leftover_residual_leaf_is(
-    graph: &crate::model::FunctionGraph,
-    funcptr: &crate::model::CallFuncPtr,
-    leaf: &str,
-) -> bool {
-    use crate::model::{CallFuncPtr, CallTarget, OpKind};
-    match funcptr {
-        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
-            segments.last().map(String::as_str) == Some(leaf)
-        }
-        CallFuncPtr::Target(CallTarget::Method { name, .. }) => {
-            crate::front::clause_spec::unspecialized_leaf(name) == leaf
-        }
-        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
-            b.operations.iter().any(|prev| {
-                prev.result.as_ref() == Some(v)
-                    && matches!(
-                        &prev.kind,
-                        OpKind::ConstFnAddr { path, .. }
-                            if path.rsplit("::").next() == Some(leaf)
-                    )
-            })
-        }),
-        _ => false,
-    }
-}
-
-/// Leftover `RootScope::pin_roots` self is the save-point word. A GCREF
-/// self banks `shadow_stack_len()` in `args_r`.
-fn leftover_pin_roots_arg_summaries(graph: &crate::model::FunctionGraph) -> String {
-    leftover_named_call_arg_summaries(graph, "pin_roots")
-}
-
-fn leftover_named_call_arg_summaries(graph: &crate::model::FunctionGraph, leaf: &str) -> String {
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
-    let mut out = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } if segments.last().map(String::as_str) == Some(leaf) => {
-                    let args = args
-                        .iter()
-                        .map(|arg| match arg {
-                            LinkArg::Value(v) => {
-                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
-                            }
-                            other => format!("{other:?}"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("Call args=[{args}]"));
-                }
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    args,
-                    ..
-                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
-                    let args = args
-                        .iter()
-                        .map(|arg| match arg {
-                            LinkArg::Value(v) => {
-                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
-                            }
-                            other => format!("{other:?}"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("Method args=[{args}]"));
-                }
-                OpKind::CallResidual {
-                    funcptr,
-                    args_i,
-                    args_r,
-                    result_kind,
-                    ..
-                } if leftover_residual_leaf_is(graph, funcptr, leaf) => {
-                    let i = args_i
-                        .iter()
-                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let r = args_r
-                        .iter()
-                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("CallResidual i=[{i}] r=[{r}] res={result_kind}"));
-                }
-                _ => {}
-            }
-        }
-    }
-    out.join(" | ")
 }
 
 /// Leftover `__cast_instance_intrinsic` of leftover `push_roots` dest.
@@ -12608,67 +12545,19 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
                 f.name
             ));
         }
-        let front_push = leftover_push_roots_dest_summaries(graph);
-        let xf_push = leftover_push_roots_dest_summaries(&xf);
-        if leftover_push_roots_paths(graph).is_empty() {
+        let front_roots = leftover_push_roots_paths(graph);
+        let xf_roots = leftover_push_roots_paths(&xf);
+        if !front_roots.is_empty() || !xf_roots.is_empty() {
             hits.push(format!(
-                "{} leftover push_roots is missing (erase refused on leftover eval_frame_after_enter): leftover={calls:?}",
+                "{} RootScope bracket survived: front={front_roots:?} xf={xf_roots:?}",
                 f.name
             ));
         }
-        if front_push.is_empty()
-            || front_push
-                .iter()
-                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
-            || !front_push.iter().any(|s| s.contains("Signed"))
-        {
+        let front_leaves = leftover_root_scope_bracket_leaves(graph);
+        let xf_leaves = leftover_root_scope_bracket_leaves(&xf);
+        if !front_leaves.is_empty() || !xf_leaves.is_empty() {
             hits.push(format!(
-                "{} leftover push_roots dest must be Signed: {front_push:?}",
-                f.name
-            ));
-        }
-        if xf_push
-            .iter()
-            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
-            || !xf_push
-                .iter()
-                .any(|s| s.contains("Signed") || s.contains("res=i"))
-        {
-            hits.push(format!(
-                "{} leftover push_roots dest is a GCREF (save-point walked as PyObject): front={front_push:?} xf={xf_push:?}",
-                f.name
-            ));
-        }
-        let front_pin = leftover_pin_roots_dest_summaries(graph);
-        let xf_pin = leftover_pin_roots_dest_summaries(&xf);
-        let xf_pin_args = leftover_pin_roots_arg_summaries(&xf);
-        if !front_pin.is_empty()
-            && (front_pin
-                .iter()
-                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
-                || !front_pin.iter().any(|s| s.contains("Signed")))
-        {
-            hits.push(format!(
-                "{} leftover pin_roots dest must be Signed: {front_pin:?}",
-                f.name
-            ));
-        }
-        if xf_pin
-            .iter()
-            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
-        {
-            hits.push(format!(
-                "{} leftover pin_roots dest is a GCREF: front={front_pin:?} xf={xf_pin:?}",
-                f.name
-            ));
-        }
-        if !xf_pin_args.is_empty()
-            && xf_pin_args.contains("Signed")
-            && xf_pin_args.contains("r=[")
-            && !xf_pin_args.contains("r=[]")
-        {
-            hits.push(format!(
-                "{} leftover pin_roots Signed self must sit in args_i: xf={xf_pin_args}",
+                "{} RootScope leaf survived: front={front_leaves:?} xf={xf_leaves:?}",
                 f.name
             ));
         }

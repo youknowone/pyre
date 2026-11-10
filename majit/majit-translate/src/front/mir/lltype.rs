@@ -7177,6 +7177,35 @@ pub(in crate::front::mir) fn type_decl_struct_field_offset(
         .and_then(|layout| layout.struct_field_offset(field_idx))
 }
 
+fn usize_tyref() -> TyRef {
+    serde_json::from_value(serde_json::json!({
+        "Scalar": {"Integer": {"Unsigned": "Usize"}}
+    }))
+    .expect("the canonical usize TyRef is valid")
+}
+
+fn inline_leaf_size_align(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<(u64, u64)> {
+    let spelling = tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
+    let (_, ir_type, size) =
+        crate::codewriter::call::get_type_flag(&spelling, raw_alloc_flavor_structs);
+    if ir_type == majit_ir::value::Type::Void || size == 0 {
+        return None;
+    }
+    let size = u64::try_from(size).ok()?;
+    let word = u64::try_from(crate::layout::target_word_size()).ok()?;
+    Some((size, size.min(word)))
+}
+
+fn type_decl_size_align(td: &TypeDecl, llbc: &Llbc) -> Option<(u64, u64)> {
+    let layout = td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default())?;
+    Some((layout.size?, layout.align?))
+}
+
 /// Leaves of by-value struct `td`, relative to `td`.
 ///
 /// `instantiated` is the use-site type of `td` (generic arguments
@@ -7212,87 +7241,150 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<InlineLeaf> {
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return Vec::new();
-    };
-    let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
-    let owner_node = tyref_node(instantiated, llbc).and_then(|n| strip_ty_wrappers(n, llbc));
-    let transparent_payload_idx =
-        tyref_transparent_nonzst_field(instantiated, llbc).map(|(idx, _)| idx);
-    let mut leaves = Vec::new();
-    for (i, f) in fields.iter().enumerate() {
-        let name = f
-            .name
-            .clone()
-            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
-        let field_ty = owner_node
-            .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
-            .unwrap_or_else(|| clone_tyref(&f.ty));
-        if tyref_is_void_zst(&field_ty, llbc)
-            && !tyref_keeps_empty_class_instance(&field_ty, llbc, tombstoned)
-        {
-            continue;
+    fn walk(
+        td: &TypeDecl,
+        instantiated: &TyRef,
+        llbc: &Llbc,
+        tombstoned: &std::collections::HashSet<String>,
+        gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+        raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ) -> Option<Vec<InlineLeaf>> {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return None;
+        };
+        // A `repr(transparent)` wrapper has field offsets but may omit
+        // size/align (`transparent_unique_field_decl`); `heaptracker.all_fielddescrs`
+        // still walks the instantiated payload. Ordinary structs stay fail-closed.
+        if !td.is_repr_transparent() {
+            type_decl_size_align(td, llbc)?;
         }
-        if tyref_pair_field_kind(&field_ty, llbc).is_some() {
-            let len = pair_len_field_name(&name);
-            for fname in [name, len] {
-                leaves.push(InlineLeaf {
-                    field: FieldDescriptor::new(fname, Some(owner_root.clone()))
-                        .with_owner_id(Some(owner_id))
-                        .with_base_is_deref(false),
-                    super_path: String::new(),
-                    ty: ValueType::Unsigned,
-                });
+        let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
+        let owner_node = tyref_node(instantiated, llbc).and_then(|n| strip_ty_wrappers(n, llbc));
+        let transparent_payload_idx =
+            tyref_transparent_nonzst_field(instantiated, llbc).map(|(idx, _)| idx);
+        let mut leaves = Vec::new();
+        for (i, f) in fields.iter().enumerate() {
+            let name = f
+                .name
+                .clone()
+                .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+            let field_ty = owner_node
+                .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
+                .unwrap_or_else(|| clone_tyref(&f.ty));
+            if tyref_is_void_zst(&field_ty, llbc)
+                && !tyref_keeps_empty_class_instance(&field_ty, llbc, tombstoned)
+            {
+                continue;
             }
-            continue;
-        }
-        if let Some(nested) = tyref_by_value_struct_decl(
-            &field_ty,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        ) {
-            // `heaptracker.all_fielddescrs`: by-value nesting is finite (a
-            // self-containing by-value struct is impossible), so there is no
-            // cutoff.
-            let nested_leaves = collect_by_value_struct_leaves(
-                nested,
+            // `repr(transparent)`: the unique non-ZST field shares the wrapper's
+            // address, so its offset is 0 even when Charon records no layout.
+            let field_offset = if td.is_repr_transparent() {
+                0
+            } else {
+                type_decl_struct_field_offset(td, llbc, i)?
+            };
+            if tyref_pair_field_kind(&field_ty, llbc).is_some() {
+                let word_ty = usize_tyref();
+                let (size, align) = inline_leaf_size_align(
+                    &word_ty,
+                    llbc,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )?;
+                for (fname, offset) in [
+                    (name.clone(), field_offset),
+                    (pair_len_field_name(&name), field_offset.checked_add(size)?),
+                ] {
+                    leaves.push(InlineLeaf {
+                        field: FieldDescriptor::new(fname, Some(owner_root.clone()))
+                            .with_owner_id(Some(owner_id))
+                            .with_base_is_deref(false),
+                        super_path: String::new(),
+                        ty: ValueType::Unsigned,
+                        source_ty: clone_tyref(&word_ty),
+                        offset,
+                        size,
+                        align,
+                    });
+                }
+                continue;
+            }
+            if let Some(nested) = tyref_by_value_struct_decl(
                 &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-            );
-            if transparent_payload_idx == Some(i) {
-                leaves.extend(nested_leaves);
+            ) {
+                let nested_leaves = walk(
+                    nested,
+                    &field_ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )?;
+                if transparent_payload_idx == Some(i) {
+                    leaves.extend(nested_leaves);
+                    continue;
+                }
+                let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
+                    .with_owner_id(Some(owner_id))
+                    .with_base_is_deref(false);
+                for leaf in nested_leaves {
+                    leaves.push(nest_inline_leaf(
+                        &container_field,
+                        field_offset == 0,
+                        field_offset,
+                        &leaf,
+                    ));
+                }
                 continue;
             }
-            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
-            let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
-                .with_owner_id(Some(owner_id))
-                .with_base_is_deref(false);
-            for leaf in nested_leaves {
-                leaves.push(nest_inline_leaf(&container_field, at_offset_zero, &leaf));
-            }
-            continue;
+            let (size, align) =
+                inline_leaf_size_align(&field_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)?;
+            leaves.push(InlineLeaf {
+                field: FieldDescriptor::new(name, Some(owner_root.clone()))
+                    .with_owner_id(Some(owner_id))
+                    .with_base_is_deref(false)
+                    .with_inline_vec(field_ty_is_inline_vec(&field_ty, llbc)),
+                super_path: String::new(),
+                ty: tyref_to_attr_value_type_for_struct_field(
+                    &field_ty,
+                    td,
+                    llbc,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ),
+                source_ty: field_ty,
+                offset: field_offset,
+                size,
+                align,
+            });
         }
-        leaves.push(InlineLeaf {
-            field: FieldDescriptor::new(name, Some(owner_root.clone()))
-                .with_owner_id(Some(owner_id))
-                .with_base_is_deref(false)
-                .with_inline_vec(field_ty_is_inline_vec(&field_ty, llbc)),
-            super_path: String::new(),
-            ty: tyref_to_attr_value_type_for_struct_field(
-                &field_ty,
-                td,
-                llbc,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ),
-        });
+        Some(leaves)
     }
-    leaves
+
+    walk(
+        td,
+        instantiated,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .unwrap_or_default()
+}
+
+/// One inlined by-value struct payload on a reference-enum variant.
+/// Declaration-ordered and exact-keyed (`owner`, `field`); not a side table.
+#[derive(Clone)]
+pub(in crate::front::mir) struct InlineVariantField {
+    pub owner: String,
+    pub owner_is_gc: bool,
+    pub field: String,
+    pub payload_offset: u64,
+    pub payload_ty: TyRef,
 }
 
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
@@ -7303,14 +7395,56 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
 /// `typeptr`-like header words are ordinary leaves: this is a copy of an
 /// existing value, not an allocation. A deeper by-value sub-struct's
 /// leaves peel leading offset-0 hops (`nest_inline_leaf`).
-pub(in crate::front::mir) fn inline_struct_field_leaves(
+///
+/// Variant payloads are an exact `InlineVariantField` lookup first
+/// (`tyref_by_value_struct_decl`); a miss falls through to the owner's
+/// TypeDecl field. `heaptracker.all_fielddescrs` emits the leaves, never
+/// the containing Struct field.
+pub(in crate::front::mir) fn expand_inline_field(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    variant_fields: &[InlineVariantField],
     owner: &str,
     field_name: &str,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<crate::model::InlineStructExpansion> {
+    if let Some(spec) = variant_fields
+        .iter()
+        .find(|spec| spec.owner == owner && spec.field == field_name)
+    {
+        let nested = tyref_by_value_struct_decl(
+            &spec.payload_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )?;
+        // A GcStruct inlines only as the first field of another GcStruct (`lltype.GcStruct` / `rclass` `super`).
+        if spec.payload_offset != 0 && gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+            return None;
+        }
+        let (size, align) = type_decl_size_align(nested, llbc)?;
+        let leaves = collect_by_value_struct_leaves(
+            nested,
+            &spec.payload_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+        if leaves.is_empty() {
+            return None;
+        }
+        return Some(crate::model::InlineStructExpansion {
+            at_offset_zero: spec.payload_offset == 0,
+            offset: spec.payload_offset,
+            size,
+            align,
+            owner_is_gc: spec.owner_is_gc,
+            leaves,
+        });
+    }
     let td = type_decl_by_owner_root(llbc, owner)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
@@ -7326,17 +7460,33 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
         gc_struct_ids,
         raw_alloc_flavor_structs,
     )?;
-    Some(crate::model::InlineStructExpansion {
-        at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
-        leaves: collect_by_value_struct_leaves(
-            nested,
-            &field.ty,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        ),
-    })
+    let owner_id = struct_id_for_type_decl(td);
+    let owner_is_gc = struct_id_is_declared_gc(gc_struct_ids, owner_id, owner);
+    let offset = type_decl_struct_field_offset(td, llbc, field_idx)?;
+    let (size, align) = type_decl_size_align(nested, llbc)?;
+    let leaves = collect_by_value_struct_leaves(
+        nested,
+        &field.ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    );
+    if leaves.is_empty() {
+        return None;
+    }
+    let expansion = crate::model::InlineStructExpansion {
+        at_offset_zero: offset == 0,
+        offset,
+        size,
+        align,
+        owner_is_gc,
+        leaves,
+    };
+    // Stage 2+ reads these; Stage 1 records them only. A field access here
+    // keeps `dead_code` quiet without changing the returned expansion.
+    let _ = (expansion.size, expansion.align, expansion.owner_is_gc);
+    Some(expansion)
 }
 
 /// Whether the pointee of exactly one raw-pointer layer is a string-family
@@ -8129,7 +8279,7 @@ pub(in crate::front::mir) fn tyref_one_word_handle_payload_field(
 ///
 /// `celldict.py` `erase({})` stores the dicttable itself; `ModuleDictStorage`
 /// is a no-op alias of that `RDict` (`heaptracker.py all_fielddescrs` /
-/// `inline_struct_field_leaves`). A pointer-shaped payload is a GC handle
+/// `expand_inline_field`). A pointer-shaped payload is a GC handle
 /// (`PyError.0` is `*mut PyErrorObject`) and keeps the wrapper's own field.
 pub(in crate::front::mir) fn transparent_by_value_inner_fields<'a>(
     td: &'a TypeDecl,
