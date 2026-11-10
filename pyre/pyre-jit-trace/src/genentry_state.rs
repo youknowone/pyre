@@ -77,8 +77,11 @@ pub fn genentry_resolved_cell_key(
     warm: &majit_metainterp::warmstate::WarmEnterState,
     pycode: PyObjectRef,
 ) -> u64 {
-    let hash = genentry_green_hash(pycode);
-    warm.resolve_cell_key(hash, || genentry_green_key(pycode))
+    let pin = majit_metainterp::GreenRefPin::pin_one(pycode as usize);
+    let mut live = genentry_green_key(pin.live() as PyObjectRef);
+    let hash = live.get_uhash();
+    pin.reload(&mut live);
+    warm.cell_key_for(&pin, &live).unwrap_or(hash)
 }
 
 /// Reds in merge-point bank order (red R: `gen`, `w_arg`).
@@ -178,8 +181,16 @@ mod tests {
         let squatter = colliding_squatter_key(&typed);
         assert_eq!(squatter.get_uhash(), hash);
         assert_ne!(squatter, typed);
-        jd2.disable_noninlinable_function_for_key(&squatter);
-        let minted = jd2.ensure_cell_key(&typed);
+        {
+            let pin = majit_metainterp::GreenRefPin::pin(&squatter);
+            let mut live = pin.live_clone(&squatter);
+            jd2.disable_noninlinable_function_for_key(&pin, &mut live);
+        }
+        let minted = {
+            let pin = majit_metainterp::GreenRefPin::pin(&typed);
+            let mut live = pin.live_clone(&typed);
+            jd2.ensure_cell_key(&pin, &mut live)
+        };
         assert_ne!(
             minted, hash,
             "the squatter keeps the raw hash; the typed cell is minted"

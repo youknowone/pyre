@@ -308,14 +308,15 @@ pub struct TraceCtx {
     pub(crate) metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     pub(crate) green_key: u64,
     root_green_key: u64,
-    /// Structured `(code_ptr, pc)` counterpart to `green_key`. Keeps
-    /// pyjitpl.py:1396-1401's element-wise `same_constant` parity when
-    /// comparing against inline-frame green keys; the u64 `green_key`
-    /// above is the hash derived from this pair and stays the identity
-    /// key for HashMap lookups (warmstate / pending
-    /// token) while comparisons route through the raw pair.
-    pub(crate) green_key_raw: (usize, usize),
-    pub(crate) root_green_key_raw: (usize, usize),
+    /// Portal `W_Code` retained as a walked owner-root (`JitCell` Ref
+    /// greens). `live_green_key_raw` reloads the forwarded bits; a copied
+    /// `(W_Code*, pc)` pair is not a GCREF local (`gctransform/shadowstack.py`).
+    pub(crate) green_key_code: majit_ir::RetainedGreens,
+    pub(crate) green_key_pc: usize,
+    pub(crate) green_key_code_fallback: i64,
+    pub(crate) root_green_key_code: majit_ir::RetainedGreens,
+    pub(crate) root_green_key_pc: usize,
+    pub(crate) root_green_key_code_fallback: i64,
     /// Stack of inlined function frames (callee green keys as raw
     /// `(code_ptr, pc)` pairs). rpython/jit/metainterp/pyjitpl.py:1390
     /// walks `self.metainterp.framestack` element-wise; pyre mirrors
@@ -2456,8 +2457,12 @@ impl TraceCtx {
             metainterp_sd,
             green_key,
             root_green_key: green_key,
-            green_key_raw: (0, 0),
-            root_green_key_raw: (0, 0),
+            green_key_code: majit_ir::RetainedGreens::default(),
+            green_key_pc: 0,
+            green_key_code_fallback: 0,
+            root_green_key_code: majit_ir::RetainedGreens::default(),
+            root_green_key_pc: 0,
+            root_green_key_code_fallback: 0,
             inline_frames: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
@@ -2558,8 +2563,12 @@ impl TraceCtx {
             metainterp_sd,
             green_key,
             root_green_key: green_key,
-            green_key_raw: (0, 0),
-            root_green_key_raw: (0, 0),
+            green_key_code: majit_ir::RetainedGreens::default(),
+            green_key_pc: 0,
+            green_key_code_fallback: 0,
+            root_green_key_code: majit_ir::RetainedGreens::default(),
+            root_green_key_pc: 0,
+            root_green_key_code_fallback: 0,
             inline_frames: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,

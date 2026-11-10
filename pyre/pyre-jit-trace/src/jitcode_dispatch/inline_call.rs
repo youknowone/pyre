@@ -3874,6 +3874,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    // Nursery-born `W_Code` and `callable` must sit on the shadow stack
+    // before `can_inline_callable` (`warmstate.py`): that lookup hashes
+    // the Ref green (`get_uhash` → `id_or_identityhash` / `_find_shadow`)
+    // and can collect. Sequential `pin_root` would normalize after the
+    // first word (`gctransform/shadowstack.py` `push_roots`; `framework.py`
+    // `gct_direct_call`). These slots are reused below for the empty
+    // vararg / globals / `const_ref` bake; do not pin the pair again.
+    let _assembler_code_roots = pyre_object::gc_roots::push_roots();
+    let assembler_base =
+        _assembler_code_roots.pin_roots(&[callable, w_code as pyre_object::PyObjectRef]);
+    let callable_slot = assembler_base;
+    let assembler_code_slot = assembler_base + 1;
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     // `_opimpl_recursive_call` residualizes with `assembler_call = False`
     // when `warmrunnerstate.inlining` is off. With inlining on, a callee
     // `can_inline_callable` accepts is inlined through `perform_call`
@@ -3887,7 +3901,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // does not check, upstream would still inline and this path leaves a
     // plain residual. No driver means a skeleton walk: leave the call a
     // plain residual.
-    let callee_green_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
+    let pin = majit_metainterp::GreenRefPin::pin_one(callee_code_key);
+    let mut callee_green_key =
+        crate::driver::make_green_key_typed(pin.live() as usize as *const (), 0, is_being_profiled);
+    pin.reload(&mut callee_green_key);
     let assembler_call = {
         let Some((driver, _)) = crate::driver::try_driver_pair() else {
             return Ok(None);
@@ -3895,8 +3913,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let warm_state = driver
             .meta_interp_mut()
             .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX);
-        warm_state.inlining() && !warm_state.can_inline_callable_for_key(&callee_green_key)
+        warm_state.inlining() && !warm_state.can_inline_callable_for_key(&pin, &callee_green_key)
     };
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     if !assembler_call {
         return Ok(None);
     }
@@ -4027,6 +4047,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     // Resolve before any IR. A missing kwonly default is a TypeError the
     // residual call raises; this builder only fills entries the mapping has.
+    // Re-read after `can_inline_callable` (`get_uhash` / `_find_shadow`)
+    // and before this call reads the function's kwdefaults.
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     let kwonly_resolved = if kwonly_count == 0 {
         None
     } else {
@@ -4035,16 +4059,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             None => return Ok(None),
         }
     };
-    // Nursery-born `W_Code` must survive the empty-vararg tuple and the
-    // kwargs dict below, as must `callable`. `walker_pin_function_code` compares
-    // `Function.getcode` after `QuasiImmutDescr.__init__` against this slot.
-    let _assembler_code_roots = pyre_object::gc_roots::push_roots();
-    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(callable);
-    let assembler_code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     // The empty tuple is rooted in this bracket until `const_ref` interns
     // it. Movability is the backend's concern (`Rewrite.remove_constptr`).
+    // `callable` / `w_code` already occupy `callable_slot` /
+    // `assembler_code_slot` from the pin above `can_inline_callable`.
     let empty_vararg_slot = if has_varargs {
         let concrete = pyre_object::w_tuple_new_array_backed(Vec::new());
         if concrete.is_null() {
@@ -4056,7 +4074,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     } else {
         None
     };
-    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
+    let code_pin = majit_metainterp::GreenRefPin::pin_one(pyre_object::gc_roots::shadow_stack_get(
+        assembler_code_slot,
+    ) as usize);
+    let w_code = code_pin.get() as *const ();
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     // The callee's globals OBJECT (`function.w_func_globals_obj`). A
     // `frame_stores_global` mismatch is stored on the inline frame as
@@ -4071,22 +4092,31 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
+    let w_code = code_pin.get() as *const ();
     let callee_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    let mut live_key = code_pin.live_clone(&callee_key);
     // `get_jitcell(*greenargs)` — the token and the later loop attach share
     // this cell (`ensure_jit_cell_at_key(greenkey)`).
     let greenboxes = [
         majit_ir::Value::Int(0),
         majit_ir::Value::Int(is_being_profiled as i64),
-        majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(code_pin.get())),
     ];
     let red_types = [Type::Ref, Type::Ref];
-    let token =
-        match driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types) {
-            Some(token) => token,
-            None => {
-                return Ok(None);
-            }
-        };
+    let token = match driver.get_or_make_portal_assembler_token_arc(
+        &code_pin,
+        &mut live_key,
+        &greenboxes,
+        &red_types,
+    ) {
+        Some(token) => token,
+        None => {
+            return Ok(None);
+        }
+    };
+    // `get_or_make` hashes the Ref green (`get_uhash` → `_find_shadow`)
+    // and can collect. Re-read before `const_ref` bakes a ConstPtr.
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
 
     // emission
     // The token is the callee this callable resolved to. A loop-carried
@@ -4124,6 +4154,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if let Some(resolved) = kwonly_resolved {
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if r_args[0].is_constant() {
+            // The GuardValue intern above can collect; bake the forwarded word.
+            let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
             let callable_const = ctx.trace_ctx.const_ref(callable as i64);
             let mutate = crate::descr::mutate_descr_for_quasi_field(&kw_defs_descr)
                 .expect("Function.w_kw_defs has mutate_w_kw_defs");
@@ -4642,25 +4674,32 @@ pub(crate) struct WalkerLoopCalleePortalRecord {
 /// keyed at the header `next_instr`).
 fn loop_bearing_header_call_assembler(
     abort_jit_pc: usize,
-    w_code: *const (),
+    code_slot: usize,
     is_being_profiled: bool,
 ) -> Option<DispatchOutcome> {
+    let pin = majit_metainterp::GreenRefPin::pin_one(pyre_object::gc_roots::shadow_stack_get(
+        code_slot,
+    ) as usize);
+    let w_code = pin.get() as *const ();
     let pjc = crate::state::pyjitcode_for_code(w_code)?;
     let py_pc =
         crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, abort_jit_pc) as usize;
+    let w_code = pin.get() as *const ();
     if !pyre_interpreter::code_pc_is_loop_header(w_code as pyre_object::PyObjectRef, py_pc) {
         return None;
     }
+    let w_code = pin.get() as *const ();
     let callee_key = crate::driver::make_green_key_typed(w_code, py_pc, is_being_profiled);
+    let mut live = pin.live_clone(&callee_key);
     let (driver, _) = crate::driver::driver_pair();
     let greenboxes = [
         Value::Int(py_pc as i64),
         Value::Int(is_being_profiled as i64),
-        Value::Ref(majit_ir::GcRef(w_code as usize)),
+        Value::Ref(majit_ir::GcRef(pin.get())),
     ];
     let red_types = [Type::Ref, Type::Ref];
     let token =
-        driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types)?;
+        driver.get_or_make_portal_assembler_token_arc(&pin, &mut live, &greenboxes, &red_types)?;
     Some(DispatchOutcome::SubLoopCalleeCallAssembler {
         token: Some(token),
         target_pc: py_pc,
@@ -4807,6 +4846,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    // Nursery-born `W_Code` must sit on the extra-area before
+    // `record_activation_charge` / `const_ref` intern (`history.py`
+    // `ConstPtr` / `id_or_identityhash` / `_allocate_shadow`).
+    // Re-read from the slot at each use (`gctransform/shadowstack.py`
+    // `push_roots` / `framework.py` `gct_direct_call`).
+    let _portal_code_roots = pyre_object::gc_roots::push_roots();
+    let portal_code_slot = _portal_code_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
+    let w_code = _portal_code_roots.get(portal_code_slot) as *const ();
     // The bridge resume captures its after-call guards on the paused callers;
     // decline before the first recorded op when they cannot take the result.
     if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
@@ -4835,7 +4882,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // check just accepted before `direct_assembler_call` forces the frame.
     // The inline path passes a dst and keeps its own setfield sequence.
     if dst.is_none()
-        && let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code as usize, target_pc)
+        && let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(
+            _portal_code_roots.get(portal_code_slot) as usize,
+            target_pc,
+        )
     {
         let vsd_box = ctx.trace_ctx.const_int(depth_vsd as i64);
         let vsd_descr = crate::descr::pyframe_stack_depth_descr();
@@ -4991,7 +5041,9 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let funcbox = ctx.trace_ctx.const_int(portal_runner_adr);
     let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
     let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
-    let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
+    let pycode_box = ctx
+        .trace_ctx
+        .const_ref(_portal_code_roots.get(portal_code_slot) as i64);
     // The `ec` red is the portal's second red (`interp_jit.py`
     // `PyPyJitDriver.reds = ['frame', 'ec']`). `do_residual_call` records
     // that box. A `ConstPtr` of `getexecutioncontext()` would bake the
@@ -6537,6 +6589,13 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             (method, w_code, nparams, has_closure)
         }
     };
+    // `w_tuple_getitem` on a specialised tuple (CALL_FUNCTION_EX) and on
+    // `kwnames` (CALL_KW) allocates. Pin the callee and its nursery-born
+    // `W_Code` before those reads (`gctransform/shadowstack.py` `push_roots`).
+    let callee_roots = pyre_object::gc_roots::push_roots();
+    let callee_base =
+        callee_roots.pin_roots(&[resolved_callable, w_code as pyre_object::PyObjectRef]);
+    w_code = callee_roots.get(callee_base + 1) as *const ();
     if fbw_inline_diag_enabled() {
         // Name the callee: a pc alone does not say which function a decline
         // cost, and one trace reaches several.
@@ -6575,7 +6634,13 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             None
         };
         let Some((args, concretes, extras)) = (unsafe {
-            fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams, receiver)
+            fbw_reorder_call_kw_args(
+                r_args,
+                &arg_concretes,
+                callee_roots.get(callee_base + 1) as *const (),
+                nparams,
+                receiver,
+            )
         }) else {
             return Ok(None);
         };
@@ -6594,12 +6659,10 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        // `w_tuple_getitem` on a specialised tuple allocates. Pin the callee
-        // and its code across that unpack, then reload the forwarded
-        // addresses. The unpack also reloads `w_code` before keyword binding.
-        let callee_roots = pyre_object::gc_roots::push_roots();
-        let callee_base =
-            callee_roots.pin_roots(&[resolved_callable, w_code as pyre_object::PyObjectRef]);
+        // `w_tuple_getitem` on a specialised tuple allocates. The callee
+        // and its code are already on `callee_roots`; reload the forwarded
+        // addresses after the unpack. The unpack also reloads `w_code`
+        // before keyword binding.
         let unpacked = fbw_unpack_call_function_ex_args(
             ctx,
             op.pc,
@@ -6608,8 +6671,6 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             callee_roots.get(callee_base + 1) as *const (),
             nparams,
         );
-        resolved_callable = callee_roots.get(callee_base);
-        w_code = callee_roots.get(callee_base + 1) as *const ();
         let Some((args, concretes, star, kwargs)) = unpacked else {
             return Ok(None);
         };
@@ -6637,6 +6698,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
         (callee_args, callee_arg_concretes)
     };
+    resolved_callable = callee_roots.get(callee_base);
+    w_code = callee_roots.get(callee_base + 1) as *const ();
     try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
@@ -9390,7 +9453,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     mut callee_args: Vec<OpRef>,
     mut callee_arg_concretes: Vec<ConcreteValue>,
     bound_method: Option<BoundMethodInline>,
-    w_code: *const (),
+    mut w_code: *const (),
     nparams: usize,
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
@@ -9465,6 +9528,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the callee sub-walk, each of which can minor-collect. Install the pins
     // before the argument `pin_roots` below: that publish normalizes, and on
     // a safepoint the raw copies are not roots.
+    // Nursery-born `W_Code` must join that publish before
+    // `can_inline_callable` (`warmstate.py`; `get_uhash` →
+    // `id_or_identityhash`). Sequential `pin_root` would normalize after
+    // the first word (`gctransform/shadowstack.py` `push_roots`). The
+    // `inline_code_slot` is reused for the later globals / `const_ref`
+    // bake; do not pin `w_code` again.
+    let _inline_const_roots = pyre_object::gc_roots::push_roots();
+    let inline_base =
+        _inline_const_roots.pin_roots(&[callable, w_code as pyre_object::PyObjectRef]);
+    let callable = pyre_object::gc_roots::shadow_stack_get(inline_base);
+    let inline_code_slot = inline_base + 1;
     let callable_pin = residual_call::owner_root_if_gc(callable as usize);
     let live_callable = || pinned_obj(&callable_pin, callable);
     let guard_value_pin = residual_call::owner_root_if_gc(callable_guard_value as usize);
@@ -9551,6 +9625,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
     }
+    w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
     let is_being_profiled = live_frame_is_being_profiled(ctx);
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -9645,12 +9720,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // value=7)` of an `Exception` subclass: 122 bridges and 24480 guard
         // failures over 50000 iterations, against 0 and 1 for the same loop
         // with no defaulted parameter.
-        if callable_guard_value != callable {
+        if pinned_obj(&guard_value_pin, callable_guard_value) != live_callable() {
             return Ok(None);
         }
-        let Some(defaults) =
-            (unsafe { positional_defaults_for_inline(&_arg_roots, callable, &missing, nparams) })
-        else {
+        let Some(defaults) = (unsafe {
+            positional_defaults_for_inline(&_arg_roots, live_callable(), &missing, nparams)
+        }) else {
             return resolved_inline_decline(op.pc, line!());
         };
         callee_args.resize(nparams, OpRef::NONE);
@@ -9684,7 +9759,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // minted from one `def` both are.  It is also not the test to gate on
         // — a module-level callee reaches here with its function baked, which
         // clears the flag and is the ordinary shape, not a corner.
-        if callable_guard_value != callable {
+        if pinned_obj(&guard_value_pin, callable_guard_value) != live_callable() {
             return resolved_inline_decline(op.pc, line!());
         }
         // Seeding from baked cells stands on a `GuardValue` that `w_kw_defs`
@@ -9698,11 +9773,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if ctx.trace_ctx.heap_cache().is_unescaped(callable_guard_op) {
             return resolved_inline_decline(op.pc, line!());
         }
+        w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
         let resolved: Option<KwonlyDefaultsInline> = crate::jitcode_dispatch::diag::spec_gate(
             crate::jitcode_dispatch::diag::SpecFold::KwonlyDefaultsInline,
             || {
                 Ok::<_, DispatchError>(unsafe {
-                    kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count)
+                    kwonly_defaults_for_inline(live_callable(), w_code, nparams, kwonly_count)
                 })
             },
         )?;
@@ -9846,6 +9922,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if callee_args.len() != seeded_locals {
         return resolved_inline_decline(op.pc, line!());
     }
+    w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
     let raw_callee_code =
         unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_callee_code.is_null() {
@@ -9854,7 +9931,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let callee_code = unsafe { &*raw_callee_code };
     let mut concrete_freevar_cells = Vec::new();
     let concrete_closure = if has_closure {
-        let closure = unsafe { pyre_interpreter::function_get_closure(callable) };
+        let closure = unsafe { pyre_interpreter::function_get_closure(live_callable()) };
         if closure.is_null()
             || !unsafe { pyre_object::is_tuple(closure) }
             || unsafe { pyre_object::w_tuple_len(closure) } != callee_code.freevars.len()
@@ -9896,16 +9973,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // essential for branching recursion.  Once one arm reaches the bound,
     // later sibling calls in the same trace go straight to CALL_ASSEMBLER
     // instead of starting a fresh unroll from their now-shallower framestack.
+    w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
-    let callee_green_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    let pin = majit_metainterp::GreenRefPin::pin_one(callee_code_key);
+    let mut callee_green_key =
+        crate::driver::make_green_key_typed(pin.live() as usize as *const (), 0, is_being_profiled);
+    pin.reload(&mut callee_green_key);
     if let Some((driver, _)) = crate::driver::try_driver_pair()
         && !driver
             .meta_interp_mut()
             .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-            .can_inline_callable_for_key(&callee_green_key)
+            .can_inline_callable_for_key(&pin, &mut callee_green_key)
     {
         return resolved_inline_decline(op.pc, line!());
     }
+    w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
+    let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
     // `_opimpl_recursive_call` (`pyjitpl.py`) reads
     // `memory_manager.max_unroll_recursion` at this decision. Do not bake the
     // RPython default here: `pypyjit.set_param(max_unroll_recursion=...)`
@@ -9919,10 +10002,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         fbw_inline_recursion_count(ctx, callee_code_key, is_being_profiled);
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            pin.reload(&mut callee_green_key);
             driver
                 .meta_interp_mut()
                 .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .disable_noninlinable_function_for_key(&callee_green_key);
+                .disable_noninlinable_function_for_key(&pin, &mut callee_green_key);
         }
         return resolved_inline_decline(op.pc, line!());
     }
@@ -10276,11 +10360,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // walks. A `frame_stores_global` mismatch is stored on the inline
     // frame as `FrameDebugData.w_globals`.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(live_callable()) };
-    let _inline_const_roots = pyre_object::gc_roots::push_roots();
     let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
-    let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
     refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
     if let Some(kw) = star_kwargs.as_mut() {
@@ -12024,6 +12105,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let next_instr_box = sub_wc.trace_ctx.const_int(0);
         let profiled_box = sub_wc.trace_ctx.const_int(is_being_profiled as i64);
         let pycode_box = sub_wc.trace_ctx.const_ref(w_code_ptr as i64);
+        // `const_ref` interns and can collect (`incminimark.py`
+        // `_find_shadow`). The extra-area slot and the `GreenRefPin`
+        // taken for `can_inline_callable` are the live words.
+        pin.reload(&mut callee_green_key);
+        let hash = callee_green_key.get_uhash();
+        pin.reload(&mut callee_green_key);
+        let w_code_ptr = pin.get();
         let mut argboxes = vec![
             (majit_metainterp::JitArgKind::Int, next_instr_box, 0),
             (
@@ -12055,7 +12143,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
-                callee_green_key.get_uhash(),
+                hash,
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
@@ -12128,11 +12216,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 pc,
                 blackhole_required,
             }) if callee_frame_seeded && constructor_result.is_none() => {
-                match loop_bearing_header_call_assembler(
-                    pc,
-                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                    is_being_profiled,
-                ) {
+                match loop_bearing_header_call_assembler(pc, inline_code_slot, is_being_profiled) {
                     Some(outcome) => Ok((outcome, op.next_pc)),
                     None => Err(DispatchError::LoopBearingCalleeInlineUnsupported {
                         pc,
@@ -13241,11 +13325,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // is still missing records `direct_call_may_force`.
             let token = match token {
                 Some(token) => Some(token),
-                None => super::portal_assembler_token(
-                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                    target_pc,
-                    is_being_profiled,
-                ),
+                None => {
+                    let pin = majit_metainterp::GreenRefPin::pin_one(
+                        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
+                    );
+                    super::portal_assembler_token(pin.save(), target_pc, is_being_profiled)
+                }
             };
             let emitted = emit_walker_loop_callee_call_assembler(
                 ctx,
@@ -16875,6 +16960,11 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     let code_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
 
+    // `const_ref` intern can minor-collect. Reload every pinned copy
+    // after it (`gctransform/shadowstack.py` push_roots / pop_roots).
+    let iter_const = ctx
+        .trace_ctx
+        .const_ref(pyre_object::gc_roots::shadow_stack_get(iter_root) as i64);
     let concrete_obj = pyre_object::gc_roots::shadow_stack_get(obj_root);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
     let w_iter = pyre_object::gc_roots::shadow_stack_get(iter_root);
@@ -16883,8 +16973,6 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     });
     let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_iter));
     let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
-
-    let iter_const = ctx.trace_ctx.const_ref(w_iter as i64);
     let executed_effects_before = fbw_executed_effect_count();
     let inline = try_walker_inline_resolved_user_call_inner(
         ctx,
@@ -17654,6 +17742,13 @@ fn descend_generatorentry<Sym: WalkSym>(
         gen_resume_decline("several_yields_no_pycode");
         return Ok(None);
     }
+    // `get_or_make` / `const_ref` hash and intern (`get_uhash` →
+    // `id_or_identityhash` / `_find_shadow`). Pin the generator before
+    // those calls; the `GreenRefPin` keeps the pycode green.
+    let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
+    let pin = majit_metainterp::GreenRefPin::pin_one(pycode as usize);
+    let pycode = pin.get() as pyre_object::PyObjectRef;
+    let iter_obj = pinned_obj(&iter_pin, iter_obj);
     // `next()` sends `w_None`. Same object the portal red `w_arg` carries.
     let w_arg = pyre_object::w_none();
     // Same cell as `genentry_merge_point_jit` (`warmstate.py JitCell`):
@@ -17662,17 +17757,20 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `(next_instr, is_being_profiled, pycode)` cell is another driver
     // (`BaseJitCell.jitdriver_sd`).
     let typed_key = crate::genentry_state::genentry_green_key(pycode);
+    let mut live = pin.live_clone(&typed_key);
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
+        pin.reload(&mut live);
         crate::genentry_state::genentry_resolved_cell_key(
             &driver
                 .meta_interp_mut()
                 .warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX),
-            pycode,
+            pin.get() as pyre_object::PyObjectRef,
         )
     };
     let (driver, _) = crate::driver::driver_pair();
-    let greenboxes = [majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize))];
+    pin.reload(&mut live);
+    let greenboxes = [majit_ir::Value::Ref(majit_ir::GcRef(pin.get()))];
     let red_types = [majit_ir::Type::Ref, majit_ir::Type::Ref];
     // `jitdrivers_sd[GENERATORENTRY_JD_INDEX]` is `generatorentry`.
     let Some(token) = driver
@@ -17680,7 +17778,7 @@ fn descend_generatorentry<Sym: WalkSym>(
         .get_or_make_jitdriver_assembler_token_arc(
             crate::genentry_state::GENERATORENTRY_JD_INDEX,
             green_key,
-            Some(&typed_key),
+            Some((&pin, &mut live)),
             &greenboxes,
             &red_types,
         )
@@ -17693,6 +17791,8 @@ fn descend_generatorentry<Sym: WalkSym>(
         none_op,
         majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
     );
+    let pycode = pin.get() as pyre_object::PyObjectRef;
+    let iter_obj = pinned_obj(&iter_pin, iter_obj);
 
     // `space.next` dispatches on the iterator's type, and `send_ex` reads
     // the immutable `self.pycode` that `generatorentry_driver.jit_merge_point`
@@ -17720,11 +17820,13 @@ fn descend_generatorentry<Sym: WalkSym>(
         let pycode_op =
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::GetfieldGcR, &[iter_op], pycode_descr);
+        let pycode = pin.get() as pyre_object::PyObjectRef;
+        let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
+        let pycode = pin.get() as pyre_object::PyObjectRef;
         ctx.trace_ctx.set_opref_concrete(
             pycode_op,
             majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)),
         );
-        let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const]);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -18972,12 +19074,22 @@ fn walk_generator_resume<Sym: WalkSym>(
             parents,
             callee_entry_trace_index,
         );
-        let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
-        let callee_green_key =
+        let code_pin = majit_metainterp::GreenRefPin::pin_one(
+            pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
+        );
+        let w_code = code_pin.get() as *const ();
+        let mut callee_green_key =
             crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled);
         let next_instr_box = ctx.trace_ctx.const_int(resume_py_pc as i64);
         let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
-        let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
+        let pycode_box = ctx.trace_ctx.const_ref(code_pin.get() as i64);
+        // `const_ref` interns and can collect; `get_uhash` then
+        // `id_or_identityhash` / `_find_shadow`. Reload from the pin
+        // (`gctransform/shadowstack.py`).
+        code_pin.reload(&mut callee_green_key);
+        let hash = callee_green_key.get_uhash();
+        code_pin.reload(&mut callee_green_key);
+        let w_code = code_pin.get() as *const ();
         let frame_bits = match ctx.trace_ctx.concrete_of_opref(frame_box) {
             Some(majit_ir::Value::Ref(g)) => g.0 as i64,
             _ => 0,
@@ -19003,7 +19115,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         ];
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
-                callee_green_key.get_uhash(),
+                hash,
                 crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled),
             ),
             None,
@@ -19178,7 +19290,12 @@ fn walk_generator_resume<Sym: WalkSym>(
             }
             let token = match token {
                 Some(token) => Some(token),
-                None => super::portal_assembler_token(w_code, target_pc, is_being_profiled),
+                None => {
+                    let pin = majit_metainterp::GreenRefPin::pin_one(
+                        pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
+                    );
+                    super::portal_assembler_token(pin.save(), target_pc, is_being_profiled)
+                }
             };
             // `do_recursive_call` records CALL_ASSEMBLER in `_send_ex`,
             // after `finishframe` popped only the portal. Pass the generator

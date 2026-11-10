@@ -4061,32 +4061,75 @@ impl TraceCtx {
         self.inline_frames.len()
     }
 
+    fn retain_code_ptr(code: usize) -> (majit_ir::RetainedGreens, i64) {
+        if code == 0 {
+            (majit_ir::RetainedGreens::default(), 0)
+        } else {
+            (
+                majit_ir::RetainedGreens::retain_greenargs(
+                    &[code as i64],
+                    &[majit_ir::GreenType::Ref],
+                ),
+                code as i64,
+            )
+        }
+    }
+
+    /// Live `(W_Code*, pc)` from the walked owner-root, not a copied pair.
+    pub fn live_green_key_raw(&self) -> (usize, usize) {
+        (
+            self.green_key_code
+                .current_value(0, self.green_key_code_fallback) as usize,
+            self.green_key_pc,
+        )
+    }
+
+    pub fn live_root_green_key_raw(&self) -> (usize, usize) {
+        (
+            self.root_green_key_code
+                .current_value(0, self.root_green_key_code_fallback) as usize,
+            self.root_green_key_pc,
+        )
+    }
+
     /// Update the green key for this trace.
     ///
     /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
     /// hits a back-edge, the loop must be registered under the back-edge's
     /// green key, not the function-entry key.
+    ///
+    /// `raw.0` must be a live wrapper (pin / owner-root), not
+    /// `state.code_ptr()` copied across a collecting call.
     pub fn set_green_key(&mut self, key: u64, raw: (usize, usize)) {
         self.green_key = key;
-        self.green_key_raw = raw;
-        crate::loop_census::note_key(key, raw);
+        self.green_key_pc = raw.1;
+        let (code, fallback) = Self::retain_code_ptr(raw.0);
+        self.green_key_code = code;
+        self.green_key_code_fallback = fallback;
+        crate::loop_census::note_key(key, self.live_green_key_raw());
     }
 
     /// Record the structured greenkey for the root trace. Called once
-    /// at trace start to seed `green_key_raw` and `root_green_key_raw`
-    /// from the tracer-side `(code_ptr, pc)`. Subsequent back-edge
-    /// retargeting flows through [`Self::set_green_key`].
+    /// at trace start to seed the walked portal wrapper and pc from a
+    /// live pin. Subsequent back-edge retargeting flows through
+    /// [`Self::set_green_key`].
     pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
-        self.green_key_raw = raw;
-        self.root_green_key_raw = raw;
-        crate::loop_census::note_key(self.green_key, raw);
+        self.green_key_pc = raw.1;
+        self.root_green_key_pc = raw.1;
+        let (code, fallback) = Self::retain_code_ptr(raw.0);
+        self.green_key_code = code;
+        self.green_key_code_fallback = fallback;
+        let (root, root_fallback) = Self::retain_code_ptr(raw.0);
+        self.root_green_key_code = root;
+        self.root_green_key_code_fallback = root_fallback;
+        crate::loop_census::note_key(self.green_key, self.live_green_key_raw());
     }
 
     /// pyjitpl.py:1396-1401 element-wise greenkey comparison against
     /// the current trace's greenkey and each inline-frame greenkey.
     pub fn is_tracing_key(&self, target: (usize, usize)) -> bool {
-        self.green_key_raw == target
-            || self.root_green_key_raw == target
+        self.live_green_key_raw() == target
+            || self.live_root_green_key_raw() == target
             || self.inline_frames.contains(&target)
     }
 
