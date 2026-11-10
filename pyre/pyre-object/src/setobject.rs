@@ -2364,37 +2364,6 @@ fn try_w_set_lock(obj: PyObjectRef) -> Option<SetGuard> {
         .map(|lock| unsafe { crate::objlock::ObjectLockGuard::from_word(lock) })
 }
 
-/// Whether `value` is a plain int [`IntegerSetStrategy`] already stores.
-///
-/// [`AbstractUnwrappedSetStrategy::add`] inserts when the key is the wrong
-/// type or absent. This answers the other half: `is_plain_int1` holds and
-/// `contains_key` finds the unwrapped int. It does not hash, pin, allocate,
-/// or wait on the stripe. A contended lock, a non-int, or any other strategy
-/// answers false so the caller runs the real add.
-#[majit_macros::dont_look_inside]
-pub fn plain_int_already_in_int_set(set: PyObjectRef, value: PyObjectRef) -> bool {
-    if set.is_null() || value.is_null() {
-        return false;
-    }
-    unsafe {
-        if !is_set(set) || !crate::listobject::is_plain_int1(value) {
-            return false;
-        }
-        let n = crate::listobject::plain_int_w(value);
-        let Some(_guard) = try_w_set_lock(set) else {
-            return false;
-        };
-        let (kind, storage) = {
-            let set_obj = &*(set as *const W_SetObject);
-            (set_obj.strategy.kind, set_obj.sstorage)
-        };
-        if kind != SetStrategyKind::Int || storage.is_null() {
-            return false;
-        }
-        (*(storage as *const IntSetStorage)).contains_key(&n)
-    }
-}
-
 /// `IntegerSetStrategy.has_key` for a key that `is_correct_type`:
 /// `self.unwrap(w_key) in self.unerase(w_set.sstorage)`. The int-keyed lookup
 /// runs no `__hash__` or `__eq__`, so this cannot raise or force.
@@ -5144,19 +5113,12 @@ mod tests {
     fn plain_int_hit_does_not_insert() {
         install_test_hash_hook();
         let s = w_set_new();
-        let one = w_int_new(1);
-        assert!(!plain_int_already_in_int_set(std::ptr::null_mut(), one));
-        assert!(!plain_int_already_in_int_set(s, std::ptr::null_mut()));
-        assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
         assert_eq!(jit_int_set_add(s, 1), 0);
         assert_eq!(
             unsafe { (*(s as *const W_SetObject)).strategy.kind },
             SetStrategyKind::Int
         );
-        assert!(plain_int_already_in_int_set(s, one));
-        assert!(!plain_int_already_in_int_set(s, w_int_new(2)));
-        assert!(!plain_int_already_in_int_set(s, crate::w_bool_from(true)));
         assert_eq!(jit_int_set_has_key(s, 1), 1);
         assert_eq!(jit_int_set_has_key(s, 2), 0);
         assert_eq!(unsafe { w_set_len(s) }, 1);
@@ -5169,7 +5131,6 @@ mod tests {
             unsafe { (*(s as *const W_SetObject)).strategy.kind },
             SetStrategyKind::Object
         );
-        assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
         assert_eq!(jit_int_set_add(s, 3), -1);
         assert_eq!(unsafe { w_set_len(s) }, 2);
@@ -5198,7 +5159,6 @@ mod tests {
                 (*(a as *const W_SetObject)).content_gen_relaxed(),
                 gen_inserted
             );
-            assert!(plain_int_already_in_int_set(a, w_int_new(1)));
 
             w_set_discard(a, w_int_new(1));
             let gen_removed = (*(a as *const W_SetObject)).content_gen_relaxed();
