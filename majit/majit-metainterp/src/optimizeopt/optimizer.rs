@@ -4468,11 +4468,8 @@ impl Optimizer {
                 "optimize_bridge requires a JUMP; FINISH uses optimize_loop",
             ));
         };
-        let jump_args: Vec<OpRef> = terminal_jump
-            .args_slice()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
+        let jump_boxes = terminal_jump.getarglist_copy();
+        let jump_args: Vec<OpRef> = jump_boxes.iter().map(Operand::to_opref).collect();
 
         // unroll.py: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
@@ -4584,7 +4581,7 @@ impl Optimizer {
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = match Self::try_jump_to_existing_trace(
             &opt_unroll,
-            &jump_args,
+            &jump_boxes,
             target_tokens,
             self,
             &mut ctx,
@@ -4719,7 +4716,7 @@ impl Optimizer {
         // jump_op.getarglist() — no pre-snapshot is reused.
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,
-            &jump_args,
+            &jump_boxes,
             target_tokens,
             self,
             &mut ctx,
@@ -4830,7 +4827,7 @@ impl Optimizer {
     )]
     fn try_jump_to_existing_trace(
         opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         optimizer: &mut Self,
         ctx: &mut OptContext,

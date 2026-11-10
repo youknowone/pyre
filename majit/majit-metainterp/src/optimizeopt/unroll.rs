@@ -1680,9 +1680,10 @@ impl UnrollOptimizer {
                     .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             })
             .unwrap_or_default();
-        // JUMP `args_slice()` is the box-native runtime-box fallback when the
-        // exported recorded list is empty or length-mismatched. `body_jump_args`
-        // stays the positional `jump_args` view for `_jump_to_existing_trace`.
+        // JUMP `args_slice()` is the box-native jump-arg list and the
+        // runtime-box fallback when the exported recorded list is empty or
+        // length-mismatched. `body_jump_args` stays the positional view for
+        // the end-of-preamble force pass.
         let body_jump_boxes: Vec<Operand> = body_terminal_op
             .as_ref()
             .map(|jump| jump.args_slice().to_vec())
@@ -1881,16 +1882,6 @@ impl UnrollOptimizer {
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
         let jump_was_redirected = {
-            let body_jump_args: Vec<OpRef> = body_terminal_op
-                .as_ref()
-                .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
-                .or_else(|| {
-                    body_ops
-                        .iter()
-                        .rfind(|o| o.opcode == OpCode::Jump)
-                        .map(|j| j.args_slice().iter().map(|a| a.to_opref()).collect())
-                })
-                .unwrap_or_default();
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
@@ -1930,10 +1921,11 @@ impl UnrollOptimizer {
             // body JUMP operands only when the channel is empty (a trace with
             // no recorded JUMP), where the generate_guards length assert
             // would otherwise fail.
-            let runtime_boxes = if exported_runtime_boxes.len() == body_jump_boxes.len() {
-                exported_runtime_boxes
+            let runtime_boxes: &[Operand] = if exported_runtime_boxes.len() == body_jump_boxes.len()
+            {
+                exported_runtime_boxes.as_slice()
             } else {
-                body_jump_boxes
+                body_jump_boxes.as_slice()
             };
             let mut invalid_loop = false;
             let mut jumped = if skip_jump_to_existing {
@@ -1941,13 +1933,13 @@ impl UnrollOptimizer {
             } else {
                 let did_jump = opt_unroll
                     .jump_to_existing_trace(
-                        &body_jump_args,
+                        &body_jump_boxes,
                         Some(&current_label_args),
                         &self.target_tokens,
                         &mut opt_p2,
                         &mut jump_ctx,
                         false,
-                        &runtime_boxes,
+                        runtime_boxes,
                     )
                     .is_none();
                 if let Some(reason) = jump_ctx.take_invalid_loop() {
@@ -1977,13 +1969,13 @@ impl UnrollOptimizer {
                 // unroll.py:161-168: force_boxes=True, except InvalidLoop: pass
                 let did_jump = opt_unroll
                     .jump_to_existing_trace(
-                        &body_jump_args,
+                        &body_jump_boxes,
                         Some(&current_label_args),
                         &self.target_tokens,
                         &mut opt_p2,
                         &mut jump_ctx,
                         true,
-                        &runtime_boxes,
+                        runtime_boxes,
                     )
                     .is_none();
                 jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
@@ -3733,7 +3725,7 @@ impl OptUnroll {
     )]
     pub fn jump_to_existing_trace(
         &self,
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
@@ -3762,7 +3754,7 @@ impl OptUnroll {
     )]
     pub fn jump_to_existing_trace_with_vs(
         &self,
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
@@ -3798,7 +3790,7 @@ impl OptUnroll {
     )]
     fn jump_to_existing_trace_impl(
         &self,
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         current_label_args: Option<&[Operand]>,
         target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
@@ -3807,14 +3799,12 @@ impl OptUnroll {
         runtime_boxes: &[Operand],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        let mut virtual_state = pre_vs
-            .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
+        let mut virtual_state = pre_vs.unwrap_or_else(|| {
+            crate::optimizeopt::virtualstate::export_state_operands(jump_args, ctx)
+        });
         let mut args: Vec<Operand> = jump_args
             .iter()
-            .map(|&a| {
-                ctx.get_box_replacement_operand_opt(a)
-                    .expect("jump arg must retain its box")
-            })
+            .map(|arg| arg.get_box_replacement(false))
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter().enumerate() {
@@ -3936,12 +3926,7 @@ impl OptUnroll {
                             .args_slice()
                             .iter()
                             .map(|arg| {
-                                let arg = arg.to_opref();
-                                (
-                                    arg,
-                                    ctx.get_box_replacement_operand_opt(arg)
-                                        .and_then(|cb| cb.const_value()),
-                                )
+                                (arg.to_opref(), arg.get_box_replacement(false).const_value())
                             })
                             .collect();
                         eprintln!(
@@ -3996,10 +3981,7 @@ impl OptUnroll {
                     if force_boxes {
                         args = jump_args
                             .iter()
-                            .map(|&a| {
-                                ctx.get_box_replacement_operand_opt(a)
-                                    .expect("jump arg must retain its box")
-                            })
+                            .map(|arg| arg.get_box_replacement(false))
                             .collect();
                         virtual_state =
                             crate::optimizeopt::virtualstate::export_state_operands(&args, ctx);
@@ -10734,11 +10716,8 @@ mod tests {
         use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
 
         let mut optimizer = Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
-
-        let arg_operand = rooted_resop_operand(Type::Int, 11);
-        let arg = arg_operand.to_opref();
-        ctx.seed_boxes_canonical(std::slice::from_ref(&arg_operand));
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(1, &[Type::Int]);
+        let arg = ctx.inputarg_at(0).expect("typed jump arg");
 
         // The incoming state knows nothing statically; the target demands a
         // narrow bound and the concrete runtime value falls inside it, which is
@@ -10757,7 +10736,7 @@ mod tests {
         assert!(ctx.patchguardop.is_none());
         assert!(optimizer.patchguardop.is_none());
         let vs = unroll.jump_to_existing_trace_with_vs(
-            &[arg],
+            std::slice::from_ref(&arg),
             None,
             &target_tokens,
             &mut optimizer,
@@ -10785,10 +10764,8 @@ mod tests {
         use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
 
         let mut optimizer = Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
-        let arg_operand = rooted_resop_operand(Type::Int, 11);
-        let arg = arg_operand.to_opref();
-        ctx.seed_boxes_canonical(std::slice::from_ref(&arg_operand));
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(1, &[Type::Int]);
+        let arg = ctx.inputarg_at(0).expect("typed jump arg");
 
         // The virtual states match exactly, so the only reason to decline is
         // the LABEL slot no close can deliver.
@@ -10802,7 +10779,7 @@ mod tests {
 
         let runtime_box = Operand::const_from_value(Value::Int(5));
         let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
-            &[arg],
+            std::slice::from_ref(&arg),
             None,
             &target_tokens,
             &mut optimizer,
@@ -11335,9 +11312,8 @@ mod tests {
         let incoming = VirtualState::new(vec![virtual_shape(bridge_descr.clone())]);
 
         let mut optimizer = Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
-        let arg = OpRef::ref_op(11);
-        let arg_box = ctx.materialize_operand_at(arg);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(1, &[Type::Ref]);
+        let arg_box = ctx.inputarg_at(0).expect("typed jump arg");
         ctx.set_ptr_info(
             &arg_box,
             PtrInfo::Virtual(VirtualInfo {
@@ -11356,7 +11332,7 @@ mod tests {
 
         let unroll = OptUnroll::default();
         let vs = unroll.jump_to_existing_trace_with_vs(
-            &[arg],
+            std::slice::from_ref(&arg_box),
             None,
             &target_tokens,
             &mut optimizer,
