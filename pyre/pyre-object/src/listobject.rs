@@ -414,7 +414,7 @@ impl W_ListObject {
         match self.strategy {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
-            ListStrategy::Object => self.length_relaxed(),
+            ListStrategy::Object => ll_list_obj_length(self),
             // rlist.py `ll_length` is the `list.int_len` / `list.float_len` /
             // `list.bytes_len` / `list.ascii_len` oopspec leaf.  Keep that call
             // boundary: jtransform lowers the nested `<strategy>_items.len` path
