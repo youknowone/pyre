@@ -1439,7 +1439,7 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     /// Byte-mode prepare cache, keyed by the recording `OpRef` raw.
     /// `None` on the `Vec<Op>` recorder, whose snapshots were already
     /// rewritten into `snapshot_boxes`.
@@ -1520,6 +1520,29 @@ pub(crate) fn translate_trace_iter_opref(
         });
     assert_prepared_cache_bank("translate_trace_iter_opref", opref, translated.ty());
     translated
+}
+
+/// Recorder-namespace JUMP / `jump_args` position → the box minted by the
+/// trace iterator into `_cache`. Inline Consts never occupy a cache slot;
+/// they become `Operand::const_from_value` here, the same box-minting
+/// boundary `opencoder.py` `TraceIterator` uses for Const boxes.
+fn translate_trace_iter_runtime_box(opref: OpRef, cache: &[Option<Operand>]) -> Operand {
+    if opref.is_none() {
+        return Operand::None;
+    }
+    if let Some(v) = opref.as_const_int() {
+        return Operand::const_from_value(Value::Int(v));
+    }
+    if let Some(v) = opref.as_const_float() {
+        return Operand::const_from_value(Value::Float(v));
+    }
+    if let Some(v) = opref.as_const_ptr() {
+        return Operand::const_from_value(Value::Ref(v));
+    }
+    cache
+        .get(opref.raw() as usize)
+        .and_then(Clone::clone)
+        .unwrap_or_else(|| panic!("runtime box {opref:?} missing from trace-iterator cache"))
 }
 
 fn translate_trace_iter_box_map(
@@ -1786,7 +1809,7 @@ fn finish_prepared_bridge(
     });
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .map(|opref| translate_trace_iter_runtime_box(opref, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -1889,7 +1912,7 @@ where
     // (which runs in the re-minted namespace) miss the producing op.
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .map(|opref| translate_trace_iter_runtime_box(opref, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -15306,7 +15329,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
-            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs)
+            Self::closing_jump_runtime_boxes(bridge_ops)
         };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
@@ -15639,59 +15662,41 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Build the bridge's `runtime_boxes` (compile.py:1056 / unroll.py:183):
-    /// the live boxes from the closing JUMP, carrying the concrete runtime
-    /// values they held at the jump point.
+    /// Build the bridge's `runtime_boxes` (`compile.py` `BridgeCompileData` /
+    /// `unroll.py` `optimize_bridge`): the live boxes from the closing JUMP,
+    /// in the recorder namespace. `prepare_bridge_trace_for_optimizer` /
+    /// `finish_prepared_bridge` translate them through the trace-iterator
+    /// cache.
     ///
     /// In RPython every box carries its `_resint`/`_resref`/`_resfloat`
-    /// (history.py:680) because the metainterp executes each op concretely
-    /// while tracing, so `runtime_box.getint()` / `get_runtime_field`
-    /// (virtualstate.py, :493) read real values during the optimizer's
-    /// jump_to_existing_trace virtual-state match. pyre stamps the same
-    /// concrete values onto the recorded `Op` / `InputArg` identities during
-    /// tracing (recorder `set_concrete_at` → `Op::set_value`), but the raw
-    /// closing-jump arg oprefs do not survive `prepare_bridge_trace_for_optimizer`'s
-    /// fresh OpRef namespace, so `runtime_value_of` cannot recover them. Recover
-    /// the value here from the recorded identities and materialize each as an
-    /// inline-Const OpRef, which carries the value namespace-independently. A
-    /// jump arg with no recorded value (or a Void result) is passed through
-    /// unchanged, leaving the corresponding virtual-state entry to match
-    /// statically as before.
-    fn closing_jump_runtime_boxes<T>(
-        bridge_ops: &[T],
-        bridge_inputargs: &[majit_ir::InputArgRc],
-    ) -> Vec<OpRef>
+    /// (`history.py` Box value) because the metainterp executes each op
+    /// concretely while tracing, so `runtime_box.getint()` /
+    /// `get_runtime_field` (`virtualstate.py` `generate_guards`) read real
+    /// values during the optimizer's `jump_to_existing_trace` virtual-state
+    /// match. pyre stamps the same concrete values onto the recorded `Op` /
+    /// `InputArg` identities during tracing (recorder `set_concrete_at` →
+    /// `Op::set_value`). Each JUMP arg is already that bound box;
+    /// `Operand::get_value` reads the producer value off the arg itself. A
+    /// valued non-Void result is materialized as
+    /// `OpRef::const_inline_from_value`, which carries the value
+    /// namespace-independently. A jump arg with no recorded value (or a Void
+    /// result) is `arg.to_opref()`, leaving the corresponding virtual-state
+    /// entry to match statically as before.
+    fn closing_jump_runtime_boxes<T>(bridge_ops: &[T]) -> Vec<OpRef>
     where
         T: std::borrow::Borrow<majit_ir::Op>,
     {
-        let jump_arg_oprefs: Vec<OpRef> = bridge_ops
+        let jump_args = bridge_ops
             .last()
             .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
+            .map(|op| op.args_slice().to_vec())
             .unwrap_or_default();
-        if jump_arg_oprefs.is_empty() {
-            return jump_arg_oprefs;
-        }
-        let mut concrete: rustc_hash::FxHashMap<OpRef, Value> = rustc_hash::FxHashMap::default();
-        for ia in bridge_inputargs {
-            if let Some(v) = ia.get_value() {
-                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
-            }
-        }
-        for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
-            let pos = op.pos().get();
-            if !pos.is_none()
-                && let Some(v) = op.get_value()
-            {
-                concrete.insert(pos, v);
-            }
-        }
-        jump_arg_oprefs
+        jump_args
             .into_iter()
-            .map(|a| match concrete.get(&a) {
-                Some(v) if !matches!(v, Value::Void) => OpRef::const_inline_from_value(v),
-                _ => a,
+            .map(|arg| match arg.get_value() {
+                Some(v) if !matches!(v, Value::Void) => OpRef::const_inline_from_value(&v),
+                _ => arg.to_opref(),
             })
             .collect()
     }
@@ -15937,7 +15942,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
-            Self::closing_jump_runtime_boxes(&bridge_ops, bridge_inputargs)
+            Self::closing_jump_runtime_boxes(&bridge_ops)
         };
         // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
         // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
@@ -32127,7 +32132,11 @@ mod tests {
         );
         // runtime_boxes are translated into the fresh-iterator namespace.
         assert_eq!(
-            prepared.runtime_boxes,
+            prepared
+                .runtime_boxes
+                .iter()
+                .map(|b| b.to_opref())
+                .collect::<Vec<_>>(),
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
     }
@@ -35832,8 +35841,8 @@ mod tests {
             .expect("sparse retrace must optimize");
         let state = phase1_out.expect("phase 1 export").1;
         assert_eq!(
-            state.runtime_boxes[1],
-            OpRef::const_int(22),
+            state.runtime_boxes[1].const_value(),
+            Some(Value::Int(22)),
             "the closing JUMP's last live arg is InputArg(2)'s value"
         );
     }

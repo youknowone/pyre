@@ -1732,7 +1732,7 @@ impl Optimizer {
         // `optimize_trace_with_constants_and_inputs_vable_out`) catches
         // and reroutes instead of crashing the worker thread.
         let (preview_label_args, preview_virtuals) = match preview_virtual_state
-            .make_inputargs_and_virtuals_operands(&preview_end_args, self, ctx, false)
+            .make_inputargs_and_virtuals(&preview_end_args, self, ctx, false)
         {
             Ok(result) => result,
             Err(_) => {
@@ -4276,7 +4276,7 @@ impl Optimizer {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
-        runtime_boxes: &[OpRef],
+        runtime_boxes: &[Operand],
         inline_short_preamble: bool,
         retraced_count: &mut u32,
         retrace_limit: u32,
@@ -4833,7 +4833,7 @@ impl Optimizer {
         optimizer: &mut Self,
         ctx: &mut OptContext,
         force_boxes: bool,
-        pre_opt_jump_args: &[OpRef],
+        pre_opt_jump_args: &[Operand],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Result<Option<crate::optimizeopt::virtualstate::VirtualState>, ()> {
         let vs = opt_unroll.jump_to_existing_trace_with_vs(

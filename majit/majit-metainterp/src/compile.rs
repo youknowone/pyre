@@ -327,13 +327,13 @@ impl<'a> SimpleCompileData<'a> {
 /// `compile.py` `class BridgeCompileData(CompileData)`.
 pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
-    pub runtime_boxes: &'a [OpRef],
+    pub runtime_boxes: &'a [Operand],
 }
 
 impl<'a> BridgeCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
-        runtime_boxes: &'a [OpRef],
+        runtime_boxes: &'a [Operand],
         resumestorage: Option<&'a ResumeStorage>,
         call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         inline_short_preamble: bool,

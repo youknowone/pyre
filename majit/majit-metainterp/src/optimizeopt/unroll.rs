@@ -271,30 +271,31 @@ fn refresh_forwarded_const_ref(
 /// readable intval, and `IntBounded` vs `Unknown(Int)` rejects the
 /// peel even though the first-iteration heap value is in range.
 fn fold_recorded_jump_args(
-    args: Vec<OpRef>,
+    args: Vec<Operand>,
     inputargs: &[Operand],
     recorded_ops: &[OpRc],
-) -> Vec<OpRef> {
+) -> Vec<Operand> {
     args.into_iter()
         .map(|arg| {
-            let inputarg_index = match arg {
+            let opref = arg.to_opref();
+            let inputarg_index = match opref {
                 OpRef::InputArgInt(i) | OpRef::InputArgFloat(i) | OpRef::InputArgRef(i) => {
                     Some(i as usize)
                 }
                 _ => None,
             };
             if let Some(inputarg) = inputarg_index.and_then(|i| inputargs.get(i))
-                && inputarg.type_() == arg.ty().unwrap_or(Type::Void)
+                && inputarg.type_() == arg.type_()
                 && let Some(value) = inputarg.get_value()
                 && !matches!(value, Value::Void)
             {
-                return OpRef::const_inline_from_value(&value);
+                return Operand::const_from_value(value);
             }
-            if let Some(op) = recorded_ops.iter().find(|op| op.pos().get() == arg)
+            if let Some(op) = recorded_ops.iter().find(|op| op.pos().get() == opref)
                 && let Some(value) = op.get_value()
                 && !matches!(value, Value::Void)
             {
-                return OpRef::const_inline_from_value(&value);
+                return Operand::const_from_value(value);
             }
             arg
         })
@@ -1057,17 +1058,7 @@ impl UnrollOptimizer {
             let recorded_jump_args = fold_recorded_jump_args(
                 ops.iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|op| {
-                        op.args_slice()
-                            .iter()
-                            .map(|a| match a.get_value() {
-                                Some(value) if !matches!(value, Value::Void) => {
-                                    OpRef::const_inline_from_value(&value)
-                                }
-                                _ => a.to_opref(),
-                            })
-                            .collect()
-                    })
+                    .map(|op| op.args_slice().to_vec())
                     .unwrap_or_default(),
                 &self.trace_inputargs,
                 ops,
@@ -1689,6 +1680,19 @@ impl UnrollOptimizer {
                     .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             })
             .unwrap_or_default();
+        // JUMP `args_slice()` is the box-native runtime-box fallback when the
+        // exported recorded list is empty or length-mismatched. `body_jump_args`
+        // stays the positional `jump_args` view for `_jump_to_existing_trace`.
+        let body_jump_boxes: Vec<Operand> = body_terminal_op
+            .as_ref()
+            .map(|jump| jump.args_slice().to_vec())
+            .or_else(|| {
+                p2_ops
+                    .iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .map(|jump| jump.args_slice().to_vec())
+            })
+            .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
             if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                 if !body_jump_args.is_empty() {
@@ -1707,10 +1711,6 @@ impl UnrollOptimizer {
                         .iter()
                         .map(|arg| opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx))
                         .collect();
-                    let forced_jump_args: Vec<OpRef> = body_jump_args
-                        .iter()
-                        .map(|&arg| final_ctx.get_replacement_opref(arg))
-                        .collect();
                     let current_vs = crate::optimizeopt::virtualstate::export_state_operands(
                         &forced_boxes,
                         &final_ctx,
@@ -1728,7 +1728,7 @@ impl UnrollOptimizer {
                         exported_vs.clone()
                     };
                     if let Ok(args) = target_virtual_state.make_inputargs(
-                        &forced_jump_args,
+                        &forced_boxes,
                         &mut opt_p2,
                         &mut final_ctx,
                         true,
@@ -1925,16 +1925,15 @@ impl UnrollOptimizer {
             //
             // `exported_runtime_boxes` is the recorded JUMP arglist threaded
             // through ExportedState.runtime_boxes (set in the Phase-1 export
-            // above, carried across a retrace import). Those Phase-1 OpRefs
-            // resolve in Phase-2's jump_ctx via cross-phase find_producer_op
-            // (phase1_emit_ops / input_ops) and carry the boxes' own observed
-            // runtime values. Fall back to the body jump args only when the
-            // channel is empty (a trace with no recorded JUMP), where the
-            // generate_guards length assert would otherwise fail.
-            let runtime_boxes = if exported_runtime_boxes.len() == body_jump_args.len() {
-                exported_runtime_boxes.clone()
+            // above, carried across a retrace import). Those Phase-1 boxes
+            // carry the boxes' own observed runtime values. Fall back to the
+            // body JUMP operands only when the channel is empty (a trace with
+            // no recorded JUMP), where the generate_guards length assert
+            // would otherwise fail.
+            let runtime_boxes = if exported_runtime_boxes.len() == body_jump_boxes.len() {
+                exported_runtime_boxes
             } else {
-                body_jump_args.clone()
+                body_jump_boxes
             };
             let mut invalid_loop = false;
             let mut jumped = if skip_jump_to_existing {
@@ -2479,7 +2478,7 @@ pub struct ExportedState {
     /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
     /// Default `Vec::new()` until the export site populates it; callers
     /// that need it write the field directly after `ExportedState::new`.
-    pub runtime_boxes: Vec<OpRef>,
+    pub runtime_boxes: Vec<Operand>,
     /// RPython parity: patchguardop from Phase 1's GuardFutureCondition.
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
@@ -2694,12 +2693,6 @@ impl ExportedState {
             opref.trace_const_ptr(visitor);
         }
 
-        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                visit_opref(r, visitor);
-            }
-        }
-
         fn visit_operands(operands: &[Operand], visitor: &mut dyn FnMut(&mut GcRef)) {
             for o in operands {
                 o.walk_const_ptr_refs(visitor);
@@ -2785,7 +2778,7 @@ impl ExportedState {
         }
         visit_operands(&self.renamed_inputargs, visitor);
         visit_operands(&self.short_inputargs, visitor);
-        visit_oprefs(&mut self.runtime_boxes, visitor);
+        visit_operands(&self.runtime_boxes, visitor);
         if let Some(patchguardop) = self.patchguardop.as_ref() {
             visit_op(patchguardop, visitor);
         }
@@ -2847,7 +2840,7 @@ impl ExportedState {
         // as the `SameAs*` op's `pos` (visited via `visit_op`). Const-folded
         // slots never survive into Phase 2, so they need no high-water cover.
         for arg in &self.runtime_boxes {
-            visit(*arg);
+            visit(arg.to_opref());
         }
 
         for (key, info) in &self.exported_infos {
@@ -3367,7 +3360,7 @@ impl OptUnroll {
             (label_args, virtuals)
         } else {
             let (label_boxes, virtual_boxes) = virtual_state
-                .make_inputargs_and_virtuals_operands(&end_args, optimizer, ctx, false)
+                .make_inputargs_and_virtuals(&end_args, optimizer, ctx, false)
                 .expect("export_state make_inputargs_and_virtuals failed");
             (label_boxes, virtual_boxes)
         };
@@ -3742,7 +3735,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: &[OpRef],
+        runtime_boxes: &[Operand],
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         self.jump_to_existing_trace_with_vs(
             jump_args,
@@ -3771,7 +3764,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: &[OpRef],
+        runtime_boxes: &[Operand],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         // unroll.py `with self.optimizer.cant_replace_guards():`
@@ -3807,14 +3800,17 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-        runtime_boxes: &[OpRef],
+        runtime_boxes: &[Operand],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         let mut virtual_state = pre_vs
             .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
-        let mut args: Vec<OpRef> = jump_args
+        let mut args: Vec<Operand> = jump_args
             .iter()
-            .map(|&a| ctx.get_replacement_opref(a))
+            .map(|&a| {
+                ctx.get_box_replacement_operand_opt(a)
+                    .expect("jump arg must retain its box")
+            })
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter().enumerate() {
@@ -3912,7 +3908,7 @@ impl OptUnroll {
             // `for guard in extra_guards.extra_guards` loop body is also
             // skipped in that case.
             for guard_req in &extra_guards {
-                let emitted = guard_req.to_ops(&args, ctx);
+                let emitted = guard_req.to_ops(ctx);
                 if emitted.is_empty() {
                     continue;
                 }
@@ -3996,9 +3992,13 @@ impl OptUnroll {
                     if force_boxes {
                         args = jump_args
                             .iter()
-                            .map(|&a| ctx.get_replacement_opref(a))
+                            .map(|&a| {
+                                ctx.get_box_replacement_operand_opt(a)
+                                    .expect("jump arg must retain its box")
+                            })
                             .collect();
-                        virtual_state = crate::optimizeopt::virtualstate::export_state(&args, ctx);
+                        virtual_state =
+                            crate::optimizeopt::virtualstate::export_state_operands(&args, ctx);
                     }
                     continue;
                 }
@@ -4010,13 +4010,7 @@ impl OptUnroll {
             // holds.
             //
             let mut short_jump_args = target_boxes.clone();
-            short_jump_args.extend(virtuals.iter().map(|&v| {
-                if v.is_none() || v.is_constant() {
-                    Operand::from_opref(v)
-                } else {
-                    ctx.materialize_operand_at(v)
-                }
-            }));
+            short_jump_args.extend(virtuals.iter().cloned());
 
             // Ensure jump_args carry PtrInfo from Phase 2 body.
             // RPython Box identity preserves info across forwarding.
@@ -4628,6 +4622,7 @@ impl OptUnroll {
             targetargs.len(),
             "import_state: next_iteration_args mismatch"
         );
+        let mut source_boxes = Vec::with_capacity(targetargs.len());
         // for i, target in enumerate(exported_state.next_iteration_args):
         for (i, carried) in exported_state.next_iteration_args.iter().enumerate() {
             // `carried` is the literal Phase-1 box (the same Rc used as the
@@ -4644,6 +4639,7 @@ impl OptUnroll {
             let b_source = ctx
                 .get_box_replacement_operand_opt(source)
                 .expect("import_state source must have a materialized operand slot");
+            source_boxes.push(b_source.clone());
             // `target` is the literal Phase-1 Box carried by ExportedState.
             // Forward to that exact Operand, not to a Phase-2 box recovered
             // from its numeric position: unroll.py:497 writes
@@ -4695,19 +4691,20 @@ impl OptUnroll {
         }
         // label_args = exported_state.virtual_state.make_inputargs(
         //     targetargs, self.optimizer)
-        let label_args = match exported_state
-            .virtual_state
-            .make_inputargs(targetargs, optimizer, ctx, false)
-        {
-            Ok(args) => args,
-            // unroll.py `raise InvalidLoop`: the imported virtual state is
-            // incompatible. Recorded as a deferred signal (checked by the
-            // caller) so the loop is abandoned without unwinding.
-            Err(_) => {
-                ctx.signal_invalid_loop("Cannot import state, virtual states don't match");
-                return Vec::new();
-            }
-        };
+        let label_args =
+            match exported_state
+                .virtual_state
+                .make_inputargs(&source_boxes, optimizer, ctx, false)
+            {
+                Ok(args) => args,
+                // unroll.py `raise InvalidLoop`: the imported virtual state is
+                // incompatible. Recorded as a deferred signal (checked by the
+                // caller) so the loop is abandoned without unwinding.
+                Err(_) => {
+                    ctx.signal_invalid_loop("Cannot import state, virtual states don't match");
+                    return Vec::new();
+                }
+            };
         if crate::callee_rca_enabled() {
             let next_iteration_args: Vec<_> = exported_state
                 .next_iteration_args
@@ -6834,7 +6831,8 @@ mod tests {
             constants,
             inputarg_infos: vec![Some(PtrInfo::Constant(old))],
         });
-        state.runtime_boxes.push(old_ref);
+        let runtime_box = Operand::const_from_value(Value::Ref(old));
+        state.runtime_boxes.push(runtime_box.clone());
         state.patchguardop = Some(Op::new(
             OpCode::GuardNonnull,
             &[Operand::from_opref(old_ref)],
@@ -6861,7 +6859,8 @@ mod tests {
             state.short_inputargs[0].const_value(),
             Some(Value::Ref(new))
         );
-        assert_eq!(state.runtime_boxes[0], old_ref);
+        assert!(state.runtime_boxes[0].same_box(&runtime_box));
+        assert_eq!(state.runtime_boxes[0].const_value(), Some(Value::Ref(new)),);
         assert!(state.exported_infos.keys().any(|k| k.to_opref() == old_ref));
         assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), old_ref);
         assert_eq!(
@@ -7537,8 +7536,8 @@ mod tests {
         let state = phase1_out.expect("Phase 1 should export loop state").1;
 
         assert_eq!(
-            state.runtime_boxes[0],
-            OpRef::const_int(73),
+            state.runtime_boxes[0].const_value(),
+            Some(Value::Int(73)),
             "recorded closing-JUMP entry InputArg must retain observed runtime value",
         );
     }
@@ -7557,10 +7556,15 @@ mod tests {
         );
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
-        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[OpRc::new(add)]);
+        let add_rc = OpRc::new(add);
+        let folded = fold_recorded_jump_args(
+            vec![Operand::from_bound_op(&add_rc)],
+            &[],
+            std::slice::from_ref(&add_rc),
+        );
         assert_eq!(
-            folded[0],
-            OpRef::const_int(73),
+            folded[0].const_value(),
+            Some(Value::Int(73)),
             "recorded closing-JUMP ResOp must retain observed runtime value",
         );
     }
@@ -7969,13 +7973,19 @@ mod tests {
             0, MASK,
         ))]);
         let incoming_vs = crate::optimizeopt::virtualstate::export_state(&[masked], &ctx);
-        let runtime_box = ctx.make_constant_int(0);
+        let runtime_box = Operand::const_from_value(Value::Int(0));
         let guard_reqs = target_vs
-            .generate_guards(&incoming_vs, &[masked], &[runtime_box], &mut ctx, false)
+            .generate_guards(
+                &incoming_vs,
+                std::slice::from_ref(&mask_box),
+                &[runtime_box],
+                &mut ctx,
+                false,
+            )
             .expect("masked short-box state should match target loop state");
         let mut emitted = Vec::new();
         for req in &guard_reqs {
-            emitted.extend(req.to_ops(&[masked], &mut ctx));
+            emitted.extend(req.to_ops(&mut ctx));
         }
 
         assert!(
@@ -10699,6 +10709,7 @@ mod tests {
 
         let arg_operand = rooted_resop_operand(Type::Int, 11);
         let arg = arg_operand.to_opref();
+        ctx.seed_boxes_canonical(std::slice::from_ref(&arg_operand));
 
         // The incoming state knows nothing statically; the target demands a
         // narrow bound and the concrete runtime value falls inside it, which is
@@ -10706,7 +10717,7 @@ mod tests {
         // INT_GE/INT_LE + GUARD_TRUE pairs (intutils.py make_guards
         // `IntBound.make_guards`) rather than rejecting the target.
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
-        let runtime_box = OpRef::const_int(5);
+        let runtime_box = Operand::const_from_value(Value::Int(5));
         let mut target_tokens = vec![TargetToken::new_loop(1)];
         target_tokens[0].attrs().virtual_state =
             Some(VirtualState::new(vec![VirtualStateInfo::IntBounded(
@@ -10723,7 +10734,7 @@ mod tests {
             &mut optimizer,
             &mut ctx,
             false,
-            &[runtime_box],
+            std::slice::from_ref(&runtime_box),
             Some(incoming),
         );
 
@@ -10746,7 +10757,9 @@ mod tests {
 
         let mut optimizer = Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
-        let arg = rooted_resop_operand(Type::Int, 11).to_opref();
+        let arg_operand = rooted_resop_operand(Type::Int, 11);
+        let arg = arg_operand.to_opref();
+        ctx.seed_boxes_canonical(std::slice::from_ref(&arg_operand));
 
         // The virtual states match exactly, so the only reason to decline is
         // the LABEL slot no close can deliver.
@@ -10758,6 +10771,7 @@ mod tests {
             )]));
         target_tokens[0].attrs().label_tail_unrebuildable = true;
 
+        let runtime_box = Operand::const_from_value(Value::Int(5));
         let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
             &[arg],
             None,
@@ -10765,7 +10779,7 @@ mod tests {
             &mut optimizer,
             &mut ctx,
             false,
-            &[OpRef::const_int(5)],
+            std::slice::from_ref(&runtime_box),
             Some(incoming),
         );
         assert!(
@@ -11319,7 +11333,7 @@ mod tests {
             &mut optimizer,
             &mut ctx,
             false,
-            &[arg],
+            std::slice::from_ref(&arg_box),
             Some(incoming),
         );
         assert!(
