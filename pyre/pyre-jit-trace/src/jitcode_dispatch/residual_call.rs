@@ -6208,6 +6208,9 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // its own, so its guards resume at the Python CALL that entered it, and
     // the CALL runs the callback a second time -- or, with the exception still
     // pending at that coordinate, lets it past the CALL's handler.
+    // A numbered helper chain does have those frames: each helper level is its
+    // own section past its caller's call, so the guards resume inside the
+    // helper (`capture_resumedata`) and the call is admitted.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -6222,6 +6225,7 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             Some(("abi-unsound-arg", addr, 0))
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
+            && ctx.session.borrow().helper_chain() != super::HelperChain::Numbered
             && !records_inside_transparent_helper(addr)
             && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
             && !call_descr.get_extra_info().is_call_release_gil()
