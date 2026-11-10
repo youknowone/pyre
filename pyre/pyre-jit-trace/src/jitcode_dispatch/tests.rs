@@ -2191,6 +2191,72 @@ fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
     );
 }
 
+/// A callable `inline_call_*` wrapper is native in the blackhole
+/// (`bhimpl_inline_call_*`) and still entered by the walker
+/// (`pyjitpl.py` `MIFrame.setup`). An unpublished callee behind that
+/// wrapper that reaches `abort` is a walk blocker, not a resume blocker
+/// of the wrapper's own body.
+#[test]
+fn walk_reaches_unpublished_blocker_behind_a_callable_inline_callee() {
+    fn install_inline_helper(name: &str, descr: u16) -> usize {
+        let mut code = inline_call_with_descr(descr);
+        code.extend(void_return());
+        let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+        runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code,
+            startpoints: Some([0_usize, 4].into_iter().collect()),
+            ..Default::default()
+        });
+        let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(runtime_jc),
+            std::ptr::null(),
+            false,
+        ));
+        crate::state::install_codeless_jitcode(payload) as usize
+    }
+
+    fn first_callable_wrapper_descr() -> Option<u16> {
+        let descrs = crate::jitcode_runtime::descr_ref_table();
+        for slot in 0..descrs.len().min(u16::MAX as usize + 1) {
+            let Some(index) = descrs
+                .at(slot)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+            else {
+                continue;
+            };
+            let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(index) else {
+                continue;
+            };
+            if !majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr) {
+                continue;
+            }
+            if super::inline_call::helper_walk_reaches_unpublished_blocker(
+                index,
+                0,
+                &mut Vec::new(),
+            ) {
+                return Some(slot as u16);
+            }
+        }
+        None
+    }
+
+    let native = first_callable_wrapper_descr()
+        .expect("a JitCode descr whose callable callee reaches an unpublished inline blocker");
+    let wrapper = install_inline_helper(
+        "walk_reaches_unpublished_blocker_behind_a_callable_inline_callee",
+        native,
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(wrapper, 0, None),
+        "a natively called inline callee contributes no body blockers"
+    );
+    assert!(
+        super::inline_call::helper_walk_reaches_unpublished_blocker(wrapper, 0, &mut Vec::new()),
+        "the walker still enters the callable callee and reaches the unpublished blocker"
+    );
+}
+
 /// Helper levels numbered for `list(iterable)`'s type call.
 ///
 /// `descr_call`'s None-check residual (`bh_check_init_returned_none`) is a

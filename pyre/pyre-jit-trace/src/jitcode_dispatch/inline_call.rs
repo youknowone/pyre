@@ -1906,6 +1906,147 @@ pub(crate) fn helper_resume_reaches_blocker(
     }
 }
 
+/// CFG successors of `d` for a remaining-body walk from a resume pc.
+///
+/// Both arms of every branch, the same `goto` / `goto_if_*` / `switch`
+/// decode [`summarize_body_blockers_from`] uses, without folding on a
+/// known discriminant. A `switch` whose table is missing widens to every
+/// instruction start.
+fn helper_walk_successors(
+    code: &[u8],
+    d: &crate::jitcode_runtime::DecodedOp,
+    payload_descrs: Option<&[DescrRef]>,
+    all_starts: &[usize],
+) -> Vec<usize> {
+    let label = label_operand_offset(d.argcodes).map(|off| read_label(code, d, off));
+    match d.opname {
+        "ref_return" | "int_return" | "float_return" | "void_return" | "abort" => Vec::new(),
+        "goto" => label.into_iter().collect(),
+        "raise" | "reraise" => crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
+            .into_iter()
+            .collect(),
+        "switch" => match descr_operand_index(code, d)
+            .and_then(|index| switch_descr_targets_in(payload_descrs, index))
+        {
+            Some(mut targets) => {
+                targets.push(d.next_pc);
+                targets
+            }
+            None => all_starts.to_vec(),
+        },
+        _ => {
+            let mut succs = Vec::new();
+            if let Some(target) = label {
+                succs.push(target);
+            }
+            succs.push(d.next_pc);
+            succs
+        }
+    }
+}
+
+/// `inline_call_*` descr indices reachable in `code` from `from_pc` onward.
+///
+/// Starts at `from_pc` and follows [`helper_walk_successors`]. `callee_summary`
+/// in [`summarize_body_blockers_from`] also runs for points before the resume
+/// pc (`!resumed`), so that hook cannot collect the remaining body alone.
+fn helper_walk_reachable_inline_call_descrs(
+    code: &[u8],
+    from_pc: usize,
+    payload_descrs: Option<&[DescrRef]>,
+) -> Option<Vec<usize>> {
+    let mut starts = Vec::new();
+    let mut pc = 0usize;
+    while let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        starts.push(pc);
+        pc = d.next_pc;
+        if pc >= code.len() {
+            break;
+        }
+    }
+    if pc < code.len() || starts.binary_search(&from_pc).is_err() {
+        return None;
+    }
+    let mut visited = vec![false; code.len().max(1)];
+    let mut work = vec![from_pc];
+    let mut descrs = Vec::new();
+    while let Some(pc) = work.pop() {
+        if visited.get(pc).copied().unwrap_or(true) {
+            continue;
+        }
+        visited[pc] = true;
+        let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return None;
+        };
+        if d.opname.starts_with("inline_call") {
+            // Same `d` operand `summarize_body_blockers_from` names, via the
+            // payload-descr-aware index helper (`descr_operand_index`).
+            if let Some(descr_index) = descr_operand_index(code, &d) {
+                descrs.push(descr_index);
+            }
+        }
+        for succ in helper_walk_successors(code, &d, payload_descrs, &starts) {
+            if starts.binary_search(&succ).is_ok() {
+                work.push(succ);
+            }
+        }
+    }
+    Some(descrs)
+}
+
+/// The walker, continuing this helper body from `pc`, enters every
+/// reachable `inline_call_*` callee (`pyjitpl.py` `MIFrame.setup`).
+/// The walk recurses through every reachable inline callee, published
+/// or not. Returns true when such a callee reaches an unpublished
+/// (`!is_callable_fnaddr`) callee for which
+/// [`helper_resume_reaches_blocker`]`(callee, 0, None)` is true.
+///
+/// The blackhole calls a callable `fnaddr` natively (`bhimpl_inline_call_*`);
+/// the walker still enters it (`run_inline_call_subwalk`). An unpublished
+/// blocker behind a published wrapper is therefore reached by the walk
+/// after a may-force callback has already run.
+pub(crate) fn helper_walk_reaches_unpublished_blocker(
+    jitcode_index: usize,
+    pc: usize,
+    seen: &mut Vec<usize>,
+) -> bool {
+    if seen.contains(&jitcode_index) {
+        return false;
+    }
+    seen.push(jitcode_index);
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return true;
+    };
+    let payload = std::sync::Arc::clone(&pjc);
+    let payload_descrs = helper_resume_codeless_descrs(&payload);
+    let Some(descrs) = helper_walk_reachable_inline_call_descrs(
+        payload.jitcode.code.as_slice(),
+        pc,
+        payload_descrs,
+    ) else {
+        return true;
+    };
+    for descr_index in descrs {
+        let Some(callee) = helper_resume_descr_at(payload_descrs, descr_index)
+            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+        else {
+            continue;
+        };
+        let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
+            .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
+        if !calls_native && helper_resume_reaches_blocker(callee, 0, None) {
+            return true;
+        }
+        // Recurse through every reachable inline callee, published or not:
+        // an unpublished callee's blackhole summary can be clear while a
+        // callable callee behind it still reaches an unpublished blocker.
+        if helper_walk_reaches_unpublished_blocker(callee, 0, seen) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Why a descent into a body is refused.
 enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already
