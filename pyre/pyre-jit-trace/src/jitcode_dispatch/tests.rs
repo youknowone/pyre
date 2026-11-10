@@ -5250,7 +5250,10 @@ fn trace_too_long_snapshot_waits_for_frame_transition_outcomes() {
         0,
     ));
     assert!(!trace_too_long_abort_safe(
-        &DispatchOutcome::SubReturn { result: None },
+        &DispatchOutcome::SubReturn {
+            result: None,
+            result_concrete: ConcreteValue::Null,
+        },
         false,
         0,
     ));
@@ -12259,8 +12262,12 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         0x05, // ref_return r5
     ];
     let mut tc = fresh_trace_ctx();
-    let regs_r = distinct_const_refs(&mut tc, 8);
+    const LIVE: usize = 0xC2_AB07_FEED_0202;
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    regs_r[2] = OpRef::input_arg_ref(0);
     let arg_value = regs_r[2];
+    let mut concrete_regs_r = vec![ConcreteValue::Null; regs_r.len()];
+    concrete_regs_r[2] = ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef);
     done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -12276,7 +12283,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
+            concrete_registers_r: concrete_regs_r,
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),
             vstack_last_ref: OpRef::NONE,
@@ -12328,6 +12335,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         "normal inline return must clear the caller's concrete exception shadow",
     );
     let regs_r = wc.registers_r.to_vec();
+    let returned_concrete = wc.frame_state.borrow().concrete_registers_r[5];
     drop(wc);
     // dst register r5 must equal the arg the caller passed (since
     // callee's `ref_return r0` returns its registers_r[0] which
@@ -12335,6 +12343,11 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     assert_eq!(
         regs_r[5], arg_value,
         "inline_call_r_r dst writeback must propagate callee's SubReturn",
+    );
+    assert_eq!(
+        returned_concrete,
+        ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef),
+        "inline_call_r_r dst writeback must propagate the callee's concrete shadow",
     );
     // The outermost finish payload carries the same value (callee's
     // ref_return surfaced as SubReturn and recorded nothing; the
@@ -13759,6 +13772,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         outcome,
         DispatchOutcome::SubReturn {
             result: Some(expected),
+            result_concrete: ConcreteValue::Int(0xCAFE_0001),
         },
         "sub-walk int_return must surface SubReturn{{Some(value)}}",
     );
@@ -13904,7 +13918,13 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     };
     let ops_before = wc.trace_ctx.num_ops();
     let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
-    assert_eq!(outcome, DispatchOutcome::SubReturn { result: None });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SubReturn {
+            result: None,
+            result_concrete: ConcreteValue::Null,
+        }
+    );
     drop(wc);
     assert_eq!(
         tc.num_ops(),
@@ -21172,7 +21192,7 @@ fn int_mul_overflow_writes_dst_before_guard_no_exception() {
         "registers_r[dst] must hold the boxed product when GuardNoException is recorded"
     );
     assert!(
-        matches!(outcome, DispatchOutcome::SubReturn { result: Some(r) } if r == boxed_pos),
+        matches!(outcome, DispatchOutcome::SubReturn { result: Some(r), .. } if r == boxed_pos),
         "SubReturn must keep the boxed product, got {outcome:?}"
     );
 }
@@ -22491,7 +22511,10 @@ fn helper_ordinary_steps_that_cross_the_limit_still_finishframe() {
     };
     let result = walk(&code, 0, &mut wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "ordinary helper steps that cross the limit still finishframe: {result:?}"
     );
     assert!(
@@ -23620,7 +23643,10 @@ fn helper_ordinary_residual_does_not_check_the_limit_at_that_call() {
     let result = walk(&code, 0, &mut wc);
     drop(wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "a non-descending residual must not take the helper ChangeFrame check: {result:?}"
     );
     fbw_store_journal_reset();
@@ -24283,7 +24309,10 @@ fn helper_residualized_inline_call_does_not_check_the_limit() {
     let result = walk(&code, 0, &mut wc);
     drop(wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "a non-descending inline_call must not take the helper ChangeFrame check: {result:?}"
     );
     fbw_store_journal_reset();

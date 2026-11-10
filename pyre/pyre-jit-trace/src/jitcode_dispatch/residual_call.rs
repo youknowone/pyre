@@ -9500,6 +9500,18 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     // the result has no recorded concrete (matches the pre-#75.F shape for
     // every recorded call without an executed concrete result).
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_call_result_to_dst_with_concrete(ctx, pc, dst, dst_bank, result, concrete_for_shadow)
+}
+
+/// Write a call result whose concrete shadow was carried with the result box.
+pub(crate) fn write_call_result_to_dst_with_concrete<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    dst_bank: char,
+    result: OpRef,
+    concrete_for_shadow: ConcreteValue,
+) -> Result<(), DispatchError> {
     match dst_bank {
         'r' => {
             write_ref_reg(ctx, pc, dst, result, concrete_for_shadow)?;
@@ -9519,6 +9531,10 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
                     bank: "f",
                 })?;
             ctx.registers_f.set(dst, result);
+            if let ConcreteValue::Float(value) = concrete_for_shadow {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, majit_ir::Value::Float(value));
+            }
         }
         // Void variants (`pyjitpl.py opimpl_residual_call_*_v`):
         // the operand layout has no `>X` dst byte and no register slot to
@@ -10776,14 +10792,24 @@ fn deliver_perform_call_result<Sym: WalkSym>(
     outcome: DispatchOutcome,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let delivered = match outcome {
-        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+        DispatchOutcome::SubReturn { result: None, .. } if dst_bank == 'v' => {
             let _ = finish_inline_callee_return(ctx, None);
             Some((DispatchOutcome::Continue, next_pc))
         }
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => {
             let result = finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+            write_call_result_to_dst_with_concrete(
+                ctx,
+                op_pc,
+                dst,
+                dst_bank,
+                result,
+                result_concrete,
+            )?;
             Some((DispatchOutcome::Continue, next_pc))
         }
         DispatchOutcome::Continue => {

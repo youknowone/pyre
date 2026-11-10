@@ -8688,9 +8688,12 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // descent entry points live even under `all`; the residual `spec_gate`
     // still covers leftover `jit_str_startswith` / `jit_str_endswith`.
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
-                let concrete = match concrete_from_recorded_opref(ctx, value) {
+                let concrete = match result_concrete {
                     ConcreteValue::Ref(p) if !p.is_null() => ConcreteValue::Ref(p),
                     other => walker_concrete_ref_object(ctx, value)
                         .map(ConcreteValue::Ref)
@@ -9094,7 +9097,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         Err(error) => return Err(error),
     };
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
-        DispatchOutcome::SubReturn { result: _ } => {
+        DispatchOutcome::SubReturn { result: _, .. } => {
             // `descr_call` discards `__init__`'s None and returns the instance.
             write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
             Ok(Some(super::continue_after_no_driver_finishframe(
@@ -12663,9 +12666,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         fbw_foriter_inflight_popframe(owner);
     }
     match outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                let concrete_for_shadow = result_concrete;
                 if require_str_result
                     && !matches!(
                         concrete_for_shadow,
@@ -18626,7 +18632,7 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
         &[gen_concrete, frame],
         &[],
     )? {
-        DispatchOutcome::SubReturn { result: None } => {}
+        DispatchOutcome::SubReturn { result: None, .. } => {}
         _ => return Err(DispatchError::callee_inline_unsupported(op.pc)),
     }
     let null_box = ctx.trace_ctx.const_null();
@@ -19249,7 +19255,9 @@ fn walk_generator_resume<Sym: WalkSym>(
         drop(inline_concrete.take());
     }
     let (item, residualize_if_unstamped) = match walk_result {
-        DispatchOutcome::SubReturn { result: Some(item) } => (item, true),
+        DispatchOutcome::SubReturn {
+            result: Some(item), ..
+        } => (item, true),
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // `do_recursive_call(..., assembler_call=True)`: reds are
             // `[frame, ec]` (`PyPyJitDriver.reds`). The CALL_ASSEMBLER
@@ -21020,7 +21028,11 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
     pc: usize,
     exc_before: Option<OpRef>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let DispatchOutcome::SubReturn { result: Some(op) } = outcome else {
+    let DispatchOutcome::SubReturn {
+        result: Some(op),
+        result_concrete,
+    } = outcome
+    else {
         return Ok(outcome);
     };
     // A void return (`None`) or a real box must not be treated as a raise
@@ -21031,7 +21043,10 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
         Some(majit_ir::Value::Ref(r)) if r.0 == 0
     );
     if !published_null {
-        return Ok(DispatchOutcome::SubReturn { result: Some(op) });
+        return Ok(DispatchOutcome::SubReturn {
+            result: Some(op),
+            result_concrete,
+        });
     }
     match ctx.last_exc_value().filter(|&exc| Some(exc) != exc_before) {
         Some(_) => {
@@ -21050,7 +21065,10 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
                 exc_concrete: ctx.last_exc_value_concrete(),
             })
         }
-        None => Ok(DispatchOutcome::SubReturn { result: Some(op) }),
+        None => Ok(DispatchOutcome::SubReturn {
+            result: Some(op),
+            result_concrete,
+        }),
     }
 }
 
@@ -21654,6 +21672,11 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     }
     Ok(InlineCallOutcome::residual(DispatchOutcome::SubReturn {
         result: (dst_bank != 'v').then_some(recorded),
+        result_concrete: if dst_bank == 'v' {
+            ConcreteValue::Null
+        } else {
+            concrete_from_recorded_opref(ctx, recorded)
+        },
     }))
 }
 
@@ -21813,6 +21836,7 @@ struct PendingSubReturn {
     dst: usize,
     caller_pc: usize,
     result: Option<OpRef>,
+    result_concrete: ConcreteValue,
     /// `SubWalkFrame::caller_exc_before` of the callee that produced `result`.
     exc_before: Option<OpRef>,
 }
@@ -21878,6 +21902,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                     &mut walk_ctx,
                     DispatchOutcome::SubReturn {
                         result: pending.result,
+                        result_concrete: pending.result_concrete,
                     },
                     pending.caller_pc,
                     pending.exc_before,
@@ -21887,12 +21912,13 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 None
             } else {
                 let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
-                    Some(value) => super::residual_call::write_residual_call_result_to_dst(
+                    Some(value) => super::residual_call::write_call_result_to_dst_with_concrete(
                         &mut walk_ctx,
                         pending.caller_pc,
                         pending.dst,
                         pending.dst_bank,
                         value,
+                        pending.result_concrete,
                     )
                     .is_ok(),
                     None => pending.dst_bank == 'v',
@@ -22244,7 +22270,10 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     let Some(parent) = self.frames.last_mut() else {
                         return result.map(|outcome| (outcome, class_state));
                     };
-                    if let Ok(DispatchOutcome::SubReturn { result: ret }) = &result
+                    if let Ok(DispatchOutcome::SubReturn {
+                        result: ret,
+                        result_concrete,
+                    }) = &result
                         && let Some((dst_bank, dst, next_pc)) =
                             inline_call_subreturn_dst(parent.body.code, caller_pc)
                     {
@@ -22254,6 +22283,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             dst,
                             caller_pc,
                             result: *ret,
+                            result_concrete: *result_concrete,
                             exc_before: caller_exc_before,
                         });
                         parent.pc = next_pc;
@@ -23886,10 +23916,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             super::specialize::binary_op_tag_for_helper_index(ctx.raw_descrs, sub_index, &[])
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-        let write_boxed = |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef| {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)
-        };
+        let write_boxed =
+            |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef, concrete: ConcreteValue| {
+                write_ref_reg(ctx, op.pc, dst, boxed, concrete)
+            };
         let is_subscr = matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
             Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -23912,11 +23942,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         if is_subscr
             && let Some(DispatchOutcome::SubReturn {
                 result: Some(boxed),
+                result_concrete,
             }) = spec_gate(SpecFold::Subscr, || {
                 super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
             })?
         {
-            write_boxed(ctx, boxed)?;
+            write_boxed(ctx, boxed, result_concrete)?;
             return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
         // Named `add`/`mul`/… helpers arrive as `dR>r`, not
@@ -23971,7 +24002,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR`
@@ -23981,20 +24015,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
                 let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-                // inline_call_* dst writeback — `value` is the callee's
-                // SubReturn OpRef.  The callee's matching concrete shadow
-                // was dropped at sub-walk exit; `concrete_of_opref` still
-                // sees through to `constants.get_value` for callees that
-                // return a constant (e.g. `LoadConst` tail), so route via
-                // the unified shadow channel.  Non-constant returns surface
-                // as the sentinel `GcRef(usize::MAX)` → Null fallback.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
@@ -24230,11 +24256,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
+            result_concrete,
         }) = spec_gate(SpecFold::Subscr, || {
             super::specialize::try_emit_list_int_getitem(ctx, op.pc, &ref_args, dst, dst_bank)
         })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            write_ref_reg(ctx, op.pc, dst, boxed, result_concrete)?;
             return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
     }
@@ -24349,13 +24375,13 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // `int_add_ovf` instead of aborting the bridge.
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
+            result_concrete,
         }) = spec_gate(SpecFold::BinaryOpDescent, || {
             super::specialize::try_emit_exact_int_binop(
                 ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
             )
         })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            write_ref_reg(ctx, op.pc, dst, boxed, result_concrete)?;
             // `pyjitpl.py finishframe` clears `last_exc_value` before popframe
             // on a non-exceptional return. This emit replaces that inline
             // call, so the following `opimpl_catch_exception` sees a clear
@@ -24446,7 +24472,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     };
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
@@ -24454,16 +24483,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // dst register byte sits after descr (2B) + I-list (int_width)
                 // + R-list (ref_width) bytes.
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
-                // See dispatch_inline_call_dr_kind: route the SubReturn
-                // OpRef through the unified shadow channel so constant
-                // return values propagate.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
@@ -24691,22 +24716,21 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
-                // See dispatch_inline_call_dr_kind: route the SubReturn
-                // OpRef through the unified shadow channel so constant
-                // return values propagate.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'f' => {
                         let len = ctx.registers_f.len();
@@ -24720,6 +24744,10 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                                     bank: "f",
                                 })?;
                         ctx.registers_f.set(dst, value);
+                        if let ConcreteValue::Float(float_value) = result_concrete {
+                            ctx.trace_ctx
+                                .set_opref_concrete(value, majit_ir::Value::Float(float_value));
+                        }
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"

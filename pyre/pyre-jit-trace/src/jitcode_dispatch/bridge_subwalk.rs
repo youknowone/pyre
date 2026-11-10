@@ -1364,6 +1364,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(recorded.result),
+                        result_concrete: super::concrete_from_recorded_opref(ctx, recorded.result),
                     },
                     cont_pc,
                 ))
@@ -1681,7 +1682,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     concrete_callee_frame: usize,
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
-    child_result: Option<OpRef>,
+    child_result: Option<(OpRef, ConcreteValue)>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     // Enter this reconstructed frame on an exception edge.  `None` is the
     // ordinary resume-at-CALL / `make_result_of_lastop` path.
@@ -1811,7 +1812,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }
         regs_f[i] = box_ref;
     }
-    if let Some(result) = child_result {
+    if let Some((result, result_concrete)) = child_result {
         // `_setup_return_value_*` (`blackhole.py`): the callee's result
         // lands in `code[position - 1]` of the call it paused in.
         match super::call_result_register_in(jc.code.as_slice(), entry) {
@@ -1825,9 +1826,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_r.set(call_dst_reg, result);
-                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
-                    concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
-                }
+                concrete_r[call_dst_reg] = result_concrete;
             }
             super::CallResultRegister::Reg('i', call_dst_reg) => {
                 if call_dst_reg >= regs_i.len() {
@@ -1838,9 +1837,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_i[call_dst_reg] = result;
-                if let Some(majit_ir::Value::Int(v)) = ctx.box_value(result) {
-                    concrete_i[call_dst_reg] = ConcreteValue::Int(v);
-                }
+                concrete_i[call_dst_reg] = result_concrete;
             }
             super::CallResultRegister::Reg('f', call_dst_reg) => {
                 if call_dst_reg >= regs_f.len() {
@@ -1851,6 +1848,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_f[call_dst_reg] = result;
+                if let ConcreteValue::Float(value) = result_concrete {
+                    ctx.set_opref_concrete(result, majit_ir::Value::Float(value));
+                }
             }
             super::CallResultRegister::Reg(..) | super::CallResultRegister::Unknown => {
                 return None;
@@ -2600,7 +2600,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
-    child_result: OpRef,
+    child_result: (OpRef, ConcreteValue),
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
         ctx,

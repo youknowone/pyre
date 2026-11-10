@@ -7056,8 +7056,10 @@ fn descend_named_cell_helper<Sym: WalkSym>(
     };
     let result =
         match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
-            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            DispatchOutcome::SubReturn { result, .. } => {
+                finish_inline_callee_return(ctx, result)
+                    .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?
+            }
             raised @ DispatchOutcome::SubRaise { .. } => {
                 let _ = raised;
                 return Ok(None);
@@ -7484,6 +7486,7 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     }
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -7629,6 +7632,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     let _ = (dst, dst_bank);
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -7782,6 +7786,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         Ok((
             DispatchOutcome::SubReturn {
                 result: Some(boxed),
+                ..
             },
             _,
         )) => Ok(Some(boxed)),
@@ -7853,6 +7858,7 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     };
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -8125,11 +8131,11 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             return Err(error);
         }
     };
-    let result =
+    let (result, result_concrete) =
         match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             // Void helpers (`opimpl_residual_call_*_v`) have no dst
             // register; `write_residual_call_result_to_dst` no-ops `'v'`.
-            DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+            DispatchOutcome::SubReturn { result: None, .. } if dst_bank == 'v' => {
                 let _ = finish_inline_callee_return(ctx, None);
                 // Callers that pass `boxed_out` check after the result is
                 // delivered (`finishframe` / `make_result_of_lastop`, then
@@ -8146,8 +8152,14 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
                 }
                 return Ok(Some(DispatchOutcome::Continue));
             }
-            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            DispatchOutcome::SubReturn {
+                result,
+                result_concrete,
+            } => (
+                finish_inline_callee_return(ctx, result)
+                    .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+                result_concrete,
+            ),
             // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
             // `PyError` aggregate from supported literal-message raise paths and
             // materialises the interpreter's `W_BaseException` through one opaque
@@ -8158,15 +8170,23 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     if boxed_out.is_some() {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        super::residual_call::write_call_result_to_dst_with_concrete(
+            ctx,
+            op_pc,
+            dst,
+            dst_bank,
+            result,
+            result_concrete,
+        )?;
     } else {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             result,
+            result_concrete,
         )?;
     }
     if let Some(slot) = boxed_out {
@@ -10116,18 +10136,25 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10237,18 +10264,25 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10366,19 +10400,26 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before),
     };
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10500,7 +10541,7 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         Err(error) => return Err(error),
     };
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             let _ = finish_inline_callee_return(ctx, result);
         }
         DispatchOutcome::Continue => {}
@@ -10606,9 +10647,15 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     // The walked `setfield_gc` moved the cursor as it was recorded; the
@@ -10619,14 +10666,18 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     let index_after = unsafe { pyre_object::w_list_iter_index(iter_now) };
     let seq_after = unsafe { pyre_object::w_list_iter_seq(iter_now) };
     let cursor_unchanged = seq_after == seq_before && index_after == index_before;
-    let item = walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null());
+    let item = match result_concrete {
+        ConcreteValue::Ref(item) if !item.is_null() => Some(item),
+        _ => walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null()),
+    };
     // Exhaustion (`list_iter_stop`, index >= 0).  A negative `__setstate__`
     // cursor stays attached; that arm returns null without the store.
     let exhausted = item.is_none()
-        && matches!(
-            ctx.trace_ctx.concrete_of_opref(result),
-            Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
-        );
+        && (matches!(result_concrete, ConcreteValue::Ref(item) if item.is_null())
+            || matches!(
+                ctx.trace_ctx.concrete_of_opref(result),
+                Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+            ));
     // The store the body recorded, for a walk that could not execute it.
     let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
     // A kept store has no undo entry.  A bridge walk snapshots the pre-walk
@@ -15929,7 +15980,7 @@ fn finish_recorded_list_append<Sym: WalkSym>(
     len_before: usize,
 ) -> Result<(), DispatchError> {
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             if finish_inline_callee_return(ctx, result).is_some() {
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op_pc });
             }
@@ -17161,9 +17212,15 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         &[],
     )?;
 
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
     };
     // The Integer arm commits `ll_list_int_set_len` before it boxes, so a guard
@@ -17193,7 +17250,14 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
             symbolic: 0,
         });
     }
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    super::residual_call::write_call_result_to_dst_with_concrete(
+        ctx,
+        op.pc,
+        dst,
+        'r',
+        result,
+        result_concrete,
+    )?;
 
     let w_item = match popped {
         PoppedTail::Int(raw_item) => pyre_object::w_int_new(raw_item),
@@ -19198,7 +19262,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         }
     };
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             // `w_list_setitem_inner` returns bool; the opcode discards it.
             let _ = result;
         }
@@ -19708,9 +19772,15 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     let Some(iter_obj) = iter_now else {
         return Ok(None);
     };
-    let item = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (item, mut item_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     // The walked body records the compare, the store and the box, and its
@@ -19727,27 +19797,30 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
             }
             ctx.trace_ctx
                 .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+            item_concrete = ConcreteValue::Ref(concrete_item);
         }
     }
     let Some(concrete_item_ptr) = walker_concrete_ref_object(ctx, item) else {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             item,
+            item_concrete,
         )?;
         return Ok(Some(item));
     };
     if !concrete_continues {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             item,
+            item_concrete,
         )?;
         return Ok(Some(item));
     }
@@ -19769,13 +19842,14 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         item,
+        item_concrete,
     )?;
     Ok(Some(item))
 }
