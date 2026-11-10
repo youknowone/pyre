@@ -6663,35 +6663,29 @@ fn bh_result_variant_field_specs(
     let Some(fields) = cc.struct_field_entries(owner) else {
         return Vec::new();
     };
+    let sid = majit_ir::descr::struct_id_for_name(owner);
     let mut specs = Vec::new();
-    let mut offset = 8usize;
     for row in fields {
-        let field_name = &row.name;
-        let field_type_str = &row.ty;
-        // This builder lays out the variant's own payload rows, which start
-        // past the inherited tag at byte 8.  The registry can also carry the
-        // enum base's synthetic `__discriminant` row (`layout.rs`,
-        // `front/semantic.rs`); emitting it here would place the tag at
-        // offset 8 alongside the payload AND make the caller's
-        // `any(field_key() == "__discriminant")` check skip the slot-0 /
-        // offset-0 tag it synthesizes.  Leave the tag to the caller.
-        if field_name == "__discriminant" {
+        if row.name == "__discriminant" {
             continue;
         }
+        let Some(offset) = cc.layout_field_offset(sid, owner, &row.name) else {
+            // A row without an exact offset is an annotation-only logical
+            // Struct field; all_fielddescrs emits its exact leaf rows instead.
+            continue;
+        };
         let (field_flag, field_type, field_size) =
-            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs);
+            type_flag_from_str(&row.ty, &cc.raw_alloc_flavor_structs);
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
-        let align = scalar_align(field_size);
-        offset = (offset + align - 1) & !(align - 1);
         let index = specs.len() + 1;
-        let rank = cc.field_immutability(Some(owner), field_name);
+        let rank = cc.field_immutability(Some(owner), &row.name);
         let is_quasi = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
         specs.push(bh_field_spec_from_parts(
             index as u32,
             owner,
-            field_name,
+            &row.name,
             offset,
             field_size,
             field_type,
@@ -6702,9 +6696,25 @@ fn bh_result_variant_field_specs(
             is_quasi && row.is_atomic,
             is_quasi && row.is_atomic,
         ));
-        offset += field_size;
     }
     specs
+}
+
+/// `heaptracker.all_fielddescrs` recurses into a nested `lltype.Struct`
+/// and emits that inner STRUCT's leaves. Instantiated enum variants keep
+/// both the logical payload row (`__pos_0`) and the exact dotted leaves
+/// (`__pos_0.hash`) in one FieldRow list; listing both would mint the
+/// same leaf twice (`listed_fielddescrs` `index_in_parent`).
+fn dotted_leaf_covered_by_struct_parent(
+    name: &str,
+    parent_is_struct: impl Fn(&str) -> bool,
+) -> bool {
+    for (i, ch) in name.char_indices() {
+        if ch == '.' && parent_is_struct(&name[..i]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// RPython `heaptracker.all_fielddescrs(STRUCT, res=...)` parity port:
@@ -6755,6 +6765,14 @@ fn bh_all_field_specs_for_struct_into(
                 || crate::codewriter::heaptracker::is_header_word(cc, root_owner, &field_key)
                 || fl.name.starts_with("c__pad")
             {
+                continue;
+            }
+            if dotted_leaf_covered_by_struct_parent(&fl.name, |parent| {
+                layout
+                    .fields
+                    .iter()
+                    .any(|row| row.name == parent && row.flag == majit_ir::descr::ArrayFlag::Struct)
+            }) {
                 continue;
             }
             if fl.flag == majit_ir::descr::ArrayFlag::Struct {
@@ -6830,6 +6848,13 @@ fn bh_all_field_specs_for_struct_into(
             type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs)
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        if dotted_leaf_covered_by_struct_parent(field_name, |parent| {
+            fields
+                .iter()
+                .any(|row| row.name == parent && cc.is_known_struct(&row.ty))
+        }) {
             continue;
         }
         let align = scalar_align(field_size);
@@ -9010,6 +9035,40 @@ mod tests {
         ids
     }
 
+    fn set_exact_field_offsets(
+        cc: &mut crate::call::CallControl,
+        owner: &str,
+        fields: &[(&str, usize, usize)],
+        size: usize,
+    ) {
+        use crate::call::{StructFieldLayout, StructLayout};
+        let sid = majit_ir::descr::struct_id_for_name(owner)
+            .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical_spelling(owner));
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: fields
+                    .iter()
+                    .map(|(name, offset, field_size)| StructFieldLayout {
+                        name: (*name).to_string(),
+                        offset: *offset,
+                        size: *field_size,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    })
+                    .collect(),
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+    }
+
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -9239,6 +9298,228 @@ mod tests {
             Some(&cc),
             true,
         );
+    }
+
+    /// `flatten_list_storage_field` names `int_items.len` on the list
+    /// owner. `heaptracker.all_fielddescrs` recurses the nested
+    /// `IntArray` STRUCT (`rlist.py` LIST length); the owner layout lists
+    /// `int_items` itself, not the dotted leaf.
+    #[test]
+    fn fielddescrof_resolves_list_storage_dotted_leaf() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let list = "list_storage_fd::W_ListObject";
+        let inner = "list_storage_fd::IntArray";
+        let list_id = majit_ir::descr::StructId::from_canonical(list);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (list.to_string(), Some(list_id)),
+            (inner.to_string(), Some(inner_id)),
+        ]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            list.to_string(),
+            vec![("int_items".to_string(), inner.to_string())],
+        );
+        struct_fields.fields.insert(
+            inner.to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([inner.to_string()].into_iter().collect());
+        cc.set_struct_layout(
+            inner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "block".to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "len".to_string(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            list_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "int_items".to_string(),
+                    offset: 0,
+                    size: 16,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let crate::jitcode::BhDescr::Field { offset, .. } = fielddescrof(
+            &FieldDescriptor::new("int_items.len", Some(list.to_string())),
+            &crate::model::ValueType::Unsigned,
+            Some(&cc),
+            true,
+        ) else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 8);
+    }
+
+    /// `w_list_make_empty` stores `IntArray` as inlined STRUCT leaves
+    /// (`heaptracker.all_fielddescrs`). A whole-`int_items` FieldDescr is
+    /// 16 bytes; `descr.py get_field_descr` only mints primitive/pointer
+    /// leaves.
+    #[test]
+    fn w_list_make_empty_writes_int_items_storage_leaves() {
+        use crate::call::CallControl;
+        use crate::layout::{HeuristicLayoutProvider, LayoutProvider};
+        use crate::model::OpKind;
+        use crate::test_support::register_struct_registries_serialized;
+
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = crate::test_support::load_ullbc(path);
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            std::slice::from_ref(llbc),
+            crate::HostStaticAddrs::default(),
+            &["listobject", "int_array"],
+            &["w_list_make_empty"],
+        )
+        .expect("harvest w_list_make_empty");
+        let graph = program
+            .functions
+            .iter()
+            .find_map(|f| {
+                let leaf = crate::front::clause_spec::unspecialized_leaf(
+                    f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+                );
+                (leaf == "w_list_make_empty").then(|| f.graph())
+            })
+            .expect("w_list_make_empty graph");
+        let writes: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            writes
+                .iter()
+                .any(|name| *name == "int_items.block" || name.ends_with(".int_items.block")),
+            "int_items.block must be written; writes={writes:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|name| *name == "int_items.len" || name.ends_with(".int_items.len")),
+            "int_items.len must be written; writes={writes:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|name| *name != "int_items" && !name.ends_with(".int_items")),
+            "int_items itself must not be written; writes={writes:?}"
+        );
+
+        let _registry = register_struct_registries_serialized(
+            program.struct_ids.clone(),
+            program.struct_origins.clone(),
+        );
+        let pair_fields: HashMap<String, Vec<(String, String)>> =
+            program.struct_fields.fields.clone().into();
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &pair_fields,
+            &program.known_struct_names,
+            &program.immutable_fields,
+            &program.raw_alloc_flavor_structs,
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(program.struct_fields.clone());
+        cc.set_known_struct_names(program.known_struct_names.clone());
+        for struct_name in program.struct_fields.fields.keys() {
+            let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
+                continue;
+            };
+            let exact = program.exact_layouts.get(&sid);
+            let layout = match exact {
+                Some(exact) => {
+                    provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
+                }
+                None => provider.get_struct_layout(struct_name),
+            };
+            if let Some(mut layout) = layout {
+                if let Some(align) = exact.and_then(|item| item.align) {
+                    layout.align = align as usize;
+                }
+                if let Some(host) = exact.and_then(|item| item.host.clone()) {
+                    layout.host = Some(host);
+                }
+                layout.gckind = if program.struct_fields.gc_struct_ids.contains(&sid) {
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                } else {
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+                };
+                cc.set_struct_layout(sid, layout);
+            }
+        }
+
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let (field, ty) = match &op.kind {
+                OpKind::FieldWrite { field, ty, .. } | OpKind::FieldRead { field, ty, .. } => {
+                    (field, ty)
+                }
+                _ => continue,
+            };
+            let is_gc = field.owner_declared_gc.unwrap_or(true);
+            match fielddescrof(field, ty, Some(&cc), is_gc) {
+                crate::jitcode::BhDescr::Field {
+                    field_size, name, ..
+                } => {
+                    assert!(
+                        matches!(field_size, 1 | 2 | 4 | 8),
+                        "FieldDescr size must be a primitive or pointer leaf; \
+                         size={field_size} name={name} field={}",
+                        field.name
+                    );
+                }
+                other => panic!(
+                    "setfield/getfield must mint a Field descr; got {other:?} field={}",
+                    field.name
+                ),
+            }
+        }
     }
 
     /// `get_field_descr` raises when `getattr(STRUCT, fieldname)` misses.
@@ -9605,6 +9886,12 @@ mod tests {
             vec![("__pos_0".to_string(), "??TypeVar".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(
+            &mut cc,
+            "core::result::Result::Ok",
+            &[("__pos_0", 8, 8)],
+            16,
+        );
 
         let spec = bh_size_spec_from_callcontrol(&cc, "core::result::Result<i64,PyError>::Ok")
             .expect("explicit Result variant size");
@@ -9636,6 +9923,15 @@ mod tests {
             vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        // Layout on the queried owner must keep `__discriminant` so
+        // `bh_size_spec_from_callcontrol` still treats this as an explicit
+        // Result shell (`is_none_or` any discriminant field).
+        set_exact_field_offsets(
+            &mut cc,
+            owner,
+            &[("__discriminant", 0, 8), ("__pos_0", 8, 8)],
+            16,
+        );
 
         let spec =
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Result variant size");
@@ -9670,6 +9966,7 @@ mod tests {
             vec![("__pos_0".to_string(), "i64".to_string())],
         );
         cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(&mut cc, template_name, &[("__pos_0", 8, 8)], 16);
 
         let spec =
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
@@ -9862,6 +10159,185 @@ mod tests {
         assert_eq!(int_ty, int_id.as_u64());
         assert_eq!(ident_ty, ident_id.as_u64());
         assert_ne!(int_ty, ident_ty);
+    }
+
+    #[test]
+    fn inline_variant_struct_payload_field_specs_skip_logical_row() {
+        use crate::call::CallControl;
+
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
+        let owner = "core::result::Result<Pair,()>::Ok";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__pos_0".to_string(), "Pair".to_string()),
+                ("__pos_0.a".to_string(), "i64".to_string()),
+                ("__pos_0.b".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        set_exact_field_offsets(
+            &mut cc,
+            owner,
+            &[("__pos_0.a", 8, 8), ("__pos_0.b", 16, 8)],
+            24,
+        );
+
+        let specs = bh_result_variant_field_specs(&cc, owner);
+        let names_offsets: Vec<(&str, usize)> = specs
+            .iter()
+            .map(|spec| (spec.field_key(), spec.offset))
+            .collect();
+        assert_eq!(names_offsets, vec![("__pos_0.a", 8), ("__pos_0.b", 16)]);
+        let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("inline variant size");
+        assert_eq!(spec.size, 24);
+    }
+
+    /// A native enum variant that is not the explicit Result/Option shell
+    /// still carries both the logical `__pos_0` Struct row and the exact
+    /// dotted leaves. `heaptracker.all_fielddescrs` recurses the parent;
+    /// the dotted rows must not be listed again.
+    #[test]
+    fn all_field_specs_skip_dotted_leaves_when_parent_struct_is_listed() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let owner = "ops::control_flow::ControlFlow::Continue";
+        let inner = "Utf16Or32Form";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (owner.to_string(), Some(owner_id)),
+            (inner.to_string(), Some(inner_id)),
+        ]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("__pos_0".to_string(), inner.to_string()),
+                ("__pos_0.is32".to_string(), "bool".to_string()),
+                ("__pos_0.order".to_string(), "u8".to_string()),
+                ("__pos_0.bom".to_string(), "u8".to_string()),
+            ],
+        );
+        struct_fields.fields.insert(
+            inner.to_string(),
+            vec![
+                ("is32".to_string(), "bool".to_string()),
+                ("order".to_string(), "u8".to_string()),
+                ("bom".to_string(), "u8".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([inner.to_string()].into_iter().collect());
+        cc.set_struct_layout(
+            inner_id,
+            StructLayout {
+                size: 3,
+                align: 1,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "is32".to_string(),
+                        offset: 0,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "order".to_string(),
+                        offset: 1,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "bom".to_string(),
+                        offset: 2,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "__discriminant".to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0".to_string(),
+                        offset: 8,
+                        size: 3,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0.is32".to_string(),
+                        offset: 8,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0.order".to_string(),
+                        offset: 9,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0.bom".to_string(),
+                        offset: 10,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let specs = bh_all_field_specs_for_struct(&cc, owner);
+        let names: Vec<&str> = specs.iter().map(|spec| spec.field_key()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "__discriminant",
+                "__pos_0.is32",
+                "__pos_0.order",
+                "__pos_0.bom"
+            ]
+        );
     }
 
     #[test]

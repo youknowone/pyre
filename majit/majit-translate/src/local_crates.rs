@@ -152,10 +152,12 @@ pub(crate) fn with_local_crate_root<R>(root: &str, f: impl FnOnce() -> R) -> R {
 /// Seed every loaded artefact's crate root for one multi-LLBC lowering,
 /// then restore the surrounding set. Production
 /// `build_semantic_program_via_active_frontend` registers the same names
-/// before it lowers; the filtered test entry point has to, or a
-/// `SyntheticTransparentCtor` of a foreign-crate struct (PyObject inside
-/// a pyframe graph) keeps the defining crate in its owner while
+/// before it lowers. Lib harvested tests seed through
+/// `test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names`,
+/// or a `SyntheticTransparentCtor` of a foreign-crate struct (PyObject
+/// inside a pyframe graph) keeps the defining crate in its owner while
 /// `struct_field_attrs` is keyed crate-relative.
+#[cfg(test)]
 pub(crate) fn push_local_crate_roots(
     names: impl IntoIterator<Item = String>,
 ) -> LocalCrateRootsRestore {
@@ -170,8 +172,10 @@ pub(crate) fn push_local_crate_roots(
     LocalCrateRootsRestore(previous)
 }
 
+#[cfg(test)]
 pub(crate) struct LocalCrateRootsRestore(Vec<String>);
 
+#[cfg(test)]
 impl Drop for LocalCrateRootsRestore {
     fn drop(&mut self) {
         set_local_crate_roots(std::mem::take(&mut self.0));

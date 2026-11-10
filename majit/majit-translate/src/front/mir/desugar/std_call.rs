@@ -2010,6 +2010,7 @@ impl<'a> Lowering<'a> {
                         vidx,
                         &inst_args,
                         inst_adt,
+                        Some(ty),
                         variant_id,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
@@ -2185,7 +2186,7 @@ impl<'a> Lowering<'a> {
                     field: if cell_slot {
                         container_field.clone()
                     } else {
-                        container_leaf_descriptor(container_field, at_offset_zero, &leaf)
+                        container_leaf_descriptor(container_field, at_offset_zero, 0, &leaf)
                     },
                     value: LinkArg::Value(read),
                     ty: leaf.ty,

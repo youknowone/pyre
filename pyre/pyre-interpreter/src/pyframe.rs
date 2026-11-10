@@ -2099,7 +2099,11 @@ impl FrameBox {
     #[inline(never)]
     fn new_malloc_typed(frame: PyFrame) -> Self {
         // The header literal is inline, as in `newfloat`, so `resolve_header_plan` sees the constant type
-        // pointer standing for its own `w_class`. Young-nonmoving is the regime the host arm allocates in.
+        // pointer standing for its own `w_class`. The source primitive is a
+        // recognizable lowering marker: `fuse_boxing_alloc` consumes it into
+        // `NewWithVtable`. The resulting jitted frame is an ordinary movable
+        // nursery allocation. The native host arm is `new_placed(frame, false)`
+        // and is movable too.
         let ptr = pyre_object::lltype::malloc_typed_young_nonmoving(PyFrame {
             ob_header: PyObject {
                 ob_type: &FRAME_TYPE as *const PyType,

@@ -82,7 +82,7 @@ fn fun_source_starts_with(fd: &majit_charon_reader::FunDecl, prefix: &str) -> bo
     if let Some(text) = fd.item_meta.source_text.as_deref() {
         return source_after_leading_attrs_and_comments(text).starts_with(prefix);
     }
-    prefix == "pub fn new(mut frame: PyFrame)"
+    prefix == "pub fn new(frame: PyFrame)"
         && fd.item_meta.name_path_str().contains("pyframe")
         && fd.item_meta.name_path_str().ends_with("::new")
         && fd.first_arg_local_name().as_deref() == Some("frame")

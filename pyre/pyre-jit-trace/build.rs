@@ -30,7 +30,6 @@ fn main() {
         "MAJIT_DECLINE_LOG",
         "MAJIT_MIR_FRONTEND_DEBUG",
         "MAJIT_RTYPER_VERBOSE",
-        "MAJIT_BFS_TRACE",
     ] {
         println!("cargo::rerun-if-env-changed={census_switch}");
     }

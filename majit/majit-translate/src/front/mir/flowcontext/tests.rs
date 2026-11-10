@@ -85,6 +85,7 @@ fn simplify_lowered_graph(
         struct_field_attrs,
         sweep_dead_vars,
         guard_words,
+        sweep_dead_vars,
         &|_, _| None,
         &std::collections::HashMap::new(),
     )
@@ -230,6 +231,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            &[],
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
@@ -774,6 +776,457 @@ fn result_branch_break_pos0_uses_ensured_variant_struct_id() {
     assert_eq!(continue_pos0, Some(continue_vsid));
 }
 
+fn utf16or32form_shaped_flow_llbc() -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let mut form = type_decl_struct(
+        2,
+        &["type_methods", "Utf16Or32Form"],
+        vec![
+            serde_json::json!({"name": "is32", "ty": bool_ty.clone(), "attr_info": null}),
+            serde_json::json!({"name": "order", "ty": u8_ty, "attr_info": null}),
+            serde_json::json!({"name": "bom", "ty": bool_ty, "attr_info": null}),
+        ],
+    );
+    form["layout"] = serde_json::json!([{
+        "key": "",
+        "value": {
+            "size": 3,
+            "align": 1,
+            "variant_layouts": [{"field_offsets": [0, 1, 2]}]
+        }
+    }]);
+    let flow = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["core", "ops", "control_flow", "ControlFlow"]),
+        "kind": {"Enum": [
+            {
+                "name": "Continue",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Break",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]},
+        "layout": []
+    });
+    llbc_with_types("fixture", vec![flow, option_enum(1), form], vec![])
+}
+
+/// Stamping a concrete variant whose payload is a by-value struct
+/// (`Utf16Or32Form`-shaped) must emit intern's FieldRow list: the
+/// logical `__pos_0` with no ExactLayout offset (so residual
+/// `getattr(STRUCT, __pos_0)` still hits the layout) plus the dotted
+/// leaves (`lltypesystem/lltype.py` Struct inlined substructure /
+/// `heaptracker.all_fielddescrs`).
+#[test]
+fn enum_variant_instance_layout_stamps_by_value_struct_dotted_leaves() {
+    use crate::codewriter::call::StructLayoutTable;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let form_node = named_adt(2, vec![]);
+    let llbc = utf16or32form_shaped_flow_llbc();
+    let flow_ty = branch_adt_ty(0, &[u8_ty, form_node.clone()]);
+    let option_ty: TyRef =
+        serde_json::from_value(option_adt_node(1, form_node.clone())).expect("Option<Form>");
+    let form_ty: TyRef = serde_json::from_value(form_node).expect("Form");
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    let continue_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &flow_ty,
+        "Continue",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Continue instance");
+    let some_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &option_ty,
+        "Some",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Some instance");
+    let names = |vsid: majit_ir::descr::StructId| {
+        let table = layouts.borrow();
+        let layout = table.get(&vsid).expect("ensured layout");
+        layout
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.offset))
+            .collect::<Vec<_>>()
+    };
+    let assert_dotted = |vsid: majit_ir::descr::StructId, label: &str| {
+        let row = names(vsid);
+        assert_eq!(
+            row[0],
+            ("__discriminant".to_string(), 0),
+            "{label}: {row:?}"
+        );
+        for (leaf, off) in [
+            ("__pos_0.is32", 8u64),
+            ("__pos_0.order", 9),
+            ("__pos_0.bom", 10),
+        ] {
+            assert!(
+                row.iter()
+                    .any(|(name, got)| name == leaf && *got == off as usize),
+                "{label} missing {leaf}@{off}: {row:?}"
+            );
+        }
+        // Intern keeps the logical `__pos_0` FieldRow without an
+        // ExactLayout offset; `from_type_strings` still lists it.
+        assert!(
+            row.iter().any(|(name, _)| name == "__pos_0"),
+            "{label} intern getattr residual __pos_0: {row:?}"
+        );
+        let table = layouts.borrow();
+        let layout = table.get(&vsid).expect("ensured layout");
+        assert!(
+            layout
+                .fields
+                .iter()
+                .any(|field| field.name == "__pos_0.is32"),
+            "{label} fielddescrof __pos_0.is32: {row:?}"
+        );
+    };
+    assert_dotted(continue_vsid, "Continue");
+    assert_dotted(some_vsid, "Some");
+
+    let owner = "ops::control_flow::ControlFlow<u8,type_methods::Utf16Or32Form>::Continue";
+    let specs = [super::InlineVariantField {
+        owner: owner.to_string(),
+        owner_is_gc: true,
+        field: "__pos_0".to_string(),
+        payload_offset: 8,
+        payload_ty: form_ty.clone(),
+    }];
+    let expansion =
+        super::expand_inline_field(&llbc, &tombstoned, &gc, &raw, &specs, owner, "__pos_0")
+            .expect("expand __pos_0 of stamped Continue");
+    let table = layouts.borrow();
+    let stamped = table.get(&continue_vsid).expect("Continue layout");
+    for leaf in &expansion.leaves {
+        let dotted = format!("__pos_0.{}{}", leaf.super_path, leaf.field.name);
+        assert!(
+            stamped.fields.iter().any(|field| field.name == dotted),
+            "stamped layout missing expanded {dotted}: {:?}",
+            stamped
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    drop(table);
+
+    let mut graph = FunctionGraph::new("stamp_inline_payload_expand");
+    let entry = graph.startblock;
+    let dst = graph.alloc_value_var();
+    let src = graph.alloc_value_var();
+    graph.block_mut(entry).inputargs = vec![dst.clone(), src.clone()];
+    graph.push_op_var(
+        entry,
+        OpKind::FieldWrite {
+            base: dst,
+            field: FieldDescriptor::new("__pos_0", Some(owner.into()))
+                .with_owner_id(Some(continue_vsid)),
+            value: LinkArg::Value(src),
+            ty: ValueType::Ref(None),
+        },
+        false,
+    );
+    graph.set_return(entry, None);
+    let expand = |field_owner: &str, field: &str| {
+        super::expand_inline_field(&llbc, &tombstoned, &gc, &raw, &specs, field_owner, field)
+    };
+    super::simplify_lowered_graph_expanding(
+        &mut graph,
+        &std::collections::HashMap::new(),
+        true,
+        &std::collections::HashSet::new(),
+        true,
+        &expand,
+        &std::collections::HashMap::new(),
+    )
+    .expect("final expanding simplify");
+    let writes: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        writes.iter().all(|name| name != "__pos_0"),
+        "expanding simplify must not leave __pos_0: {writes:?}"
+    );
+    for leaf in ["__pos_0.is32", "__pos_0.order", "__pos_0.bom"] {
+        assert!(
+            writes.iter().any(|name| name == leaf),
+            "expanding simplify writes {leaf}: {writes:?}"
+        );
+        let table = layouts.borrow();
+        let stamped = table.get(&continue_vsid).expect("Continue layout");
+        assert!(
+            stamped.fields.iter().any(|field| field.name == *leaf),
+            "stamped layout resolves {leaf} after simplify"
+        );
+    }
+}
+
+/// `render_adt_type_args` peels `&T` except raw storage, so
+/// `Option<&Utf16Or32Form>` shares intern's `Option<Form>` vsid.
+/// getattr passes the still-wrapped ADT (`Some(base_ty)`); intern's
+/// gate is the niche `None`. The stamper must recover intern's harvested
+/// ADT and emit the same dotted leaves intern registered.
+#[test]
+fn enum_variant_instance_layout_stamps_ref_wrapped_payload_as_intern_leaves() {
+    use crate::codewriter::call::StructLayoutTable;
+    use majit_charon_reader::ullbc::TypeDeclKind;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let form_node = named_adt(2, vec![]);
+    let llbc = utf16or32form_shaped_flow_llbc();
+    let option_node = option_adt_node(1, form_node.clone());
+    let form_ref = serde_json::json!({"Ref": ["Erased", form_node.clone(), "Shared"]});
+    let option_ref_node = option_adt_node(1, form_ref);
+    let option_ty: TyRef = serde_json::from_value(option_node.clone()).expect("Option<Form>");
+    let option_ref_ty: TyRef =
+        serde_json::from_value(option_ref_node.clone()).expect("Option<&Form>");
+    let option_adt = option_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .expect("Option<Form> Adt");
+    let option_ref_adt = option_ref_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .expect("Option<&Form> Adt");
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let by_value_vsid = super::concrete_adt_struct_id(
+        majit_ir::descr::StructId::from_canonical("option::Option::Some"),
+        Some(&option_adt),
+        &llbc,
+        &tombstoned,
+    );
+    let ref_vsid = super::concrete_adt_struct_id(
+        majit_ir::descr::StructId::from_canonical("option::Option::Some"),
+        Some(&option_ref_adt),
+        &llbc,
+        &tombstoned,
+    );
+    assert_eq!(
+        ref_vsid, by_value_vsid,
+        "render_adt_type_args peels shared & onto intern's Option<Form> vsid"
+    );
+
+    let td = llbc.type_by_id(1).expect("Option");
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        panic!("Option is an enum");
+    };
+    let some_idx = variants
+        .iter()
+        .position(|variant| variant.name == "Some")
+        .expect("Some");
+    let ref_args = super::render_adt_type_args(&option_ref_adt, &llbc, 0, &tombstoned);
+    let intern_args = super::render_adt_type_args(&option_adt, &llbc, 0, &tombstoned);
+
+    let assert_dotted = |layouts: &StructLayoutTable, vsid, label: &str| {
+        let table = layouts.borrow();
+        let layout = table.get(&vsid).expect(label);
+        let names: Vec<&str> = layout
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names[0], "__discriminant", "{label}: {names:?}");
+        assert!(
+            names.iter().any(|name| *name == "__pos_0"),
+            "{label} intern getattr residual __pos_0: {names:?}"
+        );
+        for leaf in ["__pos_0.is32", "__pos_0.order", "__pos_0.bom"] {
+            assert!(
+                names.iter().any(|name| *name == leaf),
+                "{label} missing {leaf}: {names:?}"
+            );
+        }
+    };
+
+    // getattr-shaped stamp alone: intern never wrote this table.
+    let ref_only: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &ref_args,
+        Some(&option_ref_adt),
+        Some(&option_ref_ty),
+        ref_vsid,
+        &tombstoned,
+        &gc,
+        &raw,
+        &ref_only,
+    );
+    assert_dotted(&ref_only, ref_vsid, "ref-wrapped only");
+
+    // intern-like stamp, then getattr overwrite of the same vsid.
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &option_ty,
+        "Some",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("intern-like Some");
+    assert_dotted(&layouts, by_value_vsid, "intern-like Some");
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &ref_args,
+        Some(&option_ref_adt),
+        Some(&option_ref_ty),
+        ref_vsid,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    assert_dotted(&layouts, ref_vsid, "after ref-wrapped overwrite");
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &intern_args,
+        Some(&option_adt),
+        Some(&option_ty),
+        by_value_vsid,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    assert_dotted(&layouts, by_value_vsid, "after intern-like restamp");
+}
+
+/// A non-generic enum still getattr `__pos_0`; intern does not dotted-expand it.
+#[test]
+fn enum_variant_instance_layout_nongeneric_struct_payload_keeps_pos0() {
+    use crate::codewriter::call::StructLayoutTable;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let mut form = type_decl_struct(
+        1,
+        &["type_methods", "Utf16Or32Form"],
+        vec![
+            serde_json::json!({"name": "is32", "ty": bool_ty.clone(), "attr_info": null}),
+            serde_json::json!({"name": "order", "ty": u8_ty, "attr_info": null}),
+            serde_json::json!({"name": "bom", "ty": bool_ty, "attr_info": null}),
+        ],
+    );
+    form["layout"] = serde_json::json!([{
+        "key": "",
+        "value": {
+            "size": 3,
+            "align": 1,
+            "variant_layouts": [{"field_offsets": [0, 1, 2]}]
+        }
+    }]);
+    let encoder = serde_json::json!({
+        "def_id": 0,
+        "item_meta": {
+            "name": [
+                {"Ident": ["type_methods", 0]},
+                {"Ident": ["BuiltinEncoder", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [{
+            "name": "Utf16Or32",
+            "fields": [{"name": null, "ty": named_adt(1, vec![]), "attr_info": null}],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]},
+        "layout": []
+    });
+    let llbc = llbc_with_types("fixture", vec![encoder, form], vec![]);
+    let encoder_ty: TyRef = serde_json::from_value(named_adt(0, vec![])).expect("encoder ty");
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    let vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &encoder_ty,
+        "Utf16Or32",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Utf16Or32 instance");
+    let table = layouts.borrow();
+    let layout = table.get(&vsid).expect("ensured layout");
+    let names: Vec<&str> = layout
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|name| *name == "__pos_0"),
+        "non-generic variant keeps physical __pos_0: {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains('.')),
+        "non-generic variant is not dotted-stamped: {names:?}"
+    );
+}
+
 fn vec_payload_flow_llbc() -> Llbc {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -1115,6 +1568,7 @@ fn ensure_enum_variant_instance_layout_skips_unsplit_payload() {
         some_idx,
         &unresolved_args,
         Some(&unresolved_adt),
+        None,
         unresolved_some,
         &tombstoned,
         &gc,
@@ -1127,6 +1581,7 @@ fn ensure_enum_variant_instance_layout_skips_unsplit_payload() {
         none_idx,
         &unresolved_args,
         Some(&unresolved_adt),
+        None,
         unresolved_none,
         &tombstoned,
         &gc,
@@ -1139,6 +1594,7 @@ fn ensure_enum_variant_instance_layout_skips_unsplit_payload() {
         some_idx,
         &unit_args,
         Some(&unit_adt),
+        None,
         unit_some,
         &tombstoned,
         &gc,
@@ -1151,6 +1607,7 @@ fn ensure_enum_variant_instance_layout_skips_unsplit_payload() {
         some_idx,
         &i64_args,
         Some(&i64_adt),
+        None,
         concrete_some,
         &tombstoned,
         &gc,
@@ -4001,159 +4458,94 @@ fn leftover_push_roots_paths(graph: &crate::model::FunctionGraph) -> Vec<String>
         .collect()
 }
 
-/// Unique look-inside leftover of `push_roots` is `>i`. `RootScope` peels
-/// to the save-point word (`shadow_stack_len()`); a GCREF dest puts that
-/// length in `registers_r` and `walk_immortal_rec` loads it as a PyObject.
-fn leftover_push_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
-    leftover_named_call_dest_summaries(graph, "push_roots")
-}
-
-/// Unique look-inside leftover of `RootScope::pin_roots` is `ri>i`.
-/// Self is the save-point word; dest is the first shadow-stack index.
-fn leftover_pin_roots_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
-    leftover_named_call_dest_summaries(graph, "pin_roots")
-}
-
-fn leftover_named_call_dest_summaries(
-    graph: &crate::model::FunctionGraph,
-    leaf: &str,
-) -> Vec<String> {
-    use crate::model::{CallTarget, FunctionGraph, OpKind};
+fn leftover_root_scope_bracket_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallFuncPtr, CallTarget, OpKind};
+    fn is_leaf(leaf: &str, path: &str) -> bool {
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        let in_roots = path.contains("gc_roots") || path.contains("RootScope");
+        match base {
+            "pin_root" | "pin_roots" | "root_scope_close" | "push_roots" => true,
+            "publish" | "publish_roots" | "normalize" | "normalize_moved" | "normalize_roots" => {
+                in_roots
+            }
+            "get" | "shadow_stack_get" => in_roots,
+            "drop" | "drop_in_place" => in_roots,
+            _ => false,
+        }
+    }
+    fn path_of_segments(segments: &[String]) -> String {
+        segments.join("::")
+    }
     graph
         .blocks
         .iter()
         .flat_map(|block| block.operations.iter())
-        .filter_map(|op| {
-            let dest = match op.result.as_ref() {
-                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
-                None => "_".into(),
-            };
-            match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    result_ty,
-                    ..
-                } if segments.last().map(String::as_str) == Some(leaf) => {
-                    Some(format!("Call dest={dest} ty={result_ty:?}"))
-                }
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    result_ty,
-                    ..
-                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
-                    Some(format!("Method dest={dest} ty={result_ty:?}"))
-                }
-                OpKind::CallResidual {
-                    funcptr,
-                    result_kind,
-                    ..
-                } => {
-                    let is_named = leftover_residual_leaf_is(graph, funcptr, leaf);
-                    is_named.then(|| format!("CallResidual dest={dest} res={result_kind}"))
-                }
-                _ => None,
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let path = path_of_segments(segments);
+                let leaf = segments.last().map(String::as_str)?;
+                is_leaf(leaf, &path).then_some(path)
             }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } => {
+                let path = match resolved_path {
+                    Some(p) => p.segments.join("::"),
+                    None => receiver_root
+                        .clone()
+                        .unwrap_or_else(|| format!("Method({name})")),
+                };
+                is_leaf(name, &path).then(|| format!("Method({name}, path={resolved_path:?})"))
+            }
+            OpKind::CallResidual { funcptr, .. } => match funcptr {
+                CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                    let path = path_of_segments(segments);
+                    let leaf = segments.last().map(String::as_str)?;
+                    is_leaf(leaf, &path).then_some(format!("CallResidual({path})"))
+                }
+                CallFuncPtr::Target(CallTarget::Method {
+                    name,
+                    resolved_path,
+                    receiver_root,
+                    ..
+                }) => {
+                    let path = match resolved_path {
+                        Some(p) => p.segments.join("::"),
+                        None => receiver_root
+                            .clone()
+                            .unwrap_or_else(|| format!("Method({name})")),
+                    };
+                    is_leaf(name, &path)
+                        .then(|| format!("CallResidual Method({name}, path={resolved_path:?})"))
+                }
+                CallFuncPtr::Value(v) => graph.blocks.iter().find_map(|b| {
+                    b.operations.iter().find_map(|prev| {
+                        (prev.result.as_ref() == Some(v))
+                            .then(|| match &prev.kind {
+                                OpKind::ConstFnAddr { path, .. } => {
+                                    let leaf = path.rsplit("::").next().unwrap_or(path);
+                                    is_leaf(leaf, path).then(|| format!("CallResidual({path})"))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                    })
+                }),
+                _ => None,
+            },
+            _ => None,
         })
         .collect()
-}
-
-fn leftover_residual_leaf_is(
-    graph: &crate::model::FunctionGraph,
-    funcptr: &crate::model::CallFuncPtr,
-    leaf: &str,
-) -> bool {
-    use crate::model::{CallFuncPtr, CallTarget, OpKind};
-    match funcptr {
-        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
-            segments.last().map(String::as_str) == Some(leaf)
-        }
-        CallFuncPtr::Target(CallTarget::Method { name, .. }) => {
-            crate::front::clause_spec::unspecialized_leaf(name) == leaf
-        }
-        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
-            b.operations.iter().any(|prev| {
-                prev.result.as_ref() == Some(v)
-                    && matches!(
-                        &prev.kind,
-                        OpKind::ConstFnAddr { path, .. }
-                            if path.rsplit("::").next() == Some(leaf)
-                    )
-            })
-        }),
-        _ => false,
-    }
-}
-
-/// Leftover `RootScope::pin_roots` self is the save-point word. A GCREF
-/// self banks `shadow_stack_len()` in `args_r`.
-fn leftover_pin_roots_arg_summaries(graph: &crate::model::FunctionGraph) -> String {
-    leftover_named_call_arg_summaries(graph, "pin_roots")
-}
-
-fn leftover_named_call_arg_summaries(graph: &crate::model::FunctionGraph, leaf: &str) -> String {
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
-    let mut out = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } if segments.last().map(String::as_str) == Some(leaf) => {
-                    let args = args
-                        .iter()
-                        .map(|arg| match arg {
-                            LinkArg::Value(v) => {
-                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
-                            }
-                            other => format!("{other:?}"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("Call args=[{args}]"));
-                }
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    args,
-                    ..
-                } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
-                    let args = args
-                        .iter()
-                        .map(|arg| match arg {
-                            LinkArg::Value(v) => {
-                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
-                            }
-                            other => format!("{other:?}"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("Method args=[{args}]"));
-                }
-                OpKind::CallResidual {
-                    funcptr,
-                    args_i,
-                    args_r,
-                    result_kind,
-                    ..
-                } if leftover_residual_leaf_is(graph, funcptr, leaf) => {
-                    let i = args_i
-                        .iter()
-                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let r = args_r
-                        .iter()
-                        .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    out.push(format!("CallResidual i=[{i}] r=[{r}] res={result_kind}"));
-                }
-                _ => {}
-            }
-        }
-    }
-    out.join(" | ")
 }
 
 /// Leftover `__cast_instance_intrinsic` of leftover `push_roots` dest.
@@ -13267,9 +13659,7 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
 #[test]
 fn range_list_length_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "range_list_length")
         .expect("lower range_list_length");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -13285,9 +13675,7 @@ fn range_list_length_decomposes_core_try_from() {
 #[test]
 fn u32_as_usize_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "u32_as_usize").expect("lower u32_as_usize");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -13305,9 +13693,7 @@ fn u32_as_usize_decomposes_core_try_from() {
 #[test]
 fn execute_opcode_step_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "execute_opcode_step")
         .expect("lower execute_opcode_step");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -13323,9 +13709,7 @@ fn execute_opcode_step_decomposes_core_try_from() {
 #[test]
 fn eval_loop_jit_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::JIT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "eval_loop_jit").expect("lower eval_loop_jit");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -13351,9 +13735,7 @@ fn extracted_try_from_callers_decompose_core_try_from() {
         ),
         ("jit", crate::runtime_names::artifacts::JIT_ULLBC),
     ] {
-        let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-            continue;
-        };
+        let llbc = crate::test_support::load_ullbc(path);
         crate::test_support::with_lowering(llbc, |ctx| {
             for fd in llbc.iter_fun_decls() {
                 if !fd.has_unstructured_body() {
@@ -13395,9 +13777,7 @@ fn extracted_try_from_callers_decompose_core_try_from() {
 #[test]
 fn harvested_execute_load_attr_aliases_arg_get() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13405,6 +13785,12 @@ fn harvested_execute_load_attr_aliases_arg_get() {
         &["execute_load_attr"],
     )
     .expect("harvest execute_load_attr");
+    let harvested_leaves: Vec<&str> = program
+        .functions
+        .iter()
+        .filter(|f| f.lazy_graph().get().is_some())
+        .map(|f| f.name.rsplit("::").next().unwrap_or(f.name.as_str()))
+        .collect();
     let mut hits: Vec<String> = Vec::new();
     let mut load_attr_found = 0usize;
     for f in &program.functions {
@@ -13414,7 +13800,14 @@ fn harvested_execute_load_attr_aliases_arg_get() {
         let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
         let base = crate::front::clause_spec::unspecialized_leaf(leaf);
         let get_leftovers = leftover_oparg_get_paths(graph);
-        let try_from_leftovers = leftover_core_try_from_paths(graph);
+        // The blanket TryFrom body is a harvested callee; only an unresolved target is a leftover.
+        let try_from_leftovers: Vec<String> = leftover_core_try_from_paths(graph)
+            .into_iter()
+            .filter(|path| {
+                let path_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+                !harvested_leaves.iter().any(|h| *h == path_leaf)
+            })
+            .collect();
         if base == "execute_load_attr" {
             load_attr_found += 1;
         }
@@ -13445,9 +13838,7 @@ fn harvested_execute_load_attr_aliases_arg_get() {
 #[test]
 fn eval_load_attr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr")
         .expect("lower eval::<Impl>::load_attr");
     let leftovers = leftover_push_roots_paths(&caller);
@@ -13463,9 +13854,7 @@ fn eval_load_attr_erases_push_roots() {
 #[test]
 fn harvested_load_attr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13506,9 +13895,7 @@ fn harvested_load_attr_erases_push_roots() {
 #[test]
 fn eval_getattr_str_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "pyre_interpreter::baseobjspace::getattr_str")
             .expect("lower getattr_str");
@@ -13526,9 +13913,7 @@ fn eval_getattr_str_erases_push_roots() {
 #[test]
 fn harvested_getattr_str_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13572,9 +13957,7 @@ fn harvested_getattr_str_erases_push_roots() {
 #[test]
 fn eval_getattr_str_impl_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(
         llbc,
         "pyre_interpreter::baseobjspace::getattr_str_impl",
@@ -13593,9 +13976,7 @@ fn eval_getattr_str_impl_erases_push_roots() {
 #[test]
 fn harvested_getattr_str_impl_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13633,9 +14014,7 @@ fn harvested_getattr_str_impl_erases_push_roots() {
 
 fn assert_baseobjspace_fn_erases_push_roots(leaf: &str) {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let full = format!("pyre_interpreter::baseobjspace::{leaf}");
     let caller =
         crate::test_support::lower_function(llbc, &full).unwrap_or_else(|_| panic!("lower {full}"));
@@ -13676,9 +14055,7 @@ fn eval_getattr_str_instance_like_override_erases_push_roots() {
 #[test]
 fn eval_get_and_call_attribute_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(
         llbc,
         "pyre_interpreter::baseobjspace::get_and_call_attribute",
@@ -13700,9 +14077,7 @@ fn eval_get_and_call_attribute_erases_push_roots() {
 #[test]
 fn harvested_get_and_call_attribute_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13787,9 +14162,7 @@ fn load_attr_cached_frame_anchor_leftovers(graph: &crate::model::FunctionGraph) 
 #[test]
 fn eval_to_bool_jitted_has_no_frame_anchor() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::to_bool")
         .expect("lower eval::<Impl>::to_bool");
     let calls = leftover_call_summaries(&caller);
@@ -13803,9 +14176,7 @@ fn eval_to_bool_jitted_has_no_frame_anchor() {
 #[test]
 fn harvested_to_bool_jitted_has_no_frame_anchor() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13845,9 +14216,7 @@ fn harvested_to_bool_jitted_has_no_frame_anchor() {
 #[test]
 fn eval_load_attr_cached_jitted_uses_wrapped_getattr() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr_cached")
         .expect("lower eval::<Impl>::load_attr_cached");
     let leftovers = leftover_push_roots_paths(&caller);
@@ -13880,9 +14249,7 @@ fn eval_load_attr_cached_jitted_uses_wrapped_getattr() {
 #[test]
 fn eval_load_attr_getattr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "pyre_interpreter::eval::load_attr_getattr")
             .unwrap_or_else(|err| panic!("lower load_attr_getattr: {err}"));
@@ -13914,9 +14281,7 @@ fn eval_load_attr_getattr_erases_push_roots() {
 #[test]
 fn harvested_getattr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13958,9 +14323,7 @@ fn harvested_getattr_erases_push_roots() {
 #[test]
 fn harvested_load_attr_cached_jitted_uses_wrapped_getattr() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -14041,9 +14404,7 @@ fn local_fun_paths_ending(llbc: &Llbc, suffix: &str) -> Vec<String> {
 #[test]
 fn eval_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let paths = local_fun_paths_ending(llbc, "::getcode");
     assert!(!paths.is_empty(), "no local FunDecl ending ::getcode");
     let mut hits: Vec<String> = Vec::new();
@@ -14079,9 +14440,7 @@ fn eval_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
 #[test]
 fn eval_co_flags_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let paths = local_fun_paths_ending(llbc, "::co_flags");
     assert!(!paths.is_empty(), "no local FunDecl ending ::co_flags");
     let mut hits: Vec<String> = Vec::new();
@@ -14119,9 +14478,7 @@ fn eval_co_flags_cast_int_to_ptr_of_codeobject_is_int_identity() {
 #[test]
 fn harvested_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -14129,7 +14486,8 @@ fn harvested_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
         &["getcode", "co_flags", "w_code_get_ptr"],
     )
     .expect("harvest getcode/co_flags/w_code_get_ptr");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -14193,15 +14551,9 @@ fn harvested_new_malloc_typed_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14209,7 +14561,8 @@ fn harvested_new_malloc_typed_has_no_cast_ptr_to_int() {
         &["new_malloc_typed"],
     )
     .expect("harvest new_malloc_typed");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -14274,15 +14627,9 @@ fn harvested_enter_recursive_frame_is_dont_look_inside() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14350,15 +14697,9 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14366,7 +14707,8 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
         &["eval_frame_with_resume", "execute_frame_portal"],
     )
     .expect("harvest eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let (resume_paths, portal_paths, mut cc) =
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = crate::codewriter::call::CallControl::new();
@@ -14529,67 +14871,19 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
                 f.name
             ));
         }
-        let front_push = leftover_push_roots_dest_summaries(graph);
-        let xf_push = leftover_push_roots_dest_summaries(&xf);
-        if leftover_push_roots_paths(graph).is_empty() {
+        let front_roots = leftover_push_roots_paths(graph);
+        let xf_roots = leftover_push_roots_paths(&xf);
+        if !front_roots.is_empty() || !xf_roots.is_empty() {
             hits.push(format!(
-                "{} leftover push_roots is missing (erase refused on leftover eval_frame_after_enter): leftover={calls:?}",
+                "{} RootScope bracket survived: front={front_roots:?} xf={xf_roots:?}",
                 f.name
             ));
         }
-        if front_push.is_empty()
-            || front_push
-                .iter()
-                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
-            || !front_push.iter().any(|s| s.contains("Signed"))
-        {
+        let front_leaves = leftover_root_scope_bracket_leaves(graph);
+        let xf_leaves = leftover_root_scope_bracket_leaves(&xf);
+        if !front_leaves.is_empty() || !xf_leaves.is_empty() {
             hits.push(format!(
-                "{} leftover push_roots dest must be Signed: {front_push:?}",
-                f.name
-            ));
-        }
-        if xf_push
-            .iter()
-            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
-            || !xf_push
-                .iter()
-                .any(|s| s.contains("Signed") || s.contains("res=i"))
-        {
-            hits.push(format!(
-                "{} leftover push_roots dest is a GCREF (save-point walked as PyObject): front={front_push:?} xf={xf_push:?}",
-                f.name
-            ));
-        }
-        let front_pin = leftover_pin_roots_dest_summaries(graph);
-        let xf_pin = leftover_pin_roots_dest_summaries(&xf);
-        let xf_pin_args = leftover_pin_roots_arg_summaries(&xf);
-        if !front_pin.is_empty()
-            && (front_pin
-                .iter()
-                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
-                || !front_pin.iter().any(|s| s.contains("Signed")))
-        {
-            hits.push(format!(
-                "{} leftover pin_roots dest must be Signed: {front_pin:?}",
-                f.name
-            ));
-        }
-        if xf_pin
-            .iter()
-            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
-        {
-            hits.push(format!(
-                "{} leftover pin_roots dest is a GCREF: front={front_pin:?} xf={xf_pin:?}",
-                f.name
-            ));
-        }
-        if !xf_pin_args.is_empty()
-            && xf_pin_args.contains("Signed")
-            && xf_pin_args.contains("r=[")
-            && !xf_pin_args.contains("r=[]")
-        {
-            hits.push(format!(
-                "{} leftover pin_roots Signed self must sit in args_i: xf={xf_pin_args}",
+                "{} RootScope leaf survived: front={front_leaves:?} xf={xf_leaves:?}",
                 f.name
             ));
         }
@@ -14663,15 +14957,9 @@ fn harvested_funccall_flat_looks_inside_eval_frame_with_resume() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14683,7 +14971,8 @@ fn harvested_funccall_flat_looks_inside_eval_frame_with_resume() {
         ],
     )
     .expect("harvest funccall_flat_1 / execute_frame_portal / eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let (funccall_paths, portal_paths, resume_paths, mut cc) =
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = crate::codewriter::call::CallControl::new();
@@ -14830,15 +15119,9 @@ fn harvested_enter_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14888,15 +15171,9 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -14904,7 +15181,8 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
         &["cached_root_raw", "root_stack_slot_raw"],
     )
     .expect("harvest cached_root_raw");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -14993,9 +15271,7 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
 #[test]
 fn harvested_getdictvalue_no_unwrapping_pure_leftover_is_entries_get() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -15052,17 +15328,16 @@ fn harvested_getdictvalue_no_unwrapping_pure_leftover_is_entries_get() {
 fn harvested_load_global_value_uses_getname_w() {
     use crate::model::{CallFuncPtr, CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
         &["eval", "pyopcode", "pycode"],
-        &["load_global_value", "w_code_getname_w", "text_w"],
+        &["load_global_value", "getname_u", "w_code_getname_w", "text_w"],
     )
     .expect("harvest load_global_value");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -15190,7 +15465,7 @@ fn harvested_load_global_value_uses_getname_w() {
         });
         let uses_getname = residual_paths(&ops)
             .iter()
-            .any(|path| path_leaf(path) == "w_code_getname_w");
+            .any(|path| matches!(path_leaf(path).as_str(), "getname_u" | "w_code_getname_w"));
         let (names_w, indexes_table, native_names, pycode_owner) = field_index(&xf);
         // NamespaceOpcodeHandler::load_global_value is a trampoline onto
         // load_name_value; the jitted getname_u path is PyFrame's body.
@@ -15259,15 +15534,9 @@ fn harvested_set_topframeref_has_no_frame_anchor() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -15392,15 +15661,9 @@ fn harvested_eval_frame_with_resume_has_no_frame_anchor() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -15412,7 +15675,8 @@ fn harvested_eval_frame_with_resume_has_no_frame_anchor() {
         ],
     )
     .expect("harvest eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -15548,15 +15812,9 @@ fn harvested_frame_dispatch_passes_the_frame_ref_to_next_instr() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -15570,7 +15828,8 @@ fn harvested_frame_dispatch_passes_the_frame_ref_to_next_instr() {
         ],
     )
     .expect("harvest frame_dispatch/next_instr");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -18936,4 +19195,192 @@ fn bytes_concat_ll_strconcat_args_are_strptr() {
             );
         }
     }
+}
+
+fn harvested_value_type_kind(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => 'i',
+        ValueType::Float => 'f',
+        ValueType::Void => 'v',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+        ValueType::Unknown | ValueType::State => '?',
+    }
+}
+
+fn harvested_var_kind(graph: &FunctionGraph, var: &Variable) -> char {
+    match FunctionGraph::concretetype_of(var) {
+        crate::codewriter::type_state::ConcreteType::Signed => return 'i',
+        crate::codewriter::type_state::ConcreteType::GcRef => return 'r',
+        crate::codewriter::type_state::ConcreteType::Float => return 'f',
+        crate::codewriter::type_state::ConcreteType::Void => return 'v',
+        crate::codewriter::type_state::ConcreteType::Unknown => {}
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Input { ty, .. }
+                | OpKind::Call { result_ty: ty, .. }
+                | OpKind::FieldRead { ty, .. } => harvested_value_type_kind(ty),
+                OpKind::New { .. } => 'r',
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => 'i',
+                OpKind::ConstFloat(_) => 'f',
+                _ => '?',
+            };
+        }
+    }
+    '?'
+}
+
+fn harvested_link_arg_kind(graph: &FunctionGraph, arg: &LinkArg) -> char {
+    match arg {
+        LinkArg::Value(var) => harvested_var_kind(graph, var),
+        LinkArg::Const(_) => '?',
+    }
+}
+
+fn harvested_call_target_is_index_of(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.iter().any(|seg| seg.contains("index_of"))
+        }
+        CallTarget::Method { name, .. } => name.contains("index_of"),
+        _ => false,
+    }
+}
+
+/// `w_dict_delitem_object_strategy_checked` leftover `index_of` keeps the
+/// `ObjectKey` pointer (`backendopt/malloc.py`: a malloc whose pointer is
+/// a call argument is not removed). Callee inputargs are entries + key.
+#[test]
+fn harvested_w_dict_delitem_index_of_keeps_object_key_pointer() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &["dictmultiobject"],
+        &[
+            "w_dict_delitem_object_strategy_checked",
+            "index_of",
+            "object_key_for_checked",
+        ],
+    )
+    .expect("harvest w_dict_delitem_object_strategy_checked");
+    let mut callee_kinds: Option<Vec<char>> = None;
+    let mut caller_calls: Vec<(String, Vec<char>)> = Vec::new();
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf.contains("index_of") {
+            let kinds: Vec<char> = graph
+                .blocks
+                .first()
+                .map(|block| {
+                    block
+                        .inputargs
+                        .iter()
+                        .map(|arg| harvested_var_kind(graph, arg))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if graph.name.contains("ObjectKey") || callee_kinds.is_none() {
+                callee_kinds = Some(kinds);
+            }
+        }
+        if leaf.contains("object_key_for_checked") {
+            let mut news_object_key = false;
+            for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+                match &op.kind {
+                    OpKind::New { owner } if owner.ends_with("ObjectKey") => {
+                        news_object_key = true;
+                    }
+                    OpKind::FieldWrite { field, .. } => {
+                        assert!(
+                            !field.name.contains("__pos_0.hash")
+                                && !field.name.contains("__pos_0.obj"),
+                            "{} must not inline ObjectKey into Result (`lltype.GcStruct` / `backendopt/malloc.py`); field={}",
+                            f.name,
+                            field.name
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                news_object_key,
+                "{} must materialize ObjectKey (`backendopt/malloc.py`)",
+                f.name
+            );
+        }
+        if !leaf.contains("w_dict_delitem_object_strategy_checked") {
+            continue;
+        }
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !harvested_call_target_is_index_of(target) {
+                continue;
+            }
+            let kinds: Vec<char> = args
+                .iter()
+                .map(|arg| harvested_link_arg_kind(graph, arg))
+                .collect();
+            caller_calls.push((f.name.clone(), kinds));
+        }
+    }
+    let callee_kinds = callee_kinds.expect("harvested index_of inputargs");
+    assert!(
+        !caller_calls.is_empty(),
+        "harvested index_of call in w_dict_delitem_object_strategy_checked, functions={}",
+        program.functions.len()
+    );
+    for (name, kinds) in &caller_calls {
+        assert_eq!(
+            kinds, &callee_kinds,
+            "{name} index_of args {kinds:?} must match callee inputargs {callee_kinds:?}"
+        );
+    }
+}
+
+/// `W_ListObject.int_items` is the inlined `IntArray` STRUCT (`rlist.py`
+/// LIST length / items). `malloc_ptr_field_spelling` is the Result-payload
+/// path (`register_ref_enum_instantiation_rows`); a nested field still
+/// inlines so `fielddescrof` can `getattr` `int_items.len`.
+#[test]
+fn harvested_w_list_int_items_is_inlined_int_array() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program =
+        crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+            std::slice::from_ref(llbc),
+            crate::HostStaticAddrs::default(),
+            &["listobject", "int_array"],
+        )
+        .expect("harvest W_ListObject / IntArray");
+    let ty = ["listobject::W_ListObject", "W_ListObject"]
+        .into_iter()
+        .find_map(|owner| program.struct_fields.field_type(owner, "int_items"))
+        .expect("W_ListObject.int_items is harvested");
+    assert!(
+        !ty.starts_with('*') && !ty.starts_with('&'),
+        "int_items is an inlined IntArray, not a malloc Ptr; ty={ty}"
+    );
+    let leaf = ty.rsplit("::").next().unwrap_or(ty);
+    assert_eq!(
+        leaf, "IntArray",
+        "int_items field type is IntArray, got {ty}"
+    );
 }

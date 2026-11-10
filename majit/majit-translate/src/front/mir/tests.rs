@@ -15757,6 +15757,192 @@ fn registered_transparent_scalar_union_lowers_to_integer_ops() {
     }
 }
 
+/// A residual `get(&Word)` of a linked transparent scalar is refused by
+/// `refuse_borrowed_transparent_scalar_residual`: the borrow is the word,
+/// not an address.
+#[test]
+fn linked_transparent_scalar_residual_borrow_is_refused() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path
+                .iter()
+                .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                .collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let word_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let word_ref = serde_json::json!({"Ref": ["_", word_adt.clone(), "Shared"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let word_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "Word"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "pass_word"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_adt.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "word", "span": span(), "ty": word_adt.clone()},
+                        {"index": 2, "name": null, "span": span(), "ty": word_ref.clone()}
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span(),
+                            "kind": {"Assign": [
+                                place(2, &word_ref),
+                                {"Ref": {
+                                    "place": place(1, &word_adt),
+                                    "kind": "Shared",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{
+                                            "Move": place(2, &word_ref)
+                                        }]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let callee = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "get"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_ref.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "self", "span": span(), "ty": word_ref}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span(), "kind": "Return"}
+                }]
+            }
+        }
+    });
+    let marker = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "_jit_look_inside_get"], true),
+        "global_kind": "NamedConst",
+        "ty": {"Scalar": "Bool"},
+        "value": [{"Bool": false}, {"Scalar": "Bool"}]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [word_decl],
+            "fun_decls": [caller, callee],
+            "global_decls": [marker],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Word".to_string(),
+        majit_charon_reader::TransparentScalarKind::Signed,
+    )]);
+    let refused = crate::test_support::lower_function(&llbc, "pass_word")
+        .expect_err("a residual callee cannot take &Word");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("repr(transparent) scalar"),
+        "refusal must name the scalar borrow, got {refused}"
+    );
+}
+
 pub(in crate::front::mir) fn ptr_ty() -> serde_json::Value {
     serde_json::json!({"RawPtr": [usize_ty(), "Const"]})
 }
@@ -43344,6 +43530,92 @@ fn one_word_handle_by_value_struct_decl_is_none() {
         super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc),
         "*mut *mut i64",
         "the enclosing field row must carry the selected pointer repr"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
+    );
+}
+
+/// A by-value named struct whose leaves include a GC pointer is still
+/// walked (`tyref_by_value_struct_decl` is `Some`). The variant-payload
+/// path spells it as Ptr (`malloc_ptr_field_spelling`).
+#[test]
+fn by_value_struct_with_gc_pointer_leaf_is_still_walked() {
+    let i64_ty = interior_i64();
+    let obj = interior_struct(0, &["fixture", "Obj"], &[], 0, &[], false);
+    let items = interior_struct(
+        1,
+        &["fixture", "Items"],
+        &[
+            ("block", interior_raw_mut(interior_adt(0))),
+            ("len", i64_ty.clone()),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let items_ty = TyRef::Other(interior_adt(1).into());
+    let pair = interior_struct(
+        2,
+        &["fixture", "Pair"],
+        &[("a", i64_ty.clone()), ("b", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let pair_ty = TyRef::Other(interior_adt(2).into());
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false),
+        "methods": []
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [0, interior_adt(0)]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![obj, items, pair],
+        vec![],
+        vec![gctype],
+        vec![gctype_impl],
+    );
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(&items_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "a by-value named struct inlines even with a GC-pointer leaf"
+    );
+    assert!(
+        super::by_value_struct_has_gc_pointer_leaf(
+            &items_ty,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc
+        ),
+        "Items.block is a GC pointer"
+    );
+    let spelling =
+        super::tyref_to_field_layout_string(&items_ty, &llbc, &gc_struct_ids, &raw_alloc);
+    assert_eq!(
+        super::malloc_ptr_field_spelling(
+            &items_ty,
+            &spelling,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .as_deref(),
+        Some(format!("*mut {spelling}").as_str()),
+        "variant-payload spelling is Ptr; spelling={spelling}"
     );
     assert!(
         super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)

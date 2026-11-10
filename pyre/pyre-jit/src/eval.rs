@@ -198,10 +198,9 @@ fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {
 /// The depth ≤ 2 gate admits the module frame (depth 1) and one nested
 /// activation (depth 2); a callback entered from a depth-1 opcode handler
 /// runs at depth 2 with that handler suspended. Operands stay on the frame
-/// value stack or are pinned (`with_roots!`), the interpreter frame is a
-/// `FrameBox` (young-nonmoving), and the result push goes through
-/// `FrameAnchor`; a handler that writes the frame after a collecting call
-/// through the pre-call `&mut` relies on the frame not moving. Upstream
+/// value stack or are pinned (`with_roots!`). The interpreter frame is a moving
+/// `FrameBox`; result pushes and every post-call frame access reread
+/// `FrameAnchor`/`FrameRoot`. Upstream
 /// roots every live variable around a collecting call and reloads it
 /// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
 /// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
@@ -11725,7 +11724,16 @@ fn drive_sortkey_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let _outcome = meta.compile_loop(&jump_args);
+        // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+        let jump_boxes: Vec<Operand> = {
+            let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
+        let _outcome = meta.compile_loop(&jump_boxes);
     } else if let Some(TraceAction::Finish {
         finish_args,
         finish_arg_types,
@@ -13811,10 +13819,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // (depth 1) and one nested activation (depth 2); a callback entered
     // from a depth-1 opcode handler runs at depth 2 with that handler
     // suspended. Operands stay on the frame value stack or are pinned
-    // (`with_roots!`), the interpreter frame is a `FrameBox`
-    // (young-nonmoving), and the result push goes through `FrameAnchor`;
-    // a handler that writes the frame after a collecting call through the
-    // pre-call `&mut` relies on the frame not moving. Upstream roots every
+    // (`with_roots!`). The interpreter frame is a moving `FrameBox`; result
+    // pushes and every post-call frame access reread `FrameAnchor`/`FrameRoot`.
+    // Upstream roots every
     // live variable around a collecting call and reloads it (`framework.py`
     // `BaseFrameworkGCTransformer.gct_direct_call`, `shadowstack.py`
     // `ShadowStackFrameworkGCTransformer.push_roots` / `pop_roots`).

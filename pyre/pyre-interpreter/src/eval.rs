@@ -2544,23 +2544,71 @@ pub(crate) fn eval_frame_with_resume(
     // pair the leftover enter with leftover `release_recursive_frame`.
     // Native panic in the body still Drops the guard; `forget` after the
     // explicit release keeps that Drop from running twice on the return path.
+    if majit_metainterp::jit::we_are_jitted() {
+        // Traced arm: `frame` is the red virtualizable GC reference.  The JIT
+        // and gctransform keep it live; a host shadow-stack index here would be
+        // a tracing-time constant and must not be residualized.
+        let token = pyre_object::with_roots!(w_arg_or_err =>
+            crate::call::enter_recursive_frame(frame));
+        let result = 'body: {
+            frame.fix_array_ptrs();
+            let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+            if ec.is_null() {
+                if resume.is_some() {
+                    let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
+                    let prepared = pyre_object::with_roots!(w_arg_or_err =>
+                        prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+                    w_arg_or_err = pyre_object::PY_NULL;
+                    let prepared = match prepared {
+                        Ok(value) => value,
+                        Err(err) => break 'body Err(err),
+                    };
+                    if let Some(value) = prepared {
+                        break 'body Ok(value);
+                    }
+                }
+                break 'body frame_dispatch(dispatch, frame, ec);
+            }
+            let execution_context = unsafe { &mut *ec };
+            pyre_object::with_roots!(w_arg_or_err =>
+                execution_context.enter(frame as *mut PyFrame));
+            break 'body eval_frame_after_enter(frame, resume, dispatch, ec, w_arg_or_err);
+        };
+        crate::call::release_recursive_frame(token.0);
+        std::mem::forget(token);
+        return result;
+    }
+
+    eval_frame_with_resume_pinned(frame, resume, dispatch, w_arg_or_err)
+}
+
+/// Native `PyFrame.execute_frame`. A host `FrameBox` is a moving nursery
+/// object, so the anchor is installed before the first collecting call and
+/// re-read before every later one. The jitted sibling deliberately has no
+/// host pin: its frame is the red virtualizable.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn eval_frame_with_resume_pinned(
+    frame: &mut PyFrame,
+    mut resume: Option<&mut crate::call::FrameResumeArgs>,
+    dispatch: FrameDispatch,
+    mut w_arg_or_err: PyObjectRef,
+) -> PyResult {
+    let frame_anchor = FrameAnchor::new(frame);
     let token = pyre_object::with_roots!(w_arg_or_err =>
-        crate::call::enter_recursive_frame(frame));
-    // `pyframe.py execute_frame` is one graph: try body then finally
-    // `ec.leave`. Unique look-inside of that graph residual-calls enter
-    // and release in order. A helper Call here made
-    // `execute_frame_portal` residualize this whole function
-    // (`guess_call_kind` leftover of `eval_frame_with_resume`).
+        crate::call::enter_recursive_frame(frame_anchor.live()));
     let result = 'body: {
-        frame.fix_array_ptrs();
+        unsafe { (&mut *frame_anchor.live()).fix_array_ptrs() };
         let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
         if ec.is_null() {
             if resume.is_some() {
-                let throw_args = resume
-                    .as_deref_mut()
-                    .and_then(|resume| resume.throw_args.take());
+                let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
                 let prepared = pyre_object::with_roots!(w_arg_or_err =>
-                    prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+                prepare_frame_resume_for_dispatch(
+                    unsafe { &mut *frame_anchor.live() },
+                    w_arg_or_err,
+                    throw_args,
+                ));
                 w_arg_or_err = pyre_object::PY_NULL;
                 let prepared = match prepared {
                     Ok(value) => value,
@@ -2570,60 +2618,126 @@ pub(crate) fn eval_frame_with_resume(
                     break 'body Ok(value);
                 }
             }
-            break 'body frame_dispatch(dispatch, frame, ec);
+            break 'body frame_dispatch(dispatch, unsafe { &mut *frame_anchor.live() }, ec);
         }
         let execution_context = unsafe { &mut *ec };
-        // executioncontext.py / threadlocals.py parity: the current
-        // ExecutionContext is owned by the OS-thread locals and is installed by
-        // thread bootstrap.  Entering an (including inlined) frame must not
-        // replace that thread-owned slot from a frame field; doing so lets a
-        // collapsed/stale translated frame identity poison every subsequent
-        // `space.getexecutioncontext()` lookup.
-        pyre_object::with_roots!(w_arg_or_err =>
-            execution_context.enter(frame as *mut PyFrame));
-        // `pyframe.py execute_frame` keeps `self` as a GCREF local. Native
-        // `FrameAnchor` roots that word across `call_trace` / `return_trace` /
-        // `leave`. Unique look-inside folds `we_are_jitted()` to true and
-        // stays on the unpinned body — residual `frame_anchor_push` would
-        // hand BH a tracing-time shadow-stack index (`set_topframeref` pin).
-        if majit_metainterp::jit::we_are_jitted() {
-            break 'body eval_frame_after_enter(frame, resume, dispatch, ec, w_arg_or_err);
-        }
-        break 'body eval_frame_after_enter_pinned(frame, resume, dispatch, ec, w_arg_or_err);
+        pyre_object::with_roots!(w_arg_or_err => execution_context.enter(frame_anchor.live()));
+        break 'body eval_frame_after_enter_pinned(
+            &frame_anchor,
+            resume,
+            dispatch,
+            ec,
+            w_arg_or_err,
+        );
     };
     crate::call::release_recursive_frame(token.0);
     std::mem::forget(token);
     result
 }
 
-/// Native pin around [`eval_frame_after_enter`]. Graphless so
-/// `frame_anchor_release` is not a look-inside-able Drop of a Ref local
-/// (`getcalldescr` Int vs Ref). FrameBox is young-nonmoving; the pin
-/// keeps the frame reachable, and `live()` at entry is the pointer the
-/// body uses.
+/// Native `PyFrame.execute_frame` body after `ec.enter(self)`. A host
+/// `FrameBox` is a moving nursery object, so the caller installs the
+/// anchor before the first collecting call and this function re-reads
+/// `frame_anchor.live()` before every later one. The jitted sibling
+/// deliberately has no host pin: its frame is the red virtualizable.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn eval_frame_after_enter_pinned(
-    frame: &mut PyFrame,
-    resume: Option<&mut crate::call::FrameResumeArgs>,
+    frame_anchor: &FrameAnchor,
+    mut resume: Option<&mut crate::call::FrameResumeArgs>,
     dispatch: FrameDispatch,
     ec: *mut crate::PyExecutionContext,
-    w_arg_or_err: PyObjectRef,
+    mut w_arg_or_err: PyObjectRef,
 ) -> PyResult {
-    let _anchor = FrameAnchor::new(frame);
-    eval_frame_after_enter(
-        unsafe { &mut *_anchor.live() },
-        resume,
-        dispatch,
-        ec,
-        w_arg_or_err,
-    )
+    let execution_context = unsafe { &mut *ec };
+    let mut got_exception = true;
+    let mut outer_result: PyResult;
+    let mut w_exitvalue: PyObjectRef;
+    let trace = pyre_object::with_roots!(w_arg_or_err =>
+        execution_context.call_trace(frame_anchor.live()));
+    match trace {
+        Err(e) => {
+            outer_result = Err(e);
+            w_exitvalue = pyre_object::w_none();
+        }
+        Ok(()) => {
+            let mut inner_result: PyResult = 'inner: {
+                if resume.is_some() {
+                    let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
+                    let prepared = pyre_object::with_roots!(w_arg_or_err =>
+                    prepare_frame_resume_for_dispatch(
+                        unsafe { &mut *frame_anchor.live() },
+                        w_arg_or_err,
+                        throw_args,
+                    ));
+                    w_arg_or_err = pyre_object::PY_NULL;
+                    if let Some(value) = match prepared {
+                        Ok(value) => value,
+                        Err(err) => break 'inner Err(err),
+                    } {
+                        break 'inner Ok(value);
+                    }
+                }
+                frame_dispatch(dispatch, unsafe { &mut *frame_anchor.live() }, ec)
+            };
+            w_exitvalue = match &inner_result {
+                Ok(value) => *value,
+                Err(_) => pyre_object::w_none(),
+            };
+            let return_trace_result = {
+                let roots = pyre_object::gc_roots::push_roots();
+                let inner_is_ok = inner_result.is_ok();
+                let pending = match inner_result {
+                    Ok(value) => value,
+                    Err(err) => err.as_raw() as PyObjectRef,
+                };
+                let base = roots.pin_roots(&[w_exitvalue, pending]);
+                let result = execution_context.return_trace(frame_anchor.live(), roots.get(base));
+                w_exitvalue = roots.get(base);
+                inner_result = if inner_is_ok {
+                    Ok(roots.get(base + 1))
+                } else {
+                    Err(crate::PyError::from_raw(roots.get(base + 1)))
+                };
+                result
+            };
+            match return_trace_result {
+                Err(err) => outer_result = Err(err),
+                Ok(live) => {
+                    w_exitvalue = live;
+                    outer_result = inner_result.map(|_| live);
+                }
+            }
+            if outer_result.is_ok() {
+                got_exception = false;
+            }
+        }
+    }
+    let leave_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let outer_is_ok = outer_result.is_ok();
+        let pending = match outer_result {
+            Ok(value) => value,
+            Err(err) => err.as_raw() as PyObjectRef,
+        };
+        let base = roots.pin_roots(&[w_exitvalue, pending]);
+        let result = execution_context.leave(frame_anchor.live(), roots.get(base), got_exception);
+        outer_result = if outer_is_ok {
+            Ok(roots.get(base + 1))
+        } else {
+            Err(crate::PyError::from_raw(roots.get(base + 1)))
+        };
+        result
+    };
+    match leave_result {
+        Err(err) => Err(err),
+        Ok(live) => outer_result.map(|_| live),
+    }
 }
 
-/// `pyframe.py execute_frame` after `ec.enter(self)`: call_trace, dispatch,
-/// return_trace, leave. The frame is the GCREF local; gctransform reloads
-/// it after collecting calls. Native roots it in
-/// [`eval_frame_after_enter_pinned`].
+/// JIT-only `pyframe.py execute_frame` body after `ec.enter(self)`. `frame`
+/// is the red virtualizable GC reference; do not call this from the native
+/// arm.
 fn eval_frame_after_enter(
     frame: &mut PyFrame,
     mut resume: Option<&mut crate::call::FrameResumeArgs>,
@@ -2654,7 +2768,7 @@ fn eval_frame_after_enter(
     // look-inside of that tuple NEW+SETFIELD then CAST_PTR_TO_INT of
     // the GCREF (`bhimpl_cast_ptr_to_int` asserts a tagged immediate).
     let mut outer_result: PyResult;
-    let mut w_exitvalue = pyre_object::w_none();
+    let mut w_exitvalue: PyObjectRef;
     {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent value and `OperationError` (`error.py`) are GC locals
@@ -2665,6 +2779,7 @@ fn eval_frame_after_enter(
         match trace {
             Err(e) => {
                 outer_result = Err(e);
+                w_exitvalue = pyre_object::w_none();
             }
             Ok(()) => {
                 let mut inner_result: PyResult = 'inner: {
@@ -2696,17 +2811,19 @@ fn eval_frame_after_enter(
                 // and the pending exception are still owed to `leave`.
                 let return_trace_result = {
                     let roots = pyre_object::gc_roots::push_roots();
-                    let pending = match &inner_result {
-                        Ok(value) => *value,
+                    let inner_is_ok = inner_result.is_ok();
+                    let pending = match inner_result {
+                        Ok(value) => value,
                         Err(err) => err.as_raw() as PyObjectRef,
                     };
                     let base = roots.pin_roots(&[w_exitvalue, pending]);
                     let result =
                         execution_context.return_trace(frame as *mut PyFrame, roots.get(base));
                     w_exitvalue = roots.get(base);
-                    inner_result = match inner_result {
-                        Ok(_) => Ok(roots.get(base + 1)),
-                        Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+                    inner_result = if inner_is_ok {
+                        Ok(roots.get(base + 1))
+                    } else {
+                        Err(crate::PyError::from_raw(roots.get(base + 1)))
                     };
                     result
                 };
@@ -2730,15 +2847,17 @@ fn eval_frame_after_enter(
     }
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let pending = match &outer_result {
-            Ok(value) => *value,
+        let outer_is_ok = outer_result.is_ok();
+        let pending = match outer_result {
+            Ok(value) => value,
             Err(err) => err.as_raw() as PyObjectRef,
         };
         let base = roots.pin_roots(&[w_exitvalue, pending]);
         let result = execution_context.leave(frame as *mut PyFrame, roots.get(base), got_exception);
-        outer_result = match outer_result {
-            Ok(_) => Ok(roots.get(base + 1)),
-            Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+        outer_result = if outer_is_ok {
+            Ok(roots.get(base + 1))
+        } else {
+            Err(crate::PyError::from_raw(roots.get(base + 1)))
         };
         result
     };
@@ -3377,14 +3496,13 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         // `getname_u` is `text_w(getname_w(index))`; `getname_w` reads
-        // `self.getcode().co_names_w`. Re-read `getcode_w` at each probe:
+        // `self.getcode().co_names_w`. `getname_u` re-reads `getcode_w` at each probe:
         // `get_builtin` can collect, and a copied W_Code pointer would go stale.
         // Unique look-inside (`we_are_jitted` ConstBool(true) on the lifted
         // graph) must pass that STR, not `code.names[idx].as_ref()` interned
         // `&str` identity-aliased as Str (`load_attr_cached` jitted arm).
         let varname = if majit_metainterp::jit::we_are_jitted() {
-            let w_name = unsafe { crate::pycode::w_code_getname_w(self.getcode_w(), nameindex) };
-            crate::baseobjspace::text_w(w_name)?
+            pyre_object::with_roots!(w_globals => unsafe { &*(roots.get(frame_slot) as *mut PyFrame) }.getname_u(nameindex))?
         } else {
             name
         };

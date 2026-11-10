@@ -4257,12 +4257,24 @@ pub(crate) fn registered_struct_layout<'a>(
     if let Some(exact) = struct_field_attrs.get(owner) {
         return Some(exact);
     }
-    let owner_id = majit_ir::descr::struct_id_for_name(owner)?;
-    let mut matches = struct_field_attrs.iter().filter_map(|(key, rows)| {
-        (majit_ir::descr::struct_id_for_name(key) == Some(owner_id)).then_some(rows)
-    });
-    let first = matches.next()?;
-    matches.all(|rows| rows == first).then_some(first)
+    if let Some(owner_id) = majit_ir::descr::struct_id_for_name(owner) {
+        let mut matches = struct_field_attrs.iter().filter_map(|(key, rows)| {
+            (majit_ir::descr::struct_id_for_name(key) == Some(owner_id)).then_some(rows)
+        });
+        if let Some(first) = matches.next() {
+            return matches.all(|rows| rows == first).then_some(first);
+        }
+    }
+    // `resolve_aggregate_adt` keeps the defining crate on
+    // `SyntheticTransparentCtor.owner_path` so intern identity stays the
+    // declaration path. `synthetic_transparent_ctor_owner` strips that
+    // crate only when it is this graph's crate or a seeded local root;
+    // a filtered harvest often has neither, so a foreign-crate boxing
+    // header arrives with the crate prefix still attached while
+    // `struct_field_attrs` is keyed crate-relative. One leading segment
+    // is that crate prefix (`relative_owner_from_segments`).
+    let rest = owner.split_once("::")?.1;
+    struct_field_attrs.get(rest)
 }
 
 /// Crate-relative struct path: Charon's declaration path with this
@@ -4700,14 +4712,19 @@ pub fn lower_struct_ptr_writes(
     lower_struct_ptr_writes_with(graph, struct_field_attrs, &|_, _| None)
 }
 
-/// Whether an inlined-struct field sits at offset 0 in its owner, plus the
-/// leaves `collect_by_value_struct_leaves` returns.
+/// One logical inlined-struct field and the exact layout of its translated
+/// low-level leaves. `heaptracker.all_fielddescrs` emits `leaves`, never the
+/// containing Struct field itself.
 pub(crate) struct InlineStructExpansion {
     pub at_offset_zero: bool,
+    pub offset: u64,
+    pub size: u64,
+    pub align: u64,
+    pub owner_is_gc: bool,
     pub leaves: Vec<InlineLeaf>,
 }
 
-/// A leaf of an inlined by-value struct `td`, relative to `td`.
+/// A physical leaf of an inlined by-value struct, relative to that struct.
 #[derive(Clone, Debug)]
 pub(crate) struct InlineLeaf {
     /// After peeling the leading offset-0 hops: owner = deepest struct reached through them,
@@ -4716,6 +4733,12 @@ pub(crate) struct InlineLeaf {
     /// The peeled hops from `td` down to `field`'s owner, each followed by '.'; "" when none.
     pub super_path: String,
     pub ty: ValueType,
+    /// Instantiated Charon type of this physical leaf. This is retained so
+    /// annotation rows and physical layout use the same translated type.
+    pub source_ty: majit_charon_reader::ullbc::TyRef,
+    pub offset: u64,
+    pub size: u64,
+    pub align: u64,
 }
 
 /// `leaf` seen from the struct that holds `td` in `container_field`.
@@ -4726,6 +4749,7 @@ pub(crate) struct InlineLeaf {
 pub(crate) fn nest_inline_leaf(
     container_field: &FieldDescriptor,
     at_offset_zero: bool,
+    container_offset: u64,
     leaf: &InlineLeaf,
 ) -> InlineLeaf {
     let mut field = leaf.field.clone();
@@ -4736,6 +4760,10 @@ pub(crate) fn nest_inline_leaf(
             field,
             super_path: format!("{}.{}", container_field.name, leaf.super_path),
             ty: leaf.ty.clone(),
+            source_ty: leaf.source_ty.clone(),
+            offset: container_offset + leaf.offset,
+            size: leaf.size,
+            align: leaf.align,
         }
     } else {
         field.name = format!(
@@ -4748,6 +4776,10 @@ pub(crate) fn nest_inline_leaf(
             field,
             super_path: String::new(),
             ty: leaf.ty.clone(),
+            source_ty: leaf.source_ty.clone(),
+            offset: container_offset + leaf.offset,
+            size: leaf.size,
+            align: leaf.align,
         }
     }
 }
@@ -4757,9 +4789,10 @@ pub(crate) fn nest_inline_leaf(
 pub(crate) fn container_leaf_descriptor(
     container_field: &FieldDescriptor,
     at_offset_zero: bool,
+    container_offset: u64,
     leaf: &InlineLeaf,
 ) -> FieldDescriptor {
-    nest_inline_leaf(container_field, at_offset_zero, leaf).field
+    nest_inline_leaf(container_field, at_offset_zero, container_offset, leaf).field
 }
 
 pub(crate) fn lower_struct_ptr_writes_with(
@@ -5045,6 +5078,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                                         field: container_leaf_descriptor(
                                             &field,
                                             expansion.at_offset_zero,
+                                            expansion.offset,
                                             &leaf,
                                         ),
                                         value: LinkArg::Value(read),
@@ -5076,6 +5110,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                                 let write = container_leaf_descriptor(
                                     &field,
                                     expansion.at_offset_zero,
+                                    expansion.offset,
                                     &leaf,
                                 );
                                 copies.push((write.clone(), write, leaf.ty));
@@ -5179,6 +5214,7 @@ pub(crate) fn lower_inlined_struct_field_writes(
         source: crate::flowspace::model::Variable,
         field: FieldDescriptor,
         at_offset_zero: bool,
+        offset: u64,
         leaves: Vec<InlineLeaf>,
     }
     let malloc_args = typed_malloc_arg_vars(graph);
@@ -5213,6 +5249,7 @@ pub(crate) fn lower_inlined_struct_field_writes(
                 source,
                 field: field.clone(),
                 at_offset_zero: expansion.at_offset_zero,
+                offset: expansion.offset,
                 leaves: expansion.leaves,
             });
         }
@@ -5235,7 +5272,12 @@ pub(crate) fn lower_inlined_struct_field_writes(
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: rewrite.destination.clone(),
-                    field: container_leaf_descriptor(&rewrite.field, rewrite.at_offset_zero, &leaf),
+                    field: container_leaf_descriptor(
+                        &rewrite.field,
+                        rewrite.at_offset_zero,
+                        rewrite.offset,
+                        &leaf,
+                    ),
                     value: LinkArg::Value(read),
                     ty: leaf.ty,
                 },
@@ -7194,6 +7236,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                             let write_field = container_leaf_descriptor(
                                 store.field,
                                 expansion.at_offset_zero,
+                                expansion.offset,
                                 leaf,
                             );
                             let key = (write_field.owner_root.clone(), write_field.name.clone());
@@ -7211,6 +7254,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                             let write_field = container_leaf_descriptor(
                                 store.field,
                                 expansion.at_offset_zero,
+                                expansion.offset,
                                 &leaf,
                             );
                             match unique_store_at_each(
@@ -12524,20 +12568,36 @@ mod tests {
         );
     }
 
+    fn test_inline_leaf_source_ty() -> majit_charon_reader::ullbc::TyRef {
+        serde_json::from_value(serde_json::json!({
+            "Scalar": {"Integer": {"Unsigned": "Usize"}}
+        }))
+        .expect("canonical scalar TyRef")
+    }
+
     fn test_inline_expansion(
         at_offset_zero: bool,
         leaves: Vec<(FieldDescriptor, ValueType)>,
     ) -> InlineStructExpansion {
+        let leaves: Vec<InlineLeaf> = leaves
+            .into_iter()
+            .map(|(field, ty)| InlineLeaf {
+                field,
+                super_path: String::new(),
+                ty,
+                source_ty: test_inline_leaf_source_ty(),
+                offset: 0,
+                size: 8,
+                align: 8,
+            })
+            .collect();
         InlineStructExpansion {
             at_offset_zero,
-            leaves: leaves
-                .into_iter()
-                .map(|(field, ty)| InlineLeaf {
-                    field,
-                    super_path: String::new(),
-                    ty,
-                })
-                .collect(),
+            offset: 0,
+            size: 8 * leaves.len() as u64,
+            align: 8,
+            owner_is_gc: true,
+            leaves,
         }
     }
 
@@ -14513,6 +14573,10 @@ mod tests {
                 .with_inline_vec(true),
             super_path: String::new(),
             ty: ValueType::Ref(None),
+            source_ty: test_inline_leaf_source_ty(),
+            offset: 0,
+            size: 8,
+            align: 8,
         };
         let container = |name: &str, owner: &str| {
             FieldDescriptor::new(name, Some(owner.into()))
@@ -14523,7 +14587,7 @@ mod tests {
 
         // PyFrame ⊃ ob_header@0 ⊃ w_class → ("w_class", PyObject)
         let w_class = leaf("w_class", "PyObject");
-        let nested = nest_inline_leaf(&container("ob_header", "PyFrame"), true, &w_class);
+        let nested = nest_inline_leaf(&container("ob_header", "PyFrame"), true, 0, &w_class);
         assert_eq!(nested.field.name, "w_class");
         assert_eq!(nested.field.owner_root.as_deref(), Some("PyObject"));
         assert_eq!(nested.super_path, "ob_header.");
@@ -14533,14 +14597,14 @@ mod tests {
 
         // W_ExceptionExtended ⊃ base@0 ⊃ args_w → ("args_w", W_BaseException)
         let args_w = leaf("args_w", "W_BaseException");
-        let nested = nest_inline_leaf(&container("base", "W_ExceptionExtended"), true, &args_w);
+        let nested = nest_inline_leaf(&container("base", "W_ExceptionExtended"), true, 0, &args_w);
         assert_eq!(nested.field.name, "args_w");
         assert_eq!(nested.field.owner_root.as_deref(), Some("W_BaseException"));
         assert_eq!(nested.super_path, "base.");
 
         // W_ListObject ⊃ int_items@nonzero ⊃ block → ("int_items.block", W_ListObject)
         let block = leaf("block", "IntArray");
-        let nested = nest_inline_leaf(&container("int_items", "W_ListObject"), false, &block);
+        let nested = nest_inline_leaf(&container("int_items", "W_ListObject"), false, 0, &block);
         assert_eq!(nested.field.name, "int_items.block");
         assert_eq!(nested.field.owner_root.as_deref(), Some("W_ListObject"));
         assert_eq!(nested.super_path, "");
@@ -14553,24 +14617,30 @@ mod tests {
 
         // Outer{a, mid@8: Mid{b, inner@0: Inner{c}}} → ("mid.inner.c", Outer)
         let c = leaf("c", "Inner");
-        let through_inner = nest_inline_leaf(&container("inner", "Mid"), true, &c);
+        let through_inner = nest_inline_leaf(&container("inner", "Mid"), true, 0, &c);
         assert_eq!(through_inner.field.name, "c");
         assert_eq!(through_inner.field.owner_root.as_deref(), Some("Inner"));
         assert_eq!(through_inner.super_path, "inner.");
-        let nested = nest_inline_leaf(&container("mid", "Outer"), false, &through_inner);
+        let nested = nest_inline_leaf(&container("mid", "Outer"), false, 0, &through_inner);
         assert_eq!(nested.field.name, "mid.inner.c");
         assert_eq!(nested.field.owner_root.as_deref(), Some("Outer"));
         assert_eq!(nested.super_path, "");
 
         // Outer{mid@0: Mid{b, inner@8: Inner{c}}} → ("inner.c", Mid)
-        let through_inner = nest_inline_leaf(&container("inner", "Mid"), false, &c);
+        let through_inner = nest_inline_leaf(&container("inner", "Mid"), false, 0, &c);
         assert_eq!(through_inner.field.name, "inner.c");
         assert_eq!(through_inner.field.owner_root.as_deref(), Some("Mid"));
         assert_eq!(through_inner.super_path, "");
-        let nested = nest_inline_leaf(&container("mid", "Outer"), true, &through_inner);
+        let nested = nest_inline_leaf(&container("mid", "Outer"), true, 0, &through_inner);
         assert_eq!(nested.field.name, "inner.c");
         assert_eq!(nested.field.owner_root.as_deref(), Some("Mid"));
         assert_eq!(nested.super_path, "mid.");
+
+        let mut block = leaf("block", "FloatArray");
+        block.offset = 8;
+        let nested = nest_inline_leaf(&container("float_items", "W_ListObject"), false, 24, &block);
+        assert_eq!(nested.field.name, "float_items.block");
+        assert_eq!(nested.offset, 32);
     }
 
     /// The cast constant stays the class leaf. The result type carries the
@@ -15122,6 +15192,13 @@ mod tests {
         assert_eq!(
             registered_struct_layout("unregistered::Owner", &attrs),
             None
+        );
+
+        // Crate-prefix spelling, no StructId: one leading segment is the
+        // crate (`relative_owner_from_segments`).
+        assert_eq!(
+            registered_struct_layout("foreign_crate::registered_layout_test::Owner", &attrs),
+            Some(&rows()),
         );
 
         // Two keys, one id, disagreeing rows: the answer is not a coin flip.
