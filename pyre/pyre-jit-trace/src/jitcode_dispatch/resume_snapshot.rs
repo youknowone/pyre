@@ -1303,7 +1303,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // set through the floor's color→slot map.
                 (resolved_offset as i32, OuterActiveBoxesEntryTwin::Plain)
             };
-            let vstack_boxes = if ctx.vstack_valid {
+            // `get_list_of_active_boxes(after_residual_call=True)` reads
+            // only the registers at the call's trailing `-live-`, where
+            // `make_result_of_lastop` has already written the result color.
+            // The vstack mirror still holds the call's popped operands until
+            // the next opcode reconciles it, so it must not stand in for
+            // those colors here.
+            let vstack_boxes = if ctx.vstack_valid && !after_residual_call {
                 Some(ctx.frame_state.borrow().vstack_boxes.clone())
             } else {
                 None
