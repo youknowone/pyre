@@ -7779,6 +7779,9 @@ fn build_class_inner(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && dict_obj.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let _ = pyre_object::gc_roots::pin_root(dict_obj);
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let classcell = unsafe { pyre_object::w_dict_getitem_str(class_dict, "__classcell__") };
@@ -7840,6 +7843,10 @@ fn build_class_inner(
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             pyre_object::gc_roots::shadow_stack_get(dict_root) as pyre_object::gc_hook::GCREF,
         );
+        // `W_TypeObject.__init__` does not expose a null type.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && w.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let _ = pyre_object::gc_roots::pin_root(w);
         // typeobject.py `_store_type_in_classcell` after `allocate_instance`,
         // before `W_TypeObject.__init__` / `ready` / `_set_names`.
@@ -7911,11 +7918,13 @@ fn build_class_inner(
         if !unsafe {
             pyre_object::w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(w_root), mro)
         } {
-            return Err(PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
-        unsafe {
+        if !unsafe {
             pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(w_root))
-        };
+        } {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         // CPython type_new_set_classdict binds __classdict__ before
         // type_new_set_names.  A descriptor's __set_name__ may mutate the
         // completed type dict and immediately materialize lazy annotations;

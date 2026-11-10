@@ -947,6 +947,14 @@ pub fn init_interned_strings() -> bool {
     intern_dict(&mut table).is_some()
 }
 
+/// `ObjSpace.__init__` must finish `interned_strings` (`ll_new_weakdict`)
+/// before the space is usable. Bootstrap has no Python error channel.
+pub fn init_interned_strings_or_alloc_failed() -> ! {
+    crate::gc_hook::gc_alloc_failed(std::mem::size_of::<
+        crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
+    >())
+}
+
 /// Tests that install a fresh collector replace the table so its blocks
 /// belong to that heap (`intern_dict_is_prebuilt_stable_across_minor_and_major`
 /// in pyre-interpreter eval.rs tests).

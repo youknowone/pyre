@@ -638,10 +638,10 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let mut inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
-    let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return;
-    }
+    let new_obj = match unsafe { node_set_terminator(map, &inst, new_term) } {
+        Ok(new_obj) => new_obj,
+        Err(()) => return,
+    };
     let new_map = new_obj.map;
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let mut inst = unsafe { mapdict_carrier(obj) };
@@ -813,14 +813,12 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     match node_delete(map, &inst, name, DICT) {
-        None => false,
-        Some(new_obj) => {
-            if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                return false;
-            }
+        Ok(None) => false,
+        Ok(Some(new_obj)) => {
             inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
             !pyre_object::gc_hook::gc_alloc_failed_pending()
         }
+        Err(()) => false,
     }
 }
 
@@ -1007,14 +1005,12 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
     match node_delete(map, &inst, Wtf8::new("slot"), attrkind) {
-        None => false,
-        Some(new_obj) => {
-            if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                return false;
-            }
+        Ok(None) => false,
+        Ok(Some(new_obj)) => {
             inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
             !pyre_object::gc_hook::gc_alloc_failed_pending()
         }
+        Err(()) => false,
     }
 }
 
@@ -1729,8 +1725,12 @@ pub unsafe fn load_attr_caching(
             {
                 let mut inst =
                     unsafe { mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
-                // mapdict.py `return attr._direct_read(w_obj)`.
-                return Ok(unsafe { direct_read(e.cached_attr, &mut inst) });
+                // `PlainAttribute._direct_read` may `_convert_to_boxed` through
+                // `PlainAttribute.copy` / `_copy_attr`; fetch that allocation
+                // exception rather than returning the value as success.
+                let w = unsafe { direct_read(e.cached_attr, &mut inst) };
+                memory_error_if_pending()?;
+                return Ok(w);
             }
         }
         map
@@ -1831,7 +1831,11 @@ unsafe fn load_attr_slowpath(
                     // `return attr._direct_read(w_obj)`.
                     let w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     let mut inst = unsafe { mapdict_carrier(w_obj) };
-                    return Ok(unsafe { direct_read(attr, &mut inst) });
+                    // `PlainAttribute._direct_read` may `_convert_to_boxed`
+                    // through `PlainAttribute.copy` / `_copy_attr`.
+                    let w = unsafe { direct_read(attr, &mut inst) };
+                    memory_error_if_pending()?;
+                    return Ok(w);
                 }
             }
         }
@@ -3342,7 +3346,10 @@ pub unsafe fn store_attr_add_fast_path(
 
 /// Perform the transition [`store_attr_add_fast_path`] resolved.  The JIT's
 /// walk is the authoritative execution path, so it applies the store itself
-/// after emitting the equivalent trace operations.
+/// and only then emits the equivalent trace operations.
+///
+/// Returns false when `_set_mapdict_increase_storage1` or the fresh unboxed
+/// bank does not publish (`MapdictStorageMixin._set_mapdict_increase_storage1`).
 ///
 /// # Safety
 /// `w_obj` must be the live instance the resolution came from, still on
@@ -3351,7 +3358,7 @@ pub unsafe fn store_attr_add_commit(
     w_obj: PyObjectRef,
     resolved: &StoreAttrAdd,
     w_value: PyObjectRef,
-) {
+) -> bool {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_value]);
     let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
@@ -3369,9 +3376,9 @@ pub unsafe fn store_attr_add_commit(
             let val = unsafe { unbox_value(typ, w_value) };
             let unboxed = erase_unboxed(&[val]);
             if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
-                return;
+                return false;
             }
-            inst._set_mapdict_increase_storage1(resolved.new_map, unboxed);
+            inst._set_mapdict_increase_storage1(resolved.new_map, unboxed)
         }
     }
 }
@@ -3437,9 +3444,12 @@ pub unsafe fn write_unboxed_storage_raw(
     }
 }
 
+/// `MapdictStorageMixin._set_mapdict_increase_storage1` lets the
+/// allocating operation's exception propagate; fetch that value rather
+/// than constructing a fresh carrier.
 fn memory_error_if_pending() -> Result<(), PyError> {
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        Err(crate::PyError::memory_error(""))
+        Err(crate::runtime_ops::fetch_memory_error())
     } else {
         Ok(())
     }
@@ -3584,29 +3594,31 @@ unsafe fn store_attr_slowpath(
                             mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1))
                         };
                         if std::ptr::eq(current_map, map) {
-                            // mapdict.py:1610
-                            // `_switch_map_and_write_increase_storage1`.
+                            // `PlainAttribute._switch_map_and_write_increase_storage1`.
                             let mut inst = unsafe {
                                 mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(base + 1))
                             };
-                            unsafe {
+                            Some(unsafe {
                                 switch_map_and_write_increase_storage1(
                                     attr_to_add,
                                     &mut inst,
                                     pyre_object::gc_roots::shadow_stack_get(base + 3),
                                 )
-                            };
-                            true
+                            })
                         } else {
-                            false
+                            None
                         }
                     };
                     pycode = pyre_object::gc_roots::shadow_stack_get(base);
                     w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                     w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
-                    if switched {
-                        return memory_error_if_pending();
+                    if let Some(ok) = switched {
+                        return if ok {
+                            Ok(())
+                        } else {
+                            Err(crate::runtime_ops::fetch_memory_error())
+                        };
                     }
                 }
             }
@@ -3802,8 +3814,10 @@ pub trait MapdictObject {
     fn _mapdict_storage_length(&self) -> usize;
     /// mapdict.py `_mapdict_pop_attribute`.
     fn _mapdict_pop_attribute(&mut self, map: MapRef) -> bool;
-    /// mapdict.py `_set_mapdict_increase_storage1`.
-    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef);
+    /// `MapdictStorageMixin._set_mapdict_increase_storage1`. False only when
+    /// the grow allocation fails with a pending collector exception; true
+    /// after the map and storage are published.
+    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool;
     /// mapdict.py `_set_mapdict_storage_and_map` — install a complete
     /// replacement storage list and map (used by `delete`/`copy`).
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef);
@@ -3956,7 +3970,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
         true
     }
-    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
+    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool {
         // grow storage by one, append value (mapdict.py _set_mapdict_increase_storage1). The first
         // grow allocates the storage block (was `None`). The new attribute's
         // index comes from the map, not from the block's capacity: a delete
@@ -3990,7 +4004,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && grown.is_null() {
-                    return;
+                    return false;
                 }
                 let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
                 let block_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -4015,6 +4029,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 pyre_object::object_array::dealloc_instance_items_block(old);
             }
         }
+        true
     }
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
         // mapdict.py _set_mapdict_storage_and_map. The incoming `Vec` comes from a lightweight
@@ -4184,7 +4199,7 @@ impl MapdictObject for MapdictCarrier {
         true
     }
 
-    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
+    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool {
         let _roots = pyre_object::gc_roots::push_roots();
         let self_slot = pyre_object::gc_roots::pin_roots(&[self.obj, value]);
         let value_slot = self_slot + 1;
@@ -4212,7 +4227,7 @@ impl MapdictObject for MapdictCarrier {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && grown.is_null() {
-                    return;
+                    return false;
                 }
                 let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
                 pyre_object::gc_roots::shadow_stack_get(
@@ -4240,6 +4255,7 @@ impl MapdictObject for MapdictCarrier {
             }
             self.obj = owner;
         }
+        true
     }
 
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
@@ -4356,10 +4372,11 @@ impl MapdictObject for Object {
         self.map = map;
         true
     }
-    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
+    fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) -> bool {
         // grow storage by one, append value (mapdict.py _set_mapdict_increase_storage1)
         self.storage.push(value);
         self.map = map;
+        true
     }
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
         self.storage = storage;
@@ -4533,10 +4550,10 @@ pub unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
 /// `obj` must implement the mapdict storage protocol.
 unsafe fn convert_to_boxed<O: MapdictObject>(obj: &mut O) -> MapRef {
     let map = obj._get_mapdict_map();
-    let new_obj = unsafe { node_copy(map, obj) };
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return map;
-    }
+    let new_obj = match unsafe { node_copy(map, obj) } {
+        Ok(new_obj) => new_obj,
+        Err(()) => return map,
+    };
     let new_map = new_obj.map;
     obj._set_mapdict_storage_and_map(new_obj.storage, new_map);
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
@@ -4755,17 +4772,18 @@ pub unsafe fn node_read_checked<O: MapdictObject>(
 
 // ── copy / delete path (mapdict.py, 433-435, 461-475) ─────────
 
-/// mapdict.py `PlainAttribute._copy_attr` — read this attribute from
-/// `obj` and re-add it to the freshly built `new_obj`. The read is
-/// `_prim_direct_read` (mapdict.py/600-601, the non-converting raw read);
-/// pyre's `plain_direct_read` performs exactly that — boxing the longlong slot
-/// when the attribute is unboxed — and defers only the read-path lazy re-box
-/// (`_direct_read`'s allow-unboxing/convert distinction, see
-/// `plain_direct_read`), which is invisible to the copied value.
+/// `PlainAttribute._copy_attr` — read this attribute from `obj` and re-add
+/// it to the freshly built `new_obj`. The read is `_prim_direct_read` (the
+/// non-converting raw read); pyre's `plain_direct_read` performs exactly that
+/// — boxing the longlong slot when the attribute is unboxed — and defers only
+/// the read-path lazy re-box (`_direct_read`'s allow-unboxing/convert
+/// distinction, see `plain_direct_read`), which is invisible to the copied
+/// value. False when `AbstractAttribute.add_attr` does not publish the
+/// attribute (`PlainAttribute._copy_attr` lets that exception propagate).
 ///
 /// # Safety
 /// `attr_node` must point to a live `PlainAttribute`; `obj` to a live carrier.
-unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut Object) {
+unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut Object) -> bool {
     // The carrier's storage is a plain `Vec` no collector updates, and a value
     // the read had to box is named by nothing else until `add_attr` stores it
     // — old-gen birth buys it immobility rather than survival, so the
@@ -4782,40 +4800,44 @@ unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut 
     let p = unsafe { (*attr_node).as_plain() };
     let map = new_obj._get_mapdict_map();
     unsafe {
-        let _ = add_attr(
+        add_attr(
             map,
             new_obj,
             &p.name,
             p.attrkind,
             pyre_object::gc_roots::shadow_stack_get(value_slot),
-        );
-    };
-}
-
-/// mapdict.py `Terminator.copy` / 472-475 `PlainAttribute.copy` — build
-/// a fresh `Object` carrier holding the same attributes as `obj` (in canonical
-/// order: the back-chain is copied bottom-up, then the node re-adds itself).
-///
-/// # Safety
-/// `self_node` and its `back` chain must point to live map nodes.
-unsafe fn node_copy<O: MapdictObject>(self_node: MapRef, obj: &O) -> Object {
-    if unsafe { (*self_node).is_plain() } {
-        let back = unsafe { (*self_node).as_plain() }.back;
-        let mut new_obj = unsafe { node_copy(back, obj) };
-        unsafe { copy_attr(self_node, obj, &mut new_obj) };
-        new_obj
-    } else {
-        // Terminator.copy (mapdict.py): empty carrier on this terminator.
-        Object::new_empty(self_node)
+        )
     }
 }
 
-/// mapdict.py `Terminator.set_terminator`, 483-486
-/// `PlainAttribute.set_terminator`, 414-418 `DevolvedDictTerminator.set_terminator`
-/// — rebuild a fresh `Object` carrier holding `obj`'s attributes (canonical
-/// order, like `node_copy`) but rooted at `new_terminator`. A devolved root
-/// re-roots onto `new_terminator`'s paired devolved terminator so the instance
-/// stays devolved.
+/// `Terminator.copy` / `PlainAttribute.copy` — build a fresh `Object` carrier
+/// holding the same attributes as `obj` (in canonical order: the back-chain is
+/// copied bottom-up, then the node re-adds itself). `Err(())` when
+/// `PlainAttribute._copy_attr` / `AbstractAttribute.add_attr` fails; the
+/// recursive walk stops and the partial carrier is not returned.
+///
+/// # Safety
+/// `self_node` and its `back` chain must point to live map nodes.
+unsafe fn node_copy<O: MapdictObject>(self_node: MapRef, obj: &O) -> Result<Object, ()> {
+    if unsafe { (*self_node).is_plain() } {
+        let back = unsafe { (*self_node).as_plain() }.back;
+        let mut new_obj = unsafe { node_copy(back, obj)? };
+        if !unsafe { copy_attr(self_node, obj, &mut new_obj) } {
+            return Err(());
+        }
+        Ok(new_obj)
+    } else {
+        // Terminator.copy: empty carrier on this terminator.
+        Ok(Object::new_empty(self_node))
+    }
+}
+
+/// `Terminator.set_terminator`, `PlainAttribute.set_terminator`,
+/// `DevolvedDictTerminator.set_terminator` — rebuild a fresh `Object` carrier
+/// holding `obj`'s attributes (canonical order, like `node_copy`) but rooted
+/// at `new_terminator`. A devolved root re-roots onto `new_terminator`'s paired
+/// devolved terminator so the instance stays devolved. `Err(())` when
+/// `PlainAttribute._copy_attr` fails; the recursive walk stops.
 ///
 /// # Safety
 /// `self_node`/its `back` chain and `new_terminator` must point to live map nodes.
@@ -4823,18 +4845,20 @@ unsafe fn node_set_terminator<O: MapdictObject>(
     self_node: MapRef,
     obj: &O,
     new_terminator: MapRef,
-) -> Object {
+) -> Result<Object, ()> {
     if unsafe { (*self_node).is_plain() } {
-        // mapdict.py set_terminator — recurse into `back` with the new terminator, then
-        // re-add this attribute.
+        // `PlainAttribute.set_terminator` — recurse into `back` with the new
+        // terminator, then re-add this attribute.
         let back = unsafe { (*self_node).as_plain() }.back;
-        let mut new_obj = unsafe { node_set_terminator(back, obj, new_terminator) };
-        unsafe { copy_attr(self_node, obj, &mut new_obj) };
-        new_obj
+        let mut new_obj = unsafe { node_set_terminator(back, obj, new_terminator)? };
+        if !unsafe { copy_attr(self_node, obj, &mut new_obj) } {
+            return Err(());
+        }
+        Ok(new_obj)
     } else {
-        // mapdict.py set_terminator — empty carrier on `new_terminator`; the devolved
-        // override (mapdict.py set_terminator) re-targets a devolved root onto the new
-        // terminator's devolved pair.
+        // `Terminator.set_terminator` — empty carrier on `new_terminator`;
+        // `DevolvedDictTerminator.set_terminator` re-targets a devolved root
+        // onto the new terminator's devolved pair.
         let term = match unsafe { (*self_node).as_terminator() }.kind {
             TerminatorKind::Devolved => {
                 let target = unsafe { (*new_terminator).as_terminator() };
@@ -4845,14 +4869,15 @@ unsafe fn node_set_terminator<O: MapdictObject>(
             }
             _ => new_terminator,
         };
-        Object::new_empty(term)
+        Ok(Object::new_empty(term))
     }
 }
 
-/// mapdict.py `AbstractAttribute.delete` (Terminator/DictTerminator,
-/// returns `None`) and 461-470 `PlainAttribute.delete`. Returns the rebuilt
-/// carrier with `(name, attrkind)` removed, or `None` if the attribute is
-/// absent.
+/// `AbstractAttribute.delete` (`Terminator`/`DictTerminator` return `None`)
+/// and `PlainAttribute.delete`. `Ok(None)` if the attribute is absent;
+/// `Ok(Some(carrier))` is the rebuilt carrier with `(name, attrkind)`
+/// removed; `Err(())` when `PlainAttribute._copy_attr` or `PlainAttribute.copy`
+/// fails and the recursive walk stops.
 ///
 /// # Safety
 /// `self_node` and its `back` chain must point to live map nodes.
@@ -4861,33 +4886,36 @@ unsafe fn node_delete<O: MapdictObject>(
     obj: &O,
     name: &Wtf8,
     attrkind: u16,
-) -> Option<Object> {
+) -> Result<Option<Object>, ()> {
     if unsafe { (*self_node).is_plain() } {
         let p = unsafe { (*self_node).as_plain() };
         if attrkind == p.attrkind && &*p.name == name {
-            // mapdict.py:462-466 — attribute found; drop it by rebuilding from
-            // `back` (which excludes this node).
+            // `PlainAttribute.delete` — attribute found; drop it by rebuilding
+            // from `back` (which excludes this node).
             p.set_ever_mutated(true);
-            return Some(unsafe { node_copy(p.back, obj) });
+            return unsafe { node_copy(p.back, obj) }.map(Some);
         }
-        // mapdict.py:467-470 — recurse, then re-add this surviving attribute.
+        // `PlainAttribute.delete` — recurse, then re-add this surviving
+        // attribute.
         let back = p.back;
-        match unsafe { node_delete(back, obj, name, attrkind) } {
+        match unsafe { node_delete(back, obj, name, attrkind)? } {
             Some(mut new_obj) => {
-                unsafe { copy_attr(self_node, obj, &mut new_obj) };
-                Some(new_obj)
+                if !unsafe { copy_attr(self_node, obj, &mut new_obj) } {
+                    return Err(());
+                }
+                Ok(Some(new_obj))
             }
-            None => None,
+            None => Ok(None),
         }
     } else {
-        // mapdict.py Terminator.delete (DictTerminator/NoDictTerminator
-        // inherit) returns None.
+        // `Terminator.delete` (`DictTerminator`/`NoDictTerminator` inherit)
+        // returns None.
         let kind = unsafe { (*self_node).as_terminator() }.kind;
         match kind {
-            // mapdict.py DevolvedDictTerminator.delete: drop the DICT
-            // attribute from the materialised instance dict (a miss is tolerated
-            // — mapdict.py swallows KeyError), then return an empty
-            // carrier on this terminator (`Terminator.copy(self, obj)`).
+            // `DevolvedDictTerminator.delete`: drop the DICT attribute from
+            // the materialised instance dict (a miss is tolerated —
+            // `DevolvedDictTerminator.delete` swallows KeyError), then return
+            // an empty carrier on this terminator (`Terminator.copy`).
             TerminatorKind::Devolved if attrkind == DICT => {
                 // The backing dict moves and the key is allocated after it has
                 // been resolved, so it is published and read back at the delete.
@@ -4904,34 +4932,38 @@ unsafe fn node_delete<O: MapdictObject>(
                         w_key,
                     )
                 };
-                Some(unsafe { node_copy(self_node, obj) })
+                unsafe { node_copy(self_node, obj) }.map(Some)
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 }
 
-/// mapdict.py `Terminator.remove_dict_entries` (= `self.copy(obj)`) and
-/// :511-515 `PlainAttribute.remove_dict_entries` — rebuild a fresh carrier that
-/// keeps every non-`DICT` attribute and drops the `DICT` ones. Used by
-/// `MapDictStrategy.clear` (mapdict.py). Reuses the `node_copy` /
-/// `copy_attr` machinery already built for `delete`.
+/// `Terminator.remove_dict_entries` (`self.copy(obj)`) and
+/// `PlainAttribute.remove_dict_entries` — rebuild a fresh carrier that keeps
+/// every non-`DICT` attribute and drops the `DICT` ones. Used by
+/// `MapDictStrategy.clear`. Reuses the `node_copy` / `copy_attr` machinery
+/// already built for `delete`. `Err(())` when `_copy_attr` fails; the
+/// recursive walk stops.
 ///
 /// # Safety
 /// `self_node` and its `back` chain must point to live map nodes.
-unsafe fn node_remove_dict_entries<O: MapdictObject>(self_node: MapRef, obj: &O) -> Object {
+unsafe fn node_remove_dict_entries<O: MapdictObject>(
+    self_node: MapRef,
+    obj: &O,
+) -> Result<Object, ()> {
     if unsafe { (*self_node).is_plain() } {
         let p = unsafe { (*self_node).as_plain() };
         let back = p.back;
-        // mapdict.py:512 — recurse into `back` first.
-        let mut new_obj = unsafe { node_remove_dict_entries(back, obj) };
-        // mapdict.py — re-add this attribute unless it is a DICT entry.
-        if p.attrkind != DICT {
-            unsafe { copy_attr(self_node, obj, &mut new_obj) };
+        // `PlainAttribute.remove_dict_entries` — recurse into `back` first.
+        let mut new_obj = unsafe { node_remove_dict_entries(back, obj)? };
+        // Re-add this attribute unless it is a DICT entry.
+        if p.attrkind != DICT && !unsafe { copy_attr(self_node, obj, &mut new_obj) } {
+            return Err(());
         }
-        new_obj
+        Ok(new_obj)
     } else {
-        // mapdict.py Terminator.remove_dict_entries = self.copy(obj).
+        // `Terminator.remove_dict_entries` = `self.copy(obj)`.
         unsafe { node_copy(self_node, obj) }
     }
 }
@@ -4958,7 +4990,7 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
     self_node: MapRef,
     obj: &O,
     w_dict: PyObjectRef,
-) -> Object {
+) -> Result<Object, ()> {
     if unsafe { (*self_node).is_plain() } {
         let p = unsafe { (*self_node).as_plain() };
         // The dict moves and both steps before this node's store allocate: the
@@ -4967,19 +4999,20 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
         // the dict and the value and read both back at the store.
         let _roots = pyre_object::gc_roots::push_roots();
         let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
-        // mapdict.py:494/503 — recurse into `back` first.
+        // `PlainAttribute.materialize_r_dict` / `materialize_str_dict` —
+        // recurse into `back` first.
         let mut new_obj = unsafe {
             node_materialize_dict(
                 p.back,
                 obj,
                 pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            )
+            )?
         };
         if p.attrkind == DICT {
-            // mapdict.py/504-506 — move the DICT attribute into the
-            // materialised dict (`dict_w[space.newtext(name)] =
-            // self._prim_direct_read(obj)`). `plain_direct_read` performs that
-            // prim read, boxing the slot when the attribute is unboxed.
+            // Move the DICT attribute into the materialised dict
+            // (`dict_w[space.newtext(name)] = self._prim_direct_read(obj)`).
+            // `plain_direct_read` performs that prim read, boxing the slot
+            // when the attribute is unboxed.
             //
             // The carrier the recursion returned holds every lower node's value
             // in a plain `Vec` the collector does not update, and nothing
@@ -4998,25 +5031,30 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
             for (i, slot) in new_obj.storage.iter_mut().enumerate() {
                 *slot = pyre_object::gc_roots::shadow_stack_get(storage_slot + i);
             }
-        } else {
-            // mapdict.py/508 — keep the non-DICT attribute on the carrier.
-            unsafe { copy_attr(self_node, obj, &mut new_obj) };
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(());
+            }
+        } else if !unsafe { copy_attr(self_node, obj, &mut new_obj) } {
+            // `PlainAttribute.materialize_r_dict` re-adds a non-DICT attribute
+            // through `_copy_attr`; stop the walk when that fails.
+            return Err(());
         }
-        new_obj
+        Ok(new_obj)
     } else {
-        // mapdict.py DictTerminator.materialize_* → `_make_devolved`: an
-        // empty carrier on the paired DevolvedDictTerminator.
+        // `DictTerminator.materialize_*` → `_make_devolved`: an empty carrier
+        // on the paired DevolvedDictTerminator.
         let t = unsafe { (*self_node).as_terminator() };
         match t.kind {
             TerminatorKind::Dict => {
                 let devolved = t.devolved_dict_terminator.get();
-                Object::new_empty(devolved)
+                Ok(Object::new_empty(devolved))
             }
-            // mapdict.py materialize_r_dict — the abstract base raises; materialise only
-            // ever runs on a not-yet-devolved DictTerminator-rooted instance
-            // dict (NoDict has no __dict__; Devolved is already materialised).
+            // `AbstractAttribute.materialize_r_dict` — the abstract base
+            // raises; materialise only ever runs on a not-yet-devolved
+            // DictTerminator-rooted instance dict (NoDict has no __dict__;
+            // Devolved is already materialised).
             _ => unimplemented!(
-                "materialize on non-DictTerminator (mapdict.py:259-263 abstract base)"
+                "materialize on non-DictTerminator (AbstractAttribute.materialize_r_dict)"
             ),
         }
     }
@@ -5047,9 +5085,9 @@ unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
         )
     };
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+    let Ok(new_obj) = new_obj else {
         return;
-    }
+    };
     let mut inst = unsafe { mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot)) };
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 }
@@ -5404,7 +5442,8 @@ unsafe fn pick_unbox_type(self_node: MapRef, w_value: PyObjectRef) -> Option<Unb
 }
 
 /// mapdict.py `PlainAttribute._switch_map_and_write_increase_storage1`
-/// and the `UnboxedPlainAttribute` override (mapdict.py).
+/// and the `UnboxedPlainAttribute` override (mapdict.py). False when a grow
+/// or unboxed-bank allocation fails with a pending collector exception.
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -5412,19 +5451,19 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
     attr: MapRef,
     obj: &mut O,
     w_value: PyObjectRef,
-) {
+) -> bool {
     let p = unsafe { (*attr).as_plain() };
     match &p.unboxed {
         None => {
             // mapdict.py _switch_map_and_write_increase_storage1
             if unsafe { (*attr).storage_needed() } > obj._mapdict_storage_length() {
                 // erase_item is identity
-                obj._set_mapdict_increase_storage1(attr, w_value);
-                return;
+                return obj._set_mapdict_increase_storage1(attr, w_value);
             }
             // change the map first, then the storage
             obj._set_mapdict_map(attr);
             unsafe { plain_direct_write(attr, obj, w_value) };
+            true
         }
         Some(u) => {
             // mapdict.py _switch_map_and_write_increase_storage1
@@ -5433,7 +5472,7 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 // a fresh longlong list of one element occupies a new slot
                 let unboxed = erase_unboxed(&[val]);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
-                    return;
+                    return false;
                 }
                 // `erase_unboxed` hands back a block nothing references yet, so
                 // it needs a root until whichever store below lands claims it.
@@ -5443,11 +5482,11 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 let _unboxed_root = pyre_object::gc_roots::push_roots();
                 let unboxed = pyre_object::gc_roots::pin_root(unboxed);
                 if unsafe { (*attr).storage_needed() } > obj._mapdict_storage_length() {
-                    obj._set_mapdict_increase_storage1(attr, unboxed);
-                    return;
+                    return obj._set_mapdict_increase_storage1(attr, unboxed);
                 }
                 obj._set_mapdict_map(attr);
                 obj._mapdict_write_storage(p.storageindex, unboxed);
+                true
             } else {
                 // `UnboxedPlainAttribute._switch_map_and_write_increase_storage1`:
                 // `_set_mapdict_map` before the bank-length check and
@@ -5459,9 +5498,10 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 new_list.push(val);
                 let unboxed = erase_unboxed(&new_list);
                 if pyre_object::gc_hook::gc_alloc_failed_pending() && unboxed.is_null() {
-                    return;
+                    return false;
                 }
                 obj._mapdict_write_storage(p.storageindex, unboxed);
+                true
             }
         }
     }
@@ -5522,14 +5562,13 @@ unsafe fn reorder_and_add<O: MapdictObject>(
                 }
             }
         }
-        unsafe {
+        if !unsafe {
             switch_map_and_write_increase_storage1(
                 attr,
                 obj,
                 pyre_object::gc_roots::shadow_stack_get(value_slot),
             )
-        };
-        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        } {
             return false;
         }
 
@@ -5577,8 +5616,7 @@ pub unsafe fn add_attr<O: MapdictObject>(
         unsafe { find_branch_to_move_into(self_node, name, attrkind, unbox_type) };
     let attr = unsafe { holder_pick_attr(holder, unbox_type) };
     if number_to_readd == 0 {
-        unsafe { switch_map_and_write_increase_storage1(attr, obj, w_value) };
-        !pyre_object::gc_hook::gc_alloc_failed_pending()
+        unsafe { switch_map_and_write_increase_storage1(attr, obj, w_value) }
     } else {
         // the complicated reorder case
         unsafe { reorder_and_add(self_node, obj, number_to_readd, attr, w_value) }
@@ -5649,6 +5687,9 @@ unsafe fn write_terminator<O: MapdictObject>(
             "LIMIT-devolve expects a MapDictStrategy __dict__ view",
         );
         unsafe { mapdict_switch_to_text_strategy(w_dict) };
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return false;
+        }
     }
     true
 }
@@ -5720,10 +5761,9 @@ pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
-    let new_obj = node_remove_dict_entries(map, &inst);
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+    let Ok(new_obj) = node_remove_dict_entries(map, &inst) else {
         return;
-    }
+    };
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 }
 
@@ -6311,8 +6351,9 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     /// mapdict.py `switch_to_object_strategy` — Slice E (#196). The
     /// default would mis-read the instance `dstorage` as an ObjectDictStrategy
     /// `IndexMap`, so override to the materialise stub.
-    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
+    unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) -> bool {
         mapdict_switch_to_object_strategy(w_dict);
+        !pyre_object::gc_hook::gc_alloc_failed_pending()
     }
 
     /// The dict is a view over the backing instance (`dstorage =
@@ -6579,6 +6620,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
     };
     if is_map_view {
         unsafe { mapdict_switch_to_object_strategy(old_backing) };
+        memory_error_if_pending()?;
     }
     let flag = unsafe {
         instance_set_dict_slot(
@@ -6962,7 +7004,7 @@ mod tests {
             };
             // re-root onto an unrelated terminator t2
             let t2 = boxed_dict_terminator();
-            let new_obj = node_set_terminator(b, &obj, t2);
+            let new_obj = node_set_terminator(b, &obj, t2).expect("PlainAttribute.set_terminator");
             // new chain is rooted at t2 with the same attrs/order/values
             assert_eq!((*new_obj.map).terminator(), t2);
             assert_eq!(
@@ -6990,7 +7032,8 @@ mod tests {
             // re-rooting onto t2 lands on t2's devolved pair, not t2 itself.
             let t2 = new_dict_terminator(std::ptr::null_mut());
             let dev2 = (*t2).as_terminator().devolved_dict_terminator.get();
-            let new_obj = node_set_terminator(dev1, &obj, t2);
+            let new_obj =
+                node_set_terminator(dev1, &obj, t2).expect("DevolvedDictTerminator.set_terminator");
             assert_eq!(new_obj.map, dev2);
         }
     }
@@ -7176,7 +7219,9 @@ mod tests {
             // delete the middle attribute and transplant the rebuilt carrier
             // (mapdict.py deldictvalue).
             let m = obj._get_mapdict_map();
-            let new_obj = node_delete(m, &obj, wn("b"), DICT).expect("b present");
+            let new_obj = node_delete(m, &obj, wn("b"), DICT)
+                .expect("PlainAttribute.delete")
+                .expect("b present");
             obj._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 
             assert_eq!(obj._mapdict_storage_length(), 2);
@@ -7187,7 +7232,11 @@ mod tests {
 
             // deleting an absent attribute returns None
             let m = obj._get_mapdict_map();
-            assert!(node_delete(m, &obj, wn("zzz"), DICT).is_none());
+            assert!(
+                node_delete(m, &obj, wn("zzz"), DICT)
+                    .expect("PlainAttribute.delete")
+                    .is_none()
+            );
         }
     }
 

@@ -274,15 +274,30 @@ pub(crate) fn jit_clear_published_exception() {
     }
 }
 
-/// The C-level `rpyexc_fetch_value` + `rpyexc_clear` pair
-/// (`exceptiontransform.py`) moving the MemoryError the GC stored into
-/// the interpreter's error value.
+/// `ExceptionTransformer.rpyexc_fetch_exception`: save `exc_value`,
+/// `rpyexc_clear`, return that value.  The value half is
+/// `BH_LAST_EXC_VALUE` (`object_residual_raise`); the backend type/value
+/// pair is then cleared.  A nonzero saved word is returned even when it
+/// is not `MemoryError`.
+///
+/// A zero saved word is the no-value `MemoryError` path
+/// (`PyFrame.handle_asynchronous_error`): wrap the allocation-free
+/// `memory_error_singleton` rather than a fresh text carrier.
 #[inline]
-pub(crate) fn fetch_memory_error() -> crate::PyError {
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        jit_clear_published_exception();
+pub fn fetch_memory_error() -> crate::PyError {
+    let value = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    jit_clear_published_exception();
+    if value != 0 {
+        unsafe { crate::PyError::from_exc_object(value as PyObjectRef) }
+    } else {
+        unsafe {
+            crate::PyError::from_exc_object(pyre_object::interp_exceptions::memory_error_singleton())
+        }
     }
-    crate::PyError::memory_error("")
 }
 
 /// llmodel.py _store_exception: publish `exc_obj` into the
@@ -2012,10 +2027,14 @@ pub fn unpack_ex_slots(
         if is_tuple(value()) {
             pyre_object::w_tuple_items_copy_as_vec(value())
         } else if is_list(value()) {
-            pyre_object::w_list_items_copy_as_vec_mode(
+            let items = pyre_object::w_list_items_copy_as_vec_mode(
                 value(),
                 majit_metainterp::jit::we_are_jitted(),
-            )
+            );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(fetch_memory_error());
+            }
+            items
         } else {
             // pyopcode.py UNPACK_EX wraps `fixedview` in a
             // TypeError → "cannot unpack non-iterable %T object" remap.

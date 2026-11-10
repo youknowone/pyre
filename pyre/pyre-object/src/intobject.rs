@@ -181,6 +181,11 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     }
     if crate::gc_interp::enabled() {
         let boxed = w_int_gc_alloc(value);
+        // `GCBase.malloc` / `ExceptionTransformer.gen_exc_check`: a failed
+        // collector allocation raises; a second allocator is not a fallback.
+        if crate::gc_hook::gc_alloc_failed_pending() && boxed.is_null() {
+            return crate::PY_NULL;
+        }
         if !boxed.is_null() {
             return boxed;
         }
@@ -197,8 +202,10 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// The collector-heap arm of [`w_int_new`]: the `gct_fv_gc_malloc` bracket
 /// (`rpython/memory/gctransform/framework.py`) in its alloc-then-init form —
 /// take the block, then write the header and payload into it, rather than
-/// copying a stack-built struct over it. Returns null when no collector owns
-/// the heap, which is the caller's signal to take the `malloc_typed` arm.
+/// copying a stack-built struct over it. Returns null when the nursery
+/// allocator has no route or refused. [`w_int_new`] takes `malloc_typed`
+/// only for the no-route case; a pending collector failure stays null
+/// (`GCBase.malloc`, `ExceptionTransformer.gen_exc_check`).
 ///
 /// Residualised (`rlib/jit.py @dont_look_inside`) rather than traced,
 /// which [`w_int_new`] is not — a deviation this arm alone carries, because

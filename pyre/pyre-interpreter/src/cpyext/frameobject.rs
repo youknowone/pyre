@@ -340,12 +340,20 @@ pub unsafe extern "C" fn PyTraceBack_Here(frame: *mut CPyFrameObject) -> c_int {
     let Some(w_exception) = super::pyerrors::pending_exception() else {
         return -1;
     };
-    unsafe {
+    let recorded = unsafe {
         crate::pytraceback::record_application_traceback(
             w_exception,
             w_frame as *mut crate::pyframe::PyFrame,
             0,
         )
     };
+    if !recorded {
+        // `record_application_traceback`: `PyTraceback.__init__` raises
+        // before `operror.set_traceback`. Install that allocation
+        // exception on the C pending-error owner (`State.set_exception`)
+        // and answer `-1`, matching `frameobject.py PyTraceBack_Here`.
+        super::pyerrors::set_pending_error(crate::pytraceback::fetch_traceback_alloc_error());
+        return -1;
+    }
     0
 }

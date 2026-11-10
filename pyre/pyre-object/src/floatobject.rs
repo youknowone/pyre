@@ -91,6 +91,11 @@ impl crate::lltype::GcType for W_FloatObjectUser {
 pub fn w_float_new(value: f64) -> PyObjectRef {
     if crate::gc_interp::enabled() {
         let boxed = w_float_gc_alloc(value);
+        // `GCBase.malloc` / `ExceptionTransformer.gen_exc_check`: a failed
+        // collector allocation raises; a second allocator is not a fallback.
+        if crate::gc_hook::gc_alloc_failed_pending() && boxed.is_null() {
+            return crate::PY_NULL;
+        }
         if !boxed.is_null() {
             return boxed;
         }

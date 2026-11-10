@@ -6015,7 +6015,11 @@ pub fn init_gc_subsystem() {
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
     pyre_interpreter::baseobjspace::publish_method_cache_container();
-    pyre_object::unicodeobject::init_interned_strings();
+    // `ObjSpace.__init__` builds `interned_strings` (`ll_new_weakdict`)
+    // before the space is usable; bootstrap has no Python error channel.
+    if !pyre_object::unicodeobject::init_interned_strings() {
+        pyre_object::unicodeobject::init_interned_strings_or_alloc_failed();
+    }
     // The root walkers belong to the same bootstrap as the collector they feed:
     // interpreter startup fills interned strings and the immortal stores
     // (`walk_interpreter_global_roots`, `walk_immortal_store_roots`) before
@@ -13415,6 +13419,7 @@ fn compile_and_run_once(
     driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
     let mut snapshot_error = None;
+    let mut snapshot_saved_last_instr = None;
     let mut published_abort_image = false;
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
@@ -13475,6 +13480,13 @@ fn compile_and_run_once(
                 // (`own_frame_array_store_target`); only `last_instr` /
                 // `valuestackdepth` need a start-of-trace copy for a declined
                 // abort that replays from the merge point.
+                //
+                // `handle_operation_error` looks up the exception table at
+                // `last_instr`. Save it before `snapshot_for_tracing` so a
+                // failed allocation can restore the hot-backedge instruction
+                // and `bound_reached` can return into that dispatch.
+                let saved_last_instr = frame_root.frame().last_instr;
+                let saved_valuestackdepth = frame_root.frame().valuestackdepth;
                 let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
                 let traced_on_live = pinned.is_some();
                 let concrete_frame = match pinned {
@@ -13482,13 +13494,12 @@ fn compile_and_run_once(
                     None => match frame_root.frame().snapshot_for_tracing() {
                         Ok(frame) => frame,
                         Err(err) => {
+                            snapshot_saved_last_instr = Some(saved_last_instr);
                             snapshot_error = Some(err);
                             return majit_metainterp::TraceAction::Abort;
                         }
                     },
                 };
-                let saved_last_instr = frame_root.frame().last_instr;
-                let saved_valuestackdepth = frame_root.frame().valuestackdepth;
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
                 let (action, executed_frame, walk_end_flushed) = trace_bytecode(
                     meta,
@@ -13595,7 +13606,13 @@ fn compile_and_run_once(
     // this leg; `finish_cancel_tracing` drops it with the scope.
     driver.meta_interp_mut().finish_cancel_tracing();
     if let Some(err) = snapshot_error {
-        return Some(LoopResult::Done(Err(err)));
+        // Snapshot allocation failure is a MemoryError this frame can
+        // catch. `ExitFrameWithException` offers it to
+        // `handle_operation_error` and the same-frame exception table.
+        if let Some(last_instr) = snapshot_saved_last_instr {
+            frame_root.frame().last_instr = last_instr;
+        }
+        return Some(LoopResult::ExitFrameWithException(err));
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();

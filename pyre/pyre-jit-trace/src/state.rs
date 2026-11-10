@@ -8440,15 +8440,18 @@ impl PyreJitState {
         self.set_pycode(value);
     }
 
-    pub fn set_namespace(&mut self, value: usize) {
+    /// `PyFrame.set_w_globals` / `PyFrame.getorcreatedebug`: a debugdata
+    /// allocation failure is returned. `ExecutionContext.settrace` reaches
+    /// the same debug block through frame force.
+    pub fn set_namespace(&mut self, value: usize) -> Result<(), pyre_interpreter::PyError> {
         let frame_ptr = self
             .frame_ptr()
             .expect("PyreJitState.frame must point to a valid PyFrame");
         unsafe {
             (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
-                .set_w_globals(value as pyre_object::PyObjectRef)
-                .expect("frame debugdata allocation");
+                .set_w_globals(value as pyre_object::PyObjectRef)?;
         }
+        Ok(())
     }
 
     /// pyframe.py:82 debugdata — read from heap frame.

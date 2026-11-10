@@ -2569,7 +2569,7 @@ pub fn subclasses_locks_after_fork_child() {
 ///
 /// Records `w_subclass` in `w_parent.weak_subclasses` if not
 /// already present.  Stores `weakref.ref(w_subclass)` via
-/// `w_weakref_new` so subclass GC isn't blocked (`:642-650`); each
+/// `w_weakref_new` so subclass GC isn't blocked (`W_TypeObject.add_subclass`); each
 /// entry is a `try_gc_alloc` WEAKREF GcStruct, so the off-GC
 /// `weak_subclasses` list is the WEAKREF's only strong root and must
 /// be walked by the collector (`W_TYPE_GC_TYPE_ID` custom trace,
@@ -2578,15 +2578,18 @@ pub fn subclasses_locks_after_fork_child() {
 /// # Safety
 /// `w_parent` must point at a valid `W_TypeObject`.  `w_subclass`
 /// likewise; the function does not type-check the argument since
-/// `ready()` already filters non-type bases (`:374-376`).
-pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef) {
+/// `W_TypeObject.ready` already filters non-type bases.
+///
+/// Returns `false` only when the WEAKREF / weak-list allocation failed
+/// (`W_TypeObject.add_subclass`); otherwise registration finished.
+pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef) -> bool {
     if w_parent.is_null() || w_subclass.is_null() {
-        return;
+        return true;
     }
     if !is_type(w_parent) || !is_type(w_subclass) {
-        return;
+        return true;
     }
-    // typeobject.py `add_subclass`: `newref = weakref.ref(w_subclass)` allocates.
+    // `W_TypeObject.add_subclass`: `newref = weakref.ref(w_subclass)` allocates.
     // gct_fv_gc_malloc reloads `self` / `w_subclass`; pin them for the
     // native path before the lock so the parent word is live for it.
     let _roots = crate::gc_roots::push_roots();
@@ -2605,13 +2608,13 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
             parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
         }
     }
-    // typeobject.py:651-660 — `newref = weakref.ref(w_subclass);
+    // `W_TypeObject.add_subclass`: `newref = weakref.ref(w_subclass);
     // for i in range(...): if ref() is w_subclass: return; if ref()
     // is None: self.weak_subclasses[i] = newref; return;
     // else: self.weak_subclasses.append(newref)`.
     let newref = crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(subclass_slot));
     if crate::gc_hook::gc_alloc_failed_pending() && newref.is_null() {
-        return;
+        return false;
     }
     let w_subclass = crate::gc_roots::shadow_stack_get(subclass_slot);
     let w_parent = crate::gc_roots::shadow_stack_get(parent_slot);
@@ -2620,16 +2623,17 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     for slot in subs.iter_mut() {
         let existing = crate::weakref::w_weakref_deref(*slot);
         if existing == w_subclass {
-            return;
+            return true;
         }
         if existing.is_null() {
             *slot = newref;
             note_weak_subclass_store(w_parent);
-            return;
+            return true;
         }
     }
     subs.push(newref);
     note_weak_subclass_store(w_parent);
+    true
 }
 
 /// Record the store of a freshly allocated weakref into `weak_subclasses`.
@@ -2731,18 +2735,21 @@ pub unsafe fn w_type_get_subclasses(
     alive
 }
 
-/// `typeobject.py W_TypeObject.ready` — register `w_self`
+/// `W_TypeObject.ready` — register `w_self`
 /// as a direct subclass on each W_TypeObject base.  Called once
 /// per heap type after `bases` is set, so the subclass tree
 /// reflects the class declaration before any attribute lookup.
 ///
+/// Returns `false` at the first failed `W_TypeObject.add_subclass`
+/// (WEAKREF allocation) and leaves later bases unregistered.
+///
 /// # Safety
 /// `w_self.bases` must be a valid tuple (or `PY_NULL`).
-pub unsafe fn w_type_ready(w_self: PyObjectRef) {
+pub unsafe fn w_type_ready(w_self: PyObjectRef) -> bool {
     if w_self.is_null() || !is_type(w_self) {
-        return;
+        return true;
     }
-    // `typeobject.py ready`: `for w_base in self.bases_w: w_base.add_subclass(self)`.
+    // `W_TypeObject.ready`: `for w_base in self.bases_w: w_base.add_subclass(self)`.
     // `add_subclass` allocates a weakref; pin `self` and reread `bases_w`
     // from it each time, as `gct_fv_gc_malloc` reloads those livevars.
     let _roots = crate::gc_roots::push_roots();
@@ -2750,7 +2757,7 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
     let _ = crate::gc_roots::pin_root(w_self);
     let bases = (*(crate::gc_roots::shadow_stack_get(self_slot) as *const W_TypeObject)).bases;
     if bases.is_null() {
-        return;
+        return true;
     }
     let n = crate::w_tuple_len(bases);
     for i in 0..n as i64 {
@@ -2762,8 +2769,11 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
         if w_base.is_null() || !is_type(w_base) {
             continue;
         }
-        w_type_add_subclass(w_base, crate::gc_roots::shadow_stack_get(self_slot));
+        if !w_type_add_subclass(w_base, crate::gc_roots::shadow_stack_get(self_slot)) {
+            return false;
+        }
     }
+    true
 }
 
 #[cfg(test)]

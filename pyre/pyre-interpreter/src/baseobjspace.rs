@@ -170,14 +170,16 @@ fn take_pending_hash_error_raw() -> *mut crate::error::PyErrorObject {
         .as_raw()
 }
 
-/// Convert the two failure modes of a checked set-table operation back into
-/// the Python exception carried by PyPy's `r_dict` operation.
+/// Convert the failure modes of a checked set-table operation back into
+/// the Python exception carried by PyPy's `r_dict` operation
+/// (`W_BaseSetObject.add`, `AbstractUnwrappedSetStrategy.update`).
 pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyError {
     match err {
         pyre_object::setobject::SetUpdateError::Key(_) => take_pending_hash_error(),
         pyre_object::setobject::SetUpdateError::ChangedSize => {
             PyError::runtime_error("Set changed size during iteration")
         }
+        pyre_object::setobject::SetUpdateError::Memory => crate::runtime_ops::fetch_memory_error(),
     }
 }
 
@@ -229,8 +231,15 @@ pub fn clear_method_cache() {
 /// Only an exact `TypeError` raised while hashing is replaced; equality
 /// callback errors, non-TypeError exceptions, and TypeError subclasses pass
 /// through unchanged.
+///
+/// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
+/// is fetched first: `w_dict_store_checked` reports that as the same
+/// `DictKeyError` sentinel as a hash failure.
 #[majit_macros::dont_look_inside]
 pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return crate::runtime_ops::fetch_memory_error();
+    }
     take_pending_hash_error_for(key, wrap_dict_key_hash_error)
 }
 
@@ -303,7 +312,13 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 
 /// Recover a pending key-hash error naming `container` as `dict` or
 /// `frozendict` (`dict_unhashable_type`).
+///
+/// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
+/// is fetched first, matching [`take_pending_dict_key_error`].
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
+    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+        return crate::runtime_ops::fetch_memory_error();
+    }
     if container_is_frozendict(container) {
         take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
     } else {
@@ -2859,10 +2874,13 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         pyre_object::w_list_getitem_inner(obj, idx)
     };
     match item {
+        Some(val) if pyre_object::gc_hook::gc_alloc_failed_pending() && val.is_null() => {
+            Err(crate::runtime_ops::fetch_memory_error())
+        }
         Some(val) => crate::runtime_ops::obj_or_memory_error(val),
         None => {
             if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                Err(crate::PyError::memory_error(""))
+                Err(crate::runtime_ops::fetch_memory_error())
             } else {
                 Err(crate::error::oefmt_noargs(
                     PyErrorKind::IndexError,
@@ -5700,7 +5718,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
             majit_metainterp::jit::we_are_jitted(),
         );
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new(items))?
     } else if pyre_object::is_list(value) {
@@ -14290,7 +14308,9 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
                     && pyre_object::is_type(w_ancestor)
                 {
                     let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
-                    pyre_object::typeobject::w_type_add_subclass(w_ancestor, w_self);
+                    if !pyre_object::typeobject::w_type_add_subclass(w_ancestor, w_self) {
+                        return Err(crate::runtime_ops::fetch_memory_error());
+                    }
                 }
             }
             return Ok(pyre_object::w_none());
@@ -19125,11 +19145,16 @@ fn fixedview_impl<const UNROLL: bool>(
             }
             // `getitems_unroll` and `getitems_fixedsize` both snapshot storage.
             // `AbstractUnwrappedStrategy.getitems_copy` skips wrapper reuse
-            // while `jit.we_are_jitted()`.
-            return Ok(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+            // while `jit.we_are_jitted()`. Wrap failure stays pending and the
+            // snapshot is empty; fetch before treating that as a real empty list.
+            let items = pyre_object::listobject::w_list_items_copy_as_vec_mode(
                 current(),
                 majit_metainterp::jit::we_are_jitted(),
-            ));
+            );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            return Ok(items);
         }
     }
     let w_obj = current();
@@ -19144,34 +19169,44 @@ fn fixedview_impl<const UNROLL: bool>(
 /// Cheap storage snapshot: exact list `getitems()`, a tuple still using the
 /// builtin iterator `getitems_copy()`, a list subclass still using the
 /// builtin iterator `getitems()`. Anything else, including a generator, is
-/// `None` so the caller can skip `unpackiterable`.
-pub fn listview_no_unpack(w_obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+/// `Ok(None)` so the caller can skip `unpackiterable`.
+/// `AbstractUnwrappedStrategy.getitems_copy` wrap failure is `Err`
+/// (`ObjSpace.listview` / `StdObjSpace.listview_no_unpack`).
+pub fn listview_no_unpack(w_obj: PyObjectRef) -> Result<Option<Vec<PyObjectRef>>, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let current = || pyre_object::gc_roots::shadow_stack_get(slot);
     unsafe {
         if is_exact_type(current(), &pyre_object::LIST_TYPE) {
-            return Some(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+            let items = pyre_object::listobject::w_list_items_copy_as_vec_mode(
                 current(),
                 majit_metainterp::jit::we_are_jitted(),
-            ));
+            );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            return Ok(Some(items));
         } else if is_tuple(current())
             && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
         {
-            return Some(pyre_object::tupleobject::w_tuple_items_copy_as_vec(
+            return Ok(Some(pyre_object::tupleobject::w_tuple_items_copy_as_vec(
                 current(),
-            ));
+            )));
         } else if is_list(current())
             && builtin_iter_replacement(current(), &pyre_object::LIST_TYPE).is_none()
         {
-            return Some(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+            let items = pyre_object::listobject::w_list_items_copy_as_vec_mode(
                 current(),
                 majit_metainterp::jit::we_are_jitted(),
-            ));
+            );
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            return Ok(Some(items));
         }
     }
-    None
+    Ok(None)
 }
 
 /// `pypy/objspace/std/objspace.py` `StdObjSpace.listview`.
@@ -19184,7 +19219,7 @@ pub fn listview(
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
-    match listview_no_unpack(pyre_object::gc_roots::shadow_stack_get(slot)) {
+    match listview_no_unpack(pyre_object::gc_roots::shadow_stack_get(slot))? {
         Some(t) => {
             if expected_length != -1 && t.len() as isize != expected_length {
                 Err(fixedview_length_error(expected_length, t.len() as isize))
@@ -20316,6 +20351,9 @@ unsafe fn list_iter_getitem_locked(seq: PyObjectRef, index: isize) -> Option<PyO
     if lock != 0 {
         pyre_object::w_list_lock_release(lock);
     }
+    // `AbstractUnwrappedStrategy.getitem`: wrap failure is pending on `None`
+    // or `Some(null)`; `list_iter_descr_next_locked` fetches before treating
+    // a miss as iterator exhaustion.
     item
 }
 
@@ -22863,7 +22901,7 @@ unsafe fn shortcut_next(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, PyErr
         let item = list_iter_descr_next(w_obj);
         if item.is_null() {
             if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                return Err(crate::PyError::memory_error(""));
+                return Err(crate::runtime_ops::fetch_memory_error());
             }
             return Err(PyError::stop_iteration());
         }
@@ -24267,7 +24305,11 @@ pub(crate) fn list_iter_next_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let item = list_iter_descr_next(self_);
         if item.is_null() {
-            Err(PyError::stop_iteration())
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                Err(crate::runtime_ops::fetch_memory_error())
+            } else {
+                Err(PyError::stop_iteration())
+            }
         } else {
             Ok(item)
         }
@@ -27180,20 +27222,28 @@ mod tests {
     fn listview_no_unpack_exact_storage_and_fallbacks() {
         crate::typedef::init_typeobjects();
         let tup = w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
-        let from_tup = listview_no_unpack(tup).expect("tuple listview_no_unpack");
+        let from_tup = listview_no_unpack(tup)
+            .expect("tuple listview_no_unpack")
+            .expect("tuple items");
         assert_eq!(from_tup.len(), 2);
         unsafe {
             assert_eq!(w_int_get_value(from_tup[0]), 1);
             assert_eq!(w_int_get_value(from_tup[1]), 2);
         }
         let lst = w_list_new(vec![w_int_new(7), w_int_new(8)]);
-        let from_list = listview_no_unpack(lst).expect("list listview_no_unpack");
+        let from_list = listview_no_unpack(lst)
+            .expect("list listview_no_unpack")
+            .expect("list items");
         assert_eq!(from_list.len(), 2);
         unsafe {
             assert_eq!(w_int_get_value(from_list[0]), 7);
             assert_eq!(w_int_get_value(from_list[1]), 8);
         }
-        assert!(listview_no_unpack(w_int_new(3)).is_none());
+        assert!(
+            listview_no_unpack(w_int_new(3))
+                .expect("non-sequence listview_no_unpack")
+                .is_none()
+        );
         let s = pyre_object::unicodeobject::w_str_new_managed("ab");
         let items = listview(s, -1).expect("str listview via unpackiterable");
         assert_eq!(items.len(), 2);

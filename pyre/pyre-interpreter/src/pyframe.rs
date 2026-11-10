@@ -2184,6 +2184,16 @@ impl FrameBox {
                 pycode,
             )
         };
+        // `GeneratorIterator.__init__` / `PyFrame.run`: construction is
+        // atomic. A failed collector allocation must not pin or write the
+        // null result; reclaim the not-yet-transferred frame first.
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && generator.is_null() {
+            let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
+            drop(_root);
+            drop(_frame_roots);
+            drop(unsafe { FrameBox::from_raw(frame_ptr) });
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         let _generator_roots = pyre_object::gc_roots::push_roots();
         let generator_slot = pyre_object::gc_roots::shadow_stack_len();
         let generator = pyre_object::gc_roots::pin_root(generator);
@@ -5705,13 +5715,17 @@ impl PyFrame {
                         &mut *frame_anchor.live(),
                     )
                 };
-                self.clear_references();
+                if !self.clear_references() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
             // generator finalizer and proceeds to clear the escaped frame.
             // It is not an executing non-generator frame.
-            self.clear_references();
+            if !self.clear_references() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             return Ok(());
         }
         if !self.frame_finished_execution() {
@@ -5720,7 +5734,9 @@ impl PyFrame {
             ));
         }
 
-        self.clear_references();
+        if !self.clear_references() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         Ok(())
     }
 
@@ -5731,17 +5747,26 @@ impl PyFrame {
     ///
     /// Allocates a fresh locals dict and empty cells. The walk residualizes
     /// the call, so the address has to be a registered fnaddr.
+    ///
+    /// `PyFrame.descr_clear` either completes each replacement (`space.newdict`,
+    /// `Cell(None, family)`) or raises; a failed allocation is not stored.
+    /// Returns false when an allocation failed; the MemoryError stays pending for the caller.
     #[majit_macros::dont_look_inside]
-    pub(crate) fn clear_references(&mut self) {
+    pub(crate) fn clear_references(&mut self) -> bool {
         if let Some(debug) = self.getdebug() {
             let had_locals = !debug.w_locals.is_null();
             // Allocate before remembering debugdata: a minor can happen here.
-            let w_locals = had_locals.then(|| unsafe { pyre_object::w_dict_new() });
-            // Residual fnaddr (`jit_fnaddr` `ResidualRet`) cannot carry
-            // `PyError`; the debug block already exists when `getdebug()`
-            // answered Some, so this allocation path is not taken.
+            let w_locals = if had_locals {
+                let w_locals = unsafe { pyre_object::w_dict_new() };
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && w_locals.is_null() {
+                    return false;
+                }
+                Some(w_locals)
+            } else {
+                None
+            };
             let Ok(d) = self.getorcreate_debug_data(-1) else {
-                return;
+                return false;
             };
             d.w_f_trace = pyre_object::PY_NULL;
             // CPython `frame_tp_clear` drops `f_extra_locals`; proxy-only
@@ -5760,18 +5785,23 @@ impl PyFrame {
             let w_oldvalue = locals_w!(self)[i];
             let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
             {
-                // pyframe.py `PyFrame.descr_clear` `Cell(None, w_oldvalue.family)` — the
+                // `PyFrame.descr_clear` `Cell(None, w_oldvalue.family)` — the
                 // replacement stands for the same binding, so it keeps the
                 // family the cleared cell shared with its siblings.
-                pyre_object::w_cell_new(pyre_object::PY_NULL, unsafe {
+                let cell = pyre_object::w_cell_new(pyre_object::PY_NULL, unsafe {
                     pyre_object::w_cell_family(w_oldvalue)
-                })
+                });
+                if pyre_object::gc_hook::gc_alloc_failed_pending() && cell.is_null() {
+                    return false;
+                }
+                cell
             } else {
                 pyre_object::PY_NULL
             };
             self.set_locals_w(i, w_newvalue);
         }
         self.valuestackdepth = 0;
+        true
     }
 
     /// pyframe.py fget_f_lasti → space.newint(self.last_instr)
@@ -6468,26 +6498,18 @@ impl PyFrame {
         code: *const (),
         args: &[PyObjectRef],
         execution_context: *const PyExecutionContext,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         Self::new_for_call_with_closure(code, args, execution_context, PY_NULL)
     }
 
-    /// JIT warm-entry frame builder. The only callers are the `call_jit.rs`
-    /// residual-frame helpers (`create_callee_frame_impl*`,
-    /// `jit_create_self_recursive_callee_frame_1`, `jit_force_callee_frame`),
-    /// which run from compiled code through an `i64`-pointer ABI with no error
-    /// channel, so this stays infallible. PRE-EXISTING-ADAPTATION: a compiled
-    /// trace sets the virtualizable frame fields directly (pyjitpl frame
-    /// setup) instead of re-running `__init__` as a residual call, so there is
-    /// no fallible `createframe` residual to mirror and `pick_builtin` cannot
-    /// newly raise here — `w_globals` carries an `__builtins__` already validated
-    /// when the interpreter first built the frame.
+    /// Frame builder used by residual-frame helpers. `PyFrame.__init__`
+    /// construction allocations return the originating error.
     pub fn new_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         Self::new_for_call_with_closure_and_globals_obj(
             code,
             args,
@@ -6504,7 +6526,7 @@ impl PyFrame {
         args: &[PyObjectRef],
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         let w_globals = PY_NULL;
         Self::new_for_call_with_closure_and_globals_obj(
             code,
@@ -6562,12 +6584,9 @@ impl PyFrame {
 
     /// PyPy `space.createframe(code, function.w_func_globals, function)`.
     /// The semantic globals carrier is the dict object.
-    /// Infallible sibling of `try_new_for_call_with_closure_and_globals_obj`.
-    /// All interpreter and tracer entry points use the `try_` variant; this
-    /// one survives only for the JIT warm-entry path via
-    /// `new_for_call_with_globals_obj` (see that method for why fallibility has
-    /// no upstream counterpart there). `pick_builtin_obj` drops a non-KeyError
-    /// `__builtins__` lookup, which is unreachable on that path.
+    /// Sibling of `try_new_for_call_with_closure_and_globals_obj` that uses
+    /// `pick_builtin_obj` (non-raising lookup). `PyFrame.__init__` construction
+    /// allocations still return the originating error.
     pub fn new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6575,7 +6594,7 @@ impl PyFrame {
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
-    ) -> Self {
+    ) -> Result<Self, crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let mut live = Vec::with_capacity(3 + args.len());
         live.push(code as PyObjectRef);
@@ -6599,7 +6618,6 @@ impl PyFrame {
             w_builtin,
             allocation,
         )
-        .expect("new_for_call_with_closure_and_globals_obj: frame allocation")
     }
 
     /// Common tail of the frame builders: everything in `Frame.__init__`

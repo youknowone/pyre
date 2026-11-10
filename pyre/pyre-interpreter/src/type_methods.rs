@@ -635,6 +635,9 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::pin_roots(&[list, other]);
         list = pyre_object::listobject::w_list_materialize_range(list);
+        if pyre_object::gc_hook::gc_alloc_failed_pending() && list.is_null() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let n = w_list_len(other);
         // list_preallocate_exact sizes the emulated allocation for both arms.
@@ -668,10 +671,22 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
         for i in 0..n {
             list = pyre_object::gc_roots::shadow_stack_get(root_base);
             other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            if let Some(item) = w_list_getitem(other, i as i64) {
-                pyre_object::listobject::w_list_append_preallocated(list, item);
-                if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                    return Err(crate::runtime_ops::fetch_memory_error());
+            match w_list_getitem(other, i as i64) {
+                Some(item) => {
+                    if pyre_object::gc_hook::gc_alloc_failed_pending() && item.is_null() {
+                        return Err(crate::runtime_ops::fetch_memory_error());
+                    }
+                    pyre_object::listobject::w_list_append_preallocated(list, item);
+                    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                        return Err(crate::runtime_ops::fetch_memory_error());
+                    }
+                }
+                None => {
+                    // `AbstractUnwrappedStrategy._extend_from_list` stops
+                    // when wrapping the next source item fails.
+                    if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                        return Err(crate::runtime_ops::fetch_memory_error());
+                    }
                 }
             }
         }
@@ -944,7 +959,7 @@ pub fn descr_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         )
     };
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return Err(crate::PyError::memory_error(""));
+        return Err(crate::runtime_ops::fetch_memory_error());
     }
     Ok(w_none())
 }
@@ -7165,7 +7180,13 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if src.is_null() {
         return Ok(pyre_object::w_dict_new());
     }
-    unsafe { Ok(pyre_object::dictmultiobject::w_dict_copy(src)) }
+    let copy = unsafe { pyre_object::dictmultiobject::w_dict_copy(src) };
+    // `DictStrategy.copy` / `W_DictObject.copy` propagate construction
+    // failure.
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && copy.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    Ok(copy)
 }
 
 /// `dictmultiobject.py update1` — merge `w_data` into `w_dict`.
@@ -7226,6 +7247,11 @@ fn dict_update1_dict_dict(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<()
         let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
         if dst_is_empty {
             let w_copy = pyre_object::dictmultiobject::w_dict_copy(resolve_dict_backing(data()));
+            // `update1_dict_dict` copies then installs strategy/storage;
+            // construction failure must not be adopted.
+            if pyre_object::gc_hook::gc_alloc_failed_pending() && w_copy.is_null() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
                 dict(),
                 w_copy,

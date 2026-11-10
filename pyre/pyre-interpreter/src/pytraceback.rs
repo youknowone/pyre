@@ -580,9 +580,11 @@ pub unsafe fn record_application_traceback(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
         );
         let new_tb = w_pytraceback_for_frame(frame, last_instruction, prev_tb);
-        // `record_application_traceback`: `PyTraceback(...)` raises before
+        // `record_application_traceback`: `PyTraceback.__init__` raises before
         // `operror.set_traceback(tb)`. A failed constructor does not store
-        // into the traceback field.
+        // into the traceback field. Callers fetch that allocation exception
+        // (`fetch_traceback_alloc_error`) and replace the exception that was
+        // in flight.
         if pyre_object::gc_hook::gc_alloc_failed_pending() && new_tb.is_null() {
             return false;
         }
@@ -591,6 +593,18 @@ pub unsafe fn record_application_traceback(
         crate::eval::set_in_flight_exception(w_exc_object);
     }
     true
+}
+
+/// `PyTraceback.__init__` raises before `operror.set_traceback`, so a failed
+/// node allocation replaces the exception `record_application_traceback` was
+/// attaching a frame to. Fetch that value
+/// (`ExceptionTransformer.rpyexc_fetch_exception`) and install it as the
+/// exception now in flight; the caller then returns it through its existing
+/// error channel.
+pub fn fetch_traceback_alloc_error() -> crate::PyError {
+    let mut err = crate::runtime_ops::fetch_memory_error();
+    crate::eval::set_in_flight_exception(err.to_exc_object());
+    err
 }
 
 #[cfg(test)]

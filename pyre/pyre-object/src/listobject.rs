@@ -1441,6 +1441,12 @@ fn boxed_from_int_or_float(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectR
         } else {
             w_float_new(f64::from_bits(value as u64))
         };
+        // `AbstractUnwrappedStrategy.getitems_copy` / `IntOrFloatListStrategy.wrap`:
+        // a failed `newint`/`newfloat` stays pending; the snapshot is empty so a
+        // caller cannot treat wrap failure as a successful empty list.
+        if crate::gc_hook::gc_alloc_failed_pending() && item.is_null() {
+            return Vec::new();
+        }
         let _ = crate::gc_roots::pin_root(item);
         previous = Some(value);
     }
@@ -1534,6 +1540,11 @@ fn boxed_from_ints(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectRef> {
         } else {
             w_int_new(value)
         };
+        // `AbstractUnwrappedStrategy.getitems_copy` / `IntegerListStrategy.wrap`
+        // (`space.newint`): wrap failure stays pending and this snapshot is empty.
+        if crate::gc_hook::gc_alloc_failed_pending() && item.is_null() {
+            return Vec::new();
+        }
         let _ = crate::gc_roots::pin_root(item);
         previous = Some(value);
     }
@@ -1556,6 +1567,11 @@ fn boxed_from_floats(values: &[f64], we_are_jitted: bool) -> Vec<PyObjectRef> {
         } else {
             w_float_new(value)
         };
+        // `AbstractUnwrappedStrategy.getitems_copy` / `FloatListStrategy.wrap`
+        // (`space.newfloat`): wrap failure stays pending and this snapshot is empty.
+        if crate::gc_hook::gc_alloc_failed_pending() && item.is_null() {
+            return Vec::new();
+        }
         let _ = crate::gc_roots::pin_root(item);
         previous_bits = Some(bits);
     }
@@ -4088,6 +4104,9 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    // `AbstractUnwrappedStrategy.getitem`: a wrap allocation failure stays
+    // pending on `None`; callers that map `None` to `IndexError` must fetch
+    // that pending value first.
     w_list_getitem_inner(obj, index)
 }
 
@@ -4112,6 +4131,18 @@ fn ll_getitem_index(index: i64, length: i64) -> Option<usize> {
     Some(index_u as usize)
 }
 
+/// `AbstractUnwrappedStrategy.getitem`: after `wrap`, a collector failure
+/// stays pending on `None`. A proven `ll_getitem_index` miss is the bounds
+/// `None`.
+#[inline(always)]
+fn list_boxed_getitem(wrapped: PyObjectRef) -> Option<PyObjectRef> {
+    if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
+        None
+    } else {
+        Some(wrapped)
+    }
+}
+
 /// `#[inline(never)]` keeps a unique Charon leaf so
 /// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
 /// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
@@ -4124,7 +4155,7 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let len = range_list_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_int_new(range_list_item_unchecked(list, idx)))
+            list_boxed_getitem(w_int_new(range_list_item_unchecked(list, idx)))
         }
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
@@ -4134,42 +4165,35 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
         ListStrategy::Integer => {
             let len = ll_list_int_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_int_new(ll_list_int_getitem_fast(list, idx)))
+            list_boxed_getitem(w_int_new(ll_list_int_getitem_fast(list, idx)))
         }
         ListStrategy::IntOrFloat => {
             let len = ll_list_int_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
             let value = ll_list_int_getitem_fast(list, idx);
-            Some(if int_or_float_is_int(value) {
+            let wrapped = if int_or_float_is_int(value) {
                 w_int_new(int_or_float_decode_int(value))
             } else {
                 w_float_new(f64::from_bits(value as u64))
-            })
+            };
+            list_boxed_getitem(wrapped)
         }
         ListStrategy::Float => {
             let len = ll_list_float_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_float_new(ll_list_float_getitem_fast(list, idx)))
+            list_boxed_getitem(w_float_new(ll_list_float_getitem_fast(list, idx)))
         }
         ListStrategy::Bytes => {
             let len = ll_list_bytes_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            let wrapped = w_bytes_from_block(ll_list_bytes_getitem_fast(list, idx));
-            if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
-                None
-            } else {
-                Some(wrapped)
-            }
+            list_boxed_getitem(w_bytes_from_block(ll_list_bytes_getitem_fast(list, idx)))
         }
         ListStrategy::Ascii => {
             let len = ll_list_ascii_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            let wrapped = w_str_from_storage(ll_list_ascii_getitem_fast(list, idx) as *mut _);
-            if crate::gc_hook::gc_alloc_failed_pending() && wrapped.is_null() {
-                None
-            } else {
-                Some(wrapped)
-            }
+            list_boxed_getitem(w_str_from_storage(
+                ll_list_ascii_getitem_fast(list, idx) as *mut _
+            ))
         }
     }
 }
@@ -4392,6 +4416,10 @@ unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// next minor traces `int_items.block` from that entry.
 #[inline(never)]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
+    // `from_storage_and_strategy` is not reached when `ll_newlist` failed.
+    if n > 0 && crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+        return crate::PY_NULL;
+    }
     let list = crate::lltype::malloc_typed_managed(W_ListObject {
         ob_header: PyObject {
             ob_type: &LIST_TYPE as *const PyType,
@@ -4438,6 +4466,9 @@ pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize
     // Pin even a null dest so both CFG arms share one shadow-stack
     // depth; `shadow_stack_erase` refuses a merge that disagrees.
     let _ = crate::gc_roots::pin_root(dest as PyObjectRef);
+    if n > 0 && crate::gc_hook::gc_alloc_failed_pending() && dest.is_null() {
+        return crate::PY_NULL;
+    }
     if n > 0 {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.
@@ -4525,6 +4556,9 @@ pub unsafe fn ll_listslice_new_object_list(
     let fresh = &storage[start..start + n];
     let block_slot = crate::gc_roots::shadow_stack_len();
     let block = alloc_list_items_block_gc(fresh);
+    if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
+        return crate::PY_NULL;
+    }
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     let result = crate::gc_roots::shadow_stack_get(result_slot);
     list_write_barrier(result);
@@ -4562,9 +4596,19 @@ unsafe fn ll_listslice_boxed(obj: PyObjectRef, start: usize, n: usize) -> PyObje
     let items_base = crate::gc_roots::shadow_stack_len();
     let mut fetched = 0usize;
     for i in 0..n {
-        if let Some(v) = w_list_getitem(roots.get(obj_slot), (start + i) as i64) {
-            let _ = roots.pin_root(v);
-            fetched += 1;
+        match w_list_getitem(roots.get(obj_slot), (start + i) as i64) {
+            Some(v) => {
+                if crate::gc_hook::gc_alloc_failed_pending() && v.is_null() {
+                    return crate::PY_NULL;
+                }
+                let _ = roots.pin_root(v);
+                fetched += 1;
+            }
+            None => {
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    return crate::PY_NULL;
+                }
+            }
         }
     }
     let mut items = Vec::with_capacity(fetched);
@@ -5703,6 +5747,10 @@ pub unsafe fn w_list_append_stores_into_gc_block_in_place(obj: PyObjectRef) -> b
 /// (e.g. the interpreter's unpack / set-update / list-to-tuple paths)
 /// that need a uniform object view.
 ///
+/// A wrap allocation failure leaves the collector exception pending and
+/// returns an empty `Vec`. Callers with an error channel must test
+/// `gc_alloc_failed_pending()` before treating that snapshot as empty.
+///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
@@ -5752,6 +5800,8 @@ pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const Py
 unsafe fn temporarily_as_objects(list: &W_ListObject, we_are_jitted: bool) -> Vec<PyObjectRef> {
     match list.strategy {
         // listobject.py EmptyListStrategy.getitems returns [].
+        // `AbstractUnwrappedStrategy.getitems_copy` wrap failure also yields
+        // an empty Vec, with the collector exception left pending.
         ListStrategy::Empty | ListStrategy::Size => Vec::new(),
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let values = range_list_values(list);
@@ -5781,6 +5831,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject, we_are_jitted: bool) -> Ve
                 (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
             );
             let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
+            // wrap failure: pending stays set; empty is not a successful snapshot.
             boxed_from_bytes(obj_slot, we_are_jitted).unwrap_or_default()
         }
         ListStrategy::Ascii => {
@@ -6336,6 +6387,8 @@ pub unsafe fn w_list_sort_range(obj: PyObjectRef, reverse: bool) -> bool {
     }
     let (_, step) = range_list_start_step(list);
     if (step > 0 && reverse) || (step < 0 && !reverse) {
+        // `BaseRangeListStrategy.sort` materialises through
+        // `switch_to_integer_strategy` before `IntegerListStrategy.sort`.
         let obj = switch_range_to_integer_strategy(list);
         if crate::gc_hook::gc_alloc_failed_pending() && obj.is_null() {
             return false;
@@ -7221,9 +7274,9 @@ unsafe fn w_list_setslice_inner(
                 // object (and shared hint state).
                 return Ok(());
             }
-            if list.strategy == ListStrategy::Size {
-                list.items = std::ptr::null_mut();
-            }
+            // EmptyListStrategy.setslice assigns strategy/storage only after
+            // getstorage_copy succeeds (`W_ListObject.setslice`).
+            let drop_size_hint = list.strategy == ListStrategy::Size;
             match other.strategy {
                 ListStrategy::Empty | ListStrategy::Size => unreachable!("handled above"),
                 ListStrategy::SimpleRange | ListStrategy::Range => {
@@ -7242,6 +7295,9 @@ unsafe fn w_list_setslice_inner(
                     if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
                         return Err("MemoryError");
                     }
+                    if drop_size_hint {
+                        list.items = std::ptr::null_mut();
+                    }
                     list.int_items.install(fresh);
                     list.strategy = ListStrategy::Integer;
                     return Ok(());
@@ -7250,6 +7306,9 @@ unsafe fn w_list_setslice_inner(
                     let fresh = IntArray::from_vec(other.int_items.to_vec());
                     if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
                         return Err("MemoryError");
+                    }
+                    if drop_size_hint {
+                        list.items = std::ptr::null_mut();
                     }
                     list.int_items.install(fresh);
                     list.strategy = ListStrategy::IntOrFloat;
@@ -7260,6 +7319,9 @@ unsafe fn w_list_setslice_inner(
                     if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
                         return Err("MemoryError");
                     }
+                    if drop_size_hint {
+                        list.items = std::ptr::null_mut();
+                    }
                     list.float_items.install(fresh);
                     list.strategy = ListStrategy::Float;
                     return Ok(());
@@ -7268,8 +7330,13 @@ unsafe fn w_list_setslice_inner(
                     let other =
                         &*(crate::gc_roots::shadow_stack_get(root_base + 1) as *const W_ListObject);
                     let fresh = BytesArray::from_vec(other.bytes_items.to_vec());
-                    if crate::gc_hook::gc_alloc_failed_pending() {
+                    if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
                         return Err("MemoryError");
+                    }
+                    if drop_size_hint {
+                        let list = &mut *(crate::gc_roots::shadow_stack_get(root_base)
+                            as *mut W_ListObject);
+                        list.items = std::ptr::null_mut();
                     }
                     let (block, len) = fresh.into_raw_parts();
                     let obj = W_ListObject::install_bytes_items(
@@ -7285,8 +7352,13 @@ unsafe fn w_list_setslice_inner(
                     let other =
                         &*(crate::gc_roots::shadow_stack_get(root_base + 1) as *const W_ListObject);
                     let fresh = UnicodeArray::from_vec(other.ascii_items.to_vec());
-                    if crate::gc_hook::gc_alloc_failed_pending() {
+                    if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
                         return Err("MemoryError");
+                    }
+                    if drop_size_hint {
+                        let list = &mut *(crate::gc_roots::shadow_stack_get(root_base)
+                            as *mut W_ListObject);
+                        list.items = std::ptr::null_mut();
                     }
                     let (block, len) = fresh.into_raw_parts();
                     let obj = W_ListObject::install_ascii_items(
@@ -7628,7 +7700,13 @@ pub extern "C" fn jit_list_getitem(list: PyObjectRef, index: i64) -> PyObjectRef
     unsafe {
         match w_list_getitem(list, index) {
             Some(value) => value,
-            None => panic!("list index out of range in JIT"),
+            None => {
+                if crate::gc_hook::gc_alloc_failed_pending() {
+                    crate::PY_NULL
+                } else {
+                    panic!("list index out of range in JIT")
+                }
+            }
         }
     }
 }
