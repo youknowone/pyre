@@ -37528,6 +37528,71 @@ mod tests {
         }
     }
 
+    /// A raw-flavored owner can contain a boxed slice without becoming GC.
+    /// `history.getkind` and `rewrite_op_getfield` must agree with FUNC.ARGS.
+    #[test]
+    fn raw_flavored_struct_slice_access_uses_int_registers_and_raw_loads() {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+
+        let llbc =
+            crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+        let mut graph = crate::test_support::lower_function(llbc, "cell_slot")
+            .expect("raw-flavored slice query lowers");
+        let raw = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(llbc),
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs = raw;
+        crate::translator::rtyper::legacy_annotator::annotate(&graph);
+        crate::translator::rtyper::legacy_resolve::resolve_types(
+            &graph,
+            &cc.raw_alloc_flavor_structs,
+        );
+        graph = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let mut fields = 0;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::FieldRead { base, field, .. } = &op.kind {
+                    fields += 1;
+                    assert_eq!(field.owner_declared_gc, Some(false), "{op:?}");
+                    assert_eq!(FunctionGraph::concretetype_of(base), ConcreteType::Signed);
+                }
+            }
+        }
+        assert!(
+            fields >= 2,
+            "slice length and data pointer must both be read"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&graph.block(graph.startblock).inputargs[0]),
+            ConcreteType::Signed,
+        );
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        crate::model_ssa::ssa_to_ssi(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        assert_eq!(
+            body.c_num_regs_r, 0,
+            "raw query has no Ref inputs or locals"
+        );
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "{:?}",
+            asm.insns
+        );
+        assert!(
+            asm.insns.keys().any(|key| key.starts_with("getarrayitem_raw_i/")
+                || key.starts_with("raw_load_i/")),
+            "slice item must use the raw data pointer: {:?}", asm.insns,
+        );
+    }
+
     /// Looked-inside `PyFrame::code` returns front `Ref(Some(CodeObject))`.
     /// Residual/regular rewrite must stamp that dest Signed (`history.getkind`
     /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.
