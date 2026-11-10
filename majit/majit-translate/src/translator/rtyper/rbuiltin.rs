@@ -4815,6 +4815,12 @@ fn rtype_jit_ll_arraycopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
             return rtype_jit_ll_arraycopy_erased(hop, r_source.as_ref(), r_dest.as_ref());
         }
     };
+    // rgc.py copy_item / CopyStructEntry: struct OF copies via getinteriorfield/setinteriorfield.
+    if matches!(item_lltype, LowLevelType::Struct(_)) {
+        return Err(TyperError::message(format!(
+            "jit_ll_arraycopy: struct-element ARRAY {items_ptr:?} needs rgc.copy_item's struct branch (getinteriorfield/setinteriorfield), which is not lowered"
+        )));
+    }
     rtype_jit_ll_arraycopy_specialized(
         hop,
         r_source.as_ref(),
@@ -7797,6 +7803,29 @@ mod tests {
             hop,
             llops,
         }
+    }
+
+    /// `rgc.py` `copy_item` / `CopyStructEntry`: a struct-element ARRAY
+    /// cannot take the specialized scalar getarrayitem/setarrayitem path.
+    #[test]
+    fn jit_ll_arraycopy_struct_element_array_is_error() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+
+        let item = LowLevelType::Struct(Box::new(Struct::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let fx = jit_ll_arraycopy_hop(
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(item.clone()))),
+            SomeValue::Ptr(SomePtr::new(gc_array_ptr(item))),
+        );
+        let mut varmapping = HashMap::new();
+        let err = fx
+            .rtyper
+            .translate_hl_to_ll(&fx.hop, &mut varmapping)
+            .expect_err("struct-element ARRAY must not specialize");
+        assert!(err.to_string().contains("struct-element ARRAY"), "{err}");
     }
 
     /// `rgc.py` `ll_arraycopy` `TP == typeOf(dest).TO`: two ARRAY endpoints
