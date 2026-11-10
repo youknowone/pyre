@@ -4867,9 +4867,10 @@ fn rtype_jit_ll_arraycopy_specialized(
     )
 }
 
-/// Both endpoints are erased (`PyObjectRef`); residualize the native
-/// `jit_ll_arraycopy`. Each lowleveltype is a `Ptr`. Both erased
-/// endpoints must have the same lowleveltype.
+/// Both endpoints are the erased `PyObjectRef` Instance with the same
+/// lowleveltype; anything else is a TyperError. Residualize the native
+/// `jit_ll_arraycopy`, whose body reads the items-block layout at run
+/// time.
 fn rtype_jit_ll_arraycopy_erased(
     hop: &HighLevelOp,
     r_source: &dyn Repr,
@@ -4880,8 +4881,21 @@ fn rtype_jit_ll_arraycopy_erased(
     };
     use crate::translator::rtyper::rtyper::GenopResult;
 
-    arraycopy_require_ptr(r_source.lowleveltype(), "erased source")?;
-    arraycopy_require_ptr(r_dest.lowleveltype(), "erased dest")?;
+    {
+        let args_s = hop.args_s.borrow();
+        for (which, idx) in [("source", 0usize), ("dest", 1usize)] {
+            let s = args_s.get(idx).ok_or_else(|| {
+                TyperError::message(format!(
+                    "jit_ll_arraycopy: erased {which} is not a PyObjectRef Instance, got None"
+                ))
+            })?;
+            if !matches!(s, SomeValue::Instance(_)) {
+                return Err(TyperError::message(format!(
+                    "jit_ll_arraycopy: erased {which} is not a PyObjectRef Instance, got {s:?}"
+                )));
+            }
+        }
+    }
     if r_source.lowleveltype() != r_dest.lowleveltype() {
         return Err(TyperError::message(format!(
             "jit_ll_arraycopy: source and dest name different ARRAYs: erased endpoints {:?} vs {:?}",
@@ -4938,16 +4952,6 @@ fn arraycopy_array_of(r: &dyn Repr) -> Option<(LowLevelType, LowLevelType)> {
         PtrTarget::Array(arr) => Some((arr.OF.clone(), ll.clone())),
         PtrTarget::FixedSizeArray(arr) => Some((arr.OF.clone(), ll.clone())),
         _ => None,
-    }
-}
-
-fn arraycopy_require_ptr(ll: &LowLevelType, which: &str) -> Result<(), TyperError> {
-    if matches!(ll, LowLevelType::Ptr(_)) {
-        Ok(())
-    } else {
-        Err(TyperError::message(format!(
-            "jit_ll_arraycopy: {which} is not a Ptr, got {ll:?}"
-        )))
     }
 }
 
@@ -7847,10 +7851,10 @@ mod tests {
         );
     }
 
-    /// Both erased endpoints that are not `Ptr` cannot residualize
-    /// `jit_ll_arraycopy`.
+    /// Both erased endpoints that are not a `PyObjectRef` Instance cannot
+    /// residualize `jit_ll_arraycopy`.
     #[test]
-    fn jit_ll_arraycopy_erased_non_ptr_is_error() {
+    fn jit_ll_arraycopy_erased_non_instance_is_error() {
         use crate::annotator::model::SomeInteger;
 
         let fx = jit_ll_arraycopy_hop(
@@ -7861,31 +7865,31 @@ mod tests {
         let err = fx
             .rtyper
             .translate_hl_to_ll(&fx.hop, &mut varmapping)
-            .expect_err("erased non-Ptr endpoints must not residualize");
-        assert!(err.to_string().contains("is not a Ptr"), "{err}");
+            .expect_err("erased non-Instance endpoints must not residualize");
+        assert!(
+            err.to_string().contains("is not a PyObjectRef Instance"),
+            "{err}"
+        );
     }
 
-    /// `rgc.py` `ll_arraycopy` `TP == typeOf(dest).TO`: both erased
-    /// endpoints must have the same lowleveltype.
+    /// A non-ARRAY struct pointer is not an items block (`rgc.py`
+    /// `ll_arraycopy` indexes `TP.OF`).
     #[test]
-    fn jit_ll_arraycopy_erased_endpoints_must_match() {
-        use crate::annotator::model::{SomeInstance, SomePtr};
+    fn jit_ll_arraycopy_erased_struct_ptr_is_error() {
+        use crate::annotator::model::SomePtr;
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
-        let fx = jit_ll_arraycopy_hop(
-            SomeValue::Ptr(SomePtr::new(Ptr {
-                TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
-            })),
-            SomeValue::Instance(SomeInstance::new(None, false, Default::default())),
-        );
+        let struct_ptr = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        let fx = jit_ll_arraycopy_hop(struct_ptr.clone(), struct_ptr);
         let mut varmapping = HashMap::new();
         let err = fx
             .rtyper
             .translate_hl_to_ll(&fx.hop, &mut varmapping)
-            .expect_err("mismatched erased endpoints must not residualize");
+            .expect_err("erased struct-ptr endpoints must not residualize");
         assert!(
-            err.to_string()
-                .contains("source and dest name different ARRAYs"),
+            err.to_string().contains("is not a PyObjectRef Instance"),
             "{err}"
         );
     }
