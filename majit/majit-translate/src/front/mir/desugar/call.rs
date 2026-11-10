@@ -6934,10 +6934,22 @@ impl<'a> Lowering<'a> {
                     // slot is the rustc method, which reads those words as
                     // `self` and `w_set`. Call the word trampoline that
                     // matches the residual instead. Do not recast the
-                    // receiver before this trampoline.
+                    // receiver before this trampoline. Each trampoline's own
+                    // body keeps the vtable `indirect_call`: rewriting its
+                    // `strategy.add` (or remove / has_key) to a direct Call
+                    // of itself would make the effect analyzers see a
+                    // self-recursive graph. `graphanalyze.py
+                    // GraphAnalyzer.analyze` joins a method-vtable
+                    // `indirect_call` over the family
+                    // (`analyze_indirect_call`); with `graphs=None` it
+                    // returns `top_result()`.
+                    let graph_segs: Vec<&str> = self.graph.name.split("::").collect();
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
+                        && !(graph_segs.ends_with(&["setobject", "set_strategy_add_key_ptr"])
+                            || graph_segs.ends_with(&["setobject", "set_strategy_remove_key_ptr"])
+                            || graph_segs.ends_with(&["setobject", "set_strategy_has_key_ptr"]))
                     {
                         let key_args = if args.len() == 3 {
                             vec![args[1].clone(), args[2].clone()]
