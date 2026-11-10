@@ -1802,7 +1802,7 @@ impl UnrollOptimizer {
                 let original = slot_to_original[i];
                 let info = original
                     .and_then(|o| final_ctx.get_box_replacement_operand_opt(o))
-                    .or_else(|| final_ctx.get_box_replacement_operand_opt(*inputarg))
+                    .or_else(|| Some(inputarg.get_box_replacement(false)))
                     .as_ref()
                     .and_then(|o| final_ctx.peek_ptr_info(o));
                 infos.push(info);
@@ -1891,7 +1891,6 @@ impl UnrollOptimizer {
                         .map(|j| j.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_default();
-            let mut current_label_args = label_args.clone();
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
@@ -1905,65 +1904,12 @@ impl UnrollOptimizer {
                     .unwrap_or_else(|| vec![majit_ir::Type::Ref; body_num_inputs]);
                 crate::optimizeopt::OptContext::with_inputarg_types(32, &types)
             });
-            // RPython Box parity: each used_box is a distinct Box even
-            // when two virtuals share the same OpRef. Allocate fresh
-            // boxes for duplicates so the LABEL carries independent slots.
-            {
-                let mut seen_used: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
-                for ub in &initial_sp.used_boxes {
-                    let ub = *ub;
-                    if !seen_used.contains(&ub) {
-                        seen_used.insert(ub);
-                        current_label_args.push(
-                            jump_ctx
-                                .get_box_replacement_operand_opt(ub)
-                                .unwrap_or_else(|| jump_ctx.materialize_operand_at(ub)),
-                        );
-                    } else {
-                        // shortpreamble.py create_short_inputargs inputarg_from_tp parity:
-                        // when the short preamble needs a fresh label slot,
-                        // PyPy creates a new typed InputArg from the source
-                        // box's `.type`. Carry that into duplicate used_box
-                        // slots: typed parents produce a matching
-                        // `InputArg{Int,Float,Ref}` alias.
-                        //
-                        // `history.py` box.type is the authoritative source.
-                        // Variant tag is the primary line-by-line equivalent
-                        // (`resoperation.py` `AbstractValue.type`); legacy
-                        // untyped paths fall through to Phase 2's
-                        // `jump_ctx.opref_type` and the recorder's
-                        // `trace_inputargs`.
-                        let tp = ub
-                            .ty()
-                            .or_else(|| jump_ctx.opref_type(ub))
-                            .or_else(|| {
-                                let raw = ub.raw() as usize;
-                                opt_p2.trace_inputargs.get(raw).map(Operand::type_)
-                            })
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "duplicate short-preamble used_box {:?} has untyped variant; \
-                                     RPython label/inputarg boxes carry Int/Ref/Float type \
-                                     intrinsically (`resoperation.py` inputarg_from_tp)",
-                                    ub
-                                )
-                            });
-                        if matches!(tp, Type::Void) {
-                            panic!(
-                                "duplicate short-preamble used_box {:?} has void type; \
-                                 RPython label/inputarg boxes must carry Int/Ref/Float \
-                                 type (`resoperation.py` inputarg_from_tp)",
-                                ub
-                            );
-                        }
-                        let alias_pos = jump_ctx.reserve_pos_typed(tp).raw();
-                        let alias = Operand::from_bound_inputarg(&majit_ir::InputArgRc::new(
-                            majit_ir::InputArg::from_type(tp, alias_pos),
-                        ));
-                        current_label_args.push(alias);
-                    }
-                }
-            }
+            // `UnrollOptimizer.optimize_peeled_loop`:
+            // `label_op.initarglist(label_args + sb.used_boxes)` — append
+            // the stored boxes verbatim. Fresh typed InputArgs were already
+            // created by `ShortBoxes.create_short_boxes`.
+            let mut current_label_args = label_args.clone();
+            current_label_args.extend(initial_sp.used_boxes.iter().cloned());
 
             // unroll.py: jump_to_existing_trace(force_boxes=False)
             // RPython: except InvalidLoop → jump_to_preamble immediately,
@@ -2227,8 +2173,8 @@ impl UnrollOptimizer {
 
         // ── Assembly (compile.py:310-338) ──
         let mut appended_label_args: Vec<OpRef> = Vec::new();
-        let sp_used_boxes: Vec<OpRef> = sp.used_boxes.clone();
-        let sp_jump_args: Vec<OpRef> = sp.jump_args.clone();
+        let sp_used_boxes: Vec<OpRef> = sp.used_boxes.iter().map(Operand::to_opref).collect();
+        let sp_jump_args: Vec<OpRef> = sp.jump_args.iter().map(Operand::to_opref).collect();
         let label_arg_refs: Vec<OpRef> = label_args.iter().map(Operand::to_opref).collect();
         let exported_renamed_inputarg_refs: Vec<OpRef> = exported_renamed_inputargs
             .iter()
@@ -2930,13 +2876,13 @@ impl ExportedState {
         }
 
         if let Some(short_preamble) = &self.short_preamble {
-            for r in short_preamble
+            for operand in short_preamble
                 .inputargs
                 .iter()
                 .chain(short_preamble.used_boxes.iter())
                 .chain(short_preamble.jump_args.iter())
             {
-                visit(*r);
+                visit(operand.to_opref());
             }
             for short_op in &short_preamble.ops {
                 visit_op(&short_op.op, &mut visit);
@@ -4126,9 +4072,7 @@ impl OptUnroll {
                     // add_op_to_short returned None" path: drop the
                     // peeled trace and let the unroll caller raise
                     // InvalidLoop, falling back to jump_to_preamble.
-                    let label_arg_refs: Vec<OpRef> =
-                        label_args.iter().map(Operand::to_opref).collect();
-                    if !builder.setup(&sp, &label_arg_refs, ctx) {
+                    if !builder.setup(&sp, label_args) {
                         optimizer.short_preamble_producer = Some(builder);
                         // Drop the peeled trace and let the caller fall back
                         // to jump_to_preamble. Recorded as a deferred
@@ -4198,7 +4142,7 @@ impl OptUnroll {
                 let prefix = extra.len().min(sp.used_boxes.len());
                 let mut kept = Vec::with_capacity(prefix);
                 for i in 0..prefix {
-                    if short_extra_is_carried(sp.used_boxes[i]) {
+                    if short_extra_box_is_carried(&sp.used_boxes[i]) {
                         kept.push(extra[i].clone());
                     }
                 }
@@ -4311,31 +4255,25 @@ impl OptUnroll {
             return Vec::new();
         }
         for (i, short_inputarg) in short_preamble.inputargs.iter().enumerate() {
-            let short_inputarg = *short_inputarg;
             if let Some(jump_arg) = jump_args.get(i) {
-                mapping.insert(short_inputarg, jump_arg.clone());
+                mapping.insert(short_inputarg.to_opref(), jump_arg.clone());
                 // RPython: jump_arg Box inherits info via identity.
                 // In majit, propagate PtrInfo from short_inputarg (which
                 // has info from Phase 1 export) to the resolved jump_arg.
-                // shortpreamble.py __init__ parity: propagate PtrInfo from
-                // Phase 1 export to jump_args so guards are redundant.
+                // `ShortPreamble.__init__`: propagate PtrInfo from Phase 1
+                // export to jump_args so guards are redundant.
                 let resolved_has_info = ctx
                     .resolve_operand_operand_opt(jump_arg)
                     .as_ref()
                     .is_some_and(|b| ctx.has_ptr_info(b));
                 if !resolved_has_info {
                     let jump_box = ctx.resolve_operand_operand_opt(jump_arg);
-                    let short_box = ctx.get_box_replacement_operand_opt(short_inputarg);
+                    let short_box = short_inputarg.get_box_replacement(false);
                     let info = jump_box
                         .as_ref()
                         .and_then(|b| ctx.peek_ptr_info(b))
-                        .or_else(|| short_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)))
-                        .or_else(|| {
-                            short_preamble
-                                .inputarg_infos
-                                .get(i)
-                                .and_then(|opt| opt.clone())
-                        });
+                        .or_else(|| ctx.peek_ptr_info(&short_box))
+                        .or_else(|| short_preamble.inputarg_infos.get(i).cloned().flatten());
                     if let Some(info) = info {
                         ctx.ensure_ptr_info_preserve_forwarding(jump_arg.to_opref(), info);
                     }
@@ -4373,7 +4311,7 @@ impl OptUnroll {
         fn current_short_jump_args(
             short_preamble: &crate::optimizeopt::shortpreamble::ShortPreamble,
             ctx: &OptContext,
-        ) -> Vec<OpRef> {
+        ) -> Vec<Operand> {
             ctx.active_short_preamble_producer
                 .as_ref()
                 .map(|builder| builder.jump_args().to_vec())
@@ -4545,10 +4483,10 @@ impl OptUnroll {
                 // instead of aborting the process.
                 let mut mapped_jump_args: Vec<Operand> = Vec::with_capacity(num_short_jump_args);
                 for jump_arg in short_jump_args.iter() {
-                    let mapped = if jump_arg.is_constant() {
-                        Operand::from_opref(*jump_arg)
+                    if jump_arg.is_constant() {
+                        mapped_jump_args.push(jump_arg.clone());
                     } else {
-                        let Some(mapped) = mapping.get(jump_arg) else {
+                        let Some(mapped) = mapping.get(&jump_arg.to_opref()) else {
                             if crate::optimizeopt::majit_log_enabled() {
                                 eprintln!(
                                     "[jit] inline_short_preamble: unmapped short jump arg \
@@ -4560,9 +4498,8 @@ impl OptUnroll {
                             );
                             return Vec::new();
                         };
-                        mapped.clone()
-                    };
-                    mapped_jump_args.push(mapped);
+                        mapped_jump_args.push(mapped.clone());
+                    }
                 }
                 // unroll.py `inline_short_preamble`: force all except virtuals.
                 for arg_box in args_no_virtuals.iter() {
@@ -4586,7 +4523,7 @@ impl OptUnroll {
                 }
                 let all_new_mapped = grown[num_short_jump_args..]
                     .iter()
-                    .all(|arg| arg.is_constant() || mapping.contains_key(arg));
+                    .all(|arg| arg.is_constant() || mapping.contains_key(&arg.to_opref()));
                 if !all_new_mapped {
                     break;
                 }
@@ -4622,10 +4559,10 @@ impl OptUnroll {
         let mut mapped_args = Vec::with_capacity(final_jump_args.len());
         for jump_arg in final_jump_args {
             if jump_arg.is_constant() {
-                mapped_args.push(Operand::from_opref(jump_arg));
+                mapped_args.push(jump_arg);
                 continue;
             }
-            let Some(mapped) = mapping.get(&jump_arg) else {
+            let Some(mapped) = mapping.get(&jump_arg.to_opref()) else {
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit] inline_short_preamble: unmapped short jump arg {jump_arg:?} \
@@ -4637,7 +4574,7 @@ impl OptUnroll {
                 );
                 return Vec::new();
             };
-            mapped_args.push(ctx.resolve_operand_operand(mapped));
+            mapped_args.push(mapped.get_box_replacement(false));
         }
         mapped_args
     }
@@ -6389,6 +6326,10 @@ fn short_extra_is_carried(arg: OpRef) -> bool {
     !arg.is_constant()
 }
 
+fn short_extra_box_is_carried(arg: &Operand) -> bool {
+    !arg.is_constant()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6884,9 +6825,9 @@ mod tests {
                 arg_mapping: Vec::new(),
                 fail_arg_mapping: Vec::new(),
             }],
-            inputargs: vec![old_ref],
-            used_boxes: vec![old_ref],
-            jump_args: vec![old_ref],
+            inputargs: vec![end_arg.clone()],
+            used_boxes: vec![end_arg.clone()],
+            jump_args: vec![end_arg.clone()],
             exported_state: Some(VirtualState::new(vec![VirtualStateInfo::KnownClass {
                 class_ptr: old.as_usize() as i64,
             }])),
@@ -6951,9 +6892,10 @@ mod tests {
         }
         let short = state.short_preamble.as_ref().unwrap();
         assert_eq!(short.ops[0].op.arg(0).to_opref(), old_ref);
-        assert_eq!(short.inputargs[0], old_ref);
-        assert_eq!(short.used_boxes[0], old_ref);
-        assert_eq!(short.jump_args[0], old_ref);
+        assert!(short.inputargs[0].same_box(&end_arg));
+        assert!(short.used_boxes[0].same_box(&end_arg));
+        assert!(short.jump_args[0].same_box(&end_arg));
+        assert_eq!(short.inputargs[0].const_value(), Some(Value::Ref(new)));
         assert_eq!(short.constants.get(&0).map(|c| c.getref_base()), Some(new));
     }
 
@@ -8600,6 +8542,7 @@ mod tests {
             .unwrap()
             .produced_short_op(&src20)
             .unwrap();
+        let expected_jump = Operand::from_bound_op(&produced.preamble_op);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: src20.clone(),
             invented_name: produced.invented_name,
@@ -8623,15 +8566,16 @@ mod tests {
         // `extra_same_as` stay empty until `force_box` pops the entry.
         assert!(sp.used_boxes.is_empty());
         assert!(sp.jump_args.is_empty());
-
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(&src20, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
-        // After force_box: orthodox `add_preamble_op` (shortpreamble.py)
+        // After force_box: orthodox `add_preamble_op`
         // populated all three lists in lock-step.
-        assert_eq!(sp.used_boxes.clone(), vec![OpRef::int_op(20)]);
-        assert_eq!(sp.jump_args.clone(), vec![OpRef::int_op(20)]);
+        assert_eq!(sp.used_boxes.len(), 1);
+        assert!(sp.used_boxes[0].same_box(&src20));
+        assert_eq!(sp.jump_args.len(), 1);
+        assert!(sp.jump_args[0].same_box(&expected_jump));
         assert!(
             !ctx.has_potential_extra_op(&src20),
             "force_box must consume the potential_extra_ops entry"
@@ -8693,6 +8637,7 @@ mod tests {
             .produced_short_op(&src19)
             .unwrap();
         let b_src = ctx.materialize_operand_at(OpRef::ref_op(19));
+        let expected_jump = Operand::from_bound_op(&produced.preamble_op);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,
@@ -8721,14 +8666,16 @@ mod tests {
             !ctx.has_potential_extra_op(&slot14),
             "the unrelated replay/body slot must not carry the potential_extra_ops entry"
         );
-
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(&b_src, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
-        // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
-        assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(19)]);
-        assert_eq!(sp.jump_args.clone(), vec![OpRef::ref_op(19)]);
+        // `preamble_op.op.get_box_replacement()` is the used_box; the
+        // replay op's result is the short-preamble JUMP arg.
+        assert_eq!(sp.used_boxes.len(), 1);
+        assert!(sp.used_boxes[0].same_box(&b_src));
+        assert_eq!(sp.jump_args.len(), 1);
+        assert!(sp.jump_args[0].same_box(&expected_jump));
         assert!(
             !ctx.has_potential_extra_op(&b_src),
             "force_box must consume the potential_extra_ops entry"
@@ -10698,17 +10645,19 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(2, 0);
 
         let short_input_operand = rooted_resop_operand(Type::Int, 11);
-        let short_input = short_input_operand.to_opref();
         let jump_arg = OpRef::int_op(12);
         let jump_arg_box = ctx.materialize_operand_at(jump_arg);
 
         // A guard carrying the PREAMBLE trace's resume coordinate.
-        let mut guard = Op::new(OpCode::GuardTrue, &[short_input_operand]);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            std::slice::from_ref(&short_input_operand),
+        );
         guard.pos().set(OpRef::void_op(13));
         guard.set_rd_resume_position(4242);
 
         let mut short_preamble = ShortPreamble::empty();
-        short_preamble.inputargs = vec![short_input];
+        short_preamble.inputargs = vec![short_input_operand];
         short_preamble.ops = vec![ShortPreambleOp {
             op: guard,
             arg_mapping: Vec::new(),

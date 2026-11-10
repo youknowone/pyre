@@ -8087,19 +8087,20 @@ mod tests {
             }],
         );
         let b14 = ctx.materialize_operand_at(OpRef::int_op(14));
+        let replay_op = {
+            let mut op = majit_ir::Op::new(
+                majit_ir::OpCode::SameAsI,
+                &[rooted_resop_operand(Type::Int, 14)],
+            );
+            op.pos().set(OpRef::op_typed(14, op.result_type()));
+            OpRc::new(op)
+        };
         ctx.set_potential_extra_op(
             b14.clone(),
             crate::optimizeopt::info::PreambleOp {
                 op: b14.clone(),
                 invented_name: false,
-                preamble_op: {
-                    let mut op = majit_ir::Op::new(
-                        majit_ir::OpCode::SameAsI,
-                        &[rooted_resop_operand(Type::Int, 14)],
-                    );
-                    op.pos().set(OpRef::op_typed(14, op.result_type()));
-                    OpRc::new(op)
-                },
+                preamble_op: replay_op.clone(),
                 same_as_source: None,
             },
         );
@@ -8113,11 +8114,14 @@ mod tests {
         let prior = OpRc::new(op.clone());
         let _ = opt.emit_operation(op, &prior, &mut ctx, false);
 
+        let expected_jump = Operand::from_bound_op(&replay_op);
         let sp = ctx
             .build_imported_short_preamble()
             .expect("forcing imported short guard arg should build short preamble");
-        assert_eq!(sp.used_boxes, vec![OpRef::int_op(14)]);
-        assert_eq!(sp.jump_args, vec![OpRef::int_op(14)]);
+        assert_eq!(sp.used_boxes.len(), 1);
+        assert!(sp.used_boxes[0].same_box(&b14));
+        assert_eq!(sp.jump_args.len(), 1);
+        assert!(sp.jump_args[0].same_box(&expected_jump));
     }
 
     #[test]
