@@ -15843,6 +15843,17 @@ fn walk_jit_force_quasi_immutable<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Execute the Ref-array allocation shared by the opcode and builtin gateways.
+/// `pyjitpl.py` `MIFrame.opimpl_new_array_clear` delegates to
+/// `MetaInterp.execute_new_array_clear`; its concrete array stays live while
+/// `execute_and_record` appends the allocation to the trace.
+fn execute_new_ref_array_clear(cap: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    let block = unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap) }?;
+    Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+        majit_ir::GcRef(block as usize),
+    ))
+}
+
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
 /// branching handlers (`goto/L`) override the linear `op.next_pc`
 /// advance; non-branching handlers return `op.next_pc` unchanged.
@@ -17484,11 +17495,11 @@ fn handle<Sym: WalkSym>(
                     // cannot represent leaves the result unbound (decline
                     // the concrete step) rather than allocating a wrong
                     // integer block. Zero length is a valid empty array.
+                    let ref_array_root = is_ref_array
+                        .then(|| execute_new_ref_array_clear(cap))
+                        .flatten();
                     let block: Option<*mut u8> = if is_ref_array {
-                        unsafe {
-                            pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap)
-                                .map(|p| p as *mut u8)
-                        }
+                        ref_array_root.as_ref().map(|root| root.get().0 as *mut u8)
                     } else if let Some(ad) = descr.as_array_descr() {
                         if ad.is_array_of_structs() || ad.item_size() != std::mem::size_of::<u64>()
                         {

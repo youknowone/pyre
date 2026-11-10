@@ -8422,6 +8422,84 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// `pyjitpl.py` `MetaInterp.execute_new_array_clear` and
+/// `execute_setarrayitem_gc` execute the allocation/stores as they record.
+/// As in `MetaInterp.execute_and_record_varargs`, execution supplies the
+/// concrete value before recording its result box.
+/// Keep the gateway's argument GcArray concrete too, so a residual inside
+/// the wrapper can read the same array as its recorded box.
+fn record_builtin_wrapper_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    items: &[OpRef],
+    item_concretes: &[ConcreteValue],
+) -> (OpRef, Option<majit_gc::shadow_stack::OwnerRootGuard>) {
+    let mut concretes: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(i, &item)| {
+            let concrete = item_concretes
+                .get(i)
+                .copied()
+                .unwrap_or(ConcreteValue::Null);
+            live_box_concrete(ctx.trace_ctx, item, concrete)
+        })
+        .collect();
+    let mut item_pins = residual_call::PinnedConcretes::new(&concretes);
+    // An unknown item must not make a partially populated array executable.
+    let array_root = concretes
+        .iter()
+        .all(|value| matches!(value, ConcreteValue::Ref(_)))
+        .then(|| execute_new_ref_array_clear(items.len()))
+        .flatten();
+    item_pins.refresh(&mut concretes);
+    for (&item, &concrete) in items.iter().zip(&concretes) {
+        if let ConcreteValue::Ref(value) = concrete
+            && !value.is_null()
+        {
+            ctx.trace_ctx.try_set_opref_concrete(
+                item,
+                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+            );
+        }
+    }
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    for (index, &item) in items.iter().enumerate() {
+        if let Some(root) = array_root.as_ref() {
+            item_pins.refresh(&mut concretes);
+            let ConcreteValue::Ref(value) = concretes[index] else {
+                unreachable!("only concrete Ref arguments materialize a gateway array")
+            };
+            unsafe {
+                pyre_object::object_array::items_block_set_ref(
+                    root.get().0 as *mut pyre_object::object_array::ItemsBlock,
+                    index,
+                    value,
+                );
+            }
+        }
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+    }
+    if let Some(root) = array_root.as_ref() {
+        ctx.trace_ctx
+            .try_set_opref_concrete(args_array, majit_ir::Value::Ref(root.get()));
+    }
+    (args_array, array_root)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8457,42 +8535,9 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     let tp_init_pin = type_call_init
         .as_ref()
         .and_then(|init| residual_call::owner_root_if_gc(init.tp_init as usize));
-    for (&item, concrete) in wrapper_items.iter().zip(wrapper_item_concretes) {
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            // Box.value is the recording-time shadow, not a compile-time
-            // constant.  The generated wrapper's getarrayitem returns this
-            // same live box; seeding it lets py_type_check choose its observed
-            // arm and emit the corresponding guards while retaining `self`
-            // as a red input.
-            ctx.trace_ctx.try_set_opref_concrete(
-                item,
-                majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
-            );
-        }
-    }
+    let (args_array, args_array_root) =
+        record_builtin_wrapper_args(ctx, wrapper_items, wrapper_item_concretes);
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -8572,7 +8617,11 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_root
+            .as_ref()
+            .map_or(ConcreteValue::Null, |root| {
+                ConcreteValue::Ref(root.get().0 as pyre_object::PyObjectRef)
+            })],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -9003,38 +9052,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     if let Some(level) = nested_helper_entry.as_mut() {
         level.entry_array_len = Some(wrapper_items.len());
     }
-    for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            // The box's own value is forwarded by the collector; the copy
-            // predates the snapshot capture above.
-            let value = walker_concrete_ref_object(ctx, item).unwrap_or(*value);
-            ctx.trace_ctx.try_set_opref_concrete(
-                item,
-                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
-            );
-        }
-    }
+    let (args_array, args_array_root) =
+        record_builtin_wrapper_args(ctx, &wrapper_items, &wrapper_item_concretes);
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
@@ -9072,7 +9092,11 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_root
+            .as_ref()
+            .map_or(ConcreteValue::Null, |root| {
+                ConcreteValue::Ref(root.get().0 as pyre_object::PyObjectRef)
+            })],
         &[],
     );
     drop(helper_frame);
