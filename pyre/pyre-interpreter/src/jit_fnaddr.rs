@@ -6388,11 +6388,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // residual-call ABI.
 
     // `PyError::to_exc_object` — residual exception materialization emitted by
-    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses
-    // the same impl-method CallPath shape as `type_error`, resolving to
-    // `["PyError", "to_exc_object"]` after the crate segment is stripped.
-    p1!(
+    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  Bind both
+    // spellings (`error::PyError::to_exc_object` after the crate segment is
+    // stripped, and the crate-root alias) because the blackhole calls
+    // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
+    pa1!(
         &mut entries,
+        "pyre_interpreter::error::PyError::to_exc_object",
         "pyre_interpreter::PyError::to_exc_object",
         crate::PyError::to_exc_object,
     );
@@ -9963,6 +9965,23 @@ mod tests {
             bindings["pyre_interpreter::pyerror_index_error_to_exc_object"],
             ie
         );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_to_exc_object_both_spellings() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let to_exc: fn(&mut crate::PyError) -> pyre_object::PyObjectRef =
+            crate::PyError::to_exc_object;
+        let to_exc = occupied_published_addr(
+            "pyre_interpreter::error::PyError::to_exc_object",
+            to_exc as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::error::PyError::to_exc_object"],
+            to_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::PyError::to_exc_object"], to_exc);
     }
 
     #[test]
