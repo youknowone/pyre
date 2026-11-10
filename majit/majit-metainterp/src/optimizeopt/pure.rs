@@ -20,15 +20,21 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// isinstance(old_op, PreambleOp) check → force_op_from_preamble → replace.
 #[derive(Clone, Debug)]
 enum ExtraCallPureEntry {
-    Direct { key: PureOpKey, result: OpRef },
-    Preamble { key: PureOpKey, pop: PreambleOp },
+    Direct {
+        key: PureOpKey<Operand>,
+        result: Operand,
+    },
+    Preamble {
+        key: PureOpKey<Operand>,
+        pop: PreambleOp,
+    },
 }
 
 /// Key for looking up a previously computed pure operation.
 ///
 /// RecentPureOps keeps native argument boxes, as pure.py does, so later
 /// forwarding writes are visible without recreating their identities.
-/// The existing imported-call adapter still uses positional arguments.
+/// Imported call-pure keys use the same Operand boxes.
 ///
 /// RPython's optimizeopt/pure.py includes the descriptor in pure-op identity
 /// checks for operations like GETFIELD_GC_PURE_*; otherwise distinct immutable
@@ -536,7 +542,7 @@ impl OptPureState {
 
     /// pure.py: inject extra_call_pure from optimizer.call_pure_results.
     /// Called before optimization starts to seed cross-iteration CSE data.
-    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<OpRef>, OpRef)>) {
+    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<Operand>, Operand)>) {
         self.extra_call_pure = results
             .into_iter()
             .map(|(args, result)| {
@@ -837,7 +843,7 @@ impl OptPureState {
     pub fn extra_call_pure_preamble(
         &mut self,
         opcode: OpCode,
-        args: Vec<OpRef>,
+        args: Vec<Operand>,
         descr_identity: Option<usize>,
         pop: PreambleOp,
     ) {
@@ -883,26 +889,6 @@ impl OptPureState {
             // applies `get_box_replacement` to both sides, then dispatches
             // identity vs Const value equality (`history.py`).
             if !ctx.same_box(&op1_args[i], &op2_args[j]) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Positional `_same_args` for `extra_call_pure` keys imported as
-    /// `OpRef` from a Stage-4 registry.
-    fn _same_args_opref(
-        op1_args: &[OpRef],
-        op2_args: &[OpRef],
-        start_index1: usize,
-        start_index2: usize,
-        ctx: &OptContext,
-    ) -> bool {
-        if op1_args.len() - start_index1 != op2_args.len() - start_index2 {
-            return false;
-        }
-        for (j, i) in (start_index2..).zip(start_index1..op1_args.len()) {
-            if !ctx.same_box_opref(op1_args[i], op2_args[j]) {
                 return false;
             }
         }
@@ -960,34 +946,6 @@ impl OptPureState {
             start_index,
             ctx,
         )
-    }
-
-    /// `optimize_call_pure_old` for `extra_call_pure` entries keyed by
-    /// imported `OpRef` positions (Stage 4 leftover).
-    fn optimize_call_pure_old_opref(
-        op: &Op,
-        old_op_opcode: OpCode,
-        old_op_args: &[OpRef],
-        old_op_descr_identity: Option<usize>,
-        op_descr_identity: Option<usize>,
-        start_index: usize,
-        ctx: &OptContext,
-    ) -> bool {
-        if !Self::call_pure_descrs_match(
-            op,
-            old_op_opcode,
-            old_op_descr_identity,
-            op_descr_identity,
-        ) {
-            return false;
-        }
-        let old_start_index = if old_op_opcode.is_cond_call_value() {
-            1
-        } else {
-            0
-        };
-        let op_args: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
-        Self::_same_args_opref(old_op_args, &op_args, old_start_index, start_index, ctx)
     }
 }
 
@@ -1406,19 +1364,15 @@ fn propagate_shared(
         // the later `extra_call_pure[i] = ...` write.
         let extra_call_pure = this.extra_call_pure.clone();
         for (i, entry) in extra_call_pure.iter().enumerate() {
-            let (entry_opcode, entry_args, entry_descr_identity, pop) = match entry {
-                ExtraCallPureEntry::Direct { key, .. } => {
-                    (key.opcode, &key.args, key.descr_identity, None)
-                }
-                ExtraCallPureEntry::Preamble { key, pop } => {
-                    (key.opcode, &key.args, key.descr_identity, Some(pop.clone()))
-                }
+            let (key, pop) = match entry {
+                ExtraCallPureEntry::Direct { key, .. } => (key, None),
+                ExtraCallPureEntry::Preamble { key, pop } => (key, Some(pop.clone())),
             };
-            if OptPureState::optimize_call_pure_old_opref(
+            if OptPureState::optimize_call_pure_old(
                 op,
-                entry_opcode,
-                entry_args,
-                entry_descr_identity,
+                key.opcode,
+                &key.args,
+                key.descr_identity,
                 op_descr_identity,
                 start_index,
                 ctx,
@@ -1429,14 +1383,14 @@ fn propagate_shared(
         }
         if let Some((i, pop)) = matched {
             let entry_result = if let Some(pop) = pop {
-                let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
+                let forced = ctx.force_op_from_preamble_op(&pop);
                 let key = match this.extra_call_pure[i].clone() {
                     ExtraCallPureEntry::Preamble { key, .. } => key,
                     _ => unreachable!("matched index must still hold the Preamble entry"),
                 };
                 this.extra_call_pure[i] = ExtraCallPureEntry::Direct {
                     key,
-                    result: forced,
+                    result: forced.clone(),
                 };
                 forced
             } else {
@@ -1446,8 +1400,7 @@ fn propagate_shared(
                 }
             };
             let b_old = Operand::from_bound_op(op_rc);
-            let b_cached = ctx.get_box_replacement_operand(entry_result);
-            ctx.make_equal_to(&b_old, &b_cached);
+            ctx.make_equal_to(&b_old, &entry_result);
             this.last_emitted_was_removed = true;
             return OptimizationResult::Remove;
         }
@@ -1571,12 +1524,12 @@ impl OptPureState {
             let descr_identity = entry.descr.as_ref().map(majit_ir::descr::descr_identity);
             let pop = entry.pop.clone();
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
-                // shortpreamble.py `PureOp.produce_op`: extra_call_pure keeps
-                // positional OpRefs resolved from the exporting-phase boxes.
-                let resolved_args: Vec<OpRef> = entry
+                // shortpreamble.py `PureOp.produce_op`: extra_call_pure
+                // stores the exporting-phase boxes (`PreambleOp(op, ...)`).
+                let resolved_args: Vec<Operand> = entry
                     .args
                     .iter()
-                    .map(|arg| ctx.with_resolved_operand(arg, |b| b.to_opref()))
+                    .map(|arg| arg.get_box_replacement(false))
                     .collect();
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             } else if !entry.cache_args.is_empty() {
@@ -1662,7 +1615,7 @@ impl OptPure {
         pass
     }
 
-    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<OpRef>, OpRef)>) {
+    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<Operand>, Operand)>) {
         self.state.borrow_mut().set_extra_call_pure(results);
     }
 
@@ -3311,10 +3264,14 @@ mod tests {
     #[test]
     fn test_extra_call_pure() {
         let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(4, 0);
 
         // Inject extra_call_pure from a previous loop iteration
-        let args = vec![OpRef::int_op(100), OpRef::int_op(101)];
-        pass.set_extra_call_pure(vec![(args.clone(), OpRef::int_op(50))]);
+        let arg0 = ctx.materialize_operand_at(OpRef::int_op(100));
+        let arg1 = ctx.materialize_operand_at(OpRef::int_op(101));
+        let expected_result = ctx.materialize_operand_at(OpRef::int_op(50));
+        let args = vec![arg0, arg1];
+        pass.set_extra_call_pure(vec![(args.clone(), expected_result.clone())]);
 
         // extra_call_pure entries are searched via optimize_call_pure_old
         // in the CALL_PURE handler (pure.py), not via
@@ -3331,7 +3288,7 @@ mod tests {
             match &state.extra_call_pure[0] {
                 super::ExtraCallPureEntry::Direct { key: k, result } => {
                     assert_eq!(k, &key);
-                    assert_eq!(*result, OpRef::int_op(50));
+                    assert!(result.same_box(&expected_result));
                 }
                 _ => panic!("expected Direct entry"),
             }
@@ -3392,13 +3349,13 @@ mod tests {
         let const_box = ctx.materialize_operand_at(const_opref);
         ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
         let box0 = ctx.materialize_operand_at(OpRef::int_op(0));
+        let result = ctx.materialize_operand_at(OpRef::int_op(2));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx,
             OpCode::IntAdd,
             None,
             vec![box0, Operand::from_opref(const_opref)],
-            OpRef::int_op(2),
-            OpRef::int_op(2),
+            result.clone(),
+            result,
             false,
             None,
         );
@@ -3471,23 +3428,22 @@ mod tests {
         assert_ne!(descr_a.index(), descr_b.index());
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let box0 = ctx.materialize_operand_at(OpRef::ref_op(0));
+        let result = ctx.materialize_operand_at(OpRef::ref_op(1));
         let a = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx,
             OpCode::GetfieldGcR,
             Some(descr_a as majit_ir::DescrRef),
             vec![box0.clone()],
-            OpRef::ref_op(1),
-            OpRef::ref_op(1),
+            result.clone(),
+            result.clone(),
             false,
             None,
         );
         let b = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx,
             OpCode::GetfieldGcR,
             Some(descr_b as majit_ir::DescrRef),
             vec![box0],
-            OpRef::ref_op(1),
-            OpRef::ref_op(1),
+            result.clone(),
+            result,
             false,
             None,
         );
@@ -3505,13 +3461,13 @@ mod tests {
         let const_box = ctx.materialize_operand_at(const_opref);
         ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
         let arg0 = ctx.materialize_operand_at(OpRef::int_op(0));
+        let result = ctx.materialize_operand_at(OpRef::int_op(2));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx,
             OpCode::IntAdd,
             None,
             vec![arg0.clone(), Operand::from_opref(const_opref)],
-            OpRef::int_op(2),
-            OpRef::int_op(2),
+            result.clone(),
+            result,
             false,
             None,
         );
@@ -3544,13 +3500,13 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         );
+        let imported_result = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut imported = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx,
             OpCode::CallPureI,
             Some(call_descr.clone()),
             vec![Operand::from_opref(const_opref), arg0.clone()],
-            OpRef::int_op(1),
-            OpRef::int_op(1),
+            imported_result.clone(),
+            imported_result.clone(),
             false,
             None,
         );
@@ -3590,10 +3546,9 @@ mod tests {
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
+        assert!(
             ctx.get_box_replacement_operand_opt(OpRef::int_op(2))
-                .map(|o| o.to_opref()),
-            Some(OpRef::int_op(1))
+                .is_some_and(|o| o.same_box(&imported_result))
         );
     }
 

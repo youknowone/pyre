@@ -1491,7 +1491,7 @@ impl ProducedShortOp {
                     opcode,
                     descr: self.preamble_op.getdescr(),
                     args,
-                    result: result.to_opref(),
+                    result: result.clone(),
                     cache_args: Vec::new(),
                     pop: crate::optimizeopt::info::PreambleOp {
                         op: op_source.clone().unwrap_or_else(|| self.res.clone()),
@@ -1502,12 +1502,11 @@ impl ProducedShortOp {
                 }
             }
             None => crate::optimizeopt::ImportedShortPureOp::new(
-                ctx,
                 opcode,
                 self.preamble_op.getdescr(),
                 args,
-                result.to_opref(),
-                source.to_opref(),
+                result.clone(),
+                source.clone(),
                 self.invented_name,
                 self.same_as_source.clone(),
             ),
@@ -1527,8 +1526,7 @@ impl ProducedShortOp {
         // would be a TODO dual write.
         //
         // `PureOp.produce_op` hands the body the original result box. The
-        // replay result stays on `ImportedShortPureOp.result` as an OpRef
-        // until that field is boxed.
+        // replay result stays on `ImportedShortPureOp.result`.
         Some(source)
     }
 

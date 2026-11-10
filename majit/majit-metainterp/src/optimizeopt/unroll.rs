@@ -5120,7 +5120,7 @@ fn emit_alias_same_as_for_imports(
             alias.same_as_opcode,
             std::slice::from_ref(&alias.same_as_source),
         );
-        op.pos().set(alias.result);
+        op.pos().set(alias.result.to_opref());
         result.push(OpRc::new(op));
     }
 }
@@ -8356,15 +8356,16 @@ mod tests {
         // A Pure short box gets a fresh replay box (`alloc_op_position_typed`).
         // `label_arg_idx` does not reuse `short_args[slot]`.
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
-        let result = ctx2.imported_short_pure_ops[0].result;
-        assert_ne!(result, OpRef::int_op(11));
+        let result = ctx2.imported_short_pure_ops[0].result.clone();
+        assert!(result.bound_inputarg().is_some());
+        assert_ne!(result.to_opref(), OpRef::int_op(11));
+        let source = ctx2.materialize_operand_at(OpRef::int_op(11));
         let expected = crate::optimizeopt::ImportedShortPureOp::new(
-            &mut ctx2,
             OpCode::GetfieldGcI,
             Some(field_descr.clone()),
             vec![const_arg],
             result,
-            OpRef::int_op(11),
+            source,
             false,
             None,
         );
@@ -8794,9 +8795,9 @@ mod tests {
         assert!(exported.short_boxes[0].0.same_box(&Operand::from_bound_op(
             &exported.short_boxes[0].1.preamble_op
         )));
-        let imported_result = ctx2.imported_short_pure_ops[0].result;
-        assert_ne!(imported_result, OpRef::int_op(30));
-        assert!(imported_result.is_input_arg());
+        let imported_result = ctx2.imported_short_pure_ops[0].result.clone();
+        assert!(imported_result.bound_inputarg().is_some());
+        assert_ne!(imported_result.to_opref(), OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
         let forced = ctx2.force_op_from_preamble_op(&pop).to_opref();
         // force_op_from_preamble may return the imported position (not necessarily 30)
@@ -8906,7 +8907,7 @@ mod tests {
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::int_op(50),
+                result: rooted_resop_operand(Type::Int, 50),
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
@@ -9330,7 +9331,7 @@ mod tests {
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::int_op(50),
+                result: rooted_resop_operand(Type::Int, 50),
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
@@ -9494,7 +9495,7 @@ mod tests {
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::int_op(50),
+                result: rooted_resop_operand(Type::Int, 50),
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],

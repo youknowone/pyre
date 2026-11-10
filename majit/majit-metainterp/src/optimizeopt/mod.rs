@@ -506,6 +506,84 @@ mod walk_live_op_quasiimmut_tests {
         );
         assert_eq!(same_as_source.const_value(), Some(Value::Ref(new_same)));
     }
+
+    #[test]
+    fn published_context_walks_imported_short_pure_boxes() {
+        let old_arg = GcRef(0x4100);
+        let new_arg = GcRef(0x5100);
+        let old_result = GcRef(0x4200);
+        let new_result = GcRef(0x5200);
+        let old_op = GcRef(0x4300);
+        let new_op = GcRef(0x5300);
+        let old_preamble = GcRef(0x4400);
+        let new_preamble = GcRef(0x5400);
+        let old_same = GcRef(0x4500);
+        let new_same = GcRef(0x5500);
+        let old_cache = GcRef(0x4600);
+        let new_cache = GcRef(0x5600);
+
+        let arg = Operand::const_from_value(Value::Ref(old_arg));
+        let result = Operand::const_from_value(Value::Ref(old_result));
+        let op_box = Operand::const_from_value(Value::Ref(old_op));
+        let preamble_arg = Operand::const_from_value(Value::Ref(old_preamble));
+        let same_as_source = Operand::const_from_value(Value::Ref(old_same));
+        let cache_arg = Operand::const_from_value(Value::Ref(old_cache));
+        let mut replay_op = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&preamble_arg));
+        replay_op.pos().set(OpRef::ref_op(14));
+
+        let mut ctx = OptContext::new(0);
+        ctx.imported_short_pure_ops.push(ImportedShortPureOp {
+            opcode: OpCode::GetfieldGcR,
+            descr: None,
+            args: vec![arg.clone()],
+            result: result.clone(),
+            pop: crate::optimizeopt::info::PreambleOp {
+                op: op_box.clone(),
+                invented_name: true,
+                preamble_op: OpRc::new(replay_op),
+                same_as_source: Some(same_as_source.clone()),
+            },
+            cache_args: vec![cache_arg.clone()],
+        });
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old_arg {
+                *slot = new_arg;
+            } else if *slot == old_result {
+                *slot = new_result;
+            } else if *slot == old_op {
+                *slot = new_op;
+            } else if *slot == old_preamble {
+                *slot = new_preamble;
+            } else if *slot == old_same {
+                *slot = new_same;
+            } else if *slot == old_cache {
+                *slot = new_cache;
+            }
+        });
+
+        let imported = &ctx.imported_short_pure_ops[0];
+        assert!(imported.args[0].same_box(&arg));
+        assert_eq!(arg.const_value(), Some(Value::Ref(new_arg)));
+        assert!(imported.result.same_box(&result));
+        assert_eq!(result.const_value(), Some(Value::Ref(new_result)));
+        assert!(imported.pop.op.same_box(&op_box));
+        assert_eq!(op_box.const_value(), Some(Value::Ref(new_op)));
+        assert!(imported.pop.preamble_op.arg(0).same_box(&preamble_arg));
+        assert_eq!(preamble_arg.const_value(), Some(Value::Ref(new_preamble)));
+        assert!(
+            imported
+                .pop
+                .same_as_source
+                .as_ref()
+                .is_some_and(|source| source.same_box(&same_as_source))
+        );
+        assert_eq!(same_as_source.const_value(), Some(Value::Ref(new_same)));
+        assert!(imported.cache_args[0].same_box(&cache_arg));
+        assert_eq!(cache_arg.const_value(), Some(Value::Ref(new_cache)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
@@ -1299,7 +1377,7 @@ pub struct ImportedShortPureOp {
     /// Exporting-phase boxes of the pure op (shortpreamble.py
     /// `PureOp.produce_op`: `self.res`, or `self.orig_op` when invented).
     pub args: Vec<majit_ir::operand::Operand>,
-    pub result: OpRef,
+    pub result: majit_ir::operand::Operand,
     /// RPython: PreambleOp stored in pure cache. Used by force_op_from_preamble.
     pub pop: crate::optimizeopt::info::PreambleOp,
     /// `pure.py` `RecentPureOps.add` stores the op, and `lookup2` calls
@@ -1315,17 +1393,12 @@ impl ImportedShortPureOp {
     /// `args` are the exporting phase's boxes. shortpreamble.py
     /// `PureOp.produce_op` hands that op to the pure cache; the replay op
     /// is built from those Operands directly.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
-    )]
     pub fn new(
-        ctx: &mut OptContext,
         opcode: OpCode,
         descr: Option<DescrRef>,
         args: Vec<majit_ir::operand::Operand>,
-        result: OpRef,
-        source: OpRef,
+        result: majit_ir::operand::Operand,
+        source: majit_ir::operand::Operand,
         invented_name: bool,
         same_as_source: Option<majit_ir::operand::Operand>,
     ) -> Self {
@@ -1346,22 +1419,16 @@ impl ImportedShortPureOp {
         //
         // The body-visible `op` and the replay `preamble_op` are distinct
         // RPython Box objects for every PureOp, not only invented aliases.
-        // Keep their OpRef identities distinct as well: `source` names
-        // self.res, while `result` names the replay operation — including
-        // the non-invented arm, where `add_op_to_short` (shortpreamble.py
-        // `op.copy_and_change(opnum, args=arglist)`) still hands
-        // `ProducedShortOp` a freshly allocated replay op rather than
-        // `self.res` itself.
-        replay.pos().set(result);
+        // `source` is the alt identifier for invented names and `self.res`
+        // otherwise; `result` is the fresh typed InputArg minted for the
+        // replay (`OpHelpers.inputarg_from_tp`).
+        replay.pos().set(result.to_opref());
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
         }
-        // shortpreamble.py:116-120: pop.op = self.orig_op.copy_and_change(...)
-        // for invented (the alt identifier) or self.res for non-invented.
-        // pyre's `source` IS the alt identifier for invented (the synthetic
-        // alias allocated by the compound-dedup pass at
-        // `ShortBoxes` in `shortpreamble.rs`) and IS self.res for non-invented.
-        let pop_op = ctx.materialize_operand_at(source);
+        // shortpreamble.py PureOp.produce_op: pop.op is the invented copy
+        // or `self.res`. The caller passes that box as `source`.
+        let pop_op = source;
         ImportedShortPureOp {
             opcode,
             descr,
@@ -1383,13 +1450,13 @@ impl PartialEq for ImportedShortPureOp {
         self.opcode == other.opcode
             && self.descr.as_ref().map(|d| d.index()) == other.descr.as_ref().map(|d| d.index())
             && self.args == other.args
-            && self.result == other.result
+            && self.result.same_box(&other.result)
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportedShortAlias {
-    pub result: OpRef,
+    pub result: majit_ir::operand::Operand,
     /// The canonical operand of the SameAs source, carried directly off
     /// `extra_same_as` (already an `Operand` op-arg) instead of round-tripping
     /// through a positional box.
@@ -5310,7 +5377,7 @@ impl OptContext {
                     .extra_same_as()
                     .iter()
                     .map(|op| ImportedShortAlias {
-                        result: op.pos().get(),
+                        result: Operand::from_bound_op(&OpRc::new(op.clone())),
                         same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
@@ -5866,7 +5933,7 @@ impl OptContext {
         if self
             .imported_short_pure_ops
             .iter()
-            .any(|sp| sp.result == opref)
+            .any(|sp| sp.result.to_opref() == opref)
         {
             return "b-shortpure";
         }
@@ -7001,8 +7068,7 @@ impl OptContext {
 
     /// Positional `same_box` for boxes that only exist as `OpRef` in a
     /// Stage-4 registry (`inputarg_refs` / `resop_refs` /
-    /// `phase1_emit_ops_index` / `const_operands`) or in extra_call_pure
-    /// keys imported as positions.
+    /// `phase1_emit_ops_index` / `const_operands`).
     pub(crate) fn same_box_opref(&self, query: OpRef, stored: OpRef) -> bool {
         match (
             self.get_box_replacement_operand_opt(query),
@@ -9970,6 +10036,20 @@ impl OptContext {
             walk_live_op(&pop.preamble_op, visitor);
             if let Some(source) = &pop.same_as_source {
                 source.walk_const_ptr_refs(visitor);
+            }
+        }
+        for entry in &self.imported_short_pure_ops {
+            for arg in &entry.args {
+                arg.walk_const_ptr_refs(visitor);
+            }
+            entry.result.walk_const_ptr_refs(visitor);
+            entry.pop.op.walk_const_ptr_refs(visitor);
+            walk_live_op(&entry.pop.preamble_op, visitor);
+            if let Some(source) = &entry.pop.same_as_source {
+                source.walk_const_ptr_refs(visitor);
+            }
+            for arg in &entry.cache_args {
+                arg.walk_const_ptr_refs(visitor);
             }
         }
         if let Some(builder) = self.active_short_preamble_producer.as_mut() {
