@@ -490,6 +490,15 @@ pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
     pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
 }
 
+/// Word-ABI residual for `w_bytes_from_bytes`. Rebuilds the `&[u8]` from the
+/// pointer and length words a residual call passes, then calls the slice entry.
+#[inline(never)]
+pub(crate) extern "C" fn w_bytes_from_bytes_word(ptr: i64, len: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::w_bytes_from_bytes_word");
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
+    pyre_object::bytesobject::w_bytes_from_bytes(bytes) as usize as i64
+}
+
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
     entries: &mut pyre_object::ObjectDictStorage,
@@ -3050,6 +3059,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::bytesobject::jit_w_bytes_from_u8x4",
         "pyre_object::jit_w_bytes_from_u8x4",
         pyre_object::bytesobject::jit_w_bytes_from_u8x4,
+    );
+    // slice entry; residual calls pass the pointer/length words.
+    cpa2!(
+        &mut entries,
+        "pyre_object::bytesobject::w_bytes_from_bytes",
+        "pyre_object::w_bytes_from_bytes",
+        w_bytes_from_bytes_word,
     );
     pa1!(
         &mut entries,
@@ -7836,10 +7852,10 @@ mod tests {
         pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
         shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        w_bytes_from_bytes_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
+        w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -10197,6 +10213,23 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_object::jit_w_bytes_from_u8"], expected);
+    }
+
+    /// `w_bytes_from_bytes` is a slice entry; residual calls pass the
+    /// pointer/length words.
+    #[test]
+    fn jit_trace_fnaddrs_covers_w_bytes_from_bytes_word() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = w_bytes_from_bytes_word as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::bytesobject::w_bytes_from_bytes"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::w_bytes_from_bytes"], expected);
+        let obj = w_bytes_from_bytes_word(1, 0) as usize as pyre_object::PyObjectRef;
+        unsafe {
+            assert_eq!(pyre_object::bytesobject::w_bytes_len(obj), 0);
+        }
     }
 
     /// `rgc.py` keeps `FinalizerQueue.register_finalizer` opaque with
