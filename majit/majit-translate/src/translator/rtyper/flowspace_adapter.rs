@@ -5816,15 +5816,38 @@ pub(crate) fn derive_subject_inputcells(
             // `*mut T` / `*const T` onto a harvested owner layout is a
             // raw pointer (`SomeInstance.__init__(can_be_None=True)`).
             // `llannotation.py` `lltype_to_annotation` of `lltype.Ptr`;
-            // gckind follows `lltype.py` `Struct._first_struct`. No
-            // Bookkeeper, or a pointee with no layout, is unknown: the
-            // classdef-less shell below. A peeled `pyobject::PyObject`
-            // Input is a non-null instance.
+            // gckind follows `lltype.py` `Struct._first_struct`. A
+            // peeled `pyobject::PyObject` Input is a non-null instance.
             if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
                 && bk.raw_ptr_declared_owner_pointee(root).is_some()
             {
                 cells.push(bk.project_struct_field_type(root));
                 continue;
+            }
+            // A raw pointer whose pointee has no harvested layout is
+            // still nullable. `llannotation.py` `lltype_to_annotation`
+            // of `lltype.Ptr(lltype.OpaqueType(T))` (`rffi.py`
+            // `COpaquePtr`) is `SomePtr`. Seeding that SomePtr here
+            // mismatches the frontend Ref bank (`history.getkind` of a
+            // raw Opaque is `'int'`) and cannot union with `s_None`
+            // (`lltype.py` `SomePtr.can_be_none` is False), so
+            // `is_(p, None)` and a None-arm return fail convert. Field
+            // projection of the same undeclared spelling is the
+            // classdef-less `SomeInstance(can_be_None=True)` intern
+            // (`project_struct_field_type` Impossible pointee). Seed
+            // that shell so `unaryop.py` `SomeInstance.bool_behavior`
+            // and `binaryop.py` `is__default` stay non-constant.
+            if let Some(root) = class_root.as_deref() {
+                let s = match bookkeeper {
+                    Some(bk) => bk.undeclared_raw_ptr_nullable_annotation(root),
+                    None => {
+                        crate::annotator::bookkeeper::undeclared_raw_ptr_nullable_annotation(root)
+                    }
+                };
+                if let Some(s) = s {
+                    cells.push(s);
+                    continue;
+                }
             }
             if class_root.as_deref().is_some_and(|root| match bookkeeper {
                 Some(bk) => bk.is_niche_option_gc_payload_spelling(root),
@@ -8095,31 +8118,40 @@ mod tests {
     }
 
     #[test]
-    fn derive_subject_inputcells_undeclared_uppercase_raw_ptr_is_not_classed() {
+    fn derive_subject_inputcells_undeclared_raw_ptr_is_nullable() {
         let bk = Rc::new(Bookkeeper::new());
-        let mut graph = LegacyGraph::new("raw_undeclared");
-        let entry = graph.startblock;
-        let var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "obj".to_string(),
-                    ty: ValueType::Ref(None),
-                    class_root: Some("*mut SomeUndeclared".to_string()),
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_inputarg_var(entry, var);
-        let cells = derive_subject_inputcells(&graph, Some(&bk))
-            .expect("undeclared raw pointer still seeds a Ref shell");
-        let crate::annotator::model::SomeValue::Instance(s) = &cells[0] else {
-            panic!("must seed SomeInstance, got {:?}", cells[0]);
-        };
-        assert!(
-            !s.can_be_none,
-            "uppercase pointee with no harvested layout is the classdef-less shell, not a nullable instance"
-        );
+        for (name, class_root) in [
+            ("mut_undeclared", "*mut SomeUndeclared"),
+            ("const_undeclared", "*const SomeUndeclared"),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some(class_root.to_string()),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
+                .expect("undeclared raw pointer still seeds a Ref shell");
+            let SomeValue::Instance(s) = &cells[0] else {
+                panic!("{name}: must seed SomeInstance, got {:?}", cells[0]);
+            };
+            assert!(
+                s.classdef.is_none(),
+                "{name}: undeclared pointee is not classed"
+            );
+            assert!(
+                s.can_be_none,
+                "{name}: a raw pointer with no harvested layout stays nullable"
+            );
+        }
     }
 
     #[test]

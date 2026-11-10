@@ -8671,8 +8671,9 @@ fn is_null_is_none_form(ops: &[&SpaceOperation]) -> bool {
     has_none && has_is
 }
 
-/// `<*mut u8>::is_null` / raw-struct pointee is `eq(bool(p), False)`
-/// (`SomePtr.bool` / `AddressRepr.rtype_bool`).
+/// `<*mut u8>::is_null` / word-storage pointee is `eq(bool(p), False)`
+/// (`SomePtr.bool` / `AddressRepr.rtype_bool`). A classed non-GC ADT
+/// that is not word-storage stays `is_(p, None)` below.
 #[test]
 fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     let u8_ptr = serde_json::json!({
@@ -8708,6 +8709,44 @@ fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
     assert!(
         !is_null_is_none_form(&raw_ops),
         "*mut RawStruct is_null must not be is_(p, None); ops={raw_ops:?}"
+    );
+}
+
+/// `<*mut PyType>::is_null` of a classed non-GC ADT that is not
+/// word-storage (`rclass.py` `getgcflavor` / `InstanceRepr`; a type
+/// object stays an instance in `raw_struct_ptr_from_layout`) is
+/// `is_(p, None)` (`rnone.py` `rtype_is_None`). A GC pointer field
+/// keeps the owner off `adt_def_is_raw_storage`.
+#[test]
+fn raw_ptr_is_null_of_classed_nongc_keeps_is_none() {
+    let obj_adt = named_adt(0, vec![]);
+    let obj_ptr = serde_json::json!({"RawPtr": [obj_adt.clone(), "Mut"]});
+    let classed_adt = named_adt(1, vec![]);
+    let classed_ptr = serde_json::json!({"RawPtr": [classed_adt, "Mut"]});
+    let graph = lower_raw_ptr_is_null_gc(
+        classed_ptr,
+        vec![
+            type_decl_struct(
+                0,
+                &["pyobject", "PyObject"],
+                vec![struct_field_json("ob_type", obj_ptr.clone())],
+            ),
+            type_decl_struct(
+                1,
+                &["pyobject", "PyType"],
+                vec![struct_field_json("instantiate", obj_ptr)],
+            ),
+        ],
+        true,
+    );
+    let ops = graph_ops(&graph);
+    assert!(
+        is_null_is_none_form(&ops),
+        "*mut PyType is_null must stay is_(p, None); ops={ops:?}"
+    );
+    assert!(
+        !is_null_bool_form(&ops),
+        "*mut PyType is_null must not be bool; ops={ops:?}"
     );
 }
 

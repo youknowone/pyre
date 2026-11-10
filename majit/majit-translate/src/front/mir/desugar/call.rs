@@ -4780,19 +4780,24 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)`
-                // spelling follows the pointee's declared gckind.
+                // spelling follows intern of the pointer.
                 //
-                // Raw / `llmemory.Address`-like: `eq(bool(p), Constant(False))`
-                // (`llannotation.py` `SomePtr.bool`, `rptr.py`
-                // `PtrRepr.rtype_bool` → `ptr_nonzero`, `raddress.py`
-                // `AddressRepr.rtype_bool` → `adr_ne`). Flowspace has no
-                // `not_` op; `operator.not_` is `bool` plus inversion.
-                // Routing as `getattr(p, "is_null")` dies on `String`.
+                // SomePtr (word-storage ADT, flavor-raw, Address, GCREF,
+                // scalar): `eq(bool(p), Constant(False))` (`llannotation.py`
+                // `SomePtr.bool`, `rptr.py` `PtrRepr.rtype_bool` →
+                // `ptr_nonzero`, `raddress.py` `AddressRepr.rtype_bool` →
+                // `adr_ne`). `SomePtr.can_be_none` is False, so `is_`
+                // would fold. Flowspace has no `not_` op; `operator.not_`
+                // is `bool` plus inversion. Routing as
+                // `getattr(p, "is_null")` dies on `String`.
                 //
-                // GC string (`is_str_family_class_root`) or GC instance
-                // (`registered_gc_ptr_class_root_with`): `is_(p, Constant(None))`
-                // (`rnone.py` `rtype_is_None` → `ptr_iszero`). `Constant(None)`
-                // is Void (`rmodel.py` `pairtype(Repr, VoidRepr).convert_from_to`).
+                // SomeInstance / SomeString (GC string, registered GC
+                // instance, or classed T that is not word-storage):
+                // `is_(p, Constant(None))` (`rnone.py` `rtype_is_None` →
+                // `ptr_iszero`). `Constant(None)` is Void (`rmodel.py`
+                // `pairtype(Repr, VoidRepr).convert_from_to`). Classed T
+                // stays `InstanceRepr` (`rclass.py` `getgcflavor`); a
+                // type object is this case (`raw_struct_ptr_from_layout`).
                 if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
                     let keep_is_none = self.is_raw_ptr_is_null_keeps_is_none(first_arg_ty.as_ref());
                     let res = self

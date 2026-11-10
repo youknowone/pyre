@@ -4896,8 +4896,7 @@ impl<'a> Lowering<'a> {
             ));
         }
         // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`). Split on
-        // the source pointee's gckind (`ptr_pointee_is_gc`, same
-        // predicate as `is_raw_ptr_is_null_keeps_is_none`):
+        // the source pointee's gckind (`ptr_pointee_is_gc`):
         // GC → `annlowlevel.py` `cast_instance_to_gcref` /
         // `lltype.py` `cast_opaque_ptr`; raw → `rffi.py` `cast` /
         // `lltype.py` `force_cast`. Run before the `Ref` gate so a

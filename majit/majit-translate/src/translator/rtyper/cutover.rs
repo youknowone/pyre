@@ -3929,26 +3929,6 @@ fn residual_stub_result_shell(
     }
 }
 
-/// Intern of `*mut T` / `*const T` onto a declared non-GC ADT.
-///
-/// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
-/// struct / Opaque is `lltype.py` `SomePtr`. `SomePtr.bool` folds only
-/// when the pointer is constant (`lltype.py`). A skipped callee whose
-/// declared result is this spelling must intern this shell
-/// (`extfunc.py` `ExtFuncEntry.compute_result_annotation`), not the
-/// classdef-less `ref` instance (`valuetype_to_someshell(Ref(None))`)
-/// whose `SomeInstance.bool` is const-True when `!can_be_None`.
-fn nongc_raw_ptr_class_root_someptr(
-    bk: &crate::annotator::bookkeeper::Bookkeeper,
-    root: &str,
-) -> Option<crate::annotator::model::SomeValue> {
-    let pointee = bk.raw_ptr_declared_owner_pointee(root)?;
-    if bk.owner_layout_gckind_is_gc(pointee) {
-        return None;
-    }
-    Some(bk.nongc_adt_raw_ptr_annotation(pointee))
-}
-
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
 /// a low-level `STR` pointer (`FunctionGraph::return_is_str`) or a
@@ -4062,29 +4042,26 @@ fn declared_return_annotation(
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
-    // Intern residual of `*mut T` / `*const T` onto a declared non-GC
-    // ADT. A GC pointee is stamped unprefixed (`registered_gc_ptr`)
-    // and intern's `SomeInstance`. A non-GC pointee stamps `*mut {root}`;
-    // `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
-    // struct / Opaque is `lltype.py` `SomePtr`. Never SomeInstance:
-    // `SomeInstance.bool` const-True when `!can_be_None` folds the live
+    // `*mut T` / `*const T` onto a harvested owner is the same
+    // annotation an Input or field of that spelling already uses
+    // (`project_struct_field_type`). A classed T stays SomeInstance
+    // (`rclass.py` `getgcflavor` / `InstanceRepr`); SomePtr is an
+    // lltype container with no ClassDef (`llannotation.py`
+    // `lltype_to_annotation`). Widen Instance `can_be_None` from
+    // `return_can_be_none` only to True (`annotator/model.py`
+    // `SomeInstance.noneify`); never narrow. A residual result stays
+    // nullable so `SomeInstance.bool_behavior` does not fold the live
     // null arm (`transform.py` `transform_dead_code`).
-    if let Some(s) = nongc_raw_ptr_class_root_someptr(bk, root) {
-        return Some(s);
-    }
-    if let Some(pointee) = bk.raw_ptr_declared_owner_pointee(root)
-        && bk.owner_layout_gckind_is_gc(pointee)
-    {
-        let classdef = bk
-            .getuniqueclassdef(&bk.intern_class_by_qualname(pointee))
-            .ok()?;
-        return Some(crate::annotator::model::SomeValue::Instance(
-            crate::annotator::model::SomeInstance::new(
-                Some(classdef),
-                graph.return_can_be_none,
-                std::collections::BTreeMap::new(),
-            ),
-        ));
+    if bk.raw_ptr_declared_owner_pointee(root).is_some() {
+        let s = bk.project_struct_field_type(root);
+        return Some(if graph.return_can_be_none {
+            match &s {
+                crate::annotator::model::SomeValue::Instance(_) => s.noneify().unwrap_or(s),
+                _ => s,
+            }
+        } else {
+            s
+        });
     }
     // A `GcStruct._arrayfld` class root is the array itself
     // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
@@ -4461,14 +4438,14 @@ pub(crate) fn register_unsafe_fn_stubs(
                 // GraphStore header for `declared_return_annotation`.
                 // The `"ref"` token alone is the classdef-less instance
                 // (`residual_return_annotation`); a declared `*mut T`
-                // onto a non-GC ADT is SomePtr (`lltype.py`).
+                // uses the field projector of that spelling.
                 if declared_token != Some("ref") && declared_token != Some(GCREF_RETURN_TYPE) {
                     return None;
                 }
-                nongc_raw_ptr_class_root_someptr(
-                    registry.bookkeeper(),
-                    return_class_root.as_deref()?,
-                )
+                let root = return_class_root.as_deref()?;
+                let bk = registry.bookkeeper();
+                bk.raw_ptr_declared_owner_pointee(root)?;
+                Some(bk.project_struct_field_type(root))
             })
             .or_else(|| residual_return_annotation(declared_token, Some(registry.bookkeeper())));
         if alias_existing_lookup(registry, &key) {
@@ -19910,43 +19887,81 @@ mod tests {
     }
 
     #[test]
-    fn declared_return_annotation_nongc_raw_ptr_class_root_is_someptr() {
+    fn declared_return_annotation_nongc_raw_ptr_class_root_follows_projector() {
         use crate::annotator::model::SomeValue;
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
-        // Fixture struct is NOT in `gc_struct_ids` and not a raw-word
-        // owner: a harvested Raw layout. Intern of `*mut T` is SomePtr
-        // (`llannotation.py` `lltype_to_annotation` of
-        // `lltype.Ptr(OpaqueType)`, `lltype.py` `SomePtr`).
+        // Harvested Raw layout, no field rows: the projector of `*mut T`
+        // is the classdef-less nullable instance (Impossible pointee).
         let (layouts, _ids) =
             crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         registry.set_struct_layouts(layouts);
+        let spelling = "*mut ffi_raw::NativeSession";
         let mut graph = LegacyGraph::new("connection_session");
         graph.return_type = Some("ref".into());
-        graph.return_class_root = Some("*mut ffi_raw::NativeSession".into());
+        graph.return_class_root = Some(spelling.into());
         let declared = declared_return_annotation(&registry, &graph)
-            .expect("a raw pointer onto a non-GC struct intern's SomePtr");
-        let SomeValue::Ptr(ptr) = declared else {
-            panic!("expected SomePtr, got {declared:?}");
+            .expect("a raw pointer onto a non-GC struct intern's the projector");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = declared else {
+            panic!("expected projector instance, got {declared:?}");
         };
-        match &ptr.ll_ptrtype.TO {
-            PtrTarget::Opaque(op) => {
-                assert_eq!(op.tag, "ffi_raw::NativeSession");
-                assert_eq!(op._gckind, GcKind::Raw);
-            }
-            PtrTarget::Struct(st) => {
-                assert_eq!(st._gckind, GcKind::Raw);
-            }
-            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
-        }
-        let SomeValue::Bool(b) = ptr.bool() else {
-            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
-        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
         assert!(
-            b.base.const_box.is_none(),
-            "SomePtr.bool does not fold (lltype.py SomePtr.bool)"
+            inst.classdef.is_none(),
+            "no ClassDef-bearing rows: classdef-less instance"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_nongc_classed_raw_ptr_matches_projector() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        // Registered non-GC owner with a ClassDef-bearing projection, not
+        // a raw-word owner (`rclass.py` `getgcflavor` / `InstanceRepr`).
+        let owner = "host::FrameDebugData";
+        let word = "host::RawWord";
+        let (layouts, _ids) = crate::test_support::raw_layout_table_for(&[owner, word]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("flag".to_string(), "u8".to_string())],
+        );
+        fields.fields.insert(
+            word.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(word.to_string());
+        registry.set_struct_fields(Rc::new(fields));
+        registry.set_struct_layouts(layouts);
+
+        let bk = registry.bookkeeper();
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("classed non-GC owner has a ClassDef");
+        let spelling = format!("*mut {owner}");
+        let mut graph = LegacyGraph::new("frame_debug_data_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(spelling.clone());
+        graph.return_can_be_none = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("residual *mut classed owner declares its annotation");
+        let projected = bk.project_struct_field_type(&spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("classed non-GC *mut T is SomeInstance, got {declared:?}");
+        };
+        assert!(inst.can_be_none, "residual *mut T is nullable");
+        assert!(
+            inst.classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &classdef)),
+            "ClassDef-bearing projection, not SomePtr"
         );
     }
 
@@ -19965,55 +19980,49 @@ mod tests {
     }
 
     #[test]
-    fn declared_return_annotation_lowercase_declared_raw_ptr_is_someptr() {
+    fn declared_return_annotation_lowercase_declared_raw_ptr_follows_projector() {
         use crate::annotator::model::SomeValue;
-        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 
         let (layouts, _ids) = crate::test_support::raw_layout_table_for(&["foo::bar_state"]);
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         registry.set_struct_layouts(layouts);
+        let spelling = "*mut foo::bar_state";
         let mut graph = LegacyGraph::new("bar_state_ptr");
         graph.return_type = Some("ref".into());
-        graph.return_class_root = Some("*mut foo::bar_state".into());
+        graph.return_class_root = Some(spelling.into());
         let declared = declared_return_annotation(&registry, &graph)
-            .expect("a raw pointer onto a lowercase declared struct intern's SomePtr");
-        let SomeValue::Ptr(_) = declared else {
-            panic!("expected SomePtr, got {declared:?}");
+            .expect("a raw pointer onto a lowercase declared struct intern's the projector");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(declared, projected);
+        let SomeValue::Instance(inst) = declared else {
+            panic!("expected projector instance, got {declared:?}");
         };
-        let SomeValue::Ptr(ptr) = declared else {
-            unreachable!();
-        };
-        match &ptr.ll_ptrtype.TO {
-            PtrTarget::Opaque(op) => assert_eq!(op.tag, "foo::bar_state"),
-            PtrTarget::Struct(st) => assert_eq!(st._name, "foo::bar_state"),
-            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
-        }
+        assert!(inst.can_be_none, "residual *mut T is nullable");
     }
 
     /// A skipped look-inside / bodyless callee whose declared result is
-    /// `*mut T` onto a non-GC ADT intern's `SomePtr` (`llannotation.py`
-    /// `lltype_to_annotation` of `lltype.Ptr`, `extfunc.py`
-    /// `ExtFuncEntry.compute_result_annotation`). The `"ref"` token
-    /// alone is the classdef-less instance whose `SomeInstance.bool`
-    /// is const-True.
+    /// `*mut T` onto a non-GC ADT intern's the field projector of that
+    /// spelling (`extfunc.py` `ExtFuncEntry.compute_result_annotation`).
+    /// The `"ref"` token alone is the classdef-less instance whose
+    /// `SomeInstance.bool` is const-True when `!can_be_None`.
     #[test]
-    fn register_unsafe_fn_stubs_nongc_raw_ptr_intern_is_someptr() {
+    fn register_unsafe_fn_stubs_nongc_raw_ptr_intern_follows_projector() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::call_registry::CallRegistry;
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
         let (layouts, _ids) =
             crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
         registry.set_struct_layouts(layouts);
+        let spelling = "*mut ffi_raw::NativeSession";
         let specs = vec![(
             vec!["nongc_raw_ptr_session".to_string()],
             Signature::new(vec!["conn".to_string()], None, None),
             Some("ref".to_string()),
             None,
-            Some("*mut ffi_raw::NativeSession".into()),
+            Some(spelling.into()),
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);
         let entry = registry
@@ -20024,33 +20033,19 @@ mod tests {
             .borrow()
             .residual_signature_result()
             .expect("bodyless residual intern");
-        let SomeValue::Ptr(ptr) = intern else {
-            panic!("skipped *mut nongc intern is SomePtr, got {intern:?}");
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        assert_eq!(intern, projected);
+        let SomeValue::Instance(inst) = intern else {
+            panic!("skipped *mut nongc intern is the projector, got {intern:?}");
         };
-        match &ptr.ll_ptrtype.TO {
-            PtrTarget::Opaque(op) => {
-                assert_eq!(op.tag, "ffi_raw::NativeSession");
-                assert_eq!(op._gckind, GcKind::Raw);
-            }
-            PtrTarget::Struct(st) => {
-                assert_eq!(st._gckind, GcKind::Raw);
-            }
-            other => panic!("raw non-GC intern SomePtr must be Opaque or Struct, got {other:?}"),
-        }
-        let SomeValue::Bool(b) = ptr.bool() else {
-            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
-        };
-        assert!(
-            b.base.const_box.is_none(),
-            "SomePtr.bool does not fold (lltype.py SomePtr.bool)"
-        );
+        assert!(inst.can_be_none, "residual *mut T is nullable");
     }
 
     /// Look-inside caller of a skipped callee that returns `null_mut()`
     /// or a real `*mut T` onto a non-GC struct. Frontend `is_null` is
     /// `eq(bool(p), False)` (`desugar/std_call.rs` `is_raw_ptr_is_null`).
     /// Both exits are followed (`annrpython.py` `follow_link`): intern is
-    /// non-constant `SomePtr`, so `SomePtr.bool` does not fold.
+    /// a nullable instance, so `SomeInstance.bool_behavior` does not fold.
     #[test]
     fn look_inside_is_null_of_skipped_nongc_raw_ptr_follows_both_exits() {
         use crate::annotator::bookkeeper::Bookkeeper;
@@ -20152,15 +20147,12 @@ mod tests {
                 .as_ref()
                 .map(|cell| (**cell).clone())
         });
-        let SomeValue::Ptr(ptr) = backend_ann.as_ref().expect("call result annotated") else {
-            panic!("call result is SomePtr, got {backend_ann:?}");
-        };
-        let SomeValue::Bool(b) = ptr.bool() else {
-            panic!("SomePtr.bool is SomeBool, got {:?}", ptr.bool());
+        let SomeValue::Instance(inst) = backend_ann.as_ref().expect("call result annotated") else {
+            panic!("call result is the projector instance, got {backend_ann:?}");
         };
         assert!(
-            b.base.const_box.is_none(),
-            "is_null of a skipped *mut nongc must not fold, got {b:?}"
+            inst.can_be_none,
+            "is_null of a skipped *mut nongc must not fold, got {backend_ann:?}"
         );
         let (ann, _) = registry
             .session_if_started()

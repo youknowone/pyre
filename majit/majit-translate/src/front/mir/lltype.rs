@@ -2461,7 +2461,22 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
             return true;
         }
         if let Some(pointee) = one_level_pointer_pointee(arg, llbc) {
-            return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
+            // `Atomic<*mut T>` is layout-identical `*mut T`. A scalar or
+            // storage-raw pointee is one address word. `pointee_is_raw_word`
+            // is also true for any non-GC struct, including a classed
+            // instance (`rclass.py` `getgcflavor`; `quasiimmut.py`
+            // `QuasiImmut` is an ordinary instance). `lltype.py`
+            // `Struct.__init__` refuses a non-raw container inside a raw
+            // Struct; `SomePtr.setattr` then requires
+            // `annotation_to_lltype` of that instance
+            // (`llannotation.py` `annotation_to_lltype`).
+            return atomic_ptr_pointee_is_storage_raw(
+                pointee,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+                stack,
+            );
         }
     }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
@@ -2495,6 +2510,41 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
     false
+}
+
+/// Stored pointee `T` of `Atomic<*mut T>` is a raw word when `T` is a
+/// scalar, a nested raw pointer to those, or a storage-raw ADT
+/// (`adt_def_is_raw_storage`). `pointee_is_raw_word` first rejects a GC
+/// container, rstr `STR`, and a declared-`Gc` struct; a classed instance
+/// that is merely not a GC header still fails `adt_def_is_raw_storage`
+/// (`rclass.py` `getgcflavor`, `lltype.py` `Struct.__init__`).
+fn atomic_ptr_pointee_is_storage_raw(
+    pointee: &serde_json::Value,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    stack: &mut Vec<u64>,
+) -> bool {
+    let Some(node) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    if node.get("Scalar").is_some() {
+        return true;
+    }
+    if let Some(inner) = one_level_pointer_pointee(node, llbc) {
+        return atomic_ptr_pointee_is_storage_raw(
+            inner,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            stack,
+        );
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    pointee_is_raw_word(node, llbc, gc_struct_ids)
+        && adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack)
 }
 
 /// Whether a field type is a GC pointer (`TO._gckind == 'gc'`).

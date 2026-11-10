@@ -718,28 +718,6 @@ pub(crate) fn raw_struct_ptr_from_layout(
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
 ) -> Option<super::model::SomeValue> {
-    raw_struct_ptr_from_layout_gated(registry, layouts, class_root, true)
-}
-
-/// Like [`raw_struct_ptr_from_layout`], but a declared non-GC ADT that
-/// is not a raw-word owner still mints `SomePtr` of its Raw layout.
-/// Intern residual of `*mut T` onto such a pointee
-/// (`declared_return_annotation`); by-value intern of the ADT stays
-/// `SomeInstance` for getattr.
-pub(crate) fn nongc_struct_ptr_from_layout(
-    registry: &crate::front::StructFieldRegistry,
-    layouts: &crate::codewriter::call::StructLayoutTable,
-    class_root: &str,
-) -> Option<super::model::SomeValue> {
-    raw_struct_ptr_from_layout_gated(registry, layouts, class_root, false)
-}
-
-fn raw_struct_ptr_from_layout_gated(
-    registry: &crate::front::StructFieldRegistry,
-    layouts: &crate::codewriter::call::StructLayoutTable,
-    class_root: &str,
-    require_raw_word_owner: bool,
-) -> Option<super::model::SomeValue> {
     use crate::translator::rtyper::lltypesystem::lltype::{
         ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget,
     };
@@ -768,10 +746,7 @@ fn raw_struct_ptr_from_layout_gated(
     // A dict strategy or a type object is still an instance; only a
     // word-storage ADT is `SomePtr`. An empty set is a fixture that never
     // harvested owners, so the gckind test below stays in force.
-    if require_raw_word_owner
-        && !registry.raw_word_owners.is_empty()
-        && !registry.raw_word_owner_contains(class_root)
-    {
+    if !registry.raw_word_owners.is_empty() && !registry.raw_word_owner_contains(class_root) {
         return None;
     }
     let mut building: HashMap<String, ForwardReference> = HashMap::new();
@@ -786,15 +761,6 @@ fn raw_struct_ptr_from_layout_gated(
         TO: PtrTarget::Struct(*st),
     }));
     Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
-}
-
-/// rffi analog of `lltype.Ptr(lltype.OpaqueType(name))`.
-/// `llannotation.py` `lltype_to_annotation` of that Ptr is `lltype.py` `SomePtr`.
-fn opaque_raw_ptr_annotation(pointee: &str) -> super::model::SomeValue {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr};
-    let ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(OpaqueType::new(pointee))))
-        .expect("OpaqueType is a container");
-    crate::translator::rtyper::llannotation::lltype_to_annotation(LowLevelType::Ptr(Box::new(ptr)))
 }
 
 /// Interned `Ptr(Struct raw)` of a harvested storage-raw enum base.
@@ -877,6 +843,48 @@ pub(crate) fn raw_ptr_declared_owner_pointee<'a>(
     class_root: &'a str,
 ) -> Option<&'a str> {
     let t = class_root.trim();
+    let pointee = raw_ptr_adt_pointee(t)?;
+    owner_layout_is_declared_with(layouts, pointee).then_some(pointee)
+}
+
+/// Pointee of `*mut T` / `*const T` when T is ADT-shaped and has no
+/// harvested owner layout.
+///
+/// `llannotation.py` `lltype_to_annotation` of
+/// `lltype.Ptr(lltype.OpaqueType(T))` (`rffi.py` `COpaquePtr`) is
+/// `SomePtr`. A missing layout does not prove the pointer is non-null.
+pub(crate) fn raw_ptr_undeclared_opaque_pointee<'a>(
+    layouts: Option<&crate::codewriter::call::StructLayoutTable>,
+    class_root: &'a str,
+) -> Option<&'a str> {
+    let t = class_root.trim();
+    let pointee = raw_ptr_adt_pointee(t)?;
+    match layouts {
+        Some(layouts) if owner_layout_is_declared_with(layouts, pointee) => None,
+        _ => Some(pointee),
+    }
+}
+
+/// Classdef-less `SomeInstance(can_be_None=True)` for a `*mut T` /
+/// `*const T` Input with no layout table. `None` when `class_root` is
+/// not that spelling.
+pub(crate) fn undeclared_raw_ptr_nullable_annotation(
+    class_root: &str,
+) -> Option<super::model::SomeValue> {
+    raw_ptr_undeclared_opaque_pointee(None, class_root)?;
+    Some(undeclared_raw_ptr_nullable_instance())
+}
+
+fn undeclared_raw_ptr_nullable_instance() -> super::model::SomeValue {
+    super::model::SomeValue::Instance(super::model::SomeInstance::new(
+        None,
+        true,
+        std::collections::BTreeMap::new(),
+    ))
+}
+
+fn raw_ptr_adt_pointee(class_root: &str) -> Option<&str> {
+    let t = class_root.trim();
     let pointee = t
         .strip_prefix("*const ")
         .or_else(|| t.strip_prefix("*mut "))
@@ -884,24 +892,26 @@ pub(crate) fn raw_ptr_declared_owner_pointee<'a>(
     if crate::front::mir::raw_ptr_pointee_is_non_adt_spelling(t, pointee) {
         return None;
     }
-    owner_layout_is_declared_with(layouts, pointee).then_some(pointee)
+    Some(pointee)
 }
 
-/// Intern residual of `*mut T` / `*const T` onto a declared non-GC ADT
-/// banks as Int (`history.getkind` of `lltype.py` `SomePtr`;
+/// Intern residual of `*mut T` / `*const T` banks as Int when the
+/// field projector of that spelling is `SomePtr` (`history.getkind`;
 /// `llannotation.py` `lltype_to_annotation` of `lltype.Ptr` of a raw
-/// struct / Opaque). The frontend token stays `"ref"`; `CallControl`
-/// remaps that Ref to Int so `getcalldescr` FUNC.RESULT matches the
-/// annotator. A GC pointee intern's `SomeInstance` and stays Ref.
-/// No harvested layout is unknown.
+/// struct). The frontend token stays `"ref"`; `CallControl` remaps that
+/// Ref to Int so `getcalldescr` FUNC.RESULT matches the annotator.
+/// A classed T stays `SomeInstance` (`rclass.py` `getgcflavor` /
+/// `InstanceRepr`) and stays Ref, even when its harvested layout
+/// gckind is not GC. No harvested layout is unknown.
 pub(crate) fn intern_nongc_raw_ptr_result_is_int_bank(
+    registry: &crate::front::StructFieldRegistry,
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
 ) -> bool {
     let Some(pointee) = raw_ptr_declared_owner_pointee(layouts, class_root) else {
         return false;
     };
-    !owner_layout_gckind_is_gc_with(layouts, pointee)
+    raw_struct_ptr_from_layout(registry, layouts, pointee).is_some()
 }
 
 /// Container lltype of `name`: a finished `Struct`, or the `ForwardReference`
@@ -1967,26 +1977,6 @@ impl Bookkeeper {
         raw_struct_ptr_from_layout(registry, &layouts, class_root)
     }
 
-    /// Intern residual of a `*mut T` onto a declared non-GC ADT.
-    ///
-    /// Tries [`Self::raw_struct_ptr_annotation`], then a Raw layout
-    /// that is not a raw-word owner, then `lltype.Ptr(OpaqueType(T))`.
-    /// `llannotation.py` `lltype_to_annotation` of that Ptr is
-    /// `lltype.py` `SomePtr`.
-    pub fn nongc_adt_raw_ptr_annotation(&self, pointee: &str) -> super::model::SomeValue {
-        if let Some(cell) = self.raw_struct_ptr_annotation(pointee) {
-            return cell;
-        }
-        let registry = self.struct_fields.borrow();
-        let layouts = self.struct_layouts.borrow();
-        if let (Some(reg), Some(lay)) = (registry.as_ref(), layouts.as_ref())
-            && let Some(cell) = nongc_struct_ptr_from_layout(reg, lay, pointee)
-        {
-            return cell;
-        }
-        opaque_raw_ptr_annotation(pointee)
-    }
-
     /// True when `pointee` has a harvested layout whose gckind is Gc
     /// (`gc_struct_ids` / first-field ancestor). No layout is not GC.
     pub fn owner_layout_gckind_is_gc(&self, pointee: &str) -> bool {
@@ -2012,6 +2002,25 @@ impl Bookkeeper {
     pub fn raw_ptr_declared_owner_pointee<'a>(&self, class_root: &'a str) -> Option<&'a str> {
         let layouts = self.struct_layouts.borrow();
         raw_ptr_declared_owner_pointee(layouts.as_ref()?, class_root)
+    }
+
+    /// Classdef-less `SomeInstance(can_be_None=True)` for a `*mut T` /
+    /// `*const T` whose pointee has no harvested owner layout.
+    ///
+    /// `llannotation.py` `lltype_to_annotation` of
+    /// `lltype.Ptr(lltype.OpaqueType(T))` (`rffi.py` `COpaquePtr`) is
+    /// `SomePtr`. That intern's `can_be_none` is False (`lltype.py`
+    /// `SomePtr.can_be_none`), so `binaryop.py` `is__default` folds
+    /// `is_(p, None)` and `None ∪ Ptr` fails convert. Field projection
+    /// of the same undeclared spelling is already this classdef-less
+    /// instance (`project_struct_field_type` Impossible pointee).
+    pub fn undeclared_raw_ptr_nullable_annotation(
+        &self,
+        class_root: &str,
+    ) -> Option<super::model::SomeValue> {
+        let layouts = self.struct_layouts.borrow();
+        raw_ptr_undeclared_opaque_pointee(layouts.as_ref(), class_root)?;
+        Some(undeclared_raw_ptr_nullable_instance())
     }
 
     /// Intern predicate for a niche `Option<P>` of a GC instance or
@@ -10415,35 +10424,93 @@ mod tests {
 
     #[test]
     fn intern_nongc_raw_ptr_uses_harvested_layout_not_spelling() {
+        use crate::front::StructFieldRegistry;
+
         let (layouts, _ids) =
             crate::test_support::raw_layout_table_for(&["foo::bar_state", "bar_state"]);
-        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+        let empty = StructFieldRegistry::default();
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &empty,
             &layouts,
             "*mut foo::bar_state"
         ));
-        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &empty,
             &layouts,
             "*const foo::bar_state"
         ));
         assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &empty,
             &layouts,
             "*mut SomeUndeclared"
         ));
+        assert_eq!(
+            raw_ptr_undeclared_opaque_pointee(Some(&layouts), "*mut SomeUndeclared"),
+            Some("SomeUndeclared")
+        );
+        assert_eq!(
+            raw_ptr_undeclared_opaque_pointee(Some(&layouts), "*mut foo::bar_state"),
+            None
+        );
+        assert_eq!(raw_ptr_undeclared_opaque_pointee(None, "*mut u8"), None);
         assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &empty,
             &layouts,
             "PyObjectRef"
         ));
         assert!(!intern_nongc_raw_ptr_result_is_int_bank(
-            &layouts, "*mut u8"
+            &empty, &layouts, "*mut u8"
         ));
         assert!(owner_layout_is_declared_with(&layouts, "foo::bar_state"));
         assert!(!owner_layout_is_declared_with(&layouts, "SomeUndeclared"));
     }
 
     #[test]
-    fn intern_nongc_raw_ptr_gc_layout_is_not_int_bank() {
-        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+    fn intern_nongc_raw_ptr_follows_projector() {
+        use crate::front::StructFieldRegistry;
+
+        let owner = "host::FrameDebugData";
+        let word = "host::RawWord";
+        let (layouts, _ids) = crate::test_support::raw_layout_table_for(&[owner, word]);
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("flag".to_string(), "u8".to_string())],
+        );
+        fields.fields.insert(
+            word.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(word.to_string());
         assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &fields,
+            &layouts,
+            &format!("*mut {owner}")
+        ));
+        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+            &fields,
+            &layouts,
+            &format!("*mut {word}")
+        ));
+        assert!(intern_nongc_raw_ptr_result_is_int_bank(
+            &fields,
+            &layouts,
+            &format!("*const {word}")
+        ));
+    }
+
+    #[test]
+    fn intern_nongc_raw_ptr_gc_layout_is_not_int_bank() {
+        use crate::front::StructFieldRegistry;
+
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("ob_type".to_string(), "PyObjectRef".to_string())],
+        );
+        assert!(!intern_nongc_raw_ptr_result_is_int_bank(
+            &fields,
             &layouts,
             "*mut pyobject::PyObject"
         ));

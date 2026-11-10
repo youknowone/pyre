@@ -4463,6 +4463,160 @@ fn option_instantiation_of_scalar_payload_is_not_a_raw_word() {
     );
 }
 
+/// `Atomic<T>` is Opaque; the stored word is `T` (`tyref_atomic_arg`).
+/// A scalar or a pointer to a storage-raw ADT is a raw word. A pointer
+/// to a classed instance is not (`rclass.py` `getgcflavor`; `lltype.py`
+/// `Struct.__init__` refuses a non-raw container inside a raw Struct;
+/// `quasiimmut.py` `QuasiImmut` is an ordinary instance).
+#[test]
+fn atomic_ptr_to_classed_instance_is_not_a_raw_word() {
+    fn atomic_of(atomic_id: u64, arg: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": atomic_id,
+                "generics": {
+                    "regions": [],
+                    "types": [arg],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+    let vec = vec_decl_json();
+    let atomic = opaque_type_decl(1, &["core", "sync", "atomic", "Atomic"]);
+    let classed = struct_decl(
+        2,
+        ident_path(&["fixture", "ClassedInst"]),
+        serde_json::json!([{
+            "name": "items",
+            "ty": vec_of(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let raw_cell = struct_decl(
+        3,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": i32_ty,
+            "attr_info": null
+        }]),
+        false,
+    );
+    let classed_ptr = serde_json::json!({"RawPtr": [adt_node(2), "Mut"]});
+    let raw_ptr = serde_json::json!({"RawPtr": [adt_node(3), "Mut"]});
+    let owner_of_classed = struct_decl(
+        4,
+        ident_path(&["fixture", "ClassedPtrOwner"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": atomic_of(1, classed_ptr.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_of_raw = struct_decl(
+        5,
+        ident_path(&["fixture", "RawPtrOwner"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": atomic_of(1, raw_ptr.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_of_scalar = struct_decl(
+        6,
+        ident_path(&["fixture", "ScalarAtomicOwner"]),
+        serde_json::json!([{
+            "name": "n",
+            "ty": atomic_of(1, u32_ty.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let view = struct_decl(
+        7,
+        ident_path(&["fixture", "AtomicPtrView"]),
+        serde_json::json!([
+            {
+                "name": "ptr",
+                "ty": option_shared_ref(atomic_of(1, classed_ptr.clone())),
+                "attr_info": null
+            },
+            {
+                "name": "lock",
+                "ty": option_shared_ref(atomic_of(1, classed_ptr.clone())),
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            vec,
+            atomic,
+            classed,
+            raw_cell,
+            owner_of_classed,
+            owner_of_raw,
+            owner_of_scalar,
+            view,
+        ],
+        vec![],
+    );
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    let raw = |ty: serde_json::Value| {
+        field_ty_is_raw_word(&TyRef::Other(ty), &llbc, &gc, immut, &mut Vec::new())
+    };
+    assert!(
+        raw(atomic_of(1, u32_ty)),
+        "Atomic<u32> stored word is the scalar"
+    );
+    assert!(
+        raw(atomic_of(1, raw_ptr)),
+        "Atomic<*mut RawCell> stored word is a C pointer"
+    );
+    assert!(
+        !raw(atomic_of(1, classed_ptr.clone())),
+        "Atomic<*mut ClassedInst> is a pointer to a classed instance"
+    );
+    assert!(
+        !raw(option_shared_ref(atomic_of(1, classed_ptr))),
+        "&Atomic<*mut ClassedInst> is the same stored word as the Atomic"
+    );
+    assert!(
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        "classed instance with a Vec field is not raw storage"
+    );
+    assert!(
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        "RawCell of one integer is raw storage"
+    );
+    assert!(
+        !adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of AtomicPtr to a classed instance is not a raw-word owner"
+    );
+    assert!(
+        adt_def_is_raw_storage(5, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of AtomicPtr to a storage-raw ADT is a raw-word owner"
+    );
+    assert!(
+        adt_def_is_raw_storage(6, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Atomic<u32> is a raw-word owner"
+    );
+    assert!(
+        !adt_def_is_raw_storage(7, &llbc, &gc, immut, &mut Vec::new()),
+        "borrowed view of AtomicPtr to a classed instance is not a raw-word owner"
+    );
+}
+
 /// Dest intern KEY of `Option<&TransparentWord>` erases `&` because the
 /// borrow is the integer word (`tyref_is_borrowed_transparent_scalar` /
 /// nested `repr(transparent)` wrap). A non-transparent one-integer
