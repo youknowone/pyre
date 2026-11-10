@@ -3639,6 +3639,50 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
     (sections_have_markers, any_blocker)
 }
 
+/// True when a helper section [`numbered_helper_sections_blocker_free`]
+/// would scan has a remaining body whose walk, entering every reachable
+/// `inline_call_*` (`pyjitpl.py` `MIFrame.setup`), reaches an unpublished
+/// callee the blackhole would not interpret (`bhimpl_inline_call_*`).
+fn numbered_helper_sections_walk_unpublished_blocker<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent_frames: &[InlineParentFrame],
+) -> bool {
+    let session = ctx.session.borrow();
+    let helper_level_count = session
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+        .count();
+    let split = parent_frames.len().saturating_sub(helper_level_count);
+    for frame in &parent_frames[..split] {
+        if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
+            continue;
+        }
+        if let Some(pc) = frame.resume_marker_jit_pc {
+            if helper_walk_reaches_unpublished_blocker(
+                frame.jitcode_index as usize,
+                pc,
+                &mut Vec::new(),
+            ) {
+                return true;
+            }
+        }
+    }
+    for frame in &parent_frames[split..] {
+        if let Some(pc) = frame.resume_marker_jit_pc {
+            if helper_walk_reaches_unpublished_blocker(
+                frame.jitcode_index as usize,
+                pc,
+                &mut Vec::new(),
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Resume of a guard at `op_pc` inside a numbered helper chain:
 /// `parent_frames` plus the innermost helper section at the guard.
 ///
@@ -3752,6 +3796,11 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
 /// [`helper_resume_reaches_blocker`] consults, cover every helper the
 /// remaining body can still enter.
 ///
+/// Admission predicts the walk, which enters callable inline callees
+/// (`pyjitpl.py` `MIFrame.setup`), while the blackhole calls them natively
+/// (`bhimpl_inline_call_*`); an unpublished blocker behind a callable callee
+/// is reached by the walk after the callback has run.
+///
 /// `post_call_pc` is the residual's next jitcode pc — the same value
 /// the later `ctx.live_after_jit_pc = op.next_pc` assigns before those
 /// guards are captured — so this numbers the helper section at the
@@ -3811,7 +3860,10 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
         Ok((frames, runnable)) => {
             let (sections_have_markers, any_blocker) =
                 numbered_helper_sections_blocker_free(ctx, &frames);
-            runnable && sections_have_markers && !any_blocker
+            runnable
+                && sections_have_markers
+                && !any_blocker
+                && !numbered_helper_sections_walk_unpublished_blocker(ctx, &frames)
         }
         Err(_) => false,
     }
