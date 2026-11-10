@@ -7805,7 +7805,10 @@ fn with_hint_walk_context<R>(
 /// `pyjitpl.py capture_resumedata` numbers only the `MIFrame`s already on
 /// `metainterp.framestack`; a residual call does not push one. Numbering a
 /// call-entry section here made FBW walk the helper during the Python loop
-/// body and drop FOR_ITER items (`reversed_disabled`).
+/// body and drop FOR_ITER items (`reversed_disabled`). A `CallResult` helper
+/// whose caller cannot pause past the call declines the descent: resuming at
+/// the CALL boundary would re-run effects the helper already applied, so it
+/// stays a residual call.
 #[test]
 fn portal_helper_call_result_does_not_number_a_call_entry_section() {
     use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
@@ -7891,12 +7894,15 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
                 entry_trace_index: 0,
                 live: None,
             });
-            let level = helper_subwalk_level(wc, 0, HelperReturn::CallResult)
-                .expect("portal helper CallResult is Ok");
-            assert!(
-                level.is_none(),
-                "capture_resumedata numbers only framestack MIFrames; a portal helper stays at the CALL"
-            );
+            match helper_subwalk_level(wc, 0, HelperReturn::CallResult) {
+                Err(e) => assert!(
+                    matches!(e, InlineCallerFrameDecline::Unavailable),
+                    "portal CallResult decline is the compute_inline_caller_frame error, got {e:?}"
+                ),
+                Ok(Some(_)) | Ok(None) => panic!(
+                    "a portal CallResult helper whose caller cannot pause past the call declines the descent rather than numbering a section or resuming at the CALL boundary"
+                ),
+            }
         },
     );
 }
