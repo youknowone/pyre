@@ -1,12 +1,14 @@
 use super::{
-    adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
+    adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
+    charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
     is_niche_option_gc_payload_spelling, is_raw_ptr_to_str_family_spelling,
     is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
-    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
-    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
-    tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
+    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
+    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -436,12 +438,34 @@ fn node_is_string_value_uses_declaration_identity() {
     ));
 }
 
+/// rstr `STR` pointee (`Utf8Str`) is GC (`TO._gckind == 'gc'`) even
+/// without a `GcType` seed. A raw struct cannot hold that pointer
+/// (`adt_def_is_raw_storage`).
+#[test]
+fn utf8str_pointee_is_not_a_raw_word() {
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let llbc = window_llbc(vec![utf8], vec![]);
+    let node = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let gc = std::collections::HashSet::new();
+    assert!(
+        !super::pointee_is_raw_word(&node, &llbc, &gc),
+        "Utf8Str pointee is rstr STR, not a raw word"
+    );
+}
+
 /// A `dont_look_inside` residual of `*mut Utf8Str` is nullable even when
 /// Utf8Str has no `GcType` impl. `registered_gc_ptr_class_root_with` is
 /// the gckind answer and stays None; nullability follows the raw
 /// pointer (`model.py` `SomeString.noneify`). `binaryop.py`
 /// `is__default` must not fold `is_(ret, None)`. A by-value / `&`
-/// string stays non-nullable.
+/// string stays non-nullable. rstr `STR` is still a GC pointee
+/// (`is_rstr_str_family_spelling` / `pointee_is_raw_word`).
 #[test]
 fn dont_look_inside_return_raw_str_ptr_is_nullable() {
     use crate::annotator::binaryop::is__default;
@@ -4207,6 +4231,353 @@ fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
             &std::collections::HashSet::<String>::new()
         ),
         "&mut i64"
+    );
+}
+
+/// CAST intern suffixes keep `&T` / `&mut T` (`charon_type_value_to_enum_arg`).
+/// Class-root lookup still strips the referent (`charon_type_value_to_ast_string`).
+/// Stripping the CAST suffix made `Option<&T>` intern as the tagged
+/// `Option<T>` class (`model.py` `SomeObject.noneify`).
+#[test]
+fn charon_ref_renders_ampersand_prefix() {
+    let llbc = empty_llbc();
+    let tomb = no_tombstoned_leaves();
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let shared = serde_json::json!({"Ref": ["Erased", i64_ty.clone(), "Shared"]});
+    let mutable = serde_json::json!({"Ref": ["Erased", i64_ty, "Mut"]});
+    assert_eq!(
+        charon_type_value_to_enum_arg(&shared, &llbc, 0, &tomb),
+        "&i64"
+    );
+    assert_eq!(
+        charon_type_value_to_enum_arg(&mutable, &llbc, 0, &tomb),
+        "&mut i64"
+    );
+    assert_eq!(charon_type_value_to_ast_string(&shared, &llbc, 0), "i64");
+    assert_eq!(charon_type_value_to_ast_string(&mutable, &llbc, 0), "i64");
+}
+
+/// Dest intern KEY of a generic ADT keeps `&` only when the referent is
+/// raw storage (`adt_def_is_raw_storage`). `Option<&Raw>` is then not
+/// the tagged `Option<Raw>` class (`model.py` `SomeObject.noneify`),
+/// and not `Option<i64>`. A scalar `&i64` is the integer itself, so
+/// the prefix is erased. Top-level `&T` still strips.
+#[test]
+fn option_of_ref_to_raw_storage_keeps_ampersand() {
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let opt_ref_raw = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let opt_raw = option_adt_node(0, adt_node(1));
+    let opt_ref_i64 = option_adt_node(0, option_shared_ref(i64_ty.clone()));
+    let opt_i64 = option_adt_node(0, i64_ty.clone());
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_ref_raw), &llbc),
+        "Option<&RawCell>",
+        "dest intern KEY of Option<&Raw> keeps &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_raw), &llbc),
+        "Option<RawCell>",
+        "by-value Option<Raw> is the tagged class"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_ref_i64), &llbc),
+        "Option<i64>",
+        "dest intern KEY of Option<&i64> erases scalar &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(opt_i64), &llbc),
+        "Option<i64>",
+        "Option<i64> dest intern KEY is the tagged integer Option"
+    );
+    assert_eq!(
+        charon_type_value_to_ast_string(&option_shared_ref(i64_ty), &llbc, 0),
+        "i64",
+        "top-level &T still strips for class-root lookup"
+    );
+}
+
+/// Variant payload `&mut Raw` is the interior pointer word
+/// (`history.getkind` of `Ptr` when `TO._gckind == raw`). Parameter dest
+/// overlay of the same borrow stays `Ref` (`ty_is_raw_address` /
+/// `RootScope::get`).
+#[test]
+fn enum_payload_of_ref_to_raw_storage_is_int() {
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), raw], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = no_tombstoned_leaves();
+    let flavors = std::collections::HashSet::<String>::new();
+    let mut_ref = TyRef::Other(serde_json::json!({
+        "Ref": ["Erased", adt_node(1), "Mut"]
+    }));
+    assert_eq!(
+        tyref_to_value_type(&mut_ref, &llbc),
+        ValueType::Ref(None),
+        "a borrowed raw struct parameter stays a reference"
+    );
+    assert_eq!(
+        tyref_enum_payload_value_type(&mut_ref, &llbc, tomb, &gc, &flavors),
+        ValueType::Int,
+        "Result Ok / Option Some of &mut Raw is the interior pointer word"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &mut_ref, &mut_ref, true, false, None, &llbc, tomb, &gc, &flavors
+        ),
+        ValueType::Int,
+        "enum payload FieldRead of &mut Raw follows intern ROW Int"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &mut_ref, &mut_ref, false, true, None, &llbc, tomb, &gc, &flavors
+        ),
+        ValueType::Int,
+        "closure-env capture of &mut Raw is the interior pointer word"
+    );
+}
+
+/// Closure-argument tuple of `&Raw` keeps `&` so `and_then` write and
+/// `call_once` read share `Tuple<&RawCell>` (`render_adt_type_args`).
+#[test]
+fn payload_tuple_suffix_of_ref_to_raw_storage_keeps_ampersand() {
+    let raw = struct_decl(
+        0,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![raw], vec![]);
+    let payload = TyRef::Other(option_shared_ref(adt_node(0)));
+    assert_eq!(
+        payload_tuple_suffix(&payload, &llbc),
+        "<&RawCell>",
+        "Tuple intern KEY of &Raw keeps &"
+    );
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let scalar = TyRef::Other(option_shared_ref(i64_ty));
+    assert_eq!(
+        payload_tuple_suffix(&scalar, &llbc),
+        "<i64>",
+        "Tuple intern KEY of &i64 erases scalar &"
+    );
+}
+
+/// Charon `monomorphize:false`: a field typed `Option<Raw>` is the
+/// Option template plus type args. The template (TypeVar payload) is
+/// not raw storage; the instantiation is, so the owner is too.
+#[test]
+fn option_instantiation_of_raw_payload_is_a_raw_word() {
+    let option = option_enum(0);
+    let raw = struct_decl(
+        1,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner = struct_decl(
+        2,
+        ident_path(&["fixture", "OwnerBag"]),
+        serde_json::json!([{
+            "name": "cell",
+            "ty": option_adt_node(0, adt_node(1)),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option, raw, owner], vec![]);
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    assert!(
+        !adt_def_is_raw_storage(0, &llbc, &gc, immut, &mut Vec::new()),
+        "Option TypeDecl template (TypeVar payload) is not raw storage"
+    );
+    let inst = TyRef::Other(option_adt_node(0, adt_node(1)));
+    assert!(
+        field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<RawCell> instantiation is a raw word"
+    );
+    assert!(
+        adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<RawCell> is raw storage"
+    );
+}
+
+/// Scalar-only type args do not substitute: `Option<i64>` stays the
+/// TypeDecl template (TypeVar payload), so an owner of that field is
+/// not a raw-word owner (`getfield_gc` of the tagged Instance).
+#[test]
+fn option_instantiation_of_scalar_payload_is_not_a_raw_word() {
+    let option = option_enum(0);
+    let owner = struct_decl(
+        1,
+        ident_path(&["fixture", "OwnerBag"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": option_adt_node(0, serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![option, owner], vec![]);
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    let inst = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+    ));
+    assert!(
+        !field_ty_is_raw_word(&inst, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<i64> instantiation stays the tagged Instance intern"
+    );
+    assert!(
+        !adt_def_is_raw_storage(1, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<i64> is not raw storage"
+    );
+}
+
+/// Dest intern KEY of `Option<&TransparentWord>` erases `&` because the
+/// borrow is the integer word (`tyref_is_borrowed_transparent_scalar` /
+/// nested `repr(transparent)` wrap). A non-transparent one-integer
+/// tuple struct is still interior `Ptr(T)` and keeps `&`.
+#[test]
+fn option_of_ref_to_integer_word_erases_ampersand() {
+    let inner = struct_decl(
+        1,
+        ident_path(&["fixture", "InnerWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U16"}}},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let outer = struct_decl(
+        2,
+        ident_path(&["fixture", "OuterWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": adt_node(1),
+            "attr_info": null
+        }]),
+        true,
+    );
+    let raw_word = struct_decl(
+        3,
+        ident_path(&["fixture", "RawWord"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), inner, outer, raw_word],
+        vec![],
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(1)))),
+            &llbc
+        ),
+        "Option<InnerWord>",
+        "dest intern KEY of Option<&transparent u16 wrap> erases &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(1))), &llbc),
+        "Option<InnerWord>",
+        "by-value Option<transparent u16 wrap> is the integer Option"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(2)))),
+            &llbc
+        ),
+        "Option<OuterWord>",
+        "dest intern KEY of Option<&nested transparent wrap> erases &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(2))), &llbc),
+        "Option<OuterWord>",
+        "by-value Option<nested transparent wrap> is the integer Option"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(
+            &TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(3)))),
+            &llbc
+        ),
+        "Option<&RawWord>",
+        "dest intern KEY of Option<&non-transparent integer tuple> keeps &"
+    );
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(0, adt_node(3))), &llbc),
+        "Option<RawWord>",
+        "by-value Option<non-transparent integer tuple> is the tagged class"
+    );
+}
+
+/// `harvest_declared_gc_facts` walks a tuple-struct field0 through
+/// `field_is_zst` → `is_unit_type` → `charon_type_value_to_ast_string`.
+/// That spelling used to `get_or_init` `value_type_inputs` and deadlock
+/// on the same OnceLock (`orig_parse_format_link_args_are_defined`).
+#[test]
+fn render_adt_type_args_does_not_reenter_value_type_inputs() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let inner = struct_decl(
+        0,
+        ident_path(&["fixture", "InnerWrap"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": option_adt_node(1, i64_ty.clone()),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let option = option_enum(1);
+    let outer = struct_decl(
+        2,
+        ident_path(&["fixture", "OuterBag"]),
+        serde_json::json!([{
+            "name": "cell",
+            "ty": adt_node(0),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![inner, option, outer], vec![]);
+    assert_eq!(
+        super::tyref_to_ast_string(&TyRef::Other(option_adt_node(1, i64_ty)), &llbc),
+        "Option<i64>",
+        "first dest intern KEY must not wait on value_type_inputs"
     );
 }
 

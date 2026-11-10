@@ -2307,6 +2307,23 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
 ) -> bool {
+    adt_def_is_raw_storage_at(def_id, None, llbc, gc_struct_ids, immutable_fields, stack)
+}
+
+/// [`adt_def_is_raw_storage`] of `def_id`, with TypeDecl TypeVars replaced
+/// by `instantiation`'s `Adt.generics.types` when present
+/// (`tyref_subst_bound_typevar`). Charon runs `monomorphize:false`, so a
+/// field typed `Option<Raw>` names the Option template; the template's
+/// Some payload is a TypeVar and is not a raw word, while the
+/// instantiation's payload is.
+fn adt_def_is_raw_storage_at(
+    def_id: u64,
+    instantiation: Option<&serde_json::Value>,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    stack: &mut Vec<u64>,
+) -> bool {
     if stack.contains(&def_id) {
         // A pointer cycle. By-value nesting cannot repeat a def without a
         // pointer, so this is not a depth cutoff and it is not evidence
@@ -2338,19 +2355,29 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     if !carrier.is_empty() && td.item_meta.name_path() == carrier {
         return false;
     }
+    let container = instantiation.map(|node| TyRef::Other(node.clone()));
     stack.push(def_id);
     let ok = match &td.kind {
         TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
-            adt_fields_are_raw_storage(td, fields, llbc, gc_struct_ids, immutable_fields, stack)
+            adt_fields_are_raw_storage_in(
+                td,
+                fields,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+                stack,
+                container.as_ref(),
+            )
         }
         TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
-            adt_fields_are_raw_storage(
+            adt_fields_are_raw_storage_in(
                 td,
                 &variant.fields,
                 llbc,
                 gc_struct_ids,
                 immutable_fields,
                 stack,
+                container.as_ref(),
             )
         }),
         TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
@@ -2367,24 +2394,29 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
 /// Fields of `owner` are raw words, or a GC pointer listed in
 /// `_immutable_fields_` (`rewrite_op_getfield`: only a non-pure
 /// `getfield_raw_r` is refused).
-pub(in crate::front::mir) fn adt_fields_are_raw_storage(
+fn adt_fields_are_raw_storage_in(
     owner: &TypeDecl,
     fields: &[FieldDecl],
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
+    container: Option<&TyRef>,
 ) -> bool {
     fields.iter().enumerate().all(|(i, field)| {
+        let ty = match container {
+            Some(c) => tyref_subst_bound_typevar(&field.ty, c, llbc),
+            None => clone_tyref(&field.ty),
+        };
         // A Void field occupies no storage (`lltype.py`
         // `Struct._names_without_voids`).
-        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+        if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) {
             return true;
         }
-        if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
+        if field_ty_is_raw_word(&ty, llbc, gc_struct_ids, immutable_fields, stack) {
             return true;
         }
-        field_ty_is_gc_pointer(&field.ty, llbc, gc_struct_ids)
+        field_ty_is_gc_pointer(&ty, llbc, gc_struct_ids)
             && field_declared_immutable(owner, &field_decl_name(i, field), immutable_fields)
     })
 }
@@ -2438,6 +2470,27 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
+        }
+        // Charon `monomorphize:false`: a field typed `Option<Raw>` is
+        // the Option template plus this node's type args. Walk the
+        // TypeDecl with TypeVars replaced (`tyref_subst_bound_typevar`)
+        // so the instantiation is a raw word and the template (TypeVar
+        // payload) is not. Scalar-only type args stay on the template:
+        // `Option<usize>` is a raw word by layout, but intern is still
+        // the tagged Instance and assembler `getfield_raw_r` of that
+        // field is refused (`rewrite_op_getfield`).
+        if !adt_node_type_subst(node, llbc).is_empty() {
+            if adt_node_type_subst_names_an_adt(node, llbc) {
+                return adt_def_is_raw_storage_at(
+                    def_id,
+                    Some(node),
+                    llbc,
+                    gc_struct_ids,
+                    immutable_fields,
+                    stack,
+                );
+            }
+            return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
         }
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
@@ -2495,6 +2548,15 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
             struct_id_for_type_decl(td),
             &strip_crate_prefix(&td.item_meta.name_path()),
         ) {
+            return false;
+        }
+        // rstr `STR` (`GcStruct('rpy_string')`): `TO._gckind == 'gc'`.
+        // A `*mut Utf8Str` / `*mut BytesBlock` is a GC pointer, so an
+        // enum that holds one (`BlockRoute::Managed`) is not a raw
+        // word bag (`adt_def_is_raw_storage`).
+        let path = td.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        if is_rstr_str_family_spelling(leaf) {
             return false;
         }
         return match &td.kind {
@@ -2995,6 +3057,16 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_option_of_uninhabited(ty, llbc) {
         return ValueType::Void;
     }
+    // A pointer-niche Option is the payload word, not the Option enum
+    // class (`model.py` `SomeObject.noneify`). Name the pointee so dest
+    // intern's `SomePtr` of that owner (`by_value_payload_annotation`)
+    // rather than the tagged `Option<T>` class `tyref_to_ast_string`
+    // would strip `&` onto.
+    if tyref_is_niche_option(ty, llbc)
+        && let Some(root) = niche_option_pointee_class_root(ty, llbc, tombstoned)
+    {
+        return ValueType::Ref(Some(root));
+    }
     // A payload-carrying enum (any variant has a non-ZST field) is a
     // `SomeInstance` of its interned enum-base classdef.  Fieldless
     // (C-like) enums are already `Int` above; a mixed enum would
@@ -3246,6 +3318,29 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             {
                 return ValueType::Int;
             }
+            // A captured / variant `&Raw` is the same interior pointer
+            // (`tyref_is_raw_value` declines a pointer). Intern ROW is
+            // `*mut T`; dest overlay `Ref(None)` unioned Instance with
+            // that SomePtr (`history.getkind` of `Ptr`).
+            if (tyref_is_raw_storage_borrow(place_ty, llbc, gc_struct_ids)
+                || tyref_is_raw_storage_borrow(field_ty, llbc, gc_struct_ids))
+                && flavor_raw_pointer_class_root(
+                    place_ty,
+                    llbc,
+                    tombstoned,
+                    raw_alloc_flavor_structs,
+                )
+                .is_none()
+                && flavor_raw_pointer_class_root(
+                    field_ty,
+                    llbc,
+                    tombstoned,
+                    raw_alloc_flavor_structs,
+                )
+                .is_none()
+            {
+                return ValueType::Int;
+            }
             tyref_to_value_type_with(
                 field_ty,
                 llbc,
@@ -3434,6 +3529,18 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
+    }
+    // A variant payload `&Raw` / `&mut Raw` is the interior pointer word
+    // (`history.getkind` of `Ptr` when `TO._gckind == raw`; intern ROW
+    // `intern_type_arg_payload_spelling`). [`tyref_to_value_type_with`]
+    // leaves a raw-struct borrow `Ref` (`ty_is_raw_address` /
+    // `RootScope::get`); wrapping `Result::ok` of that payload into the
+    // niche Option then unions `Ref(None)` with the Option dest `Int`.
+    // A flavor-raw pointer stays `Ref(Some(root))`.
+    if tyref_is_raw_storage_borrow(ty, llbc, gc_struct_ids)
+        && flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs).is_none()
+    {
+        return ValueType::Int;
     }
     // A payload slot read straight out of `generics.types` may still carry
     // the `Value` / `Deduplicated` wrappers. [`tyref_to_value_type_with`]
@@ -5273,6 +5380,25 @@ pub(in crate::front::mir) fn tyref_is_rust_heap_string(ty: &TyRef, llbc: &Llbc) 
 /// produced by synthesized roots).
 pub(in crate::front::mir) fn is_rust_heap_string_root(root: &str) -> bool {
     matches!(root, "String" | "string::String")
+}
+
+/// Leaf spellings of the rstr `STR` family (`ValueType::Str`).
+///
+/// `rstr.py` `GcStruct('rpy_string', ...)`: `TO._gckind == 'gc'`.
+/// Shared by [`super::tuple_field_value_type`] and the raw-storage
+/// pointee predicate (`pointee_is_raw_word`). A Rust-heap `String` is
+/// not this family (`is_rust_heap_string_root`).
+pub(crate) fn is_rstr_str_family_spelling(spelling: &str) -> bool {
+    matches!(
+        spelling,
+        "str"
+            | "Wtf8"
+            | "Wtf8Buf"
+            | "Utf8Str"
+            | "UnicodeValueStorage"
+            | "BytesBlock"
+            | "LowlevelStringHeader"
+    )
 }
 
 /// Class identity of `pyre_object::pyobject::PyObject`, the `W_Root` port
@@ -7819,6 +7945,21 @@ pub(crate) fn same_nominal_adt(llbc: &Llbc, a: u64, b: u64) -> bool {
         && x.item_meta.name_path() == y.item_meta.name_path()
 }
 
+/// A type argument, after peeling `&` / `*mut` / aliases, names an ADT.
+/// Scalar-only instantiations (`Option<usize>`) stay on the TypeDecl
+/// template so intern remains the tagged Instance.
+fn adt_node_type_subst_names_an_adt(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    adt_node_type_subst(node, llbc).iter().any(|arg| {
+        let Some(mut inner) = strip_ty_indirections(arg, llbc) else {
+            return false;
+        };
+        while let Some(pointee) = one_level_pointer_pointee(inner, llbc) {
+            inner = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+        }
+        adt_node_def_id(inner).is_some()
+    })
+}
+
 /// Instantiated type arguments of an ADT node (`generics.types`).
 pub(in crate::front::mir) fn adt_node_type_subst(
     node: &serde_json::Value,
@@ -8943,6 +9084,9 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
     if !matches!(decl.kind, TypeDeclKind::Struct(_)) || decl.layout.is_none() {
         return None;
     }
+    // `raw_address_owner_root` also requires a sized borrow. A recorded
+    // layout still names the owner when that peel misses
+    // (`adt_node_class_root_with`).
     raw_address_owner_root(
         &payload,
         llbc,
@@ -8950,6 +9094,7 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
         &inputs.gc_struct_ids,
         &inputs.raw_alloc_flavor_structs,
     )
+    .or_else(|| adt_node_class_root_with(adt, llbc, tombstoned))
 }
 
 /// Paint of a niche `Option<P>` whose payload is a rust-heap `String`,
@@ -9024,6 +9169,29 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
         return Some(ValueType::Int);
     }
     None
+}
+
+/// Pointee class of a pointer-niche `Option<&T>` / `Option<&mut T>`.
+///
+/// Dest intern's that class (`Lowering::option_payload_instance_class_root`);
+/// a harvested `raw_word_owner` then stays `SomePtr`
+/// (`Bookkeeper::by_value_payload_annotation`). `Option<*mut T>` keeps
+/// today's payload-class CAST (`option_residual_narrow_root`). A remaining
+/// pointer after one `Ref` (`Option<&*mut T>`) is a slot address
+/// (`rdict.py` `ll_get`), not class `T`.
+fn niche_option_pointee_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
+    let payload_node = tyref_node(&payload, llbc).and_then(|n| type_node_peel_aliases(n, llbc))?;
+    if option_payload_remaining_pointer(payload_node, llbc) {
+        return None;
+    }
+    let pointee = payload_node.as_object()?.get("Ref")?.as_array()?.get(1)?;
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// `true` when Charon's resolved layout for `ty` is a two-variant
@@ -11548,7 +11716,8 @@ pub(in crate::front::mir) fn json_ty_is_objectptr(node: &serde_json::Value, llbc
 /// strings instead of `TyRef::label()` placeholders.
 ///
 /// Format contract:
-///   - references are STRIPPED (`&T` / `&mut T` -> `T`);
+///   - references keep `&T` / `&mut T` so `Option<&T>` is not the tagged
+///     `Option<T>` class (`model.py` `SomeObject.noneify`);
 ///   - raw pointers keep `*mut ` / `*const ` prefixes;
 ///   - integer / float / bool / char primitives use their Rust spelling;
 ///   - `Vec<T>` / `Option<T>` / `HashMap<K,V>` etc. are angle-bracketed
@@ -11590,11 +11759,11 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         return spelling;
     }
     // A reference field is one pointer repr, not an inline copy of its
-    // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
-    // annotation lookup, but feeding that erased spelling to the physical
-    // layout registry makes `&Engine` recursively enumerate every `Engine`
-    // field inside the containing struct.  RPython's lltype row here is
-    // `Ptr(T)`, so retain the reference constructor at the layout boundary.
+    // referent.  `tyref_to_ast_string` strips `&T` for nominal annotation
+    // lookup; feeding that erased spelling to the physical layout
+    // registry makes `&Engine` recursively enumerate every `Engine`
+    // field.  RPython's lltype row here is `Ptr(T)`, so retain the
+    // reference constructor at the layout boundary.
     //
     // Checked before handle spelling: `transparent_handle_field_spelling`
     // peels `&` via `strip_ty_wrappers` and would paint a captured
@@ -11995,6 +12164,24 @@ pub(in crate::front::mir) fn narrow_item_array_type_id(
     (item_type == majit_ir::value::Type::Int && item_size < 8).then_some(identity)
 }
 
+/// `{"Ref": [region, ty, kind]}` as `&T` / `&mut T`.
+fn render_charon_ref(
+    r: &serde_json::Value,
+    render_inner: impl FnOnce(&serde_json::Value) -> String,
+) -> String {
+    let Some(arr) = r.as_array() else {
+        return "??ref_shape".to_string();
+    };
+    let Some(inner) = arr.get(1) else {
+        return "??ref_shape".to_string();
+    };
+    let prefix = match arr.get(2).and_then(serde_json::Value::as_str) {
+        Some(kind) if kind.eq_ignore_ascii_case("Mut") => "&mut ",
+        _ => "&",
+    };
+    format!("{prefix}{}", render_inner(inner))
+}
+
 /// Recursive worker for [`tyref_to_ast_string`] operating on a raw
 /// Charon type-expression `Value` (a TyRef body or a nested
 /// generic-argument type).  `depth` guards against pathological cycles.
@@ -12035,7 +12222,11 @@ pub(crate) fn charon_type_value_to_ast_string(
     if let Some(lit) = obj.get("Scalar") {
         return charon_literal_to_ast_string(lit);
     }
-    // References are stripped to their referent (`&T` / `&mut T` -> `T`).
+    // Class-root lookup strips `&T` / `&mut T` to the referent. CAST
+    // intern suffixes keep the constructor in [`charon_type_value_to_enum_arg`]
+    // so `Option<&T>` is not the tagged `Option<T>` class
+    // (`intern_niche_option_payload_spelling`; `model.py`
+    // `SomeObject.noneify`).
     if let Some(r) = obj.get("Ref") {
         if let Some(arr) = r.as_array() {
             // `{"Ref": [region, ty, kind]}`.
@@ -12553,6 +12744,141 @@ pub(in crate::front::mir) fn charon_int_kind_to_rust(kind: &str, signed: bool) -
     }
 }
 
+/// By-value intern of this ADT is the integer word (`history.getkind`
+/// of the payload). `&T` is that same word: a fieldless-enum borrow is
+/// the tag, and a `repr(transparent)` scalar wrapper is the inner
+/// integer (`tyref_is_borrowed_transparent_scalar` /
+/// `discover_transparent_scalar_kinds` /
+/// `external_transparent_scalar_kinds`). The intern-key spelling of a
+/// generic ADT type argument therefore erases `&`. A non-transparent
+/// one-integer tuple struct is still interior `Ptr(T)` and is not this.
+fn adt_def_is_integer_word(def_id: u64, llbc: &Llbc, stack: &mut Vec<u64>) -> bool {
+    if stack.contains(&def_id) {
+        return false;
+    }
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    if type_decl_is_fieldless_enum(td, llbc) {
+        return true;
+    }
+    if llbc
+        .transparent_scalar_kind(&td.item_meta.name_path())
+        .is_some()
+    {
+        return true;
+    }
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    if !td.is_repr_transparent() {
+        return false;
+    }
+    let [field] = fields.as_slice() else {
+        return false;
+    };
+    if one_word_integer_scalar_value_type(&field.ty, llbc).is_some() {
+        return true;
+    }
+    let Some(node) = tyref_node(&field.ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))
+    else {
+        return false;
+    };
+    let Some(inner_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    stack.push(def_id);
+    let ok = adt_def_is_integer_word(inner_id, llbc, stack);
+    stack.pop();
+    ok
+}
+
+/// `ty` is `&T` / `&mut T` of raw storage (`type_arg_referent_is_raw_storage`).
+/// Intern ROW of that argument is interior `Ptr(T)` (`history.getkind` of
+/// `Ptr` when `TO._gckind == raw`). A scalar, integer-word, GC, str, or
+/// closure borrow is not this. Kept out of [`ty_is_raw_address`]: a
+/// borrowed raw struct parameter stays `Ref` (`RootScope::get`).
+fn tyref_is_raw_storage_borrow(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    type_arg_referent_is_raw_storage(node, llbc, gc_struct_ids)
+}
+
+/// Keep `&` / `&mut` on a generic ADT type argument when the referent is
+/// raw storage (`adt_def_is_raw_storage`). By-value that ADT is inline
+/// (or its own raw-malloc intern); `&T` is an interior pointer
+/// (`lltype` `Ptr(T)` / `_interior_ptr`). A scalar, str-family, GC
+/// class, closure, or integer-word referent (`adt_def_is_integer_word`)
+/// is the same representation with or without `&`, so the prefix is
+/// erased — the same as top-level [`charon_type_value_to_ast_string`].
+fn type_arg_referent_is_raw_storage(
+    t: &serde_json::Value,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let node = strip_ty_indirections(t, llbc).unwrap_or(t);
+    let Some(r) = node.as_object().and_then(|o| o.get("Ref")) else {
+        return false;
+    };
+    let Some(pointee) = r.as_array().and_then(|arr| arr.get(1)) else {
+        return false;
+    };
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    if pointee.get("Scalar").is_some() {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(pointee) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    if type_decl_is_closure_env(td) || type_decl_is_builtin_adt(td) {
+        return false;
+    }
+    let path = td.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+        return false;
+    }
+    let canon = strip_crate_prefix(&path);
+    if is_str_family_class_root(&canon)
+        || is_str_family_class_root(leaf)
+        || is_rstr_str_family_spelling(leaf)
+    {
+        return false;
+    }
+    // A `repr(transparent)` scalar wrapper's borrow is the word
+    // (`tyref_is_borrowed_transparent_scalar`); keeping `&` intern'd a
+    // `Ptr` beside the by-value `Integer`. A non-transparent one-integer
+    // tuple struct is still an interior `Ptr(T)` and keeps the prefix.
+    if adt_def_is_integer_word(def_id, llbc, &mut Vec::new()) {
+        return false;
+    }
+    if !adt_node_type_subst(pointee, llbc).is_empty() {
+        return adt_def_is_raw_storage_at(
+            def_id,
+            Some(pointee),
+            llbc,
+            gc_struct_ids,
+            no_immutable_fields(),
+            &mut Vec::new(),
+        );
+    }
+    adt_def_is_raw_storage(
+        def_id,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        &mut Vec::new(),
+    )
+}
+
 /// Render an ADT head's generic type-arguments (`generics.types[]`) to
 /// their AST strings, dropping the default allocator / hasher type-args
 /// Charon makes explicit (`Vec<T, Global>`, `HashMap<K, V, RandomState,
@@ -12569,6 +12895,18 @@ pub(in crate::front::mir) fn render_adt_type_args(
     llbc: &Llbc,
     depth: usize,
 ) -> Vec<String> {
+    // `value_type_inputs` is a OnceLock filled by `harvest_declared_gc_facts`.
+    // That harvest walks `field_is_zst` → `is_unit_type` →
+    // `charon_type_value_to_ast_string` → here. `OnceLock` is not
+    // reentrant, so this spelling must not `get_or_init`. An empty set
+    // during the fill treats a declared-GC seed as a field walk; the
+    // harvest path only compares the spelling to `()`.
+    let empty_gc_struct_ids = std::collections::HashSet::new();
+    let gc_struct_ids = llbc_derived(llbc)
+        .value_type_inputs
+        .get()
+        .map(|inputs| &inputs.gc_struct_ids)
+        .unwrap_or(&empty_gc_struct_ids);
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
@@ -12576,7 +12914,21 @@ pub(in crate::front::mir) fn render_adt_type_args(
         .map(|arr| {
             arr.iter()
                 .map(|t| {
-                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    // Keep `&T` / `&mut T` only when the referent is raw
+                    // storage, so `Option<&Raw>` is not the tagged
+                    // `Option<Raw>` class (`model.py` `SomeObject.noneify`).
+                    // Top-level `&T` still strips in
+                    // [`charon_type_value_to_ast_string`].
+                    let node = strip_ty_indirections(t, llbc).unwrap_or(t);
+                    let rendered = if type_arg_referent_is_raw_storage(t, llbc, gc_struct_ids)
+                        && let Some(r) = node.as_object().and_then(|o| o.get("Ref"))
+                    {
+                        render_charon_ref(r, |inner| {
+                            charon_type_value_to_ast_string(inner, llbc, depth + 1)
+                        })
+                    } else {
+                        charon_type_value_to_ast_string(t, llbc, depth + 1)
+                    };
                     // `rtuple.py TupleRepr` keys fields on each item's
                     // lowleveltype. A shared byte window has data + len;
                     // erasing its borrow aliases the mutable byte-list repr.
@@ -12671,14 +13023,16 @@ fn unique_type_id_for_name_path(llbc: &Llbc, path: &str) -> Option<u64> {
 
 /// Intern payload-row spelling of one ADT type argument.
 ///
-/// The `<…>` CAST suffix stays the leaf render ([`render_adt_type_args`]).
+/// The `<…>` CAST suffix stays the leaf render
+/// ([`charon_type_value_to_enum_arg`], which keeps `&` on `Option<&T>`).
 /// The intern ROW is the declared TypeDecl representation so getattr of
 /// a substituted `__pos_0` hits a registry key that survives
 /// `harden_duplicate_leaf_metadata`: a fieldless enum is its discriminant
 /// integer, a transparent handle is `*mut` of its `Deref::Target`, a
-/// pointer-niche Option is `*mut` of the payload pointee ([`charon_type_value_to_ast_string`]
-/// strips `&`, so `Option<&T>` would otherwise intern as the tagged
-/// `Option<T>` class), a monomorphic named ADT is `strip_crate_prefix` of
+/// kept `&T` raw-storage argument is `*mut` of the pointee (interior
+/// `Ptr(T)`, `history.getkind` of `Ptr`), a pointer-niche Option is
+/// `*mut` of the payload pointee (the ROW is the nullable pointer word),
+/// a monomorphic named ADT is `strip_crate_prefix` of
 /// the TypeDecl path, and a generic instantiation keeps the CAST leaf render.
 ///
 /// A `type T = Handle` alias and a published `{"id": {"Path": …}}` ADT
@@ -12703,6 +13057,28 @@ fn intern_type_arg_payload_spelling(
     let t = type_node_peel_aliases(t, llbc).unwrap_or(t);
     let numeric = intern_adt_node_with_numeric_id(t, llbc);
     let t = numeric.as_ref().unwrap_or(t);
+    // A kept `&T` raw-storage type argument is one interior pointer
+    // word (`history.getkind` of `Ptr`). Intern ROW is `*mut` of the
+    // pointee, the same lltype a first-struct / interior getattr of
+    // that field gives. A scalar / GC / str `&T` still strips.
+    // RawPtr already keeps `*mut` / `*const` in the leaf render.
+    if type_arg_referent_is_raw_storage(t, llbc, gc_struct_ids)
+        && let Some(pointee) = t
+            .as_object()
+            .and_then(|o| o.get("Ref"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+    {
+        let inner = intern_type_arg_payload_spelling(
+            pointee,
+            llbc,
+            depth,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            tombstoned,
+        )?;
+        return Some(intern_pointer_payload_row(inner));
+    }
     let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
     if rendered == "Global" || rendered == "RandomState" {
         return None;
@@ -12741,11 +13117,9 @@ fn intern_type_arg_payload_spelling(
 /// Intern ROW of a pointer-niche `Option<P>` used as a tagged enum payload.
 ///
 /// Intern harvest skips the niche Option as a class
-/// ([`tyref_is_niche_option`]). CAST of the same type argument
-/// strips `&` ([`charon_type_value_to_ast_string`]), so the leaf render
-/// of `Option<&T>` is `Option<T>` — a tagged enum class whose
-/// `__pos_0` is `Instance`, while the value is the nullable pointer.
-/// The ROW is that pointer: `*mut` of the payload pointee, matching
+/// ([`tyref_is_niche_option`]). CAST of the same type argument keeps
+/// `&` so `Option<&T>` is not the tagged `Option<T>` class. The ROW
+/// is the nullable pointer: `*mut` of the payload pointee, matching
 /// [`one_level_pointer_pointee`] / a thin Arc/Rc, or the payload's own
 /// intern spelling when it is already a pointer word.
 fn intern_niche_option_payload_spelling(
@@ -13195,8 +13569,8 @@ pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(
 /// [`Lowering::resolve_place`] through [`tyref_tuple_suffix`]); the
 /// synthesized WRITE must derive the identical leaf so the `__pos_0` write and
 /// read key under one classdef.  Both terminate in `render_adt_type_args` →
-/// `charon_type_value_to_ast_string` (which strips `&T → T`) on the SAME
-/// payload node, so the strings are equal by construction.  Sourced from
+/// `charon_type_value_to_ast_string` on the SAME payload node, so the
+/// strings are equal by construction.  Sourced from
 /// `recv_ty` (`Option<X>`, un-erased) — NOT `site.payload_ty`, which is
 /// `Ref(None)` erased.  Fail-closed: a non-Option recv, a missing payload node,
 /// or a deferred arg yields "" (bare `Tuple`, unchanged).
@@ -13222,18 +13596,19 @@ pub(in crate::front::mir) fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: 
             "generics": { "types": [node.clone()] }
         }
     });
-    // 3. return tyref_tuple_suffix of the wrapper — the same renderer the read
-    //    side routes through, so the `&`-stripped leaf matches by construction.
+    // 3. return tyref_tuple_suffix of the wrapper — the same renderer the
+    //    read side routes through, so write and read keys match by
+    //    construction.
     tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
 }
 
 /// The closure-argument tuple spelling for an already projected enum payload.
 /// Both the synthesized writer and Charon's closure `call_once` reader use
-/// `tyref_tuple_suffix`, so reference erasure and generic rendering stay
-/// identical on the two sides.
+/// `tyref_tuple_suffix`. [`strip_ty_indirections`] leaves a `Ref` in place
+/// so [`render_adt_type_args`] can keep `&` on a raw-storage referent.
 pub(in crate::front::mir) fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
     let Some(node) = tyref_node(payload, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| strip_ty_indirections(n, llbc))
         .cloned()
     else {
         return String::new();
@@ -13471,8 +13846,12 @@ fn render_adt_suffix_type_args(
 /// declaration [`charon_adt_to_ast_string`] stamps: `ClassDesc.getuniqueclassdef`
 /// (`classdesc.py`) is that class, not the `__name__` leaf, so
 /// `Result<_, synth::E>` must not intern `E`. Every other monomorphic
-/// ADT keeps the TypeDecl leaf so existing intern keys stay put.
-fn charon_type_value_to_enum_arg(
+/// ADT keeps the TypeDecl leaf so existing intern keys stay put. Nested
+/// type arguments keep `&T` / `&mut T` so `Option<&T>` is not the tagged
+/// `Option<T>` class (`intern_niche_option_payload_spelling`;
+/// `model.py` `SomeObject.noneify`). [`charon_type_value_to_ast_string`]
+/// still strips the referent for class-root lookup.
+pub(in crate::front::mir) fn charon_type_value_to_enum_arg(
     v: &serde_json::Value,
     llbc: &Llbc,
     depth: usize,
@@ -13490,27 +13869,23 @@ fn charon_type_value_to_enum_arg(
             None => format!("??unresolved_dedup#{id}"),
         };
     }
-    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj
+        .get("Value")
+        .or_else(|| obj.get("HashConsedValue"))
+        .and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return charon_type_value_to_enum_arg(&arr[1], llbc, depth + 1, tombstoned);
     }
     if let Some(r) = obj.get("Ref") {
-        if let Some(arr) = r.as_array()
-            && let Some(inner) = arr.get(1)
-        {
-            return charon_type_value_to_enum_arg(inner, llbc, depth + 1, tombstoned);
-        }
-        return "??ref_shape".to_string();
+        return render_charon_ref(r, |inner| {
+            charon_type_value_to_enum_arg(inner, llbc, depth + 1, tombstoned)
+        });
     }
     let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) else {
         return charon_type_value_to_ast_string(v, llbc, depth);
     };
     if adt.get("builtin").filter(|b| !b.is_null()).is_some() {
-        return charon_type_value_to_ast_string(v, llbc, depth);
-    }
-    let nested = render_adt_type_args(adt, llbc, depth);
-    if !nested.is_empty() {
         return charon_type_value_to_ast_string(v, llbc, depth);
     }
     let name = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
@@ -13536,10 +13911,16 @@ fn charon_type_value_to_enum_arg(
     if rbigint_gc_root::is_root_path(&name) {
         return "RBigInt".to_string();
     }
-    if tombstoned.contains(leaf) && !intern_suffix_keeps_cast_leaf(llbc, leaf) {
+    let leaf_spelling = if tombstoned.contains(leaf) && !intern_suffix_keeps_cast_leaf(llbc, leaf) {
         super::class_identity_spelling(&name, tombstoned)
     } else {
         leaf.to_string()
+    };
+    let nested = render_adt_suffix_type_args(adt, llbc, depth, tombstoned);
+    if nested.is_empty() {
+        leaf_spelling
+    } else {
+        format!("{leaf_spelling}<{}>", nested.join(","))
     }
 }
 
@@ -13630,11 +14011,13 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
     format!("??adt_id_{key}")
 }
 
-/// FieldRow.ty of a named by-value STRUCT: the crate-stripped TypeDecl
+/// FieldRow.ty of a named by-value ADT: the crate-stripped TypeDecl
 /// path `resolve_adt_field` stamps on FieldWrite.owner_root
 /// (`class_identity_spelling`). `charon_adt_to_ast_string` is the ADT
-/// leaf; `consider_struct` / `all_fielddescrs` / `get_field_descr` key
-/// on the STRUCT. Pointer, reference, array, and builtin layouts keep
+/// leaf; two TypeDecls that share that leaf (`module::struct::Code`
+/// beside `eval::Code`) collide unless the row carries `name_path()`.
+/// `consider_struct` / `all_fielddescrs` / `get_field_descr` key on
+/// the STRUCT. Pointer, reference, array, and builtin layouts keep
 /// the spelling `tyref_to_field_layout_string` already produced.
 pub(in crate::front::mir) fn field_row_struct_identity(
     ty: &TyRef,
@@ -13652,12 +14035,24 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     if adt.get("builtin").is_some_and(|b| !b.is_null()) {
         return None;
     }
-    let def_id = adt.get("id")?.as_u64()?;
-    let td = llbc.type_by_id(def_id)?;
-    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+    let name_path = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        let td = llbc.type_by_id(def_id)?;
+        if !matches!(
+            td.kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) | TypeDeclKind::Union(_)
+        ) {
+            return None;
+        }
+        td.item_meta.name_path()
+    } else if let Some(path) = adt
+        .get("id")
+        .and_then(|id| id.get("Path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        path.to_string()
+    } else {
         return None;
-    }
-    let name_path = td.item_meta.name_path();
+    };
     if crate::front::semantic::is_list_family_spelling(&name_path) {
         return None;
     }

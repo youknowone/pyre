@@ -16352,9 +16352,8 @@ fn interned_result_tuple_ok_fieldless_err_payload_is_discriminant_int() {
 
 /// Intern of tagged `Option<Option<&MappedObj>>` spells `Some.__pos_0` as
 /// the inner niche pointer (`*mut` of the TypeDecl identity). CAST of
-/// `Option<&MappedObj>` strips `&`, so the leaf render is `Option<MappedObj>`
-/// — a tagged class whose getattr of `__pos_0` is `Instance`. The value is
-/// the nullable pointer. CAST intern suffix stays `<Option<MappedObj>>`.
+/// `Option<&MappedObj>` keeps `&`, so the intern key is
+/// `Option<Option<&MappedObj>>` and the ROW is the nullable pointer.
 #[test]
 fn interned_tagged_option_of_niche_option_payload_is_pointer() {
     let mapped = interior_struct(
@@ -16376,17 +16375,17 @@ fn interned_tagged_option_of_niche_option_payload_is_pointer() {
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "core::option::Option<Option<MappedObj>>::Some",
+            "core::option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
-        "intern ROW is the niche pointer, CAST suffix stays <Option<MappedObj>>; keys={:?}",
+        "intern ROW is the niche pointer, CAST suffix keeps <Option<&MappedObj>>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "option::Option<Option<MappedObj>>::Some",
+            "option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
@@ -16397,8 +16396,7 @@ fn interned_tagged_option_of_niche_option_payload_is_pointer() {
 
 /// Production `bool::then` call generics hash-cons `T`
 /// (`{"Value": [id, Option<&MappedObj>]}`). Intern ROW peels that
-/// wrapper so the payload is still the niche pointer, not CAST's
-/// `Option<MappedObj>` leaf.
+/// wrapper so the payload is still the niche pointer. CAST keeps `&`.
 #[test]
 fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
     let mapped = interior_struct(
@@ -16421,21 +16419,75 @@ fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "core::option::Option<Option<MappedObj>>::Some",
+            "core::option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
-        "intern ROW peels Value wrapper; keys={:?}",
+        "intern ROW peels Value wrapper; CAST suffix keeps <Option<&MappedObj>>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "option::Option<Option<MappedObj>>::Some",
+            "option::Option<Option<&MappedObj>>::Some",
             "__pos_0"
         ),
         Some("*mut module::mmap::interp_mmap::MappedObj"),
         "crate-stripped intern KEY matches CAST owner after Value peel; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern ROW of `Result<&mut T, E>::Ok.__pos_0` is the pointer word, not
+/// the by-value referent. CAST suffix keeps `&mut`; stripping the Ref
+/// intern'd T as an Instance (GcRef) against a Signed overlay.
+#[test]
+fn interned_result_of_mut_ref_payload_is_pointer() {
+    let native = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "NativeMMap"],
+        &[(
+            "flags",
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let mut_ref = serde_json::json!({"Ref": ["Erased", adt_node(1), "Mut"]});
+    let llbc =
+        intern_result_from_unwrap_call_llbc(vec![mut_ref, adt_node(2)], vec![native, pyerror]);
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<&mut NativeMMap, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<&mut NativeMMap,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::NativeMMap"),
+        "intern ROW is the mut-ref pointer word; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<&mut NativeMMap,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::NativeMMap"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }

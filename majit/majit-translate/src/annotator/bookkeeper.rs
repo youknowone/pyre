@@ -770,8 +770,7 @@ fn raw_struct_ptr_from_layout_gated(
     // harvested owners, so the gckind test below stays in force.
     if require_raw_word_owner
         && !registry.raw_word_owners.is_empty()
-        && !registry.raw_word_owners.contains(lookup)
-        && !registry.raw_word_owners.contains(class_root)
+        && !registry.raw_word_owner_contains(class_root)
     {
         return None;
     }
@@ -952,10 +951,16 @@ fn owner_ll_container(
             continue;
         }
         let concrete = instantiate_field_spelling(registry, name, &row.ty);
-        fields.push((
-            row.name.clone(),
-            field_spelling_lltype(registry, layouts, &concrete, gckind, index, building),
-        ));
+        // Harvest spells a fieldless-enum field as its discriminant
+        // scalar (`u8`). FORCE / `s_int` of that field stay Signed;
+        // the lltype row must match so SomePtr setattr/getattr share
+        // that intern. `usize` save_point is not this flag.
+        let field_t = if row.is_fieldless_enum {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed
+        } else {
+            field_spelling_lltype(registry, layouts, &concrete, gckind, index, building)
+        };
+        fields.push((row.name.clone(), field_t));
     }
     if fields.is_empty() {
         building.remove(name);
@@ -1064,6 +1069,111 @@ fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
     out
 }
 
+/// Lltype of a nested enum-base field: Ptr of the interned Raw struct
+/// when the base has payload, Signed when it is fieldless.
+///
+/// The field row carries the TypeDecl `name_path()` identity
+/// (`field_row_struct_identity`), so intern looks up that path
+/// (`module::struct::Code`) rather than the ADT leaf. setattr of
+/// instantiate shares the cached `StructLayout.ll_struct`.
+fn enum_base_field_lltype(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    spelling: &str,
+    building: &mut HashMap<
+        String,
+        crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
+    >,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+
+    let lookup = generic_owner_lookup(spelling.trim());
+    if lookup.is_empty() {
+        return None;
+    }
+    if let Some(intern) = payload_enum_layout_intern(registry, layouts, lookup) {
+        let container = owner_ll_container(registry, layouts, &intern, building)?;
+        let to = match container {
+            LowLevelType::Struct(st) => PtrTarget::Struct(*st),
+            LowLevelType::ForwardReference(fwd) => PtrTarget::ForwardReference(*fwd),
+            _ => return None,
+        };
+        return Some(LowLevelType::Ptr(Box::new(Ptr { TO: to })));
+    }
+    let intern_key = intern_class_key_from_registry(registry, lookup, true);
+    if registry.is_enum_base(&intern_key) || registry.is_enum_base(lookup) {
+        if !(registry.enum_base_has_payload(&intern_key) || registry.enum_base_has_payload(lookup))
+        {
+            return Some(LowLevelType::Signed);
+        }
+    }
+    if let Some(key) = registry.enum_base_registry_key(lookup)
+        && !registry.enum_base_has_payload(&key)
+    {
+        return Some(LowLevelType::Signed);
+    }
+    None
+}
+
+/// Registry spelling of the cached Raw struct instantiate /
+/// `by_value_payload_annotation` intern. The field row is the TypeDecl
+/// `name_path()` identity, so intern_key / lookup / the enum-base
+/// registry key name that layout.
+fn payload_enum_layout_intern(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    lookup: &str,
+) -> Option<String> {
+    let intern_key = intern_class_key_from_registry(registry, lookup, true);
+    if let Some(name) = intern_if_payload_enum_layout(registry, layouts, &intern_key) {
+        return Some(name);
+    }
+    if intern_key != lookup
+        && let Some(name) = intern_if_payload_enum_layout(registry, layouts, lookup)
+    {
+        return Some(name);
+    }
+    if let Some(key) = registry.enum_base_registry_key(lookup)
+        && let Some(name) = intern_if_payload_enum_layout(registry, layouts, &key)
+    {
+        return Some(name);
+    }
+    None
+}
+
+fn intern_if_payload_enum_layout(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    key: &str,
+) -> Option<String> {
+    if !registry.is_enum_base(key) || !registry.enum_base_has_payload(key) {
+        return None;
+    }
+    intern_name_for_payload_enum_key(registry, layouts, key).map(|(_, name)| name)
+}
+
+fn intern_name_for_payload_enum_key(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    key: &str,
+) -> Option<(majit_ir::descr::StructId, String)> {
+    let intern = intern_class_key_from_registry(registry, key, true);
+    if let Some((sid, _)) = layout_for_owner(layouts, generic_owner_lookup(&intern)) {
+        return Some((sid, intern));
+    }
+    if let Some(Some(ci)) = registry.class_identity.get(key)
+        && let Some((sid, _)) = layout_for_owner(layouts, generic_owner_lookup(&ci.spelling))
+    {
+        return Some((sid, ci.spelling.clone()));
+    }
+    if intern != key
+        && let Some((sid, _)) = layout_for_owner(layouts, generic_owner_lookup(key))
+    {
+        return Some((sid, key.to_string()));
+    }
+    None
+}
+
 fn field_spelling_lltype(
     registry: &crate::front::StructFieldRegistry,
     layouts: &crate::codewriter::call::StructLayoutTable,
@@ -1113,6 +1223,24 @@ fn field_spelling_lltype(
     if is_string_spelling(spelling) {
         return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
     }
+    // `Option<T>` of a harvested raw-word owner is the nullable interior
+    // `Ptr(T)` (`lltype.py` interior pointer / `_interior_ptr`). By-value
+    // `T` is inline storage or its own raw-malloc intern; `&T` is that
+    // pointer. Intern of the Option field must share the intern ROW of
+    // `Option<&T>` (`peel_one_pointer` of the latter already returns `T`).
+    // A fieldless enum intern is the integer tag, not `Ptr`.
+    if let Some(pointee) = option_raw_word_payload_pointee(registry, spelling) {
+        return pointer_field_lltype(registry, layouts, &pointee, building);
+    }
+    // Nested payload-enum field: Ptr of the same intern instantiate /
+    // `by_value_payload_annotation` mint (`lltype.malloc` flavor='raw').
+    // Inlining the discriminant Struct or falling to Address made
+    // setattr of that intern fail. A registered fieldless-enum
+    // spelling (not the u8 layout flattening) is Signed (`s_int`).
+    // RootScope-style raw structs fall through and stay inlined.
+    if let Some(enum_t) = enum_base_field_lltype(registry, layouts, spelling, building) {
+        return enum_t;
+    }
     let Some(container) = owner_ll_container(registry, layouts, spelling, building) else {
         return LowLevelType::Address;
     };
@@ -1130,6 +1258,32 @@ fn field_spelling_lltype(
     } else {
         LowLevelType::Address
     }
+}
+
+/// Payload pointee of `Option<T>` when `T` is a harvested raw-word owner.
+///
+/// Strips one `&` / `&mut` so `Option<&T>` (already handled by
+/// [`peel_one_pointer`] when the inner is a pointer word) and
+/// `Option<T>` share `Ptr(T)`. A fieldless enum is the integer tag
+/// (`enum_base_field_lltype` Signed), not an interior pointer.
+fn option_raw_word_payload_pointee(
+    registry: &crate::front::StructFieldRegistry,
+    spelling: &str,
+) -> Option<String> {
+    let inner = angle_wrapper_inner(spelling, &["Option"])?;
+    let pointee = inner
+        .strip_prefix("&mut ")
+        .map(str::trim)
+        .or_else(|| inner.strip_prefix('&').map(str::trim))
+        .unwrap_or(inner.as_str())
+        .trim();
+    if !registry.raw_word_owner_contains(pointee) {
+        return None;
+    }
+    if registry.is_enum_base(pointee) && !registry.enum_base_has_payload(pointee) {
+        return None;
+    }
+    Some(pointee.to_string())
 }
 
 fn pointer_field_lltype(
@@ -1232,7 +1386,9 @@ fn scalar_lltype_for(
         "f64" => LowLevelType::Float,
         "f32" => LowLevelType::SingleFloat,
         "bool" => LowLevelType::Bool,
-        "char" => LowLevelType::Char,
+        // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`).
+        // `*mut u8` is spelled `u8` (`rffi.py` CCHARP), not `char`.
+        "char" => LowLevelType::UniChar,
         "()" => LowLevelType::Void,
         _ => return None,
     })
@@ -1284,6 +1440,19 @@ fn peel_one_pointer(spelling: &str) -> Option<String> {
         return peel_one_pointer(&inner);
     }
     None
+}
+
+/// Payload of `Option<P>` that is itself one pointer word (`&T` /
+/// `*mut T` / `Box<T>` / `NonNull<T>`). `peel_one_pointer` of a nested
+/// `Option<&T>` is also a pointer word as a *type*; as a payload of
+/// another Option that inner niche has no null left
+/// (`model.py` `SomeObject.noneify`).
+fn is_direct_pointer_word_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    if angle_wrapper_inner(t, &["Option"]).is_some() {
+        return false;
+    }
+    peel_one_pointer(t).is_some()
 }
 
 /// `Box<[T]>`, `Box<str>`, and `Box<dyn Trait>`: data word then length word
@@ -1854,10 +2023,74 @@ impl Bookkeeper {
         crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref())
     }
 
+    /// Intern of a by-value payload of type `ty`.
+    ///
+    /// Dest of `__cast_instance_intrinsic(x, ty)`, a positional payload
+    /// field of type `ty`, and `robjmodel_instantiate` of a harvested
+    /// `raw_word_owner` share this so they cannot drift. A harvested
+    /// `raw_word_owner` stays `SomePtr` (one machine word,
+    /// `history.getkind` `'int'`). A classed scalar that is not a
+    /// raw-word owner promotes the named-field `SomePtr` to the
+    /// `SomeInstance` `robjmodel_instantiate` writes for that class.
+    pub fn by_value_payload_annotation(self: &Rc<Self>, ty: &str) -> SomeValue {
+        let s_value = self.project_struct_field_type(ty);
+        if self.payload_ptr_promotes_to_instance(ty, &s_value) {
+            self.struct_instance_annotation(ty).unwrap_or(s_value)
+        } else {
+            s_value
+        }
+    }
+
+    /// Intern of `objectmodel.instantiate` of `class_name`.
+    ///
+    /// A harvested `raw_word_owner` (or a variant whose enum base is
+    /// one) is the same `SomePtr` [`Self::by_value_payload_annotation`]
+    /// gives that type. A variant spelling uses the enum base's intern
+    /// so it unions with dest / payload of the base — one lltype, no
+    /// second intern. `None` keeps the `SomeInstance` shell.
+    pub fn instantiate_annotation(self: &Rc<Self>, class_name: &str) -> Option<SomeValue> {
+        let intern_root = self.raw_word_owner_instantiate_root(class_name)?;
+        let s = self.by_value_payload_annotation(&intern_root);
+        matches!(s, SomeValue::Ptr(_)).then_some(s)
+    }
+
+    /// Registry spelling whose `SomePtr` intern `instantiate` of
+    /// `class_name` must share. Membership is
+    /// [`crate::front::StructFieldRegistry::raw_word_owner_contains`];
+    /// `Enum::V` uses the enum base's membership (`is_enum_base` /
+    /// `enum_base_registry_key`). Closures and `module::struct::Fmt`
+    /// fail the enum-base gate on the parent.
+    fn raw_word_owner_instantiate_root(&self, class_name: &str) -> Option<String> {
+        let lookup = normalize_class_qualname(class_name);
+        if lookup.is_empty() {
+            return None;
+        }
+        let intern_key = self.intern_class_key(&lookup);
+        let guard = self.struct_fields.borrow();
+        let reg = guard.as_ref()?;
+        if reg.raw_word_owner_contains(&intern_key) || reg.raw_word_owner_contains(&lookup) {
+            return Some(intern_key);
+        }
+        let (parent, _) = intern_key.rsplit_once("::")?;
+        let parent_key = reg.enum_base_registry_key(parent).or_else(|| {
+            if reg.is_enum_base(parent) {
+                Some(parent.to_string())
+            } else {
+                None
+            }
+        })?;
+        if reg.raw_word_owner_contains(&parent_key) {
+            Some(parent_key)
+        } else {
+            None
+        }
+    }
+
     /// SomeInstance of a registered named struct — the shell
-    /// `robjmodel_instantiate` writes. Variant payloads (`__pos_N`) use
-    /// this so the constructor does not union Instance with the SomePtr
-    /// `project_struct_field_type` would mint for a raw-word owner.
+    /// `robjmodel_instantiate` writes for a class that is not a
+    /// `raw_word_owner`. Variant payloads (`__pos_N`) of such a class
+    /// use this so the constructor does not union Instance with the
+    /// SomePtr `project_struct_field_type` would mint.
     fn struct_instance_annotation(self: &Rc<Self>, field_ty: &str) -> Option<SomeValue> {
         let stripped = field_ty
             .trim()
@@ -1908,8 +2141,8 @@ impl Bookkeeper {
     /// word (`StructLayout.fields[..].size`, Charon layout size 0), so a
     /// marker ADT is not a stored pointer. Variant payloads of
     /// stored-pointer owners stay SomePtr so `getfield_raw` matches the
-    /// named-field projection. A classed scalar ADT (Fmt, Utf16Or32Form,
-    /// RootScope) keeps the SomeInstance `robjmodel_instantiate` writes.
+    /// named-field projection. Promote of a classed scalar is gated
+    /// separately by `payload_ptr_promotes_to_instance`.
     fn struct_ty_has_raw_pointer_field(&self, field_ty: &str) -> bool {
         let stripped = field_ty
             .trim()
@@ -1957,28 +2190,29 @@ impl Bookkeeper {
     }
 
     /// Promote a positional payload SomePtr to SomeInstance only for a
-    /// classed scalar ADT written by `robjmodel_instantiate` (Fmt /
-    /// Utf16Or32Form / RootScope as an enum payload). A closure capture
+    /// classed scalar that is not a harvested raw-word owner. A
+    /// `raw_word_owner` is a machine word (`history.getkind` `'int'`),
+    /// interned as SomePtr at every by-value site. A closure capture
     /// and a nullable pointer word keep the SomePtr the writer stores.
     /// Positional origin is the harvested `FieldDecl::name == None` flag
     /// on the registry row, not the `__pos_N` spelling.
-    fn variant_payload_promotes_to_instance(
-        &self,
-        owner: &str,
-        row: &crate::front::semantic::FieldRow,
-        s_value: &SomeValue,
-    ) -> bool {
-        if !row.is_positional || !matches!(s_value, SomeValue::Ptr(_)) {
-            return false;
-        }
-        let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
-        if majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
-            return false;
-        }
-        if self.field_ty_is_nullable_ptr(&row.ty) {
-            return false;
-        }
-        !self.struct_ty_has_raw_pointer_field(&row.ty)
+    fn payload_ptr_promotes_to_instance(&self, ty: &str, s_value: &SomeValue) -> bool {
+        matches!(s_value, SomeValue::Ptr(_))
+            && !self.field_ty_is_nullable_ptr(ty)
+            && !self.struct_ty_has_raw_pointer_field(ty)
+            && !self.ty_is_raw_word_owner(ty)
+    }
+
+    fn ty_is_raw_word_owner(&self, ty: &str) -> bool {
+        let stripped = ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        self.struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.raw_word_owner_contains(stripped))
     }
 
     /// A niche-optimized pointer-sized enum is the nullable `lltype.Ptr`
@@ -1989,15 +2223,28 @@ impl Bookkeeper {
     /// intern would mint `Instance(enum)` over the already-collapsed Ptr.
     /// Every payload enum's base is also `__discriminant` only — the
     /// variants hold the payload (`rclass.py` variant subclass) — so
-    /// `is_enum_base` alone is not this fact. `BuiltinEncoder` is that
-    /// payload enum: `Option<BuiltinEncoder>::Some.__pos_0` is Instance
-    /// so instantiate can setattr a `Utf8` variant.
+    /// `is_enum_base` alone is not this fact.
+    ///
+    /// The generic `Option` template often carries `TagEncoding::Direct`
+    /// at size 16; that host is not `Option<&T>` / `Option<*mut T>` /
+    /// `Option<Box<T>>` / `Option<NonNull<T>>` / `Option<fn(..)>` (one
+    /// nullable pointer word, `model.py` `SomeObject.noneify`). Gate
+    /// those on the payload spelling being that word, the same
+    /// `is_direct_pointer_word_spelling` / `is_fn_type_spelling` test
+    /// `project_struct_field_type` uses, so dest CAST of the niche
+    /// does not promote the SomePtr to a tagged Instance.
     fn field_ty_is_nullable_ptr(&self, field_ty: &str) -> bool {
         let stripped = field_ty
             .trim()
             .trim_start_matches('&')
             .trim_start_matches("mut ")
             .trim();
+        if let Some(inner) = strip_generic_leaf(stripped, "Option") {
+            let inner = inner.trim();
+            if is_direct_pointer_word_spelling(inner) || is_fn_type_spelling(inner) {
+                return true;
+            }
+        }
         let named = majit_ir::descr::strip_generic_args(stripped);
         if let Some(layout) = self.layout_of_named(named.as_ref())
             && layout.size == crate::layout::target_word_size()
@@ -4052,34 +4299,28 @@ impl Bookkeeper {
             if row.name == "__class__" {
                 continue;
             }
-            let s_value = self.project_struct_field_type(&row.ty);
             // A variant payload (`FieldDecl::name == None`) is written by
-            // `robjmodel_instantiate` + setattr, which is always
-            // SomeInstance (`builtin.py` `robjmodel_instantiate`).
-            // Flattening a classed scalar ADT (Fmt / Utf16Or32Form)
-            // to SomePtr made `llannotation.py`
-            // `pairtype(SomePtr, SomeObject).union` refuse Instance ∪
-            // Ptr at the constructor. A payload whose rows include a
-            // raw pointer (PosixMap.ptr: *mut u8) stays SomePtr so
-            // `getfield_raw` matches the named-field projection
-            // (`raw_struct_ptr_annotation`). Named raw fields
-            // (`mapped`, `sin_addr`) and FUNC.ARGS `&Raw` are not
-            // positional and stay SomePtr either way.
+            // `robjmodel_instantiate` + setattr. Intern that cell through
+            // `by_value_payload_annotation` so dest of
+            // `__cast_instance_intrinsic` and instantiate of a
+            // `raw_word_owner` onto the same type cannot drift.
+            // A payload whose rows include a raw pointer (PosixMap.ptr:
+            // `*mut u8`) stays SomePtr so `getfield_raw` matches the
+            // named-field projection. Named raw fields (`mapped`,
+            // `sin_addr`) and FUNC.ARGS `&Raw` are not positional and
+            // stay SomePtr either way.
             //
             // A closure capture is the captured value, not a variant
             // constructor: `__cast_instance_intrinsic` / FUNC.ARGS of a
             // raw owner write SomePtr (`load_attr` RootScope). Promoting
             // that slot to Instance made setattr refuse Ptr ∪ Instance.
-            // A niche-optimized pointer-sized enum already collapsed to
-            // the nullable Ptr (`project_struct_field_type` Option arm,
-            // None is the null word); promoting that to Instance(enum)
-            // is the mmap_get_attr_i64 `Ptr(MappedObj) ∪ Instance(enum)`
-            // refusal.
-            let s_value = if self.variant_payload_promotes_to_instance(n, row, &s_value) {
-                self.struct_instance_annotation(&row.ty).unwrap_or(s_value)
-            } else {
-                s_value
-            };
+            let owner_leaf = n.rsplit("::").next().unwrap_or(n);
+            let s_value =
+                if row.is_positional && !majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
+                    self.by_value_payload_annotation(&row.ty)
+                } else {
+                    self.project_struct_field_type(&row.ty)
+                };
             // `rlist.py` `ll_length` is `return l.length`. A Vec field's
             // length word is the parent `{name}.len` Signed getfield
             // (`assembler` suffixes `.len`); getattr of that name must
@@ -4112,24 +4353,19 @@ impl Bookkeeper {
                             && inst.flags.is_empty()
                             && inst.base.const_box.is_none()
                 );
-                // `tyref_to_attr_value_type` puts `Ptr(FuncType)` in the Int
-                // bank (`history.getkind`), so FORCE shells a `fn` /
-                // `Option<fn>` field as the Int-bank shell
-                // (`valuetype_to_someshell(Int)`: no const, signed,
-                // nonneg=false). The layout spelling is still a function
-                // pointer, and `project_struct_field_type` answers
-                // `SomePtr`. Replace ONLY that exact FORCE shell on a
-                // function-pointer spelling: it carries strictly less
-                // information than the registry projection, and leaving it
-                // makes a `fn` field read union `Integer ∪ Ptr(Func)` with
-                // `fn_null_constant`. Any other value was produced by real
-                // annotation flow and stays.
-                let is_fn_integer_force_shell =
-                    fn_ptr_somevalue_for_spelling_in(&row.ty, Some(self)).is_some()
-                        && crate::codewriter::annotation_state::valuetype_to_someshell(
-                            &crate::model::ValueType::Int,
-                        )
-                        .is_some_and(|shell| shell == attr.s_value);
+                // `tyref_to_attr_value_type` banks a raw-storage pointer
+                // (`*mut T` / `ty_is_raw_address`) and `Ptr(FuncType)` as
+                // Int, so FORCE shells `SomeInteger`. Intern is SomePtr
+                // (`raw_struct_ptr_annotation` / `history.getkind` of
+                // `Ptr`). Replace ONLY that exact FORCE shell: leaving it
+                // unions `Integer ∪ Ptr(T)` at setattr of a capture of
+                // the same field. A scalar Int field intern is Integer
+                // and stays.
+                let is_ptr_integer_force_shell = matches!(&s_value, SomeValue::Ptr(_))
+                    && crate::codewriter::annotation_state::valuetype_to_someshell(
+                        &crate::model::ValueType::Int,
+                    )
+                    .is_some_and(|shell| shell == attr.s_value);
                 // `tyref_to_attr_value_type` banks `&[u8]` as Int, so FORCE
                 // shells a window field as the Int-bank shell. The layout
                 // spelling is still `{data: CCHARP, len: Signed}`
@@ -4145,7 +4381,7 @@ impl Bookkeeper {
                         .is_some_and(|shell| shell == attr.s_value);
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
-                    || is_fn_integer_force_shell
+                    || is_ptr_integer_force_shell
                     || is_window_integer_force_shell
                 {
                     attr.s_value = s_value;
@@ -5299,7 +5535,7 @@ impl Bookkeeper {
             // (`bookkeeper.py` `getdesc`).
             return SomeValue::Impossible;
         }
-        if let Some(inner) = strip_generic_one(stripped, "Option<") {
+        if let Some(inner) = strip_generic_leaf(stripped, "Option") {
             // `Option<fn>` is the nullable `Ptr(FuncType)`, not
             // `union(SomePtr, s_None)`. `s_None` is `SomeNone`
             // (`annotator/model.py` `s_None`); `pairtype(SomeObject,
@@ -5320,16 +5556,19 @@ impl Bookkeeper {
                 return dyn_fat_window_annotation();
             }
             let s_inner = self.project_struct_field_type(inner);
-            // Ptr inner is already int-bank (`history.getkind` Signed).
-            // The pointee is Raw (`DeclaredGcFacts::gc_struct_ids`: no
-            // GcType impl, no GC field-0 ancestor), so Option of it is
-            // also int-bank. `union(SomePtr, s_None)` absorbs the Ptr
-            // into a classdef-less Instance (GcRef) — refused by
-            // `llannotation.py` `pairtype(SomePtr, SomeObject).union`.
-            // Minting a tagged Option shell from the generic Option
-            // template (`TagEncoding::Direct`, size 16, inherited onto
-            // every instantiation) is not the instantiation layout.
-            if matches!(s_inner, SomeValue::Ptr(_)) {
+            // Null-niche: `Option<&T>` / `Option<*mut T>` /
+            // `Option<NonNull<T>>` / `Option<Box<T>>` are one nullable
+            // pointer word. A by-value raw_word_owner struct is SomePtr
+            // at every site without being a pointer; `Option` of it has
+            // no null niche (`model.py` `SomeObject.noneify` —
+            // `binaryop.py` `pairtype(SomeObject, SomeNone).union`)
+            // and stays the tagged ADT whose `__pos_0` is that intern.
+            // Gate on the payload spelling being that pointer word, not
+            // on the payload annotation being SomePtr, and not through
+            // a nested Option: `Option<Option<&T>>` is a tagged ADT
+            // whose payload is the inner niche (`peel_one_pointer`
+            // of `Option<&T>` is a pointer word as a type).
+            if is_direct_pointer_word_spelling(inner) && matches!(s_inner, SomeValue::Ptr(_)) {
                 return s_inner;
             }
             // The Option is the one-word nullable payload exactly when
@@ -7000,10 +7239,19 @@ fn collect_referenced_struct_names(
     if is_gcref_type_spelling(stripped) {
         return;
     }
+    if let Some(inner) = strip_generic_leaf(stripped, "Option") {
+        collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    if let Some(inner) = strip_generic_leaf(stripped, "Result") {
+        for part in split_generic_args(inner) {
+            collect_referenced_struct_names(part, reg, out);
+        }
+        return;
+    }
     for wrapper in [
         "Vec<",
         "VecDeque<",
-        "Option<",
         "Rc<",
         "Arc<",
         "Box<",
@@ -7086,7 +7334,7 @@ fn is_nullable_sum_spelling(field_ty: &str) -> bool {
         .trim_start_matches('&')
         .trim_start_matches("mut ")
         .trim();
-    strip_generic_one(t, "Option<").is_some() || strip_generic_one(t, "Result<").is_some()
+    strip_generic_leaf(t, "Option").is_some() || strip_generic_leaf(t, "Result").is_some()
 }
 
 /// `SomePtr(Ptr(FuncType([], Void)))` — the annotation of a raw function
@@ -7202,7 +7450,7 @@ pub(crate) fn func_type_from_fn_spelling(
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
     let t = spelling.trim();
-    let inner = if let Some(inner) = strip_generic_one(t, "Option<") {
+    let inner = if let Some(inner) = strip_generic_leaf(t, "Option") {
         inner.trim()
     } else {
         t
@@ -9124,6 +9372,69 @@ mod tests {
             );
             assert_eq!(classdef.borrow().name, root);
         }
+    }
+
+    #[test]
+    fn qualified_option_of_i64_some_payload_is_integer() {
+        // After `field_row_struct_identity` remaps Enum to crate-stripped
+        // `name_path()`, the field spelling is `option::Option<i64>`.
+        // The Some payload is Integer (`s_int`), not the untyped FORCE
+        // classdef-less shell (`valuetype_to_someshell(Ref)`).
+        use crate::front::StructFieldRegistry;
+
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let bk = bk();
+        crate::annotator::classdesc::register_struct_fields(
+            "option::Option<i64>::Some",
+            &[("__pos_0".to_string(), crate::model::ValueType::Ref(None))],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<i64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<i64>::Some".to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let projected = bk.project_struct_field_type("option::Option<i64>");
+        let SomeValue::Instance(inst) = &projected else {
+            panic!("option::Option<i64> must project to SomeInstance, got {projected:?}");
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "option::Option<i64> must carry a classdef, got {projected:?}"
+        );
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root("option::Option<i64>::Some")
+            .expect("option::Option<i64>::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Integer(_)),
+            "option::Option<i64>::Some.__pos_0 is Integer, got {payload:?}"
+        );
+        assert!(
+            !matches!(
+                &payload,
+                SomeValue::Instance(inst) if inst.classdef.is_none()
+            ),
+            "payload must not stay the classdef-less FORCE shell, got {payload:?}"
+        );
     }
 
     #[test]
@@ -12691,7 +13002,7 @@ mod tests {
     }
 
     #[test]
-    fn option_some_payload_of_scalar_raw_struct_stays_instance() {
+    fn option_some_payload_of_scalar_raw_struct_stays_someptr() {
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
@@ -12769,9 +13080,12 @@ mod tests {
             .s_value
             .clone();
         assert!(
-            matches!(payload, SomeValue::Instance(_)),
-            "Option::Some.__pos_0 of a classed scalar ADT stays SomeInstance so instantiate can setattr it, got {payload:?}"
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of a raw_word_owner scalar bag stays SomePtr, got {payload:?}"
         );
+        let dest = bk.by_value_payload_annotation(inner);
+        crate::annotator::model::union(&dest, &payload)
+            .expect("by_value_payload_annotation must match the positional field cell");
     }
 
     #[test]
@@ -12854,13 +13168,13 @@ mod tests {
     }
 
     #[test]
-    fn option_some_payload_of_payload_enum_stays_instance() {
-        // `BuiltinEncoder`: the base is `__discriminant` only, the
-        // `Utf16Or32` variant carries `Utf16Or32Form`. A named-field
-        // projection is still SomePtr (`raw_struct_ptr_annotation`);
-        // Option::Some.__pos_0 stays SomeInstance so instantiate can
-        // setattr a `Utf8` variant (`llannotation.py`
-        // pairtype(SomePtr, SomeObject).union).
+    fn option_some_payload_of_payload_enum_stays_someptr() {
+        // `BuiltinEncoder` is a harvested raw_word_owner: the base is
+        // `__discriminant` only, the `Utf16Or32` variant carries
+        // `Utf16Or32Form`. Named-field projection is SomePtr
+        // (`raw_struct_ptr_annotation`); Option::Some.__pos_0 stays
+        // SomePtr, the same intern as dest / named / capture / declared
+        // return.
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
@@ -12941,13 +13255,16 @@ mod tests {
             .s_value
             .clone();
         assert!(
-            matches!(payload, SomeValue::Instance(_)),
-            "Option::Some.__pos_0 of a payload enum stays SomeInstance so instantiate can setattr a fieldless variant, got {payload:?}"
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of a raw_word_owner payload enum stays SomePtr, got {payload:?}"
         );
+        let dest = bk.by_value_payload_annotation(inner);
+        crate::annotator::model::union(&dest, &payload)
+            .expect("by_value_payload_annotation must match the positional field cell");
     }
 
     #[test]
-    fn option_some_payload_of_rootscope_stays_instance() {
+    fn option_some_payload_of_rootscope_stays_someptr() {
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
@@ -13010,9 +13327,12 @@ mod tests {
             .s_value
             .clone();
         assert!(
-            matches!(payload, SomeValue::Instance(_)),
-            "PhantomData<*const ()> is not a stored pointer; RootScope payload stays SomeInstance, got {payload:?}"
+            matches!(payload, SomeValue::Ptr(_)),
+            "PhantomData<*const ()> is not a stored pointer; a raw_word_owner RootScope payload stays SomePtr, got {payload:?}"
         );
+        let dest = bk.by_value_payload_annotation(inner);
+        crate::annotator::model::union(&dest, &payload)
+            .expect("by_value_payload_annotation must match the positional field cell");
     }
 
     #[test]
@@ -13199,16 +13519,23 @@ mod tests {
             .s_value
             .clone();
         assert!(
-            matches!(payload, SomeValue::Ptr(_)),
-            "Option::Some.__pos_0 of Option<Raw> stays the nullable Ptr, got {payload:?}"
+            matches!(payload, SomeValue::Instance(_)),
+            "Option::Some.__pos_0 of by-value Option<Raw> is the tagged Option shell, got {payload:?}"
+        );
+        let SomeValue::Instance(inst) = &payload else {
+            unreachable!("asserted Instance");
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "by-value Option<Raw> payload must carry the Option classdef, got {payload:?}"
         );
     }
 
     #[test]
-    fn tagged_option_of_raw_struct_projects_option_ptr() {
+    fn tagged_option_of_raw_struct_is_tagged_shell() {
         use crate::front::StructFieldRegistry;
         use crate::front::host_layout::HostLayout;
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
         use majit_charon_reader::ullbc::{TagEncoding, TagLayout};
 
         let inner = "rawproj::PosixMap";
@@ -13242,9 +13569,8 @@ mod tests {
                 "__pos_0", inner,
             )],
         );
+        // Inner is a word-storage ADT; Option of it is the tagged shell.
         reg.raw_word_owners.insert(inner.to_string());
-        reg.raw_word_owners.insert(option_root.to_string());
-        reg.raw_word_owners.insert(option_ty.to_string());
         bk.set_struct_fields(Rc::new(reg));
 
         let mut cc = crate::call::CallControl::new();
@@ -13300,30 +13626,45 @@ mod tests {
         cc.set_struct_layout(option_inst, tagged);
         bk.set_struct_layouts(cc.struct_layouts_handle());
 
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "by-value raw struct stays SomePtr"
+        );
         let projected = bk.project_struct_field_type(option_ty);
-        let SomeValue::Ptr(ptr) = projected else {
-            panic!("tagged Option<RawStruct> must project to the inner Ptr, got {projected:?}");
+        let SomeValue::Instance(inst) = &projected else {
+            panic!("by-value Option<RawStruct> is the tagged Option shell, got {projected:?}");
         };
-        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
-            panic!("SomePtr target must be a Struct");
-        };
-        assert_eq!(st._gckind, GcKind::Raw);
-        assert_eq!(
-            st._name.as_str(),
-            inner,
-            "Option of a Raw struct stays the inner Ptr (int bank), not a tagged Option shell"
+        let classdef = inst
+            .classdef
+            .as_ref()
+            .expect("tagged Option must carry a classdef");
+        assert_eq!(classdef.borrow().name, option_ty);
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(&format!("{option_root}::Some"))
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of a by-value raw_word_owner stays SomePtr, got {payload:?}"
         );
     }
 
     #[test]
-    fn tagged_option_of_raw_payload_enum_uses_layout_gckind() {
+    fn tagged_option_of_raw_payload_enum_is_tagged_shell() {
         // Production `Option<MappedObj>`: MappedObj is a payload enum
-        // with no GcType impl / GC field-0 ancestor, so
-        // `layout.gckind` is Raw. The Option arm must not union with
-        // s_None into a classdef-less Instance (legacy=Signed, real=GcRef).
+        // harvested as a raw_word_owner, interned SomePtr at every site.
+        // `Option` of that by-value ADT has no null niche, so the Option
+        // arm keeps the tagged `Instance(option::Option)` shell whose
+        // `__pos_0` is that intern (`model.py` `SomeObject.noneify`).
         use crate::front::StructFieldRegistry;
         use crate::front::host_layout::HostLayout;
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
         use majit_charon_reader::ullbc::{TagEncoding, TagLayout};
 
         let inner = "mmap::MappedObj";
@@ -13401,24 +13742,34 @@ mod tests {
         cc.set_struct_layout(option_inst, tagged);
         bk.set_struct_layouts(cc.struct_layouts_handle());
 
-        let projected = bk.project_struct_field_type(option_ty);
         assert!(
-            !matches!(projected, SomeValue::Instance(_)),
-            "Option of a Raw payload enum must not intern as SomeInstance/GcRef, got {projected:?}"
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "raw payload enum stays SomePtr"
         );
-        let SomeValue::Ptr(ptr) = projected else {
+        let projected = bk.project_struct_field_type(option_ty);
+        let SomeValue::Instance(inst) = &projected else {
             panic!(
-                "tagged Option<Raw payload enum> must project to the inner Ptr, got {projected:?}"
+                "by-value Option of a raw payload enum is the tagged Option shell, got {projected:?}"
             );
         };
-        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
-            panic!("SomePtr target must be a Struct");
-        };
-        assert_eq!(st._gckind, GcKind::Raw);
-        assert_eq!(
-            st._name.as_str(),
-            inner,
-            "Option of a Raw payload enum stays the inner Ptr (int bank), not a tagged Option shell"
+        let classdef = inst
+            .classdef
+            .as_ref()
+            .expect("tagged Option must carry a classdef");
+        assert_eq!(classdef.borrow().name, option_ty);
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(&format!("{option_root}::Some"))
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of a by-value raw payload enum stays SomePtr, got {payload:?}"
         );
     }
 
@@ -13520,6 +13871,10 @@ mod tests {
             inner,
             "Option<&Raw> is the nullable Ptr of T, not a tagged Option shell"
         );
+        assert!(
+            matches!(bk.by_value_payload_annotation(option_ty), SomeValue::Ptr(_)),
+            "dest CAST of Option<&Raw> intern's the same SomePtr"
+        );
     }
 
     #[test]
@@ -13559,8 +13914,6 @@ mod tests {
             )],
         );
         reg.raw_word_owners.insert(inner.to_string());
-        reg.raw_word_owners.insert(option_root.to_string());
-        reg.raw_word_owners.insert(option_ty.to_string());
         bk.set_struct_fields(Rc::new(reg));
 
         let mut cc = crate::call::CallControl::new();
@@ -13594,18 +13947,194 @@ mod tests {
             matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
             "inner raw struct still projects to SomePtr"
         );
-        let returned_inner = match &projected {
-            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
-                crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) => {
-                    st._name.as_str() == inner
-                }
-                _ => false,
-            },
-            _ => false,
+        let SomeValue::Instance(inst) = &projected else {
+            panic!(
+                "by-value Option<Raw> without a host tag is still the tagged Option shell, got {projected:?}"
+            );
         };
         assert!(
-            returned_inner,
-            "Option of a Raw struct stays the inner Ptr (int bank), got {projected:?}"
+            inst.classdef.is_some(),
+            "tagged Option must carry a classdef, got {projected:?}"
+        );
+    }
+
+    #[test]
+    fn option_of_by_value_raw_word_owner_is_tagged_shell() {
+        // `field_row_struct_identity` spells the Option as
+        // `option::Option<T>`. T is a harvested raw_word_owner, interned
+        // SomePtr; Option of that by-value ADT is not one pointer word
+        // (`peel_one_pointer`), so the projection stays the tagged
+        // Instance shell (`model.py` `SomeObject.noneify`).
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::PosixMap";
+        let option_root = "option::Option";
+        let option_ty = "option::Option<rawproj::PosixMap>";
+        let some = "option::Option<rawproj::PosixMap>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_root);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_root.to_string(), Some(option_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            option_root.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "by-value raw_word_owner stays SomePtr"
+        );
+        let projected = bk.project_struct_field_type(option_ty);
+        let SomeValue::Instance(inst) = &projected else {
+            panic!(
+                "option::Option of a by-value raw_word_owner is the tagged shell, got {projected:?}"
+            );
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "tagged option::Option must carry a classdef, got {projected:?}"
+        );
+        assert!(
+            bk.instantiate_annotation(option_ty).is_none(),
+            "instantiate of Option of a raw_word_owner is the Instance shell, not the inner Ptr"
+        );
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("option::Option<T>::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "option::Option<T>::Some.__pos_0 of a raw_word_owner stays SomePtr, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn option_of_option_of_ref_to_raw_is_tagged_shell() {
+        // `bool::then(|| mapped.as_ref())` returns `Option<Option<&T>>`.
+        // The inner `Option<&T>` is the null-niche pointer word; the outer
+        // Option has no niche left (`model.py` `SomeObject.noneify`) and
+        // stays the tagged shell whose `__pos_0` is that pointer.
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::PosixMap";
+        let option_root = "option::Option";
+        let inner_opt = "option::Option<&rawproj::PosixMap>";
+        let outer_opt = "option::Option<option::Option<&rawproj::PosixMap>>";
+        let outer_some = "option::Option<option::Option<&rawproj::PosixMap>>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_root);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_root.to_string(), Some(option_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            option_root.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            outer_some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner_opt,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            matches!(bk.project_struct_field_type(inner_opt), SomeValue::Ptr(_)),
+            "Option<&raw> is the inner niche pointer"
+        );
+        let projected = bk.project_struct_field_type(outer_opt);
+        let SomeValue::Instance(inst) = &projected else {
+            panic!("Option of a niche Option<&raw> is the tagged shell, got {projected:?}");
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "tagged outer Option must carry a classdef, got {projected:?}"
+        );
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(outer_some)
+            .expect("outer Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "outer Some.__pos_0 is the inner niche pointer, got {payload:?}"
         );
     }
 
@@ -16164,6 +16693,167 @@ mod tests {
     }
 
     #[test]
+    fn struct_root_pass2_replaces_integer_force_shell_of_raw_ptr_field() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let inner = "rawforce::RawCell";
+        let holder = "rawforce::Holder";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+        let bk = bk();
+        crate::annotator::classdesc::register_struct_fields(
+            holder,
+            &[("backend".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            holder.to_string(),
+            vec![("backend".to_string(), format!("*mut {inner}"))],
+        );
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("word".to_string(), "i32".to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 4,
+                align: 4,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "word".into(),
+                    offset: 0,
+                    size: 4,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(holder)
+            .expect("Holder registers");
+        let g = cd.borrow();
+        let slot = g.attrs.get("backend").expect("backend attr present");
+        let SomeValue::Ptr(ptr) = &slot.s_value else {
+            panic!(
+                "*mut raw-storage field must replace the Int FORCE shell with SomePtr, got {:?}",
+                slot.s_value
+            );
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!(
+                "*mut raw-storage intern is Ptr(Struct), got {:?}",
+                ptr.ll_ptrtype.TO
+            );
+        };
+        assert_eq!(st._name.as_str(), inner);
+        assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn option_of_raw_word_owner_field_is_ptr_of_payload() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+
+        let inner = "rawopt::RawCell";
+        let option_base = "option::Option";
+        let bag = format!("{option_base}<{inner}>");
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_base);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_base.to_string(), Some(option_id)),
+            ]));
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("word".to_string(), "i32".to_string())],
+        );
+        reg.fields.insert(
+            option_base.to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        reg.fields.insert(
+            format!("{option_base}::Some"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 4,
+                align: 4,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "word".into(),
+                    offset: 0,
+                    size: 4,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            option_id,
+            crate::call::StructLayout {
+                size: 1,
+                align: 1,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__discriminant".into(),
+                    offset: 0,
+                    size: 1,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let layouts = cc.struct_layouts_handle();
+        let mut building = std::collections::HashMap::new();
+        let field_t = field_spelling_lltype(&reg, &layouts, &bag, GcKind::Raw, 0, &mut building);
+        let LowLevelType::Ptr(ptr) = field_t else {
+            panic!("Option of a raw-word owner must intern as Ptr of the payload, got {field_t:?}");
+        };
+        let PtrTarget::Struct(st) = ptr.TO else {
+            panic!(
+                "Option of a raw-word owner intern is Ptr(Struct), got {:?}",
+                ptr.TO
+            );
+        };
+        assert_eq!(st._name.as_str(), inner);
+        assert!(
+            !st._name.contains("Option"),
+            "payload intern must not be the Option template, got {}",
+            st._name
+        );
+        assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
     fn struct_root_pass2_replaces_integer_force_shell_of_fn_field() {
         use crate::front::StructFieldRegistry;
         let bk = bk();
@@ -16188,6 +16878,60 @@ mod tests {
         assert!(
             matches!(slot.s_value, SomeValue::Ptr(_)),
             "fn field must project to SomePtr(FuncType), got {:?}",
+            slot.s_value
+        );
+    }
+
+    #[test]
+    fn qualified_option_of_fn_ptr_is_someptr_not_integer() {
+        // After `field_row_struct_identity` remaps Enum, `Option<fn>` is
+        // `option::Option<fn(...)>`. That spelling is the nullable
+        // `Ptr(FuncType)` (`lltype.py` `FuncType` / `getfunctionptr`), not
+        // the Int-bank FORCE shell (`valuetype_to_someshell(Int)`).
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let spelling = "option::Option<fn(PyObjectRef) -> Result<(), PyError>>";
+        let s = fn_ptr_somevalue_for_spelling(spelling)
+            .expect("qualified Option<fn> is a function pointer");
+        let SomeValue::Ptr(p) = &s else {
+            panic!("option::Option<fn> must seed SomePtr, got {s:?}");
+        };
+        assert!(
+            matches!(p.ll_ptrtype.TO, PtrTarget::Func(_)),
+            "option::Option<fn> is Ptr(FuncType), got {:?}",
+            p.ll_ptrtype.TO
+        );
+        let bk = bk();
+        let projected = bk.project_struct_field_type(spelling);
+        crate::annotator::model::union(&s, &projected)
+            .expect("project of option::Option<fn> unions with the fn-pointer seed");
+        assert!(
+            matches!(bk.by_value_payload_annotation(spelling), SomeValue::Ptr(_)),
+            "dest CAST of option::Option<fn> intern's the same SomePtr"
+        );
+
+        crate::annotator::classdesc::register_struct_fields(
+            "ProfileHolder",
+            &[("profilefunc".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "ProfileHolder".to_string(),
+            vec![("profilefunc".to_string(), spelling.to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("ProfileHolder")
+            .expect("ProfileHolder registers");
+        let g = cd.borrow();
+        let slot = g
+            .attrs
+            .get("profilefunc")
+            .expect("profilefunc attr present");
+        assert!(
+            matches!(slot.s_value, SomeValue::Ptr(_)),
+            "option::Option<fn> field must replace the Int FORCE shell with SomePtr, got {:?}",
             slot.s_value
         );
     }

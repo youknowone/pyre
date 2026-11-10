@@ -2900,6 +2900,9 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
     };
     let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(classdesc)
         .map_err(|e| TyperError::message(e.to_string()))?;
+    if let Some(v_raw) = rtype_instantiate_raw_malloc(hop) {
+        return Ok(Some(v_raw));
+    }
     let mut llops = hop.llops.borrow_mut();
     let v_instance = crate::translator::rtyper::rclass::rtype_new_instance(
         &hop.rtyper,
@@ -2909,6 +2912,46 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
         nonmovable,
     )?;
     Ok(Some(v_instance))
+}
+
+/// `lltype.malloc(T, flavor='raw')` when instantiate annotated as
+/// `SomePtr` of a Raw struct (`robjmodel_instantiate` of a
+/// `raw_word_owner`). `hop.r_result` already carries that intern.
+fn rtype_instantiate_raw_malloc(hop: &HighLevelOp) -> Option<Hlvalue> {
+    use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let lltype = hop.r_result.borrow().as_ref()?.lowleveltype().clone();
+    let LowLevelType::Ptr(ptr) = &lltype else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = &ptr.TO else {
+        return None;
+    };
+    if st._gckind != GcKind::Raw {
+        return None;
+    }
+    let container = LowLevelType::Struct(Box::new(st.clone()));
+    let ctype = Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(container)),
+        LowLevelType::Void,
+    );
+    let mut flags_map = IndexMap::new();
+    flags_map.insert(
+        ConstValue::ByteStr(b"flavor".to_vec()),
+        ConstValue::ByteStr(b"raw".to_vec()),
+    );
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )
+    .ok()?;
+    hop.genop(
+        "malloc",
+        vec![Hlvalue::Constant(ctype), Hlvalue::Constant(cflags)],
+        GenopResult::LLType(lltype),
+    )
 }
 
 /// RPython `@typer_for(OrderedDict)`, `objectmodel.r_dict`, and
@@ -7753,6 +7796,57 @@ mod tests {
         assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
         assert_eq!(ops.ops[2].opname, "cast_pointer");
         assert_eq!(ops.ops[2].result, out);
+    }
+
+    #[test]
+    fn rtype_instantiate_of_raw_ptr_result_emits_malloc_raw() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, Ptr, PtrTarget, Struct};
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("rawinst::PosError", None);
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Class(classdef.borrow().classdesc.clone())],
+            false,
+        );
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::PBC(s_pbc));
+        let st = Struct::registry_fields(
+            "rawinst::PosError",
+            vec![("pos".into(), LowLevelType::Signed)],
+            GcKind::Raw,
+        );
+        let ptr = Ptr {
+            TO: PtrTarget::Struct(st),
+        };
+        let r_result: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let out = rtype_instantiate(&hop, &HashMap::new())
+            .expect("rtype_instantiate")
+            .expect("malloc result");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "malloc");
+        assert_eq!(ops.ops[0].result, out);
+        let Hlvalue::Constant(flags) = &ops.ops[0].args[1] else {
+            panic!("malloc flags");
+        };
+        let ConstValue::Dict(map) = &flags.value else {
+            panic!("malloc flags dict, got {:?}", flags.value);
+        };
+        assert_eq!(
+            map.get(&ConstValue::byte_str("flavor")),
+            Some(&ConstValue::byte_str("raw"))
+        );
     }
 
     #[test]

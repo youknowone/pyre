@@ -2299,10 +2299,13 @@ fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp
 /// interns by qualname and the first mint wins; a cast that minted the
 /// variant first would freeze it without bases.
 ///
-/// Returns `None` when the owner is not a registered per-instantiation
-/// payload row. A path that only contains `<Impl>` is not an enum
-/// instantiation (`bufferview::<Impl>::stride0::closure#1`): the parent
-/// has to be a registered discriminant-only enum base
+/// Returns `None` when the owner is not an enum-payload `__pos_` read.
+/// A registered per-instantiation variant row CAST+getattr's. An
+/// unregistered niche Option interned as `Ptr(T)` (and a discriminant-only
+/// enum-base owner with no `<…>`) is identity of the receiver. A path
+/// that only contains `<Impl>` is not an enum instantiation
+/// (`bufferview::<Impl>::stride0::closure#1`): the parent has to be a
+/// registered discriminant-only enum base
 /// (`StructFieldRegistry::is_enum_base`). Other `__pos_` reads stay a
 /// plain `getattr`.
 fn enum_payload_getattr_ops(
@@ -2314,7 +2317,30 @@ fn enum_payload_getattr_ops(
     let Some(owner) = field.owner_root.as_deref() else {
         return Ok(None);
     };
-    if !field.name.starts_with("__pos_") || !owner.contains('<') {
+    if !field.name.starts_with("__pos_") {
+        return Ok(None);
+    }
+    let enum_payload_owner = |name: &str| {
+        call_registry
+            .bookkeeper()
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.is_enum_base(name) || reg.enum_base_registry_key(name).is_some())
+    };
+    // Discriminant-only Option interned as SomePtr: `__pos_N` is the
+    // payload word, which is the receiver (`llannotation.py`
+    // `SomePtr.getattr` of `as_ref` is identity). Result and other
+    // payload enums keep CAST+getattr / plain getattr. A tuple-struct
+    // or closure path with no enum base stays a plain getattr.
+    if !owner.contains('<') {
+        if enum_payload_owner(owner) && enum_base_leaf_is_option(owner) {
+            return Ok(Some(vec![FlowspaceOp::new(
+                "same_as",
+                vec![base_hl],
+                result,
+            )]));
+        }
         return Ok(None);
     }
     let registered = call_registry
@@ -2327,9 +2353,6 @@ fn enum_payload_getattr_ops(
                 .get(owner)
                 .is_some_and(|rows| rows.iter().any(|row| row.name == field.name))
         });
-    if !registered {
-        return Ok(None);
-    }
     let parts = crate::model::split_qualified_path(owner);
     let Some((variant, root_parts)) = parts.split_last() else {
         return Ok(None);
@@ -2343,12 +2366,21 @@ fn enum_payload_getattr_ops(
     // the first mint would freeze the closure without its own fields.
     // Borrow of `struct_fields` ends before the intern call, which borrows
     // the same registry.
-    let enum_payload = {
-        let fields = call_registry.bookkeeper().struct_fields.borrow();
-        fields.as_ref().is_some_and(|reg| {
-            reg.is_enum_base(&enum_root) || reg.enum_base_registry_key(&enum_root).is_some()
-        })
-    };
+    let enum_payload = enum_payload_owner(&enum_root);
+    if !registered {
+        // Niche Option interned as `Ptr(T)`: the payload FieldRead is
+        // the receiver. A registered instantiation variant keeps
+        // CAST+getattr below. Result `Ok`/`Err` is a tagged payload
+        // enum even when the variant row is not yet interned.
+        if enum_payload && enum_base_leaf_is_option(&enum_root) {
+            return Ok(Some(vec![FlowspaceOp::new(
+                "same_as",
+                vec![base_hl],
+                result,
+            )]));
+        }
+        return Ok(None);
+    }
     if !enum_payload {
         return Ok(None);
     }
@@ -2389,6 +2421,15 @@ fn enum_payload_getattr_ops(
             result,
         ),
     ]))
+}
+
+/// True when `owner` names the `Option` enum (bare, crate-prefixed, or
+/// instantiated). Identity of an unregistered `__pos_N` is only sound
+/// for that intern (`Ptr(T)` niche); `Result` and other payload enums
+/// keep CAST+getattr.
+fn enum_base_leaf_is_option(owner: &str) -> bool {
+    let stripped = majit_ir::descr::strip_generic_args(owner);
+    stripped.rsplit("::").next() == Some("Option")
 }
 
 /// The `#[jit_llop]` opname declared on the callee of `target`, read off
@@ -14174,6 +14215,80 @@ mod tests {
         let translated = translate_op(&op, &value_map, &bare).expect("unregistered payload");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "getattr");
+    }
+
+    #[test]
+    fn translate_op_unregistered_niche_option_payload_is_identity() {
+        let owner = "option::Option<&rawopt::RawCell>::Some";
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("niche payload is identity");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "same_as");
+        assert_eq!(translated[0].args.len(), 1);
+
+        let unsuffixed = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some("option::Option".into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated = translate_op(&unsuffixed, &value_map, &registry)
+            .expect("unsuffixed enum-base payload is identity");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "same_as");
+
+        let result_bk = Rc::new(Bookkeeper::new());
+        let mut result_fields = crate::front::StructFieldRegistry::default();
+        result_fields.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        result_bk.set_struct_fields(Rc::new(result_fields));
+        let result_registry = CallRegistry::new(result_bk);
+        let result_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "__pos_0",
+                    Some("result::Result<(), i64>::Ok".into()),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated = translate_op(&result_op, &value_map, &result_registry)
+            .expect("unregistered Result payload is not identity");
+        assert_ne!(
+            translated[0].opname, "same_as",
+            "Result Ok payload must not alias the receiver"
+        );
     }
 
     #[test]

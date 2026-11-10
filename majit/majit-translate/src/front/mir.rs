@@ -802,8 +802,8 @@ fn ref_enum_instantiation_of_adt(
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
     // `Deref::Target` class so the payload attr and the cast agree. A
-    // pointer-niche Option payload is `*mut` of the pointee: CAST
-    // strips `&`, and intern of `Option<&T>` as `Option<T>` would
+    // pointer-niche Option payload is `*mut` of the pointee: CAST keeps
+    // `&` on `Option<&T>`, and intern of that as `Option<T>` would
     // getattr a tagged class over a pointer word. Type-arg nodes from
     // call generics are hash-consed (`Value` / `Deduplicated`); intern
     // ROW peels those wrappers so the niche test sees the Option ADT.
@@ -3905,13 +3905,7 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
         s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
-        "str"
-        | "Wtf8"
-        | "Wtf8Buf"
-        | "Utf8Str"
-        | "UnicodeValueStorage"
-        | "BytesBlock"
-        | "LowlevelStringHeader" => ValueType::Str,
+        s if is_rstr_str_family_spelling(s) => ValueType::Str,
         _ => {
             if majit_ir::descr::is_shared_u8_slice_spelling(type_name)
                 || majit_ir::descr::is_option_of_u8_window_spelling(type_name)
@@ -3984,6 +3978,10 @@ fn field_row_from_decl(
 ) -> crate::front::semantic::FieldRow {
     field_decl_row(index, field, ty)
         .with_atomic(lltype::tyref_atomic_arg(&field.ty, llbc).is_some())
+        .with_fieldless_enum(
+            lltype::tyref_is_fieldless_enum_free(&field.ty, llbc)
+                || lltype::tyref_is_borrowed_fieldless_enum_free(&field.ty, llbc),
+        )
 }
 
 fn field_decl_name(index: usize, field: &FieldDecl) -> String {
@@ -5984,6 +5982,10 @@ fn derive_program_metadata(
 /// declaration's crate and name (`majit_gc` + `GcType`), not by a list
 /// of payload type names. The facts are folded into
 /// [`crate::call::StructLayout::gckind`]; they are not a lookup table.
+/// rstr `STR` (`is_rstr_str_family_spelling`) is GC at the pointee
+/// (`pointee_is_raw_word`) without a `GcType` seed: putting it in
+/// `gc_struct_ids` would make `registered_gc_ptr_class_root_with` of
+/// `&Utf8Str` a nullable instance.
 #[derive(Default)]
 pub(crate) struct DeclaredGcFacts {
     seeds: Vec<majit_ir::descr::StructId>,
@@ -6903,6 +6905,11 @@ impl<'a> LowerContext<'a> {
         llbc: &'a Llbc,
         dependency_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ) -> Self {
+        // Fill `value_type_inputs` before the stack walk. `render_adt_type_args`
+        // reads that OnceLock with `get` (it cannot `get_or_init`: harvest
+        // re-enters through `is_unit_type`). Class-root spelling during
+        // `ensure_stack_sensitive_fns` then sees the declared-GC set.
+        let _ = value_type_inputs(llbc);
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
         // [`link_transparent_scalar_types`]. Publish the same external
@@ -7298,8 +7305,8 @@ pub(crate) use self::lltype::{
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
     is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
+    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, strip_crate_prefix, type_decl_ref_adt_id,
