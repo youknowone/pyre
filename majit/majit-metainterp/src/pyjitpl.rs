@@ -1522,23 +1522,18 @@ pub(crate) fn translate_trace_iter_opref(
     translated
 }
 
-/// Recorder-namespace JUMP / `jump_args` position → the box minted by the
-/// trace iterator into `_cache`. Inline Consts never occupy a cache slot;
-/// they become `Operand::const_from_value` here, the same box-minting
-/// boundary `opencoder.py` `TraceIterator` uses for Const boxes.
-fn translate_trace_iter_runtime_box(opref: OpRef, cache: &[Option<Operand>]) -> Operand {
-    if opref.is_none() {
+/// `opencoder.py` `TraceIterator._get`: rewrite one original JUMP /
+/// `runtime_boxes` entry into the fresh-iterator namespace. Const boxes
+/// stay the same object (`ConstInt` identity); they never occupy `_cache`.
+/// Bound boxes look up `_cache` by recorder position (class-C key).
+fn translate_trace_iter_runtime_box(box_: Operand, cache: &[Option<Operand>]) -> Operand {
+    if box_.is_none() {
         return Operand::None;
     }
-    if let Some(v) = opref.as_const_int() {
-        return Operand::const_from_value(Value::Int(v));
+    if box_.is_constant() {
+        return box_;
     }
-    if let Some(v) = opref.as_const_float() {
-        return Operand::const_from_value(Value::Float(v));
-    }
-    if let Some(v) = opref.as_const_ptr() {
-        return Operand::const_from_value(Value::Ref(v));
-    }
+    let opref = box_.to_opref();
     cache
         .get(opref.raw() as usize)
         .and_then(Clone::clone)
@@ -1563,7 +1558,8 @@ fn translate_trace_iter_box_map(
     box_map
 }
 
-/// `unroll.py:187 trace = trace.get_iter()` parity.
+/// `unroll.py` `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+/// parity.
 ///
 /// RPython mints fresh `InputArg` / `ResOperation` objects before
 /// `optimize_bridge()` consumes the trace; `opencoder.py
@@ -1591,7 +1587,7 @@ fn prepare_bridge_trace_from_owned(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
     // `Operand::Op` already shares the producer `Rc`. Later uses hold a
@@ -1754,7 +1750,7 @@ fn prepare_bridge_from_byte_recorder(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> Option<PreparedBridgeTrace> {
     // unroll.py `optimize_bridge` `trace = trace.get_iter()`.
@@ -1794,7 +1790,7 @@ fn finish_prepared_bridge(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
 ) -> PreparedBridgeTrace {
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
@@ -1809,7 +1805,7 @@ fn finish_prepared_bridge(
     });
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_runtime_box(opref, &cache))
+        .map(|box_| translate_trace_iter_runtime_box(box_, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -1834,7 +1830,7 @@ fn prepare_bridge_trace_for_optimizer<T>(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    runtime_boxes: Vec<OpRef>,
+    runtime_boxes: Vec<Operand>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace
 where
@@ -1846,7 +1842,8 @@ where
     // two preparations share one.
     #[cfg(feature = "jit-audits")]
     next_audit_prepare_generation();
-    // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
+    // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+    // parity for bridge traces.
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
     // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
@@ -1866,12 +1863,12 @@ where
     // `cls()` whose result box defaults `_resint`/`_resref` to 0/NULL — it does
     // NOT carry the recorded box's observed runtime value. RPython tolerates
     // this because `runtime_boxes` are the SEPARATE original history boxes
-    // (pyjitpl.py:3213 `live_arg_boxes[num_green_args:]`), whose `_resint` is
-    // intact and read un-forwarded by `runtime_box.getint()`
-    // (virtualstate.py:494). Pyre resolves a runtime box's value through its
-    // producing op, so the re-minted op must keep the recorded value to expose
-    // the same un-forwarded `_resint` that drives the IntBound runtime fallback
-    // (`get_virtual_runtime_field` / virtualstate.py:493-498). The source/
+    // (`pyjitpl.py` `compile_trace` `live_arg_boxes[num_green_args:]`), whose
+    // `_resint` is intact and read un-forwarded by `runtime_box.getint()`
+    // (`virtualstate.py` `generate_guards`). Pyre resolves a runtime box's
+    // value through its producing op, so the re-minted op must keep the
+    // recorded value to expose the same un-forwarded `_resint` that drives
+    // the IntBound runtime fallback (`get_virtual_runtime_field`). The source/
     // re-minted op lists are 1:1 (one `next()` per recorded op), so copy each
     // observed value across.
     for (src, dst) in bridge_ops
@@ -1905,14 +1902,15 @@ where
             .collect();
         prd
     });
-    // unroll.py:105/153/166 `runtime_boxes` are the closing JUMP's live boxes.
-    // They are harvested from the pre-iterator trace and must be rewritten into
-    // the fresh-iterator namespace alongside `liveboxes` / snapshot feeds —
-    // otherwise `runtime_value_of` / `getptrinfo` lookups in optimize_bridge
-    // (which runs in the re-minted namespace) miss the producing op.
+    // unroll.py `UnrollOptimizer.optimize_bridge` `runtime_boxes` are the
+    // closing JUMP's live boxes. They are harvested from the pre-iterator
+    // trace and must be rewritten into the fresh-iterator namespace
+    // alongside `liveboxes` / snapshot feeds — otherwise `runtime_value_of`
+    // / `getptrinfo` lookups in optimize_bridge (which runs in the
+    // re-minted namespace) miss the producing op.
     let runtime_boxes = runtime_boxes
         .into_iter()
-        .map(|opref| translate_trace_iter_runtime_box(opref, &cache))
+        .map(|box_| translate_trace_iter_runtime_box(box_, &cache))
         .collect();
     PreparedBridgeTrace {
         ops,
@@ -10889,6 +10887,17 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
+        let jump_boxes: Vec<Operand> = if !bridge_ops.is_empty() {
+            Self::closing_jump_runtime_boxes(&bridge_ops)
+        } else {
+            let rec = &mut self.tracing.as_mut().expect("compile_trace").recorder;
+            finish_args
+                .iter()
+                .copied()
+                .map(|r| rec.box_for_operand(r))
+                .collect()
+        };
+
         let outcome = if from_guard {
             // compile.py — ResumeGuardDescr path: attach bridge
             // to the existing guard that failed.
@@ -10937,7 +10946,7 @@ impl<M: Clone> MetaInterp<M> {
                 &descr_arc,
                 bridge_ops,
                 &bridge_inputargs,
-                finish_args,
+                &jump_boxes,
                 constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
@@ -10978,7 +10987,7 @@ impl<M: Clone> MetaInterp<M> {
                 entry_driver_descriptor,
                 &bridge_ops,
                 &bridge_inputargs,
-                finish_args,
+                &jump_boxes,
                 constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
@@ -15244,7 +15253,7 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<crate::jitdriver::JitDriverStaticData>>,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15294,14 +15303,12 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py `deserialize_optimizer_knowledge` receives
         // `frontend_boxes` (the source guard's live boxes) alongside
         // `liveboxes` (the bridge inputargs). It reads class knowledge
-        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
-        // and heap knowledge through `decode_box` at :153-157.
+        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` and heap
+        // knowledge through `decode_box`.
         //
         // Pyre stamps the `frontend_boxes` concrete values onto the
         // bridge inputarg operands here, so `runtime_value_of` and
         // `cls_of_box` consumers in the optimizer can read them.
-        // The stamp must precede `closing_jump_runtime_boxes`, which folds a
-        // valued inputarg JUMP arg into an inline Const.
         if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
             // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
             // failed source-guard `fail_args` must be paired 1:1 with
@@ -15312,7 +15319,8 @@ impl<M: Clone> MetaInterp<M> {
                 frontend_boxes.len(),
                 bridge_inputargs.len(),
                 "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
-                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
+                 fail_args plumbing diverged from liveboxes \
+                 (bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`)",
                 frontend_boxes.len(),
                 bridge_inputargs.len(),
             );
@@ -15323,17 +15331,18 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(value);
             }
         }
-        // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
-        // separately from the trace iterator and stay as the original live
-        // boxes from the closing JUMP.
-        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+        // compile.py `BridgeCompileData` / unroll.py `optimize_bridge`:
+        // runtime_boxes are passed separately from the trace iterator and
+        // stay as the original live boxes from the closing JUMP.
+        let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
             Self::closing_jump_runtime_boxes(bridge_ops)
         };
-        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
-        // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`:
+        // mint fresh InputArg / ResOperation objects in a disjoint OpRef
+        // namespace (`opencoder.py` `TraceIterator.__init__`
+        // `self.inputargs = [rop.inputarg_from_tp(...)]`).
         let use_byte_iter = self
             .tracing
             .as_ref()
@@ -15369,9 +15378,10 @@ impl<M: Clone> MetaInterp<M> {
         let byte_unique_cache = prepared.byte_unique_cache.take();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
-        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
-        // into the fresh-iterator namespace; consume the translated list so
-        // optimize_bridge's generate_guards reads them in the re-minted space.
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+        // rewrote the runtime boxes into the fresh-iterator namespace; consume
+        // the translated list so optimize_bridge's generate_guards reads them
+        // in the re-minted space.
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
@@ -15662,43 +15672,19 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Build the bridge's `runtime_boxes` (`compile.py` `BridgeCompileData` /
-    /// `unroll.py` `optimize_bridge`): the live boxes from the closing JUMP,
-    /// in the recorder namespace. `prepare_bridge_trace_for_optimizer` /
-    /// `finish_prepared_bridge` translate them through the trace-iterator
-    /// cache.
-    ///
-    /// In RPython every box carries its `_resint`/`_resref`/`_resfloat`
-    /// (`history.py` Box value) because the metainterp executes each op
-    /// concretely while tracing, so `runtime_box.getint()` /
-    /// `get_runtime_field` (`virtualstate.py` `generate_guards`) read real
-    /// values during the optimizer's `jump_to_existing_trace` virtual-state
-    /// match. pyre stamps the same concrete values onto the recorded `Op` /
-    /// `InputArg` identities during tracing (recorder `set_concrete_at` →
-    /// `Op::set_value`). Each JUMP arg is already that bound box;
-    /// `Operand::get_value` reads the producer value off the arg itself. A
-    /// valued non-Void result is materialized as
-    /// `OpRef::const_inline_from_value`, which carries the value
-    /// namespace-independently. A jump arg with no recorded value (or a Void
-    /// result) is `arg.to_opref()`, leaving the corresponding virtual-state
-    /// entry to match statically as before.
-    fn closing_jump_runtime_boxes<T>(bridge_ops: &[T]) -> Vec<OpRef>
+    /// `compile.py` `BridgeCompileData` / `unroll.py` `optimize_bridge`:
+    /// the live boxes from the closing JUMP, recorder namespace.
+    /// `prepare_bridge_*` rewrites them through `TraceIterator._cache`.
+    fn closing_jump_runtime_boxes<T>(bridge_ops: &[T]) -> Vec<Operand>
     where
         T: std::borrow::Borrow<majit_ir::Op>,
     {
-        let jump_args = bridge_ops
+        bridge_ops
             .last()
             .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args_slice().to_vec())
-            .unwrap_or_default();
-        jump_args
-            .into_iter()
-            .map(|arg| match arg.get_value() {
-                Some(v) if !matches!(v, Value::Void) => OpRef::const_inline_from_value(&v),
-                _ => arg.to_opref(),
-            })
-            .collect()
+            .map(|op| op.getarglist_copy().to_vec())
+            .unwrap_or_default()
     }
 
     /// Compile a bridge from a guard failure point.
@@ -15744,7 +15730,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr_arc: &majit_ir::DescrRef,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
-        jump_args: &[OpRef],
+        jump_args: &[Operand],
         bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15939,7 +15925,7 @@ impl<M: Clone> MetaInterp<M> {
         // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
-        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+        let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
             jump_args.to_vec()
         } else {
             Self::closing_jump_runtime_boxes(&bridge_ops)
@@ -16009,9 +15995,10 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_call_pure_results = call_pure_results.clone();
         let bridge_inputargs = prepared_inputargs.as_slice();
         let bridge_ops = bridge_trace_data.ops.as_slice();
-        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
-        // into the fresh-iterator namespace; consume the translated list so
-        // optimize_bridge's generate_guards reads them in the re-minted space.
+        // unroll.py `UnrollOptimizer.optimize_bridge` `trace = trace.get_iter()`
+        // rewrote the runtime boxes into the fresh-iterator namespace; consume
+        // the translated list so optimize_bridge's generate_guards reads them
+        // in the re-minted space.
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
@@ -32053,7 +32040,7 @@ mod tests {
 
         // The closing JUMP's args are the bridge `runtime_boxes`; they must be
         // rewritten into the fresh-iterator namespace like the snapshot feeds.
-        let bridge_runtime_boxes = vec![OpRef::ref_op(2), OpRef::int_op(3)];
+        let bridge_runtime_boxes = bridge_ops[2].getarglist_copy().to_vec();
         let prepared = prepare_bridge_trace_for_optimizer(
             &bridge_ops,
             &bridge_inputargs,
@@ -32130,15 +32117,12 @@ mod tests {
                 .clone(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_ref(11)]
         );
-        // runtime_boxes are translated into the fresh-iterator namespace.
-        assert_eq!(
-            prepared
-                .runtime_boxes
-                .iter()
-                .map(|b| b.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::ref_op(12), OpRef::int_op(13)]
+        // runtime_boxes remap onto the reminted JUMP args.
+        assert!(
+            prepared.runtime_boxes[0].same_box(&prepared.ops[2].arg(0)),
+            "runtime_boxes remap onto the reminted JUMP args"
         );
+        assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[2].arg(1)));
     }
 
     #[test]
@@ -32162,6 +32146,7 @@ mod tests {
             live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
         );
+        let runtime_boxes = vec![rec.box_for_operand(add)];
         let prepared = prepare_bridge_from_byte_recorder(
             &rec,
             &live,
@@ -32171,7 +32156,7 @@ mod tests {
             Vec::new(),
             SnapshotFramePcs::new(),
             None,
-            vec![add],
+            runtime_boxes,
             1000,
         )
         .expect("byte buffer");
@@ -32209,7 +32194,7 @@ mod tests {
             Vec::new(),
             SnapshotFramePcs::new(),
             None,
-            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            bridge_ops[0].getarglist_copy().to_vec(),
             556,
         );
         assert_eq!(
@@ -32229,6 +32214,8 @@ mod tests {
             vec![OpRef::input_arg_ref(556), OpRef::input_arg_ref(558)],
             "JUMP[1] remints through the cache onto the Vm failarg"
         );
+        assert!(prepared.runtime_boxes[0].same_box(&prepared.ops[0].arg(0)));
+        assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[0].arg(1)));
     }
 
     /// `pyjitpl.py compile_trace` + `unroll.py optimize_bridge`: original
