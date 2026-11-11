@@ -706,6 +706,10 @@
       "dynasm": "SKIP",
       "reason": "CPython Windows py.exe launcher"
     },
+    "test.test_lazy_import": {
+      "dynasm": "FAIL",
+      "reason": "test_add_lazy_to_exec_builtins_after_specialization needs CPython's specializing LOAD_GLOBAL builtins cache; test_cached_import_releases_builtins: a code object compiled by exec() keeps its namespace alive through PyCode.w_globals, so the exec __builtins__ mapping is not released"
+    },
     "test.test_linecache": {
       "dynasm": "PASS"
     },
@@ -745,6 +749,9 @@
     "test.test_math": {
       "dynasm": "TIMEOUT",
       "reason": "test_sumprod_stress exceeds the 600s budget on ubuntu: Decimal arithmetic through _pydecimal runs ~50x slower than PyPy because BINARY_OP on Decimal residualizes the whole __mul__ (ContextVar.get has no jitcode; type-call with overridden __new__ and loop-bearing callees decline)"
+    },
+    "test.test_math_integer": {
+      "dynasm": "PASS"
     },
     "test.test_math_property": {
       "cranelift": "SKIP",
