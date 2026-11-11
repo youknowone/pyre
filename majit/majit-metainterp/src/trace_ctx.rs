@@ -5360,13 +5360,15 @@ impl TraceCtx {
     /// Trace every concrete Ref carried by `virtualizable_boxes`.
     ///
     /// Each box is an `InputArg*` / `*FrontendOp` / `Const*` that carries its
-    /// own value. `InputArg*` and `*FrontendOp` refs are forwarded by the
-    /// recorder walk (`walk_active_trace_refs` visits `inputargs` and
-    /// `value_slots`); this walk traces `ConstPtr` indexes the vable box
-    /// list still holds, then forwards `virtualizable_heap_ptr`. The trailing
-    /// identity is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt
-    /// frame identity live instead of falling back to an older cached
-    /// portal-frame pointer.
+    /// own value. `ConstPtr` indexes are `trace_const_ptr`'d here;
+    /// `InputArg*` / `*FrontendOp` `_resref` is `forward_concrete_ref`'d here
+    /// so the vable shadow is a root even when `live_boxes` did not already
+    /// name the box (`history.py` `RefFrontendOp._resref` is a field of the
+    /// Box; `walk_active_trace_refs` still visits `inputargs` / `live_boxes`
+    /// first). Then forwards `virtualizable_heap_ptr`. The trailing identity
+    /// is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt frame
+    /// identity live instead of falling back to an older cached portal-frame
+    /// pointer.
     pub(crate) fn walk_virtualizable_value_refs(
         &mut self,
         mut visitor: impl FnMut(&mut majit_ir::GcRef),
@@ -5376,8 +5378,9 @@ impl TraceCtx {
             _ => None,
         };
         if let Some(boxes) = self.virtualizable_boxes.as_ref() {
-            for slot in boxes {
+            for &slot in boxes {
                 slot.trace_const_ptr(&mut visitor);
+                self.recorder.forward_concrete_ref(slot, &mut visitor);
             }
         }
         // The cell names either the identity or a different object: a frontend
@@ -9598,8 +9601,9 @@ mod tests {
     }
 
     /// Production `walk_active_trace_refs` forwards `InputArg*` `_res*` on
-    /// the recorder, then `ConstPtr` in `virtualizable_boxes` and
-    /// `virtualizable_heap_ptr` through `walk_virtualizable_value_refs`.
+    /// the recorder, then `ConstPtr` / FrontendOp `_resref` in
+    /// `virtualizable_boxes` and `virtualizable_heap_ptr` through
+    /// `walk_virtualizable_value_refs`.
     fn walk_vable_refs_as_gc(ctx: &mut TraceCtx, mut visitor: impl FnMut(&mut majit_ir::GcRef)) {
         for ia in ctx.recorder.inputargs() {
             if let Some(Value::Ref(mut r)) = ia.get_value() {
@@ -10118,6 +10122,34 @@ mod tests {
         assert_eq!(ctx.virtualizable_heap_ptr(), Some(0xA000 as *const u8));
     }
 
+    /// `virtualizable_entry_at` prefers `box_runtime_concrete` over the live
+    /// heap. A SameAsR identity that lives only on `virtualizable_boxes` (no
+    /// framestack `live_boxes`) must still have `_resref` rewritten here, or
+    /// the FBW walk-end flush copies the corpse into the frame.
+    #[test]
+    fn walk_virtualizable_value_refs_forwards_frontendop_resref() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let input = ctx.recorder.inputargs()[0].opref();
+        let ident = ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(majit_ir::GcRef(0x7000))),
+        );
+        ctx.virtualizable_boxes = Some(vec![ident]);
+        ctx.set_virtualizable_heap_ptr(0x7000 as *const u8);
+        ctx.walk_virtualizable_value_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+        });
+        assert_eq!(ctx.box_bits(ident), Some(0x8000));
+        assert_eq!(ctx.virtualizable_heap_ptr(), Some(0x8000 as *const u8));
+        assert_eq!(
+            ctx.virtualizable_entry_at(0).map(|(_, v)| v),
+            Some(Value::Ref(majit_ir::GcRef(0x8000)))
+        );
+    }
+
     /// `add_merge_point_with_key` must stamp the header snapshot with the virtualizable
     /// IDENTITY, not the synchronization target.
     ///
@@ -10214,7 +10246,17 @@ mod tests {
         );
         ctx.set_virtualizable_heap_ptr(SNAPSHOT_COPY as *const u8);
 
-        walk_vable_refs_as_gc(&mut ctx, |gcref| gcref.0 += MOVED_BY);
+        // Collector forwarding is idempotent (corpse → live, live stays).
+        // `walk_active_trace_refs` visits inputargs then
+        // `walk_virtualizable_value_refs` visits the same identity box's
+        // `_resref` again, so a `+=` visitor would double-move it.
+        walk_vable_refs_as_gc(&mut ctx, |gcref| {
+            if gcref.0 == LIVE_FRAME {
+                gcref.0 = LIVE_FRAME + MOVED_BY;
+            } else if gcref.0 == SNAPSHOT_COPY {
+                gcref.0 = SNAPSHOT_COPY + MOVED_BY;
+            }
+        });
 
         assert_eq!(
             ctx.virtualizable_heap_ptr(),
@@ -10253,7 +10295,11 @@ mod tests {
         );
         ctx.set_virtualizable_heap_ptr(LIVE_FRAME as *const u8);
 
-        walk_vable_refs_as_gc(&mut ctx, |gcref| gcref.0 += MOVED_BY);
+        walk_vable_refs_as_gc(&mut ctx, |gcref| {
+            if gcref.0 == LIVE_FRAME {
+                gcref.0 = LIVE_FRAME + MOVED_BY;
+            }
+        });
 
         assert_eq!(
             ctx.virtualizable_heap_ptr(),
