@@ -2657,6 +2657,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "WTERMSIG",
             "WIFSTOPPED",
             "WSTOPSIG",
+            "WCOREDUMP",
+            "WIFCONTINUED",
             // "WEXITED"/"WNOWAIT"/"WSTOPPED" — `waitid`'s option flags, which
             // are numbers rather than calls; bound with the other wait options
             // below.
@@ -5236,11 +5238,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             if entry.is_null() {
                 return majit_rlib::rposix::get_saved_errno();
             }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name = unsafe {
+                std::ffi::CStr::from_ptr((*entry).c_d_name.as_ptr() as *const libc::c_char)
+            };
             let name = name.to_bytes();
             if name != b"." && name != b".." {
-                let ino = unsafe { (*entry).d_ino } as i64;
-                let d_type = unsafe { (*entry).d_type };
+                let ino = unsafe { (*entry).c_d_ino } as i64;
+                #[cfg(rposix_have_d_type)]
+                let d_type = unsafe { (*entry).c_d_type } as u8;
+                #[cfg(not(rposix_have_d_type))]
+                let d_type = 0u8;
                 f(name, ino, d_type);
             }
         }
@@ -6468,14 +6475,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     const S_IFLNK: u32 = 0o120_000;
 
     /// The `d_type` byte `readdir` reports — the `known_type` half of
-    /// `interp_scandir.py`'s `flags`.  `DT_UNKNOWN` (`0`) is the `W_DirEntry`
-    /// default, so an entry whose type the host did not report (a non-unix
-    /// host, or a filesystem that answers `DT_UNKNOWN`) falls through to the
-    /// stat `dir_entry_kind` runs.  Only the three types the tests read need a
-    /// name.
+    /// `interp_scandir.py`'s `flags`.  `rposix.py` `dirent_config` `DT_*`
+    /// when `HAVE_D_TYPE`; otherwise the POSIX numbers the Windows walk
+    /// stores as the same tags (`rposix_scandir.py` `DT_UNKNOWN` default 0).
+    #[cfg(rposix_have_d_type)]
+    const DT_UNKNOWN: u8 = majit_rlib::rposix::DT_UNKNOWN as u8;
+    #[cfg(rposix_have_d_type)]
+    const DT_DIR: u8 = majit_rlib::rposix::DT_DIR as u8;
+    #[cfg(rposix_have_d_type)]
+    const DT_REG: u8 = majit_rlib::rposix::DT_REG as u8;
+    #[cfg(rposix_have_d_type)]
+    const DT_LNK: u8 = majit_rlib::rposix::DT_LNK as u8;
+    #[cfg(not(rposix_have_d_type))]
     const DT_UNKNOWN: u8 = 0;
+    #[cfg(not(rposix_have_d_type))]
     const DT_DIR: u8 = 4;
+    #[cfg(not(rposix_have_d_type))]
     const DT_REG: u8 = 8;
+    #[cfg(not(rposix_have_d_type))]
     const DT_LNK: u8 = 10;
 
     fn dir_entry_known_type(self_obj: PyObjectRef) -> u8 {
@@ -7424,7 +7441,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "uname",
             |_| {
                 // `rposix.c_uname` releases the GIL and saves errno.
-                let mut uts = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+                let mut uts = std::mem::MaybeUninit::<majit_rlib::rposix::UTSNAME>::zeroed();
                 let ret = unsafe { majit_rlib::rposix::c_uname(uts.as_mut_ptr()) };
                 if ret < 0 {
                     return Err(io_err(
@@ -7433,17 +7450,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ));
                 }
                 let uts = unsafe { uts.assume_init() };
-                let field = |bytes: &[libc::c_char]| {
+                let field = |bytes: &[u8]| {
                     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    let raw =
-                        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), end) };
-                    String::from_utf8_lossy(raw).into_owned()
+                    String::from_utf8_lossy(&bytes[..end]).into_owned()
                 };
-                let sysname = field(&uts.sysname);
-                let nodename = field(&uts.nodename);
-                let release = field(&uts.release);
-                let version = field(&uts.version);
-                let machine = field(&uts.machine);
+                let sysname = field(&uts.c_sysname);
+                let nodename = field(&uts.c_nodename);
+                let release = field(&uts.c_release);
+                let version = field(&uts.c_version);
+                let machine = field(&uts.c_machine);
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_str_new_managed(&sysname));
                 fields.push(pyre_object::w_str_new_managed(&nodename));
@@ -10252,23 +10267,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 );
             };
         }
-        reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(
-            s
-        )));
+        reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(
+            majit_rlib::rposix::WIFEXITED(s)
+        ));
         reg_wstatus!("WEXITSTATUS", |s| pyre_object::w_int_new(
-            libc::WEXITSTATUS(s) as i64
+            majit_rlib::rposix::WEXITSTATUS(s)
         ));
         reg_wstatus!("WIFSIGNALED", |s| pyre_object::w_bool_from(
-            libc::WIFSIGNALED(s)
+            majit_rlib::rposix::WIFSIGNALED(s)
         ));
         reg_wstatus!("WTERMSIG", |s| pyre_object::w_int_new(
-            libc::WTERMSIG(s) as i64
+            majit_rlib::rposix::WTERMSIG(s)
         ));
         reg_wstatus!("WIFSTOPPED", |s| pyre_object::w_bool_from(
-            libc::WIFSTOPPED(s)
+            majit_rlib::rposix::WIFSTOPPED(s)
         ));
         reg_wstatus!("WSTOPSIG", |s| pyre_object::w_int_new(
-            libc::WSTOPSIG(s) as i64
+            majit_rlib::rposix::WSTOPSIG(s)
+        ));
+        reg_wstatus!("WCOREDUMP", |s| pyre_object::w_bool_from(
+            majit_rlib::rposix::WCOREDUMP(s)
+        ));
+        reg_wstatus!("WIFCONTINUED", |s| pyre_object::w_bool_from(
+            majit_rlib::rposix::WIFCONTINUED(s)
         ));
 
         // Wait option flags — override the `0` placeholders registered above
@@ -12115,15 +12136,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // through `posix.WIFEXITED`/`WEXITSTATUS`, each of which is
                     // `@unwrap_spec(status=c_int)`.
                     let status = crate::baseobjspace::c_int_w(args[0])?;
-                    let code = if libc::WIFEXITED(status) {
-                        Some(libc::WEXITSTATUS(status))
-                    } else if libc::WIFSIGNALED(status) {
-                        Some(-libc::WTERMSIG(status))
+                    let code = if majit_rlib::rposix::WIFEXITED(status) {
+                        Some(majit_rlib::rposix::WEXITSTATUS(status))
+                    } else if majit_rlib::rposix::WIFSIGNALED(status) {
+                        Some(-majit_rlib::rposix::WTERMSIG(status))
                     } else {
                         None
                     };
                     match code {
-                        Some(code) => Ok(pyre_object::w_int_new(code as i64)),
+                        Some(code) => Ok(pyre_object::w_int_new(code)),
                         None => Err(crate::PyError::value_error(
                             "waitstatus_to_exitcode: invalid status",
                         )),

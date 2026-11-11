@@ -11,9 +11,11 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_pipe2)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fadvise)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fallocate)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_d_type)");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_PIPE2");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_FADVISE");
     println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_FALLOCATE");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_D_TYPE");
     // These mirror `moduledef.py`'s `rposix.HAVE_PIPE2` / `hasattr(rposix, 'posix_fadvise')`.
     if std::env::var("DEP_MAJIT_RLIB_HAVE_PIPE2").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=rposix_have_pipe2");
@@ -23,6 +25,9 @@ fn main() {
     }
     if std::env::var("DEP_MAJIT_RLIB_HAVE_FALLOCATE").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=rposix_have_fallocate");
+    }
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_D_TYPE").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rposix_have_d_type");
     }
     majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     let target = std::env::var("TARGET").unwrap_or_default();
