@@ -4053,7 +4053,7 @@ impl<S: JitState> JitDriver<S> {
     /// now survives a declined bridge attempt. Both consumers want a live
     /// session rather than the bare class — `close_loop_args_at` reads it
     /// mid-walk to decide whose LABEL types the JUMP must match, and
-    /// `eval_with_jit_inner` reads it to force concrete force-helper calls onto
+    /// `ll_portal_runner` reads it to force concrete force-helper calls onto
     /// the plain interpreter — but `self.sym` is not the liveness signal:
     /// `start_bridge_tracing` sets `bridge_info` (through
     /// `start_retrace_from_guard`) and then runs `rebuild_from_resumedata`
