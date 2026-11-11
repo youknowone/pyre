@@ -276,18 +276,20 @@ impl<'a> CompileData<'a> {
 /// `compile.py` `class PreambleCompileData(CompileData)`.
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
+    pub runtime_boxes: &'a [Operand],
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
 }
 
 impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
-        runtime_boxes: &'a [OpRef],
+        runtime_boxes: &'a [Operand],
         call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace),
+            runtime_boxes,
             call_pure_results,
         }
     }

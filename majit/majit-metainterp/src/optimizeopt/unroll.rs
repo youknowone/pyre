@@ -258,50 +258,6 @@ fn refresh_forwarded_const_ref(
     forwarded.refresh_const_ref(updated);
 }
 
-/// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` —
-/// `runtime_boxes` are the original boxes, InputArg and Op alike.
-/// `generate_guards` reads them via `getint`/`getref_base` /
-/// `get_runtime_field` (virtualstate.py, :493). A raw OpRef does
-/// not carry `_resint`/`_resref`, so materialize each stamped value as
-/// an inline Const — the same recovery `closing_jump_runtime_boxes`
-/// already performs for bridges. InputArg values live on
-/// `trace_inputargs`; ResOp values live on the recorded producer
-/// (`set_concrete_at` → `Op::set_value`). Without the ResOp arm a
-/// virtual W_IntObject JUMP slot arrives as `RefOp(n)` with no
-/// readable intval, and `IntBounded` vs `Unknown(Int)` rejects the
-/// peel even though the first-iteration heap value is in range.
-fn fold_recorded_jump_args(
-    args: Vec<Operand>,
-    inputargs: &[Operand],
-    recorded_ops: &[OpRc],
-) -> Vec<Operand> {
-    args.into_iter()
-        .map(|arg| {
-            let opref = arg.to_opref();
-            let inputarg_index = match opref {
-                OpRef::InputArgInt(i) | OpRef::InputArgFloat(i) | OpRef::InputArgRef(i) => {
-                    Some(i as usize)
-                }
-                _ => None,
-            };
-            if let Some(inputarg) = inputarg_index.and_then(|i| inputargs.get(i))
-                && inputarg.type_() == arg.type_()
-                && let Some(value) = inputarg.get_value()
-                && !matches!(value, Value::Void)
-            {
-                return Operand::const_from_value(value);
-            }
-            if let Some(op) = recorded_ops.iter().find(|op| op.pos().get() == opref)
-                && let Some(value) = op.get_value()
-                && !matches!(value, Value::Void)
-            {
-                return Operand::const_from_value(value);
-            }
-            arg
-        })
-        .collect()
-}
-
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -885,12 +841,22 @@ impl UnrollOptimizer {
         num_inputs: usize,
     ) -> (Vec<majit_ir::OpRc>, usize) {
         let ops_rc: Vec<OpRc> = ops.iter().cloned().map(OpRc::new).collect();
-        self.optimize_trace_with_constants_and_inputs_vable(&ops_rc, constants, num_inputs, None)
-            .expect("optimize_trace_with_constants_and_inputs: unexpected InvalidLoop")
+        let runtime_boxes: Vec<Operand> = ops
+            .iter()
+            .rfind(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.getarglist_copy().to_vec())
+            .unwrap_or_default();
+        self.optimize_trace_with_constants_and_inputs_vable(
+            &ops_rc,
+            constants,
+            num_inputs,
+            None,
+            &runtime_boxes,
+        )
+        .expect("optimize_trace_with_constants_and_inputs: unexpected InvalidLoop")
     }
 
-    /// compile.py: compile_loop — 2-phase preamble peeling.
-    /// compile.py:275-338: 2-phase preamble peeling (RPython parity).
+    /// compile.py `compile_loop` — 2-phase preamble peeling.
     ///
     /// Phase 1 (optimize_preamble): full pipeline on trace → preamble_ops.
     /// export_state: capture the preamble's exported optimizer state.
@@ -902,6 +868,7 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
+        runtime_boxes: &[Operand],
     ) -> Result<(Vec<majit_ir::OpRc>, usize), crate::optimize::InvalidLoop> {
         self.optimize_trace_with_constants_and_inputs_vable_out(
             ops,
@@ -909,14 +876,16 @@ impl UnrollOptimizer {
             num_inputs,
             vable_config,
             None,
+            runtime_boxes,
         )
     }
 
     /// Same as optimize_trace_with_constants_and_inputs_vable but with an
-    /// output parameter for Phase 1 results. RPython compile.py:278-294
-    /// parity: Phase 1 results (preamble_ops + exported_state) are written
-    /// to `phase1_out` before Phase 2 starts. If Phase 2 panics, the caller
-    /// still has the Phase 1 results for retrace_needed.
+    /// output parameter for Phase 1 results. RPython `compile.py`
+    /// `compile_loop` / `PreambleCompileData.optimize`: Phase 1 results
+    /// (preamble_ops + exported_state) are written to `phase1_out` before
+    /// Phase 2 starts. If Phase 2 panics, the caller still has the Phase 1
+    /// results for retrace_needed.
     pub(crate) fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
         ops: &[OpRc],
@@ -924,6 +893,7 @@ impl UnrollOptimizer {
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<majit_ir::OpRc>, ExportedState)>>,
+        runtime_boxes: &[Operand],
     ) -> Result<(Vec<majit_ir::OpRc>, usize), crate::optimize::InvalidLoop> {
         // `TraceIterator::next` re-interns each recorded `Op.value`. That
         // asks `id_or_identityhash` and can collect. The source ops are the
@@ -961,7 +931,7 @@ impl UnrollOptimizer {
             (pre_imported, constants.clone(), Vec::new(), None)
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
-            // ── Phase 1: optimize_preamble (compile.py:275-276) ──
+            // ── Phase 1: UnrollOptimizer.optimize_preamble ──
             let mut consts_p1 = constants.clone();
             let mut opt_p1 = self.phase_optimizer(vable_config.clone());
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
@@ -1046,23 +1016,6 @@ impl UnrollOptimizer {
                     cache,
                 ));
             }
-            // compile.py `PreambleCompileData(trace, jumpargs, ...)` —
-            // the recorded JUMP arglist is the preamble's `runtime_boxes`
-            // (live_arg_boxes captured at the merge point). Capture it into a
-            // local here; `opt_p1.runtime_boxes` cannot carry it because
-            // `setup()` clears that field at the start of every optimize run
-            // (optimizer.rs `self.runtime_boxes.clear()`). Threaded into the
-            // exported state below so the peeled-loop close reads it as
-            // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
-            // peeled body's own jump args.
-            let recorded_jump_args = fold_recorded_jump_args(
-                ops.iter()
-                    .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|op| op.args_slice().to_vec())
-                    .unwrap_or_default(),
-                &self.trace_inputargs,
-                ops,
-            );
             // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated. trace.get_iter() per-call
             // inputarg_from_tp(...) / cls() — each phase optimizes against a
@@ -1100,10 +1053,9 @@ impl UnrollOptimizer {
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
                     // unroll.py `export_state(..., runtime_boxes, ...)` —
-                    // carry the recorded JUMP args into ExportedState so the
-                    // peeled-loop close passes them to generate_guards as
-                    // `state.runtime_boxes` (unroll.py:153/166).
-                    state.runtime_boxes = recorded_jump_args.clone();
+                    // original jumpargs (`PreambleCompileData.runtime_boxes`),
+                    // not the TraceIterator-reminted JUMP args.
+                    state.runtime_boxes = runtime_boxes.to_vec();
                     // end_arg_types is already populated by
                     // `Optimizer::optimize_with_constants_and_inputs_at`
                     // using the optimizer-visible `ctx.opref_type()` (see
@@ -7325,6 +7277,7 @@ mod tests {
                 1,
                 None,
                 None,
+                &canonical.last().unwrap().getarglist_copy(),
             );
             assert_eq!(result.is_err(), reject);
             // opencoder.py TraceIterator.next creates each phase's operation;
@@ -7368,6 +7321,7 @@ mod tests {
         let mut constants = majit_ir::ConstMap::default();
         let mut phase1_out = None;
 
+        let runtime_boxes = vec![unroll_opt.trace_inputargs[0].clone()];
         unroll_opt
             .optimize_trace_with_constants_and_inputs_vable_out(
                 &ops,
@@ -7375,22 +7329,26 @@ mod tests {
                 1,
                 None,
                 Some(&mut phase1_out),
+                &runtime_boxes,
             )
             .expect("tiny loop should optimize");
         let state = phase1_out.expect("Phase 1 should export loop state").1;
 
+        assert!(
+            state.runtime_boxes[0].same_box(&unroll_opt.trace_inputargs[0]),
+            "ExportedState.runtime_boxes is the original jumparg box"
+        );
         assert_eq!(
-            state.runtime_boxes[0].const_value(),
+            state.runtime_boxes[0].get_value(),
             Some(Value::Int(73)),
-            "recorded closing-JUMP entry InputArg must retain observed runtime value",
+            "observed runtime value lives on that InputArg"
         );
     }
 
     #[test]
     fn test_recorded_jump_resop_keeps_observed_runtime_value() {
-        // closing_jump_runtime_boxes already lifts a stamped ResOp into an
-        // inline Const for bridges; fold_recorded_jump_args must do the
-        // same for the peeled-loop runtime_boxes channel.
+        let mut unroll_opt = UnrollOptimizer::new();
+        unroll_opt.trace_inputargs = rooted_inputarg_operands(&[Type::Int]);
         let mut add = Op::new(
             OpCode::IntAdd,
             &[
@@ -7401,15 +7359,33 @@ mod tests {
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
         let add_rc = OpRc::new(add);
-        let folded = fold_recorded_jump_args(
-            vec![Operand::from_bound_op(&add_rc)],
-            &[],
-            std::slice::from_ref(&add_rc),
+        let runtime_boxes = vec![Operand::from_bound_op(&add_rc)];
+        let mut jump = Op::new(OpCode::Jump, std::slice::from_ref(&runtime_boxes[0]));
+        jump.pos().set(OpRef::int_op(2));
+        let ops = vec![add_rc.clone(), OpRc::new(jump)];
+        let mut constants = majit_ir::ConstMap::default();
+        let mut phase1_out = None;
+
+        unroll_opt
+            .optimize_trace_with_constants_and_inputs_vable_out(
+                &ops,
+                &mut constants,
+                1,
+                None,
+                Some(&mut phase1_out),
+                &runtime_boxes,
+            )
+            .expect("tiny loop should optimize");
+        let state = phase1_out.expect("Phase 1 should export loop state").1;
+
+        assert!(
+            state.runtime_boxes[0].same_box(&runtime_boxes[0]),
+            "ExportedState.runtime_boxes is the original jumparg box"
         );
         assert_eq!(
-            folded[0].const_value(),
+            state.runtime_boxes[0].get_value(),
             Some(Value::Int(73)),
-            "recorded closing-JUMP ResOp must retain observed runtime value",
+            "observed runtime value lives on that ResOp"
         );
     }
 

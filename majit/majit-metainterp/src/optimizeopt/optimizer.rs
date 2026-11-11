@@ -398,10 +398,6 @@ pub struct Optimizer {
     /// Bound InputArg boxes (`optimizer.py Optimizer._propagate_all_forward`
     /// / `BasicLoopInfo` store `trace.inputargs` directly).
     pub trace_inputargs: Vec<Operand>,
-    /// unroll.py / compile.py parity: original live values at the jump
-    /// point, threaded into export_state as `runtime_boxes`. Dormant
-    /// until the export/import pair starts reading it.
-    pub runtime_boxes: Vec<OpRef>,
     /// RPython unroll.py: export_state — exported optimizer facts at the end
     /// of the preamble, adapted to majit's slot-based inputarg model.
     pub exported_loop_state: Option<crate::optimizeopt::unroll::ExportedState>,
@@ -1415,7 +1411,6 @@ impl Optimizer {
             quasi_immutable_deps: Vec::new(),
             imported_virtuals: Vec::new(),
             trace_inputargs: Vec::new(),
-            runtime_boxes: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
             imported_short_aliases: Vec::new(),
@@ -2908,7 +2903,6 @@ impl Optimizer {
         }
         self.imported_label_args = None;
         self.terminal_op = None;
-        self.runtime_boxes.clear();
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
         self.last_guard_op_idx = None;

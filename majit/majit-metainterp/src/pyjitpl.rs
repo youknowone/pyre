@@ -8676,7 +8676,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// RPython-compatible helper name from compile.py.
-    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    pub fn send_loop_to_backend(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         self.compile_loop(jump_args)
     }
 
@@ -8947,8 +8947,9 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Close the current trace, optimize, and compile.
     ///
-    /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
-    /// in the same order as the InputArgs registered during `on_back_edge`.
+    /// `jump_args` are the live boxes at the end of the loop
+    /// (`compile.py` `compile_loop` `jumpargs`), in the same order as
+    /// the InputArgs registered during `on_back_edge`.
     /// pyjitpl.py `reached_loop_header` → `compile_loop` dispatch.
     ///
     /// This public entry wraps `Self::compile_loop_body` so every exit
@@ -8962,7 +8963,7 @@ impl<M: Clone> MetaInterp<M> {
     /// inner path consumed `self.tracing`. If so, the session envelope
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
-    pub fn compile_loop(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    pub fn compile_loop(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
         // at translation. Close before the optimizer reads it. A trace that
         // did not enter through `force_start_tracing` still reaches here.
@@ -8983,7 +8984,7 @@ impl<M: Clone> MetaInterp<M> {
         outcome
     }
 
-    fn compile_loop_body(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+    fn compile_loop_body(&mut self, jump_args: &[Operand]) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -9341,11 +9342,12 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2969: GUARD_FUTURE_CONDITION and heapcache.py:176:
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
+        let jump_oprefs: Vec<OpRef> = jump_args.iter().map(|b| b.to_opref()).collect();
         self.compile_tracing
             .as_mut()
             .unwrap()
             .recorder
-            .close_loop(jump_args);
+            .close_loop(&jump_oprefs);
         // `materialize_ops` copies `FrontendSlot.concrete` onto op values
         // and interns. `walk_active_trace_refs` stops seeing this recorder
         // at `take`, so materialize first.
@@ -9639,6 +9641,7 @@ impl<M: Clone> MetaInterp<M> {
                 num_trace_inputargs,
                 vable_config.clone(),
                 Some(&mut phase1_out),
+                preamble_data.runtime_boxes,
             )
         };
         let mut retried_without_unroll = false;
@@ -10536,9 +10539,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` is the same `live_arg_boxes` upstream appends, already
     /// normalized by `remove_consts_and_duplicates`, so every element is a
     /// typed box; a `None`/`TempVar` here would silently change the label's
-    /// arity against the closing JUMP (compile.py:334), so decline to
-    /// register rather than record a short list.
-    fn register_retrace_merge_point(&mut self, jump_args: &[OpRef]) {
+    /// arity against the closing JUMP (`compile.py` `compile_loop` jumpargs),
+    /// so decline to register rather than record a short list.
+    fn register_retrace_merge_point(&mut self, jump_args: &[Operand]) {
         let Some(ctx) = self.tracing.as_ref() else {
             return;
         };
@@ -10546,12 +10549,12 @@ impl<M: Clone> MetaInterp<M> {
         // is unconditional. A missing type is a bookkeeping bug, not a
         // reason to skip the append.
         debug_assert!(
-            jump_args.iter().all(|op| op.ty().is_some()),
+            jump_args.iter().all(|b| !b.is_none()),
             "retrace merge-point jump_args must carry box.type (history.py)"
         );
         let green_boxes: Vec<crate::trace_ctx::GreenBox> = jump_args
             .iter()
-            .map(|&op| crate::trace_ctx::GreenBox::new(op, op.ty().unwrap_or(majit_ir::Type::Void)))
+            .map(|b| crate::trace_ctx::GreenBox::new(b.to_opref(), b.type_()))
             .collect();
         // pyjitpl.py:3059-3060 `self.current_merge_points.append(
         // (live_arg_boxes, start))` appends the greens the trace is closing
@@ -10646,7 +10649,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn compile_trace(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         from_guard: bool,
     ) -> CompileOutcome {
         let outcome = self.compile_trace_inner(green_key, finish_args, from_guard, None, None);
@@ -10658,7 +10661,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn compile_trace_from_interp(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         original_green_key: u64,
     ) -> CompileOutcome {
         // ResumeFromInterpDescr.get_resumestorage() is None — an interp-origin
@@ -10686,7 +10689,24 @@ impl<M: Clone> MetaInterp<M> {
         from_guard: bool,
         finish_descr: majit_ir::DescrRef,
     ) -> CompileOutcome {
-        self.compile_trace_inner(green_key, finish_args, from_guard, Some(finish_descr), None)
+        let finish_boxes: Vec<Operand> = self
+            .tracing
+            .as_mut()
+            .map(|ctx| {
+                finish_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.recorder.box_for_operand(r))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.compile_trace_inner(
+            green_key,
+            &finish_boxes,
+            from_guard,
+            Some(finish_descr),
+            None,
+        )
     }
 
     /// compile.py `compile_trace` + `ResumeFromInterpDescr.compile_and_attach`
@@ -10704,7 +10724,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compile_trace_inner(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
         from_guard: bool,
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<u64>,
@@ -10756,6 +10776,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        let finish_oprefs: Vec<OpRef> = finish_args.iter().map(|b| b.to_opref()).collect();
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
@@ -10764,10 +10785,10 @@ impl<M: Clone> MetaInterp<M> {
 
         // pyjitpl.py compile_trace: record tentative JUMP or FINISH
         if let Some(descr) = finish_descr {
-            ctx.finish(finish_args, descr);
+            ctx.finish(&finish_oprefs, descr);
         } else {
             ctx.recorder.close_loop_with_descr(
-                finish_args,
+                &finish_oprefs,
                 Some(crate::call_descr::jit_cell_token_as_descr(
                     jump_token.expect("JUMP token resolved before recording"),
                 )),
@@ -10887,17 +10908,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        let jump_boxes: Vec<Operand> = if !bridge_ops.is_empty() {
-            Self::closing_jump_runtime_boxes(&bridge_ops)
-        } else {
-            let rec = &mut self.tracing.as_mut().expect("compile_trace").recorder;
-            finish_args
-                .iter()
-                .copied()
-                .map(|r| rec.box_for_operand(r))
-                .collect()
-        };
-
         let outcome = if from_guard {
             // compile.py — ResumeGuardDescr path: attach bridge
             // to the existing guard that failed.
@@ -10946,7 +10956,7 @@ impl<M: Clone> MetaInterp<M> {
                 &descr_arc,
                 bridge_ops,
                 &bridge_inputargs,
-                &jump_boxes,
+                finish_args,
                 constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
@@ -10987,7 +10997,7 @@ impl<M: Clone> MetaInterp<M> {
                 entry_driver_descriptor,
                 &bridge_ops,
                 &bridge_inputargs,
-                &jump_boxes,
+                finish_args,
                 constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
@@ -11052,7 +11062,7 @@ impl<M: Clone> MetaInterp<M> {
     /// concatenates with partial_trace ops.
     ///
     /// Returns true if compilation succeeded.
-    pub fn compile_retrace(&mut self, jump_args: &[OpRef]) -> bool {
+    pub fn compile_retrace(&mut self, jump_args: &[Operand]) -> bool {
         self.remember_compiled_graph_write();
         // compile.py compile_retrace: jitlog.start_new_trace(faildescr=resumekey).
         let descr_id = self
@@ -11258,7 +11268,8 @@ impl<M: Clone> MetaInterp<M> {
             let jump_cut = {
                 let ctx = self.compile_tracing.as_mut().unwrap();
                 let jump_cut = ctx.get_trace_position();
-                ctx.close_loop(jump_args);
+                let jump_oprefs: Vec<OpRef> = jump_args.iter().map(|b| b.to_opref()).collect();
+                ctx.close_loop(&jump_oprefs);
                 jump_cut
             };
             // Decode snapshots and copy `FrontendSlot.concrete` while
@@ -11469,6 +11480,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             trace.inputargs.len(),
             vable_config,
+            jump_args,
         );
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
@@ -15214,7 +15226,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py: close_bridge — compile_trace wrapper that
     /// maps CompileOutcome to BridgeCompileResult.
-    pub fn close_bridge(&mut self, green_key: u64, finish_args: &[OpRef]) -> BridgeCompileResult {
+    pub fn close_bridge(&mut self, green_key: u64, finish_args: &[Operand]) -> BridgeCompileResult {
         let outcome = self.compile_trace(green_key, finish_args, true);
         self.classify_compile_outcome(outcome)
     }
@@ -15223,7 +15235,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn send_bridge_to_backend(
         &mut self,
         green_key: u64,
-        finish_args: &[OpRef],
+        finish_args: &[Operand],
     ) -> BridgeCompileResult {
         self.close_bridge(green_key, finish_args)
     }
@@ -30066,6 +30078,16 @@ mod metainterp_static_data_tests {
 mod tests {
     use super::*;
     use crate::JitArgKind;
+    use majit_ir::operand::Operand;
+
+    fn jump_boxes_from_recorder(meta: &mut MetaInterp<()>, oprefs: &[OpRef]) -> Vec<Operand> {
+        let rec = &mut meta.trace_ctx().expect("compile_loop test seed").recorder;
+        oprefs
+            .iter()
+            .copied()
+            .map(|r| rec.box_for_operand(r))
+            .collect()
+    }
 
     fn start_hash_trace(meta: &mut MetaInterp<()>, key: &majit_ir::GreenKey, live: &[i64]) {
         let live_values: Vec<Value> = live.iter().copied().map(Value::Int).collect();
@@ -32623,7 +32645,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        meta.compile_loop(&[sum]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[sum]);
+        meta.compile_loop(&jump_boxes);
         assert!(
             meta.get_procedure_token(green_key.get_uhash()).is_some(),
             "compile_loop must install a live origin token"
@@ -33806,11 +33829,15 @@ mod tests {
         meta.set_on_compile_loop(move |_, _, _, opcodes| {
             *captured.lock() = opcodes.to_vec();
         });
-        meta.compile_loop(&[
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_int(2),
-        ]);
+        let jump_boxes = jump_boxes_from_recorder(
+            &mut meta,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+            ],
+        );
+        meta.compile_loop(&jump_boxes);
 
         let opcodes = compiled_opcodes.lock();
         assert!(
@@ -33929,7 +33956,8 @@ mod tests {
             "no front target tokens, so this key is one compile_loop proceeds from"
         );
 
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         let fresh = meta
             .get_procedure_token(green_key.get_uhash())
@@ -33988,7 +34016,8 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
         }
 
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Compiled { .. }),
             "compile_loop must install a loop, got {outcome:?}"
@@ -34125,7 +34154,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         // Charge the live token. `history.py JitCellToken.target_tokens` is
         // the label list `unroll.py optimize_bridge` scans; a hollow
@@ -34221,7 +34251,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
 
         let events = compile_events.lock();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -34245,7 +34276,8 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+            let jump_boxes = jump_boxes_from_recorder(meta, &[OpRef::input_arg_int(0)]);
+            let outcome = meta.compile_loop(&jump_boxes);
             let CompileOutcome::Compiled { green_key: key, .. } = outcome else {
                 panic!("compile_loop must produce a loop, got {outcome:?}");
             };
@@ -35214,7 +35246,8 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        meta.compile_loop(&jump_boxes);
         assert_eq!(
             *compile_count.lock(),
             1,
@@ -35254,7 +35287,11 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
-            meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]);
+            let jump_boxes = jump_boxes_from_recorder(
+                &mut meta,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            );
+            meta.compile_loop(&jump_boxes);
         }
 
         let events = events.lock();
@@ -35511,7 +35548,8 @@ mod tests {
         });
         meta.retracing_from = Some(start);
         let before = meta.trace_ctx().unwrap().current_merge_points.len();
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "retrace cancel must keep tracing, got {outcome:?}"
@@ -35589,7 +35627,8 @@ mod tests {
             Vec::new(),
         ));
         let loops_before = meta.stats.loops_aborted;
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Aborted),
             "tag overflow must abort, got {outcome:?}"
@@ -35683,7 +35722,8 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(matches!(outcome, CompileOutcome::Cancelled));
         let stored = meta
             .trace_ctx()
@@ -35768,7 +35808,8 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let jump_boxes = jump_boxes_from_recorder(&mut meta, &[OpRef::input_arg_int(0)]);
+        let outcome = meta.compile_loop(&jump_boxes);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "compile_loop retrace cancel: {outcome:?}"
@@ -35817,6 +35858,8 @@ mod tests {
             .map(Operand::from_bound_inputarg)
             .collect();
         let mut phase1_out = None;
+        let live0 = Operand::from_bound_inputarg(&live[0]);
+        let live1 = Operand::from_bound_inputarg(&live[1]);
         unroll_opt
             .optimize_trace_with_constants_and_inputs_vable_out(
                 &prepared.ops,
@@ -35824,13 +35867,18 @@ mod tests {
                 prepared.inputargs.len(),
                 None,
                 Some(&mut phase1_out),
+                &[live0.clone(), live1.clone()],
             )
             .expect("sparse retrace must optimize");
         let state = phase1_out.expect("phase 1 export").1;
+        assert!(
+            state.runtime_boxes[1].same_box(&live1),
+            "the closing JUMP's last live arg is the InputArg(2) box"
+        );
         assert_eq!(
-            state.runtime_boxes[1].const_value(),
+            state.runtime_boxes[1].get_value(),
             Some(Value::Int(22)),
-            "the closing JUMP's last live arg is InputArg(2)'s value"
+            "observed runtime value lives on that InputArg"
         );
     }
 
