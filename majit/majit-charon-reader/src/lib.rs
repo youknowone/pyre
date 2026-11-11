@@ -24,11 +24,12 @@ pub mod schema;
 pub mod ullbc;
 
 pub use raw_body::RawBody;
-pub use schema::{ImplMethod, LlbcFile};
+pub use schema::{AssocType, ImplGenericsLens, ImplMethod, LlbcFile};
 pub use ullbc::{
-    BasicBlock, FieldDecl, FunDecl, FunGenerics, FunSrc, GlobalDecl, Locals, Statement, StmtKind,
-    TagEncoding, TagLayout, TermKind, TraitClauseBound, TraitDecl, TypeDecl, TypeDeclKind,
-    TypeDeclSrc, Unstructured, VariantDecl,
+    BasicBlock, ClosureSrc, FieldDecl, FunDecl, FunGenerics, FunSrc, GlobalDecl, GlobalKind,
+    GlobalTy, GlobalValue, Locals, Statement, StmtKind, TagEncoding, TagLayout, TermKind,
+    TraitClauseBound, TraitDecl, TraitMethod, TypeDecl, TypeDeclKind, TypeDeclSrc, Unstructured,
+    VariantDecl,
 };
 
 use serde::Deserialize;
@@ -204,7 +205,10 @@ fn tyref_dedup_id(ty: &crate::ullbc::TyRef) -> Option<u64> {
     }
 }
 
-fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
+fn build_trait_assoc_index(
+    rows: &[serde_json::Value],
+    types: &[Option<Vec<Option<schema::AssocType>>>],
+) -> TraitAssocIndex {
     let mut index: TraitAssocIndex = std::collections::HashMap::new();
     for (impl_index, row) in rows.iter().enumerate() {
         let Some(trait_id) = row
@@ -219,28 +223,23 @@ fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
             continue;
         }
         let mut by_assoc = std::collections::HashMap::new();
-        if let Some(entries) = row.get("types").and_then(serde_json::Value::as_array) {
+        if let Some(Some(entries)) = types.get(impl_index) {
             for (entry_index, entry) in entries.iter().enumerate() {
-                let Some(kind) = entry
-                    .get("kind")
-                    .and_then(|kind| kind.get("TraitType"))
-                    .and_then(serde_json::Value::as_array)
-                else {
+                let Some(entry) = entry.as_ref() else {
                     continue;
                 };
-                if kind.len() != 2 || by_assoc.contains_key(&kind[1]) {
+                let Some(assoc) = entry.assoc.as_ref() else {
+                    continue;
+                };
+                if by_assoc.contains_key(assoc) {
                     continue;
                 }
-                let bind = if entry
-                    .get("skip_binder")
-                    .and_then(|binder| binder.get("value"))
-                    .is_some()
-                {
+                let bind = if entry.value.is_some() {
                     AssocBind::Found(entry_index)
                 } else {
                     AssocBind::Absent
                 };
-                by_assoc.insert(kind[1].clone(), bind);
+                by_assoc.insert(assoc.clone(), bind);
             }
         }
         index.insert(
@@ -1030,8 +1029,8 @@ impl Llbc {
         self.trait_by_id(trait_id)?
             .methods
             .get(method_id as usize)?
-            .pointer("/skip_binder/name")?
-            .as_str()
+            .name
+            .as_deref()
     }
 
     /// Iterate over every present `TypeDecl`.
@@ -1077,6 +1076,27 @@ impl Llbc {
     /// names. `None` when that impl is absent.
     pub fn trait_impl_methods_of_def(&self, def_id: u64) -> Option<&[Option<ImplMethod>]> {
         Some(self.trait_impl_methods(self.trait_impl_row_index(def_id)?))
+    }
+
+    /// `generics` lengths of the `trait_impls` row at `row_index`.
+    pub fn trait_impl_generics(&self, row_index: usize) -> Option<&ImplGenericsLens> {
+        self.file
+            .translated
+            .trait_impl_generics
+            .get(row_index)?
+            .as_ref()
+    }
+
+    /// Associated types of the `trait_impls` row at `row_index`. Holes
+    /// stay `None`. A missing `types` key, a null row, or an out-of-range
+    /// index is an empty slice.
+    pub fn trait_impl_types(&self, row_index: usize) -> &[Option<AssocType>] {
+        self.file
+            .translated
+            .trait_impl_types
+            .get(row_index)
+            .and_then(|row| row.as_deref())
+            .unwrap_or(&[])
     }
 
     fn trait_impl_row_index(&self, def_id: u64) -> Option<usize> {
@@ -1153,9 +1173,12 @@ impl Llbc {
         assoc: &serde_json::Value,
     ) -> Option<&serde_json::Value> {
         let (impl_index, entry_index) = {
-            let index = self
-                .trait_assoc_index
-                .get_or_init(|| build_trait_assoc_index(&self.file.translated.trait_impls));
+            let index = self.trait_assoc_index.get_or_init(|| {
+                build_trait_assoc_index(
+                    &self.file.translated.trait_impls,
+                    &self.file.translated.trait_impl_types,
+                )
+            });
             let bindings = index.get(&trait_decl_id)?.as_ref()?;
             match bindings.by_assoc.get(assoc)? {
                 AssocBind::Absent => return None,
@@ -1164,13 +1187,13 @@ impl Llbc {
         };
         self.file
             .translated
-            .trait_impls
+            .trait_impl_types
             .get(impl_index)?
-            .get("types")?
-            .as_array()?
+            .as_ref()?
             .get(entry_index)?
-            .get("skip_binder")?
-            .get("value")
+            .as_ref()?
+            .value
+            .as_ref()
     }
 
     /// Whether a `trait_impls` row implements `Drop` for the ADT
@@ -1944,6 +1967,11 @@ mod tests {
                 "trait_impls":[{
                     "def_id":0,
                     "impl_trait":{"id":1},
+                    "generics":{"types":[{},{}],"const_generics":[],"trait_refs":[]},
+                    "types":[
+                        null,
+                        {"kind":{"TraitType":[1,{"name":"Item"}]},"skip_binder":{"value":{"Deduplicated":4}}}
+                    ],
                     "methods":[
                         null,
                         {"kind":{"TraitMethod":[1,0]},"skip_binder":{"id":9,"generics":{}}}
@@ -1953,6 +1981,8 @@ mod tests {
         }"#;
         let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
         assert!(l.trait_impls_raw()[0].get("methods").is_none());
+        assert!(l.trait_impls_raw()[0].get("generics").is_none());
+        assert!(l.trait_impls_raw()[0].get("types").is_none());
         let methods = l.trait_impl_methods(0);
         assert!(methods[0].is_none());
         let method = methods[1].as_ref().expect("method 0");
@@ -1964,5 +1994,15 @@ mod tests {
                 .map(|row| row[1].as_ref().and_then(|m| m.fn_id)),
             Some(Some(9))
         );
+        let generics = l.trait_impl_generics(0).expect("generics");
+        assert_eq!(generics.types_len, Some(2));
+        assert_eq!(generics.const_generics_len, Some(0));
+        assert_eq!(generics.trait_refs, Some(serde_json::json!([])));
+        let types = l.trait_impl_types(0);
+        assert!(types[0].is_none());
+        let assoc = types[1].as_ref().expect("assoc 1");
+        assert_eq!(assoc.trait_id, Some(1));
+        assert_eq!(assoc.assoc, Some(serde_json::json!({"name":"Item"})));
+        assert_eq!(assoc.value, Some(serde_json::json!({"Deduplicated":4})));
     }
 }
