@@ -998,6 +998,35 @@ fn generic_owner_lookup(name: &str) -> &str {
     name.split_once('<').map(|(bare, _)| bare).unwrap_or(name)
 }
 
+/// Layout spelling of `owner.field` after the same exact-key overlay and
+/// `??TypeVar#N` substitution [`Bookkeeper::project_struct_rows`] applies
+/// before [`Bookkeeper::project_struct_field_type`].
+///
+/// `StructFieldRegistry::field_type` strips `<…>` (`lookup_fields`), so a
+/// generic `&B` payload stays `&??TypeVar#0` there while this path keeps
+/// the declared `Ref` wrapper (`PtrRepr.rtype_getattr`) and substitutes
+/// only the type variable (`&B` with `B = [u8]` is `&[u8]`,
+/// `rffi.get_nonmovingbuffer`).
+pub(crate) fn projected_field_layout_spelling(
+    registry: &crate::front::StructFieldRegistry,
+    owner: &str,
+    field: &str,
+) -> Option<String> {
+    let exact = registry
+        .fields
+        .get(owner)
+        .and_then(|rows| rows.iter().find(|row| row.name == field))
+        .map(|row| row.ty.clone());
+    let mut ty = match exact {
+        Some(ty) => ty,
+        None => registry.field_type(owner, field)?.to_string(),
+    };
+    if ty.contains("??TypeVar") {
+        ty = instantiate_field_spelling(registry, owner, &ty);
+    }
+    Some(ty)
+}
+
 /// A template row spells a parameter as `??TypeVar#N` (declaration index)
 /// or, for one argument, as a bare name such as `T`.
 fn instantiate_field_spelling(
@@ -17370,6 +17399,28 @@ mod tests {
             "??TypeVar",
         );
         assert_eq!(concrete, "(??TypeVar#0,??TypeVar#1)");
+    }
+
+    #[test]
+    fn instantiate_field_spelling_keeps_ref_wrapper_on_slice_arg() {
+        let reg = crate::front::StructFieldRegistry::default();
+        let concrete =
+            super::instantiate_field_spelling(&reg, "borrow::Cow<[u8]>::Borrowed", "&??TypeVar#0");
+        assert_eq!(concrete, "&[u8]");
+    }
+
+    #[test]
+    fn projected_field_layout_spelling_instantiates_ref_typevar_slice() {
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "borrow::Cow::Borrowed".to_string(),
+            vec![("__pos_0".to_string(), "&??TypeVar#0".to_string())],
+        );
+        let ty =
+            super::projected_field_layout_spelling(&reg, "borrow::Cow<[u8]>::Borrowed", "__pos_0")
+                .expect("template row instantiates");
+        assert_eq!(ty, "&[u8]");
+        assert!(majit_ir::descr::is_shared_u8_slice_spelling(&ty));
     }
 
     #[test]

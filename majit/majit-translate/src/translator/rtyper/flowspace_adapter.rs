@@ -6457,27 +6457,35 @@ fn input_class_name(kind: &OpKind) -> Option<&str> {
     }
 }
 
+/// Declared layout spelling of `field`, after the same exact-key /
+/// `??TypeVar#N` substitution [`Bookkeeper::project_struct_rows`] applies
+/// before [`Bookkeeper::project_struct_field_type`].
+fn projected_owner_field_spelling(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    field: &crate::model::FieldDescriptor,
+) -> Option<String> {
+    let owner = field.owner_root.as_deref()?;
+    let borrowed = call_registry.bookkeeper().struct_fields.borrow();
+    crate::annotator::bookkeeper::projected_field_layout_spelling(
+        borrowed.as_ref()?,
+        owner,
+        &field.name,
+    )
+}
+
 /// Field type spelling is a fat `&dyn Trait` (`spelling_is_dyn_fat_ptr`),
-/// looked up on the owner through `StructFieldRegistry.field_type` — the
+/// looked up on the owner through the projected layout spelling — the
 /// type of the field, not its name.
 fn field_spelling_is_dyn_fat(
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     field: &crate::model::FieldDescriptor,
 ) -> bool {
-    let Some(owner) = field.owner_root.as_deref() else {
+    let Some(ty) = projected_owner_field_spelling(call_registry, field) else {
         return false;
     };
-    let bk = call_registry.bookkeeper();
-    let borrowed = bk.struct_fields.borrow();
-    let Some(reg) = borrowed.as_ref() else {
-        return false;
-    };
-    let Some(ty) = reg.field_type(owner, &field.name) else {
-        return false;
-    };
-    crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty)
-        || majit_ir::descr::is_shared_u8_slice_spelling(ty)
-        || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+    crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(&ty)
+        || majit_ir::descr::is_shared_u8_slice_spelling(&ty)
+        || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
 }
 
 /// Index of the metadata (`true`) or data (`false`) word in
@@ -6969,18 +6977,11 @@ fn function_graph_to_flowspace_inner(
             })
             .collect();
         let is_window_field = |field: &crate::model::FieldDescriptor| -> bool {
-            let Some(owner) = field.owner_root.as_deref() else {
+            let Some(ty) = projected_owner_field_spelling(call_registry, field) else {
                 return false;
             };
-            let borrowed = call_registry.bookkeeper().struct_fields.borrow();
-            let Some(reg) = borrowed.as_ref() else {
-                return false;
-            };
-            let Some(ty) = reg.field_type(owner, &field.name) else {
-                return false;
-            };
-            majit_ir::descr::is_shared_u8_slice_spelling(ty)
-                || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+            majit_ir::descr::is_shared_u8_slice_spelling(&ty)
+                || majit_ir::descr::is_option_of_u8_window_spelling(&ty)
         };
         let window_pairs = window_field_write_pairs(&legacy_block.operations, &is_window_field);
         for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
@@ -15282,6 +15283,102 @@ mod tests {
             &startblock.operations[0].args[len_idx],
             Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
         ));
+        let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
+            panic!("setattr name");
+        };
+        assert!(matches!(
+            &name.value,
+            ConstValue::ByteStr(bytes) if bytes == b"__pos_0"
+        ));
+    }
+
+    #[test]
+    fn window_field_writes_instantiate_typevar_slice_as_tuple_setattr() {
+        // A generic `&B` payload intern's `&??TypeVar#0` on the template
+        // (`lookup_fields` strips `<…>`). `project_struct_field_type`
+        // substitutes `&[u8]` (`PtrRepr.rtype_getattr`); the adapter must
+        // rebuild the same Tuple (`rtuple.py` `TupleRepr.newtuple`).
+        let mut graph = LegacyGraph::new("window_typevar_slice_setattr");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new(
+            "__pos_0",
+            Some("borrow::Cow<[u8]>::Borrowed".into()),
+        );
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("borrow::Cow<[u8]>::Borrowed".to_string())),
+                        class_root: Some("borrow::Cow<[u8]>::Borrowed".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("borrow::Cow::Borrowed", "__pos_0", "&??TypeVar#0"),
+        )
+        .expect("instantiated &[u8] window pair must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["newtuple", "setattr"], "got {opnames:?}");
         let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
             panic!("setattr name");
         };

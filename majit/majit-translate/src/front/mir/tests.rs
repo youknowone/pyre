@@ -5191,6 +5191,119 @@ fn window_keep_gain_fmtarg_bytes_pos0_is_window_write() {
     );
 }
 
+/// Generic `&B` payload instantiated at `[u8]`: intern harvest keeps the
+/// declared `Ref` wrapper (`PtrRepr.rtype_getattr`) so the field is the
+/// two-word window (`rffi.get_nonmovingbuffer`), and the constructor
+/// stores FatData/FatLen.
+#[test]
+fn window_generic_ref_slice_payload_pos0_is_window_write() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let shared = window_shared_slice();
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let borrowed_field = serde_json::json!({"Ref": ["Erased", typevar, "Shared"]});
+    let cow_generics = serde_json::json!({
+        "regions": [],
+        "types": [window_slice()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cow_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": cow_generics}
+    });
+    let cow = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["alloc", "borrow", "Cow"], false),
+        "kind": {"Enum": [{
+            "name": "Borrowed",
+            "fields": [{
+                "name": null,
+                "ty": borrowed_field,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "window_generic_ref_slice"], true),
+        "signature": {"is_unsafe": false, "inputs": [shared.clone()], "output": cow_adt.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &cow_adt),
+                window_local(1, &shared)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &cow_adt),
+                        {"Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [{"Move": window_place(serde_json::json!({"Local": 1}), &shared)}]
+                        ]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![cow], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "window_generic_ref_slice")
+        .expect("lower generic Ref([u8]) payload ctor");
+    let ops = window_graph_ops(&graph);
+    let data_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, ty, .. }
+                if field.name == "__pos_0"
+                    && field.vec_part == Some(VecFieldPart::FatData)
+                    && !matches!(ty, ValueType::Str)
+        )
+    });
+    let len_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, ty, .. }
+                if field.name == "__pos_0"
+                    && field.vec_part == Some(VecFieldPart::FatLen)
+                    && !matches!(ty, ValueType::Str)
+        )
+    });
+    let whole_field_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.name == "__pos_0" && field.vec_part.is_none()
+        )
+    });
+    assert!(
+        data_write && len_write,
+        "generic &[u8] payload __pos_0 is FatData/FatLen; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !whole_field_write,
+        "generic &[u8] payload is not a whole-field CCHARP setattr; graph={}",
+        graph.dump()
+    );
+
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("intern generic Ref([u8]) payload");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "borrow::Cow<[u8]>::Borrowed",
+            "__pos_0"
+        ),
+        Some("&[u8]"),
+        "intern harvest keeps the declared Ref wrapper; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
 /// A STR-source local passed to `fn f(d: &[u8])` borrows a window at
 /// the call (`rffi.get_raw_address_of_string`), not at the definition.
 #[test]
@@ -27999,6 +28112,79 @@ fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
     assert!(
         residual_next.is_empty(),
         "Iterator::next must rewrite to [__iter_next]: {residual_next:#?}"
+    );
+}
+
+/// Window → STR copy (`rffi.py` `charpsize2str`) is rstr `STR`, not a
+/// Call of the interned `Result<Vec<u8>, MemoryError>` graph.
+#[test]
+fn window_str_copy_is_str_not_result_charpsize2str() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "oefmt").expect("lower oefmt");
+    let mut str_copies = 0usize;
+    let mut result_charpsize = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let interned_result = segments
+            .windows(3)
+            .any(|w| w == ["rffi", "buffer", "charpsize2str"])
+            || segments.as_slice() == ["majit_rlib", "rffi", "buffer", "charpsize2str"];
+        if interned_result && *result_ty == ValueType::Str {
+            result_charpsize += 1;
+        }
+        if segments.as_slice() == [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            assert_eq!(
+                result_ty,
+                &ValueType::Str,
+                "window STR copy dest is Str; graph={}",
+                graph.dump()
+            );
+            let dest = op.result.as_ref().expect("window STR copy dest");
+            assert_eq!(
+                dest.concretetype().as_ref(),
+                Some(&*STRPTR),
+                "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            str_copies += 1;
+        }
+    }
+    assert_eq!(
+        result_charpsize,
+        0,
+        "window STR copy must not Call the Result-returning charpsize2str graph; graph={}",
+        graph.dump()
+    );
+    assert!(
+        str_copies >= 1,
+        "oefmt Bytes arm emits window STR copy; graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.as_deref(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp,
+        Some("CCHARP"),
+        "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
+        helper.dump()
     );
 }
 

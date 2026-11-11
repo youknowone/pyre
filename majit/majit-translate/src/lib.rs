@@ -2965,6 +2965,11 @@ fn analyze_pipeline_from_module_paths(
     // Inverse: `STR` → list of unsigned (`Vec<u8>`). `list(str)` yields
     // `Char`; a `Vec<u8>` item is `r_uint` (`ord` of each char).
     front::join_chars::register_ll_str2uintlist_helper(&mut call_control);
+    // `rffi.py` `charpsize2str` — look-inside window → STR copy
+    // (`rstr.py` `mallocstr` analogue plus the raw-to-string copy).
+    // Minted in the rich model because the Wtf8-from-bytes Ok window
+    // rewrite runs on the front spine before prepass.
+    front::join_chars::register_ll_charpsize2str_helper(&mut call_control);
 
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function

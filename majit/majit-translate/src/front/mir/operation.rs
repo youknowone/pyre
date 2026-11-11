@@ -3360,6 +3360,21 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
+                            // Declared window field (`project_struct_field_type`
+                            // `&[u8]` → `dyn_fat_window_annotation`): store
+                            // `{data, len}` even when `window_operand` did not
+                            // classify the value. A whole-field CCHARP setattr
+                            // unions `Ptr(Array)` onto the Tuple the field
+                            // already carries (`ClassDef.generalize_attr`).
+                            if field_is_window {
+                                let src_ty = operand_tyref(&op).map(clone_tyref);
+                                let var = self.resolve_operand(mir_bb, op)?;
+                                let (ptr, len) =
+                                    self.owner_to_window(mir_bb, var, src_ty.as_ref())?;
+                                arg_vars.push(self.ensure_window_ccharp(mir_bb, ptr));
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
                             arg_vars.push(self.resolve_operand(mir_bb, op)?);
                             pair_lens.push(None);
                         }

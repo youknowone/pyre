@@ -3476,8 +3476,14 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Window → STR copy (`rffi.py` `charpsize2str`,
-    /// `majit_rlib::rffi::buffer::charpsize2str`).
+    /// Window → STR copy (`rffi.py` `charpsize2str`).
+    ///
+    /// Upstream is `mallocfn(size)` (`rstr.py` `mallocstr`) plus
+    /// `copy_raw_to_string(cp, ll_str, 0, size)` plus `hlstrtype(ll_str)`.
+    /// The dest is rstr `STR`. The interned
+    /// `majit_rlib::rffi::buffer::charpsize2str` graph returns
+    /// `Result<Vec<u8>, MemoryError>` and is the list form
+    /// ([`Self::emit_charpsize2str_list`]), not this copy.
     pub(in crate::front::mir) fn emit_charpsize2str(
         &mut self,
         mir_bb: usize,
@@ -3500,12 +3506,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(header.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path([
-                    "majit_rlib",
-                    "rffi",
-                    "buffer",
-                    "charpsize2str",
-                ]),
+                target: CallTarget::function_path([crate::front::join_chars::LL_CHARPSIZE2STR]),
                 args: crate::model::call_args(vec![ptr, len]),
                 result_ty: ValueType::Str,
             },

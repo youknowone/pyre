@@ -1140,12 +1140,59 @@ fn intern_call_trait_refs(generics: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// `Ref` / `RawPtr` prefixes `PtrRepr.rtype_getattr` keeps on a field
+/// whose payload is a type variable ([`tyref_subst_bound_typevar`]).
+/// `&B` with `B = [u8]` is `&[u8]`, the two-word window
+/// (`rffi.get_nonmovingbuffer`), not the peeled `[u8]` list.
+fn pointer_wrapper_spelling_prefixes<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> (Vec<&'static str>, &'l serde_json::Value) {
+    let mut prefixes = Vec::new();
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            break;
+        };
+        if let Some(r) = obj.get("Ref") {
+            let (inner, kind) = ref_inner_and_kind(r);
+            let Some(inner) = inner.and_then(|n| strip_ty_indirections(n, llbc)) else {
+                break;
+            };
+            prefixes.push(if json_ref_kind_is_mut(kind) {
+                "&mut "
+            } else {
+                "&"
+            });
+            node = inner;
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            let mut_kind = arr.get(1).and_then(serde_json::Value::as_str);
+            let Some(inner) = arr.first().and_then(|n| strip_ty_indirections(n, llbc)) else {
+                break;
+            };
+            prefixes.push(if json_ref_kind_is_mut(mut_kind) {
+                "*mut "
+            } else {
+                "*const "
+            });
+            node = inner;
+            continue;
+        }
+        break;
+    }
+    (prefixes, node)
+}
+
 /// Substitute the instantiation's concrete type args into a variant
 /// field's type: a bound type variable resolves to `args[idx]`; any other
 /// shape (a concrete field, or a `??…` placeholder for an unresolved node)
-/// renders as-is via [`tyref_to_ast_string`].  Only a bare type variable
-/// is substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
+/// renders as-is via [`tyref_to_ast_string`].  Only a type variable is
+/// substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
 /// inner rendering, which the caller treats as unresolved and skips.
+/// Declared `Ref` / `RawPtr` wrappers stay on the substituted arg
+/// (`PtrRepr.rtype_getattr`, [`tyref_subst_bound_typevar`]): `&T` with
+/// `T = [u8]` is `&[u8]`.
 fn substitute_field_type(
     ty: &TyRef,
     args: &[String],
@@ -1153,13 +1200,18 @@ fn substitute_field_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
-    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
-        && let Some(idx) = typevar_bound_index(node)
-    {
-        return args
-            .get(idx as usize)
-            .cloned()
-            .unwrap_or_else(|| "??typevar_oob".to_string());
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) {
+        let (prefixes, inner) = pointer_wrapper_spelling_prefixes(node, llbc);
+        if let Some(idx) = typevar_bound_index(inner) {
+            let mut spelling = args
+                .get(idx as usize)
+                .cloned()
+                .unwrap_or_else(|| "??typevar_oob".to_string());
+            for prefix in prefixes.iter().rev() {
+                spelling = format!("{prefix}{spelling}");
+            }
+            return spelling;
+        }
     }
     // A concrete payload that is itself the handle (a monomorphized
     // `Result::Err` field) has to name the same class the cast writes.
