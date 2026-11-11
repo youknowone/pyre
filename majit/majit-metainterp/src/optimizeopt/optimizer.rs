@@ -859,7 +859,7 @@ impl Optimizer {
     }
 
     pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
-        // virtualstate.py make_inputargs + 627-634 _enum parity:
+        // virtualstate.py make_inputargs + `_enum` parity:
         // label_args are laid out by recursive _enum traversal where each
         // NotVirtualStateInfo leaf gets a position_in_notvirtuals slot.
         // Virtual states don't consume slots directly — their non-virtual
@@ -892,9 +892,9 @@ impl Optimizer {
         // from LABEL arg positions to body op fresh positions, causing virtual fields
         // to get body IntAddOvf results instead of LABEL values.
         struct VirtualEntry {
-            head: OpRef,
+            head: Operand,
             size_descr: majit_ir::DescrRef,
-            fields: Vec<(u32, OpRef)>,
+            fields: Vec<(u32, Operand)>,
             kind: ImportedVirtualKind,
             head_load_descr_index: Option<u32>,
         }
@@ -939,35 +939,11 @@ impl Optimizer {
                     continue;
                 }
                 walk_visited.insert(top_key, Operand::None);
-                //
-                // `iv.inputarg_index` is the virtualizable state's index
-                // within `next_iteration_args`, which corresponds to
-                // Phase 2 inputarg slot i (not to a raw OpRef). Shift
-                // by `ctx.inputarg_base` so the OpRef we resolve points
-                // to Phase 2's fresh inputarg slot in the disjoint
-                // `[inputarg_base..inputarg_base+num_inputs)` range
-                // (matches RPython's TraceIterator fresh-InputArg model).
-                // For Phase 1 / standalone runs `inputarg_base == 0`, so
-                // the shift is a no-op and the legacy raw-position path
-                // still works.
-                //
-                // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: mint a
-                // typed variant from `inputarg_types` so the OpRef carries
-                // RPython `box.type` (history.py:220) and matches the
-                // typed `OpRef::input_arg_typed` minted at trace start
-                // (pyre/pyre-jit-trace/src/trace.rs) under variant-aware Eq.
-                // opencoder.py inputarg_from_tp(arg.type) parity:
-                // every inputarg always carries `box.type` (history.py:220);
-                // RPython has no InputArgVoid class. Strict accessor
-                // panics on missing/Void → exposes structural bookkeeping
-                // bugs instead of silently minting an InputArgVoid-shaped
-                // VoidOp variant.
-                let pos = ctx.inputarg_base + iv.inputarg_index as u32;
-                let raw =
-                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(iv.inputarg_index));
-                let virtual_head = ctx.get_replacement_opref(raw);
+                // `iv.inputarg_index` is the slot in `ctx.inputargs`
+                // (`optimizer.py` `self.inputargs[idx]` / `inputarg_at`).
                 let virtual_head_box = ctx
-                    .get_box_replacement_operand_opt(raw)
+                    .inputarg_at(iv.inputarg_index)
+                    .map(|b| b.get_box_replacement(false))
                     .unwrap_or(Operand::None);
                 walk_visited.insert(top_key, virtual_head_box.clone());
                 // unroll.py `setinfo_from_preamble`: `if op.get_forwarded() is not None: return`.
@@ -1016,11 +992,11 @@ impl Optimizer {
                             )
                         })
                         .unwrap_or_else(|| descr.index());
-                    fields.push((field_idx, field_box.to_opref()));
+                    fields.push((field_idx, field_box));
                     let _ = descr; // descr threading handled via SizeDescr.all_fielddescrs()
                 }
                 entries.push(VirtualEntry {
-                    head: virtual_head,
+                    head: virtual_head_box,
                     size_descr: iv.size_descr.clone(),
                     fields,
                     kind: iv.kind.clone(),
@@ -1043,13 +1019,9 @@ impl Optimizer {
         // reserve_pos from returning a position that's already used
         // as a virtual head (allocated during import_state).
         for entry in &entries {
-            if !entry.head.is_none()
-                && ctx
-                    .get_box_replacement_operand_opt(entry.head)
-                    .and_then(|cb| cb.const_value())
-                    .is_none()
-            {
-                ctx.next_pos = ctx.next_pos.max(entry.head.raw() + 1);
+            if !entry.head.is_none() && entry.head.const_value().is_none() {
+                // class-C high-water: next_pos is a raw position cursor.
+                ctx.next_pos = ctx.next_pos.max(entry.head.to_opref().raw() + 1);
             }
         }
         for (label_arg, entry_idx, field_idx) in &same_as_targets {
@@ -1062,33 +1034,34 @@ impl Optimizer {
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(label_arg));
             op.pos().set(ctx.reserve_pos_typed(tp));
-            let fresh = op.pos().get();
-            // Op.type_ carries `tp` intrinsically (resoperation.py:1693
-            // SAME_AS_*.type parity); the immediate push below makes
-            // op_at(fresh) the authoritative type source. No
-            // `value_types` write needed (5).
+            // Op.type_ carries `tp` intrinsically (`ResOperation.type` /
+            // `same_as_for_type`); the immediate push below makes the
+            // SameAs producer the authoritative type source.
             let op_rc = OpRc::new(op);
             ctx.emitted_operations
                 .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
+            let same_as_box = Operand::from_bound_op(&op_rc);
             ctx.push_new_operation(op_rc);
             // Update the field to reference the SameAs result.
-            entries[*entry_idx].fields[*field_idx].1 = fresh;
+            entries[*entry_idx].fields[*field_idx].1 = same_as_box;
         }
 
         // Install PtrInfo for each virtual.
-        // unroll.py:55: if op.get_forwarded() is not None: return
+        // `setinfo_from_preamble`: `if op.get_forwarded() is not None: return`
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
         // Keyed by the virtual head's producer identity (`Operand` ptr_eq).
-        // A head is normally a NEW (virtual-alloc) ResOp with a producer, so
-        // `get_box_replacement_operand_opt` returns the memoized bound box and two
-        // entries sharing a head dedupe. A producer-less head resolves to
-        // None and is never dedupable (matching the prior fresh-unbound-box
-        // behaviour); its `set_ptr_info` is skipped below anyway.
+        // A bound head is already the box (`inputarg_at` + `get_box_replacement`);
+        // two entries sharing a head dedupe. An `Operand::None` head is never
+        // dedupable; its `set_ptr_info` is skipped below anyway.
         let mut installed_heads: crate::FxIndexSet<majit_ir::operand::Operand> =
             crate::FxIndexSet::default();
         for entry in entries {
-            let head_box = ctx.get_box_replacement_operand_opt(entry.head);
+            let head_box = if entry.head.is_none() {
+                None
+            } else {
+                Some(entry.head.get_box_replacement(false))
+            };
             if let Some(hk) = &head_box {
                 let head_key = hk.clone();
                 if installed_heads.contains(&head_key) {
@@ -1105,11 +1078,8 @@ impl Optimizer {
             match &entry.kind {
                 ImportedVirtualKind::Instance { known_class } => {
                     if let Some(b) = &head_box {
-                        let fields: majit_ir::ptr_info::VirtualFieldList = entry
-                            .fields
-                            .iter()
-                            .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
-                            .collect();
+                        let fields: majit_ir::ptr_info::VirtualFieldList =
+                            entry.fields.iter().map(|(i, r)| (*i, r.clone())).collect();
                         ctx.set_ptr_info(
                             b,
                             crate::optimizeopt::info::PtrInfo::Virtual(
@@ -1127,11 +1097,8 @@ impl Optimizer {
                 }
                 ImportedVirtualKind::Struct => {
                     if let Some(b) = &head_box {
-                        let fields: majit_ir::ptr_info::VirtualFieldList = entry
-                            .fields
-                            .iter()
-                            .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
-                            .collect();
+                        let fields: majit_ir::ptr_info::VirtualFieldList =
+                            entry.fields.iter().map(|(i, r)| (*i, r.clone())).collect();
                         ctx.set_ptr_info(
                             b,
                             crate::optimizeopt::info::PtrInfo::VirtualStruct(
@@ -8090,6 +8057,89 @@ mod tests {
         assert_eq!(snap.opt_ops, 5);
         assert_eq!(snap.opt_guards, 2);
         assert_eq!(snap.opt_guards_shared, 1);
+    }
+
+    /// `setinfo_from_preamble` writes field boxes from `label_args`.
+    /// Drive real `install_imported_virtuals`: the installed field slot is
+    /// the same box as the seeded label-arg `L` (or the SameAs result when
+    /// `skip_flush_mode`).
+    #[test]
+    fn test_imported_virtual_field_boxes_are_the_same_box() {
+        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::unroll::ExportedState;
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+
+        let size_descr = make_size_descr(16);
+        let field_descr = majit_ir::descr::make_field_descr_full(0, 0, 8, Type::Int, false);
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
+        let head = ctx.inputarg_at(0).expect("phase-2 input must be bound");
+        let label_arg = rooted_inputarg_operand(Type::Int, 1);
+
+        let mut opt = Optimizer::new();
+        opt.imported_label_args = Some(vec![label_arg.clone()]);
+        opt.imported_virtuals = vec![ImportedVirtual {
+            inputarg_index: 0,
+            size_descr: size_descr.clone(),
+            kind: ImportedVirtualKind::Instance { known_class: None },
+            fields: vec![(field_descr, VirtualStateInfo::Unknown(Type::Int))],
+            head_load_descr_index: None,
+        }];
+        let vs = VirtualState::new(vec![VirtualStateInfo::Virtual {
+            descr: size_descr,
+            known_class: None,
+            ob_type_descr: None,
+            fields: vec![],
+            field_descrs: Vec::new(),
+        }]);
+        opt.imported_loop_state = Some(ExportedState::new(
+            vec![],
+            vec![],
+            vs,
+            indexmap::IndexMap::new(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        opt.install_imported_virtuals(&mut ctx);
+
+        let installed = ctx
+            .peek_ptr_info(&head)
+            .expect("install_imported_virtuals writes PtrInfo on the head");
+        let field = match installed {
+            PtrInfo::Virtual(vinfo) => vinfo.fields.into_iter().next().map(|(_, box_)| box_),
+            _ => None,
+        }
+        .expect("virtual must carry its field box");
+        assert!(
+            field.same_box(&label_arg),
+            "installed field must be the label-arg box L"
+        );
+
+        let mut ctx2 = OptContext::with_inputarg_types(8, &[Type::Ref]);
+        ctx2.skip_flush_mode = true;
+        let head2 = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
+        opt.install_imported_virtuals(&mut ctx2);
+        let installed2 = ctx2
+            .peek_ptr_info(&head2)
+            .expect("install_imported_virtuals writes PtrInfo on the head");
+        let field2 = match installed2 {
+            PtrInfo::Virtual(vinfo) => vinfo.fields.into_iter().next().map(|(_, box_)| box_),
+            _ => None,
+        }
+        .expect("virtual must carry its SameAs field box");
+        let same_as = ctx2
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::SameAsI)
+            .expect("skip_flush_mode emits SameAs for the label-arg leaf");
+        let same_as_box = Operand::from_bound_op(same_as);
+        assert!(
+            field2.same_box(&same_as_box),
+            "skip_flush_mode field must be the SameAs result box"
+        );
+        assert!(!field2.same_box(&label_arg));
     }
 
     /// bind-at-alloc totality: an `Unknown` virtual-state leaf
