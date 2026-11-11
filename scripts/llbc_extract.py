@@ -2012,6 +2012,8 @@ def zstd_decompress_file(src: Path, dst: Path) -> None:
                     outf.write(decompressor.decompress(chunk))
                 while not decompressor.eof and not decompressor.needs_input:
                     outf.write(decompressor.decompress(b""))
+            if not decompressor.eof:
+                raise ValueError(f"llbc store: truncated zstd payload: {src}")
         else:
             exe = _zstd_executable()
             if exe is None:
