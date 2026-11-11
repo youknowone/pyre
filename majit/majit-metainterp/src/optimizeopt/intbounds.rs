@@ -1807,33 +1807,30 @@ impl OptIntBoundsState {
 
     /// Bounds learned in the preamble must be visible when optimizing the
     /// loop body. RPython keeps these on stable Box identities via
-    /// `box._forwarded`; pyre rebuilds `OptContext` around flat `OpRef`
-    /// positions, so this export surface has to carry the bound explicitly
-    /// until `setinfo_from_preamble` imports all needed `IntBound` state.
+    /// `box._forwarded`. This export surface carries the bound explicitly
+    /// until `setinfo_from_preamble` imports the `IntBound` state.
     fn export_arg_int_bounds(
         &self,
-        args: &[OpRef],
+        args: &[Operand],
         ctx: &OptContext,
-    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+    ) -> indexmap::IndexMap<Operand, IntBound> {
         let mut exported = indexmap::IndexMap::new();
-        for &arg in args {
-            // An IntBound only lives on a value-bearing box; an unresolvable
-            // arg position carries none. Resolve the canonical box once and
-            // key the export by box identity (`Rc::ptr_eq`), matching RPython's
-            // `box._forwarded` IntBound storage. `&OptContext` here forbids the
-            // `materialize_operand_at` fallback, so an unbound arg is simply skipped.
-            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
-                continue;
-            };
-            // optimizer.py `setintbound`: an IntBound is never stored
-            // on a Const (history.py a Const carries its value inline);
-            // unroll.py:483 likewise skips Const args when exporting info, so
-            // a Const resolved arg has no preamble bound to carry across the
-            // peel boundary. The consumer already recovers a Const's bound via
-            // `synthesize_const_info` before this table is consulted.
-            if arg_box.is_constant() {
+        for arg in args {
+            // An IntBound only lives on a value-bearing box. Walk
+            // `get_box_replacement(false)` and key the export by box
+            // identity, matching `box._forwarded` IntBound storage. An
+            // unbound arg (`is_none()`) is skipped.
+            let arg_box = arg.get_box_replacement(false);
+            if arg_box.is_none() || arg_box.is_constant() {
                 continue;
             }
+            // optimizer.py `setintbound`: an IntBound is never stored
+            // on a Const (`history.py` Const carries its value inline);
+            // `unroll.py OptUnroll.export_state` likewise skips Const args
+            // when exporting info, so a Const resolved arg has no preamble
+            // bound to carry across the peel boundary. The consumer already
+            // recovers a Const's bound via `synthesize_const_info` before
+            // this table is consulted.
             if arg_box.type_() != majit_ir::Type::Int {
                 continue;
             }
@@ -1891,9 +1888,9 @@ impl Optimization for OptIntBounds {
 
     fn export_arg_int_bounds(
         &self,
-        args: &[OpRef],
+        args: &[Operand],
         ctx: &OptContext,
-    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+    ) -> indexmap::IndexMap<Operand, IntBound> {
         self.state.borrow().export_arg_int_bounds(args, ctx)
     }
 }
