@@ -2836,9 +2836,8 @@ impl ExportedState {
         for (key, info) in &self.exported_infos {
             visit(key.to_opref());
             if let crate::optimizeopt::info::OpInfo::Ptr(rc) = info {
-                let children = rc.borrow().visitor_walk_recursive();
-                for child in children {
-                    visit(child);
+                for child in rc.borrow().visitor_walk_recursive() {
+                    visit(child.to_opref());
                 }
             }
         }
@@ -2872,7 +2871,7 @@ impl ExportedState {
             }
             for ptr_info in short_preamble.inputarg_infos.iter().flatten() {
                 for child in ptr_info.visitor_walk_recursive() {
-                    visit(child);
+                    visit(child.to_opref());
                 }
             }
         }
@@ -6649,10 +6648,19 @@ mod tests {
         let old = GcRef(0x1111_0000);
         let new = GcRef(0x2222_0000);
         let old_ref = OpRef::const_ptr(old);
+        let field_old = GcRef(0x3333_0000);
+        let field_new = GcRef(0x4444_0000);
+        let virtual_field = Operand::const_from_value(Value::Ref(field_old));
+        let mut virtual_info = PtrInfo::virtual_obj(majit_ir::descr::make_size_descr(16), None);
+        virtual_info.setfield(0, virtual_field.clone());
         let mut exported_infos = indexmap::IndexMap::new();
         exported_infos.insert(
             Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
+        );
+        exported_infos.insert(
+            Operand::const_from_value(Value::Ref(GcRef(0x5555_0000))),
+            OpInfo::ptr(virtual_info),
         );
         let mut constants = majit_ir::ConstMap::default();
         constants.insert(0, majit_ir::Const::from_gcref(old));
@@ -6741,6 +6749,8 @@ mod tests {
         state.walk_const_ptr_refs_mut(&mut |slot| {
             if *slot == old {
                 *slot = new;
+            } else if *slot == field_old {
+                *slot = field_new;
             }
         });
         // `ConstPtr` names a `const_ptr_table` slot. The index does not
@@ -6794,6 +6804,26 @@ mod tests {
         assert!(short.jump_args[0].same_box(&end_arg));
         assert_eq!(short.inputargs[0].const_value(), Some(Value::Ref(new)));
         assert_eq!(short.constants.get(&0).map(|c| c.getref_base()), Some(new));
+
+        let virtual_ptr = state
+            .exported_infos
+            .values()
+            .find_map(|info| match info {
+                OpInfo::Ptr(rc) => {
+                    let borrowed = rc.borrow();
+                    match &*borrowed {
+                        PtrInfo::Virtual(_) => Some(rc.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("exported pointer information carries the virtual field");
+        let walked_fields = virtual_ptr.borrow().visitor_walk_recursive();
+        assert_eq!(walked_fields.len(), 1);
+        assert!(walked_fields[0].same_box(&virtual_field));
+        assert_eq!(virtual_field.const_value(), Some(Value::Ref(field_new)));
+        assert_eq!(walked_fields[0].const_value(), Some(Value::Ref(field_new)));
     }
 
     #[test]

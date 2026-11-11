@@ -584,6 +584,36 @@ mod walk_live_op_quasiimmut_tests {
         assert!(imported.cache_args[0].same_box(&cache_arg));
         assert_eq!(cache_arg.const_value(), Some(Value::Ref(new_cache)));
     }
+
+    #[test]
+    fn test_context_walks_virtualizable_identity_inputarg() {
+        let old = GcRef(0x4100);
+        let new = GcRef(0x5100);
+        let ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
+        let identity = ctx
+            .inputarg_at(0)
+            .expect("virtualizable identity InputArg must be bound");
+        identity
+            .bound_inputarg()
+            .expect("identity is an InputArg")
+            .set_value(Value::Ref(old));
+
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_context(&ctx);
+        roots.walk(&mut |slot| {
+            if *slot == old {
+                *slot = new;
+            }
+        });
+
+        let walked = ctx
+            .inputarg_at(0)
+            .expect("identity InputArg remains in ctx.inputargs");
+        assert!(identity.is_inputarg());
+        assert!(identity.same_box(&walked));
+        assert_eq!(identity.get_value(), Some(Value::Ref(new)));
+        assert_eq!(walked.get_value(), Some(Value::Ref(new)));
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;

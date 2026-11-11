@@ -89,9 +89,9 @@ pub(crate) struct VirtualizableConfig {
     /// marker is installed.
     ///
     /// The decline is not total. On the bridge path (`ctx.building_bridge`)
-    /// `identity_input_ref` returns `Some(input_arg_ref(ctx.inputarg_base))`
-    /// before it consults this field at all, so a tracker is still installed
-    /// there with this set to `None`.
+    /// `identity_input_box` returns `ctx.inputarg_at(0)` before it consults
+    /// this field at all, so a tracker is still installed there with this
+    /// set to `None`.
     pub identity_input_index: Option<usize>,
 }
 
@@ -153,13 +153,12 @@ impl VirtualizableTracker {
         self.needs_setup = true;
     }
 
-    /// The input-arg slot the virtualizable identity occupies, or `None` when
-    /// no sound slot is known and the tracker must decline.
+    /// The bound `InputArg` box the virtualizable identity occupies, or
+    /// `None` when no sound slot is known and the tracker must decline.
     ///
-    /// The answer is always expressed in this run's own OpRef namespace:
-    /// inputarg `#i` is raw OpRef `inputarg_base + i`. Phase 1 runs at base 0;
-    /// Phase 2 and bridges are shifted above the parent trace's high water
-    /// mark.
+    /// `virtualize.py` `OptVirtualize` hangs `PtrInfo` on the live input
+    /// box itself (`ctx.inputargs[index]`). Phase 2 and bridges already
+    /// store their own typed `InputArg` boxes in `ctx.inputargs`.
     ///
     /// A bridge keeps the identity at slot 0: its input args are rebuilt from
     /// the deadframe frame-first, so the front end's resolved offset does not
@@ -174,13 +173,13 @@ impl VirtualizableTracker {
     /// `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be. On the
     /// banked layout that is an Int scalar, and the loop-close Jump then fails
     /// to match the Ref-typed preview (`VirtualStatesCantMatch`).
-    fn identity_input_ref(&self, ctx: &OptContext) -> Option<OpRef> {
-        if ctx.building_bridge {
-            return Some(OpRef::input_arg_ref(ctx.inputarg_base));
-        }
-        Some(OpRef::input_arg_ref(
-            ctx.inputarg_base + self.config.identity_input_index? as u32,
-        ))
+    fn identity_input_box(&self, ctx: &OptContext) -> Option<Operand> {
+        let index = if ctx.building_bridge {
+            0
+        } else {
+            self.config.identity_input_index?
+        };
+        ctx.inputarg_at(index)
     }
 
     /// Apply deferred virtualizable setup if needed.
@@ -189,33 +188,25 @@ impl VirtualizableTracker {
             self.needs_setup = false;
             // No sound identity slot — decline rather than install
             // `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be.
-            let Some(identity_ref) = self.identity_input_ref(ctx) else {
+            let Some(identity) = self.identity_input_box(ctx) else {
                 return;
             };
-            let first_check = ctx
-                .get_box_replacement_operand_opt(identity_ref)
-                .as_ref()
-                .is_some_and(|b| ctx.has_ptr_info(b));
+            let identity = identity.get_box_replacement(false);
+            let first_check = ctx.has_ptr_info(&identity);
             if !first_check {
                 self.init(ctx);
-                let second_check = ctx
-                    .get_box_replacement_operand_opt(identity_ref)
-                    .as_ref()
-                    .is_some_and(|b| ctx.has_ptr_info(b));
-                if !second_check {
-                    {
-                        let b = ctx.materialize_operand_at(identity_ref);
-                        ctx.set_ptr_info(
-                            &b,
-                            PtrInfo::Virtualizable(VirtualizableFieldState {
-                                fields: vec![],
-                                field_descrs: vec![],
-                                arrays: vec![],
-                                heap_fields: vec![],
-                                last_guard_pos: -1,
-                            }),
-                        );
-                    }
+                let identity = identity.get_box_replacement(false);
+                if !ctx.has_ptr_info(&identity) {
+                    ctx.set_ptr_info(
+                        &identity,
+                        PtrInfo::Virtualizable(VirtualizableFieldState {
+                            fields: vec![],
+                            field_descrs: vec![],
+                            arrays: vec![],
+                            heap_fields: vec![],
+                            last_guard_pos: -1,
+                        }),
+                    );
                 }
             }
         }
@@ -228,7 +219,7 @@ impl VirtualizableTracker {
         }
         // Same decline as `ensure_setup`: without a known identity slot there is
         // nothing to hang the seeded `VirtualizableFieldState` on.
-        let Some(identity_ref) = self.identity_input_ref(ctx) else {
+        let Some(identity) = self.identity_input_box(ctx) else {
             return;
         };
 
@@ -239,8 +230,7 @@ impl VirtualizableTracker {
             heap_fields: vec![],
             last_guard_pos: -1,
         };
-        let b = ctx.materialize_operand_at(identity_ref);
-        ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
+        ctx.set_ptr_info(&identity, PtrInfo::Virtualizable(state));
     }
 }
 

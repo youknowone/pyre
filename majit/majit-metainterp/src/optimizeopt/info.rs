@@ -3236,10 +3236,14 @@ mod tests {
     fn test_ptr_info_visitor_walk() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(0, field_op(Type::Int, 10));
-        info.setfield(1, field_op(Type::Int, 20));
+        let expected0 = field_op(Type::Int, 10);
+        let expected1 = field_op(Type::Int, 20);
+        info.setfield(0, expected0.clone());
+        info.setfield(1, expected1.clone());
         let refs = info.visitor_walk_recursive();
-        assert_eq!(refs, vec![OpRef::int_op(10), OpRef::int_op(20)]);
+        assert_eq!(refs.len(), 2);
+        assert!(refs[0].same_box(&expected0));
+        assert!(refs[1].same_box(&expected1));
     }
 
     #[test]
