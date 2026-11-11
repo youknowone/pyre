@@ -3531,13 +3531,6 @@ impl OptContext {
         (opref, b)
     }
 
-    /// Dispatch on a `Value`'s type tag and produce a typed `*Op` OpRef
-    /// at the given position (resoperation.py IntOp
-    /// IntOp/FloatOp/RefOp/VoidOp mixins).
-    pub(crate) fn op_ref_for_value(pos: u32, value: &Value) -> OpRef {
-        OpRef::op_typed(pos, value.get_type())
-    }
-
     /// `vstring.py` `optstring.emit_extra(op)` — walks the passes after
     /// OptString (`optforce.optimizer.optstring`), whoever forced the string
     /// and during final emission too; without an optimizer the op ends at

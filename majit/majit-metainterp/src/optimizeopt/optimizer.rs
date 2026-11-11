@@ -371,13 +371,11 @@ pub struct Optimizer {
     /// optimizer.py `_really_emitted_operation` — last op appended by
     /// `_emit_operation`. `getlastop` returns this, not `new_operations.last()`.
     really_emitted_operation: Option<OpRc>,
-    /// optimizer.py:241/304/632-634 `replaces_guard` — maps an emitted
-    /// guard op to its replacement. RPython keys this dict by the guard
-    /// `op` object itself (object identity); pyre keys by the guard op's
-    /// canonical producer `Operand` (compared by `Rc::ptr_eq`), the
-    /// box-identity analog of `op is op`. Every key is resolved through
-    /// `ctx.resolve_to_operand(op.pos)` so insert and lookup agree on the
-    /// canonical producer. Guard ops are never Const, so the key is always a
+    /// optimizer.py `replaces_guard` — maps an emitted guard op to its
+    /// replacement. RPython keys this dict by the guard `op` object itself
+    /// (object identity); keys are the raw producer `Operand`
+    /// (`from_bound_op`, no `_forwarded`), the box-identity analog of
+    /// `op is op`. Guard ops are never Const, so the key is always a
     /// ptr-stable ResOp producer.
     replaces_guard: crate::FxIndexMap<majit_ir::operand::Operand, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
@@ -1519,45 +1517,30 @@ impl Optimizer {
         self.last_guard_op_idx
     }
 
-    /// optimizer.py replace_guard: `self.replaces_guard[op] = value.last_guard_pos`.
-    /// Record that a guard at the given position should be replaced when the
-    /// future condition is realized. PyPy keys `replaces_guard` by the raw `op`
-    /// object identity, and `_emit_operation` (optimizer.py) looks it up by
-    /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_operand`
-    /// yields that producer box (chain root, before `_forwarded`), so insert and
-    /// the emit-time lookup compare the same raw box.
+    /// optimizer.py `replace_guard`: `self.replaces_guard[op] = value`.
+    /// Record that a guard should be replaced when the future condition is
+    /// realized. Keys by the raw `op` (no get_box_replacement).
+    /// `_emit_operation` looks it up by the raw `orig_op`.
     /// (The method keeps its historical name; the body performs replace_guard's
     /// insert.)
-    pub fn notice_guard_future_condition(
-        &mut self,
-        ctx: &OptContext,
-        guard_pos: OpRef,
-        replacement: Op,
-    ) {
-        if let Some(op) = ctx.resolve_to_operand(guard_pos) {
-            self.replaces_guard.insert(op, replacement);
-        }
+    pub fn notice_guard_future_condition(&mut self, guard: &Operand, replacement: Op) {
+        // optimizer.py replace_guard: `self.replaces_guard[op] = value`
+        // keys by the raw `op` (no get_box_replacement).
+        self.replaces_guard.insert(guard.clone(), replacement);
     }
 
-    /// optimizer.py: replace_guard_op(old_op_pos, new_op)
+    /// optimizer.py `replace_guard_op(old_op, new_op)`
     /// Replace a previously emitted guard with a new one.
     ///
     /// optimizer.py: `self._emittedoperations[new_op] = None` —
-    /// the new guard takes over the emit identity, so it must enter
-    /// the emit set even though it was substituted post-hoc rather
-    /// than directly emitted via `_emit_operation`.
-    pub fn replace_guard_op(&mut self, ctx: &mut OptContext, old_pos: OpRef, new_guard: Op) {
-        let new_pos = new_guard.pos().get();
-        // replaces_guard is keyed by the raw `op` identity (optimizer.py:307),
-        // so resolve to the producer box without following `_forwarded`.
-        if let Some(op) = ctx.resolve_to_operand(old_pos) {
-            self.replaces_guard.insert(op, new_guard);
-        }
-        // optimizer.py `self._emittedoperations[new_op] = None` — new_op is
-        // the canonical (get_box_replacement'd) emitted op, so this insert stays
-        // canonical, matching the emit-set keying in `_emit_operation`.
-        let new_op = ctx.get_box_replacement_operand(new_pos);
-        ctx.emitted_operations.insert(new_op);
+    /// the new guard object itself.
+    pub fn replace_guard_op(&mut self, ctx: &mut OptContext, old_guard: &Operand, new_guard: Op) {
+        let new_rc = majit_ir::OpRc::new(new_guard.clone());
+        self.replaces_guard.insert(old_guard.clone(), new_guard);
+        // optimizer.py `self._emittedoperations[new_op] = None` — the new
+        // guard object itself.
+        ctx.emitted_operations
+            .insert(Operand::from_bound_op(&new_rc));
     }
 
     /// optimizer.py `as_operation(op, required_opnum=-1)`:
@@ -1572,36 +1555,32 @@ impl Optimizer {
     ///     return None
     /// ```
     ///
-    /// Returns `Some(opref)` iff the opref refers to an actually-emitted
-    /// op (in `ctx.emitted_operations`) and its opcode matches
+    /// Returns `Some(op_rc)` iff `op` is an actually-emitted AbstractResOp
+    /// (in `ctx.emitted_operations`) and its opcode matches
     /// `required_opnum` (or `required_opnum` is `None` meaning "any
     /// opcode"). Callers verify identity before reasoning about
     /// emit-bound metadata.
     pub fn as_operation(
         &self,
-        opref: OpRef,
+        op: &Operand,
         required_opnum: Option<majit_ir::OpCode>,
         ctx: &OptContext,
-    ) -> Option<OpRef> {
+    ) -> Option<majit_ir::OpRc> {
+        // optimizer.py as_operation: isinstance(op, AbstractResOp);
+        // a Const is not an AbstractResOp.
+        if op.is_constant() {
+            return None;
+        }
+        let op_rc = op.bound_op()?;
         if let Some(required) = required_opnum
-            && ctx.op_at(opref).map(|op| op.opcode) != Some(required)
+            && op_rc.opcode != required
         {
             return None;
         }
-        // optimizer.py `if op in self._emittedoperations` keys by the op's
-        // own (raw) identity, not its forwarded replacement. `resolve_to_operand`
-        // is that producer box (chain root, before `_forwarded`); `ctx.emit_rc`
-        // records the same op with `Operand::from_bound_op`.
-        // A constant is never an emitted op; short-circuit before resolving so
-        // resolving never mints a throwaway Const key (which would harmlessly
-        // miss anyway, since no Const is ever inserted into the emit set).
-        if opref.is_constant() {
-            return None;
-        }
-        match ctx.resolve_to_operand(opref) {
-            Some(op) if ctx.emitted_operations.contains(&op) => Some(opref),
-            _ => None,
-        }
+        // optimizer.py `if op in self._emittedoperations` keys by the raw
+        // producer (`from_bound_op`), not get_box_replacement.
+        let raw = Operand::from_bound_op(&op_rc);
+        ctx.emitted_operations.contains(&raw).then_some(op_rc)
     }
 
     // RPython optimizer.py store_final_boxes_in_guard and
@@ -2499,19 +2478,8 @@ impl Optimizer {
     ///
     /// Takes `&mut OptContext` to mirror the upstream `getintbound`
     /// lazy-install side effect (optimizer.py).
-    pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
-        // optimizer.py `getnullness` reads `getptrinfo` /
-        // `getintbound` of an existing box; the `'r'` arm uses
-        // `getptrinfo(create=False)`, so an absent info yields `INFO_UNKNOWN`
-        // without minting. Resolve the producer box and delegate — a
-        // producer-less position has no info and returns `INFO_UNKNOWN`, never
-        // a fresh stand-in (a nullness query must not pollute the producer
-        // registry). `ctx.getnullness` performs the per-type `getintbound`
-        // lazy-install on the resolved box.
-        let Some(b) = ctx.get_box_replacement_operand_opt(opref) else {
-            return crate::optimizeopt::INFO_UNKNOWN;
-        };
-        ctx.getnullness(&b)
+    pub fn getnullness(ctx: &mut OptContext, op: &Operand) -> i8 {
+        ctx.getnullness(op)
     }
 
     /// optimizer.py: make_constant_class(op, class_const, update_last_guard)
@@ -3100,20 +3068,44 @@ impl Optimizer {
 
         // Pre-populate known constants so passes can see them.
         //
-        // history.py/261/307: `ConstInt/ConstFloat/ConstPtr` pin
-        // `Box.type` at construction. The `Value` payload carries the
-        // box class intrinsically, so the OpRef variant tag is recovered
-        // directly from the `Value`'s type tag without any external
-        // `constant_types` side table.
-        //
-        // The `constants` map keys inline-value-at-op-position slots: each
-        // `idx` mints `OpRef::*_op(idx)` matching the `Value` variant.
-        for (&idx, value) in constants.iter() {
-            let opref = OptContext::op_ref_for_value(idx, value);
-            // seed_constant takes the canonical `_forwarded` host; resolve
-            // the body OpRef to its producing `Op` / `InputArg` box first.
-            let op_ = ctx.materialize_operand_at(opref);
-            ctx.seed_constant(&op_, *value);
+        // ConstInt / ConstFloat / ConstPtr pin Box.type at construction.
+        // Seed the bound producer already in `ops` / `ctx.inputargs`
+        // whose pos.raw() is the ConstMap key. Do not intern via
+        // const_operands; ConstInt.__init__ mints a fresh instance per use
+        // and seed writes `_forwarded` on the existing producer.
+        for op in ops {
+            let pos = op.pos().get();
+            if pos.is_none() || pos.is_constant() {
+                continue;
+            }
+            if let Some(value) = constants.get(&pos.raw()) {
+                ctx.seed_constant(&Operand::from_bound_op(op), *value);
+            }
+        }
+        // Index walk: `seed_constant` needs `&mut self` while the host lives
+        // in `ctx.inputargs` (optimizer.py make_constant / ConstInt seed).
+        for i in 0..ctx.inputargs.len() {
+            let raw = ctx.inputarg_base.saturating_add(i as u32);
+            if let Some(&value) = constants.get(&raw) {
+                ctx.seed_constant(&ctx.inputargs[i].clone(), value);
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            for (&idx, value) in constants.iter() {
+                let matched_op = ops.iter().any(|op| {
+                    let p = op.pos().get();
+                    !p.is_none() && !p.is_constant() && p.raw() == idx
+                });
+                let matched_ia = (0..ctx.inputargs.len())
+                    .any(|i| ctx.inputarg_base.saturating_add(i as u32) == idx);
+                debug_assert!(
+                    matched_op
+                        || matched_ia
+                        || OpRef::op_typed(idx, value.get_type()).is_constant(),
+                    "constants key {idx} has no bound producer; mint at allocation"
+                );
+            }
         }
 
         // Setup all passes
@@ -5311,15 +5303,14 @@ impl Optimizer {
 
             // optimizer.py: replaces_guard check BEFORE emit_guard_operation.
             // optimizer.py `orig_op in self.replaces_guard` keys by the raw
-            // `orig_op` identity (before get_box_replacement), so resolve to the
-            // producer box without following `_forwarded`.
+            // producer (`from_bound_op`), not get_box_replacement.
             // optimizer.py `if self.replaces_guard and orig_op in
             // self.replaces_guard`.
             if self.can_replace_guards
                 && !self.replaces_guard.is_empty()
-                && let Some(replacement) = ctx
-                    .resolve_to_operand(op.pos().get())
-                    .and_then(|op_key| self.replaces_guard.swap_remove(&op_key))
+                && let Some(replacement) = self
+                    .replaces_guard
+                    .swap_remove(&Operand::from_bound_op(&op))
             {
                 let target_pos = replacement.pos().get().raw() as usize;
                 if target_pos < ctx.new_operations.len() {
@@ -7742,24 +7733,16 @@ mod tests {
         use crate::optimizeopt::{INFO_NONNULL, INFO_NULL, INFO_UNKNOWN};
         let mut ctx = OptContext::new(10);
         // Unknown integer → INFO_UNKNOWN.
-        assert_eq!(
-            Optimizer::getnullness(&mut ctx, OpRef::int_op(0)),
-            INFO_UNKNOWN
-        );
+        let unknown = ctx.materialize_operand_at(OpRef::int_op(0));
+        assert_eq!(Optimizer::getnullness(&mut ctx, &unknown), INFO_UNKNOWN);
         // Known nonzero integer → INFO_NONNULL.
         let b = ctx.materialize_operand_at(OpRef::int_op(1));
         ctx.make_constant_box(&b, majit_ir::Value::Int(42));
-        assert_eq!(
-            Optimizer::getnullness(&mut ctx, OpRef::int_op(1)),
-            INFO_NONNULL
-        );
+        assert_eq!(Optimizer::getnullness(&mut ctx, &b), INFO_NONNULL);
         // Known zero integer → INFO_NULL.
-        let b = ctx.materialize_operand_at(OpRef::int_op(2));
-        ctx.make_constant_box(&b, majit_ir::Value::Int(0));
-        assert_eq!(
-            Optimizer::getnullness(&mut ctx, OpRef::int_op(2)),
-            INFO_NULL
-        );
+        let z = ctx.materialize_operand_at(OpRef::int_op(2));
+        ctx.make_constant_box(&z, majit_ir::Value::Int(0));
+        assert_eq!(Optimizer::getnullness(&mut ctx, &z), INFO_NULL);
     }
 
     #[test]
