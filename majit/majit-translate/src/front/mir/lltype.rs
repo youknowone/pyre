@@ -12341,6 +12341,43 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
     .to_string()
 }
 
+/// Rewrite a Path-form ADT TypeDeclRef (`{"id": {"Path": "crate::T"}}`)
+/// to the unique numeric def id of that path. Published field types keep
+/// Path ids when remap misses; intern's handle check reads only `id` as
+/// `u64`. Ambiguous paths stay Path so intern fails closed to the CAST
+/// leaf rather than picking a colliding decl.
+fn intern_adt_node_with_numeric_id(
+    t: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let adt = t.as_object()?.get("Adt")?.as_object()?;
+    if adt.get("id")?.as_u64().is_some() {
+        return None;
+    }
+    let path = adt.get("id")?.get("Path")?.as_str()?;
+    let def_id = unique_type_id_for_name_path(llbc, path)?;
+    let mut out = t.clone();
+    out.as_object_mut()?
+        .get_mut("Adt")?
+        .as_object_mut()?
+        .insert("id".into(), serde_json::json!(def_id));
+    Some(out)
+}
+
+fn unique_type_id_for_name_path(llbc: &Llbc, path: &str) -> Option<u64> {
+    let mut found = None;
+    for td in llbc.iter_type_decls() {
+        if td.item_meta.name_path() != path {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(td.def_id);
+    }
+    found
+}
+
 /// Intern payload-row spelling of one ADT type argument.
 ///
 /// The `<…>` CAST suffix stays the leaf render ([`render_adt_type_args`]).
@@ -12352,6 +12389,10 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
 /// strips `&`, so `Option<&T>` would otherwise intern as the tagged
 /// `Option<T>` class), a monomorphic named ADT is `strip_crate_prefix` of
 /// the TypeDecl path, and a generic instantiation keeps the CAST leaf render.
+///
+/// A `type T = Handle` alias and a published `{"id": {"Path": …}}` ADT
+/// name the same handle as a numeric `Adt` id; intern peels both so the
+/// ROW is `*mut {Deref::Target}` at every site, not a by-value class name.
 fn intern_type_arg_payload_spelling(
     t: &serde_json::Value,
     llbc: &Llbc,
@@ -12364,8 +12405,13 @@ fn intern_type_arg_payload_spelling(
     // `{"Deduplicated": id}`). CAST already peels those wrappers
     // ([`charon_type_value_to_ast_string`]); intern ROW must too, or
     // [`tyref_is_option`] / [`intern_adt_type_decl_identity`] see the
-    // wrapper node and the ROW falls through to the CAST leaf.
+    // wrapper node and the ROW falls through to the CAST leaf. A type
+    // alias and a Path-form TypeDeclRef are the same peel for a handle:
+    // without them the ROW is the alias / CAST leaf class name.
     let t = strip_ty_indirections(t, llbc).unwrap_or(t);
+    let t = type_node_peel_aliases(t, llbc).unwrap_or(t);
+    let numeric = intern_adt_node_with_numeric_id(t, llbc);
+    let t = numeric.as_ref().unwrap_or(t);
     let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
     if rendered == "Global" || rendered == "RandomState" {
         return None;

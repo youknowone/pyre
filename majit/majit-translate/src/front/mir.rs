@@ -725,12 +725,31 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 /// Charon def id and qualified name, the concrete type arguments in
 /// generic-parameter order (`["Tuple", "PyError"]`), and the `<…>` suffix
 /// the per-instantiation classdef carries (`<Tuple,PyError>`).
+///
+/// Ordered by `(name_path, suffix, args, def_id)` so intern registration
+/// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+}
+
+impl PartialOrd for RefEnumInst {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RefEnumInst {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name_path
+            .cmp(&other.name_path)
+            .then_with(|| self.suffix.cmp(&other.suffix))
+            .then_with(|| self.args.cmp(&other.args))
+            .then_with(|| self.def_id.cmp(&other.def_id))
+    }
 }
 
 /// Physical layout identity for a concrete ADT use. The defining path supplies
@@ -896,7 +915,9 @@ fn collect_ref_enum_instantiations(
             intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
         }
     }
-    found.into_iter().collect()
+    let mut insts: Vec<RefEnumInst> = found.into_iter().collect();
+    insts.sort();
+    insts
 }
 
 fn intern_enum_from_ty(
