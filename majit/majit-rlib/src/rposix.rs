@@ -24,13 +24,26 @@ pub mod cConfig {
 pub use cConfig::TIOCGWINSZ;
 #[cfg(any(unix, windows))]
 pub use cConfig::{
-    CLOCK_T, F_LOCK, F_TEST, F_TLOCK, F_ULOCK, GETPGRP_HAVE_ARG, HAVE_D_TYPE, HAVE_FADVISE,
-    HAVE_FALLOCATE, HAVE_UTIMES, O_NONBLOCK, OFF_T, OFF_T_SIZE, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
-    SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR, SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG,
-    UTIMBUF,
+    CLOCK_T, F_LOCK, F_TEST, F_TLOCK, F_ULOCK, GETPGRP_HAVE_ARG, HAVE_D_TYPE, HAVE_DUP3,
+    HAVE_FADVISE, HAVE_FALLOCATE, HAVE_PIPE2, HAVE_UTIMES, O_NONBLOCK, OFF_T, OFF_T_SIZE,
+    PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
+    SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
+};
+/// `rposix.py` `constants` (`pipe_config`).
+#[cfg(any(unix, windows))]
+pub use cConfig::{
+    COPYFILE_DATA, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS,
+    O_CLOEXEC,
 };
 #[cfg(unix)]
 pub use cConfig::{GID_T, ID_T, NCCS, TMS, UID_T};
+/// `rposix.py` `advise_config`.
+#[cfg(rposix_have_fadvise)]
+pub use cConfig::{
+    POSIX_FADV_DONTNEED, POSIX_FADV_NOREUSE, POSIX_FADV_NORMAL, POSIX_FADV_RANDOM,
+    POSIX_FADV_SEQUENTIAL, POSIX_FADV_WILLNEED,
+};
 
 /// `rposix.py` `assert OFF_T_SIZE == rffi.sizeof(rffi.LONGLONG)`.
 #[cfg(unix)]
@@ -905,9 +918,9 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_posix_fallocate` and `rposix.c_posix_fadvise` save errno.
-// `HAVE_FALLOCATE` / `HAVE_FADVISE` are linux here. `rposix.posix_fadvise`
-// uses the C return value as the errno.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// `rposix.posix_fadvise` uses the C return value as the errno.
+// `rposix.py` `if HAVE_FALLOCATE:`.
+#[cfg(rposix_have_fallocate)]
 crate::rffi::llexternal!(
     pub c_posix_fallocate = "posix_fallocate",
     [crate::rffi::INT, OFF_T, OFF_T],
@@ -916,7 +929,8 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// `rposix.py` `if HAVE_FADVISE:`.
+#[cfg(rposix_have_fadvise)]
 crate::rffi::llexternal!(
     pub c_posix_fadvise = "posix_fadvise",
     [crate::rffi::INT, OFF_T, OFF_T, crate::rffi::INT],
@@ -2859,15 +2873,8 @@ crate::rffi::llexternal!(
     compilation_info = STATUS_FLAGS_ECI
 );
 
-// `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
+// `rposix.c_pipe2` saves errno. `rposix.py` `if HAVE_PIPE2:`.
+#[cfg(rposix_have_pipe2)]
 crate::rffi::llexternal!(
     pub c_pipe2 = "pipe2",
     [*mut libc::c_int, crate::rffi::INT],
@@ -3440,6 +3447,29 @@ mod tests {
         assert_eq!(F_TLOCK, Some(libc::F_TLOCK));
         assert_eq!(F_ULOCK, Some(libc::F_ULOCK));
         assert_eq!(F_TEST, Some(libc::F_TEST));
+        assert_eq!(O_CLOEXEC, Some(libc::O_CLOEXEC as i32));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            // `rposix.eci` does not include `copyfile.h`; `DefinedConstantInteger`
+            // leaves `COPYFILE_DATA` None. pypy3 `posix` has no `_COPYFILE_DATA`.
+            assert_eq!(COPYFILE_DATA, None);
+            assert!(!HAVE_PIPE2);
+            assert!(!HAVE_DUP3);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(HAVE_PIPE2);
+            assert!(HAVE_DUP3);
+            assert_eq!(POSIX_FADV_WILLNEED, Some(libc::POSIX_FADV_WILLNEED as i32));
+            assert_eq!(POSIX_FADV_NORMAL, Some(libc::POSIX_FADV_NORMAL as i32));
+            assert_eq!(
+                POSIX_FADV_SEQUENTIAL,
+                Some(libc::POSIX_FADV_SEQUENTIAL as i32)
+            );
+            assert_eq!(POSIX_FADV_RANDOM, Some(libc::POSIX_FADV_RANDOM as i32));
+            assert_eq!(POSIX_FADV_NOREUSE, Some(libc::POSIX_FADV_NOREUSE as i32));
+            assert_eq!(POSIX_FADV_DONTNEED, Some(libc::POSIX_FADV_DONTNEED as i32));
+        }
         assert_eq!(std::mem::size_of::<TMS>(), std::mem::size_of::<libc::tms>());
         assert_eq!(
             std::mem::size_of::<UTIMBUF>(),
@@ -4737,10 +4767,10 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(rposix_have_fadvise, rposix_have_fallocate))]
     #[test]
     fn c_posix_fadvise_and_fallocate_reject_bad_fd() {
-        let advice = libc::POSIX_FADV_NORMAL as crate::rffi::INT;
+        let advice = POSIX_FADV_NORMAL.unwrap();
         let err = unsafe { c_posix_fadvise(-1, 0, 0, advice) };
         assert_ne!(err, 0, "c_posix_fadvise(-1) succeeded");
         let ret = unsafe { c_posix_fallocate(-1, 0, 0) };

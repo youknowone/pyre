@@ -61,12 +61,11 @@ pub mod sys {
         SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
         WSTOPPED, WUNTRACED, X_OK,
     };
-    // `posix`'s darwin-only names: the `setpriority` scopes, the `copyfile`
-    // flags `_fcopyfile` takes, and `<stdio.h>`'s own `TMP_MAX`.
+    // `posix`'s darwin-only names: the `setpriority` scopes and `<stdio.h>`'s
+    // own `TMP_MAX`.
     #[cfg(target_vendor = "apple")]
     pub use libc::{
-        COPYFILE_ACL, COPYFILE_DATA, COPYFILE_STAT, COPYFILE_XATTR, PRIO_DARWIN_BG,
-        PRIO_DARWIN_NONUI, PRIO_DARWIN_PROCESS, PRIO_DARWIN_THREAD, TMP_MAX,
+        PRIO_DARWIN_BG, PRIO_DARWIN_NONUI, PRIO_DARWIN_PROCESS, PRIO_DARWIN_THREAD, TMP_MAX,
     };
     // The `<langinfo.h>` items beside `CODESET`, which `_locale` publishes as
     // the keys `nl_langinfo` takes.

@@ -2146,12 +2146,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("O_NDELAY", libc::O_NONBLOCK as i64),
         #[cfg(not(any(unix, windows)))]
         ("O_NDELAY", 0i64),
-        // `moduledef.py:264-266` publishes O_CLOEXEC by name wherever the host
-        // has it, which is every Unix. `nt` has no such flag -- it spells the
-        // same intent O_NOINHERIT -- so a zero there would be a flag that
-        // silently leaves the descriptor inheritable.
-        #[cfg(unix)]
-        ("O_CLOEXEC", libc::O_CLOEXEC as i64),
         // The rest of the `<fcntl.h>` set. Each value is the host header's own,
         // and the split below is the hosts' own too: these six are on every
         // Unix, the next two groups are one platform's each. `nt` has none of
@@ -2284,7 +2278,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     #[cfg(all(windows, feature = "host_env"))]
     {
         use rustpython_host_env::msvcrt as host_msvcrt;
-        use rustpython_host_env::nt as host_nt;
         for (name, val) in [
             ("EX_OK", host_msvcrt::EX_OK as i64),
             ("P_WAIT", host_msvcrt::P_WAIT as i64),
@@ -2293,26 +2286,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ("P_NOWAITO", host_msvcrt::P_NOWAITO as i64),
             ("P_DETACH", host_msvcrt::P_DETACH as i64),
             ("TMP_MAX", host_msvcrt::TMP_MAX as i64),
-            (
-                "_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
-                host_nt::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR as i64,
-            ),
-            (
-                "_LOAD_LIBRARY_SEARCH_APPLICATION_DIR",
-                host_nt::LOAD_LIBRARY_SEARCH_APPLICATION_DIR as i64,
-            ),
-            (
-                "_LOAD_LIBRARY_SEARCH_USER_DIRS",
-                host_nt::LOAD_LIBRARY_SEARCH_USER_DIRS as i64,
-            ),
-            (
-                "_LOAD_LIBRARY_SEARCH_SYSTEM32",
-                host_nt::LOAD_LIBRARY_SEARCH_SYSTEM32 as i64,
-            ),
-            (
-                "_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS",
-                host_nt::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS as i64,
-            ),
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
         }
@@ -2326,11 +2299,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("P_NOWAITO", 3),
         ("P_DETACH", 4),
         ("TMP_MAX", 2_147_483_647),
-        ("_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR", 0x100),
-        ("_LOAD_LIBRARY_SEARCH_APPLICATION_DIR", 0x200),
-        ("_LOAD_LIBRARY_SEARCH_USER_DIRS", 0x400),
-        ("_LOAD_LIBRARY_SEARCH_SYSTEM32", 0x800),
-        ("_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS", 0x1000),
     ] {
         crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
     }
@@ -2408,16 +2376,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
         }
         // `moduledef.py` publishes these when `rposix.posix_fadvise` exists.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(rposix_have_fadvise)]
         for (name, val) in [
-            ("POSIX_FADV_WILLNEED", libc::POSIX_FADV_WILLNEED as i64),
-            ("POSIX_FADV_NORMAL", libc::POSIX_FADV_NORMAL as i64),
-            ("POSIX_FADV_SEQUENTIAL", libc::POSIX_FADV_SEQUENTIAL as i64),
-            ("POSIX_FADV_RANDOM", libc::POSIX_FADV_RANDOM as i64),
-            ("POSIX_FADV_NOREUSE", libc::POSIX_FADV_NOREUSE as i64),
-            ("POSIX_FADV_DONTNEED", libc::POSIX_FADV_DONTNEED as i64),
+            (
+                "POSIX_FADV_WILLNEED",
+                majit_rlib::rposix::POSIX_FADV_WILLNEED.expect("missing POSIX_FADV_WILLNEED"),
+            ),
+            (
+                "POSIX_FADV_NORMAL",
+                majit_rlib::rposix::POSIX_FADV_NORMAL.expect("missing POSIX_FADV_NORMAL"),
+            ),
+            (
+                "POSIX_FADV_SEQUENTIAL",
+                majit_rlib::rposix::POSIX_FADV_SEQUENTIAL.expect("missing POSIX_FADV_SEQUENTIAL"),
+            ),
+            (
+                "POSIX_FADV_RANDOM",
+                majit_rlib::rposix::POSIX_FADV_RANDOM.expect("missing POSIX_FADV_RANDOM"),
+            ),
+            (
+                "POSIX_FADV_NOREUSE",
+                majit_rlib::rposix::POSIX_FADV_NOREUSE.expect("missing POSIX_FADV_NOREUSE"),
+            ),
+            (
+                "POSIX_FADV_DONTNEED",
+                majit_rlib::rposix::POSIX_FADV_DONTNEED.expect("missing POSIX_FADV_DONTNEED"),
+            ),
         ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
         // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists.
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2491,9 +2477,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Darwin-only names. `NGROUPS_MAX` (`<sys/syslimits.h>`) and `TMP_MAX`
         // (`<stdio.h>`) exist on linux too but with the glibc numbering, so
         // they are answered per platform rather than shared. The `PRIO_DARWIN_*`
-        // family is what `setpriority` takes there instead of a nice value, and
-        // the `_COPYFILE_*` bits are the `flags` word `shutil` hands
-        // `copyfile()` through `posix._fcopyfile`.
+        // family is what `setpriority` takes there instead of a nice value.
         #[cfg(target_vendor = "apple")]
         for (name, val) in [
             ("NGROUPS_MAX", 16i64),
@@ -2502,12 +2486,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ("PRIO_DARWIN_NONUI", libc::PRIO_DARWIN_NONUI as i64),
             ("PRIO_DARWIN_PROCESS", libc::PRIO_DARWIN_PROCESS as i64),
             ("PRIO_DARWIN_THREAD", libc::PRIO_DARWIN_THREAD as i64),
-            ("_COPYFILE_ACL", libc::COPYFILE_ACL as i64),
-            ("_COPYFILE_DATA", libc::COPYFILE_DATA as i64),
-            ("_COPYFILE_STAT", libc::COPYFILE_STAT as i64),
-            ("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i64),
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+        }
+    }
+    // `moduledef.py`: `O_CLOEXEC` when `rposix.O_CLOEXEC` is not None.
+    #[cfg(any(unix, windows))]
+    if let Some(val) = majit_rlib::rposix::O_CLOEXEC {
+        crate::__pyre_put_new!(ns_slot, "O_CLOEXEC", pyre_object::w_int_new(val as i64));
+    }
+    // `moduledef.py`: `'_' + _name` for each of `rposix.constants` that is not None.
+    #[cfg(any(unix, windows))]
+    for (name, val) in [
+        (
+            "_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS",
+            majit_rlib::rposix::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        ),
+        (
+            "_LOAD_LIBRARY_SEARCH_APPLICATION_DIR",
+            majit_rlib::rposix::LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+        ),
+        (
+            "_LOAD_LIBRARY_SEARCH_SYSTEM32",
+            majit_rlib::rposix::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        ),
+        (
+            "_LOAD_LIBRARY_SEARCH_USER_DIRS",
+            majit_rlib::rposix::LOAD_LIBRARY_SEARCH_USER_DIRS,
+        ),
+        (
+            "_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
+            majit_rlib::rposix::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        ),
+        ("_COPYFILE_DATA", majit_rlib::rposix::COPYFILE_DATA),
+        ("_O_CLOEXEC", majit_rlib::rposix::O_CLOEXEC),
+    ] {
+        if let Some(val) = val {
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
     }
     // Remaining noop stubs — functions os.py references at module level.
@@ -7936,14 +7951,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `interp_posix.py`, which — unlike `pipe` two blocks up —
         // forces no inheritance on the pair afterwards: the flags argument is
         // the whole of the caller's control over it.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "linux",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
+        // `rposix.py` `if HAVE_PIPE2:`.
+        #[cfg(rposix_have_pipe2)]
         crate::__pyre_put_new!(
             ns_slot,
             "pipe2",
@@ -8076,10 +8085,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // interp_posix.py `posix_fallocate`: `eintr_retry=True`.
         // `rposix.c_posix_fallocate` releases the GIL and saves errno.
-        #[cfg(all(
-            not(feature = "sandbox"),
-            any(target_os = "linux", target_os = "android")
-        ))]
+        #[cfg(all(not(feature = "sandbox"), rposix_have_fadvise))]
         crate::__pyre_put_new!(
             ns_slot,
             "posix_fallocate",
@@ -8130,10 +8136,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // interp_posix.py `posix_fadvise`: `eintr_retry=True`.
         // `rposix.posix_fadvise` uses the C return value as the errno.
-        #[cfg(all(
-            not(feature = "sandbox"),
-            any(target_os = "linux", target_os = "android")
-        ))]
+        #[cfg(all(not(feature = "sandbox"), rposix_have_fadvise))]
         crate::__pyre_put_new!(
             ns_slot,
             "posix_fadvise",
@@ -15744,14 +15747,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // would not neutralise anything on a host that never registered them —
         // `module_ns_store` writes rather than overwrites, so it would publish
         // a `posix.pipe2` where there is no `pipe2` to refuse.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "linux",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
+        #[cfg(rposix_have_pipe2)]
         crate::__pyre_put_new!(
             ns_slot,
             "pipe2",
@@ -15784,13 +15780,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "sched_getaffinity",
             "sched_setaffinity",
             "memfd_create",
-            "posix_fallocate",
-            "posix_fadvise",
             "getxattr",
             "setxattr",
             "removexattr",
             "listxattr",
         ] {
+            crate::__pyre_put_new!(
+                ns_slot,
+                name,
+                crate::make_builtin_function(name, sandbox_unavailable)
+            );
+        }
+        #[cfg(rposix_have_fadvise)]
+        for name in ["posix_fallocate", "posix_fadvise"] {
             crate::__pyre_put_new!(
                 ns_slot,
                 name,
