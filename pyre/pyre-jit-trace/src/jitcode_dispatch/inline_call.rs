@@ -13742,7 +13742,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         dst_bank,
         dst,
         init,
-        r_args[0],
+        // The class was promoted above; `MetaInterp.replace_box` (pyjitpl.py)
+        // swaps the box for the constant in every frame, so the callee sees a
+        // Const callable.
+        type_const,
         w_type,
         arg_concretes,
         callee_args,
