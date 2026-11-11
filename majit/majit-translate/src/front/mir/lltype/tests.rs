@@ -8027,17 +8027,14 @@ fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
     let generic_message = TyRef::Other(serde_json::json!({
         "TypeVar": {"Bound": [0, 0]}
     }));
-    let generics = serde_json::json!({
-        "trait_clauses": [{
-            "trait_": {"skip_binder": {
-                "id": 1,
-                "generics": {"types": [
-                    {"TypeVar": {"Bound": [1, 0]}},
-                    pointee
-                ]}
-            }}
-        }]
-    });
+    let generics = majit_charon_reader::FunGenerics {
+        has_types: false,
+        has_const_generics: false,
+        trait_clauses: vec![majit_charon_reader::TraitClauseBound {
+            trait_id: Some(1),
+            types: vec![serde_json::json!({"TypeVar": {"Bound": [1, 0]}}), pointee],
+        }],
+    };
     assert_eq!(
         super::tyref_generic_trait_bound_root(&generic_message, &llbc, Some(&generics),).as_deref(),
         Some("String"),

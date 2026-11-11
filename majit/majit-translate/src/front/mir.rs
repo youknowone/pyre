@@ -127,10 +127,10 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunId,
-        GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
-        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
-        const_fn_def_regular_id,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunGenerics,
+        FunId, GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
+        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, TypeDeclSrc,
+        Unstructured, const_fn_def_regular_id,
     },
 };
 

@@ -117,7 +117,9 @@ pub(in crate::front::mir) fn trait_default_call_segments(
     fd: &FunDecl,
     generics: &serde_json::Value,
 ) -> Option<Vec<String>> {
-    fd.src.as_ref()?.get("TraitDefault")?;
+    if !fd.is_trait_default() {
+        return None;
+    }
     let self_ty = generics.get("types")?.as_array()?.first()?;
     let td = llbc.type_by_id(resolve_tyexpr_to_adt_def_id_free(llbc, self_ty)?)?;
     let owner = strip_crate_prefix(&td.item_meta.name_path());
@@ -1779,7 +1781,7 @@ fn from_impl_conversions(
         ));
     };
     let mut found = Vec::new();
-    for row in llbc.trait_impls_raw() {
+    for (row_index, row) in llbc.trait_impls_raw().iter().enumerate() {
         let Some(impl_trait) = row.get("impl_trait") else {
             continue;
         };
@@ -1802,15 +1804,8 @@ fn from_impl_conversions(
         if !matches_impl(llbc, self_ty, arg_ty) {
             continue;
         }
-        let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for method in methods {
-            let Some(fn_id) = method
-                .get("skip_binder")
-                .and_then(|binder| binder.get("id"))
-                .and_then(serde_json::Value::as_u64)
-            else {
+        for method in llbc.trait_impl_methods(row_index) {
+            let Some(fn_id) = method.as_ref().and_then(|method| method.fn_id) else {
                 continue;
             };
             let Some(fd) = llbc.fn_by_id(fn_id) else {
@@ -3349,17 +3344,13 @@ pub(in crate::front::mir) fn operand_const_u8(llbc: &Llbc, op: &Operand) -> Opti
 /// `"Normal"`.  Identified from that origin, never from the `closure` /
 /// `closure#N` name leaf.
 pub(in crate::front::mir) fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
-    td.src
-        .as_ref()
-        .is_some_and(|src| src.get("Closure").is_some())
+    matches!(td.src, TypeDeclSrc::Closure)
 }
 
 /// A compiler-synthesised tuple, `str`, or `Box` declaration. Its `TypeDecl`
 /// exists so type refs can name it by id; it is not a user struct.
 pub(in crate::front::mir) fn type_decl_is_builtin_adt(td: &TypeDecl) -> bool {
-    td.src
-        .as_ref()
-        .is_some_and(|src| src.get("Builtin").is_some())
+    matches!(td.src, TypeDeclSrc::Builtin(_))
 }
 
 /// Whether `ty` resolves to a closure-env ADT, after peeling reference
@@ -6600,7 +6591,7 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
-    generics: Option<&serde_json::Value>,
+    generics: Option<&FunGenerics>,
 ) -> Option<String> {
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
@@ -9726,9 +9717,10 @@ pub(in crate::front::mir) fn type_node_box_pointee<'l>(
                 .and_then(|def_id| llbc.type_by_id(def_id))
                 .is_some_and(|td| {
                     td.item_meta.name_path() == "alloc::boxed::Box"
-                        || td.src.as_ref().is_some_and(|src| {
-                            src.get("Builtin").and_then(serde_json::Value::as_str) == Some("Box")
-                        })
+                        || matches!(
+                            &td.src,
+                            TypeDeclSrc::Builtin(Some(s)) if s == "Box"
+                        )
                 });
         if !is_box {
             return None;
@@ -10813,16 +10805,9 @@ pub(in crate::front::mir) fn typevar_bound_index(node: &serde_json::Value) -> Op
 /// rstr `STR` layout (`is_rstr_str_layout_declaration`).
 pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
     var_index: u64,
-    fn_generics: &serde_json::Value,
+    fn_generics: &FunGenerics,
     llbc: &Llbc,
 ) -> bool {
-    let Some(clauses) = fn_generics
-        .as_object()
-        .and_then(|g| g.get("trait_clauses"))
-        .and_then(|c| c.as_array())
-    else {
-        return false;
-    };
     fn strip<'a>(llbc: &'a Llbc, mut v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
         loop {
             let obj = v.as_object()?;
@@ -10839,32 +10824,16 @@ pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
             return Some(v);
         }
     }
-    for clause in clauses {
-        let Some(sb) = clause
-            .as_object()
-            .and_then(|c| c.get("trait_"))
-            .and_then(|t| t.as_object())
-            .and_then(|t| t.get("skip_binder"))
-            .and_then(|s| s.as_object())
-        else {
-            continue;
-        };
-        let is_into = sb
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
+    for clause in &fn_generics.trait_clauses {
+        let is_into = clause
+            .trait_id
             .and_then(|id| llbc.trait_by_id(id))
             .map(|td| td.item_meta.name_path())
             .is_some_and(|n| n.rsplit("::").next() == Some("Into"));
         if !is_into {
             continue;
         }
-        let Some(types) = sb
-            .get("generics")
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-        else {
-            continue;
-        };
+        let types = &clause.types;
         let subject_is_var = types
             .first()
             .and_then(|s| strip(llbc, s))
@@ -10907,7 +10876,7 @@ pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
 pub(in crate::front::mir) fn tyref_generic_trait_bound_root(
     ty: &TyRef,
     llbc: &Llbc,
-    generics: Option<&serde_json::Value>,
+    generics: Option<&FunGenerics>,
 ) -> Option<String> {
     let generics = generics?;
     let node = match ty {
@@ -10927,21 +10896,16 @@ pub(in crate::front::mir) fn tyref_generic_trait_bound_root(
     if typevar_bounded_by_into_string_value(param_index, generics, llbc) {
         return Some("String".to_string());
     }
-    for clause in generics.get("trait_clauses")?.as_array()? {
-        let Some(pred) = clause.get("trait_").and_then(|t| t.get("skip_binder")) else {
-            continue;
-        };
-        let subject_index = pred
-            .get("generics")
-            .and_then(|g| g.get("types"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|t| t.first())
+    for clause in &generics.trait_clauses {
+        let subject_index = clause
+            .types
+            .first()
             .and_then(|s| strip_ty_wrappers(s, llbc))
             .and_then(typevar_bound_index);
         if subject_index != Some(param_index) {
             continue;
         }
-        let Some(trait_id) = pred.get("id").and_then(serde_json::Value::as_u64) else {
+        let Some(trait_id) = clause.trait_id else {
             continue;
         };
         let Some(td) = llbc.trait_by_id(trait_id) else {
