@@ -708,7 +708,7 @@
     },
     "test.test_lazy_import": {
       "dynasm": "FAIL",
-      "reason": "test_add_lazy_to_exec_builtins_after_specialization needs CPython's specializing LOAD_GLOBAL builtins cache; test_cached_import_releases_builtins: a code object compiled by exec() keeps its namespace alive through PyCode.w_globals, so the exec __builtins__ mapping is not released"
+      "reason": "test_add_lazy_to_exec_builtins_after_specialization: a function defined in exec'd code does not see names added to the exec __builtins__ mapping; pypy3 raises the same NameError (pypyoption.py honor__builtins__ defaults to False, so pyframe.py get_builtin returns space.builtin)"
     },
     "test.test_linecache": {
       "dynasm": "PASS"

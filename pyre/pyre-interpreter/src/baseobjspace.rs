@@ -18499,7 +18499,10 @@ pub fn pick_builtin_obj_checked(
                 );
                 let w_builtin = pyre_object::gc_roots::shadow_stack_get(builtin_slot);
                 if !backing.is_null() {
-                    return Ok(pyre_object::w_module_new_aliasing_dict(
+                    // `moduledef.py Module.pick_builtin` wraps a dict as
+                    // `module.Module(space, None, w_builtin)`: an ordinary
+                    // collectible object, not an immortal holder.
+                    return Ok(pyre_object::w_module_new_aliasing_dict_managed(
                         pyre_object::PY_NULL,
                         w_builtin,
                     ));
@@ -18508,8 +18511,9 @@ pub fn pick_builtin_obj_checked(
                 // builtin mapping too.  A later LOAD_GLOBAL dispatches
                 // `obj[name]`, so a non-mapping value raises its native
                 // TypeError instead of silently becoming PyPy's default
-                // empty builtin Module.
-                return Ok(pyre_object::w_module_new_aliasing_dict(
+                // empty builtin Module.  The wrapper is still the
+                // `moduledef.py Module.pick_builtin` collectible Module.
+                return Ok(pyre_object::w_module_new_aliasing_dict_managed(
                     pyre_object::PY_NULL,
                     w_builtin,
                 ));
@@ -18539,17 +18543,19 @@ pub fn pick_builtin_obj(
         .unwrap_or_else(|_| build_default_pick_builtin_module())
 }
 
-/// Allocate the `moduledef.py:106-108` default Module — empty backing
-/// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
-/// `Module.__init__`; `PY_NULL` is that sentinel).
+/// Allocate the `moduledef.py Module.pick_builtin` default Module — empty
+/// backing storage with `None=w_None`, anonymous (PyPy passes `name=None`
+/// to `Module.__init__`; `PY_NULL` is that sentinel). The Module is an
+/// ordinary collectible object.
 fn build_default_pick_builtin_module() -> PyObjectRef {
-    // `pypy/module/__builtin__/moduledef.py:106-108` constructs the
-    // default Module backed by a `W_ModuleDictObject` whose strategy
-    // is `ModuleDictStrategy` (`celldict.py`).  Pyre's
+    // `moduledef.py Module.pick_builtin` constructs the default as
+    // `module.Module(space, None)` backed by a `W_ModuleDictObject`
+    // whose strategy is `ModuleDictStrategy` (`celldict.py`).  Pyre's
     // `w_module_dict_new()` ports that allocation directly; the
     // `Module(space, None, w_builtin)` aliasing-constructor path
     // hands the dict object straight through without the
-    // `DictStorage` carrier.
+    // `DictStorage` carrier. The resulting Module is an ordinary
+    // collectible object.
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_module_dict_new());
@@ -18560,7 +18566,7 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
             pyre_object::w_none(),
         );
     }
-    pyre_object::w_module_new_aliasing_dict(
+    pyre_object::w_module_new_aliasing_dict_managed(
         pyre_object::PY_NULL,
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
     )
