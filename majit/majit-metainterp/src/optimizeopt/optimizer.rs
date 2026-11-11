@@ -3179,30 +3179,14 @@ impl Optimizer {
         // is restored at the end of the block.
         let imported_loop_state_taken = self.imported_loop_state.take();
         if let Some(ref exported_state) = imported_loop_state_taken {
-            // Every `end_arg` OpRef from the exported state is typed via
-            // `OpRef::input_arg_typed` /
-            // `op_typed`, so its variant tag carries Box.type and the
-            // side-table refresh is dead.
-            // opencoder.py + unroll.py:479-504 parity: RPython's  allow-line-citation
-            // TraceIterator allocates fresh InputArg Box objects for
-            // each iteration, and `import_state` asserts
-            // `source is not target` (unroll.py) because the fresh
-            // Phase 2 inputargs never coincide with any Phase 1 emitted
-            // Box. majit encodes "fresh per iteration" via the
-            // `ctx.inputarg_base` offset — Phase 2's source slots live
-            // at `[inputarg_base..inputarg_base+n)`, disjoint from
-            // Phase 1 emitted OpRefs `[num_inputs..next_global_opref)`.
-            //
-            // With disjoint namespaces, the `source == target` edge
-            // case RPython avoids by construction cannot occur here
-            // either: any `target` coming from `next_iteration_args`
-            // is either a constant, a Phase 1 emitted OpRef, or a
-            // Phase 1 inputarg OpRef (in `[0..num_inputs)`) — all
-            // outside the Phase 2 `source` range. The cross-slot
-            // collision guard below is preserved for the Phase 1 /
-            // standalone path where `inputarg_base == 0` and `source`
-            // can coincide with another slot's `target`.
-            let inputarg_base = ctx.inputarg_base;
+            // TraceIterator allocates fresh InputArg boxes for each iteration,
+            // and `import_state` asserts `source is not target`
+            // (`unroll.py OptUnroll.import_state`) because those Phase 2
+            // inputargs never coincide with any Phase 1 emitted box.
+            // Sources here are the bound InputArg boxes in `ctx.inputargs`
+            // (`optimizer.py self.inputargs`). A collision alias is a fresh
+            // typed InputArg (`OptUnroll::inputarg_from_tp` /
+            // `OpHelpers.inputarg_from_tp`), never a producerless ResOp.
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
             // `next_iteration_args` must not be longer than the trace's
@@ -3233,53 +3217,28 @@ impl Optimizer {
                      cross-loop cut over a forced heap virtual)",
                 ));
             }
-            // resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float}: mint typed
-            // variants for each Phase 2 source slot from `inputarg_types`
-            // (history.py:220 box.type). Variant-aware Eq requires the
-            // OpRef minted here to match the typed `OpRef::input_arg_typed`
-            // emitted at trace start (pyre/pyre-jit-trace/src/trace.rs).
-            let typed_inputargs: Vec<OpRef> = (0..n)
-                .map(|i| {
-                    // opencoder.py:259 inputarg_from_tp parity — strict
-                    // box.type lookup, no InputArgVoid fallback.
-                    let pos = inputarg_base + i as u32;
-                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
-                })
+            let source_boxes: Vec<Operand> = (0..n)
+                .map(|i| ctx.inputarg_at(i).expect("phase-2 input must be bound"))
                 .collect();
-            let source_set: crate::FxIndexSet<OpRef> = typed_inputargs.iter().copied().collect();
-            let targetargs: Vec<OpRef> = (0..n)
-                .map(|i| {
-                    let source = typed_inputargs[i];
-                    let target = nia[i].to_opref();
-                    // Constants don't participate in forwarding.
-                    if ctx.get_box_replacement_operand_opt(target).and_then(|cb| cb.const_value()).is_some() {
-                        return source;
+            let source_set: crate::FxIndexSet<Operand> = source_boxes.iter().cloned().collect();
+
+            let targetargs: Vec<Operand> = source_boxes
+                .iter()
+                .enumerate()
+                .map(|(i, source)| {
+                    let target = nia[i].get_box_replacement(false);
+                    if target.is_constant() {
+                        return source.clone();
                     }
-                    // Cross-slot collision: target is another slot's source.
-                    // Allocate fresh to avoid forwarding overwrite.
-                    if target != source && source_set.contains(&target) {
-                        // The alias inherits `box.type` from `source`. RPython
-                        // Box always carries `box.type` (history.py:220), so
-                        // a missing type here is an unrecoverable invariant
-                        // violation — panic in release as well as debug.
-                        let tp = ctx.opref_type(source).unwrap_or_else(|| {
-                            panic!(
-                                "cross-slot collision: source {:?} has no resolvable box.type (RPython invariant violated)",
-                                source,
-                            )
-                        });
-                        // `fresh` is a producer-less resop: mint its bound
-                        // box up front. `source` is a Phase 2 inputarg whose
-                        // slot `ensure_inputarg_bindings` materialized above,
-                        // so it resolves without minting.
-                        let (fresh, b_fresh) = ctx.reserve_virtual_box(tp);
-                        let b_source = ctx
-                            .get_box_replacement_operand_opt(source)
-                            .expect("Phase 2 source inputarg must have a materialized operand slot");
-                        ctx.make_equal_to(&b_source, &b_fresh);
+                    if !target.same_box(source) && source_set.contains(&target) {
+                        let fresh = crate::optimizeopt::unroll::OptUnroll::inputarg_from_tp(
+                            &mut ctx,
+                            source.type_(),
+                        );
+                        ctx.make_equal_to(source, &fresh);
                         fresh
                     } else {
-                        source
+                        source.clone()
                     }
                 })
                 .collect();
@@ -3308,18 +3267,12 @@ impl Optimizer {
                 }
                 if !self.imported_virtuals.is_empty() {
                     for slot in 0..ctx.num_inputs as usize {
-                        let raw_pos = ctx.inputarg_base + slot as u32;
-                        // history.py:220 box.type invariant: every InputArg
-                        // carries a `.type`. opencoder.py:259
-                        // `inputarg_from_tp(arg.type)` always types its
-                        // result; missing type is a bookkeeping bug, even
-                        // on this debug-log path.
-                        let tp = ctx.inputarg_type_at_strict(slot);
-                        let raw = OpRef::input_arg_typed(raw_pos, tp);
-                        eprintln!(
-                            "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
-                            ctx.get_replacement_opref(raw)
-                        );
+                        if let Some(raw) = ctx.inputarg_at(slot) {
+                            eprintln!(
+                                "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
+                                raw.get_box_replacement(false)
+                            );
+                        }
                     }
                 }
             }

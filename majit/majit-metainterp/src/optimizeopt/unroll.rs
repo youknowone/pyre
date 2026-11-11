@@ -4590,7 +4590,7 @@ impl OptUnroll {
     /// dict.
     pub fn import_state(
         &self,
-        targetargs: &[OpRef],
+        targetargs: &[Operand],
         exported_state: &ExportedState,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -4601,47 +4601,21 @@ impl OptUnroll {
             targetargs.len(),
             "import_state: next_iteration_args mismatch"
         );
-        let mut source_boxes = Vec::with_capacity(targetargs.len());
         // for i, target in enumerate(exported_state.next_iteration_args):
         for (i, carried) in exported_state.next_iteration_args.iter().enumerate() {
-            // `carried` is the literal Phase-1 box (the same Rc used as the
-            // exported_infos key); `.to_opref()` is its resolved position, used
-            // only for the forwarding plumbing below.
-            let target = carried.to_opref();
             // source = targetargs[i]
-            let source = targetargs[i];
-            // source.set_forwarded(target)
-            // `source` is `targetargs[i]`, produced by the caller's
-            // cross-slot resolution as either a materialized inputarg or a
-            // `reserve_virtual_box`-minted alias — both resolve without
-            // minting here.
-            let b_source = ctx
-                .get_box_replacement_operand_opt(source)
-                .expect("import_state source must have a materialized operand slot");
-            source_boxes.push(b_source.clone());
-            // `target` is the literal Phase-1 Box carried by ExportedState.
-            // Forward to that exact Operand, not to a Phase-2 box recovered
-            // from its numeric position: unroll.py:497 writes
-            // `source.set_forwarded(target)`, preserving box identity across
-            // the phase boundary. Re-materializing by OpRef collapses the
-            // source/replay namespaces when their raw positions coincide.
-            // The carried Box arrives as a private `Rc` that
-            // `find_producer_op` cannot reach, so register it as the host for
-            // its position first: otherwise every chain forwarded here ends on
-            // a producerless position and guard resume numbering has no
-            // producer to bind.
+            let b_source = targetargs[i].clone();
             let b_target = carried.clone();
-            // unroll.py:496 checks Box identity. `Operand` equality is Rc
-            // pointer identity, while raw OpRef positions may legitimately
-            // coincide across this phase boundary.
+            // `assert source is not target` (`unroll.py OptUnroll.import_state`).
+            // `Operand` equality is Rc pointer identity, while raw OpRef
+            // positions may legitimately coincide across this phase boundary.
             debug_assert!(
                 b_source != b_target,
-                "import_state: source is target (unroll.py:496 `assert source is not target`)"
+                "import_state: source is target (`assert source is not target`)"
             );
-            ctx.register_carried_host(&b_target);
-            // unroll.py `import_state`: `source.set_forwarded(target)` overwrites
-            // leftover `_forwarded` on the Phase-2 source. `make_equal_to` would
-            // transfer that leftover PtrInfo onto the target
+            // `import_state`: `source.set_forwarded(target)` overwrites leftover
+            // `_forwarded` on the Phase-2 source. `make_equal_to` would transfer
+            // that leftover PtrInfo onto the target
             // (`optimizer.py Optimizer.make_equal_to`: `newop.set_forwarded(opinfo)`),
             // which import_state does not do. Discard source leftover first so
             // the subsequent `make_equal_to` is the `set_forwarded` write.
@@ -4655,7 +4629,7 @@ impl OptUnroll {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-optimizer",
-                    &format!("import_state_map[{i}]: source={source:?} target={target:?}"),
+                    &format!("import_state_map[{i}]: source={b_source:?} target={b_target:?}"),
                 );
             }
             // info = exported_state.exported_infos.get(target, None)
@@ -4665,38 +4639,31 @@ impl OptUnroll {
             if let Some(info) = exported_state.exported_infos.get(carried) {
                 //     self.optimizer.setinfo_from_preamble(source, info,
                 //                                     exported_state.exported_infos)
-                self.setinfo_from_preamble(source, info, &exported_state.exported_infos, ctx);
+                self.setinfo_from_preamble(&b_source, info, &exported_state.exported_infos, ctx);
             }
         }
         // label_args = exported_state.virtual_state.make_inputargs(
         //     targetargs, self.optimizer)
-        let label_args =
-            match exported_state
-                .virtual_state
-                .make_inputargs(&source_boxes, optimizer, ctx, false)
-            {
-                Ok(args) => args,
-                // unroll.py `raise InvalidLoop`: the imported virtual state is
-                // incompatible. Recorded as a deferred signal (checked by the
-                // caller) so the loop is abandoned without unwinding.
-                Err(_) => {
-                    ctx.signal_invalid_loop("Cannot import state, virtual states don't match");
-                    return Vec::new();
-                }
-            };
+        let label_args = match exported_state
+            .virtual_state
+            .make_inputargs(targetargs, optimizer, ctx, false)
+        {
+            Ok(args) => args,
+            // unroll.py `raise InvalidLoop`: the imported virtual state is
+            // incompatible. Recorded as a deferred signal (checked by the
+            // caller) so the loop is abandoned without unwinding.
+            Err(_) => {
+                ctx.signal_invalid_loop("Cannot import state, virtual states don't match");
+                return Vec::new();
+            }
+        };
         if crate::callee_rca_enabled() {
-            let next_iteration_args: Vec<_> = exported_state
-                .next_iteration_args
-                .iter()
-                .map(|arg| arg.to_opref())
-                .collect();
-            let label_arg_refs: Vec<_> = label_args.iter().map(Operand::to_opref).collect();
             eprintln!(
                 "[callee-rca][import-state] targetargs={:?} next_iteration_args={:?} \
                  label_args={:?} num_boxes={} entries={}",
                 targetargs,
-                next_iteration_args,
-                label_arg_refs,
+                exported_state.next_iteration_args,
+                label_args,
                 exported_state.virtual_state.num_boxes(),
                 exported_state.virtual_state.num_entries(),
             );
@@ -4717,7 +4684,7 @@ impl OptUnroll {
     /// resoperation.py `OpHelpers.inputarg_from_tp` — a fresh typed InputArg
     /// box. The `Operand` owns the `InputArgRc`; no parallel position-only
     /// registry is required.
-    fn inputarg_from_tp(ctx: &mut OptContext, tp: Type) -> Operand {
+    pub(crate) fn inputarg_from_tp(ctx: &mut OptContext, tp: Type) -> Operand {
         let pos = ctx.alloc_op_position_typed(tp).raw();
         let inputarg = majit_ir::InputArg::from_type_rc(tp, pos);
         Operand::from_bound_inputarg(&inputarg)
@@ -4725,7 +4692,6 @@ impl OptUnroll {
 
     pub fn import_short_preamble_state(
         &self,
-        targetargs: &[OpRef],
         label_args: &[Operand],
         exported_state: &ExportedState,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
@@ -4846,7 +4812,7 @@ impl OptUnroll {
     /// bypassed for part of the import path.
     fn setinfo_from_preamble(
         &self,
-        opref: OpRef,
+        op: &Operand,
         info: &crate::optimizeopt::info::OpInfo,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
@@ -4854,8 +4820,7 @@ impl OptUnroll {
         >,
         ctx: &mut OptContext,
     ) {
-        let op = ctx.materialize_operand_at(opref);
-        ctx.setinfo_from_preamble_item(&op, info, exported_infos);
+        ctx.setinfo_from_preamble_item(op, info, exported_infos);
     }
 }
 
@@ -4881,7 +4846,7 @@ pub(crate) fn export_state(
 /// unroll.py import_state — module-level entry point.
 #[cfg(test)]
 pub(crate) fn import_state(
-    targetargs: &[OpRef],
+    targetargs: &[Operand],
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
@@ -4891,19 +4856,12 @@ pub(crate) fn import_state(
 
 #[cfg(test)]
 pub(crate) fn import_short_preamble_state(
-    targetargs: &[OpRef],
     label_args: &[Operand],
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
-    OptUnroll::new().import_short_preamble_state(
-        targetargs,
-        label_args,
-        exported_state,
-        optimizer,
-        ctx,
-    )
+    OptUnroll::new().import_short_preamble_state(label_args, exported_state, optimizer, ctx)
 }
 
 /// RPython unroll.py `import_state(targetargs, exported_state)`
@@ -4923,7 +4881,7 @@ pub(crate) fn import_short_preamble_state(
 /// that need to inspect intermediate state can still invoke the
 /// individual functions above.
 pub(crate) fn import_state_full(
-    targetargs: &[OpRef],
+    targetargs: &[Operand],
     exported_state: &ExportedState,
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
@@ -4941,13 +4899,7 @@ pub(crate) fn import_state_full(
     if !optimizer.imported_virtuals.is_empty() {
         optimizer.install_imported_virtuals(ctx);
     }
-    OptUnroll::new().import_short_preamble_state(
-        targetargs,
-        &label_args,
-        exported_state,
-        optimizer,
-        ctx,
-    );
+    OptUnroll::new().import_short_preamble_state(&label_args, exported_state, optimizer, ctx);
     label_args
 }
 
@@ -7559,8 +7511,9 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int]);
+        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
         let label_args = import_state(
-            &[OpRef::input_arg_int(0)],
+            std::slice::from_ref(&source),
             &exported,
             &mut optimizer,
             &mut ctx2,
@@ -7578,9 +7531,7 @@ mod tests {
             // import_state forwards the Phase-2 source Box to the literal
             // carried Phase-1 Box. Follow that identity edge instead of
             // fabricating a new box from the carried box's numeric position.
-            let __mb = ctx2
-                .materialize_operand_at(OpRef::input_arg_int(0))
-                .get_box_replacement(false);
+            let __mb = source.get_box_replacement(false);
             ctx2.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
@@ -7665,15 +7616,14 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
         let _label_args = import_state(
-            &[OpRef::input_arg_ref(0)],
+            std::slice::from_ref(&source),
             &exported,
             &mut optimizer,
             &mut ctx2,
         );
-        let imported = ctx2
-            .materialize_operand_at(OpRef::input_arg_ref(0))
-            .get_box_replacement(false);
+        let imported = source.get_box_replacement(false);
         assert_eq!(
             ctx2.get_known_class(&imported),
             Some(CLASS),
@@ -7777,15 +7727,14 @@ mod tests {
             "VirtualState must export the virtual so install_imported_virtuals runs"
         );
         optimizer.imported_loop_state = Some(exported.clone());
+        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
         let _label_args = import_state_full(
-            &[OpRef::input_arg_ref(0)],
+            std::slice::from_ref(&source),
             &exported,
             &mut optimizer,
             &mut ctx2,
         );
-        let imported = ctx2
-            .materialize_operand_at(OpRef::input_arg_ref(0))
-            .get_box_replacement(false);
+        let imported = source.get_box_replacement(false);
         assert!(
             ctx2.is_virtual(&imported),
             "setinfo_from_preamble must re-install the virtual on the Phase-2 source"
@@ -8029,15 +7978,12 @@ mod tests {
         // exercised independent of base type.
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
-        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
+        let targetargs = [
+            ctx2.inputarg_at(0).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(1).expect("phase-2 input must be bound"),
+        ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(
-            &targetargs,
-            &label_args,
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        import_short_preamble_state(&label_args, &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args.len(), 2);
         assert!(label_args[0].same_box(&exported.end_args[0]));
         assert!(label_args[1].same_box(&exported.end_args[1]));
@@ -8047,7 +7993,7 @@ mod tests {
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
+        let obj_box = targetargs[0].get_box_replacement(false);
         let pop = ctx2
             .with_ptr_info_mut(&obj_box, |info| {
                 info.take_preamble_field(crate::optimizeopt::heap::OptHeap::field_slot_index(
@@ -8150,19 +8096,16 @@ mod tests {
 
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
-        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
+        let targetargs = [
+            ctx2.inputarg_at(0).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(1).expect("phase-2 input must be bound"),
+        ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(
-            &targetargs,
-            &label_args,
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        import_short_preamble_state(&label_args, &exported, &mut optimizer, &mut ctx2);
         // shortpreamble.py:72-76: the replayed entry lands in the receiver's
         // `_fields`, and for a const entry `PreambleOp(self.res, ...)` keeps
         // the Const as the body-visible Box.
-        let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
+        let obj_box = targetargs[0].get_box_replacement(false);
         let pop = ctx2
             .with_ptr_info_mut(&obj_box, |info| {
                 info.take_preamble_field(crate::optimizeopt::heap::OptHeap::field_slot_index(
@@ -8246,15 +8189,12 @@ mod tests {
         // Both label args resolve to Int op slots (12 / 11 = GetfieldGcI base / result).
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
-        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
+        let targetargs = [
+            ctx2.inputarg_at(0).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(1).expect("phase-2 input must be bound"),
+        ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(
-            &targetargs,
-            &label_args,
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        import_short_preamble_state(&label_args, &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args.len(), 2);
         assert!(label_args[0].same_box(&exported.end_args[0]));
         assert!(label_args[1].same_box(&exported.end_args[1]));
@@ -8280,6 +8220,81 @@ mod tests {
             None,
         );
         assert_eq!(ctx2.imported_short_pure_ops, vec![expected]);
+    }
+
+    #[test]
+    fn test_import_state_uses_source_inputarg_box_identity() {
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        ctx.materialize_operand_at(OpRef::int_op(21));
+        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
+
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int]);
+        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
+        let decoy = Operand::from_bound_inputarg(&majit_ir::InputArg::from_type_rc(
+            source.type_(),
+            source.to_opref().raw(),
+        ));
+        assert_eq!(source.to_opref(), decoy.to_opref());
+        assert!(!source.same_box(&decoy));
+
+        let label_args = import_state(
+            std::slice::from_ref(&source),
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
+        assert_eq!(label_args.len(), 1);
+        assert!(label_args[0].same_box(&exported.end_args[0]));
+        assert!(source.is_inputarg());
+        assert!(
+            source.same_box(
+                &ctx2
+                    .inputarg_at(0)
+                    .expect("phase-2 input remains the original InputArg")
+            )
+        );
+        assert!(
+            source
+                .get_box_replacement(false)
+                .same_box(&exported.next_iteration_args[0])
+        );
+        assert!(decoy.get_box_replacement(false).same_box(&decoy));
+    }
+
+    #[test]
+    fn test_import_state_collision_alias_is_fresh_typed_inputarg() {
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        ctx.materialize_operand_at(OpRef::int_op(21));
+        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let carried = exported.next_iteration_args[0].clone();
+
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
+        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
+        let collided = ctx2
+            .inputarg_at(1)
+            .expect("phase-2 collision slot must be bound");
+        let source_set: crate::FxIndexSet<Operand> =
+            [source.clone(), collided.clone()].into_iter().collect();
+        let target = collided.get_box_replacement(false);
+        assert!(!target.same_box(&source) && source_set.contains(&target));
+
+        let fresh = OptUnroll::inputarg_from_tp(&mut ctx2, source.type_());
+        ctx2.make_equal_to(&source, &fresh);
+        assert!(fresh.is_inputarg());
+        assert_eq!(fresh.type_(), source.type_());
+        assert!(!fresh.same_box(&source));
+        assert!(!fresh.same_box(&collided));
+
+        let _label_args = import_state(
+            std::slice::from_ref(&fresh),
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
+        assert!(fresh.get_box_replacement(false).same_box(&carried));
     }
 
     #[test]
@@ -8337,15 +8352,12 @@ mod tests {
         // Int func-address constant base, so both label args are Int.
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
-        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
+        let targetargs = [
+            ctx2.inputarg_at(0).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(1).expect("phase-2 input must be bound"),
+        ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(
-            &targetargs,
-            &label_args,
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        import_short_preamble_state(&label_args, &exported, &mut optimizer, &mut ctx2);
 
         assert_eq!(
             ctx2.imported_loop_invariant_results
@@ -8414,7 +8426,6 @@ mod tests {
         ctx.seed_constant(&func_box, Value::Int(func_ptr));
 
         import_short_preamble_state(
-            &[OpRef::int_op(0)],
             std::slice::from_ref(&phase2_result),
             &exported,
             &mut optimizer,
@@ -8690,18 +8701,12 @@ mod tests {
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Int; 1024]);
         let targetargs = [
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-            OpRef::input_arg_int(2),
+            ctx2.inputarg_at(0).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(1).expect("phase-2 input must be bound"),
+            ctx2.inputarg_at(2).expect("phase-2 input must be bound"),
         ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(
-            &targetargs,
-            &label_args,
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        import_short_preamble_state(&label_args, &exported, &mut optimizer, &mut ctx2);
         assert!(exported.short_boxes[0].0.same_box(&Operand::from_bound_op(
             &exported.short_boxes[0].1.preamble_op
         )));
