@@ -1657,8 +1657,9 @@ impl UnrollOptimizer {
                 es.runtime_boxes.clone(),
             )
         };
-        // RPython unroll.py:124-141 performs an extra end-of-preamble forcing
-        // pass on the closing JUMP args before finalize_short_preamble():
+        // unroll.py UnrollOptimizer.optimize_peeled_loop performs an extra
+        // end-of-preamble forcing pass on the closing JUMP args before
+        // finalize_short_preamble():
         //   for a in end_jump.getarglist():
         //       self.force_box_for_end_of_preamble(get_box_replacement(a))
         //   current_vs = self.optunroll.get_virtual_state(end_jump.getarglist())
@@ -1670,20 +1671,10 @@ impl UnrollOptimizer {
         // The optimizer-level imported_short_preamble snapshot is taken before
         // this step, so rebuild from the live Phase 2 context here instead of
         // trusting the stale copy.
-        let body_jump_args: Vec<OpRef> = body_terminal_op
-            .as_ref()
-            .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
-            .or_else(|| {
-                p2_ops
-                    .iter()
-                    .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
-            })
-            .unwrap_or_default();
         // JUMP `args_slice()` is the box-native jump-arg list and the
         // runtime-box fallback when the exported recorded list is empty or
-        // length-mismatched. `body_jump_args` stays the positional view for
-        // the end-of-preamble force pass.
+        // length-mismatched. The end-of-preamble force pass walks these
+        // boxes (`end_jump.getarglist()`), one per JUMP arg.
         let body_jump_boxes: Vec<Operand> = body_terminal_op
             .as_ref()
             .map(|jump| jump.args_slice().to_vec())
@@ -1696,19 +1687,19 @@ impl UnrollOptimizer {
             .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
             if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
-                if !body_jump_args.is_empty() {
-                    // unroll.py:126-127 parity:
+                if !body_jump_boxes.is_empty() {
+                    // unroll.py UnrollOptimizer.optimize_peeled_loop:
                     //   for a in end_jump.getarglist():
                     //       self.force_box_for_end_of_preamble(get_box_replacement(a))
                     //
                     // Route through `force_box_for_end_of_preamble` (the
                     // per-box type-gating wrapper) rather than the inner
-                    // dispatcher, matching optimizer.py:306-319.
-                    let resolved_jump_args: Vec<majit_ir::operand::Operand> = body_jump_args
+                    // dispatcher, matching Optimizer.force_box_for_end_of_preamble.
+                    let resolved_jump_args: Vec<Operand> = body_jump_boxes
                         .iter()
-                        .filter_map(|&arg| final_ctx.get_box_replacement_operand_opt(arg))
+                        .map(|arg| arg.get_box_replacement(false))
                         .collect();
-                    let forced_boxes: Vec<majit_ir::operand::Operand> = resolved_jump_args
+                    let forced_boxes: Vec<Operand> = resolved_jump_args
                         .iter()
                         .map(|arg| opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx))
                         .collect();
@@ -2090,24 +2081,14 @@ impl UnrollOptimizer {
                 "jump_to_preamble expects the start/preamble target token"
             );
             if crate::majit_log_enabled() {
-                let body_jump_arity = body_terminal_op
-                    .as_ref()
-                    .map(|j| j.num_args())
-                    .or_else(|| {
-                        body_ops
-                            .iter()
-                            .rev()
-                            .find(|op| op.opcode == OpCode::Jump)
-                            .map(|op| op.num_args())
-                    })
-                    .unwrap_or(0);
                 let exported_renamed_inputarg_refs: Vec<_> = exported_renamed_inputargs
                     .iter()
                     .map(Operand::to_opref)
                     .collect();
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} start_label_args={:?}",
-                    body_jump_arity, exported_renamed_inputarg_refs,
+                    body_jump_boxes.len(),
+                    exported_renamed_inputarg_refs,
                 );
             }
             if let Some(end_jump) = body_terminal_op {
