@@ -7528,6 +7528,7 @@ pub fn getattr_str_impl(
             if let Some(loaded) = crate::lazyimport::try_load_lazy_submodule(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 name,
+                suppress,
             )? {
                 return Ok(loaded);
             }

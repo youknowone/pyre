@@ -16,6 +16,9 @@ pub struct W_LazyImportObject {
     pub w_code: PyObjectRef,
     /// Declaration instruction index (`lz_instr_offset`). `-1` when no frame.
     pub instr_offset: i64,
+    /// `lz_active` (`lazyimportobject.c _PyLazyImport_IsActive`): the root
+    /// was accessed, so its declared path requires import semantics.
+    pub active: i64,
 }
 
 pub fn w_lazy_import_new(
@@ -37,6 +40,7 @@ pub fn w_lazy_import_new(
         w_attr: crate::gc_roots::shadow_stack_get(save_point + 2),
         w_code: crate::gc_roots::shadow_stack_get(save_point + 3),
         instr_offset,
+        active: 0,
     })
 }
 
