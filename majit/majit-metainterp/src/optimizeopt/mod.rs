@@ -4566,7 +4566,7 @@ impl OptContext {
         let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = resolved.const_value().is_some();
-        // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
+        // unroll.py OptUnroll.force_op_from_preamble: use_box(op, preamble_op.preamble_op, self).
         // RPython passes the preamble_op directly — no lookup miss possible.
         // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
         // with fallback to info::PreambleOp.preamble_op.
@@ -4588,7 +4588,7 @@ impl OptContext {
             self.active_short_preamble_producer = Some(builder);
         } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
             builder.use_box(
-                preamble_source,
+                &resolved,
                 &preamble_op.preamble_op,
                 &arg_guards,
                 &result_guards,
@@ -9315,20 +9315,19 @@ impl OptContext {
     }
 
     /// Set PtrInfo without clearing forwarding.
-    /// RPython parity: set PtrInfo at the terminal of opref's forwarding chain.
-    /// In RPython, `box.set_forwarded(info)` sets info on the Box directly.
-    /// `get_box_replacement(box)` then returns the terminal Box which has the info.
-    /// In majit, we follow the Op chain to the terminal OpRef and set Info there.
-    fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
+    /// `box.set_forwarded(info)` on the terminal of the box's forwarding
+    /// chain (`AbstractValue.get_box_replacement`).
+    fn ensure_ptr_info_preserve_forwarding(&mut self, box_: &Operand, info: PtrInfo) {
         use crate::optimizeopt::info::OpInfo;
-        let terminal = self.get_replacement_opref(opref);
+        let terminal = box_.get_box_replacement(false);
         if terminal.is_constant() {
             return;
         }
-        let b = self.materialize_operand_at(terminal);
-        let already_set = !matches!(b.get_forwarded(), majit_ir::forwarding::Forwarded::None);
-        if !already_set {
-            b.set_forwarded_info(OpInfo::ptr(info));
+        if matches!(
+            terminal.get_forwarded(),
+            majit_ir::forwarding::Forwarded::None
+        ) {
+            terminal.set_forwarded_info(OpInfo::ptr(info));
         }
     }
 

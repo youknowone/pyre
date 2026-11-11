@@ -1708,15 +1708,16 @@ impl UnrollOptimizer {
         });
         // Per-slot ORIGINAL box (what each renamed `short_inputargs[i]`
         // replaces), recovered from the produced `InputArg` short boxes via
-        // `label_arg_idx` (shortpreamble.py:417 keys the info lookup by
-        // `produced_op.short_op.res`, the original). Every label/virtual slot produces an InputArg
+        // `label_arg_idx` (shortpreamble.py ShortPreamble.__init__ keys the
+        // info lookup by `produced_op.short_op.res`, the original). Every
+        // label/virtual slot produces an InputArg
         // entry, except a duplicate slot (one box appears twice in
         // `label_args + virtuals`: the `potential_ops[box]` overwrite keys the
-        // single entry at its LAST slot — shortpreamble.py:259, mirrored by
-        // `live_slot` in add_short_input_arg — so the earlier dead slot stays
+        // single entry at its LAST slot — shortpreamble.py add_short_input_arg
+        // / `live_slot` — so the earlier dead slot stays
         // None) and a const-folded slot (dropped at export, never surviving
         // into Phase 2).
-        let mut slot_to_original: Vec<Option<OpRef>> = vec![None; initial_sp.inputargs.len()];
+        let mut slot_to_original: Vec<Option<Operand>> = vec![None; initial_sp.inputargs.len()];
         for (_, produced) in &exported_short_boxes_produced {
             if !matches!(
                 produced.kind,
@@ -1727,28 +1728,26 @@ impl UnrollOptimizer {
             if let Some(slot) = produced.label_arg_idx
                 && slot < slot_to_original.len()
             {
-                slot_to_original[slot] = Some(produced.res.to_opref());
+                slot_to_original[slot] = Some(produced.res.clone());
             }
         }
-        // shortpreamble.py:416-425 parity: attach PtrInfo to each short
-        // inputarg. RPython keys the info by the ORIGINAL res box
+        // shortpreamble.py ShortPreamble.__init__ parity: attach PtrInfo to
+        // each short inputarg. Keys the info by the ORIGINAL res box
         // (`op = produced_op.short_op.res; info = exported_infos.get(op)`)
         // and forwards it onto the renamed `preamble_op`. The renamed short
         // inputarg carries no PtrInfo of its own, so the lookup MUST use the
         // original box, not the renamed one — otherwise a distinct renamed
         // identity yields None and the loop-carried info (e.g. KnownClass)
         // is dropped. A dead duplicate slot's box carries no info
-        // (shortpreamble.py __init__), so its None is correct.
+        // (shortpreamble.py ShortPreamble.__init__), so its None is correct.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for (i, inputarg) in initial_sp.inputargs.iter().enumerate() {
                 // Phase-2 info of the original box this short inputarg renames.
-                let original = slot_to_original[i];
+                let original = slot_to_original[i].as_ref();
                 let info = original
-                    .and_then(|o| final_ctx.get_box_replacement_operand_opt(o))
-                    .or_else(|| Some(inputarg.get_box_replacement(false)))
-                    .as_ref()
-                    .and_then(|o| final_ctx.peek_ptr_info(o));
+                    .and_then(|o| final_ctx.peek_ptr_info(o))
+                    .or_else(|| final_ctx.peek_ptr_info(&inputarg.get_box_replacement(false)));
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
@@ -3255,7 +3254,7 @@ impl OptUnroll {
         let mut infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo> =
             indexmap::IndexMap::new();
         for arg in &end_args {
-            self.expand_info(arg.to_opref(), arg, ctx, exported_int_bounds, &mut infos);
+            self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
         // unroll.py OptUnroll.export_state:
         //   label_args, virtuals =
@@ -3290,7 +3289,7 @@ impl OptUnroll {
         }
         // unroll.py OptUnroll.export_state: for arg in label_args: _expand_info(arg, infos)
         for arg in &label_args {
-            self.expand_info(arg.to_opref(), arg, ctx, exported_int_bounds, &mut infos);
+            self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
         let mut short_args = label_args.clone();
         short_args.extend(virtuals.iter().cloned());
@@ -3372,7 +3371,7 @@ impl OptUnroll {
             crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
                 &exported_short_boxes,
             );
-        // unroll.py:481-484:
+        // unroll.py OptUnroll.export_state:
         //     for produced_op in short_boxes:
         //         op = produced_op.short_op.res
         //         if not isinstance(op, Const):
@@ -3385,13 +3384,12 @@ impl OptUnroll {
         // `initialize_imported_short_preamble_builder_from_short_boxes` lookup
         // re-derives the identical Rc and the box-identity lookup hits.
         for (_, produced_op) in &short_boxes_for_info {
-            let op = produced_op.res.to_opref();
-            if !op.is_constant() {
+            if !produced_op.res.is_constant() {
                 // `expand_info` keys the operand-keyed `exported_infos`
                 // (#158) on the producer-bound `res`, which is
                 // `Rc::ptr_eq`-stable on the producer, so the import lookup
                 // still hits.
-                self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
+                self.expand_info(&produced_op.res, ctx, exported_int_bounds, &mut infos);
             }
         }
 
@@ -3454,10 +3452,9 @@ impl OptUnroll {
         state
     }
 
-    /// unroll.py: _expand_info
+    /// unroll.py OptUnroll._expand_info
     fn expand_info(
         &self,
-        arg: OpRef,
         arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
@@ -3481,9 +3478,8 @@ impl OptUnroll {
         // `getinfo` runs first (it lazily installs an unbounded IntBound),
         // then the dict membership check. Keyed by `arg_box`, the same
         // Phase-1 box `next_iteration_args` carries so the import lookup
-        // is a ptr_eq hit. `arg` is the OpRef view of `arg_box`; SAME_AS
-        // is decided on the box (`as_operation` / `bound_op`).
-        let _ = arg;
+        // is a ptr_eq hit. SAME_AS is decided on the box
+        // (`as_operation` / `bound_op`).
         let info = self.getinfo_for_expand(arg_box, ctx, exported_int_bounds);
         if infos.contains_key(arg_box) {
             return;
@@ -3572,13 +3568,7 @@ impl OptUnroll {
             if field_box.is_none() {
                 continue;
             }
-            self.expand_info(
-                field_box.to_opref(),
-                &field_box,
-                ctx,
-                exported_int_bounds,
-                infos,
-            );
+            self.expand_info(&field_box, ctx, exported_int_bounds, infos);
         }
     }
 
@@ -3922,7 +3912,7 @@ impl OptUnroll {
                         if let Some(label_arg) = label.get(i) {
                             let label_box = label_arg.get_box_replacement(false);
                             if let Some(info) = ctx.peek_ptr_info(&label_box) {
-                                ctx.ensure_ptr_info_preserve_forwarding(jump_box.to_opref(), info);
+                                ctx.ensure_ptr_info_preserve_forwarding(jump_box, info);
                             }
                         }
                     }
@@ -4164,7 +4154,7 @@ impl OptUnroll {
                         .or_else(|| ctx.peek_ptr_info(&short_box))
                         .or_else(|| short_preamble.inputarg_infos.get(i).cloned().flatten());
                     if let Some(info) = info {
-                        ctx.ensure_ptr_info_preserve_forwarding(jump_arg.to_opref(), info);
+                        ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                     }
                 }
             }
@@ -5778,8 +5768,9 @@ impl OptUnrollState {
     ///
     /// The caller is responsible for emitting the final Jump.
     /// Emit the peeled iteration, the loop Label, and the body iteration
-    /// in that order, returning the `original_pos -> body_pos` map the
-    /// caller uses to rewrite the back-edge Jump's args.
+    /// in that order, returning the `original_pos -> body_pos` map and the
+    /// reserved body boxes the caller uses to rewrite the back-edge Jump's
+    /// args.
     ///
     /// Positions are allocated through `reserve_pos` (which honors the
     /// `inputarg_base + num_inputs` floor) instead of being computed
@@ -5794,51 +5785,55 @@ impl OptUnrollState {
         &self,
         jump_op: &Op,
         ctx: &mut OptContext,
-    ) -> crate::FxIndexMap<OpRef, OpRef> {
+    ) -> (
+        crate::FxIndexMap<OpRef, OpRef>,
+        crate::FxIndexMap<OpRef, Operand>,
+    ) {
         // First pass: reserve peeled-iteration positions, tagged with each
-        // source op's result type ( `OpRef.ty()`
-        // matches RPython's `box.type` at allocation time).
-        // Args of later peeled ops read these positions (`remapped_producer_operand`);
-        // mint at allocation so a forward-reference consumer binds the SameAs
-        // stand-in `emit` later adopts (`resoperation.py ResOperation(...)`).
-        let peeled_positions: Vec<OpRef> = self
+        // source op's result type (`OpRef.ty()` matches `box.type` at
+        // allocation). Keep the `reserve_virtual_box` Operand
+        // (`resoperation.py ResOperation(...)`) so later args bind that
+        // box, not a rematerialize of the new pos.
+        let peeled: Vec<(OpRef, Operand)> = self
             .buffer
             .iter()
-            .map(|op| ctx.reserve_virtual_box(op.result_type()).0)
+            .map(|op| ctx.reserve_virtual_box(op.result_type()))
             .collect();
         let mut ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
-        for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
-            ref_map.insert(op.pos().get(), new_pos);
+        let mut box_map: crate::FxIndexMap<OpRef, Operand> = crate::FxIndexMap::default();
+        for (op, (new_pos, new_box)) in self.buffer.iter().zip(peeled.iter()) {
+            ref_map.insert(op.pos().get(), *new_pos);
+            box_map.insert(*new_pos, new_box.clone());
         }
 
         // Emit peeled iteration with remapped refs.
-        for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
-            let mut peeled = op.clone();
-            peeled.pos().set(new_pos);
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..peeled.num_args() {
-                let arg = peeled.arg(i);
+        for (op, (new_pos, _)) in self.buffer.iter().zip(peeled.iter()) {
+            let mut peeled_op = op.clone();
+            peeled_op.pos().set(*new_pos);
+            // optimizer.py Optimizer._emit_operation setarg loop parity.
+            for i in 0..peeled_op.num_args() {
+                let arg = peeled_op.arg(i);
                 if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                    peeled.setarg(i, remapped_producer_operand(ctx, new_ref));
+                    peeled_op.setarg(i, remapped_producer_operand(&box_map, new_ref));
                 }
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
             }
-            if let Some(fa) = peeled.fail_args_mut() {
+            if let Some(fa) = peeled_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                        *arg = remapped_producer_operand(ctx, new_ref);
+                        *arg = remapped_producer_operand(&box_map, new_ref);
                     }
                 }
             }
-            if peeled.opcode.is_guard() {
-                clone_guard_snapshot_remapped(ctx, &mut peeled, &ref_map);
-                // opencoder.py:391-401 parity: trace iteration strips guard
-                // descrs, keeping only rd_resume_position. optimizer.py then
-                // invents a fresh opcode-appropriate descr at emission time.
-                peeled.cleardescr();
+            if peeled_op.opcode.is_guard() {
+                clone_guard_snapshot_remapped(ctx, &mut peeled_op, &ref_map, &box_map);
+                // opencoder.py TraceIterator strips guard descrs, keeping
+                // only rd_resume_position. optimizer.py then invents a
+                // fresh opcode-appropriate descr at emission time.
+                peeled_op.cleardescr();
             }
-            ctx.emit(peeled);
+            ctx.emit(peeled_op);
         }
 
         // Emit Label between peeled and original body.
@@ -5850,45 +5845,48 @@ impl OptUnrollState {
         label_op.pos().set(label_pos);
         ctx.emit(label_op);
 
-        // Reserve body positions, tagged per source op ( ).
-        let body_positions: Vec<OpRef> = self
+        // Reserve body positions, tagged per source op.
+        let body: Vec<(OpRef, Operand)> = self
             .buffer
             .iter()
-            .map(|op| ctx.reserve_virtual_box(op.result_type()).0)
+            .map(|op| ctx.reserve_virtual_box(op.result_type()))
             .collect();
         let mut orig_ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
-        for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
-            orig_ref_map.insert(op.pos().get(), new_pos);
+        let mut orig_box_map: crate::FxIndexMap<OpRef, Operand> = crate::FxIndexMap::default();
+        for (op, (new_pos, new_box)) in self.buffer.iter().zip(body.iter()) {
+            orig_ref_map.insert(op.pos().get(), *new_pos);
+            orig_box_map.insert(*new_pos, new_box.clone());
         }
 
         // Emit original body ops with remapped positions and refs.
-        for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
+        for (op, (new_pos, _)) in self.buffer.iter().zip(body.iter()) {
             let mut body_op = op.clone();
-            body_op.pos().set(new_pos);
-            // optimizer.py:651-652 setarg loop parity.
+            body_op.pos().set(*new_pos);
+            // optimizer.py Optimizer._emit_operation setarg loop parity.
             for i in 0..body_op.num_args() {
                 let arg = body_op.arg(i);
                 if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                    body_op.setarg(i, remapped_producer_operand(ctx, new_ref));
+                    body_op.setarg(i, remapped_producer_operand(&orig_box_map, new_ref));
                 }
             }
             if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                        *arg = remapped_producer_operand(ctx, new_ref);
+                        *arg = remapped_producer_operand(&orig_box_map, new_ref);
                     }
                 }
             }
             if body_op.opcode.is_guard() {
-                clone_guard_snapshot_remapped(ctx, &mut body_op, &orig_ref_map);
+                clone_guard_snapshot_remapped(ctx, &mut body_op, &orig_ref_map, &orig_box_map);
                 // Same opencoder.py guard-descr stripping as the peeled copy.
                 // ResumeAtPositionDescr is inline_short_preamble-only
-                // (unroll.py:406-409), not normal peeled body guard state.
+                // (unroll.py inline_short_preamble), not normal peeled body
+                // guard state.
                 body_op.cleardescr();
             }
             ctx.emit(body_op);
         }
-        orig_ref_map
+        (orig_ref_map, orig_box_map)
     }
 }
 
@@ -5905,20 +5903,14 @@ fn remap_snapshot_box_into_iter_namespace(
     *r = r.map_opref(translate);
 }
 
-/// Resolve a remapped peel position to its canonical producer operand.
-/// Peel / body positions are minted at allocation (`reserve_virtual_box`);
-/// `emit` adopts that stand-in. The None arm is a bind-at-alloc gap.
-fn remapped_producer_operand(ctx: &mut OptContext, new_ref: OpRef) -> Operand {
-    match ctx.get_box_replacement_operand_opt(new_ref) {
-        Some(o) => o,
-        None => {
-            debug_assert!(
-                cfg!(test),
-                "remapped_producer_operand: {new_ref:?} was reserved without minting"
-            );
-            ctx.mint_box_at(new_ref)
-        }
-    }
+/// Resolve a remapped peel position to the box reserved at allocation.
+/// Peel / body positions are minted at `reserve_virtual_box`
+/// (`resoperation.py ResOperation(...)`); a miss means the reservation
+/// was discarded.
+fn remapped_producer_operand(boxes: &crate::FxIndexMap<OpRef, Operand>, new_ref: OpRef) -> Operand {
+    boxes.get(&new_ref).cloned().unwrap_or_else(|| {
+        panic!("remapped_producer_operand: {new_ref:?} was reserved without keeping the box")
+    })
 }
 
 fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
@@ -5956,6 +5948,7 @@ fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
     ref_map: &crate::FxIndexMap<OpRef, OpRef>,
+    box_map: &crate::FxIndexMap<OpRef, Operand>,
 ) {
     let old_pos = guard.rd_resume_position();
     if old_pos < 0 {
@@ -5967,27 +5960,27 @@ fn clone_guard_snapshot_remapped(
     let vable_boxes = snapshot_get(&ctx.snapshot_vable_boxes, old_pos).cloned();
     let vref_boxes = snapshot_get(&ctx.snapshot_vref_boxes, old_pos).cloned();
 
-    // RPython TraceIterator decodes snapshot box references against the
-    // current iteration's box cache.  Majit keeps snapshots in side tables,
-    // so cloned guards need a cloned snapshot table entry with the same
-    // raw-box -> cloned-box mapping used for op args. Rebind `cached` to
-    // the remapped producer (`remapped_producer_operand`) so numbering
+    // TraceIterator decodes snapshot box references against the current
+    // iteration's box cache. Cloned guards need a cloned snapshot table
+    // entry with the same raw-box -> cloned-box mapping used for op args.
+    // Rebind `cached` to the reserved remapped producer so numbering
     // walks that box, not the source-namespace cache `map_opref` keeps.
+    // Unmapped slots (input args outside the peel buffer) miss `box_map`
+    // and clear `cached`; numbering falls back to
+    // `get_box_replacement_operand`.
     let new_pos = fresh_snapshot_key(ctx);
     let remapped_boxes = remap_snapshot_boxes(&snapshot_boxes, ref_map, |opref| {
-        Some(remapped_producer_operand(ctx, opref))
+        box_map.get(&opref).cloned()
     });
     snapshot_insert(&mut ctx.snapshot_boxes, new_pos, remapped_boxes);
     if let Some(vable_boxes) = vable_boxes {
-        let remapped = remap_snapshot_boxes(&vable_boxes, ref_map, |opref| {
-            Some(remapped_producer_operand(ctx, opref))
-        });
+        let remapped =
+            remap_snapshot_boxes(&vable_boxes, ref_map, |opref| box_map.get(&opref).cloned());
         snapshot_insert(&mut ctx.snapshot_vable_boxes, new_pos, remapped);
     }
     if let Some(vref_boxes) = vref_boxes {
-        let remapped = remap_snapshot_boxes(&vref_boxes, ref_map, |opref| {
-            Some(remapped_producer_operand(ctx, opref))
-        });
+        let remapped =
+            remap_snapshot_boxes(&vref_boxes, ref_map, |opref| box_map.get(&opref).cloned());
         snapshot_insert(&mut ctx.snapshot_vref_boxes, new_pos, remapped);
     }
     ctx.snapshot_frame_pcs.copy_run(old_pos, new_pos);
@@ -6019,19 +6012,20 @@ impl OptUnrollState {
             }
 
             // Perform the peeling: emit peeled body + Label + original body.
-            // The returned map forwards original `buffer` positions to
-            // their freshly-allocated body positions so we can rewrite
-            // the back-edge Jump's args without re-deriving the layout.
-            let orig_ref_map = self.peel_iteration(op, ctx);
+            // The returned maps forward original `buffer` positions to
+            // their freshly-allocated body positions and reserved boxes
+            // so we can rewrite the back-edge Jump's args without
+            // re-deriving the layout.
+            let (orig_ref_map, orig_box_map) = self.peel_iteration(op, ctx);
 
             // Emit the final Jump with remapped args pointing to the
             // body iteration's ops.
             let mut jump = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
+            // optimizer.py Optimizer._emit_operation setarg loop parity.
             for i in 0..jump.num_args() {
                 let arg = jump.arg(i);
                 if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                    jump.setarg(i, remapped_producer_operand(ctx, new_ref));
+                    jump.setarg(i, remapped_producer_operand(&orig_box_map, new_ref));
                 }
             }
             // Reserve the Jump's own position so it lands above any
@@ -6952,6 +6946,57 @@ mod tests {
     }
 
     #[test]
+    fn test_peel_remapped_arg_is_the_reserved_box() {
+        // Drive real `propagate_forward` / `peel_iteration` on a one-op
+        // buffer. The JUMP arg is the `reserve_virtual_box` Operand
+        // (`resoperation.py ResOperation(...)`), whose replacement is the
+        // emitted body producer after `emit` adopts the stand-in.
+        let add = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, 101),
+                ],
+            );
+            op.pos().set(OpRef::int_op(0));
+            op
+        };
+        let jump = {
+            let mut op = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]);
+            op.pos().set(OpRef::void_op(1));
+            op
+        };
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
+        let mut state = OptUnrollState::new();
+        let add_rc = OpRc::new(add.clone());
+        assert!(matches!(
+            state.propagate_forward(&add, &add_rc, &mut None, &mut ctx),
+            OptimizationResult::Remove
+        ));
+        let jump_rc = OpRc::new(jump.clone());
+        let OptimizationResult::Emit(emitted_jump) =
+            state.propagate_forward(&jump, &jump_rc, &mut None, &mut ctx)
+        else {
+            panic!("expected Emit of remapped JUMP");
+        };
+        assert_eq!(ctx.new_operations.len(), 3);
+        assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAdd);
+        assert_eq!(ctx.new_operations[1].opcode, OpCode::Label);
+        assert_eq!(ctx.new_operations[2].opcode, OpCode::IntAdd);
+        let body_box = Operand::from_bound_op(&ctx.new_operations[2]);
+        let jump_arg = emitted_jump.arg(0);
+        assert!(
+            jump_arg.same_box(&body_box) || jump_arg.get_box_replacement(false).same_box(&body_box),
+            "JUMP arg must be the reserved peel box (or forward to the emitted body producer)"
+        );
+        assert!(
+            jump_arg.bound_op().is_some(),
+            "JUMP arg is the reserved bound producer, not a rematerialize"
+        );
+    }
+
+    #[test]
     fn test_label_args_match_jump_args() {
         // The Label should carry the same args as the Jump.
         let mut ops = vec![
@@ -7601,7 +7646,7 @@ mod tests {
         ctx.set_ptr_info(&box_, PtrInfo::instance(None, Some(CLASS)));
 
         let mut infos = indexmap::IndexMap::new();
-        OptUnroll::new().expand_info(OpRef::ref_op(99), &box_, &ctx, None, &mut infos);
+        OptUnroll::new().expand_info(&box_, &ctx, None, &mut infos);
         match infos.get(&box_) {
             Some(OpInfo::Ptr(rc)) => match &*rc.borrow() {
                 PtrInfo::Instance(iinfo) => assert_eq!(iinfo.known_class, Some(CLASS)),

@@ -968,9 +968,11 @@ impl ShortBoxes {
             new_op
                 .pos()
                 .set(ctx.alloc_op_position_typed(new_op.result_type()));
-            // shortpreamble.py: ProducedShortOp(short_op, preamble_op)
+            // shortpreamble.py ProducedShortOp(short_op, preamble_op):
+            // `short_op.res` is the Const; `copy_and_change` mints a
+            // distinct preamble result box.
             short_boxes.push(ProducedShortOp {
-                res: ctx.materialize_operand_at(getfield_op.pos().get()),
+                res: short_op.res.clone(),
                 preamble_op: OpRc::new(new_op),
                 source_op: short_op.source_op.unwrap_or_else(|| short_op.op.clone()),
                 kind: PreambleOpKind::Heap,
@@ -1136,10 +1138,11 @@ impl CollectedExtendedShortPreambleBuilder {
     /// Add a guard operation.
     pub fn add_guard(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos().get());
+        let op_rc = OpRc::new(op);
         self.guards.push(PreambleOp {
             source_op: None,
-            res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: OpRc::new(op),
+            res: Operand::from_bound_op(&op_rc),
+            op: op_rc,
             kind: PreambleOpKind::Guard,
             label_arg_idx,
             invented_name: false,
@@ -1150,10 +1153,11 @@ impl CollectedExtendedShortPreambleBuilder {
     /// Add a pure operation.
     pub fn add_pure_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos().get());
+        let op_rc = OpRc::new(op);
         self.pure_ops.push(PreambleOp {
             source_op: None,
-            res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: OpRc::new(op),
+            res: Operand::from_bound_op(&op_rc),
+            op: op_rc,
             kind: PreambleOpKind::Pure,
             label_arg_idx,
             invented_name: false,
@@ -1164,10 +1168,11 @@ impl CollectedExtendedShortPreambleBuilder {
     /// Add a heap read.
     pub fn add_heap_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos().get());
+        let op_rc = OpRc::new(op);
         self.heap_ops.push(PreambleOp {
             source_op: None,
-            res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: OpRc::new(op),
+            res: Operand::from_bound_op(&op_rc),
+            op: op_rc,
             kind: PreambleOpKind::Heap,
             label_arg_idx,
             invented_name: false,
@@ -1178,10 +1183,11 @@ impl CollectedExtendedShortPreambleBuilder {
     /// Add a loop-invariant call.
     pub fn add_loopinvariant_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos().get());
+        let op_rc = OpRc::new(op);
         self.loopinvariant_ops.push(PreambleOp {
             source_op: None,
-            res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: OpRc::new(op),
+            res: Operand::from_bound_op(&op_rc),
+            op: op_rc,
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
             invented_name: false,
@@ -2216,15 +2222,23 @@ impl ShortPreambleBuilder {
     /// `produce_op` family), verified against the builder entry.
     pub fn use_box(
         &mut self,
-        source: OpRef,
+        source: &Operand,
         preamble_op: &majit_ir::OpRc,
         arg_guards: &[OpRc],
         result_guards: &[OpRc],
     ) {
-        // shortpreamble.py `use_box(box, preamble_op)`: `preamble_op` is the
-        // replay op created by `add_op_to_short`. Its args are already
-        // `produce_arg` results, and `make_guards` was called on this same
-        // op, so guard args name the replay result. No second lookup.
+        // shortpreamble.py ShortPreambleBuilder.use_box(box, preamble_op):
+        // `preamble_op` is the replay op created by `add_op_to_short`. Its
+        // args are already `produce_arg` results, and `make_guards` was
+        // called on this same op, so guard args name the replay result.
+        #[cfg(debug_assertions)]
+        if let Some(produced) = self.produced_short_boxes.get(source) {
+            debug_assert!(
+                OpRc::ptr_eq(&produced.preamble_op, preamble_op),
+                "use_box pop replay diverged from builder entry at {source:?}"
+            );
+        }
+        #[cfg(not(debug_assertions))]
         let _ = source;
         self.state.use_box(
             preamble_op,
@@ -3760,6 +3774,30 @@ mod tests {
         builder.add_heap_op(heap);
         builder.add_loopinvariant_op(Op::new(OpCode::CallI, &[v100]));
         assert_eq!(builder.num_ops(), 4);
+        assert!(
+            builder.guards[0]
+                .res
+                .same_box(&Operand::from_bound_op(&builder.guards[0].op)),
+            "add_guard res is the bound producer box"
+        );
+        assert!(
+            builder.pure_ops[0]
+                .res
+                .same_box(&Operand::from_bound_op(&builder.pure_ops[0].op)),
+            "add_pure_op res is the bound producer box"
+        );
+        assert!(
+            builder.heap_ops[0]
+                .res
+                .same_box(&Operand::from_bound_op(&builder.heap_ops[0].op)),
+            "add_heap_op res is the bound producer box"
+        );
+        assert!(
+            builder.loopinvariant_ops[0]
+                .res
+                .same_box(&Operand::from_bound_op(&builder.loopinvariant_ops[0].op)),
+            "add_loopinvariant_op res is the bound producer box"
+        );
     }
 
     #[test]
@@ -4124,8 +4162,10 @@ mod tests {
             majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(constant);
+        let const_box;
         {
             let res = ctx.materialize_operand_at(heap.pos().get());
+            const_box = res.clone();
             sb.add_heap_op(&mut ctx, res, heap);
         }
 
@@ -4141,6 +4181,10 @@ mod tests {
         assert_eq!(produced_const.len(), 1);
         assert_eq!(produced_const[0].kind, PreambleOpKind::Heap);
         assert_eq!(produced_const[0].res.to_opref(), constant);
+        assert!(
+            produced_const[0].res.same_box(&const_box),
+            "produced_const_ops res is the Const box passed to add_heap_op"
+        );
         assert_ne!(produced_const[0].preamble_op.pos().get(), constant);
     }
 
