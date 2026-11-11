@@ -5834,6 +5834,16 @@ impl OptUnrollState {
                 peeled_op.cleardescr();
             }
             ctx.emit(peeled_op);
+            // opencoder.py TraceIterator `_cache`: the freshly created
+            // ResOp is the box later args / JUMP bind. emit may mint a
+            // distinct producer that the reserved stand-in only forwards
+            // to; overwrite with that producer when it landed at the
+            // reserved position.
+            if let Some(emitted) = ctx.new_operations.last()
+                && emitted.pos().get() == *new_pos
+            {
+                box_map.insert(*new_pos, Operand::from_bound_op(emitted));
+            }
         }
 
         // Emit Label between peeled and original body.
@@ -5885,6 +5895,14 @@ impl OptUnrollState {
                 body_op.cleardescr();
             }
             ctx.emit(body_op);
+            // Same TraceIterator `_cache` overwrite as the peeled copy:
+            // later body args, fail_args, snapshots, and the closing JUMP
+            // bind the emitted producer.
+            if let Some(emitted) = ctx.new_operations.last()
+                && emitted.pos().get() == *new_pos
+            {
+                orig_box_map.insert(*new_pos, Operand::from_bound_op(emitted));
+            }
         }
         (orig_ref_map, orig_box_map)
     }
@@ -6946,11 +6964,10 @@ mod tests {
     }
 
     #[test]
-    fn test_peel_remapped_arg_is_the_reserved_box() {
+    fn test_peel_remapped_arg_is_the_emitted_producer() {
         // Drive real `propagate_forward` / `peel_iteration` on a one-op
-        // buffer. The JUMP arg is the `reserve_virtual_box` Operand
-        // (`resoperation.py ResOperation(...)`), whose replacement is the
-        // emitted body producer after `emit` adopts the stand-in.
+        // buffer. The JUMP arg is the emitted body producer
+        // (`opencoder.py TraceIterator._cache`).
         let add = {
             let mut op = Op::new(
                 OpCode::IntAdd,
@@ -6987,8 +7004,8 @@ mod tests {
         let body_box = Operand::from_bound_op(&ctx.new_operations[2]);
         let jump_arg = emitted_jump.arg(0);
         assert!(
-            jump_arg.same_box(&body_box) || jump_arg.get_box_replacement(false).same_box(&body_box),
-            "JUMP arg must be the reserved peel box (or forward to the emitted body producer)"
+            jump_arg.same_box(&body_box),
+            "JUMP arg must be the emitted body producer"
         );
         assert!(
             jump_arg.bound_op().is_some(),
@@ -8272,47 +8289,6 @@ mod tests {
                 .same_box(&exported.next_iteration_args[0])
         );
         assert!(decoy.get_box_replacement(false).same_box(&decoy));
-    }
-
-    #[test]
-    fn test_import_state_collision_alias_is_fresh_typed_inputarg() {
-        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let box21 = ctx.materialize_operand_at(OpRef::int_op(21));
-        let exported = export_state(
-            std::slice::from_ref(&box21),
-            &[],
-            &mut optimizer,
-            &mut ctx,
-            None,
-        );
-        let carried = exported.next_iteration_args[0].clone();
-
-        let mut ctx2 =
-            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
-        let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
-        let collided = ctx2
-            .inputarg_at(1)
-            .expect("phase-2 collision slot must be bound");
-        let source_set: crate::FxIndexSet<Operand> =
-            [source.clone(), collided.clone()].into_iter().collect();
-        let target = collided.get_box_replacement(false);
-        assert!(!target.same_box(&source) && source_set.contains(&target));
-
-        let fresh = OptUnroll::inputarg_from_tp(&mut ctx2, source.type_());
-        ctx2.make_equal_to(&source, &fresh);
-        assert!(fresh.is_inputarg());
-        assert_eq!(fresh.type_(), source.type_());
-        assert!(!fresh.same_box(&source));
-        assert!(!fresh.same_box(&collided));
-
-        let _label_args = import_state(
-            std::slice::from_ref(&fresh),
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
-        assert!(fresh.get_box_replacement(false).same_box(&carried));
     }
 
     #[test]

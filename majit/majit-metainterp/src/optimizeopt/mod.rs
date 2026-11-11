@@ -7089,34 +7089,6 @@ impl OptContext {
         })
     }
 
-    /// Positional `same_box` for boxes that only exist as `OpRef` in a
-    /// Stage-4 registry (`inputarg_refs` / `resop_refs` /
-    /// `phase1_emit_ops_index` / `const_operands`).
-    pub(crate) fn same_box_opref(&self, query: OpRef, stored: OpRef) -> bool {
-        match (
-            self.get_box_replacement_operand_opt(query),
-            self.get_box_replacement_operand_opt(stored),
-        ) {
-            (Some(ref a), Some(ref b)) => a.same_box(b),
-            _ => {
-                let query = self.get_replacement_opref(query);
-                let stored = self.get_replacement_opref(stored);
-                if query == stored {
-                    return true;
-                }
-                match (
-                    self.get_box_replacement_operand_opt(query)
-                        .and_then(|cb| cb.const_value()),
-                    self.get_box_replacement_operand_opt(stored)
-                        .and_then(|cb| cb.const_value()),
-                ) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                }
-            }
-        }
-    }
-
     /// vstring.py:237 `optstring.getintbound(box).is_constant()` pattern.
     /// Returns the constant value if known either from the constant pool
     /// or from IntBound analysis.

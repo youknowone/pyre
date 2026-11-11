@@ -371,13 +371,14 @@ pub struct Optimizer {
     /// optimizer.py `_really_emitted_operation` — last op appended by
     /// `_emit_operation`. `getlastop` returns this, not `new_operations.last()`.
     really_emitted_operation: Option<OpRc>,
-    /// optimizer.py `replaces_guard` — maps an emitted guard op to its
-    /// replacement. RPython keys this dict by the guard `op` object itself
-    /// (object identity); keys are the raw producer `Operand`
-    /// (`from_bound_op`, no `_forwarded`), the box-identity analog of
-    /// `op is op`. Guard ops are never Const, so the key is always a
+    /// optimizer.py `replaces_guard` — maps an orig guard op box to
+    /// `last_guard_pos`, an index into `_newoperations`
+    /// (`Optimizer.replace_guard`). RPython keys this dict by the guard
+    /// `op` object itself (object identity); keys are the raw producer
+    /// `Operand` (`from_bound_op`, no `_forwarded`), the box-identity analog
+    /// of `op is op`. Guard ops are never Const, so the key is always a
     /// ptr-stable ResOp producer.
-    replaces_guard: crate::FxIndexMap<majit_ir::operand::Operand, Op>,
+    replaces_guard: crate::FxIndexMap<majit_ir::operand::Operand, usize>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -1484,30 +1485,66 @@ impl Optimizer {
         self.last_guard_op_idx
     }
 
-    /// optimizer.py `replace_guard`: `self.replaces_guard[op] = value`.
-    /// Record that a guard should be replaced when the future condition is
-    /// realized. Keys by the raw `op` (no get_box_replacement).
-    /// `_emit_operation` looks it up by the raw `orig_op`.
-    /// (The method keeps its historical name; the body performs replace_guard's
-    /// insert.)
-    pub fn notice_guard_future_condition(&mut self, guard: &Operand, replacement: Op) {
-        // optimizer.py replace_guard: `self.replaces_guard[op] = value`
-        // keys by the raw `op` (no get_box_replacement).
-        self.replaces_guard.insert(guard.clone(), replacement);
+    /// optimizer.py `Optimizer.replace_guard`:
+    /// `self.replaces_guard[op] = value.last_guard_pos`.
+    /// Record that a later `_emit_operation` of `op` should overwrite the
+    /// previously emitted guard at `last_guard_pos`. Keys by the raw `op`
+    /// (no get_box_replacement). `_emit_operation` looks it up by the raw
+    /// `orig_op`.
+    pub fn replace_guard(&mut self, op: &Operand, last_guard_pos: i32) {
+        debug_assert!(self.can_replace_guards);
+        if last_guard_pos == -1 {
+            return;
+        }
+        self.replaces_guard
+            .insert(op.clone(), last_guard_pos as usize);
     }
 
-    /// optimizer.py `replace_guard_op(old_op, new_op)`
-    /// Replace a previously emitted guard with a new one.
+    /// optimizer.py `Optimizer.replace_guard_op(old_op_pos, new_op)`
     ///
-    /// optimizer.py: `self._emittedoperations[new_op] = None` —
-    /// the new guard object itself.
-    pub fn replace_guard_op(&mut self, ctx: &mut OptContext, old_guard: &Operand, new_guard: Op) {
-        let new_rc = majit_ir::OpRc::new(new_guard.clone());
-        self.replaces_guard.insert(old_guard.clone(), new_guard);
-        // optimizer.py `self._emittedoperations[new_op] = None` — the new
-        // guard object itself.
+    /// Copy resume attributes from the slot's old descr onto `new_op`'s
+    /// descr, overwrite `_newoperations[old_op_pos]` with that same `new_op`
+    /// Rc, and insert it into `_emittedoperations`.
+    pub fn replace_guard_op(
+        &mut self,
+        ctx: &mut OptContext,
+        old_op_pos: usize,
+        new_op: majit_ir::OpRc,
+    ) {
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
+                new_op.opcode,
+                new_op.pos().get(),
+                old_op_pos,
+                ctx.new_operations.len()
+            );
+        }
+        // Inherit the slot's resume payload onto the new op's descr so
+        // the new guard carries old's rd_* — without this,
+        // `_newoperations[old_op_pos]` would land with the new descr's
+        // empty rd_* defaults. In-place mutation preserves new_descr's
+        // identity (fail_index / status / subtype tag).
+        //
+        // RPython performs both getdescr() calls and the
+        // copy_all_attributes_from unconditionally; an old/new descr
+        // missing here means the optimizer gave us a replacement guard
+        // without resume payload, which would silently overwrite the
+        // slot. Match RPython by panicking instead of skipping.
+        let old_descr = ctx.new_operations[old_op_pos].getdescr().expect(
+            "optimizer.py replace_guard_op: old_descr = old_op.getdescr(): \
+             replaced guard slot has no descr",
+        );
+        let new_descr = new_op.getdescr().expect(
+            "optimizer.py replace_guard_op: new_descr = new_op.getdescr(): \
+             replacement guard has no descr",
+        );
+        crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
+        ctx.replace_new_operation(old_op_pos, new_op.clone());
+        // optimizer.py `self._emittedoperations[new_op] = None` — the same
+        // Rc that landed in the slot.
         ctx.emitted_operations
-            .insert(Operand::from_bound_op(&new_rc));
+            .insert(Operand::from_bound_op(&new_op));
     }
 
     /// optimizer.py `as_operation(op, required_opnum=-1)`:
@@ -3317,11 +3354,6 @@ impl Optimizer {
             // force_box materializes the virtual to preserve Ref type.
             let inputargs = self.trace_inputargs.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
-            let resolved_args: Vec<OpRef> = terminal_op
-                .args_slice()
-                .iter()
-                .map(|arg| arg.get_box_replacement(false).to_opref())
-                .collect();
             for arg in terminal_op.args_slice().iter() {
                 self.force_box_for_end_of_preamble(&arg.get_box_replacement(false), &mut ctx);
             }
@@ -5268,66 +5300,28 @@ impl Optimizer {
             // emit_guard_operation reads ctx.pending_for_guard inside store_final_boxes_in_guard
             // and clears it.
 
-            // optimizer.py: replaces_guard check BEFORE emit_guard_operation.
-            // optimizer.py `orig_op in self.replaces_guard` keys by the raw
-            // producer (`from_bound_op`), not get_box_replacement.
-            // optimizer.py `if self.replaces_guard and orig_op in
-            // self.replaces_guard`.
+            // optimizer.py `_emit_operation`: `if self.replaces_guard and
+            // orig_op in self.replaces_guard` — keys by the raw producer
+            // (`from_bound_op`), not get_box_replacement. Then
+            // `replace_guard_op(self.replaces_guard[orig_op], op)`.
             if self.can_replace_guards
                 && !self.replaces_guard.is_empty()
-                && let Some(replacement) = self
+                && let Some(old_op_pos) = self
                     .replaces_guard
                     .swap_remove(&Operand::from_bound_op(&op))
             {
-                let target_pos = replacement.pos().get().raw() as usize;
-                if target_pos < ctx.new_operations.len() {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
-                            op.opcode,
-                            op.pos().get(),
-                            target_pos,
-                            ctx.new_operations.len()
-                        );
-                    }
-                    // optimizer.py replace_guard_op:
-                    //   old_descr = old_op.getdescr()
-                    //   new_descr = new_op.getdescr()
-                    //   new_descr.copy_all_attributes_from(old_descr)
-                    // Inherit the slot's resume payload onto the new op's
-                    // descr so the new guard carries old's rd_* — without
-                    // this, `_newoperations[target_pos]` would land with
-                    // the new descr's empty rd_* defaults.  In-place
-                    // mutation preserves new_descr's identity (fail_index
-                    // / status / subtype tag).
-                    //
-                    // RPython performs both getdescr() calls and the
-                    // copy_all_attributes_from unconditionally; an old/new
-                    // descr missing here means the optimizer gave us a
-                    // replacement guard without resume payload, which
-                    // would silently overwrite the slot.  Match RPython
-                    // by panicking instead of skipping.
-                    let old_descr = ctx.new_operations[target_pos].getdescr().expect(
-                        "optimizer.py:716 old_descr = old_op.getdescr(): \
-                                 replaced guard slot has no descr",
-                    );
-                    let new_descr = op.getdescr().expect(
-                        "optimizer.py:717 new_descr = new_op.getdescr(): \
-                             replacement guard has no descr",
-                    );
-                    crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                    ctx.replace_new_operation(target_pos, op.clone());
-                    // Guard replacement returns before the postprocess
-                    // consume. Put the sheltered callbacks back; do not run
-                    // them here.
-                    Self::restore_emit_shelter(
-                        ctx,
-                        saved_in_final_emission,
-                        &mut saved_pending_mark,
-                        &mut saved_pending_class,
-                    );
-                    return Ok(());
-                }
+                assert!(old_op_pos < ctx.new_operations.len());
+                self.replace_guard_op(ctx, old_op_pos, op);
+                // Guard replacement returns before the postprocess
+                // consume. Put the sheltered callbacks back; do not run
+                // them here.
+                Self::restore_emit_shelter(
+                    ctx,
+                    saved_in_final_emission,
+                    &mut saved_pending_mark,
+                    &mut saved_pending_class,
+                );
+                return Ok(());
             }
 
             // optimizer.py: op = self.emit_guard_operation(op, pendingfields)
@@ -7723,6 +7717,46 @@ mod tests {
         opt.restore_can_replace_guards(&mut ctx, guard);
         assert!(opt.can_replace_guards);
         assert!(ctx.can_replace_guards);
+    }
+
+    #[test]
+    fn test_replace_guard_op_overwrites_slot_with_emitted_guard() {
+        let mut opt = Optimizer::new();
+        let mut ctx = OptContext::with_num_inputs(8, 0);
+        let arg = rooted_resop_operand(Type::Int, 0);
+
+        let old = {
+            let mut op = Op::with_descr(
+                OpCode::GuardTrue,
+                std::slice::from_ref(&arg),
+                crate::compile::make_resume_guard_descr_typed(Vec::new()),
+            );
+            op.pos().set(OpRef::void_op(0));
+            OpRc::new(op)
+        };
+        ctx.push_new_operation(old);
+
+        let new_guard = {
+            let mut op = Op::with_descr(
+                OpCode::GuardFalse,
+                std::slice::from_ref(&arg),
+                crate::compile::make_resume_guard_descr_typed(Vec::new()),
+            );
+            op.pos().set(OpRef::void_op(1));
+            OpRc::new(op)
+        };
+        let orig = Operand::from_bound_op(&new_guard);
+        opt.replace_guard(&orig, -1);
+        assert!(opt.replaces_guard.is_empty());
+        opt.replace_guard(&orig, 0);
+        opt.emit(new_guard, &mut ctx)
+            .expect("emit replacement guard");
+
+        assert_eq!(ctx.new_operations.len(), 1);
+        assert_eq!(ctx.new_operations[0].opcode, OpCode::GuardFalse);
+        let slot = Operand::from_bound_op(&ctx.new_operations[0]);
+        assert!(ctx.emitted_operations.contains(&slot));
+        assert!(slot.same_box(&orig));
     }
 
     #[test]
