@@ -439,7 +439,21 @@ fn contains_ty(ty: &TyRef, llbc: &Llbc, depth: usize, seen: &mut Vec<u64>) -> bo
 }
 
 fn type_exposes_root(ty: &TyRef, llbc: &Llbc) -> bool {
-    contains_ty(ty, llbc, 0, &mut Vec::new())
+    let id = match ty {
+        TyRef::Dedup { id } => Some(*id),
+        TyRef::Inline { value: (id, _) } => Some(*id),
+        TyRef::Other(_) => None,
+    };
+    if let Some(id) = id
+        && let Some(cached) = llbc.type_flag_memo_get(id)
+    {
+        return cached;
+    }
+    let value = contains_ty(ty, llbc, 0, &mut Vec::new());
+    if let Some(id) = id {
+        llbc.type_flag_memo_set(id, value);
+    }
+    value
 }
 
 fn arg_is_erased_drop(ty: &TyRef, llbc: &Llbc) -> bool {

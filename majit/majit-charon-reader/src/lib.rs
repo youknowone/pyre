@@ -162,6 +162,10 @@ pub struct Llbc {
     /// One value the translator derives from this artefact and reuses across queries.
     /// [`Llbc::type_decls_mut`] drops it, since editing a type declaration can change it.
     derived: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
+    /// Caches one caller-defined boolean per hash-consed type id
+    /// (`0` unknown, `1` false, `2` true). The single user is the rbigint
+    /// root-exposure test. [`Llbc::type_decls_mut`] clears it.
+    type_flag_memo: std::sync::Mutex<Vec<u8>>,
 }
 
 /// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
@@ -483,6 +487,7 @@ impl Llbc {
             drop_impl_owners: std::sync::OnceLock::new(),
             trait_impl_rows_by_trait: std::sync::OnceLock::new(),
             derived: std::sync::OnceLock::new(),
+            type_flag_memo: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1155,10 +1160,34 @@ impl Llbc {
             .expect("Llbc::derived holds one type")
     }
 
-    /// Mutable access to the type declarations. Drops the [`Llbc::derived`] value.
+    /// Mutable access to the type declarations. Drops the [`Llbc::derived`] value
+    /// and the per-type-id flag memo.
     pub fn type_decls_mut(&mut self) -> impl Iterator<Item = &mut TypeDecl> + '_ {
         self.derived = std::sync::OnceLock::new();
+        self.type_flag_memo.get_mut().unwrap().clear();
         self.file.translated.type_decls.iter_mut().flatten()
+    }
+
+    /// Caches one caller-defined boolean per hash-consed type id.
+    /// The single user is the rbigint root-exposure test.
+    pub fn type_flag_memo_get(&self, id: u64) -> Option<bool> {
+        let memo = self.type_flag_memo.lock().unwrap();
+        match memo.get(id as usize).copied().unwrap_or(0) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Caches one caller-defined boolean per hash-consed type id.
+    /// The single user is the rbigint root-exposure test.
+    pub fn type_flag_memo_set(&self, id: u64, value: bool) {
+        let mut memo = self.type_flag_memo.lock().unwrap();
+        let id = id as usize;
+        if id >= memo.len() {
+            memo.resize(id + 1, 0);
+        }
+        memo[id] = if value { 2 } else { 1 };
     }
 
     /// The type value the unique impl of `trait_decl_id` binds `assoc` to.
