@@ -2,6 +2,7 @@
 
 use super::*;
 use majit_charon_reader::ullbc::{FunDecl, TypeDeclKind};
+use std::collections::HashMap;
 
 /// Spill allocation for one borrowed primitive passed to a raw
 /// scalar pointer. `Tuple<i64>` is one signed field: size 8, align 8,
@@ -3357,7 +3358,7 @@ pub(in crate::front::mir) fn callee_returns_spill_address(
             uninspectable: false,
         };
     }
-    let escape = function_address_escape(llbc, fun_id, &entry, &mut Vec::new());
+    let escape = function_address_escape(llbc, fun_id, &entry, &mut AddressEscapeWalk::new());
     // `p == null` is the same branch after the spill moves. `p < 0` is
     // not: the sign can see the address bits. Several null checks stay
     // that branch. A comparison that is not one can encode the address.
@@ -3379,6 +3380,7 @@ pub(in crate::front::mir) struct SpillAddressVerdict {
     uninspectable: bool,
 }
 
+#[derive(Clone, PartialEq, Debug)]
 pub(in crate::front::mir) struct AddressEscape {
     /// Bit `n` is set when `n` dereferences of the return slot yield the
     /// address. Bit 0 means the slot holds those bits. A local keeps
@@ -3415,13 +3417,13 @@ pub(in crate::front::mir) struct AddressEscape {
 
 /// A place a raw pointer names. An empty `path` is `local`.
 /// `[0, 1]` is `local.0.1`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(in crate::front::mir) struct AddressReferent {
     pub(in crate::front::mir) local: u64,
     pub(in crate::front::mir) path: Vec<usize>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(in crate::front::mir) struct FieldSlot {
     pub(in crate::front::mir) index: usize,
     pub(in crate::front::mir) bits: u64,
@@ -3442,7 +3444,7 @@ pub(in crate::front::mir) struct FieldSlot {
     pub(in crate::front::mir) referent: Option<AddressReferent>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(in crate::front::mir) struct LocalAddress {
     pub(in crate::front::mir) local: u64,
     pub(in crate::front::mir) bits: u64,
@@ -3490,7 +3492,7 @@ pub(in crate::front::mir) fn plain_local(local: u64, bits: u64, condition: u8) -
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::front::mir) struct AddressValue {
     pub(in crate::front::mir) bits: u64,
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
@@ -3541,24 +3543,106 @@ pub(in crate::front::mir) const SPILL_REF_DEPTH_LIMIT: u8 = 32;
 /// Two address-derived comparisons are enough to encode the address.
 pub(in crate::front::mir) const SPILL_CONDITION_MANY: u8 = 2;
 
+/// One top-level address-escape walk: the recursion stack, a memo of
+/// finished callee results, and the lowest cycle cut-off still open.
+pub(in crate::front::mir) struct AddressEscapeWalk {
+    stack: Vec<u64>,
+    /// Results of finished callee walks, keyed by callee and entry state.
+    memo: HashMap<(u64, Vec<LocalAddress>), AddressEscape>,
+    /// Smallest `stack` index a cycle cut-off hit while the frames above it were open.
+    cut_floor: usize,
+    #[cfg(test)]
+    memo_enabled: bool,
+    #[cfg(test)]
+    walk_counts: HashMap<u64, usize>,
+}
+
+impl AddressEscapeWalk {
+    pub(in crate::front::mir) fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            memo: HashMap::new(),
+            cut_floor: usize::MAX,
+            #[cfg(test)]
+            memo_enabled: true,
+            #[cfg(test)]
+            walk_counts: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::front::mir) fn without_memo() -> Self {
+        let mut walk = Self::new();
+        walk.memo_enabled = false;
+        walk
+    }
+
+    #[cfg(test)]
+    pub(in crate::front::mir) fn walk_count(&self, fun_id: u64) -> usize {
+        self.walk_counts.get(&fun_id).copied().unwrap_or(0)
+    }
+
+    fn memo_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.memo_enabled
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+}
+
 pub(in crate::front::mir) fn function_address_escape(
     llbc: &Llbc,
     fun_id: u64,
     entry: &[LocalAddress],
-    stack: &mut Vec<u64>,
+    walk: &mut AddressEscapeWalk,
 ) -> AddressEscape {
-    if stack.contains(&fun_id) {
+    if let Some(i) = walk.stack.iter().position(|&id| id == fun_id) {
+        walk.cut_floor = walk.cut_floor.min(i);
         return unclassified_address_escape();
     }
+    let key = (fun_id, entry.to_vec());
+    if walk.memo_enabled()
+        && let Some(cached) = walk.memo.get(&key)
+    {
+        return cached.clone();
+    }
     let Some(fd) = llbc.fn_by_id(fun_id) else {
-        return unclassified_address_escape();
+        let escape = unclassified_address_escape();
+        if walk.memo_enabled() {
+            walk.memo.insert(key, escape.clone());
+        }
+        return escape;
     };
     let Some(body) = fd.unstructured() else {
-        return unclassified_address_escape();
+        let escape = unclassified_address_escape();
+        if walk.memo_enabled() {
+            walk.memo.insert(key, escape.clone());
+        }
+        return escape;
     };
-    stack.push(fun_id);
-    let escape = unstructured_address_escape(llbc, &body, entry, stack);
-    stack.pop();
+    let my_index = walk.stack.len();
+    let saved = walk.cut_floor;
+    walk.cut_floor = usize::MAX;
+    walk.stack.push(fun_id);
+    #[cfg(test)]
+    {
+        *walk.walk_counts.entry(fun_id).or_insert(0) += 1;
+    }
+    let escape = unstructured_address_escape(llbc, &body, entry, walk);
+    walk.stack.pop();
+    let seen = walk.cut_floor;
+    if walk.memo_enabled() && seen >= my_index {
+        walk.memo.insert(key, escape.clone());
+    }
+    walk.cut_floor = if seen < my_index {
+        saved.min(seen)
+    } else {
+        saved
+    };
     escape
 }
 
@@ -3566,7 +3650,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
     llbc: &Llbc,
     body: &Unstructured,
     entry: &[LocalAddress],
-    stack: &mut Vec<u64>,
+    walk: &mut AddressEscapeWalk,
 ) -> AddressEscape {
     let mut projections = Vec::new();
     let mut escapes = false;
@@ -3630,7 +3714,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
                     target,
                     on_unwind,
                 }) => {
-                    let escape = call_address_escape(llbc, call, &depths, stack);
+                    let escape = call_address_escape(llbc, call, &depths, walk);
                     if escape.escapes {
                         escapes = true;
                     }
@@ -3714,7 +3798,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
                             value.bits,
                             value.condition,
                             value.invariant,
-                            stack,
+                            walk,
                         );
                         if escape.return_bits & 1 != 0 || escape.escapes || escape.condition > 1 {
                             escapes = true;
@@ -4895,7 +4979,7 @@ pub(in crate::front::mir) fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
     depths: &[LocalAddress],
-    stack: &mut Vec<u64>,
+    walk: &mut AddressEscapeWalk,
 ) -> AddressEscape {
     let mut arg_overflows = false;
     let entry: Vec<LocalAddress> = call
@@ -4950,7 +5034,7 @@ pub(in crate::front::mir) fn call_address_escape(
         return unclassified_address_escape();
     };
     match &reg.kind {
-        CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, stack),
+        CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, walk),
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)
         | CallKind::Ptr(_)
@@ -4995,7 +5079,7 @@ pub(in crate::front::mir) fn drop_address_escape(
     bits: u64,
     condition: u8,
     invariant: bool,
-    stack: &mut Vec<u64>,
+    walk: &mut AddressEscapeWalk,
 ) -> AddressEscape {
     let (entry_bits, overflow) = lift_address_bits(bits);
     if overflow {
@@ -5010,7 +5094,7 @@ pub(in crate::front::mir) fn drop_address_escape(
             // `p == null` takes the same branch in the glue. `p < 0`
             // does not: `plain_local` would drop that distinction.
             local.invariant = invariant;
-            function_address_escape(llbc, *id, &[local], stack)
+            function_address_escape(llbc, *id, &[local], walk)
         }
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)

@@ -4894,6 +4894,30 @@ mod tests {
     }
 
     #[test]
+    fn has_unstructured_body_matches_unstructured() {
+        let with_body = fun_decl_from_blocks(vec![bb(serde_json::json!("Return"), false, 0)]);
+        assert_eq!(
+            with_body.has_unstructured_body(),
+            with_body.unstructured().is_some()
+        );
+        assert!(with_body.has_unstructured_body());
+
+        let no_body = parse_fun_decl(serde_json::json!({"body": null}));
+        assert_eq!(
+            no_body.has_unstructured_body(),
+            no_body.unstructured().is_some()
+        );
+        assert!(!no_body.has_unstructured_body());
+
+        let structured = parse_fun_decl(serde_json::json!({"body": {"Structured": {}}}));
+        assert_eq!(
+            structured.has_unstructured_body(),
+            structured.unstructured().is_some()
+        );
+        assert!(!structured.has_unstructured_body());
+    }
+
+    #[test]
     fn raw_object_first_key_is_unstructured() {
         assert!(raw_object_first_key_is(
             r#"{"Unstructured":{}}"#,

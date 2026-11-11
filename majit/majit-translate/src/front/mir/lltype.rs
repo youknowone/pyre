@@ -1167,11 +1167,12 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // (`locals[1..=argc]`, the same source the regular lowering reads
         // at `local.name`); fall back to positional `arg{N}` when the body
         // is opaque or a local is unnamed.
-        let body = fd.unstructured();
+        let locals = fd.unstructured_locals();
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
             .map(|i| {
-                body.as_ref()
-                    .and_then(|u| u.locals.locals.get(i + 1))
+                locals
+                    .as_ref()
+                    .and_then(|l| l.locals.get(i + 1))
                     .and_then(|l| l.name.clone())
                     .unwrap_or_else(|| format!("arg{i}"))
             })
@@ -1342,11 +1343,12 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(in crate::front::mir) fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
-    let body = fd.unstructured();
+    let locals = fd.unstructured_locals();
     (0..fd.signature.inputs.len())
         .map(|i| {
-            body.as_ref()
-                .and_then(|u| u.locals.locals.get(i + 1))
+            locals
+                .as_ref()
+                .and_then(|l| l.locals.get(i + 1))
                 .and_then(|l| l.name.clone())
                 .unwrap_or_else(|| format!("arg{i}"))
         })
@@ -3042,10 +3044,39 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// `jit.*`. Built from this `Llbc`'s global decls.
     pub(in crate::front::mir) oopspec_fn_paths:
         std::sync::OnceLock<std::collections::HashSet<String>>,
+    /// Decoded marker-const strings. The payload is a property of the artefact.
+    global_marker_strs:
+        std::sync::Mutex<std::collections::HashMap<u64, Option<std::sync::Arc<str>>>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
     llbc.derived(LlbcDerived::default)
+}
+
+/// Memoize [`crate::front::llbc_hints::global_marker_str`] per global def id.
+/// The decoded string does not depend on later `register_*` / `set_*` calls.
+pub(crate) fn cached_global_marker_str(
+    llbc: &Llbc,
+    def_id: u64,
+    compute: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let cache = &llbc_derived(llbc).global_marker_strs;
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = guard.get(&def_id) {
+            return hit.as_ref().map(|s| s.to_string());
+        }
+    }
+    let value = compute();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(def_id)
+        .or_insert_with(|| value.clone().map(std::sync::Arc::from));
+    value
 }
 
 pub(in crate::front::mir) fn value_type_inputs(llbc: &Llbc) -> &ValueTypeInputs {

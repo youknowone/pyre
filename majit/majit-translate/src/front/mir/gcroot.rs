@@ -4287,7 +4287,7 @@ pub fn mark_foreign_scope_owners(llbc: &Llbc, identities: &[String]) {
         return;
     }
     for fd in llbc.iter_fun_decls() {
-        if fd.item_meta.is_local || fd.unstructured().is_some() {
+        if fd.item_meta.is_local || fd.has_unstructured_body() {
             continue;
         }
         let identity = scope_owner_identity(llbc, fd);

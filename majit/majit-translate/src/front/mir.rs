@@ -7061,17 +7061,17 @@ pub(crate) use self::gcroot::{
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
-    adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
-    charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
-    collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
-    host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, seed_program_exception_class_hints,
-    strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
-    tyref_is_fat_dyn, unichr_call,
+    adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
+    charon_literal_to_ast_string, charon_type_value_to_ast_string,
+    collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
+    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
+    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt,
+    seed_program_exception_class_hints, strip_crate_prefix, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

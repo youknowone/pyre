@@ -2830,7 +2830,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(fn_id) else {
             return false;
         };
-        if fd.unstructured().is_some() {
+        if fd.has_unstructured_body() {
             return false;
         }
         if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
