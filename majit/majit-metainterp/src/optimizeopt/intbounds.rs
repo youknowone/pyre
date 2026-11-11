@@ -1962,27 +1962,22 @@ impl IntegerAnalysisLogger {
     }
 
     /// RPython `IntegerAnalysisLogger.log_result(self, op)`.
-    pub fn log_result(&mut self, op: &Op, ctx: &mut OptContext) {
+    pub fn log_result(&mut self, op: &Op) {
+        use majit_ir::forwarding::ForwardingHost;
         if op.result_type() != majit_ir::Type::Int {
             return;
         }
-        let pos = op.pos().get();
-        if pos.is_none() || pos.is_constant() {
-            return;
-        }
-        let Some(op_box) = ctx.get_box_replacement_operand_opt(pos) else {
-            return;
-        };
-        let Some(bound) = ctx.peek_intbound_box(&op_box) else {
+        let Some(bound) = op.int_bound() else {
             return;
         };
         if op.opcode.returns_bool() {
             return;
         }
+        let bound = (*bound).clone();
         let repr = format!("{bound:?}");
         self.lines
-            .push(format!("# {:?} -> {}   {}", op_box, bound, repr));
-        self.last_printed_repr_memo.insert(pos, repr);
+            .push(format!("# {:?} -> {}   {}", op, bound, repr));
+        self.last_printed_repr_memo.insert(op.pos().get(), repr);
     }
 
     /// RPython `IntegerAnalysisLogger.log_inputargs(self, inputargs)`.

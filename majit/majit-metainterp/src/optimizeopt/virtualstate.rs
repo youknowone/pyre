@@ -2881,8 +2881,7 @@ fn export_single_value_inner(
     // is always true → no guard).
     if tp == Type::Int
         && let Some(widened) = ctx
-            .get_box_replacement_operand_opt(opref)
-            .and_then(|b| ctx.peek_intbound_box(&b))
+            .peek_intbound_box(box_)
             .map(|b| b.widen())
             .filter(|b| !b.is_unbounded())
     {

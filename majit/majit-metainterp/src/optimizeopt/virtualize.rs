@@ -1595,22 +1595,19 @@ impl OptVirtualize {
 
         // virtualize.py: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = majit_ir::OpRc::new(Op::new(OpCode::ForceToken, &[]));
-        let token_ref = if let Some(o) = opt.as_deref_mut() {
+        if let Some(o) = opt.as_deref_mut() {
             if let Err(crate::optimize::InvalidLoop(reason)) =
                 o.send_extra_operation_after(ctx.current_pass_idx, &token_op, ctx)
             {
                 ctx.signal_invalid_loop(reason);
             }
-            token_op.pos().get()
         } else {
             // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
-            ctx.emit_rc(token_op.clone())
-        };
-        if let Some(b) = ctx.get_box_replacement_operand_opt(token_ref) {
-            ctx.set_ptr_info(&b, PtrInfo::nonnull());
+            ctx.emit_rc(token_op.clone());
         }
+        ctx.set_ptr_info(&Operand::from_bound_op(&token_op), PtrInfo::nonnull());
 
-        // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
+        // virtualize.py optimize_VIRTUAL_REF: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
 
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
