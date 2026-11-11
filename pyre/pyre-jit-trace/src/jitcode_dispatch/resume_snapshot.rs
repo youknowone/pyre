@@ -1942,10 +1942,14 @@ fn caller_operand_slots<Sym: WalkSym>(
     // looked-up name (`load_global_checked_value`); LOAD_GLOBAL with the
     // low bit set also pushes a NULL sentinel. The helper's namespace
     // argument is the frame, not a value-stack operand.
+    // `execute_jump_backward` pops nothing either: `jump_backward` (`pyopcode.py`
+    // `jump_absolute`) reads only the frame and the action ticker.
     if matches!(
         instruction,
         pyre_interpreter::Instruction::LoadGlobal { .. }
             | pyre_interpreter::Instruction::LoadName { .. }
+            | pyre_interpreter::Instruction::JumpBackward { .. }
+            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { .. }
     ) {
         return Some(CallerOperandSlots::Empty);
     }
