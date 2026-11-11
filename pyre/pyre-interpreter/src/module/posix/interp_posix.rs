@@ -2477,7 +2477,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Darwin-only names. `NGROUPS_MAX` (`<sys/syslimits.h>`) and `TMP_MAX`
         // (`<stdio.h>`) exist on linux too but with the glibc numbering, so
         // they are answered per platform rather than shared. The `PRIO_DARWIN_*`
-        // family is what `setpriority` takes there instead of a nice value.
+        // family is what `setpriority` takes there instead of a nice value, and
+        // the `_COPYFILE_*` bits are the `flags` word `shutil` hands
+        // `copyfile()` through `posix._fcopyfile`.
         #[cfg(target_vendor = "apple")]
         for (name, val) in [
             ("NGROUPS_MAX", 16i64),
@@ -2486,6 +2488,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ("PRIO_DARWIN_NONUI", libc::PRIO_DARWIN_NONUI as i64),
             ("PRIO_DARWIN_PROCESS", libc::PRIO_DARWIN_PROCESS as i64),
             ("PRIO_DARWIN_THREAD", libc::PRIO_DARWIN_THREAD as i64),
+            // [3.15-spec] `posixmodule.c` publishes these from `<copyfile.h>`;
+            // `rposix.eci` has no `copyfile.h`, so `rposix.constants`
+            // `COPYFILE_DATA` is None and pypy3's `posix` has none of them.
+            ("_COPYFILE_ACL", libc::COPYFILE_ACL as i64),
+            ("_COPYFILE_DATA", libc::COPYFILE_DATA as i64),
+            ("_COPYFILE_STAT", libc::COPYFILE_STAT as i64),
+            ("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i64),
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
         }
@@ -2518,6 +2527,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
             majit_rlib::rposix::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
         ),
+        #[cfg(not(target_vendor = "apple"))]
         ("_COPYFILE_DATA", majit_rlib::rposix::COPYFILE_DATA),
         ("_O_CLOEXEC", majit_rlib::rposix::O_CLOEXEC),
     ] {
