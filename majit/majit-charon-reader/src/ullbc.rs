@@ -370,19 +370,19 @@ impl FunDecl {
         if table.is_empty() {
             return;
         }
+        let mut table_ids: Vec<u64> = table.iter().map(|&(id, _)| id).collect();
+        if table_ids.windows(2).any(|w| w[0] > w[1]) {
+            table_ids.sort_unstable();
+        }
         let mut consumed: Vec<usize> = Vec::new();
         for i in 0..body.body.len() {
             let raw = body.body[i].terminator.kind.get();
             if raw_variant_name(raw) != Some("Call") {
                 continue;
             }
-            let Some((id, op)) = table
-                .iter()
-                .copied()
-                .find(|(id, _)| raw_fun_ids(raw.as_bytes()).any(|fun_id| fun_id == *id))
-            else {
+            if !raw_fun_ids(raw.as_bytes()).any(|fun_id| table_ids.binary_search(&fun_id).is_ok()) {
                 continue;
-            };
+            }
             let kind = body.body[i].terminator.kind_value().clone();
             let Some(call_term) = kind.get("Call") else {
                 continue;
@@ -390,15 +390,18 @@ impl FunDecl {
             let Some(inner) = call_term.get("call") else {
                 continue;
             };
-            let fun_id = inner
+            let Some(fun_id) = inner
                 .get("func")
                 .and_then(|f| f.get("Regular"))
                 .and_then(|r| r.get("kind"))
                 .and_then(|k| k.get("Fun"))
-                .and_then(Value::as_u64);
-            if fun_id != Some(id) {
+                .and_then(Value::as_u64)
+            else {
                 continue;
-            }
+            };
+            let Some((_, op)) = table.iter().copied().find(|(id, _)| *id == fun_id) else {
+                continue;
+            };
             let Some(args) = inner.get("args").and_then(Value::as_array) else {
                 continue;
             };
@@ -5100,6 +5103,50 @@ mod tests {
             body.body[3].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
+    }
+
+    #[test]
+    fn rewrite_checked_binop_calls_looks_up_the_callee_id() {
+        let call_block = serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {
+                "span": span(0),
+                "kind": {
+                    "Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 9}, "generics": {}}},
+                            "args": [
+                                {"Const": [{"FnDef": {"kind": {"Fun": 7}, "generics": {}}}, {"Deduplicated": 0}]},
+                                {"Read": {"kind": {"Local": 2}, "ty": {"Deduplicated": 0}}}
+                            ]
+                        },
+                        "dest": {"kind": {"Local": 3}, "ty": {"Deduplicated": 1}},
+                        "target": 1,
+                        "on_unwind": 2
+                    }
+                }
+            }
+        });
+        let mut decl = fun_decl_from_blocks(vec![
+            call_block,
+            overflow_assert_block(2, 3),
+            bb(serde_json::json!("Return"), false, 0),
+            bb(serde_json::json!("UnwindResume"), true, 0),
+        ]);
+        let mut body = decl.unstructured().expect("Unstructured body");
+        decl.checked_binop_calls = Some(Arc::<[(u64, &'static str)]>::from([
+            (7u64, "AddChecked"),
+            (9u64, "MulChecked"),
+        ]));
+        decl.rewrite_checked_binop_calls(&mut body);
+        assert_eq!(body.body[0].statements.len(), 1);
+        match body.body[0].statements[0].stmt_kind().expect("typed") {
+            StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
+                assert_eq!(op, serde_json::json!("MulChecked"));
+            }
+            other => panic!("expected Assign(_, BinaryOp(MulChecked, ..)), got {other:?}"),
+        }
     }
 
     #[test]

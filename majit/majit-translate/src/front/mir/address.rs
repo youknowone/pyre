@@ -190,7 +190,13 @@ pub(in crate::front::mir) struct FunctionScopeCell {
 /// jtransform rewrites those calls to a box query (`jit.isconstant`)
 /// instead of the rustc `&T` pointer ABI. `ordereddict.lookup` still
 /// residual-executes the trampoline and is not in this set.
-pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
+pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> &std::collections::HashSet<String> {
+    llbc_derived(llbc)
+        .oopspec_fn_paths
+        .get_or_init(|| collect_oopspec_fn_paths(llbc))
+}
+
+fn collect_oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for gd in llbc.iter_global_decls() {
         let path = strip_crate_prefix(&gd.item_meta.name_path());
@@ -214,7 +220,27 @@ pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> std::collections::
     out
 }
 
-fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &std::collections::HashSet<String>) -> bool {
+/// Membership of artefact-local `oopspec:jit.*` paths plus the program set.
+#[derive(Clone, Copy)]
+pub(in crate::front::mir) struct OopspecFns<'a> {
+    local: &'a std::collections::HashSet<String>,
+    program: &'a std::collections::HashSet<String>,
+}
+
+impl<'a> OopspecFns<'a> {
+    pub(in crate::front::mir) fn new(
+        local: &'a std::collections::HashSet<String>,
+        program: &'a std::collections::HashSet<String>,
+    ) -> Self {
+        Self { local, program }
+    }
+
+    pub(in crate::front::mir) fn contains(&self, path: &str) -> bool {
+        self.local.contains(path) || self.program.contains(path)
+    }
+}
+
+fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &OopspecFns<'_>) -> bool {
     oopspec_fns.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
 }
 
@@ -299,7 +325,7 @@ fn residual_arg_store_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize
 fn residual_scalar_ref_callee(
     fd: &FunDecl,
     dont_look_inside: &std::collections::HashSet<String>,
-    oopspec_fns: &std::collections::HashSet<String>,
+    oopspec_fns: &OopspecFns<'_>,
 ) -> bool {
     fun_decl_is_residual(fd, dont_look_inside)
         && !fun_decl_has_oopspec(fd, oopspec_fns)
@@ -312,7 +338,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
     arg_count: usize,
     forward: &[bool],
     dont_look_inside: &std::collections::HashSet<String>,
-    oopspec_fns: &std::collections::HashSet<String>,
+    oopspec_fns: &OopspecFns<'_>,
 ) -> CellScalarPlan {
     let n_locals = body.locals.locals.len();
     let mut locals = bit_set::BitSet::with_capacity(n_locals);
@@ -446,7 +472,7 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
     arg_count: usize,
     forward: &[bool],
     dont_look_inside: &std::collections::HashSet<String>,
-    oopspec_fns: &std::collections::HashSet<String>,
+    oopspec_fns: &OopspecFns<'_>,
     cell_locals: &bit_set::BitSet,
 ) -> Vec<FunctionScopeCellPlan> {
     let mut out = Vec::new();

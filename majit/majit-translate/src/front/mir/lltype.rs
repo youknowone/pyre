@@ -3038,6 +3038,10 @@ pub(in crate::front::mir) struct LlbcDerived {
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
     /// Module of the unique type whose last path segment is `FrameAnchor`.
     pub(in crate::front::mir) frame_anchor_module: std::sync::OnceLock<Option<String>>,
+    /// FunDecl paths whose artefact-local `oopspec_*` marker consts spell
+    /// `jit.*`. Built from this `Llbc`'s global decls.
+    pub(in crate::front::mir) oopspec_fn_paths:
+        std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
