@@ -178,7 +178,7 @@ unsafe fn instance_node_getdictvalue_checked_str(
 /// The native item takes fat `&str`; unique look-inside leftover
 /// `residual_call_r_r` passes rstr `Ptr(STR)` (`llmodel.py bh_call_r`).
 /// `look_inside_iff` declined (`rordereddict.py ll_dict_lookup`) residualizes
-/// `_orig_module_dict_entries_get`; this trampoline is that orig.
+/// the orig at this name (`mint_look_inside_iff`); this trampoline is that orig.
 unsafe fn module_dict_entries_get_str(
     entries: *const pyre_object::celldict::ModuleDictEntries,
     key: *const pyre_object::unicodeobject::UnicodeValueStorage,
@@ -3526,27 +3526,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // Unique look-inside of `_getdictvalue_no_unwrapping_pure` promotes
     // then leftover-calls the look_inside_iff-declined probe
     // (`rordereddict.py ll_dict_lookup`). Native `&str` is fat; residual
-    // key is rstr `Ptr(STR)`.
+    // key is rstr `Ptr(STR)`. `look_inside_iff` keeps the orig at this
+    // name (`mint_look_inside_iff`); the sibling impl-method orig spelling
+    // is `_orig_<name>_unlikely_name` and is not used here. Crate-stripped
+    // `celldict::…` is the `register_macro_helper_trace_fnaddr` alias, not
+    // a hand-listed `{module}::{leaf}` next to `{crate}::{leaf}`.
     upa2!(
         &mut entries,
         "pyre_object::celldict::module_dict_entries_get",
         "pyre_object::module_dict_entries_get",
-        module_dict_entries_get_str,
-    );
-    upa2!(
-        &mut entries,
-        "pyre_object::celldict::_orig_module_dict_entries_get",
-        "pyre_object::_orig_module_dict_entries_get",
-        module_dict_entries_get_str,
-    );
-    up2!(
-        &mut entries,
-        "celldict::module_dict_entries_get",
-        module_dict_entries_get_str,
-    );
-    up2!(
-        &mut entries,
-        "celldict::_orig_module_dict_entries_get",
         module_dict_entries_get_str,
     );
     // The uncached arm's thin-pointer twins (`lookup_where_pair` under the
@@ -8204,70 +8192,72 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(
             bindings["pyre_object::celldict::module_dict_entries_get"] as usize
         ));
-        assert!(!is_abi_unsound_argument_residual(
-            bindings["pyre_object::celldict::_orig_module_dict_entries_get"] as usize
-        ));
         let r_word = super::ll_vec_alloc_and_set_nonnull_r_word as *const () as usize as i64;
         let i_word = super::ll_vec_alloc_and_set_nonnull_i_word as *const () as usize as i64;
         let f_word = super::ll_vec_alloc_and_set_nonnull_f_word as *const () as usize as i64;
-        assert_eq!(
-            bindings["majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline"],
-            r_word
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+            r_word,
         );
-        assert_eq!(
-            bindings["lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline"],
-            r_word
+        assert_occupied_binding(
+            &bindings,
+            "lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+            r_word,
         );
-        assert_eq!(
-            bindings["majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline"],
-            i_word
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+            i_word,
         );
-        assert_eq!(
-            bindings["majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline"],
-            f_word
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+            f_word,
         );
         assert!(!is_abi_unsound_argument_residual(r_word as usize));
         assert!(!is_abi_unsound_argument_residual(i_word as usize));
         assert!(!is_abi_unsound_argument_residual(f_word as usize));
         let call_non_fn =
             crate::call::call_non_function_callable_with_mode_jit_abi as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::call::call_non_function_callable_with_mode"],
-            call_non_fn
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::call::call_non_function_callable_with_mode",
+            call_non_fn,
         );
-        assert_eq!(
-            bindings["pyre_interpreter::call_non_function_callable_with_mode"],
-            call_non_fn
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::call_non_function_callable_with_mode",
+            call_non_fn,
         );
         assert!(!is_abi_unsound_argument_residual(call_non_fn as usize));
         let entries_get_trampoline =
             super::module_dict_entries_get_str as *const () as usize as i64;
         let entries_get_raw =
             pyre_object::celldict::module_dict_entries_get as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_object::celldict::module_dict_entries_get"],
-            entries_get_trampoline
-        );
-        assert_eq!(
-            bindings["pyre_object::celldict::_orig_module_dict_entries_get"],
-            entries_get_trampoline
+        assert_occupied_binding(
+            &bindings,
+            "pyre_object::celldict::module_dict_entries_get",
+            entries_get_trampoline,
         );
         assert_ne!(
             entries_get_trampoline, entries_get_raw,
             "must not publish the fat-&str item"
         );
         let build_tuple_trampoline = super::opcode_build_tuple_pyframe as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::shared_opcode::opcode_build_tuple"],
-            build_tuple_trampoline
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::shared_opcode::opcode_build_tuple",
+            build_tuple_trampoline,
         );
         let getdictvalue_trampoline =
             super::instance_node_getdictvalue_checked_str as *const () as usize as i64;
         let getdictvalue_raw = crate::objspace::std::mapdict::instance_node_getdictvalue_checked
             as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked"],
-            getdictvalue_trampoline
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
+            getdictvalue_trampoline,
         );
         assert_ne!(
             getdictvalue_trampoline, getdictvalue_raw,
@@ -8744,7 +8734,7 @@ mod tests {
                 slot_from_cached_word as *const () as usize as i64,
             ),
         ] {
-            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert_occupied_binding(&bindings, path, expected);
         }
     }
 
@@ -9370,7 +9360,7 @@ mod tests {
         let enter = crate::call::enter_recursive_frame as *const () as usize as i64;
         let native = crate::call::enter_native_dispatch as *const () as usize as i64;
         let release = crate::call::release_recursive_frame as *const () as usize as i64;
-        for (path, expected) in [
+        for (path, fallback) in [
             ("call::enter_recursive_frame", enter),
             ("pyre_interpreter::call::enter_recursive_frame", enter),
             ("call::enter_native_dispatch", native),
@@ -9378,7 +9368,7 @@ mod tests {
             ("call::release_recursive_frame", release),
             ("pyre_interpreter::call::release_recursive_frame", release),
         ] {
-            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert_occupied_binding(&bindings, path, fallback);
         }
     }
 
@@ -10646,34 +10636,28 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_vref_referent() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::executioncontext::vref_referent_jit_abi as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_interpreter::executioncontext::vref_referent"],
-            expected
-        );
-        assert_eq!(bindings["pyre_interpreter::vref_referent"], expected);
-        assert_eq!(bindings["executioncontext::vref_referent"], expected);
+        let fallback = crate::executioncontext::vref_referent_jit_abi as *const () as usize as i64;
+        for path in [
+            "pyre_interpreter::executioncontext::vref_referent",
+            "pyre_interpreter::vref_referent",
+            "executioncontext::vref_referent",
+        ] {
+            assert_occupied_binding(&bindings, path, fallback);
+        }
     }
 
     #[test]
     fn jit_trace_fnaddrs_covers_pin_frame_across_topframeref_barrier() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::executioncontext::pin_frame_across_topframeref_barrier_jit_abi
+        let fallback = crate::executioncontext::pin_frame_across_topframeref_barrier_jit_abi
             as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_interpreter::executioncontext::pin_frame_across_topframeref_barrier"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::pin_frame_across_topframeref_barrier"],
-            expected
-        );
-        assert_eq!(
-            bindings["executioncontext::pin_frame_across_topframeref_barrier"],
-            expected
-        );
+        for path in [
+            "pyre_interpreter::executioncontext::pin_frame_across_topframeref_barrier",
+            "pyre_interpreter::pin_frame_across_topframeref_barrier",
+            "executioncontext::pin_frame_across_topframeref_barrier",
+        ] {
+            assert_occupied_binding(&bindings, path, fallback);
+        }
     }
 
     /// `w_float_gc_alloc` is `dont_look_inside`; a typo in either spelling

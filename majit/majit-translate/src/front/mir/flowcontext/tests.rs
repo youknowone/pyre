@@ -11421,6 +11421,12 @@ fn harvested_execute_load_attr_aliases_arg_get() {
         &["execute_load_attr"],
     )
     .expect("harvest execute_load_attr");
+    let harvested_leaves: Vec<&str> = program
+        .functions
+        .iter()
+        .filter(|f| f.lazy_graph().get().is_some())
+        .map(|f| f.name.rsplit("::").next().unwrap_or(f.name.as_str()))
+        .collect();
     let mut hits: Vec<String> = Vec::new();
     let mut load_attr_found = 0usize;
     for f in &program.functions {
@@ -11430,7 +11436,14 @@ fn harvested_execute_load_attr_aliases_arg_get() {
         let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
         let base = crate::front::clause_spec::unspecialized_leaf(leaf);
         let get_leftovers = leftover_oparg_get_paths(graph);
-        let try_from_leftovers = leftover_core_try_from_paths(graph);
+        // The blanket TryFrom body is a harvested callee; only an unresolved target is a leftover.
+        let try_from_leftovers: Vec<String> = leftover_core_try_from_paths(graph)
+            .into_iter()
+            .filter(|path| {
+                let path_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+                !harvested_leaves.iter().any(|h| *h == path_leaf)
+            })
+            .collect();
         if base == "execute_load_attr" {
             load_attr_found += 1;
         }
@@ -12145,7 +12158,8 @@ fn harvested_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
         &["getcode", "co_flags", "w_code_get_ptr"],
     )
     .expect("harvest getcode/co_flags/w_code_get_ptr");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -12225,7 +12239,8 @@ fn harvested_new_malloc_typed_has_no_cast_ptr_to_int() {
         &["new_malloc_typed"],
     )
     .expect("harvest new_malloc_typed");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -12382,7 +12397,8 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
         &["eval_frame_with_resume", "execute_frame_portal"],
     )
     .expect("harvest eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let (resume_paths, portal_paths, mut cc) =
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = crate::codewriter::call::CallControl::new();
@@ -12651,7 +12667,8 @@ fn harvested_funccall_flat_looks_inside_eval_frame_with_resume() {
         ],
     )
     .expect("harvest funccall_flat_1 / execute_frame_portal / eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let (funccall_paths, portal_paths, resume_paths, mut cc) =
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = crate::codewriter::call::CallControl::new();
@@ -12872,7 +12889,8 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
         &["cached_root_raw", "root_stack_slot_raw"],
     )
     .expect("harvest cached_root_raw");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -13027,10 +13045,11 @@ fn harvested_load_global_value_uses_getname_w() {
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
         &["eval", "pyopcode", "pycode"],
-        &["load_global_value", "w_code_getname_w", "text_w"],
+        &["load_global_value", "getname_u", "w_code_getname_w", "text_w"],
     )
     .expect("harvest load_global_value");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -13158,7 +13177,7 @@ fn harvested_load_global_value_uses_getname_w() {
         });
         let uses_getname = residual_paths(&ops)
             .iter()
-            .any(|path| path_leaf(path) == "w_code_getname_w");
+            .any(|path| matches!(path_leaf(path).as_str(), "getname_u" | "w_code_getname_w"));
         let (names_w, indexes_table, native_names, pycode_owner) = field_index(&xf);
         // NamespaceOpcodeHandler::load_global_value is a trampoline onto
         // load_name_value; the jitted getname_u path is PyFrame's body.
@@ -13380,7 +13399,8 @@ fn harvested_eval_frame_with_resume_has_no_frame_anchor() {
         ],
     )
     .expect("harvest eval_frame_with_resume");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());
@@ -13538,7 +13558,8 @@ fn harvested_frame_dispatch_passes_the_frame_ref_to_next_instr() {
         ],
     )
     .expect("harvest frame_dispatch/next_instr");
-    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
     let mut cc = crate::codewriter::call::CallControl::new();
     cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     cc.set_known_struct_names(program.known_struct_names.clone());

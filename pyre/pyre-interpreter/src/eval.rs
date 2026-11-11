@@ -2705,7 +2705,7 @@ fn eval_frame_after_enter(
     // look-inside of that tuple NEW+SETFIELD then CAST_PTR_TO_INT of
     // the GCREF (`bhimpl_cast_ptr_to_int` asserts a tagged immediate).
     let mut outer_result: PyResult;
-    let mut w_exitvalue = pyre_object::w_none();
+    let mut w_exitvalue: PyObjectRef;
     {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent value and `OperationError` (`error.py`) are GC locals
@@ -2716,6 +2716,7 @@ fn eval_frame_after_enter(
         match trace {
             Err(e) => {
                 outer_result = Err(e);
+                w_exitvalue = pyre_object::w_none();
             }
             Ok(()) => {
                 let mut inner_result: PyResult = 'inner: {
@@ -2747,17 +2748,19 @@ fn eval_frame_after_enter(
                 // and the pending exception are still owed to `leave`.
                 let return_trace_result = {
                     let roots = pyre_object::gc_roots::push_roots();
-                    let pending = match &inner_result {
-                        Ok(value) => *value,
+                    let inner_is_ok = inner_result.is_ok();
+                    let pending = match inner_result {
+                        Ok(value) => value,
                         Err(err) => err.as_raw() as PyObjectRef,
                     };
                     let base = roots.pin_roots(&[w_exitvalue, pending]);
                     let result =
                         execution_context.return_trace(frame as *mut PyFrame, roots.get(base));
                     w_exitvalue = roots.get(base);
-                    inner_result = match inner_result {
-                        Ok(_) => Ok(roots.get(base + 1)),
-                        Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+                    inner_result = if inner_is_ok {
+                        Ok(roots.get(base + 1))
+                    } else {
+                        Err(crate::PyError::from_raw(roots.get(base + 1)))
                     };
                     result
                 };
@@ -2781,15 +2784,17 @@ fn eval_frame_after_enter(
     }
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let pending = match &outer_result {
-            Ok(value) => *value,
+        let outer_is_ok = outer_result.is_ok();
+        let pending = match outer_result {
+            Ok(value) => value,
             Err(err) => err.as_raw() as PyObjectRef,
         };
         let base = roots.pin_roots(&[w_exitvalue, pending]);
         let result = execution_context.leave(frame as *mut PyFrame, roots.get(base), got_exception);
-        outer_result = match outer_result {
-            Ok(_) => Ok(roots.get(base + 1)),
-            Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+        outer_result = if outer_is_ok {
+            Ok(roots.get(base + 1))
+        } else {
+            Err(crate::PyError::from_raw(roots.get(base + 1)))
         };
         result
     };
@@ -3424,14 +3429,13 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         // `getname_u` is `text_w(getname_w(index))`; `getname_w` reads
-        // `self.getcode().co_names_w`. Re-read `getcode_w` at each probe:
+        // `self.getcode().co_names_w`. `getname_u` re-reads `getcode_w` at each probe:
         // `get_builtin` can collect, and a copied W_Code pointer would go stale.
         // Unique look-inside (`we_are_jitted` ConstBool(true) on the lifted
         // graph) must pass that STR, not `code.names[idx].as_ref()` interned
         // `&str` identity-aliased as Str (`load_attr_cached` jitted arm).
         let varname = if majit_metainterp::jit::we_are_jitted() {
-            let w_name = unsafe { crate::pycode::w_code_getname_w(self.getcode_w(), nameindex) };
-            crate::baseobjspace::text_w(w_name)?
+            pyre_object::with_roots!(w_globals => unsafe { &*(roots.get(frame_slot) as *mut PyFrame) }.getname_u(nameindex))?
         } else {
             name
         };

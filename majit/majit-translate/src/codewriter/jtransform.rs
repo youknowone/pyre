@@ -19930,7 +19930,7 @@ mod tests {
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
-    fn register_codeobject_origin() -> parking_lot::MutexGuard<'static, ()> {
+    fn register_codeobject_origin() -> crate::test_support::StructRegistryTestGuard {
         crate::test_support::register_struct_origins_serialized(std::collections::HashMap::from([
             ("CodeObject".to_string(), "bytecode".to_string()),
         ]))

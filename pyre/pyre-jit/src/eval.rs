@@ -10091,7 +10091,16 @@ fn drive_sortkey_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let _outcome = meta.compile_loop(&jump_args);
+        // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+        let jump_boxes: Vec<Operand> = {
+            let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+            jump_args
+                .iter()
+                .copied()
+                .map(|r| ctx.operand_for(r))
+                .collect()
+        };
+        let _outcome = meta.compile_loop(&jump_boxes);
     } else if let Some(TraceAction::Finish {
         finish_args,
         finish_arg_types,

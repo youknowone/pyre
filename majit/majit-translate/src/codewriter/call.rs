@@ -49,55 +49,6 @@ use crate::decline::gate::{
     WRAPPER_FAMILY as WRAPPER_FAMILY_GATE,
 };
 
-/// Env-gated BFS / `guess_call_kind` dump for unique-look-inside leftover of
-/// `eval_frame_with_resume` from `execute_frame_portal`. Isolated harvest
-/// InlineCalls it; production residualizes.
-///
-/// `MAJIT_BFS_TRACE=1` writes `/tmp/majit-bfs-trace.txt`; any other non-empty
-/// value is the destination path. Cargo swallows build-script stderr on a
-/// successful run, so this cannot be `eprintln`.
-fn bfs_trace_resume_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("MAJIT_BFS_TRACE").is_some_and(|v| !v.is_empty() && v != "0")
-    })
-}
-
-fn bfs_trace(args: std::fmt::Arguments<'_>) {
-    use std::io::Write;
-    static FILE: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
-    let Some(file) = FILE.get_or_init(|| {
-        let raw = std::env::var_os("MAJIT_BFS_TRACE")?;
-        if raw.is_empty() || raw == "0" {
-            return None;
-        }
-        let path = if raw == "1" {
-            std::path::PathBuf::from("/tmp/majit-bfs-trace.txt")
-        } else {
-            std::path::PathBuf::from(raw)
-        };
-        let _ = std::fs::remove_file(&path);
-        std::fs::File::create(&path).ok().map(std::sync::Mutex::new)
-    }) else {
-        return;
-    };
-    if let Ok(mut f) = file.lock() {
-        let _ = writeln!(f, "{args}");
-    }
-}
-
-fn path_mentions_eval_frame_resume(path: &CallPath) -> bool {
-    path.segments
-        .iter()
-        .any(|s| s.contains("eval_frame_with_resume"))
-}
-
-fn path_mentions_execute_frame_portal(path: &CallPath) -> bool {
-    path.segments
-        .iter()
-        .any(|s| s.contains("execute_frame_portal"))
-}
-
 /// `specialize.py default_specialize` cache-key choice: the regular `key`
 /// versus `(AccessDirect, key)`. `cachedgraph` builds a distinct graph for
 /// the AccessDirect key under alt_name `{name}__AccessDirect_None`; that
@@ -9941,16 +9892,6 @@ impl CallControl {
                         &builtin_wrappers,
                         &fastfunc_2,
                     );
-                    if bfs_trace_resume_enabled()
-                        && (path_mentions_execute_frame_portal(&path)
-                            || path_mentions_eval_frame_resume(&path)
-                            || callees.iter().any(path_mentions_eval_frame_resume))
-                    {
-                        bfs_trace(format_args!(
-                            "[bfs-trace] scan caller={path} spec={:?} block={block_idx} op={op_idx} callees={callees:?}",
-                            path.specialization
-                        ));
-                    }
                     for callee_path in callees {
                         // A target with no registered graph is upstream's
                         // `funcobj.graph is None` → residual (call.py:127).
@@ -9963,17 +9904,7 @@ impl CallControl {
                         // precisely why the count has to exist: it turns "no
                         // jitcode appeared" into "this named path had no
                         // registered graph at BFS time".
-                        let trace = bfs_trace_resume_enabled()
-                            && (path_mentions_eval_frame_resume(&callee_path)
-                                || path_mentions_execute_frame_portal(&path)
-                                || path_mentions_eval_frame_resume(&path));
                         if self.candidate_graphs.contains(&callee_path) {
-                            if trace {
-                                bfs_trace(format_args!(
-                                    "[bfs-trace] already-candidate callee={callee_path} caller={path} spec={:?}",
-                                    callee_path.specialization
-                                ));
-                            }
                             continue;
                         }
                         let graph_ref = match self.function_graphs.get(&callee_path) {
@@ -9984,41 +9915,12 @@ impl CallControl {
                                     "callee-has-no-registered-graph",
                                     format_args!("{callee_path} in {path}"),
                                 );
-                                if trace {
-                                    bfs_trace(format_args!(
-                                        "[bfs-trace] no-graph callee={callee_path} caller={path}"
-                                    ));
-                                }
                                 continue;
                             }
                         };
                         // RPython call.py:84,87: callee must satisfy
                         // policy.look_inside_graph(graph).
-                        let unsupported =
-                            crate::codewriter::policy::contains_unsupported_variable_type(
-                                &graph_ref,
-                                policy.state().supports_floats,
-                                policy.state().supports_longlong,
-                                policy.state().supports_singlefloats,
-                            );
                         if policy.look_inside_graph(&graph_ref) {
-                            if trace {
-                                bfs_trace(format_args!(
-                                    "[bfs-trace] add callee={callee_path} caller={path} spec={:?} ad={} jit_look={:?} unroll={} elidable={} unsupported={unsupported} module={:?} n_blocks={} n_ops={}",
-                                    callee_path.specialization,
-                                    graph_ref.access_directly,
-                                    graph_ref.func.jit_look_inside,
-                                    graph_ref.func.unroll_safe,
-                                    graph_ref.func.elidable,
-                                    graph_ref.func.module,
-                                    graph_ref.blocks.len(),
-                                    graph_ref
-                                        .blocks
-                                        .iter()
-                                        .map(|b| b.operations.len())
-                                        .sum::<usize>(),
-                                ));
-                            }
                             self.candidate_graphs.insert(callee_path.clone());
                             todo.push(callee_path);
                         } else {
@@ -10034,40 +9936,10 @@ impl CallControl {
                                 "callee-policy-declined",
                                 format_args!("{callee_path} in {path}"),
                             );
-                            if trace {
-                                bfs_trace(format_args!(
-                                    "[bfs-trace] policy-declined callee={callee_path} caller={path} spec={:?} ad={} jit_look={:?} unroll={} elidable={} unsupported={unsupported} module={:?} n_blocks={} n_ops={}",
-                                    callee_path.specialization,
-                                    graph_ref.access_directly,
-                                    graph_ref.func.jit_look_inside,
-                                    graph_ref.func.unroll_safe,
-                                    graph_ref.func.elidable,
-                                    graph_ref.func.module,
-                                    graph_ref.blocks.len(),
-                                    graph_ref
-                                        .blocks
-                                        .iter()
-                                        .map(|b| b.operations.len())
-                                        .sum::<usize>(),
-                                ));
-                            }
                         }
                     }
                 }
             }
-        }
-        if bfs_trace_resume_enabled() {
-            let hits: Vec<String> = self
-                .candidate_graphs
-                .iter()
-                .filter(|p| {
-                    path_mentions_eval_frame_resume(p) || path_mentions_execute_frame_portal(p)
-                })
-                .map(|p| format!("{p} spec={:?}", p.specialization))
-                .collect();
-            bfs_trace(format_args!(
-                "[bfs-trace] candidates mentioning resume/portal: {hits:?}"
-            ));
         }
     }
 
@@ -10962,25 +10834,6 @@ impl CallControl {
             // so re-derive which one it was — but only when the census is
             // on, so the classification never runs on the hot path it
             // measures.
-            if bfs_trace_resume_enabled()
-                && let OpKind::Call { target, .. } = &op.kind
-                && (format!("{target:?}").contains("eval_frame_with_resume")
-                    || self
-                        .target_to_path(target)
-                        .as_ref()
-                        .is_some_and(path_mentions_eval_frame_resume))
-            {
-                match self.direct_callee_graph_path(target, None) {
-                    Some(p) => bfs_trace(format_args!(
-                        "[bfs-trace] guess_call_kind residual path={p} spec={:?} candidate={} target={target:?}",
-                        p.specialization,
-                        self.candidate_graphs.contains(&p),
-                    )),
-                    None => bfs_trace(format_args!(
-                        "[bfs-trace] guess_call_kind residual-unresolvable target={target:?}"
-                    )),
-                }
-            }
             if crate::decline::enabled() {
                 let reason = match &op.kind {
                     OpKind::Call { target, .. } => match self.target_to_path(target) {
@@ -11790,7 +11643,8 @@ impl CallControl {
     fn compute_builtin_fastfunc_2_indirect_graphs(&self) -> Vec<CallPath> {
         let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
             std::collections::BTreeMap::new();
-        for (path, &fnaddr) in &self.function_fnaddrs {
+        for (path, bound) in &self.function_fnaddrs {
+            let fnaddr = bound.addr;
             let Some(leaf) = path.last_segment() else {
                 crate::decline::record(
                     WRAPPER_FAMILY_GATE,

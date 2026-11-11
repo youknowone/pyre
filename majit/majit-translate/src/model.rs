@@ -4123,12 +4123,24 @@ pub(crate) fn registered_struct_layout<'a>(
     if let Some(exact) = struct_field_attrs.get(owner) {
         return Some(exact);
     }
-    let owner_id = majit_ir::descr::struct_id_for_name(owner)?;
-    let mut matches = struct_field_attrs.iter().filter_map(|(key, rows)| {
-        (majit_ir::descr::struct_id_for_name(key) == Some(owner_id)).then_some(rows)
-    });
-    let first = matches.next()?;
-    matches.all(|rows| rows == first).then_some(first)
+    if let Some(owner_id) = majit_ir::descr::struct_id_for_name(owner) {
+        let mut matches = struct_field_attrs.iter().filter_map(|(key, rows)| {
+            (majit_ir::descr::struct_id_for_name(key) == Some(owner_id)).then_some(rows)
+        });
+        if let Some(first) = matches.next() {
+            return matches.all(|rows| rows == first).then_some(first);
+        }
+    }
+    // `resolve_aggregate_adt` keeps the defining crate on
+    // `SyntheticTransparentCtor.owner_path` so intern identity stays the
+    // declaration path. `synthetic_transparent_ctor_owner` strips that
+    // crate only when it is this graph's crate or a seeded local root;
+    // a filtered harvest often has neither, so a foreign-crate boxing
+    // header arrives with the crate prefix still attached while
+    // `struct_field_attrs` is keyed crate-relative. One leading segment
+    // is that crate prefix (`relative_owner_from_segments`).
+    let rest = owner.split_once("::")?.1;
+    struct_field_attrs.get(rest)
 }
 
 /// Crate-relative struct path: Charon's declaration path with this
@@ -14775,6 +14787,13 @@ mod tests {
         assert_eq!(
             registered_struct_layout("unregistered::Owner", &attrs),
             None
+        );
+
+        // Crate-prefix spelling, no StructId: one leading segment is the
+        // crate (`relative_owner_from_segments`).
+        assert_eq!(
+            registered_struct_layout("foreign_crate::registered_layout_test::Owner", &attrs),
+            Some(&rows()),
         );
 
         // Two keys, one id, disagreeing rows: the answer is not a coin flip.

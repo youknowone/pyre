@@ -716,8 +716,7 @@ pub(crate) fn trait_default_method(
         .trait_by_id(trait_id)?
         .methods
         .get(method_idx as usize)?
-        .pointer("/skip_binder/default/id")?
-        .as_u64()?;
+        .default_id?;
     let fn_id = match listed_fn_id {
         Some(listed) if listed != default_fn_id => listed,
         _ => default_fn_id,

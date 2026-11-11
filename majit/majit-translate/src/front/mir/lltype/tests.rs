@@ -17275,6 +17275,7 @@ fn inline_variant_struct_payload_has_exact_leaf_layout() {
     assert_eq!(layout.field_offsets.get("__pos_0.b"), Some(&16));
     assert!(!layout.field_offsets.contains_key("__pos_0"));
     let rows = &program.struct_fields.fields["result::Result<Pair,()>::Ok"];
+    assert!(rows.iter().any(|row| row.name == "__discriminant"));
     assert!(rows.iter().any(|row| row.name == "__pos_0"));
     assert!(rows.iter().any(|row| row.name == "__pos_0.a"));
     assert!(rows.iter().any(|row| row.name == "__pos_0.b"));

@@ -264,6 +264,17 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_and_function_n
     function_names: &[&str],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     with_shared_link_write(llbcs.iter().map(std::borrow::Borrow::borrow), || {
+        // Harvested lib tests need the loaded crate names as alias roots
+        // for the duration of lowering (`SyntheticTransparentCtor` of a
+        // foreign-crate struct). Restore on return, matching
+        // `push_local_crate_roots`. Production
+        // `build_semantic_program_via_active_frontend` uses
+        // `register_local_crate_roots`; the filtered builder does not seed.
+        let _local_crates = crate::local_crates::push_local_crate_roots(
+            llbcs
+                .iter()
+                .map(|llbc| std::borrow::Borrow::borrow(llbc).crate_name().to_string()),
+        );
         crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             llbcs,
             static_addrs,
@@ -399,6 +410,25 @@ pub(crate) fn raw_layout_table_for(
     layout_table_for(names, GcKind::Raw)
 }
 
+/// Holds the test-lock and the previous registry map(s). `Drop` restores
+/// those maps before `_lock` is released (declaration order: maps, then lock).
+pub(crate) struct StructRegistryTestGuard {
+    previous_ids: Option<HashMap<String, Option<majit_ir::descr::StructId>>>,
+    previous_origins: Option<HashMap<String, String>>,
+    _lock: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl Drop for StructRegistryTestGuard {
+    fn drop(&mut self) {
+        if let Some(origins) = self.previous_origins.take() {
+            majit_ir::descr::replace_struct_origins(origins);
+        }
+        if let Some(ids) = self.previous_ids.take() {
+            majit_ir::descr::replace_struct_ids_by_name(ids);
+        }
+    }
+}
+
 /// Publish an origin table while excluding tests that replace either global
 /// struct-name registry. Production publishes both together for one program;
 /// tests must likewise prevent one table from changing under another test's
@@ -406,10 +436,14 @@ pub(crate) fn raw_layout_table_for(
 #[must_use = "the returned guard holds the registry lock for the rest of the test"]
 pub(crate) fn register_struct_origins_serialized(
     table: HashMap<String, String>,
-) -> parking_lot::MutexGuard<'static, ()> {
-    let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
-    majit_ir::descr::register_struct_origins(table);
-    guard
+) -> StructRegistryTestGuard {
+    let lock = STRUCT_REGISTRY_TEST_LOCK.lock();
+    let previous_origins = majit_ir::descr::replace_struct_origins(table);
+    StructRegistryTestGuard {
+        previous_ids: None,
+        previous_origins: Some(previous_origins),
+        _lock: lock,
+    }
 }
 
 /// Publish both global struct-name registries under one acquisition of their
@@ -419,9 +453,13 @@ pub(crate) fn register_struct_origins_serialized(
 pub(crate) fn register_struct_registries_serialized(
     ids: HashMap<String, Option<majit_ir::descr::StructId>>,
     origins: HashMap<String, String>,
-) -> parking_lot::MutexGuard<'static, ()> {
-    let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
-    majit_ir::descr::register_struct_ids(ids);
-    majit_ir::descr::register_struct_origins(origins);
-    guard
+) -> StructRegistryTestGuard {
+    let lock = STRUCT_REGISTRY_TEST_LOCK.lock();
+    let previous_ids = majit_ir::descr::replace_struct_ids_by_name(ids);
+    let previous_origins = majit_ir::descr::replace_struct_origins(origins);
+    StructRegistryTestGuard {
+        previous_ids: Some(previous_ids),
+        previous_origins: Some(previous_origins),
+        _lock: lock,
+    }
 }

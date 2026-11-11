@@ -2084,85 +2084,88 @@ mod tests {
         // CodeObject origins from sibling tests cannot qualify a bare
         // leaf. Tombstone until the unique-leaf case below
         // (`canonical_struct_name` of an empty module path stays the leaf).
-        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
-            "CodeObject".to_string(),
-            String::new(),
-        )]));
         let raw = HashSet::from(["bytecode::CodeObject".to_string()]);
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "bytecode::CodeObject"
-        ));
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "rustpython_compiler_core::bytecode::CodeObject"
-        ));
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "*const rustpython_compiler_core::bytecode::CodeObject"
-        ));
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "&bytecode::CodeObject"
-        ));
-        for spelling in [
-            "&mut bytecode::CodeObject",
-            "Box<bytecode::CodeObject>",
-            "NonNull<bytecode::CodeObject>",
-            "Arc<bytecode::CodeObject>",
-            "Rc<bytecode::CodeObject>",
-            "AtomicPtr<bytecode::CodeObject>",
-            "alloc::boxed::Box<bytecode::CodeObject>",
-            "alloc::sync::Arc<bytecode::CodeObject>",
-            "core::ptr::non_null::NonNull<bytecode::CodeObject>",
-            "std::sync::atomic::AtomicPtr<bytecode::CodeObject>",
-        ] {
-            assert!(
-                super::alloc_flavor_raw_contains(&raw, spelling),
-                "{spelling}"
-            );
-            assert!(
-                super::spelling_is_one_word_flavor_raw_ptr(&raw, spelling),
-                "{spelling}"
-            );
+        {
+            let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from(
+                [("CodeObject".to_string(), String::new())],
+            ));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "bytecode::CodeObject"
+            ));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "rustpython_compiler_core::bytecode::CodeObject"
+            ));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "*const rustpython_compiler_core::bytecode::CodeObject"
+            ));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "&bytecode::CodeObject"
+            ));
+            for spelling in [
+                "&mut bytecode::CodeObject",
+                "Box<bytecode::CodeObject>",
+                "NonNull<bytecode::CodeObject>",
+                "Arc<bytecode::CodeObject>",
+                "Rc<bytecode::CodeObject>",
+                "AtomicPtr<bytecode::CodeObject>",
+                "alloc::boxed::Box<bytecode::CodeObject>",
+                "alloc::sync::Arc<bytecode::CodeObject>",
+                "core::ptr::non_null::NonNull<bytecode::CodeObject>",
+                "std::sync::atomic::AtomicPtr<bytecode::CodeObject>",
+            ] {
+                assert!(
+                    super::alloc_flavor_raw_contains(&raw, spelling),
+                    "{spelling}"
+                );
+                assert!(
+                    super::spelling_is_one_word_flavor_raw_ptr(&raw, spelling),
+                    "{spelling}"
+                );
+            }
+            assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+                &raw,
+                "bytecode::CodeObject"
+            ));
+            assert!(!super::alloc_flavor_raw_contains(
+                &raw,
+                "Box<dyn bytecode::CodeObject>"
+            ));
+            assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+                &raw,
+                "Box<dyn Trait>"
+            ));
+            assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&[u8]"));
+            assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&str"));
+            assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
+            // A bare leaf does not guess from the raw-key subset.
+            assert!(!super::alloc_flavor_raw_contains(&raw, "CodeObject"));
         }
-        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
-            &raw,
-            "bytecode::CodeObject"
-        ));
-        assert!(!super::alloc_flavor_raw_contains(
-            &raw,
-            "Box<dyn bytecode::CodeObject>"
-        ));
-        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
-            &raw,
-            "Box<dyn Trait>"
-        ));
-        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&[u8]"));
-        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&str"));
-        assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
-        // A bare leaf does not guess from the raw-key subset.
-        assert!(!super::alloc_flavor_raw_contains(&raw, "CodeObject"));
-        majit_ir::descr::register_struct_origins(HashMap::from([(
-            "CodeObject".to_string(),
-            "bytecode".to_string(),
-        )]));
-        assert!(super::alloc_flavor_raw_contains(&raw, "CodeObject"));
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "CodeObject<ConstantData>"
-        ));
-        assert!(super::alloc_flavor_raw_contains(
-            &raw,
-            "&CodeObject<ConstantData>"
-        ));
-        majit_ir::descr::register_struct_origins(HashMap::from([(
-            "Node".to_string(),
-            String::new(),
-        )]));
-        let raw_node = HashSet::from(["a::Node".to_string()]);
-        assert!(super::alloc_flavor_raw_contains(&raw_node, "a::Node"));
-        assert!(!super::alloc_flavor_raw_contains(&raw_node, "Node"));
+        {
+            let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from(
+                [("CodeObject".to_string(), "bytecode".to_string())],
+            ));
+            assert!(super::alloc_flavor_raw_contains(&raw, "CodeObject"));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "CodeObject<ConstantData>"
+            ));
+            assert!(super::alloc_flavor_raw_contains(
+                &raw,
+                "&CodeObject<ConstantData>"
+            ));
+        }
+        {
+            let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from(
+                [("Node".to_string(), String::new())],
+            ));
+            let raw_node = HashSet::from(["a::Node".to_string()]);
+            assert!(super::alloc_flavor_raw_contains(&raw_node, "a::Node"));
+            assert!(!super::alloc_flavor_raw_contains(&raw_node, "Node"));
+        }
     }
 
     #[test]

@@ -729,13 +729,21 @@ static STRUCT_ID_BY_NAME: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, Option<StructId>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+/// Replace the process-global name → [`StructId`] table and return the
+/// previous map.
+pub fn replace_struct_ids_by_name(
+    table: std::collections::HashMap<String, Option<StructId>>,
+) -> std::collections::HashMap<String, Option<StructId>> {
+    let mut guard = STRUCT_ID_BY_NAME.lock();
+    std::mem::replace(&mut *guard, table)
+}
+
 /// Populate / replace the global name → [`StructId`] resolution table.
 /// The front-end builds it once at populate, inserting every
 /// spelling-variant of each type that maps unambiguously, and `None` for
 /// any bare leaf two distinct modules share.
 pub fn register_struct_ids(table: std::collections::HashMap<String, Option<StructId>>) {
-    let mut guard = STRUCT_ID_BY_NAME.lock();
-    *guard = table;
+    replace_struct_ids_by_name(table);
 }
 
 /// `raw` without its leading reference / raw-pointer markers: each of
@@ -877,13 +885,20 @@ static STRUCT_ORIGIN_REGISTRY: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, String>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+/// Replace the process-global origin table and return the previous map.
+pub fn replace_struct_origins(
+    origins: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut guard = STRUCT_ORIGIN_REGISTRY.lock();
+    std::mem::replace(&mut *guard, origins)
+}
+
 /// Populate / replace the global `STRUCT_ORIGIN_REGISTRY` with a fresh
 /// `(bare_name, defining_module_path)` table.  Analyzer calls this
 /// once after `collect_program_metadata_pub` so subsequent
 /// `canonical_struct_name` lookups see the resolver output.
 pub fn register_struct_origins(origins: std::collections::HashMap<String, String>) {
-    let mut guard = STRUCT_ORIGIN_REGISTRY.lock();
-    *guard = origins;
+    replace_struct_origins(origins);
 }
 
 /// Canonicalise a struct name into its `defining_module_path::Bare`

@@ -5534,17 +5534,10 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // No containing field place (`jtransform.py
-                    // rewrite_op_getfield` has no field to read). A borrowed
-                    // `repr(transparent)` scalar receiver is the word, not an
-                    // address, so its call stays. `Cell` is Opaque in consumer
-                    // LLBC, so a field place may land as a GCREF `FieldRead`
-                    // without `taken_by_address`; `get` of that result is still
-                    // the field's value, not an offset-0 `raw_load` of the
-                    // GCREF (`bhimpl_cast_ptr_to_int` of a heap pointer
-                    // panics). A `Cell` address that is already a local with no
-                    // struct field is the offset-0 `raw_load`, like
-                    // `FnPtrCell::get`.
+                    // No containing field place: the call stays
+                    // (`jtransform.py rewrite_op_getfield` has no field to
+                    // read), except a GCREF `FieldRead` without
+                    // `taken_by_address` is still that field's value.
                     if tyref_is_copy_scalar_or_thin_ptr(&call.dest.ty, self.llbc)
                         && !first_arg_ty.as_ref().is_some_and(|ty| {
                             tyref_is_borrowed_transparent_scalar(
@@ -5602,35 +5595,6 @@ impl<'a> Lowering<'a> {
                                     field,
                                     ty: dest_ty,
                                     pure,
-                                },
-                            });
-                            self.local_var[dest_local] = Some(LocalValue::One(res));
-                            let target_bb = self.block_id[target];
-                            let link_args = self.edge_args(mir_bb, target)?;
-                            self.graph.set_goto(bb_id, target_bb, link_args);
-                            return Ok(());
-                        }
-                        if let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&call.dest.ty)
-                        {
-                            let offset = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(offset.clone()),
-                                kind: OpKind::ConstInt(0),
-                            });
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind: OpKind::RawLoad {
-                                    base: args[0].clone(),
-                                    offset,
-                                    item_ty,
-                                    itemsize,
-                                    is_item_signed,
                                 },
                             });
                             self.local_var[dest_local] = Some(LocalValue::One(res));

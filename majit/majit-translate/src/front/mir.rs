@@ -545,9 +545,6 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
     let llbcs: &[&Llbc] = &llbc_refs;
-    let _local_crates = crate::local_crates::push_local_crate_roots(
-        llbcs.iter().map(|llbc| llbc.crate_name().to_string()),
-    );
     if link_scalars {
         link_transparent_scalar_types(llbcs);
     }
@@ -1623,6 +1620,20 @@ fn register_ref_enum_instantiation_rows(
                             break;
                         };
 
+                        // `explicit_sum_shell` records `__discriminant` as the
+                        // variant's first FieldRow. ExactLayout already has that
+                        // tag at byte 0; without the FieldRow,
+                        // `GcStructLayout::apply_exact_layout` omits it,
+                        // `result_variant` is false, and
+                        // `bh_all_field_specs_for_struct_into` lists both the
+                        // logical `__pos_0` leaves and these dotted rows
+                        // (`heaptracker.all_fielddescrs`).
+                        if !rows.iter().any(|row| row.name == "__discriminant") {
+                            rows.push(crate::front::semantic::FieldRow::named(
+                                "__discriminant",
+                                "i64",
+                            ));
+                        }
                         rows.push(field_row_from_decl(i, f, concrete.clone(), llbc));
                         let exact = exact_layouts.entry(sid).or_default();
                         exact.align = Some(8.max(expansion.align));
@@ -1630,6 +1641,9 @@ fn register_ref_enum_instantiation_rows(
                         for leaf in &expansion.leaves {
                             let dotted =
                                 format!("{}.{}{}", fname, leaf.super_path, leaf.field.name);
+                            if rows.iter().any(|row| row.name == dotted) {
+                                continue;
+                            }
                             let row_ty = tyref_to_field_layout_string(
                                 &leaf.source_ty,
                                 llbc,
