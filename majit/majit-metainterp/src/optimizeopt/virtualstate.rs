@@ -2491,24 +2491,29 @@ impl GuardRequirement {
 /// Export the abstract state of loop-carried values.
 ///
 /// Given the current optimization context and PtrInfo table (from the virtualize pass),
-/// create a VirtualState snapshot for the given OpRefs (typically the Jump args).
+/// create a VirtualState snapshot for the given boxes (typically the Jump args).
 ///
-/// virtualstate.py: VirtualStateConstructor.make_virtual_state()
-pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
+/// virtualstate.py VirtualStateConstructor.get_virtual_state / create_state
+/// hold boxes. RPython `get_virtual_state(end_args)` holds Box objects, not
+/// positions.
+pub(crate) fn export_state_operands(
+    operands: &[majit_ir::operand::Operand],
+    ctx: &OptContext,
+) -> VirtualState {
     // virtualstate.py VirtualStateConstructor.create_state caches by
-    // resolved box: if two different oprefs (or two field references) resolve
-    // to the same target, they share the SAME `VirtualStateInfo` Python
-    // object — and consequently the same `position` /
-    // `position_in_notvirtuals`. The Rust port mirrors this with an
-    // `Rc<VirtualStateInfoNode>` cache shared across the whole export, including
-    // recursive nested-field calls AND top-level jump args.
+    // resolved box: if two different field references resolve to the same
+    // target, they share the SAME `VirtualStateInfo` Python object — and
+    // consequently the same `position` / `position_in_notvirtuals`. The Rust
+    // port mirrors this with an `Rc<VirtualStateInfoNode>` cache shared across
+    // the whole export, including recursive nested-field calls AND top-level
+    // jump args.
     //
     // virtualstate.py `create_state` does `box = get_box_replacement(box)`
     // inside the per-value walk, so we don't pre-resolve here.
     let mut cache = ExportCache::new();
-    let state: Vec<Rc<VirtualStateInfoNode>> = oprefs
+    let state: Vec<Rc<VirtualStateInfoNode>> = operands
         .iter()
-        .map(|opref| export_single_value(*opref, ctx, &mut cache))
+        .map(|operand| export_single_operand(operand, ctx, &mut cache))
         .collect();
     // virtualstate.py VirtualState.__init__ assigns positions via
     // _enum so subsequent walks dedup shared Rc'd subtrees via
@@ -2516,21 +2521,7 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     VirtualState::from_shared_rcs(state)
 }
 
-/// Same walk as [`export_state`], keyed by the already-resolved boxes.
-/// RPython `get_virtual_state(end_args)` holds Box objects, not positions.
-pub(crate) fn export_state_operands(
-    operands: &[majit_ir::operand::Operand],
-    ctx: &OptContext,
-) -> VirtualState {
-    let mut cache = ExportCache::new();
-    let state: Vec<Rc<VirtualStateInfoNode>> = operands
-        .iter()
-        .map(|operand| export_single_operand(operand, ctx, &mut cache))
-        .collect();
-    VirtualState::from_shared_rcs(state)
-}
-
-/// Bookkeeping shared across `export_single_value` recursion: the DAG cache
+/// Bookkeeping shared across `export_single_operand` recursion: the DAG cache
 /// (fully constructed nodes only) plus an `in_progress` set used to detect
 /// back-edges. Splitting the two prevents the previous "insert Unknown stub
 /// then overwrite" pattern from leaking the stub to in-flight recursive
@@ -2548,7 +2539,7 @@ pub(crate) struct ExportCache {
     // virtual `W_UnicodeObject.len = 5` as one box.
     //
     // bind-at-alloc invariant: every position reaching export resolves to a
-    // bound box (debug-asserted in `export_single_value`). Production forced
+    // bound box (debug-asserted in `export_single_operand`). Production forced
     // end-args and `ProducedShortOp.res` (`PreambleOp::add_op_to_short`
     // `materialize_operand_at`) are bound at creation; an unbound position would
     // mint a fresh operand from the opref per visit and split the cache, so the
@@ -2615,14 +2606,6 @@ fn create_state_or_none(
 /// reflects the genuine acyclic prefix, and downstream code that
 /// requires real cycle preservation can detect the dropped edge by
 /// checking for `Unknown` in a virtual subtree.
-fn export_single_value(
-    opref: OpRef,
-    ctx: &OptContext,
-    cache: &mut ExportCache,
-) -> Rc<VirtualStateInfoNode> {
-    export_single_operand(&ctx.get_box_replacement_operand(opref), ctx, cache)
-}
-
 fn export_single_operand(
     operand: &majit_ir::operand::Operand,
     ctx: &OptContext,
@@ -2913,7 +2896,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::info::{VirtualArrayInfo, VirtualStructInfo};
     use majit_ir::operand::Operand;
-    use majit_ir::{Descr, FieldDescr, GcRef, Type};
+    use majit_ir::{Descr, FieldDescr, GcRef, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -3412,7 +3395,7 @@ mod tests {
             PtrInfo::array(test_descr(20), IntBound::bounded(0, 10)),
         );
 
-        let state = export_state(&[array_ref], &ctx);
+        let state = export_state_operands(&[array_box.clone()], &ctx);
         assert!(matches!(state.state[0].info, VirtualStateInfo::NonNull));
         let lenbound = state.state[0]
             .lenbound
@@ -3442,7 +3425,7 @@ mod tests {
             }),
         );
 
-        let state = export_state(&[array_ref], &ctx);
+        let state = export_state_operands(&[array_box.clone()], &ctx);
         let VirtualStateInfo::VArray { items, .. } = &state.state[0].info else {
             panic!("exported state is not a virtual array");
         };
@@ -3477,7 +3460,7 @@ mod tests {
             }),
         );
 
-        let state = export_state(&[struct_ref], &ctx);
+        let state = export_state_operands(&[struct_box.clone()], &ctx);
         let VirtualStateInfo::VStruct { fields, .. } = &state.state[0].info else {
             panic!("exported state is not a virtual struct");
         };
@@ -3597,15 +3580,12 @@ mod tests {
         info.setfield(0, field_box.clone());
         ctx.set_ptr_info(&object_box, info);
 
-        let args = [object, field, scalar];
-        let state = export_state(&args, &ctx);
+        let scalar_box = ctx
+            .get_box_replacement_operand_opt(scalar)
+            .expect("scalar box is bound");
+        let boxes = [object_box.clone(), field_box.clone(), scalar_box];
+        let state = export_state_operands(&boxes, &ctx);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let boxes = [
-            object_box.clone(),
-            field_box.clone(),
-            ctx.get_box_replacement_operand_opt(scalar)
-                .expect("scalar box is bound"),
-        ];
         let matched = state.make_inputargs_and_virtuals(&boxes, &mut optimizer, &mut ctx, false);
 
         assert!(
@@ -3625,13 +3605,19 @@ mod tests {
     #[test]
     fn independent_const_int_uses_do_not_share_virtualstate_position() {
         let ctx = OptContext::new(32);
-        let five = OpRef::const_int(5);
-        let state = export_state(&[five, five], &ctx);
+        let a = Operand::const_from_value(Value::Int(5));
+        let b = Operand::const_from_value(Value::Int(5));
+        // history.py ConstInt.__init__ mints a fresh instance per use.
+        // Operand Eq is that object identity; Const.same_box is value
+        // identity (`same_constant`), so two `ConstInt(5)` are same_box
+        // and still distinct boxes.
+        assert_ne!(a, b, "ConstInt.__init__ mints a fresh instance per use");
+        let state = export_state_operands(&[a, b], &ctx);
         assert_eq!(state.state.len(), 2);
         assert_ne!(
             state.state[0].position.get(),
             state.state[1].position.get(),
-            "interned ConstInt operands must not share generate_guards renum positions"
+            "independent ConstInt uses must not share generate_guards renum positions"
         );
     }
 

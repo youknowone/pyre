@@ -2292,15 +2292,6 @@ impl UnrollOptimizer {
         let guard_count = Self::count_guards(ops);
         guard_count > max_retrace_guards
     }
-
-    /// unroll.py: get_virtual_state(args)
-    /// Build a VirtualState from the optimizer's current knowledge about args.
-    pub fn get_virtual_state(
-        args: &[OpRef],
-        ctx: &crate::optimizeopt::OptContext,
-    ) -> crate::optimizeopt::virtualstate::VirtualState {
-        crate::optimizeopt::virtualstate::export_state(args, ctx)
-    }
 }
 
 fn closing_loop_contract_arity<T: AsRef<Op>>(ops: &[T], fallback: usize) -> usize {
@@ -3254,7 +3245,7 @@ impl OptUnroll {
     /// - short boxes: mapping of preamble ops to label args
     pub fn export_state(
         &self,
-        original_label_args: &[OpRef],
+        original_label_args: &[Operand],
         renamed_inputargs: &[Operand],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -3265,7 +3256,7 @@ impl OptUnroll {
     /// unroll.py: export_state implementation.
     fn export_state_with_bounds(
         &self,
-        original_label_args: &[OpRef],
+        original_label_args: &[Operand],
         renamed_inputargs: &[Operand],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -3286,22 +3277,14 @@ impl OptUnroll {
         //   end_args = [force_box_for_end_of_preamble(a) for a in original_label_args]
         //   end_args = [get_box_replacement(arg) for arg in end_args]
         // Forced boxes are stored on the context / preview and passed
-        // straight through; the no-preview fallback materializes the
-        // caller-supplied original_label_args positions.
+        // straight through; the no-preview fallback is the identity walk
+        // `arg.get_box_replacement(false)` over the caller boxes.
         let end_args: Vec<Operand> = preview_args_state.as_ref().map_or_else(
             || {
                 ctx.preamble_end_args.clone().unwrap_or_else(|| {
                     original_label_args
                         .iter()
-                        .map(|&arg| {
-                            ctx.get_box_replacement_operand_opt(arg)
-                                .unwrap_or_else(|| match arg {
-                                    OpRef::InputArgInt(_)
-                                    | OpRef::InputArgFloat(_)
-                                    | OpRef::InputArgRef(_) => ctx.materialize_operand_at(arg),
-                                    _ => ctx.mint_box_at(arg),
-                                })
-                        })
+                        .map(|arg| arg.get_box_replacement(false))
                         .collect()
                 })
             },
@@ -4807,7 +4790,7 @@ impl OptUnroll {
 
 /// unroll.py: export_state — module-level entry point.
 pub(crate) fn export_state(
-    jump_args: &[OpRef],
+    jump_args: &[Operand],
     renamed_inputargs: &[Operand],
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
@@ -7464,10 +7447,10 @@ mod tests {
         let box21 = ctx
             .get_box_replacement_operand_opt(OpRef::int_op(21))
             .expect("int_op(21) bound to a box");
-        exported_bounds.insert(box21, IntBound::bounded(10, 20));
+        exported_bounds.insert(box21.clone(), IntBound::bounded(10, 20));
 
         let exported = export_state(
-            &[OpRef::int_op(21)],
+            std::slice::from_ref(&box21),
             &[],
             &mut optimizer,
             &mut ctx,
@@ -7478,7 +7461,7 @@ mod tests {
             match exported
                 .exported_infos
                 .iter()
-                .find(|(k, _)| k.to_opref() == OpRef::int_op(21))
+                .find(|(k, _)| k.same_box(&box21))
                 .map(|(_, v)| v)
                 .unwrap()
             {
@@ -7545,13 +7528,19 @@ mod tests {
 
         // `None` side table → current code has no way to recover the bound and
         // drops it; the live-bound read must surface it.
-        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let exported = export_state(
+            std::slice::from_ref(&box21),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
 
         assert_eq!(
             match exported
                 .exported_infos
                 .iter()
-                .find(|(k, _)| k.to_opref() == OpRef::int_op(21))
+                .find(|(k, _)| k.same_box(&box21))
                 .map(|(_, v)| v)
             {
                 Some(crate::optimizeopt::info::OpInfo::IntBound(b)) => {
@@ -7582,7 +7571,13 @@ mod tests {
         const CLASS: i64 = 0x1234;
         ctx.set_ptr_info(&box21, PtrInfo::instance(None, Some(CLASS)));
 
-        let exported = export_state(&[OpRef::ref_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let exported = export_state(
+            std::slice::from_ref(&box21),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
 
         match exported.exported_infos.get(&box21) {
             Some(OpInfo::Ptr(rc)) => match &*rc.borrow() {
@@ -7678,7 +7673,13 @@ mod tests {
             }),
         );
 
-        let exported = export_state(&[OpRef::ref_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let exported = export_state(
+            std::slice::from_ref(&obj),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
 
         match exported.exported_infos.get(&obj) {
             Some(info) => assert!(info.is_virtual(), "virtual head must be exported"),
@@ -7830,7 +7831,10 @@ mod tests {
         let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
             0, MASK,
         ))]);
-        let incoming_vs = crate::optimizeopt::virtualstate::export_state(&[masked], &ctx);
+        let incoming_vs = crate::optimizeopt::virtualstate::export_state_operands(
+            std::slice::from_ref(&mask_box),
+            &ctx,
+        );
         let runtime_box = Operand::const_from_value(Value::Int(0));
         let guard_reqs = target_vs
             .generate_guards(
@@ -7867,7 +7871,13 @@ mod tests {
         let forced = ctx.materialize_operand_at(OpRef::int_op(21));
         ctx.preamble_end_args = Some(vec![forced.clone()]);
 
-        let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
+        let exported = export_state(
+            std::slice::from_ref(&forced),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
 
         assert!(
             exported.end_args[0].same_box(&forced),
@@ -7943,10 +7953,10 @@ mod tests {
         // = materialize_operand_at, `PreambleOp::add_op_to_short`).
         // virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_operand_at(OpRef::int_op(11));
+        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
-            &[OpRef::int_op(10), OpRef::int_op(11)],
+            &[source_receiver.clone(), box11],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -8060,10 +8070,10 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             });
-        ctx.materialize_operand_at(OpRef::int_op(11));
+        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
-            &[OpRef::int_op(10), OpRef::int_op(11)],
+            &[source_receiver.clone(), box11],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -8157,16 +8167,10 @@ mod tests {
         // ProducedShortOp.res = materialize_operand_at,
         // `PreambleOp::add_op_to_short`);
         // virtualstate.py create_state receives real AbstractValues.
-        ctx.materialize_operand_at(OpRef::int_op(12));
-        ctx.materialize_operand_at(OpRef::int_op(11));
+        let box12 = ctx.materialize_operand_at(OpRef::int_op(12));
+        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
 
-        let exported = export_state(
-            &[OpRef::int_op(12), OpRef::int_op(11)],
-            &[],
-            &mut optimizer,
-            &mut ctx,
-            None,
-        );
+        let exported = export_state(&[box12, box11], &[], &mut optimizer, &mut ctx, None);
         // Both label args resolve to Int op slots (12 / 11 = GetfieldGcI base / result).
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
@@ -8207,8 +8211,14 @@ mod tests {
     fn test_import_state_uses_source_inputarg_box_identity() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        ctx.materialize_operand_at(OpRef::int_op(21));
-        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let box21 = ctx.materialize_operand_at(OpRef::int_op(21));
+        let exported = export_state(
+            std::slice::from_ref(&box21),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int]);
         let source = ctx2.inputarg_at(0).expect("phase-2 input must be bound");
@@ -8247,8 +8257,14 @@ mod tests {
     fn test_import_state_collision_alias_is_fresh_typed_inputarg() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        ctx.materialize_operand_at(OpRef::int_op(21));
-        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
+        let box21 = ctx.materialize_operand_at(OpRef::int_op(21));
+        let exported = export_state(
+            std::slice::from_ref(&box21),
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
         let carried = exported.next_iteration_args[0].clone();
 
         let mut ctx2 =
@@ -8319,16 +8335,10 @@ mod tests {
         // ProducedShortOp.res = materialize_operand_at,
         // `PreambleOp::add_op_to_short`);
         // virtualstate.py create_state receives real AbstractValues.
-        ctx.materialize_operand_at(OpRef::int_op(10));
-        ctx.materialize_operand_at(OpRef::int_op(11));
+        let box10 = ctx.materialize_operand_at(OpRef::int_op(10));
+        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
 
-        let exported = export_state(
-            &[OpRef::int_op(10), OpRef::int_op(11)],
-            &[],
-            &mut optimizer,
-            &mut ctx,
-            None,
-        );
+        let exported = export_state(&[box10, box11], &[], &mut optimizer, &mut ctx, None);
         // CallLoopinvariantI produces an Int at int_op(11); slot 10 is the
         // Int func-address constant base, so both label args are Int.
         let mut ctx2 =
@@ -8665,17 +8675,11 @@ mod tests {
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_operand_at(OpRef::int_op(12));
-        ctx.materialize_operand_at(OpRef::int_op(13));
-        ctx.materialize_operand_at(OpRef::int_op(14));
+        let box12 = ctx.materialize_operand_at(OpRef::int_op(12));
+        let box13 = ctx.materialize_operand_at(OpRef::int_op(13));
+        let box14 = ctx.materialize_operand_at(OpRef::int_op(14));
 
-        let exported = export_state(
-            &[OpRef::int_op(12), OpRef::int_op(13), OpRef::int_op(14)],
-            &[],
-            &mut optimizer,
-            &mut ctx,
-            None,
-        );
+        let exported = export_state(&[box12, box13, box14], &[], &mut optimizer, &mut ctx, None);
         // IntAdd producer at int_op(30) consumes Int op slots, so the
         // imported targetargs must be Int-typed too — generous pool keeps
         // typed `OpRef::input_arg_int(K)` handles for any K the test walks.

@@ -3551,15 +3551,17 @@ impl Optimizer {
                 //   self.optimizer.flush()
                 //   virtual_state = self.get_virtual_state(end_args)
                 // — VS captured AFTER force + flush.
-                let original_jump_args: Vec<OpRef> = pre_jump_resolved_args
+                let original_jump_boxes: Vec<Operand> = pre_jump_resolved_args
                     .clone()
-                    .map(|v| v.iter().map(|b| b.to_opref()).collect())
+                    .map(|v| v.into_iter().collect())
                     .unwrap_or_else(|| {
                         jump.args_slice()
                             .iter()
-                            .map(|a| a.get_box_replacement(false).to_opref())
+                            .map(|a| a.get_box_replacement(false))
                             .collect()
                     });
+                let original_jump_args: Vec<OpRef> =
+                    original_jump_boxes.iter().map(Operand::to_opref).collect();
                 let mut resolved_args = original_jump_args.clone();
                 // Dedup: two cases require SameAs allocation at end of preamble.
                 //
@@ -3748,7 +3750,7 @@ impl Optimizer {
                 // InputArg boxes already living on this optimizer context.
                 let renamed_inputargs: Vec<Operand> = ctx.inputargs[..num_inputs].to_vec();
                 Some(crate::optimizeopt::unroll::export_state(
-                    &original_jump_args,
+                    &original_jump_boxes,
                     &renamed_inputargs,
                     self,
                     &mut ctx,
@@ -4624,7 +4626,7 @@ impl Optimizer {
             // recomputes from `ctx.preamble_end_args`.
             let _ = self.publish_preview_short_state(&mut ctx, &preview_args);
             let mut state = crate::optimizeopt::unroll::export_state(
-                &jump_args,
+                &jump_boxes,
                 &renamed_inputargs,
                 self,
                 &mut ctx,
