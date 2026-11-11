@@ -7132,7 +7132,7 @@ pub fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> 
 /// still compared against whatever the bucket holds, so a stored non-string
 /// key whose hash collides can run a user `__eq__`, and the raw accessor
 /// reports that as an ordinary miss — the attribute would look absent.
-fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+pub(crate) fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
     // interp_iobase.py W_IOBase.getdictvalue — a typed IO payload owns
     // `w_dict` (`typedef.hasdict`), so `_getusercls` does not mix in
     // `MapdictDictSupport`. A null `w_dict` is a miss and does not allocate.

@@ -50,7 +50,26 @@ pub fn lazy_import_new(
             "lazy_import: fromlist must be None, a string, or a tuple",
         ));
     };
-    Ok(w_lazy_import_new(w_builtins, w_from, w_attr))
+    // `lazyimportobject.c _PyLazyImport_New`: store the current frame's code
+    // and LASTI. `PyFrame.last_instr` is an instruction-unit index (same unit
+    // as LASTI); `w_code_addr2line` takes a byte offset, so callers multiply
+    // by 2.
+    let frame = current_frame();
+    let (w_code, instr_offset) = if frame.is_null() {
+        (PY_NULL, -1)
+    } else {
+        (
+            unsafe { (*frame).getcode_w() },
+            unsafe { (*frame).last_instr } as i64,
+        )
+    };
+    Ok(w_lazy_import_new(
+        w_builtins,
+        w_from,
+        w_attr,
+        w_code,
+        instr_offset,
+    ))
 }
 
 /// `_PyEval_LazyImportFrom`
@@ -221,6 +240,134 @@ pub fn load_lazy_import(lazy_import: PyObjectRef) -> Result<PyObjectRef, crate::
     load_lazy_import_impl(lazy_import).map(|(value, _imported)| value)
 }
 
+/// `lazyimportobject.c lazy_import_add_exception_cause`
+fn lazy_import_add_exception_cause(lz: PyObjectRef, mut err: crate::PyError) -> crate::PyError {
+    let roots = pyre_object::gc_roots::push_roots();
+    let lz_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lz);
+    let err_slot = err.pin(&roots);
+    let lz = pyre_object::gc_roots::shadow_stack_get(lz_slot);
+    let w_code = unsafe { (*w_lazy_import_cast(lz)).w_code };
+    let instr_offset = unsafe { (*w_lazy_import_cast(lz)).instr_offset };
+    if w_code.is_null() || instr_offset < 0 {
+        err.reload(&roots, err_slot);
+        return err;
+    }
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code);
+    err.reload(&roots, err_slot);
+    let exc = err.to_exc_object();
+    err.reload(&roots, err_slot);
+    if exc.is_null() || unsafe { !is_exception(exc) } {
+        return err;
+    }
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let lz = pyre_object::gc_roots::shadow_stack_get(lz_slot);
+    let name = match lazy_import_name(lz) {
+        Ok(n) => n,
+        Err(_) => {
+            err.reload(&roots, err_slot);
+            return err;
+        }
+    };
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    err.reload(&roots, err_slot);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
+    // `PyCode_Addr2Line(lz_code, lz_instr_offset * 2)`: LASTI / `last_instr`
+    // is an instruction index; `w_code_addr2line` wants a byte offset.
+    let lineno = unsafe { crate::pycode::w_code_addr2line(w_code, instr_offset.saturating_mul(2)) };
+    let filename_obj = unsafe { crate::pycode::w_code_filename_obj(w_code) };
+    if filename_obj.is_null() {
+        err.reload(&roots, err_slot);
+        return err;
+    }
+    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(filename_obj);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
+    let funcname_obj = unsafe { crate::pycode::w_code_name_obj(w_code) };
+    if funcname_obj.is_null() {
+        err.reload(&roots, err_slot);
+        return err;
+    }
+    let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(funcname_obj);
+    err.reload(&roots, err_slot);
+    let Some(filename) = str_value(pyre_object::gc_roots::shadow_stack_get(filename_slot)) else {
+        err.reload(&roots, err_slot);
+        return err;
+    };
+    let filename = filename.to_owned();
+    let Some(funcname) = str_value(pyre_object::gc_roots::shadow_stack_get(funcname_slot)) else {
+        err.reload(&roots, err_slot);
+        return err;
+    };
+    let funcname = funcname.to_owned();
+    let Some(name_s) = str_value(pyre_object::gc_roots::shadow_stack_get(name_slot)) else {
+        err.reload(&roots, err_slot);
+        return err;
+    };
+    let name_s = name_s.to_owned();
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let cause = unsafe { w_exception_get_cause(exc) };
+    let context = unsafe { w_exception_get_context(exc) };
+    let suppress = unsafe { w_exception_get_suppress_context(exc) };
+    if !cause.is_null() || !context.is_null() || suppress {
+        let note = w_str_new(&format!(
+            "lazy import of '{name_s}' declared in {funcname} at {filename}:{lineno}"
+        ));
+        let note_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(note);
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        let notes = crate::baseobjspace::getattr_str_impl(exc, "__notes__", true, true);
+        let add = match notes {
+            Ok(notes) if notes.is_null() => true,
+            Ok(notes) => {
+                let notes_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(notes);
+                match crate::baseobjspace::contains(
+                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
+                    pyre_object::gc_roots::shadow_stack_get(note_slot),
+                ) {
+                    Ok(false) => true,
+                    _ => false,
+                }
+            }
+            Err(_) => false,
+        };
+        if add {
+            let _ = crate::baseobjspace::base_exception_add_note(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(note_slot),
+            );
+        }
+        err.reload(&roots, err_slot);
+        return err;
+    }
+    let mut cause_err = crate::PyError::new(
+        crate::PyErrorKind::ImportError,
+        format!("lazy import of '{name_s}' raised an exception during resolution"),
+    );
+    err.reload(&roots, err_slot);
+    let cause = cause_err.to_exc_object();
+    err.reload(&roots, err_slot);
+    if cause.is_null() || unsafe { !is_exception(cause) } {
+        return err;
+    }
+    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cause);
+    // `_PyTraceback_Add` has no interpreter helper; the cause is still set.
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+    unsafe {
+        w_exception_set_cause(exc, cause);
+        w_exception_set_suppress_context(exc, true);
+    }
+    err.reload(&roots, err_slot);
+    err
+}
+
 fn load_lazy_import_impl(
     mut lazy_import: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
@@ -243,7 +390,13 @@ fn load_lazy_import_impl(
     resolving_push(pyre_object::gc_roots::shadow_stack_get(lazy_slot));
     let result = load_lazy_import_resolve(lazy_slot, root_slot, first_slot);
     resolving_pop(pyre_object::gc_roots::shadow_stack_get(lazy_slot));
-    result
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => Err(lazy_import_add_exception_cause(
+            pyre_object::gc_roots::shadow_stack_get(lazy_slot),
+            e,
+        )),
+    }
 }
 
 fn load_lazy_import_resolve(
@@ -729,20 +882,108 @@ fn import_abs_name(
     }
 }
 
-fn lazy_modules_add(mut name: PyObjectRef) -> Result<(), crate::PyError> {
-    if let Some(name_s) = str_value(name)
-        && let Some(existing) = pyre_object::with_roots!(name => {
-            crate::importing::sys_modules_entry(name_s)
-        })
-        && unsafe { is_module(existing) }
-    {
-        return Ok(());
+/// `import.c lazy_modules_add`. Skip `sys.lazy_modules` when *name* is already
+/// imported and fully initialized. `__spec__` is read from the module dict;
+/// `_initializing` from mapdict instance storage only (no descriptors, no
+/// `__bool__`). Returns the `sys.modules` entry (`existing_mod_p`).
+fn lazy_modules_add(mut name: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    let name_s = str_value(name).unwrap_or("").to_owned();
+    name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    let existing = crate::importing::sys_modules_entry(&name_s);
+    let existing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(existing.unwrap_or(PY_NULL));
+    let mut loaded = {
+        let m = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+        !m.is_null() && unsafe { !is_none(m) }
+    };
+    if loaded {
+        let existing_mod = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+        if unsafe { is_module(existing_mod) } {
+            let mut dict = unsafe { w_module_get_w_dict(existing_mod) };
+            let spec = if dict.is_null() {
+                None
+            } else {
+                pyre_object::with_roots!(dict => {
+                    crate::baseobjspace::finditem_str(dict, "__spec__")
+                })?
+            };
+            let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(spec.unwrap_or(PY_NULL));
+            let spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+            loaded = spec.is_null() || unsafe { is_none(spec) };
+            if !loaded {
+                let mut spec = spec;
+                if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(spec) } {
+                    loaded = match pyre_object::with_roots!(spec => {
+                        crate::baseobjspace::getdictvalue(spec, "_initializing")
+                    })? {
+                        None => true,
+                        Some(init) => is_w(init, w_bool_from(false)),
+                    };
+                }
+            }
+        }
     }
-    let set = crate::module::sys::state::lazy_modules();
-    if !set.is_null() {
-        unsafe { w_set_add(set, name) };
+    if !loaded {
+        name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let set = crate::module::sys::state::lazy_modules();
+        if !set.is_null() {
+            unsafe { w_set_add(set, name) };
+        }
     }
-    Ok(())
+    let existing = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+    Ok(if existing.is_null() {
+        None
+    } else {
+        Some(existing)
+    })
+}
+
+/// `import.c register_from_lazy_on_parent`.
+///
+/// `IMPORT_FROM` returns a stored attribute directly, so skip the alias when
+/// `from` is already on the existing module.
+fn register_from_lazy_on_parent(
+    existing_module: Option<PyObjectRef>,
+    mut abs_name: PyObjectRef,
+    mut from: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut existing_module = existing_module.unwrap_or(PY_NULL);
+    let existing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(existing_module);
+    let abs_name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(abs_name);
+    let from_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(from);
+    existing_module = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+    from = pyre_object::gc_roots::shadow_stack_get(from_slot);
+    let from_s = str_value(from).unwrap_or("").to_owned();
+    existing_module = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+    if !existing_module.is_null() && unsafe { is_module(existing_module) } {
+        let mut dict = unsafe { w_module_get_w_dict(existing_module) };
+        if !dict.is_null()
+            && pyre_object::with_roots!(dict => {
+                crate::baseobjspace::finditem_str(dict, &from_s)
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+    }
+    abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+    let abs = str_value(abs_name).unwrap_or("").to_owned();
+    let mut fromname = w_str_new(&format!("{abs}.{from_s}"));
+    let fromname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromname);
+    fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
+    lazy_modules_add(fromname)?;
+    fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
+    register_lazy_on_parent(fromname, w_none())
 }
 
 fn register_lazy_on_parent(
@@ -901,28 +1142,24 @@ pub fn lazy_import_module_level(
     let res_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(res);
     res = pyre_object::gc_roots::shadow_stack_get(res_slot);
-    lazy_modules_add(abs_name)?;
+    let existing_module = lazy_modules_add(abs_name)?;
     fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
     abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+    let existing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(existing_module.unwrap_or(PY_NULL));
     if unsafe { is_tuple(fromlist) && w_tuple_len(fromlist) > 0 } {
         let n = unsafe { w_tuple_len(fromlist) };
         for i in 0..n {
             fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
             abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+            let existing = pyre_object::gc_roots::shadow_stack_get(existing_slot);
+            let existing_module = if existing.is_null() {
+                None
+            } else {
+                Some(existing)
+            };
             let item = unsafe { w_tuple_getitem(fromlist, i as i64) }.unwrap_or(PY_NULL);
-            let abs = str_value(abs_name).unwrap_or("").to_owned();
-            let from = str_value(item).unwrap_or("").to_owned();
-            let mut fromname = w_str_new(&format!("{abs}.{from}"));
-            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
-            abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
-            let fromname_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(fromname);
-            fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
-            lazy_modules_add(fromname)?;
-            fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
-            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
-            abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
-            register_lazy_on_parent(fromname, w_none())?;
+            register_from_lazy_on_parent(existing_module, abs_name, item)?;
         }
         res = pyre_object::gc_roots::shadow_stack_get(res_slot);
     } else {
@@ -1260,10 +1497,16 @@ fn validate_lazy_stmts(
             ast::Stmt::ImportFrom(node) if node.is_lazy => {
                 let module = node.module.as_ref().map(|s| s.as_str()).unwrap_or("");
                 if node.level == 0 && module == "__future__" {
+                    // `_PyPegen_checked_from_import` raises on the `lazy` token.
+                    let start = node.range.start();
+                    let lazy_range = ruff_text_size::TextRange::new(
+                        start,
+                        start + ruff_text_size::TextSize::from(4u32),
+                    );
                     return Err(lazy_syntax_error(
                         source,
                         filename,
-                        node.range,
+                        lazy_range,
                         "lazy from __future__ import is not allowed".to_string(),
                     ));
                 }
