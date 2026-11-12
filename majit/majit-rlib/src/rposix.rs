@@ -25,6 +25,18 @@ pub use cConfig::DIRENT;
 /// `rposix.py` `if HAVE_SCHED_GETPARAM:` `SCHED_PARAM`.
 #[cfg(rposix_have_sched_getparam)]
 pub use cConfig::SCHED_PARAM;
+/// `rposix.py` linux `CConfig` `XATTR_*`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{XATTR_CREATE, XATTR_REPLACE, XATTR_SIZE_MAX};
+/// `rposix.buf_sizes`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const BUF_SIZES: [usize; 2] = [
+    256,
+    match XATTR_SIZE_MAX {
+        Some(v) => v as usize,
+        None => panic!("XATTR_SIZE_MAX"),
+    },
+];
 /// `rposix.py` `times_config` `TIMEVAL`.
 #[cfg(rposix_have_utimes)]
 pub use cConfig::TIMEVAL;
@@ -3626,6 +3638,13 @@ mod tests {
         assert!(HAVE_SCHED_GETPARAM);
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert!(!HAVE_SCHED_GETPARAM);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(XATTR_SIZE_MAX, Some(65536));
+            assert_eq!(XATTR_CREATE, Some(libc::XATTR_CREATE as i32));
+            assert_eq!(XATTR_REPLACE, Some(libc::XATTR_REPLACE as i32));
+            assert_eq!(BUF_SIZES, [256, 65536]);
+        }
         assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
         assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
         assert_eq!(AT_SYMLINK_NOFOLLOW, Some(libc::AT_SYMLINK_NOFOLLOW as i32));
@@ -4972,7 +4991,7 @@ mod tests {
                 name.as_ptr(),
                 value.as_ptr() as *const libc::c_char,
                 value.len(),
-                libc::XATTR_CREATE as crate::rffi::INT,
+                XATTR_CREATE.expect("XATTR_CREATE") as crate::rffi::INT,
             )
         };
         if ret < 0 {

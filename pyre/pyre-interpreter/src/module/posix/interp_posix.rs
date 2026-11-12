@@ -2283,16 +2283,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
         }
-        // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`.
-        // `rposix.XATTR_SIZE_MAX` is `linux/limits.h` (65536); libc has no
-        // `XATTR_SIZE_MAX`.
+        // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`
+        // and `getattr(rposix, _name) is not None`.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         for (name, val) in [
-            ("XATTR_SIZE_MAX", 65536i64),
-            ("XATTR_CREATE", libc::XATTR_CREATE as i64),
-            ("XATTR_REPLACE", libc::XATTR_REPLACE as i64),
+            ("XATTR_SIZE_MAX", majit_rlib::rposix::XATTR_SIZE_MAX),
+            ("XATTR_CREATE", majit_rlib::rposix::XATTR_CREATE),
+            ("XATTR_REPLACE", majit_rlib::rposix::XATTR_REPLACE),
         ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+            if let Some(val) = val {
+                crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+            }
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
@@ -8877,13 +8878,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // interp_posix.py `getxattr` / `setxattr` / `removexattr` / `listxattr`.
         // `rposix.c_*xattr` release the GIL and save errno. ERANGE retries
-        // `rposix.buf_sizes` = [256, XATTR_SIZE_MAX] in the product builtin.
+        // `rposix.buf_sizes`.
         #[cfg(all(
             not(feature = "sandbox"),
             any(target_os = "linux", target_os = "android")
         ))]
         {
-            const XATTR_BUF_SIZES: [usize; 2] = [256, 65536];
+            const XATTR_BUF_SIZES: [usize; 2] = majit_rlib::rposix::BUF_SIZES;
             crate::__pyre_put_new!(
                 ns_slot,
                 "getxattr",

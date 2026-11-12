@@ -5,7 +5,8 @@
 //! the "f... and ...at families" `CConfig`, the `AT_*`/`UTIME_*`/
 //! `TIMESPEC` `CConfig`, `ConfConfig` (`pathconf_consts_defs` /
 //! `confstr_consts_defs` / `sysconf_consts_defs`), and the
-//! `HAVE_SCHED_GETPARAM` `SCHED_PARAM` `CConfig` probes go through
+//! `HAVE_SCHED_GETPARAM` `SCHED_PARAM` `CConfig`, and the linux `XATTR_*`
+//! `CConfig` probes go through
 //! `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -224,6 +225,9 @@ const RPOSIX_AT_CONST_NAMES: &[&str] = &[
     "UTIME_NOW",
     "UTIME_OMIT",
 ];
+
+/// `rposix.py` linux `CConfig` `XATTR_*` (`DefinedConstantInteger`).
+const RPOSIX_XATTR_CONST_NAMES: &[&str] = &["XATTR_SIZE_MAX", "XATTR_CREATE", "XATTR_REPLACE"];
 
 /// `rposix.py` `pathconf_consts_defs` (key, C macro).
 const RPOSIX_PATHCONF_CONSTS_DEFS: &[(&str, &str)] = &[
@@ -1012,6 +1016,10 @@ fn write_rposix_cconfig(
         write_rposix_at_timespec_config(&mut text);
         write_rposix_conf_config(&mut text);
     }
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" || target_os == "android" {
+        write_rposix_xattr_config(&mut text);
+    }
 
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rposix_cconfig.rs");
@@ -1179,6 +1187,31 @@ fn write_rposix_at_timespec_config(text: &mut String) {
         &struct_layout("TIMESPEC", cconfig_lookup(&at_results, "TIMESPEC"))
             .rust_struct_source("TIMESPEC", &[]),
     );
+}
+
+/// `rposix.py` linux `CConfig` `XATTR_SIZE_MAX` / `XATTR_CREATE` / `XATTR_REPLACE`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/xattr.h', 'linux/limits.h'])`.
+fn write_rposix_xattr_config(text: &mut String) {
+    let mut entries = Vec::new();
+    for name in RPOSIX_XATTR_CONST_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    let xattr_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/xattr.h".into(), "linux/limits.h".into()],
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![],
+    };
+    let results = configure(&xattr_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig XATTR_*\n");
+    for name in RPOSIX_XATTR_CONST_NAMES {
+        emit_option_i32(text, name, cconfig_lookup(&results, name));
+    }
 }
 
 /// `rposix.py` `ConfConfig` / `configure(ConfConfig)` / `pathconf_names` /
