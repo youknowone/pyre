@@ -414,6 +414,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
 /// The merge point comes from the body's `LoopScanIndex` rather than re-decoding the floor.
+/// Opcode case floors of a shared `PyFrame.dispatch` head contain no merge;
+/// returning the head marker would snapshot the head's live Int greens
+/// (`next_instr`) at a call whose own `-live-` has none.
 pub(crate) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
