@@ -4787,8 +4787,15 @@ impl OptContext {
             self.bind_input_resops(std::slice::from_ref(preamble_op));
         }
         let b = Operand::from_bound_op(preamble_op);
-        if self.has_forwarding(&b) {
-            return;
+        // shortpreamble.py ShortPreambleBuilder.__init__:
+        //     preamble_op.set_forwarded(info)
+        // always assigns. EmptyInfo is the no-info sentinel; it must
+        // not keep exported IntBound / PtrInfo off the replay object
+        // use_box reads. A make_equal_to redirect stays.
+        match b.get_forwarded() {
+            majit_ir::forwarding::Forwarded::None
+            | majit_ir::forwarding::Forwarded::Info(OpInfo::EmptyInfo(_)) => {}
+            _ => return,
         }
         match info {
             OpInfo::Unknown => b.clear_forwarded(),

@@ -1847,28 +1847,11 @@ impl Optimizer {
                 }
                 // shortpreamble.py produce_arg already stored the dep
                 // replay handle / renamed short InputArg / Const on
-                // preamble_op.args. Keep that object.
-                for i in 0..preamble_op.num_args() {
-                    let arg = preamble_op.arg(i);
-                    // The `OpRef::none()` sentinel has no producer box
-                    // (`materialize_operand_at` doc) — routing it through the
-                    // producer lookup is meaningless and trips the
-                    // `get_box_replacement` "box must exist" debug tripwire.
-                    if arg.is_none() {
-                        continue;
-                    }
-                    let resolved = arg.get_box_replacement(false);
-                    preamble_op.setarg(i, resolved);
-                }
-                if let Some(mut fail_args) = preamble_op.getfailargs() {
-                    for arg in fail_args.iter_mut() {
-                        if arg.is_none() {
-                            continue;
-                        }
-                        *arg = arg.get_box_replacement(false);
-                    }
-                    preamble_op.setfailargs(fail_args);
-                }
+                // preamble_op.args. Keep that object: use_box reads
+                // arg.get_forwarded() on it, and ShortPreambleBuilder.__init__
+                // plants exported_infos on the same ResOperation.
+                // get_box_replacement would swap in a body box that does
+                // not carry the replay marker.
                 // An InputArg label arg whose canonical result forwards away
                 // is absent from `short_boxes.label_args`, so a re-lookup of
                 // `canonical_result` returns None and the per-slot original
