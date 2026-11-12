@@ -4386,6 +4386,20 @@ impl OptContext {
                 .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
                 .unwrap_or(arg)
         };
+        let plant_imported_info =
+            |ctx: &mut Self, new_pop: &ProducedShortOp, produced_op: &ProducedShortOp| {
+                // shortpreamble.py ShortPreambleBuilder.__init__:
+                //   info = exported_infos.get(op, None)
+                //   if info is None:
+                //       info = empty_info
+                //   preamble_op.set_forwarded(info)
+                let info = exported_infos.get(&produced_op.res).cloned().unwrap_or(
+                    crate::optimizeopt::info::OpInfo::EmptyInfo(
+                        crate::optimizeopt::info::EmptyInfo,
+                    ),
+                );
+                ctx.set_preamble_forwarded_info(&new_pop.preamble_op, &info);
+            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
@@ -4421,6 +4435,7 @@ impl OptContext {
                         same_as_source: produced_op.same_as_source.clone(),
                         label_arg_idx: produced_op.label_arg_idx,
                     };
+                    plant_imported_info(self, &new_pop, produced_op);
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
                     produced.push((source.clone(), new_pop.clone()));
@@ -4498,6 +4513,7 @@ impl OptContext {
                         }
                         _ => continue,
                     };
+                    plant_imported_info(self, &new_pop, produced_op);
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
                     produced.push((source.clone(), new_pop.clone()));
@@ -4527,6 +4543,7 @@ impl OptContext {
                         same_as_source: produced_op.same_as_source.clone(),
                         label_arg_idx: produced_op.label_arg_idx,
                     };
+                    plant_imported_info(self, &new_pop, produced_op);
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
                     // Exported args name either the entry or its replay op.
                     produced.push((source.clone(), new_pop.clone()));
@@ -6860,42 +6877,43 @@ impl OptContext {
     }
 
     /// resoperation.py `InputArg*.getint/getref_base/getfloatstorage`
-    /// — extract the concrete runtime value carried by an OpRef's OWN box.
+    /// — extract the concrete runtime value carried by a box's OWN slot.
     ///
-    /// virtualstate.py `runtime_box.constbox()`, :494 `.getint()`, :579
-    /// `.nonnull()`, :601/:608 `cpu.cls_of_box(runtime_box)` read the runtime
+    /// virtualstate.py `runtime_box.constbox()`, `InputArgInt.getint`,
+    /// `InputArg*.nonnull`, `cpu.cls_of_box(runtime_box)` read the runtime
     /// box object itself: `getint`/`getref_base` (resoperation.py) return
     /// `_resint`/`_resref` — the box's own value slot, set when the box was
-    /// created — and never walk `_forwarded`. This resolves the box at
-    /// `opref`'s own position (`resolve_to_operand`, the canonical host WITHOUT
-    /// the `get_box_replacement` chain walk) and reads its value directly; an
-    /// optimizer forwarding (`make_equal_to` / `make_constant`) never takes
-    /// precedence over the box's own observed value.
+    /// created — and never walk `_forwarded`. An optimizer forwarding
+    /// (`make_equal_to` / `make_constant`) never takes precedence over the
+    /// box's own observed value.
     ///
-    /// `None` for an own slot that carries no value: pyre's value slots are
+    /// `None` for an own slot that carries no value: value slots are
     /// `Option<Value>` (resoperation.rs / forwarding.rs) where RPython's are
     /// `_resint=0` / `_resref=NULL` defaults, so an unobserved box reads as
     /// `None` here. Callers (`runtime_nonnull`, IntBounded, `runtime_cls_of`,
     /// `get_runtime_field`) treat `None` as "no runtime guidance" and refuse
     /// the guard — the conservative direction. The runtime boxes threaded into
-    /// generate_guards are the recorded JUMP args (unroll.py:105), whose
-    /// producing ops carry their own observed values, so this reads the real
-    /// runtime value without consulting `_forwarded`.
-    pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
-        let own = self.resolve_to_operand(opref)?;
-        own.const_value().or_else(|| own.get_value())
+    /// generate_guards are the recorded JUMP args (`unroll.py`
+    /// `UnrollOptimizer.optimize_preamble` / `PreambleCompileData.runtime_boxes`),
+    /// whose producing ops carry their own observed values, so this reads the
+    /// real runtime value without consulting `_forwarded`.
+    pub fn runtime_value_of(&self, op: &Operand) -> Option<Value> {
+        // virtualstate.py runtime_box.constbox() / InputArg*.getint
+        // reads the box's own value slot, never _forwarded.
+        op.const_value().or_else(|| op.get_value())
     }
 
     /// `runtime_box.nonnull()` — resoperation.py `IntOp.nonnull`
-    /// (`self._resint != 0`), :609 `FloatOp.nonnull`
+    /// (`self._resint != 0`), `FloatOp.nonnull`
     /// (`bool(extract_bits(self._resfloat))`), `RefOp.nonnull`
     /// (`bool(self.getref_base())`). Reads the runtime box's carried value
     /// (`runtime_value_of`) and applies the per-type rule. Returns `false`
     /// when no runtime value is plumbed: a box with no observed value must
-    /// not be claimed nonnull (virtualstate.py:579 gates GUARD_NONNULL on
+    /// not be claimed nonnull (`virtualstate.py`
+    /// `_generate_guards_nonnull` gates GUARD_NONNULL on
     /// `runtime_box.nonnull()`, so a null/absent value refuses the guard).
-    pub fn runtime_nonnull(&self, opref: OpRef) -> bool {
-        match self.runtime_value_of(opref) {
+    pub fn runtime_nonnull(&self, op: &Operand) -> bool {
+        match self.runtime_value_of(op) {
             Some(Value::Int(i)) => i != 0,
             Some(Value::Float(f)) => f.to_bits() != 0,
             Some(Value::Ref(r)) => !r.is_null(),
@@ -6918,8 +6936,8 @@ impl OptContext {
     /// box itself, with no optimizer-tracked / forwarded precedence. Returns
     /// `None` for non-Ref / null / unobserved values, so a KnownClass guard
     /// refuses rather than reading a forwarded class.
-    pub fn runtime_cls_of(&self, opref: OpRef) -> Option<i64> {
-        match self.runtime_value_of(opref)? {
+    pub fn runtime_cls_of(&self, op: &Operand) -> Option<i64> {
+        match self.runtime_value_of(op)? {
             Value::Ref(gcref) if !gcref.is_null() => {
                 let typeptr = self.cpu.bh_classof(gcref);
                 if typeptr == 0 { None } else { Some(typeptr) }
@@ -8635,37 +8653,35 @@ impl OptContext {
     /// `FieldDescr.field_size()` / `is_field_signed()` (the same
     /// (offset, size, sign) triple `Cpu::bh_getfield_gc_i` consumes on
     /// the backend — `majit-backend-cranelift/src/compiler.rs`). Wraps
-    /// the read in a freshly
-    /// allocated const OpRef matching `InputArg*` parity.
+    /// the read in a freshly allocated const Operand matching `InputArg*`
+    /// parity (`ConstInt.__init__` via `const_from_value`).
     ///
-    /// Concrete-Ref extractor is `runtime_value_of` (mod.rs) which
-    /// cascades box-forwarding chain → const_pool → stamped operand
-    /// runtime value (the RPython `InputArg*.value` analog).
-    /// Returns `None` when the OpRef does not resolve to a concrete
-    /// non-null Ref, when the descr is not a FieldDescr, or when the
-    /// runtime pointer is null.
+    /// Concrete-Ref extractor is `runtime_value_of` which reads the box's
+    /// own stamped value (the RPython `InputArg*.value` analog).
+    /// Returns `None` when the box does not carry a concrete non-null Ref,
+    /// when the descr is not a FieldDescr, or when the runtime pointer is
+    /// null.
     pub fn get_runtime_field(
         &mut self,
-        runtime_box: OpRef,
+        runtime_box: &Operand,
         descr: &majit_ir::descr::DescrRef,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         // virtualstate.py get_runtime_field `cpu.bh_getfield_gc_*(struct, descr)` reads the
         // field off the *struct* the runtime box points at. RPython's runtime
         // box is always an eagerly allocated object, so `getref_base()` yields
-        // a concrete pointer. Under pyre's lazy boxing the runtime box can be
-        // an unmaterialized virtual (state.rs NewWithVtable without a W_*Object
-        // allocation), so `getref_base()` has no concrete pointer to read. The
-        // faithful equivalent is to read the field's tracked box — the
-        // `setfield_gc` source the optimizer recorded on the virtual — which is
-        // exactly the value `bh_getfield_gc_*` would observe on the eager
-        // object. Consult it before the concrete-Ref read; the concrete path is
-        // unchanged for already-materialized runtime boxes.
-        if let Some(opref) = self.get_virtual_runtime_field(runtime_box, descr) {
-            return Some(opref);
+        // a concrete pointer. An unmaterialized virtual (NewWithVtable without
+        // an allocation) has no concrete pointer to read. The faithful
+        // equivalent is to read the field's tracked box — the `setfield_gc`
+        // source the optimizer recorded on the virtual — which is exactly the
+        // value `bh_getfield_gc_*` would observe on the eager object. Consult
+        // it before the concrete-Ref read; the concrete path is unchanged for
+        // already-materialized runtime boxes.
+        if let Some(field) = self.get_virtual_runtime_field(runtime_box, descr) {
+            return Some(field);
         }
         // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped operand value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own stamped value
+        // (`InputArg*.value`).
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
@@ -8679,11 +8695,11 @@ impl OptContext {
         match fd.field_type() {
             Type::Ref => {
                 let val = unsafe { (ptr as *const usize).read_unaligned() };
-                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+                Some(Operand::const_from_value(Value::Ref(majit_ir::GcRef(val))))
             }
             Type::Float => {
                 let val = unsafe { (ptr as *const f64).read_unaligned() };
-                Some(self.make_constant_float(val))
+                Some(Operand::const_from_value(Value::Float(val)))
             }
             Type::Int => {
                 let size = fd.field_size();
@@ -8699,7 +8715,7 @@ impl OptContext {
                         _ => (ptr as *const i64).read_unaligned(),
                     }
                 };
-                Some(self.make_constant_int(val))
+                Some(Operand::const_from_value(Value::Int(val)))
             }
             _ => None,
         }
@@ -8710,28 +8726,27 @@ impl OptContext {
     /// virtualstate.py reads `cpu.bh_getfield_gc_*(struct, descr)` off the
     /// eagerly allocated struct the runtime box points at. When `runtime_box`
     /// resolves to an unmaterialized `PtrInfo::Virtual` / `VirtualStruct`
-    /// instead of a concrete pointer (pyre keeps W_IntObject counters as
-    /// virtuals — state.rs NewWithVtable with no allocation), there is no
-    /// struct to read; the field's observed value lives on the virtual's
-    /// tracked field box (the recorded `setfield_gc` source). This mirrors what
-    /// `bh_getfield_gc_*` would observe on the eager object: look up the field
-    /// slot via `info.getfield(index_in_parent)` (the same parent-local slot
-    /// `enum_forced_boxes_for_entry` reads, in `virtualstate.rs`), resolve
-    /// its own runtime value (`runtime_value_of`, the InputArg*.value analog),
-    /// and wrap it in a fresh const OpRef matching the concrete-read return
-    /// shape. Returns `None` when the runtime box is not a virtual, the slot is
-    /// unset, or the slot carries no observed value.
+    /// instead of a concrete pointer, there is no struct to read; the field's
+    /// observed value lives on the virtual's tracked field box (the recorded
+    /// `setfield_gc` source). This mirrors what `bh_getfield_gc_*` would
+    /// observe on the eager object: look up the field slot via
+    /// `info.getfield(index_in_parent)` (the same parent-local slot
+    /// `enum_forced_boxes_for_entry` reads), resolve its own runtime value
+    /// (`runtime_value_of`, the InputArg*.value analog), and wrap it in a
+    /// fresh const Operand matching the concrete-read return shape. Returns
+    /// `None` when the runtime box is not a virtual, the slot is unset, or
+    /// the slot carries no observed value.
     fn get_virtual_runtime_field(
         &mut self,
-        runtime_box: OpRef,
+        runtime_box: &Operand,
         descr: &majit_ir::descr::DescrRef,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         let fd = descr.as_field_descr()?;
-        // virtualstate.py:149-151 `opinfo = getptrinfo(box); assert
-        // opinfo.is_virtual()`. Read the field box only off a virtual struct
-        // ptrinfo; a concrete/instance ptrinfo falls through to the eager read.
-        let op = self.get_box_replacement_operand_opt(runtime_box)?;
-        let info = self.getptrinfo(&op)?;
+        // virtualstate.py GenerateGuardState.get_runtime_field:
+        //   opinfo = getptrinfo(box); field = opinfo._fields[descr.get_index()]
+        // Read the field box only off a virtual struct ptrinfo; a
+        // concrete/instance ptrinfo falls through to the eager read.
+        let info = self.getptrinfo(runtime_box)?;
         // virtualstate.py `opinfo._fields[descr.get_index()]`. Storage
         // keys by the allocation SizeDescr list (`parent_list_slot_in`).
         let owner = match &info {
@@ -8740,18 +8755,18 @@ impl OptContext {
             _ => None,
         };
         let slot = crate::optimizeopt::virtualize::parent_list_slot_in(owner, fd);
-        let field_opref = match &info {
+        let field_box = match &info {
             crate::optimizeopt::info::PtrInfo::Virtual(_)
             | crate::optimizeopt::info::PtrInfo::VirtualStruct(_) => {
-                info.getfield(slot)?.as_opref()?
+                info.getfield(slot)?.as_value()?
             }
             _ => return None,
         };
         // virtualstate.py get_runtime_field: the read produces a fresh InputArg* carrying
         // the concrete field value. `runtime_value_of` reads the field box's
         // own observed value (the setfield_gc source's stamped value); wrap it
-        // in the matching const OpRef.
-        self.const_opref_from_runtime_value(field_opref)
+        // in the matching const Operand.
+        self.const_from_runtime_value(&field_box)
     }
 
     /// Lazy-boxing companion to `get_runtime_interiorfield`.
@@ -8764,40 +8779,44 @@ impl OptContext {
     /// array-struct, the slot is unset, or the slot carries no observed value.
     fn get_virtual_runtime_interiorfield(
         &mut self,
-        runtime_box: OpRef,
+        runtime_box: &Operand,
         descr: &majit_ir::descr::DescrRef,
         i: usize,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         let ifd = descr.as_interior_field_descr()?;
         let fd = ifd.field_descr();
-        // virtualstate.py:321-322 reads `opinfo._fields[i][descr.get_index()]`:
-        // the parent-local field slot index (descr.rs index_in_parent), with a
-        // fallback to the global index when no parent SizeDescr is bound.
+        // virtualstate.py VArrayStructStateInfo._generate_guards reads
+        // `opinfo._fields[i][descr.get_index()]`: the parent-local field
+        // slot index (`FieldDescr.index_in_parent`), with a fallback to
+        // the global index when no parent SizeDescr is bound.
         let slot = fd
             .get_parent_descr()
             .map(|_| crate::optimizeopt::virtualize::parent_list_slot(fd))
             .unwrap_or_else(|| descr.index());
-        let op = self.get_box_replacement_operand_opt(runtime_box)?;
-        let info = self.getptrinfo(&op)?;
-        if !matches!(
-            info,
-            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
-        ) {
-            return None;
-        }
-        let field_opref = info.getinteriorfield_virtual(i, slot)?;
-        self.const_opref_from_runtime_value(field_opref)
+        let info = self.getptrinfo(runtime_box)?;
+        let field_box = match &info {
+            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                v.element_fields.get(i).and_then(|row| {
+                    row.iter()
+                        .find(|(fdidx, _)| *fdidx == slot)
+                        .map(|(_, b)| b.clone())
+                })?
+            }
+            _ => return None,
+        };
+        self.const_from_runtime_value(&field_box)
     }
 
     /// virtualstate.py get_runtime_field tail: wrap the field box's observed runtime value
-    /// (`runtime_value_of`, the `InputArg*.value` analog) in a fresh const OpRef
+    /// (`runtime_value_of`, the `InputArg*.value` analog) in a fresh const Operand
     /// matching the `InputArg{Int,Float,Ref}` the concrete `bh_getfield_gc_*`
-    /// read would produce. Returns `None` for an unobserved or void slot.
-    fn const_opref_from_runtime_value(&mut self, field_opref: OpRef) -> Option<OpRef> {
-        match self.runtime_value_of(field_opref)? {
-            Value::Int(v) => Some(self.make_constant_int(v)),
-            Value::Float(v) => Some(self.make_constant_float(v)),
-            Value::Ref(v) => Some(self.make_constant_ref(v)),
+    /// read would produce (`ConstInt.__init__`). Returns `None` for an
+    /// unobserved or void slot.
+    fn const_from_runtime_value(&self, field: &Operand) -> Option<Operand> {
+        match self.runtime_value_of(field)? {
+            Value::Int(v) => Some(Operand::const_from_value(Value::Int(v))),
+            Value::Float(v) => Some(Operand::const_from_value(Value::Float(v))),
+            Value::Ref(v) => Some(Operand::const_from_value(Value::Ref(v))),
             Value::Void => None,
         }
     }
@@ -8820,20 +8839,20 @@ impl OptContext {
     /// `ArrayDescr.base_size()` / `ArrayDescr.itemsize()` matching the
     /// backend `Cpu::bh_getarrayitem_gc_*`
     /// (`majit-backend-cranelift/src/compiler.rs`). Wraps
-    /// the read in a freshly allocated const OpRef.
+    /// the read in a freshly allocated const Operand (`ConstInt.__init__`).
     ///
     /// Concrete-Ref extractor routes through `runtime_value_of`; see
     /// the matching note on `get_runtime_field` for the concrete-value
     /// population path.
     pub fn get_runtime_item(
         &mut self,
-        runtime_box: OpRef,
+        runtime_box: &Operand,
         descr: &majit_ir::descr::DescrRef,
         i: usize,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped operand value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own stamped value
+        // (`InputArg*.value`).
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
@@ -8846,11 +8865,11 @@ impl OptContext {
         match ad.item_type() {
             Type::Ref => {
                 let val = unsafe { (ptr as *const usize).read_unaligned() };
-                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+                Some(Operand::const_from_value(Value::Ref(majit_ir::GcRef(val))))
             }
             Type::Float => {
                 let val = unsafe { (ptr as *const f64).read_unaligned() };
-                Some(self.make_constant_float(val))
+                Some(Operand::const_from_value(Value::Float(val)))
             }
             Type::Int => {
                 let size = itemsize as usize;
@@ -8866,7 +8885,7 @@ impl OptContext {
                         _ => (ptr as *const i64).read_unaligned(),
                     }
                 };
-                Some(self.make_constant_int(val))
+                Some(Operand::const_from_value(Value::Int(val)))
             }
             _ => None,
         }
@@ -8894,20 +8913,20 @@ impl OptContext {
     /// `get_runtime_field` docstring.
     pub fn get_runtime_interiorfield(
         &mut self,
-        runtime_box: OpRef,
+        runtime_box: &Operand,
         descr: &majit_ir::descr::DescrRef,
         i: usize,
-    ) -> Option<OpRef> {
+    ) -> Option<Operand> {
         // Lazy-boxing path: when the runtime box is an unmaterialized
         // `VirtualArrayStruct` the interior field's observed value lives on the
         // virtual's tracked element-field box rather than a concrete struct.
         // See `get_virtual_runtime_field` for the model this mirrors.
-        if let Some(opref) = self.get_virtual_runtime_interiorfield(runtime_box, descr, i) {
-            return Some(opref);
+        if let Some(field) = self.get_virtual_runtime_interiorfield(runtime_box, descr, i) {
+            return Some(field);
         }
         // virtualstate.py get_runtime_item `box.getref_base()` — concrete Ref read.
-        // `runtime_value_of` cascades const_pool → stamped operand value
-        // (RPython `InputArg*.value` analog).
+        // `runtime_value_of` reads the box's own stamped value
+        // (`InputArg*.value`).
         let raw = match self.runtime_value_of(runtime_box)? {
             Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
             _ => return None,
@@ -8921,11 +8940,11 @@ impl OptContext {
         match fd.field_type() {
             Type::Ref => {
                 let val = unsafe { (ptr as *const usize).read_unaligned() };
-                Some(self.make_constant_ref(majit_ir::GcRef(val)))
+                Some(Operand::const_from_value(Value::Ref(majit_ir::GcRef(val))))
             }
             Type::Float => {
                 let val = unsafe { (ptr as *const f64).read_unaligned() };
-                Some(self.make_constant_float(val))
+                Some(Operand::const_from_value(Value::Float(val)))
             }
             Type::Int => {
                 let size = fd.field_size();
@@ -8941,7 +8960,7 @@ impl OptContext {
                         _ => (ptr as *const i64).read_unaligned(),
                     }
                 };
-                Some(self.make_constant_int(val))
+                Some(Operand::const_from_value(Value::Int(val)))
             }
             _ => None,
         }
