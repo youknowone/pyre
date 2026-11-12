@@ -637,8 +637,7 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
 }
 
 /// `tyref_pair_field_kind` peels one extra `Ref`, so `&&[usize]` is a
-/// pair. The spelling path peels `&` / `&mut ` / `*mut ` / `*const `
-/// until the slice remains.
+/// pair. `*const &[T]` is one pointer word and is not a pair.
 #[test]
 fn spelling_pair_field_kind_peels_nested_ref_prefixes() {
     use majit_ir::rvec::VecItemKind;
@@ -650,13 +649,82 @@ fn spelling_pair_field_kind_peels_nested_ref_prefixes() {
         super::spelling_pair_field_kind("&mut &[usize]"),
         Some(VecItemKind::Int)
     );
-    assert_eq!(
-        super::spelling_pair_field_kind("*const &[usize]"),
-        Some(VecItemKind::Int)
-    );
-    assert_eq!(
-        super::spelling_pair_field_kind("*mut &mut [usize]"),
-        Some(VecItemKind::Int)
-    );
+    assert_eq!(super::spelling_pair_field_kind("*const &[usize]"), None);
+    assert_eq!(super::spelling_pair_field_kind("*mut &mut [usize]"), None);
     assert_eq!(super::spelling_pair_field_kind("&&[u8]"), None);
+}
+
+#[test]
+fn spelling_pair_field_kind_matches_tyref_pair_shapes() {
+    use majit_ir::rvec::VecItemKind;
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [], "global_decls": [],
+            "trait_decls": [], "trait_impls": [],
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
+    let slice = serde_json::json!({ "Slice": [usize_ty, null] });
+    let field_kind =
+        |node: serde_json::Value| super::tyref_pair_field_kind(&TyRef::Other(node), &llbc);
+
+    assert_eq!(
+        super::spelling_pair_field_kind("&[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        field_kind(serde_json::json!({ "Ref": ["'_", slice.clone(), "Shared"] })),
+        Some(VecItemKind::Int)
+    );
+
+    assert_eq!(
+        super::spelling_pair_field_kind("&mut [usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        field_kind(serde_json::json!({ "Ref": ["'_", slice.clone(), "Mut"] })),
+        Some(VecItemKind::Int)
+    );
+
+    assert_eq!(
+        super::spelling_pair_field_kind("*const [usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        field_kind(serde_json::json!({ "RawPtr": [slice.clone(), "Const"] })),
+        Some(VecItemKind::Int)
+    );
+
+    assert_eq!(
+        super::spelling_pair_field_kind("*mut [usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        field_kind(serde_json::json!({ "RawPtr": [slice.clone(), "Mut"] })),
+        Some(VecItemKind::Int)
+    );
+
+    assert_eq!(
+        super::spelling_pair_field_kind("&&[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        field_kind(serde_json::json!({
+            "Ref": ["'_", { "Ref": ["'_", slice.clone(), "Shared"] }, "Shared"]
+        })),
+        Some(VecItemKind::Int)
+    );
+
+    assert_eq!(super::spelling_pair_field_kind("*const &[usize]"), None);
+    assert_eq!(
+        field_kind(serde_json::json!({
+            "RawPtr": [{ "Ref": ["'_", slice, "Shared"] }, "Const"]
+        })),
+        None
+    );
 }

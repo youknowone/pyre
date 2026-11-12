@@ -5939,6 +5939,10 @@ fn trait_box_slice_deref_is_container_identity() {
         Some(&slice_ty),
         &llbc
     ));
+    assert_eq!(
+        super::impl_owner_path(&llbc, fd).as_deref(),
+        Some("alloc::boxed::Box")
+    );
     assert!(super::container_identity_deref_owner(
         "alloc::vec::Vec",
         None,
@@ -5951,6 +5955,21 @@ fn trait_box_slice_deref_is_container_identity() {
     ));
     assert!(!super::container_identity_deref_owner(
         "foo::Vec", None, &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "foo::alloc::vec::Vec",
+        None,
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "foo::alloc::string::String",
+        None,
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "foo::alloc::boxed::Box",
+        Some(&slice_ty),
+        &llbc
     ));
 }
 
@@ -6879,11 +6898,13 @@ fn foreign_opaque_string_new_keeps_str_family_root() {
     );
 }
 
-/// Foreign opaque `HashMap::get` returning pointer-niche `Option<&V>`.
-/// `tyref_to_value_type_with` names the pointee and drops Option
-/// nullability; collection keeps the Option spelling so intern can
-/// noneify (`Bookkeeper::niche_option_gc_payload_annotation`).
-fn hashmap_get_option_ref_fixture() -> Llbc {
+/// Foreign opaque `HashMap` method returning pointer-niche `Option<P>`.
+fn hashmap_opaque_option_method_fixture(
+    method: &str,
+    payload: serde_json::Value,
+    self_mut: bool,
+    gc_pointee: bool,
+) -> Llbc {
     let span = || {
         serde_json::json!({
             "data": {
@@ -6912,18 +6933,37 @@ fn hashmap_get_option_ref_fixture() -> Llbc {
     let hashmap_ty = serde_json::json!({
         "Adt": {"id": 0, "generics": generics.clone()}
     });
-    let gc_obj_ty = serde_json::json!({
-        "Adt": {"id": 2, "generics": generics.clone()}
-    });
-    let option_of_ref = option_adt_node(1, option_shared_ref(gc_obj_ty));
+    let option_of = option_adt_node(1, payload);
     let impl_seg = serde_json::json!({"Impl": {"Ty": {
         "skip_binder": {"Value": [0, hashmap_ty.clone()]},
         "kind": "InherentImplBlock"
     }}});
     let hashmap_decl = opaque_type_decl(0, &["alloc", "collections", "hashmap", "HashMap"]);
     let option_decl = option_enum(1);
-    let gc_obj_decl = code_struct(2, &["pyre_object", "pyobject", "PyObject"]);
-    let hashmap_get = serde_json::json!({
+    let mut type_decls = vec![hashmap_decl, option_decl];
+    let mut trait_decls = Vec::new();
+    let mut trait_impls = Vec::new();
+    if gc_pointee {
+        type_decls.push(code_struct(2, &["pyre_object", "pyobject", "PyObject"]));
+        let gc_obj_ty = serde_json::json!({
+            "Adt": {"id": 2, "generics": generics.clone()}
+        });
+        trait_decls.push(serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(
+                vec![ident("majit_gc"), ident("header"), ident("GcType")],
+                false,
+            ),
+        }));
+        trait_impls.push(serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{"Value": [2, gc_obj_ty]}]}
+            }
+        }));
+    }
+    let self_kind = if self_mut { "Mut" } else { "Shared" };
+    let hashmap_method = serde_json::json!({
         "def_id": 0,
         "item_meta": item_meta(
             vec![
@@ -6931,24 +6971,55 @@ fn hashmap_get_option_ref_fixture() -> Llbc {
                 ident("collections"),
                 ident("hashmap"),
                 impl_seg,
-                ident("get"),
+                ident(method),
             ],
             false,
         ),
         "signature": {
             "is_unsafe": false,
             "inputs": [
-                {"Ref": ["Erased", hashmap_ty, "Shared"]},
+                {"Ref": ["Erased", hashmap_ty, self_kind]},
                 {"Ref": ["Erased", {"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Shared"]},
             ],
-            "output": option_of_ref
+            "output": option_of
         },
         "body": "Opaque"
     });
-    llbc_with_types(
-        "fixture",
-        vec![hashmap_decl, option_decl, gc_obj_decl],
-        vec![hashmap_get],
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": type_decls,
+            "fun_decls": [hashmap_method],
+            "global_decls": [],
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("HashMap opaque fixture Llbc parses")
+}
+
+/// Foreign opaque `HashMap::get` returning pointer-niche `Option<&V>`.
+/// `tyref_to_value_type_with` names the pointee and drops Option
+/// nullability; collection keeps the Option spelling so intern can
+/// noneify (`Bookkeeper::niche_option_gc_payload_annotation`).
+fn hashmap_get_option_ref_fixture() -> Llbc {
+    let generics = empty_generics();
+    let gc_obj_ty = serde_json::json!({
+        "Adt": {"id": 2, "generics": generics}
+    });
+    hashmap_opaque_option_method_fixture("get", option_shared_ref(gc_obj_ty), false, true)
+}
+
+/// Opaque `HashMap::get_mut` of a scalar value: `Option<&mut i64>`.
+fn hashmap_get_mut_option_mut_i64_fixture() -> Llbc {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    hashmap_opaque_option_method_fixture(
+        "get_mut",
+        serde_json::json!({"Ref": ["Erased", i64_ty, "Mut"]}),
+        true,
+        false,
     )
 }
 
@@ -6972,6 +7043,31 @@ fn foreign_opaque_hashmap_get_keeps_niche_option_spelling() {
         root.contains("Option<") && root.contains('&') && root.contains("PyObject"),
         "HashMap::get residual must keep Option<&T> spelling, got {root:?}"
     );
+}
+
+#[test]
+fn foreign_opaque_hashmap_get_mut_scalar_does_not_keep_niche_option_spelling() {
+    let llbc = hashmap_get_mut_option_mut_i64_fixture();
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let row = harvested.iter().find(|(segments, _, _)| {
+        segments.last().map(String::as_str) == Some("get_mut")
+            && segments.iter().any(|s| s == "HashMap" || s == "hashmap")
+    });
+    if let Some((_, _, result_ty)) = row {
+        match result_ty {
+            crate::model::ValueType::Ref(Some(root)) => {
+                assert!(
+                    !(root.contains("Option<") && root.contains("&mut") && root.contains("i64")),
+                    "scalar HashMap::get_mut must not keep Option<&mut i64> spelling, got {root:?}"
+                );
+                assert!(
+                    !super::is_niche_option_gc_payload_spelling(root, None),
+                    "scalar HashMap::get_mut must not stamp a GC-niche Option, got {root:?}"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]

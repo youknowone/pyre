@@ -1513,7 +1513,8 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// payload-carrying enum keeps `Ref(Some(root))` when
 /// `tyref_to_value_type` painted a class root (`unaryop.py`
 /// `SomeInstance.getattr` needs `self.classdef`). A pointer-niche
-/// `Option<&T>` keeps the Option spelling so intern noneifies
+/// `Option<&T>` of a GC / str-family pointee keeps the Option spelling
+/// ([`tyref_niche_option_gc_payload_spelling`]) so intern noneifies
 /// (`Bookkeeper::niche_option_gc_payload_annotation`). A payload enum
 /// with no class root is declined. A fieldless enum, tuple, reference,
 /// or non-opaque struct is declined.
@@ -1557,10 +1558,13 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //
         // A non-opaque struct / tagged `Option<i64>` / fieldless enum
         // would be mis-typed as an opaque GcRef, so decline it. A
-        // pointer-niche `Option<&T>` is the nullable payload word
-        // (`annotator/model.py` `SomeObject.noneify`); keep that Option
-        // spelling so intern noneifies
-        // (`Bookkeeper::niche_option_gc_payload_annotation`).
+        // pointer-niche `Option<&T>` of a GC instance / str-family
+        // pointee is the nullable payload word (`annotator/model.py`
+        // `SomeObject.noneify`); keep that Option spelling so intern
+        // noneifies (`Bookkeeper::niche_option_gc_payload_annotation`).
+        // [`tyref_niche_option_gc_payload_spelling`] is the collection
+        // side of that intern predicate; a scalar pointee such as
+        // `Option<&mut i64>` falls through.
         ValueType::Ref(root) => {
             if tyref_is_niche_option(output, llbc) {
                 let inputs = value_type_inputs(llbc);
@@ -1571,13 +1575,6 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                     &inputs.raw_alloc_flavor_structs,
                 ) {
                     return Some(ValueType::Ref(Some(opt_root)));
-                }
-                if let Some(payload) = crate::front::result_exc::tyref_option_payload(output, llbc)
-                {
-                    let inner = niche_option_payload_inner_spelling(&payload, llbc);
-                    if peel_niche_option_payload_pointer(&inner).0 {
-                        return Some(ValueType::Ref(Some(format!("Option<{inner}>"))));
-                    }
                 }
             }
             let def_id = output_adt_def_id_free(output, llbc)?;
@@ -6944,17 +6941,18 @@ pub(in crate::front::mir) fn is_deref_call_for(
 /// identity only when the dest is a slice (`Box<[T]>` → `&[T]`);
 /// `Box<Struct>` is [`deref_cast_root`] and `Box<i64>` is a thin integer
 /// pointer. `owner_path` is the impl owner's declaration path
-/// (`rclass.py` `getgcflavor`); a user `foo::Vec` is not identity.
+/// (`rclass.py` `getgcflavor`), compared whole-path with
+/// [`path_eq_ignoring_raw`]. A user `foo::alloc::vec::Vec` is not identity.
 pub(in crate::front::mir) fn container_identity_deref_owner(
     owner_path: &str,
     dest_ty: Option<&TyRef>,
     llbc: &Llbc,
 ) -> bool {
-    if path_ends_with_segments(owner_path, "alloc::vec::Vec")
-        || path_ends_with_segments(owner_path, "alloc::string::String")
+    if path_eq_ignoring_raw(owner_path, "alloc::vec::Vec")
+        || path_eq_ignoring_raw(owner_path, "alloc::string::String")
     {
         true
-    } else if path_ends_with_segments(owner_path, "alloc::boxed::Box") {
+    } else if path_eq_ignoring_raw(owner_path, "alloc::boxed::Box") {
         dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc))
     } else {
         false

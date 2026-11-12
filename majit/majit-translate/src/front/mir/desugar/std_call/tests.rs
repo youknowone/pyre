@@ -4,8 +4,8 @@ use majit_charon_reader::{
 };
 
 use super::{
-    AccumulatorFacts, Lowering, RootStackAnalyzer, RootStackState, harvest_declared_gc_facts,
-    no_immutable_fields,
+    AccumulatorFacts, Lowering, RootStackAnalyzer, RootStackState, deref_callee_fun_decl,
+    harvest_declared_gc_facts, impl_owner_path, no_immutable_fields,
 };
 
 fn with_fixture_lowering(llbc: &Llbc, f: impl FnOnce(&Lowering<'_>)) {
@@ -148,6 +148,11 @@ fn user_vec_deref_is_not_container_identity() {
     });
 
     let (llbc, call) = deref_impl_fixture(&["alloc", "vec", "Vec"]);
+    let fd = deref_callee_fun_decl(&call, None, &llbc).expect("Vec Deref FunDecl");
+    assert_eq!(
+        impl_owner_path(&llbc, fd).as_deref(),
+        Some("alloc::vec::Vec")
+    );
     with_fixture_lowering(&llbc, |lo| {
         assert!(
             lo.is_container_identity_deref_for(&call, None, None),
@@ -156,6 +161,11 @@ fn user_vec_deref_is_not_container_identity() {
     });
 
     let (llbc, call) = deref_impl_fixture(&["alloc", "string", "String"]);
+    let fd = deref_callee_fun_decl(&call, None, &llbc).expect("String Deref FunDecl");
+    assert_eq!(
+        impl_owner_path(&llbc, fd).as_deref(),
+        Some("alloc::string::String")
+    );
     with_fixture_lowering(&llbc, |lo| {
         assert!(
             lo.is_container_identity_deref_for(&call, None, None),
@@ -164,6 +174,11 @@ fn user_vec_deref_is_not_container_identity() {
     });
 
     let (llbc, call) = deref_impl_fixture(&["alloc", "boxed", "Box"]);
+    let fd = deref_callee_fun_decl(&call, None, &llbc).expect("Box Deref FunDecl");
+    assert_eq!(
+        impl_owner_path(&llbc, fd).as_deref(),
+        Some("alloc::boxed::Box")
+    );
     with_fixture_lowering(&llbc, |lo| {
         assert!(
             lo.is_container_identity_deref_for(&call, None, Some(&slice_ty)),
@@ -180,6 +195,35 @@ fn user_vec_deref_is_not_container_identity() {
         assert!(
             !lo.is_container_identity_deref_for(&call, None, Some(&slice_ty)),
             "foo::Box with a slice dest is not alloc::boxed::Box"
+        );
+    });
+
+    let (llbc, call) = deref_impl_fixture(&["foo", "alloc", "vec", "Vec"]);
+    let fd = deref_callee_fun_decl(&call, None, &llbc).expect("foo::alloc::vec::Vec Deref FunDecl");
+    assert_eq!(
+        impl_owner_path(&llbc, fd).as_deref(),
+        Some("foo::alloc::vec::Vec")
+    );
+    with_fixture_lowering(&llbc, |lo| {
+        assert!(
+            !lo.is_container_identity_deref_for(&call, None, None),
+            "foo::alloc::vec::Vec Deref is not alloc::vec::Vec"
+        );
+    });
+
+    let (llbc, call) = deref_impl_fixture(&["foo", "alloc", "string", "String"]);
+    with_fixture_lowering(&llbc, |lo| {
+        assert!(
+            !lo.is_container_identity_deref_for(&call, None, None),
+            "foo::alloc::string::String Deref is not alloc::string::String"
+        );
+    });
+
+    let (llbc, call) = deref_impl_fixture(&["foo", "alloc", "boxed", "Box"]);
+    with_fixture_lowering(&llbc, |lo| {
+        assert!(
+            !lo.is_container_identity_deref_for(&call, None, Some(&slice_ty)),
+            "foo::alloc::boxed::Box with a slice dest is not alloc::boxed::Box"
         );
     });
 }

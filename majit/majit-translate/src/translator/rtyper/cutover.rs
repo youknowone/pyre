@@ -19964,6 +19964,37 @@ mod tests {
     }
 
     #[test]
+    fn foreign_opaque_scalar_option_mut_result_does_not_noneify() {
+        // HashMap::get_mut-shaped residual `Option<&mut i64>`. Collection
+        // declines that spelling (`tyref_niche_option_gc_payload_spelling`);
+        // intern's GC-niche predicate
+        // (`Bookkeeper::is_niche_option_gc_payload_spelling`) also
+        // declines a scalar pointee, so the shell must not noneify
+        // (`annotator/model.py` `SomeInstance.noneify`).
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let result_ty = crate::model::ValueType::Ref(Some("Option<&mut i64>".into()));
+        assert!(
+            !registry
+                .bookkeeper()
+                .is_niche_option_gc_payload_spelling("Option<&mut i64>"),
+            "scalar Option<&mut i64> is not a GC-niche payload"
+        );
+        let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
+            .expect("a named Ref residual has a shell");
+        match &shell {
+            SomeValue::Instance(inst) => {
+                assert!(
+                    !inst.can_be_none,
+                    "scalar Option<&mut i64> residual is not SomeInstance(can_be_None=True)"
+                );
+            }
+            other => panic!("scalar Option<&mut i64> intern's SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn declared_return_annotation_raw_class_root_is_someptr() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
