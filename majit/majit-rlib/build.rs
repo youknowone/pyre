@@ -3,8 +3,9 @@
 //! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
 //! `configure(CConfig)`), `rposix.py` `pipe_config`, `advise_config`, and
 //! the "f... and ...at families" `CConfig`, the `AT_*`/`UTIME_*`/
-//! `TIMESPEC` `CConfig`, and `ConfConfig` (`pathconf_consts_defs` /
-//! `confstr_consts_defs` / `sysconf_consts_defs`) probes go through
+//! `TIMESPEC` `CConfig`, `ConfConfig` (`pathconf_consts_defs` /
+//! `confstr_consts_defs` / `sysconf_consts_defs`), and the
+//! `HAVE_SCHED_GETPARAM` `SCHED_PARAM` `CConfig` probes go through
 //! `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -54,6 +55,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_chflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_lchflags)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fexecve)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_sched_getparam)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -80,11 +82,12 @@ fn main() {
         have_chflags,
         have_lchflags,
         have_fexecve,
+        have_sched_getparam,
     ) = if target_is_unix_or_windows() {
         write_rdynload_cconfig();
         write_rposix_cconfig(&pipe_config)
     } else {
-        (false, false, false, false, false, false, false)
+        (false, false, false, false, false, false, false, false)
     };
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
@@ -100,6 +103,10 @@ fn main() {
     println!("cargo::metadata=HAVE_CHFLAGS={}", have_chflags as u8);
     println!("cargo::metadata=HAVE_LCHFLAGS={}", have_lchflags as u8);
     println!("cargo::metadata=HAVE_FEXECVE={}", have_fexecve as u8);
+    println!(
+        "cargo::metadata=HAVE_SCHED_GETPARAM={}",
+        have_sched_getparam as u8
+    );
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -651,7 +658,7 @@ fn rposix_pipe_config() -> Vec<(String, ConfigValue)> {
 /// The probe ECI is `rposix.eci`.
 fn write_rposix_cconfig(
     pipe_config: &Option<Vec<(String, ConfigValue)>>,
-) -> (bool, bool, bool, bool, bool, bool, bool) {
+) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
     let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
 
@@ -998,7 +1005,9 @@ fn write_rposix_cconfig(
         println!("cargo:rustc-cfg=rposix_have_fallocate");
     }
 
-    let (have_chflags, have_lchflags, have_fexecve) = write_rposix_at_family(&mut text, windows);
+    let (have_chflags, have_lchflags, have_fexecve, have_sched_getparam) =
+        write_rposix_at_family(&mut text, windows);
+    write_rposix_sched_param_config(&mut text, have_sched_getparam);
     if unix {
         write_rposix_at_timespec_config(&mut text);
         write_rposix_conf_config(&mut text);
@@ -1015,6 +1024,7 @@ fn write_rposix_cconfig(
         have_chflags,
         have_lchflags,
         have_fexecve,
+        have_sched_getparam,
     )
 }
 
@@ -1028,14 +1038,14 @@ fn rposix_at_family_have_name(name: &str) -> String {
 ///
 /// Upstream merges `sys/statvfs.h` into `eci` unconditionally. That header is
 /// absent on Windows, so the probe would fail; every `HAVE_*` is false there.
-fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool) {
+fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool, bool) {
     text.push_str("// rposix.py CConfig (f... and ...at families)\n");
     if windows {
         for name in RPOSIX_AT_FAMILY_NAMES {
             let have = rposix_at_family_have_name(name);
             text.push_str(&format!("pub const {have}: bool = false;\n"));
         }
-        return (false, false, false);
+        return (false, false, false, false);
     }
     let at_eci = rposix_eci().merge(&[&ExternalCompilationInfo {
         includes: vec!["sys/statvfs.h".into()],
@@ -1060,6 +1070,7 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
     let mut have_chflags = false;
     let mut have_lchflags = false;
     let mut have_fexecve = false;
+    let mut have_sched_getparam = false;
     for name in RPOSIX_AT_FAMILY_NAMES {
         let have = rposix_at_family_have_name(name);
         if have == "HAVE_LCHMOD" && linux {
@@ -1076,6 +1087,7 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
             "HAVE_CHFLAGS" => have_chflags = flag,
             "HAVE_LCHFLAGS" => have_lchflags = flag,
             "HAVE_FEXECVE" => have_fexecve = flag,
+            "HAVE_SCHED_GETPARAM" => have_sched_getparam = flag,
             _ => {}
         }
     }
@@ -1088,7 +1100,44 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
     if have_fexecve {
         println!("cargo:rustc-cfg=rposix_have_fexecve");
     }
-    (have_chflags, have_lchflags, have_fexecve)
+    if have_sched_getparam {
+        println!("cargo:rustc-cfg=rposix_have_sched_getparam");
+    }
+    (
+        have_chflags,
+        have_lchflags,
+        have_fexecve,
+        have_sched_getparam,
+    )
+}
+
+/// `rposix.py` `if HAVE_SCHED_GETPARAM:` `CConfig` `SCHED_PARAM`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/stat.h', 'unistd.h', 'sched.h'])`.
+fn write_rposix_sched_param_config(text: &mut String, have_sched_getparam: bool) {
+    if !have_sched_getparam {
+        return;
+    }
+    let sched_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/stat.h".into(), "unistd.h".into(), "sched.h".into()],
+            ..Default::default()
+        },
+        entries: vec![(
+            "SCHED_PARAM".into(),
+            CConfigEntry::struct_type(
+                "struct sched_param",
+                vec![("sched_priority".into(), FieldType::int())],
+                None,
+            ),
+        )],
+        single_entries: vec![],
+    };
+    let results = configure(&sched_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig SCHED_PARAM (HAVE_SCHED_GETPARAM)\n");
+    text.push_str(
+        &struct_layout("SCHED_PARAM", cconfig_lookup(&results, "SCHED_PARAM"))
+            .rust_struct_source("SCHED_PARAM", &[]),
+    );
 }
 
 /// `rposix.py` `CConfig` `AT_*` / `UTIME_*` / `TIMESPEC` under `if not _WIN32`.

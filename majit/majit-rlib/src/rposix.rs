@@ -22,6 +22,9 @@ pub mod cConfig {
 /// `rposix.py` `dirent_config` `DIRENT`.
 #[cfg(unix)]
 pub use cConfig::DIRENT;
+/// `rposix.py` `if HAVE_SCHED_GETPARAM:` `SCHED_PARAM`.
+#[cfg(rposix_have_sched_getparam)]
+pub use cConfig::SCHED_PARAM;
 /// `rposix.py` `times_config` `TIMEVAL`.
 #[cfg(rposix_have_utimes)]
 pub use cConfig::TIMEVAL;
@@ -2440,29 +2443,20 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix.c_sched_rr_get_interval`, `c_sched_getscheduler`,
-// `c_sched_getparam`, `c_sched_setscheduler`, and `c_sched_setparam` use
-// `RFFI_FULL_ERRNO_ZERO`. The setters are absent from musl.
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+// `rposix.c_sched_rr_get_interval`, `c_sched_getscheduler`, `c_sched_getparam`,
+// `c_sched_setscheduler`, and `c_sched_setparam` sit under
+// `if HAVE_SCHED_GETPARAM:`. They use `RFFI_FULL_ERRNO_ZERO`. The setters
+// are absent from musl.
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_rr_get_interval = "sched_rr_get_interval",
-    [libc::pid_t, *mut libc::timespec],
+    [libc::pid_t, *mut TIMESPEC],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_getscheduler = "sched_getscheduler",
     [libc::pid_t],
@@ -2471,49 +2465,28 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd"
-))]
+#[cfg(rposix_have_sched_getparam)]
 crate::rffi::llexternal!(
     pub c_sched_getparam = "sched_getparam",
-    [libc::pid_t, *mut libc::sched_param],
+    [libc::pid_t, *mut SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(all(
-    not(target_env = "musl"),
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
-))]
+#[cfg(all(rposix_have_sched_getparam, not(target_env = "musl")))]
 crate::rffi::llexternal!(
     pub c_sched_setscheduler = "sched_setscheduler",
-    [libc::pid_t, crate::rffi::INT, *const libc::sched_param],
+    [libc::pid_t, crate::rffi::INT, *const SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-#[cfg(all(
-    not(target_env = "musl"),
-    any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "netbsd"
-    )
-))]
+#[cfg(all(rposix_have_sched_getparam, not(target_env = "musl")))]
 crate::rffi::llexternal!(
     pub c_sched_setparam = "sched_setparam",
-    [libc::pid_t, *const libc::sched_param],
+    [libc::pid_t, *const SCHED_PARAM],
     crate::rffi::INT,
     compilation_info = SCHED_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO
@@ -3644,6 +3617,15 @@ mod tests {
             std::mem::size_of::<TIMESPEC>(),
             std::mem::size_of::<libc::timespec>()
         );
+        #[cfg(rposix_have_sched_getparam)]
+        assert_eq!(
+            std::mem::size_of::<SCHED_PARAM>(),
+            std::mem::size_of::<libc::sched_param>()
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(HAVE_SCHED_GETPARAM);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(!HAVE_SCHED_GETPARAM);
         assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
         assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
         assert_eq!(AT_SYMLINK_NOFOLLOW, Some(libc::AT_SYMLINK_NOFOLLOW as i32));
