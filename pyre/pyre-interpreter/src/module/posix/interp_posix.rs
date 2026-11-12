@@ -2260,28 +2260,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ] {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
-        // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        for (name, val) in [
-            ("MFD_CLOEXEC", libc::MFD_CLOEXEC as i64),
-            ("MFD_ALLOW_SEALING", libc::MFD_ALLOW_SEALING as i64),
-            ("MFD_HUGETLB", libc::MFD_HUGETLB as i64),
-            ("MFD_HUGE_SHIFT", libc::MFD_HUGE_SHIFT as i64),
-            ("MFD_HUGE_MASK", libc::MFD_HUGE_MASK as i64),
-            ("MFD_HUGE_64KB", libc::MFD_HUGE_64KB as i64),
-            ("MFD_HUGE_512KB", libc::MFD_HUGE_512KB as i64),
-            ("MFD_HUGE_1MB", libc::MFD_HUGE_1MB as i64),
-            ("MFD_HUGE_2MB", libc::MFD_HUGE_2MB as i64),
-            ("MFD_HUGE_8MB", libc::MFD_HUGE_8MB as i64),
-            ("MFD_HUGE_16MB", libc::MFD_HUGE_16MB as i64),
-            ("MFD_HUGE_32MB", libc::MFD_HUGE_32MB as i64),
-            ("MFD_HUGE_256MB", libc::MFD_HUGE_256MB as i64),
-            ("MFD_HUGE_512MB", libc::MFD_HUGE_512MB as i64),
-            ("MFD_HUGE_1GB", libc::MFD_HUGE_1GB as i64),
-            ("MFD_HUGE_2GB", libc::MFD_HUGE_2GB as i64),
-            ("MFD_HUGE_16GB", libc::MFD_HUGE_16GB as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
+        // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists,
+        // and only the names whose probe value is not None.
+        #[cfg(rposix_have_memfd_create)]
+        for &(name, val) in majit_rlib::rposix::MFD_NAMES {
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
         // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`
         // and `getattr(rposix, _name) is not None`.
@@ -8826,10 +8809,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // interp_posix.py `memfd_create`. `rposix.c_memfd_create` releases
         // the GIL and saves errno. Default flags are `rposix.MFD_CLOEXEC`.
-        #[cfg(all(
-            not(feature = "sandbox"),
-            any(target_os = "linux", target_os = "android")
-        ))]
+        #[cfg(all(not(feature = "sandbox"), rposix_have_memfd_create))]
         crate::__pyre_put_new!(
             ns_slot,
             "memfd_create",
@@ -8851,7 +8831,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::text_w(w_name)
                     })?;
                     let flags = if w_flags.is_null() {
-                        libc::MFD_CLOEXEC as majit_rlib::rffi::UINT
+                        majit_rlib::rposix::MFD_CLOEXEC.expect("MFD_CLOEXEC")
+                            as majit_rlib::rffi::UINT
                     } else {
                         pyre_object::with_roots!(w_name, w_flags => {
                             crate::baseobjspace::int_w(w_flags)
@@ -15564,7 +15545,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         for name in [
             "sched_getaffinity",
             "sched_setaffinity",
-            "memfd_create",
             "getxattr",
             "setxattr",
             "removexattr",
@@ -15576,6 +15556,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::make_builtin_function(name, sandbox_unavailable)
             );
         }
+        #[cfg(rposix_have_memfd_create)]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "memfd_create",
+            crate::make_builtin_function("memfd_create", sandbox_unavailable)
+        );
         #[cfg(rposix_have_fadvise)]
         for name in ["posix_fallocate", "posix_fadvise"] {
             crate::__pyre_put_new!(

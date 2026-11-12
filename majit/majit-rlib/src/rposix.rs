@@ -84,6 +84,14 @@ pub use cConfig::{
     HAVE_MKNODAT, HAVE_OPENAT, HAVE_READLINKAT, HAVE_RENAMEAT, HAVE_SCHED_GETPARAM, HAVE_SYMLINKAT,
     HAVE_UNLINKAT, HAVE_UTIMENSAT,
 };
+/// `rposix.py` linux `CConfig` `MFD_*` / `HAVE_MEMFD_CREATE`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{
+    HAVE_MEMFD_CREATE, MFD_ALLOW_SEALING, MFD_CLOEXEC, MFD_HUGE_1GB, MFD_HUGE_1MB, MFD_HUGE_2GB,
+    MFD_HUGE_2MB, MFD_HUGE_8MB, MFD_HUGE_16GB, MFD_HUGE_16MB, MFD_HUGE_32MB, MFD_HUGE_64KB,
+    MFD_HUGE_256MB, MFD_HUGE_512KB, MFD_HUGE_512MB, MFD_HUGE_MASK, MFD_HUGE_SHIFT, MFD_HUGETLB,
+    MFD_NAMES,
+};
 /// `rposix.py` `advise_config`.
 #[cfg(rposix_have_fadvise)]
 pub use cConfig::{
@@ -3223,14 +3231,15 @@ pub fn sendfile_hdtr(
 }
 
 // `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// Behind `HAVE_MEMFD_CREATE`.
+#[cfg(rposix_have_memfd_create)]
 crate::rffi::external_compilation_info! {
     const MMAN_ECI = {
         includes: ["sys/mman.h"],
     };
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(rposix_have_memfd_create)]
 crate::rffi::llexternal!(
     pub c_memfd_create = "memfd_create",
     [*const libc::c_char, crate::rffi::UINT],
@@ -3644,6 +3653,8 @@ mod tests {
             assert_eq!(XATTR_CREATE, Some(libc::XATTR_CREATE as i32));
             assert_eq!(XATTR_REPLACE, Some(libc::XATTR_REPLACE as i32));
             assert_eq!(BUF_SIZES, [256, 65536]);
+            assert!(HAVE_MEMFD_CREATE);
+            assert_eq!(MFD_CLOEXEC, Some(libc::MFD_CLOEXEC as i32));
         }
         assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
         assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
@@ -4910,13 +4921,13 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(rposix_have_memfd_create)]
     #[test]
     fn c_memfd_create_opens_or_saves_errno() {
         let fd = unsafe {
             c_memfd_create(
                 c"pyre-rffi-memfd".as_ptr(),
-                libc::MFD_CLOEXEC as crate::rffi::UINT,
+                MFD_CLOEXEC.expect("MFD_CLOEXEC") as crate::rffi::UINT,
             )
         };
         if fd >= 0 {
