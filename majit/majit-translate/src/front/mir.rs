@@ -6704,8 +6704,11 @@ pub(crate) fn enum_ctor_class_identity(
 }
 
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
-pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
-    DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
+/// Computed on first use and kept with the artefact's derived state.
+pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> &std::collections::HashSet<String> {
+    llbc_derived(llbc).tombstoned_leaves.get_or_init(|| {
+        DuplicateLeafFacts::discover(llbc, &std::collections::HashSet::new()).tombstoned_leaves()
+    })
 }
 
 /// Withdraw the bare-leaf convenience aliases for struct leaves shared
@@ -7057,7 +7060,7 @@ impl<'a> LowerContext<'a> {
             struct_field_attrs,
             struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
-            tombstoned_leaves: tombstoned_leaves_of(llbc),
+            tombstoned_leaves: tombstoned_leaves_of(llbc).clone(),
             gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,

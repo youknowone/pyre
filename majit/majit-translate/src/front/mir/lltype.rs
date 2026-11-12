@@ -1867,7 +1867,7 @@ fn adt_def_id_of_type_json(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
 fn type_decl_identity(llbc: &Llbc, def_id: u64) -> Option<(String, String)> {
     let td = llbc.type_by_id(def_id)?;
     let path = td.item_meta.name_path();
-    let identity = class_identity_spelling(&path, &tombstoned_leaves_of(llbc));
+    let identity = class_identity_spelling(&path, tombstoned_leaves_of(llbc));
     Some((identity, path))
 }
 
@@ -3183,6 +3183,9 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// FunDecl paths whose artefact-local `oopspec_*` marker consts spell
     /// `jit.*`. Built from this `Llbc`'s global decls.
     pub(in crate::front::mir) oopspec_fn_paths:
+        std::sync::OnceLock<std::collections::HashSet<String>>,
+    /// Duplicate-leaf tombstones of this artefact. Computed on first use.
+    pub(in crate::front::mir) tombstoned_leaves:
         std::sync::OnceLock<std::collections::HashSet<String>>,
     /// Decoded marker-const strings. The payload is a property of the artefact.
     global_marker_strs:
