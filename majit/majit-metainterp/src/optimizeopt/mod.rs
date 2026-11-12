@@ -2886,8 +2886,7 @@ impl OptContext {
     /// already-bound slot keeps the `InputArgRc` it binds; an unbound slot
     /// gets a fresh one (bound here) carrying the position's type. Stashing
     /// the strong ref in `inputarg_refs` gives the canonical-host readers
-    /// (`resolve_to_operand` / `read_forwarded` / `clear_forwarded`) a live
-    /// `InputArg.forwarded` host to resolve to.
+    /// (`resolve_to_operand`) a live `InputArg.forwarded` host to resolve to.
     ///
     /// Phase 2 enters with a fresh per-iteration inputarg set that the
     /// previous OptContext's `inputarg_refs` no longer names. Re-binding here restores
@@ -2930,8 +2929,8 @@ impl OptContext {
     }
 
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
-    /// `tp` (the `_forwarded` host that `resolve_to_operand` / `read_forwarded`
-    /// / `clear_forwarded` / `materialize_operand_at` route the matching InputArg OpRef
+    /// `tp` (the `_forwarded` host that `resolve_to_operand` /
+    /// `materialize_operand_at` route the matching InputArg OpRef
     /// through). Idempotent: keeps an existing same-shape host (preserving any
     /// `_forwarded` chain and the chain targets naming it) and only
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
@@ -3150,32 +3149,6 @@ impl OptContext {
         }
         self.resop_refs.insert(pos, op.clone());
         self.live_synthetics_push(op.clone());
-    }
-
-    /// Read `_forwarded` for `opref` directly off the canonical
-    /// host (`op.forwarded` / `inputarg.forwarded`). Mirrors
-    /// `resoperation.py get_forwarded` semantics
-    /// but bypasses the wrapper allocation. Returns `Forwarded::None`
-    /// for constants (`resoperation.py` `Const._forwarded` is
-    /// permanently `None`), `None` for sentinel `OpRef::none()` and
-    /// for ResOp positions whose producer is not in any canonical
-    /// store (`new_operations` / `phase1_emit_ops` / `resop_refs`).
-    pub(crate) fn read_forwarded(&self, opref: OpRef) -> Option<majit_ir::forwarding::Forwarded> {
-        if opref.is_none() {
-            return None;
-        }
-        if opref.is_constant() {
-            return Some(majit_ir::forwarding::Forwarded::None);
-        }
-        match opref {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => self
-                .inputarg_refs
-                .get(&opref.raw())
-                .map(|ia| ia.forwarded.borrow().clone()),
-            _ => self
-                .find_producer_op(opref)
-                .map(|op| op.forwarded().borrow().clone()),
-        }
     }
 
     /// Resolve a position to its canonical producer as an [`Operand`]
@@ -3838,10 +3811,10 @@ impl OptContext {
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
     ///
-    /// `optimizer.py Optimizer._emit_operation` appends the same `op`
-    /// object it was handed. A recorder / extra / synthetic `OpRc` already
-    /// registered at this position is reused; a genuinely new
-    /// `ResOperation` (`copy_and_change`) is cloned.
+    /// `optimizer.py Optimizer._emit_operation` appends the `op` it was
+    /// handed. `emit(Op)` is `copy_and_change` / peel clone / pending
+    /// fields — a new `ResOperation`. Pass-through of an existing box is
+    /// `emit_rc`.
     pub fn emit(&mut self, op: Op) -> OpRef {
         self.emit_impl(op)
     }
@@ -3890,8 +3863,10 @@ impl OptContext {
     fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
         let op_pos = op_rc.pos().get();
         // A live SameAs/extra stand-in, else the recorder box in
-        // `resop_refs`. `optimizer.py replace_op_with` forwards the old
-        // box (`op.set_forwarded(newop)`) when emit clones a new
+        // `resop_refs` (dropped in 4f once `bind_input_resops` no longer
+        // writes the recorder box for `emit(Op)` catch-up).
+        // `optimizer.py replace_op_with` forwards the old box
+        // (`op.set_forwarded(newop)`) when emit clones a new
         // ResOperation (`copy_and_change`). `ptr_eq` with the recorder
         // itself is a no-op carry.
         let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos).or_else(|| {
@@ -4055,27 +4030,11 @@ impl OptContext {
         // the primary fast path. The Box.type invariant is checked by
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
-        let op_pos = op.pos().get();
-        // optimizer.py Optimizer._emit_operation appends the same `op`
-        // object (`TraceIterator.next` `_cache`). Reuse the registered
-        // `OpRc` when opcode and arity still match — the recorder box, an
-        // extra producer, or a SameAs synthetic being emitted as itself.
-        // Guard emit mutates failargs/descr on the owned `op` first
-        // (`emit_guard_operation`); stamp that state onto the registered
-        // box. Opcode/arity mismatch is `copy_and_change`: clone, and
-        // `adopt_live_synthetic` / `link_replaced_producer` forward the
-        // old box.
-        if let Some(reused) = self.resop_refs.get(&op_pos).cloned()
-            && reused.opcode == op.opcode
-            && reused.num_args() == op.num_args()
-        {
-            Self::stamp_emitted_op(&op, &reused);
-            self.adopt_live_synthetic(&reused);
-            self.emitted_operations
-                .insert(majit_ir::operand::Operand::from_bound_op(&reused));
-            self.push_new_operation(reused);
-            return op_pos;
-        }
+        // optimizer.py Optimizer._emit_operation appends the `op` it was
+        // handed (`TraceIterator.next` `_cache`). `emit(Op)` always mints
+        // a new `ResOperation`; pass-through of an existing box is
+        // `emit_rc`. `adopt_live_synthetic` / `link_replaced_producer`
+        // forward the old box (`optimizer.py replace_op_with`).
         let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
         // `op_pos` ahead of this emit (forward-reference path).
@@ -5701,35 +5660,15 @@ impl OptContext {
     }
 
     /// Write receiver for `op.set_forwarded(info)` on an already
-    /// chain-resolved operand. A bound ResOp is its own host; its position is
-    /// made to resolve to it, since guard resume numbering reads by position.
-    /// InputArg and Const write on that box. The `None` sentinel passes
-    /// through untouched. A position-only operand is a bind-at-alloc bug.
+    /// chain-resolved operand. A bound `Op` is the host
+    /// (`op.set_forwarded(info)`). InputArg and Const write on that box.
+    /// The `None` sentinel passes through untouched. A position-only
+    /// operand is a bind-at-alloc bug.
     pub(crate) fn materialize_write_host(&mut self, o: Operand) -> Operand {
-        let pos = o.to_opref();
-        if pos.is_none() {
+        if o.is_none() {
             return o;
         }
-        if let Some(op) = o.bound_op() {
-            // `op.set_forwarded(info)` writes the chain terminal itself. A
-            // terminal its position does not resolve to becomes the position's
-            // producer, and an unforwarded stand-in registered there is
-            // forwarded to it, so position readers reach the same box.
-            match self.find_producer_op(pos) {
-                Some(p) if OpRc::ptr_eq(&p, &op) => {}
-                Some(p) => {
-                    use majit_ir::forwarding::ForwardingHost;
-                    if matches!(p.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
-                        p.set_forwarded_op(&op);
-                    }
-                }
-                None => {
-                    self.resop_refs.insert(pos, op);
-                }
-            }
-            return o;
-        }
-        if o.bound_inputarg().is_some() || o.is_constant() {
+        if o.bound_op().is_some() || o.bound_inputarg().is_some() || o.is_constant() {
             return o;
         }
         panic!("materialize_write_host: unbound operand {o:?}; mint at allocation");
@@ -5753,14 +5692,8 @@ impl OptContext {
             "materialize_operand_at: sentinel OpRef::none() has no operand"
         );
         if opref.is_constant() {
-            // history.py/261/307: a Const carries its Value on the OpRef.
-            let value = self.get_constant(opref).unwrap_or_else(|| {
-                panic!(
-                    "materialize_operand_at: const OpRef {opref:?} carries no Value — \
-                     a Const carries its Value (history.py:220/261/307)"
-                )
-            });
-            return Operand::const_from_value(value);
+            // history.py ConstInt.__init__: a Const-namespace OpRef is the box.
+            return Operand::from_opref(opref);
         }
         // Align the write-path host with `resolve_to_operand` (the read
         // path). For ResOp variants, resolve to the producing `Op`'s
@@ -5779,8 +5712,7 @@ impl OptContext {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
                 // InputArg write path: route through the canonical
                 // `inputarg_refs` host (symmetric with
-                // `resolve_to_operand`'s InputArg branch and the
-                // `read_forwarded` / `clear_forwarded` writers), so a
+                // `resolve_to_operand`'s InputArg branch), so a
                 // `set_forwarded_*` write lands the same
                 // `InputArg.forwarded` slot a later `resolve_to_operand`
                 // read observes. Materialize / repair the slot's canonical
@@ -5788,7 +5720,7 @@ impl OptContext {
                 // OpRef variant tag can disagree across a phase boundary (a
                 // Phase-2 OpRef referencing a Phase-1 low slot), so it is a
                 // fallback only when no canonical type is recorded
-                // (`resoperation.py InputArgInt/727/739` + `:233` the `_forwarded`
+                // (`resoperation.py` `InputArgInt` / `AbstractResOpOrInputArg._forwarded`
                 // host).
                 let idx = opref.raw();
                 let tp = self
@@ -5887,29 +5819,6 @@ impl OptContext {
         // in the sense this rejoin needs, and a preamble-proved constant is
         // the case it exists for.
         imported.is_constant().then_some(imported)
-    }
-
-    /// Debug witness: `got` is the box `get_box_replacement` reached from a
-    /// caller-held operand, `probed` is that operand's position. When the
-    /// position has a producer, the two terminals are the same box.
-    #[cfg(debug_assertions)]
-    pub(crate) fn debug_assert_operand_matches_positional(
-        &self,
-        got: &Operand,
-        probed: OpRef,
-        site: &str,
-    ) {
-        if probed.is_none() {
-            return;
-        }
-        if let Some(old) = self.get_box_replacement_operand_opt(probed) {
-            debug_assert!(
-                got.same_box(&old),
-                "{site} {probed:?}: new {:?} old {:?}",
-                got.to_opref(),
-                old.to_opref()
-            );
-        }
     }
 
     /// `resoperation.py AbstractValue.get_box_replacement(op)`: walk the
@@ -6730,27 +6639,6 @@ impl OptContext {
             }
             None
         })
-    }
-
-    /// Actual-Const reader: `box = box.get_box_replacement(); isinstance(box, Const)`.
-    ///
-    /// This intentionally does not use `get_constant_box`, because PyPy's
-    /// `optimizer.get_constant_box` also synthesizes `ConstInt` from constant
-    /// `IntBound`. Call this only for source sites that literally test
-    /// `isinstance(..., Const)` / `box.is_constant()` / direct `ConstInt`.
-    pub fn get_constant(&self, opref: OpRef) -> Option<Value> {
-        match opref {
-            OpRef::ConstInt(v) => return Some(Value::Int(v)),
-            OpRef::ConstFloat(v) => return Some(Value::Float(v)),
-            OpRef::ConstPtr(v) => {
-                return Some(Value::Ref(majit_ir::const_ptr_table::resolve(v)));
-            }
-            // Non-constant OpRefs walk the forwarding chain below to find a
-            // value forwarded onto them by `make_constant`.
-            _ => {}
-        }
-        self.get_box_replacement_operand_opt(opref)
-            .and_then(|b| b.const_value())
     }
 
     /// resoperation.py `InputArg*.getint/getref_base/getfloatstorage`

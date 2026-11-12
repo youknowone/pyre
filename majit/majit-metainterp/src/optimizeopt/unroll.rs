@@ -8216,7 +8216,7 @@ mod tests {
         // lands at `OpRef::ConstPtr(ptr)`, carrying the pointer
         // directly.
         let fresh_const = OpRef::const_ptr(ptr);
-        assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
+        assert_eq!(fresh_const.inline_const_to_value(), Some(Value::Ref(ptr)));
         // A Pure short box gets a fresh replay box (`alloc_op_position_typed`).
         // `label_arg_idx` does not reuse `short_args[slot]`.
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
@@ -8349,7 +8349,7 @@ mod tests {
         // address lands at `OpRef::ConstInt(func_ptr)`, which
         // carries the value directly.
         assert_eq!(
-            ctx2.get_constant(OpRef::const_int(func_ptr)),
+            OpRef::const_int(func_ptr).inline_const_to_value(),
             Some(Value::Int(func_ptr))
         );
     }

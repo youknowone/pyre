@@ -629,16 +629,15 @@ impl Optimizer {
         }
     }
 
-    fn is_constant_placeholder_op(op: &Op, ctx: &OptContext) -> bool {
+    fn is_constant_placeholder_op(op: &Op) -> bool {
         if !matches!(
             op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             return false;
         }
-        let Some(forwarded) = ctx.read_forwarded(op.pos().get()) else {
-            return false;
-        };
+        use majit_ir::forwarding::ForwardingHost;
+        let forwarded = op.get_forwarded();
         if !forwarded.is_const() {
             return false;
         }
@@ -3445,9 +3444,8 @@ impl Optimizer {
         //
         // Never-emitted recorder ops come from the iterator's op list
         // (`opencoder.py TraceIterator._cache`), not a side map. Skip
-        // positions already in `new_operations` and recorder ops that
-        // `install_canonical_producer` / `mint_synthetic_resop` replaced
-        // as the `resop_refs` host — those replacements live in
+        // positions already in `new_operations`; replacements from
+        // `install_canonical_producer` / `mint_synthetic_resop` live in
         // `live_synthetics` below.
         for op in ops {
             let pos = op.pos().get();
@@ -3460,14 +3458,7 @@ impl Optimizer {
             ) {
                 continue;
             }
-            if ctx.new_operations_index.contains_key(&pos) {
-                continue;
-            }
-            if !ctx
-                .resop_refs
-                .get(&pos)
-                .is_some_and(|canonical| OpRc::ptr_eq(canonical, op))
-            {
+            if ctx.new_operations.iter().any(|e| e.pos().get() == pos) {
                 continue;
             }
             self.phase1_emit_ops.push(op.clone());
@@ -3752,7 +3743,7 @@ impl Optimizer {
             .new_operations
             .iter()
             .enumerate()
-            .filter(|(_, op)| !Self::is_constant_placeholder_op(op, &ctx))
+            .filter(|(_, op)| !Self::is_constant_placeholder_op(op))
             .map(|(i, _)| i)
             .collect();
         let mut idx = 0usize;
@@ -3866,7 +3857,10 @@ impl Optimizer {
             for op in &ctx.phase1_emit_ops {
                 consider_const(op);
             }
-            for op in ctx.resop_refs.values() {
+            for op in &ctx.live_synthetics {
+                consider_const(op);
+            }
+            for op in &ctx.input_ops {
                 consider_const(op);
             }
             // Align each const-folded producer's canonical `Op.pos` to its
@@ -3882,8 +3876,9 @@ impl Optimizer {
             }
 
             // Apply remap to all args and fail_args. Const operands carry
-            // their value inline (history.py:227/268/314); position-remap
-            // applies only to body-namespace OpRefs (InputArg* / *Op).
+            // their value inline (`history.py` ConstInt/ConstFloat/ConstPtr);
+            // position-remap applies only to body-namespace OpRefs
+            // (InputArg* / *Op).
             for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
                     // A bound operand (`Operand::Op` / `InputArg`) live-tracks
@@ -5326,7 +5321,7 @@ impl Optimizer {
                 self.last_guard_op_idx = None;
             }
         }
-        // optimizer.py:598-602:
+        // optimizer.py `_emit_operation`:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
         // The `make_bool` IntBound write runs post-emit (below), once the
@@ -5349,6 +5344,7 @@ impl Optimizer {
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
         let _ = reuse;
+        let emitted_rc = op.clone();
         let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
         // optimizer.py `_emit_operation`: `self._really_emitted_operation = op`
         // then `_newoperations.append(op)`.
@@ -5359,9 +5355,10 @@ impl Optimizer {
         // is in the emit set.
         let emitted_box = emitted_box.get_box_replacement(false);
         debug_assert!(
-            ctx.get_box_replacement_operand(emitted)
-                .same_box(&emitted_box),
-            "emitted op at {emitted:?} is not its position's producer"
+            Operand::from_bound_op(ctx.new_operations.last().expect("just emitted"))
+                .same_box(&emitted_box)
+                || emitted_box.same_box(&Operand::from_bound_op(&emitted_rc)),
+            "emitted op is not the producer just appended"
         );
         // optimizer.py `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
@@ -5905,12 +5902,13 @@ impl Optimizer {
     ///     return op
     /// ```
     fn _maybe_replace_guard_value_if_changed(op: &Op, ctx: &mut OptContext) -> Option<Op> {
-        // optimizer.py:755: if op.getarg(0).type == 'i'
+        // optimizer.py `_maybe_replace_guard_value`: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        if ctx.opref_type(arg0.to_opref()) != Some(majit_ir::Type::Int) {
+        if arg0.type_() != majit_ir::Type::Int {
             return None;
         }
-        // optimizer.py: b = self.getintbound(op.getarg(0)); if b.is_bool()
+        // optimizer.py `_maybe_replace_guard_value`:
+        //   b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
             let b = ctx.resolve_operand_operand(&arg0);
             ctx.getintbound_handle(&b).borrow().clone()
@@ -5918,9 +5916,9 @@ impl Optimizer {
         if !b.is_bool() {
             return None;
         }
-        // optimizer.py:762: constvalue = op.getarg(1).getint()
+        // optimizer.py `_maybe_replace_guard_value`: constvalue = op.getarg(1).getint()
         let constvalue = op.arg(1).get_box_replacement(false).const_int()?;
-        // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
+        // optimizer.py `_maybe_replace_guard_value`: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
