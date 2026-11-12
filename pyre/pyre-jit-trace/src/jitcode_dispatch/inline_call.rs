@@ -19094,23 +19094,17 @@ fn walk_generator_resume<Sym: WalkSym>(
             // the no-effect residual so `jit_next` can send again.
             //
             // A kept-stack branch abort already selected the taken link
-            // (`opimpl_goto_if_not`). Convert would resume at the guard pc
-            // and re-run the branch without the truth operand. The #32
-            // portal flush cannot write this generator frame
-            // (`abort_in_subwalk`). `jit_next` is `_send_ex`, so restore
-            // the parked yield and residualize (`do_residual_call`).
+            // (`opimpl_goto_if_not`). Root walks latch at that pc and
+            // convert (`_copy_data_from_miframe`). Converting here
+            // cancels the caller's FOR_ITER and its portal loop
+            // (`generator_frame_handout_image`). `jit_next` is
+            // `_send_ex`: restore the parked yield and residualize
+            // (`do_residual_call`).
             if matches!(
                 error,
                 DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
                     | DispatchError::BranchGuardKeptStackUnsupported { .. }
             ) {
-                // Convert would resume at the guard pc and re-run the
-                // branch without the truth operand. `jit_next` is
-                // `_send_ex`: it pushes the sent value and continues
-                // after a yield, so the frame has to be back at that
-                // yield. A residual store in the post-yield body already
-                // mutated the live container; restoring `last_instr` /
-                // vsd and sending again re-runs that store.
                 if fbw_debug_abort_enabled() {
                     let gf = live_generator_frame(frame_root);
                     if !gf.is_null() {

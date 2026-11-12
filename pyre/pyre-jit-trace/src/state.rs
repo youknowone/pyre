@@ -5669,7 +5669,7 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None, false)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], false)
 }
 
 /// Merge-point handoff for `raise_continue_running_normally`.
@@ -5683,28 +5683,7 @@ pub(crate) fn flush_walk_loop_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None, true)
-}
-
-/// `flush_walk_end_state_to_frame` with the COMPLETE operand stack supplied by
-/// the caller as a contiguous slice for absolute slots
-/// `nlocals..nlocals + stack.len()`.  The mid-expression escape flush resolves
-/// the walk's operand-stack mirror to concrete refs, which the vable shadow
-/// cannot provide outside a merge point (its stack region reads NULL there).
-/// Declines (frame untouched) when the supplied height disagrees with the
-/// forward analysis's depth at `resume_py_pc`.
-///
-/// `stack` values are re-read per slot during the commit loop, whose Int/Float
-/// local boxing can trigger a minor collection — the caller must keep the
-/// slice registered as GC roots (`push_resume_ref_roots`) across the call so
-/// the slots are forwarded in place.
-pub(crate) fn flush_walk_end_state_to_frame_with_full_stack(
-    ctx: &TraceCtx,
-    frame: usize,
-    resume_py_pc: usize,
-    stack: &[PyObjectRef],
-) -> bool {
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], Some(stack), false)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], true)
 }
 
 fn flush_walk_end_state_to_frame_inner(
@@ -5713,7 +5692,6 @@ fn flush_walk_end_state_to_frame_inner(
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
     stack_overrides: &[(usize, PyObjectRef)],
-    full_stack: Option<&[PyObjectRef]>,
     allow_known_null_stack: bool,
 ) -> bool {
     let decline = |why: &str| {
@@ -5748,25 +5726,17 @@ fn flush_walk_end_state_to_frame_inner(
     else {
         return decline("no depth_at_py_pc");
     };
-    if let Some(full) = full_stack
-        && full.len() != depth as usize
-    {
-        return decline("full-stack height != analysis depth");
-    }
     let end_vsd = nlocals + depth as usize;
     let live = end_vsd.max(nlocals);
     let base = info.num_static_extra_boxes;
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
     let stack_override_at = |abs: usize| -> Option<PyObjectRef> {
-        if let Some(full) = full_stack {
-            return full.get(abs - nlocals).copied();
-        }
         stack_overrides
             .iter()
             .find_map(|&(slot, value)| (slot == abs).then_some(value))
     };
-    let have_overrides = full_stack.is_some() || !stack_overrides.is_empty();
+    let have_overrides = !stack_overrides.is_empty();
     for abs in 0..live {
         if abs >= nlocals && have_overrides {
             // An override is taken as authoritative, INCLUDING a null one — the
@@ -6366,111 +6336,6 @@ pub(crate) fn capture_frame_stack_for_publish(
         stack_base,
         scalars: capture_frame_scalars(snapshot)?,
         roots: slots[stack_base..stack_depth]
-            .iter()
-            .map(|&value| value as i64)
-            .collect(),
-    })
-}
-
-/// Build the same carrier from the walker's operand-stack MIRROR instead of
-/// the live virtualizable's slot array.
-///
-/// [`capture_frame_stack_for_publish`] reads the walk's concrete frame, which
-/// is the live virtualizable. Walk-owned inlined callees store through
-/// `own_frame_array_store_target`; the portal live frame is the
-/// `virtualizable_heap_ptr` object `write_box_at` already wrote.
-/// Locals are unaffected — `write_back_outer_locals` takes those from
-/// the virtualizable shadow.
-///
-/// The walker's opcode-entry mirror pairs with `last_instr = py_pc - 1`,
-/// the same coordinate [`flush_walk_end_state_to_frame_with_full_stack`]
-/// stores for its own full-stack override. An abort-point image from
-/// `virtualizable_boxes` may already be the post-pop height
-/// (`_opimpl_setfield_vable` ran before the CALL); that height is
-/// admitted when it matches the synchronized `valuestackdepth` and does
-/// not exceed the forward-analysis entry height. A mirror describing
-/// another coordinate must decline, not publish a shifted stack.
-///
-/// The virtualizable's synchronized scalars win over the entry coordinate
-/// (`synchronize_virtualizable`): a stop inside the opcode has already run its
-/// `last_instr` stores, which the resumed MIFrame does not repeat.
-pub(crate) fn capture_frame_stack_from_mirror(
-    live_frame: usize,
-    py_pc: usize,
-    stack: &[PyObjectRef],
-    synced_valuestackdepth: Option<usize>,
-    synced_last_instr: Option<isize>,
-) -> Option<CapturedFrameStack> {
-    let stack_base = concrete_nlocals(live_frame)?;
-    let entry_depth = stack_base.checked_add(stack.len())?;
-    let live_arr = unsafe {
-        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
-    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < entry_depth {
-        return None;
-    }
-    // The virtualizable's own depth wins (`synchronize_virtualizable`): an
-    // opcode that popped before the stop leaves its popped slots dead.  A
-    // depth above the entry mirror means the opcode pushed first, and the
-    // mirror has no value for that slot.
-    let valuestackdepth = match synced_valuestackdepth {
-        None => entry_depth,
-        Some(depth) if (stack_base..=entry_depth).contains(&depth) => depth,
-        Some(_) => return None,
-    };
-    let w_code = unsafe {
-        *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
-            as *const *const ())
-    };
-    if w_code.is_null() {
-        return None;
-    }
-    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
-    // The synchronized value is published when it is a unit the opcode at
-    // `py_pc` owns: its own pc, or one of its cache words once it has advanced
-    // over them (`PyFrame::executing_instr`).  Any other value does not belong
-    // to the mirror's opcode (a truth-tail latch inside `POP_JUMP_IF_FALSE`
-    // reads the fall-through instruction), so the entry coordinate stands.
-    let last_instr = synced_last_instr
-        .filter(|&pc| {
-            usize::try_from(pc).is_ok_and(|pc| {
-                pyre_interpreter::pyopcode::owning_instruction(
-                    unsafe { &(*raw_code).instructions },
-                    pc,
-                ) == py_pc
-            })
-        })
-        .unwrap_or(py_pc as isize - 1);
-    let depth = crate::liveness::liveness_for(raw_code)
-        .depth_at_py_pc()
-        .get(py_pc)
-        .copied()?;
-    let live_height = depth as usize;
-    if stack.len() != live_height {
-        // Abort-point image: `_opimpl_setarrayitem_vable` /
-        // `_opimpl_setfield_vable` already ran the pop before the CALL
-        // whose `next_pc` is the MIFrame resume coordinate, so the slots
-        // are already the post-pop height. Accept that height when it is
-        // the synchronized `valuestackdepth` and does not exceed the
-        // opcode-entry height.
-        let Some(synced) = synced_valuestackdepth else {
-            return None;
-        };
-        if synced != valuestackdepth
-            || stack.len() != valuestackdepth - stack_base
-            || stack.len() > live_height
-        {
-            return None;
-        }
-    }
-    Some(CapturedFrameStack {
-        stack_base,
-        scalars: FrameScalars {
-            last_instr,
-            valuestackdepth,
-        },
-        roots: stack[..valuestackdepth - stack_base]
             .iter()
             .map(|&value| value as i64)
             .collect(),

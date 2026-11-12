@@ -199,8 +199,6 @@ pub(crate) enum WalkEndCommitLeg {
     CalleeRebuild = 4,
     /// Resume at the abort pc itself.
     AbortPc = 5,
-    /// Kept-stack branch guard flush at the abort pc.
-    BranchGuard = 7,
     /// Not a flush leg: the portal/CALL_ASSEMBLER `Terminate` no-replay
     /// shortcut.  It keeps the journal like the legs above, but by a different
     /// caller protocol — the caller consumes the walk's concrete result
@@ -228,8 +226,8 @@ pub(crate) enum WalkEndCommitLeg {
     /// whose mid-opcode MIFrame image was converted to blackhole frames and run
     /// forward.  Same contract as [`Self::TraceTooLong`]; kept a separate leg
     /// so the census can tell a bounded-length abort from a capability gap.
-    /// Both legs publish the walker's OpRef mirror
-    /// (`capture_frame_stack_from_mirror`).
+    /// Both legs publish the virtualizable operand stack
+    /// (`capture_frame_stack_from_vable`).
     WalkAbort = 11,
     /// `SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`
     /// (`pyjitpl.py _create_segmented_trace_and_blackhole`): the walk cut
@@ -321,37 +319,6 @@ pub(crate) enum WalkEndResume {
     /// "behind the resume point" coincide here, which is why the sticky
     /// unjournaled flags a terminal leg consults are a sufficient gate.
     Terminal,
-    /// The resume pc REWINDS — the interpreter re-runs a region the walk
-    /// already ran, while the journal stays committed.  Sound only while the
-    /// executed-effect odometer has not moved since `effects_at_resume_point`,
-    /// which is sampled AT that pc; otherwise every effect applied since it
-    /// runs a second time on top of the committed ones.  [`commit_walk_end`]
-    /// enforces this and declines the leg, leaving the legacy path whose
-    /// journal rollback makes the replay exactly-once.
-    Rewind { effects_at_resume_point: usize },
-    /// The resume pc rewinds and the leg has no sample to prove the odometer
-    /// stayed put since it.  [`commit_walk_end`] always declines: an unproven
-    /// rewind is exactly the shape that double-executes silently.  A leg that
-    /// reaches this either has to start sampling its resume point or should
-    /// not be committing at all.
-    RewindUnproven,
-    /// A rewind whose only proof is taken ELSEWHERE and EARLIER: the escape
-    /// latch's `escape_opcode_window_clean` runs at the residual
-    /// (`residual_call.rs`), not at this commit.  Named rather than spelled
-    /// `Terminal` because the resume pc genuinely re-runs its opcode —
-    /// `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
-    /// (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
-    /// the PREVIOUS opcode), and the flush sets `last_instr = pc - 1`
-    /// (`state.rs`), so `next_instr()` re-executes that opcode.
-    ///
-    /// The proof is DECLARED, not measured: the window records each residual's
-    /// `EffectInfo` re-runnability class (`EF_ELIDABLE_*` / `EF_LOOPINVARIANT`),
-    /// the same axis upstream licenses `resumepc=orgpc` on
-    /// (`jtransform.py:620-630`).  A commit-time counter sample would answer a
-    /// different question — the forcing residual itself moves the odometer
-    /// after the window is read — and upstream's op counters gate nothing
-    /// (`jitprof.py count_ops`).
-    RewindProvenAtLatch,
     /// The resume pc is AHEAD of what the walk applied — a rebuilt callee
     /// resumed at its own abort pc.  Nothing re-runs; committing is what
     /// *keeps* the applied effects, and rolling back would lose them (the
@@ -362,12 +329,6 @@ pub(crate) enum WalkEndResume {
     AfterApplied,
 }
 
-/// Record which leg committed the walk-end flush and set `flush_committed`.
-///
-/// Returns whether the commit was taken.  A [`WalkEndResume::Rewind`] leg whose
-/// odometer moved since its resume point is declined here rather than
-/// committed — the one gate that cannot be left to each leg, because a leg that
-/// forgets it produces a silent double-execution rather than a crash.
 /// Whether `resume` may be committed — the predicate [`commit_walk_end`]
 /// applies.  Exposed separately because a leg whose flush mutates the live
 /// frame before it can commit has to consult it FIRST: those flushes have no
@@ -375,13 +336,7 @@ pub(crate) enum WalkEndResume {
 #[must_use]
 pub(crate) fn walk_end_resume_provable(resume: WalkEndResume) -> bool {
     match resume {
-        WalkEndResume::Terminal
-        | WalkEndResume::AfterApplied
-        | WalkEndResume::RewindProvenAtLatch => true,
-        WalkEndResume::Rewind {
-            effects_at_resume_point,
-        } => crate::jitcode_dispatch::fbw_executed_effect_count() == effects_at_resume_point,
-        WalkEndResume::RewindUnproven => false,
+        WalkEndResume::Terminal | WalkEndResume::AfterApplied => true,
     }
 }
 
@@ -1176,10 +1131,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
-    // A prior walk's opcode-effect-window sample must not alias a same-pc
-    // opcode of this walk (the escape-flush latch gate reads it).
-    crate::jitcode_dispatch::escape_opcode_window_reset();
-    // Likewise drop any escape-flush undo a prior attempt failed to consume:
+    // Drop any escape-flush undo a prior attempt failed to consume:
     // "oldest capture wins" is only correct WITHIN one walk attempt — a
     // leftover here would restore wrong-generation locals onto a frame many
     // iterations ahead.
@@ -3657,7 +3609,6 @@ fn cash_single_frame_blackhole(
             ));
         }
     }
-    let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
     crate::jitcode_dispatch::discard_escape_flush_undo();
     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
     if let Some(flush_committed) = flush_committed {
@@ -4032,7 +3983,6 @@ fn cash_multi_frame_blackhole(
             ));
         }
     }
-    let _ = crate::jitcode_dispatch::take_committed_frame_escape_pc();
     crate::jitcode_dispatch::discard_escape_flush_undo();
     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
     if let Some(flush_committed) = flush_committed {
@@ -4201,6 +4151,10 @@ fn publish_portal_abort_image(
         banks,
     });
     ctx.aborted_framestack = Some(stack);
+    // The blackhole holds in-flight FOR_ITER items in registers
+    // (`_copy_data_from_miframe`); the legacy deliver in `eval.rs` must
+    // not re-apply them.
+    crate::jitcode_dispatch::fbw_foriter_inflight_clear();
 }
 
 /// ⚠️`drive_single_frame_blackhole` **executes** — `bh.resume_mainloop()`
@@ -4372,9 +4326,7 @@ fn try_adopt_single_frame_blackhole(
     // QUIETER, not smaller — before it the accumulator was visibly wrong too.
     // So the decline had to go, not be gated around.
     //
-    // The escape flush that ran ahead of the forcing residual is all-or-
-    // nothing, and its decline is what the vable-escape latch is gated on
-    // (`committed_frame_escape_pc().is_none()`).  The LOCALS half is not
+    // The LOCALS half of the adopt is not
     // optional: every LOAD_FAST lowers to
     // `getarrayitem_vable_r` on the frame the latched image's register names,
     // so without it the drive reads whatever that frame held before the walk
@@ -4462,13 +4414,14 @@ fn try_adopt_single_frame_blackhole(
         // live operand.  The same hole lands on `ABORT_TOO_LONG` of a root
         // walk (`trace_too_long_inline_multiframe`: snapshot-array `[x, 0]`,
         // mirror `[x, iter]`): a root walk keeps the virtualizable symbolic
-        // (`capture_frame_stack_from_mirror`), so the array is still the
+        // (`capture_frame_stack_from_vable`), so the array is still the
         // pre-walk stack.  RPython has no such split — `_copy_data_from_miframe`
         // copies the live MIFrame banks after every `run_one_step`.  The
-        // walker's OpRef mirror is that bank.
+        // virtualizable boxes are that stack at the latched jitcode pc
+        // (`synchronize_virtualizable` / `write_box_at`).
         // `WalkAbort` / `VableEscape` stop INSIDE an opcode; `SegmentTrace`
         // stops at a merge point whose array is equally unrefreshed.  Take
-        // the mirror the latch resolved while the concrete side tables were
+        // the image the latch resolved while the concrete side tables were
         // still live.
         let takes_mirror = commit_leg == WalkEndCommitLeg::WalkAbort
             || commit_leg == WalkEndCommitLeg::VableEscape
@@ -6313,8 +6266,9 @@ fn run_perfn_walk<Sym: WalkSym>(
         // The cases below have narrower recovery and must not be pre-empted
         // here.  A qmut abort converts here at either depth
         // (`opimpl_jit_force_quasi_immutable` raises `SwitchToBlackhole`,
-        // continued past the force by `convert_and_run_from_pyjitpl`); the
-        // root's one-frame rewind flush below runs only when this declines.
+        // continued past the force by `convert_and_run_from_pyjitpl`).
+        // A kept-stack branch abort converts at the post-branch MIFrame.pc
+        // (`opimpl_goto_if_not` / `generate_guard`).
         let mut walk_abort_adopted = !trace_too_long_adopted
             && !segment_adopted
             && matches!(&walk_result, Err(error) if error.can_convert_seeded_inline()
@@ -6367,7 +6321,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                 WalkEndCommitLeg::VableEscape,
                 crossed_inline_subwalk,
             );
-        let mut escape_pc_adopted = false;
         // What a VableEscape whose adopt did not commit must do once the walk
         // has already applied heap writes: replaying the traced region would
         // execute those writes a second time, so keep the flushed frame
@@ -6385,53 +6338,6 @@ fn run_perfn_walk<Sym: WalkSym>(
         };
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
-        }
-        if !force_blackhole_adopted
-            && vable_escaped
-            && let Some((resume_py_pc, escape_kind)) =
-                crate::jitcode_dispatch::take_committed_frame_escape_pc()
-        {
-            escape_pc_adopted = true;
-            // BOTH flushes inside `flush_active_frame_escape` rewind: they take
-            // the same `py_pc` and the same `last_instr = pc - 1`, so the
-            // escaping opcode re-runs either way.  They differ in whether the
-            // mid-expression operand stack was reconstructed, and — the part
-            // that matters here — in whether any gate ran at all.  The latched
-            // path is gated by `escape_opcode_window_clean` back at the
-            // residual; the merge-point fallback had no gate anywhere, so it
-            // has nothing to offer this contract and is refused.
-            let resume = match escape_kind {
-                crate::jitcode_dispatch::EscapeResumeKind::Exact => {
-                    WalkEndResume::RewindProvenAtLatch
-                }
-                crate::jitcode_dispatch::EscapeResumeKind::RerunsOpcode => {
-                    WalkEndResume::RewindUnproven
-                }
-            };
-            if commit_walk_end(flush_committed, WalkEndCommitLeg::VableEscape, resume) {
-                crate::jitcode_dispatch::discard_escape_flush_undo();
-                // The committed flush owns the iteration count (the resume pc
-                // is PAST the FOR_ITER consume); drop any in-flight item so
-                // the legacy deliver cannot re-apply one.
-                crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
-            } else if crate::jitcode_dispatch::fbw_executed_effect_count() > 0 {
-                // The rewind commit was declined, but the walk already applied
-                // heap writes, so the pre-flush restore below is not available.
-                keep_flushed_frame_after_applied();
-            } else {
-                // Put the live frame back to its pre-flush state: the legacy
-                // replay's contract is that the frame still holds pre-walk
-                // state, and its journal rollback makes the replay exactly-once.
-                crate::jitcode_dispatch::restore_escape_flush_undo();
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-abort-flush] escape flush declined at \
-                         resume_py_pc={resume_py_pc} (merge-point fallback re-runs the \
-                         escaping opcode) — legacy replay kept"
-                    );
-                }
-            }
         }
         // No adopt took the escape, and the walk already applied heap writes.
         if vable_escaped
@@ -6460,7 +6366,6 @@ fn run_perfn_walk<Sym: WalkSym>(
         // live resume state.
         if crate::jitcode_dispatch::take_escape_flush_undo_pending()
             && !force_blackhole_adopted
-            && !escape_pc_adopted
             && !walk_abort_adopted
             && !flush_committed.get()
         {
@@ -6638,236 +6543,6 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             if carrier.is_some() {
                 crate::jitcode_dispatch::fbw_abort_carrier_clear();
-            }
-        }
-
-        // A qmut abort the framestack handoff above adopted is consumed there.
-        if !walk_abort_adopted
-            && let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) =
-                &walk_result
-        {
-            let abort_jit_pc = *pc;
-            // A recorded-but-unexecuted residual is applied only by the replay
-            // this leg removes, so committing would DROP it; a sub-walk abort's
-            // resume coordinate names the callee's code object, not `sym`'s.
-            if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                || session.borrow().abort_in_subwalk
-            {
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
-                         (unjournaled effect or inline sub-walk) — legacy replay kept"
-                    );
-                }
-            } else if let Some((resume_py_pc, oprefs)) =
-                crate::jitcode_dispatch::fbw_qmut_abort_stack_take()
-            {
-                // The resume RE-RUNS this opcode (`last_instr = pc - 1`), so it
-                // owes the `Rewind` proof: nothing of it may have been applied
-                // yet.  The sample is taken at the opcode boundary itself, and
-                // its absence (no boundary crossed, or a different opcode)
-                // leaves the leg unprovable — `walk_end_resume_provable`
-                // declines and the legacy replay stands.
-                let resume =
-                    match crate::jitcode_dispatch::fbw_opcode_entry_effects_at(resume_py_pc) {
-                        Some(effects_at_resume_point) => WalkEndResume::Rewind {
-                            effects_at_resume_point,
-                        },
-                        None => WalkEndResume::RewindUnproven,
-                    };
-                if !walk_end_resume_provable(resume) {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        // The two ways this leg can be unprovable are different
-                        // failures and want different fixes, so name which one
-                        // happened.  `RewindUnproven` means no opcode-entry
-                        // sample was taken at all (no boundary crossed, or a
-                        // different opcode); a `Rewind` that is still unprovable
-                        // means the sample exists but the opcode had already
-                        // applied an effect by the resume point.
-                        let reason = match resume {
-                            WalkEndResume::RewindUnproven => "no opcode-entry sample",
-                            _ => "opcode already applied an effect",
-                        };
-                        eprintln!(
-                            "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                             ({reason}) — legacy replay kept"
-                        );
-                    }
-                } else if meta.trace_ctx().is_some_and(|ctx| {
-                    crate::jitcode_dispatch::flush_qmut_abort_state(
-                        ctx,
-                        cf_addr,
-                        resume_py_pc,
-                        &oprefs,
-                    )
-                }) {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-qmut-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                             resume_py_pc={resume_py_pc}"
-                        );
-                    }
-                    let committed =
-                        commit_walk_end(flush_committed, WalkEndCommitLeg::AbortPc, resume);
-                    debug_assert!(committed, "provability re-checked after a pure flush");
-                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                         (operand slot without concrete / depth) — legacy replay kept"
-                    );
-                }
-            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
-                     (no operand-stack mirror latched) — legacy replay kept"
-                );
-            }
-        }
-
-        // #32: a kept-stack branch guard whose not-taken arm cannot be
-        // restored for the COMPILED trace aborts (`AbortPermanent` for the
-        // unrestorable-Ref shape, decline + `Abort` for the depth>1
-        // invalid-mirror shape), but the authoritative walk's symbolic shadow
-        // IS complete at the abort pc (the hazard is about the JIT resume
-        // snapshot, not the interpreter-side shadow).  Flush that end state to
-        // the live frame so the interpreter resumes at the abort pc with the
-        // walked iterations already counted, instead of discarding the walk
-        // and dropping an in-flight FOR_ITER item via the conservative #30
-        // header-guard drop (or, for the `Unsupported` shape, re-executing the
-        // walk's residual effects from loop entry).  Same
-        // no-unjournaled-effect / no-sub-walk predicate and same all-or-nothing
-        // `flush_walk_end_state_to_frame` gate as the CloseLoop / marker legs;
-        // when the flush declines (a slot the shadow cannot resolve) the legacy
-        // drop stands (the residual S3 case).
-        let kept_stack_abort_pc = match &walk_result {
-            Err(
-                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
-                    pc,
-                },
-            ) => Some(*pc),
-            Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported { pc }) => {
-                Some(*pc)
-            }
-            _ => None,
-        };
-        if let Some(pc) = kept_stack_abort_pc {
-            let abort_jit_pc = pc;
-            if flush_committed.get() {
-                // A walk commits at most ONE leg.  The MidBody / AbortPc
-                // block above already repositioned the frame; flushing
-                // again here would move it a second time.
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (a carrier leg already committed this walk)"
-                    );
-                }
-            } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                || session.borrow().abort_in_subwalk
-            {
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (unjournaled effect or inline sub-walk) — legacy drop kept"
-                    );
-                }
-            } else {
-                let mirror = crate::jitcode_dispatch::fbw_branch_abort_stack_take();
-                let resume_py_pc = mirror
-                    .as_ref()
-                    .map(|(py_pc, _)| *py_pc)
-                    .or_else(|| crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc))
-                    .unwrap_or(0);
-                let mirror = mirror.map(|(_, stack)| stack);
-                // RPython resumes a mid-expression abort from the complete
-                // MIFrame register image.  Without that image, the vable
-                // shadow is only authoritative at a merge point: delivering
-                // an in-flight FOR_ITER item onto it can discard the list and
-                // iterator operands below that item (for example an inlined
-                // comprehension reached through a branch bridge).  Therefore
-                // only the exact-coordinate mirror may commit this leg.  A
-                // missing mirror leaves the established safe-point replay in
-                // place.
-                let committed = if let Some(ref stack) = mirror {
-                    // RPython converts the current MIFrame — including its
-                    // register-held mid-expression operands — directly into a
-                    // blackhole frame (`blackhole.py _copy_data_from_miframe`).  The vable
-                    // array is only complete at merge points, so prefer the
-                    // exact-coordinate walk mirror here.  Resolution and GC
-                    // rooting are shared with the established escape/qmut
-                    // mid-expression handoff.
-                    if !crate::jitcode_dispatch::fbw_foriter_inflight_active() {
-                        // A function-entry trace can reach the same kept-stack
-                        // abort without any FOR_ITER carrier.  Its live MIFrame
-                        // mirror is already the complete continuation; requiring
-                        // an iterator entry here discarded that state and
-                        // replayed from function entry after eager effects had
-                        // run (a recursive closure's `need.add` lost one item).
-                        meta.trace_ctx().is_some_and(|ctx| {
-                            crate::jitcode_dispatch::flush_with_latched_stack(
-                                ctx,
-                                cf_addr,
-                                resume_py_pc,
-                                stack,
-                            )
-                        })
-                    } else if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
-                        cf_addr,
-                        resume_py_pc,
-                    ) {
-                        meta.trace_ctx().is_some_and(|ctx| {
-                            crate::jitcode_dispatch::flush_with_latched_stack(
-                                ctx,
-                                cf_addr,
-                                resume_py_pc,
-                                stack,
-                            )
-                        })
-                    } else if let Some(push) =
-                        crate::jitcode_dispatch::fbw_foriter_inflight_take_for_resume(
-                            cf_addr,
-                            resume_py_pc,
-                        )
-                    {
-                        meta.trace_ctx().is_some_and(|ctx| {
-                            crate::jitcode_dispatch::flush_with_latched_stack_and_item(
-                                ctx,
-                                cf_addr,
-                                resume_py_pc,
-                                stack,
-                                push,
-                            )
-                        })
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if committed {
-                    // The flush owns the iteration count; drop any remaining
-                    // in-flight items so the legacy deliver cannot re-apply
-                    // one (exactly-once).
-                    crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                    // The abort pc is where the walk stopped, and the in-flight
-                    // item is delivered exactly once by the flush above.
-                    let _ = commit_walk_end(
-                        flush_committed,
-                        WalkEndCommitLeg::BranchGuard,
-                        WalkEndResume::Terminal,
-                    );
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-branch-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                 resume_py_pc={resume_py_pc} (delivered in-flight FOR_ITER item)"
-                        );
-                    }
-                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-branch-flush] declined at resume_py_pc={resume_py_pc} \
-                             (shadow slot without concrete / depth) — legacy drop kept"
-                    );
-                }
             }
         }
     }
@@ -8731,28 +8406,14 @@ mod tests {
         owner.join().unwrap();
     }
 
-    /// The walk-end commit contract: only a resume pc that does not precede
-    /// something the walk already applied may keep the store journal.
+    /// The walk-end commit contract: a terminal or after-applied resume keeps
+    /// the store journal.
     #[test]
-    fn walk_end_commit_refuses_an_unproven_or_stale_rewind() {
+    fn walk_end_commit_accepts_terminal_and_after_applied() {
         use super::{WalkEndResume, walk_end_resume_provable};
-        let live = crate::jitcode_dispatch::fbw_executed_effect_count();
 
         assert!(walk_end_resume_provable(WalkEndResume::Terminal));
         assert!(walk_end_resume_provable(WalkEndResume::AfterApplied));
-        assert!(walk_end_resume_provable(WalkEndResume::Rewind {
-            effects_at_resume_point: live,
-        }));
-        assert!(
-            !walk_end_resume_provable(WalkEndResume::Rewind {
-                effects_at_resume_point: live.wrapping_sub(1),
-            }),
-            "an odometer delta since the resume point means the region re-runs its effects",
-        );
-        assert!(
-            !walk_end_resume_provable(WalkEndResume::RewindUnproven),
-            "a rewind with no resume-point sample cannot be proven and must decline",
-        );
     }
 
     /// `run_perfn_walk` convert-before-rewind: a published abort latch keeps

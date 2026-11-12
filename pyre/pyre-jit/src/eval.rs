@@ -6691,13 +6691,24 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // Clearing the portal token for any other frame raises a spurious
         // escape with no committed resume pc, so the walk replays from entry
         // and double-applies the residual's non-journaled body effects.
-        if traced_frame_escaped && let Some(ptr) = tracing_frame {
-            // Step-0 attribution probe: this clear of the PORTAL's token is
-            // what the post-residual probe reads as an escape and turns into
-            // `VableEscapedDuringResidualCall`, so attributing it names which
-            // disjunct actually owns each abort.
+        //
+        // `tracing_before_residual_call` stamps the identity box
+        // (`standard_virtualizable_ptr` / the live frame). A root portal seed
+        // can point `virtualizable_heap_ptr` at the `snapshot_for_tracing`
+        // copy, which still holds an Active compiled-loop token, so the heap
+        // filter above misses TOKEN_TRACING_RESCALL. `force_now` on the frame
+        // Python handed over clears the stamped token.
+        if traced_frame_escaped {
             pyre_jit_trace::jitcode_dispatch::attribute_last_escape_force();
-            force(ptr);
+            let frame_rescall = matches!(
+                info.read_token(frame.cast()),
+                majit_metainterp::virtualizable::VableToken::TracingRescall
+            );
+            if frame_rescall {
+                force(frame.cast());
+            } else if let Some(ptr) = tracing_frame {
+                force(ptr);
+            }
         }
         if live_frame_armed {
             force(frame.cast());

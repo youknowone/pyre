@@ -4229,6 +4229,12 @@ impl DispatchError {
                 }
                 // Forcing the watcher leaves every register bound.
                 | Self::ForceQuasiImmutable { .. }
+                // `opimpl_goto_if_not` has already selected the taken link
+                // (`self.pc = target` or fall-through) when `generate_guard`
+                // records the guard. `convert_and_run_from_pyjitpl` copies
+                // that MIFrame.pc (`_copy_data_from_miframe`).
+                | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
+                | Self::BranchGuardKeptStackUnsupported { .. }
                 // Emitted only after both segment-cut blackhole preflights
                 // succeed. The missing guard snapshot affects compilation of
                 // the discarded trace, not the complete forward image.
@@ -4263,8 +4269,6 @@ impl DispatchError {
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::FunctionCodeRacedRecord { .. }
                 | Self::ConcreteShadowAllocationFailed { .. }
-                | Self::BranchGuardKeptStackUnsupported { .. }
-                | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
                 | Self::ExcEdgeNoInFrameCatch { .. }
                 // In-walk refuse of a loop-bearing callee (`fbw_decline_inline_callee`).
                 // With a seeded inline the frames are already an MIFrame stack, so
@@ -9025,8 +9029,8 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
-    /// `Some` arms `WalkEndResume::Rewind` and re-executes that call. A
-    /// bridge root leaves this unset; the call position is `call_pc`.
+    /// `Some` re-executes that call. A bridge root leaves this unset; the
+    /// call position is `call_pc`.
     call_jitcode_pc: Option<usize>,
     /// Jitcode pc of the CALL this frame is paused in. The handler records
     /// that position, then sets `MIFrame.pc` to the first byte after the
@@ -10021,31 +10025,6 @@ thread_local! {
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
-    /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef
-    /// mirror)` taken at the abort, for the flush leg that resumes the
-    /// interpreter at that opcode.
-    ///
-    /// The mirror is needed because the abort lands MID-EXPRESSION: the vable
-    /// shadow's stack region reads NULL outside a merge point, so the plain
-    /// flush declines on the first operand slot and the walk falls back to the
-    /// replay this leg exists to avoid.  Holds symbolic `OpRef`s only — the
-    /// concrete refs are resolved and rooted inside the flush.
-    static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
-        const { std::cell::RefCell::new(None) };
-
-    /// Kept-stack branch-abort resume carrier: `(py_pc, complete operand-stack
-    /// OpRef mirror)` captured from the live MIFrame-equivalent walk context
-    /// before it is dropped.
-    ///
-    /// Like the quasiimmutable carrier above, this is needed only for a
-    /// mid-expression abort: the virtualizable array is authoritative at merge
-    /// points, while RPython resumes a blackhole from the MIFrame register
-    /// image at the exact abort point (`blackhole.py _copy_data_from_miframe`).  The trace
-    /// epilogue accepts this carrier only when its Python coordinate exactly
-    /// matches the decoded abort resume pc.
-    static FBW_BRANCH_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
-        const { std::cell::RefCell::new(None) };
-
     /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
     /// opcode it is currently inside, as `(py_pc, odometer)`.
     ///
@@ -10258,7 +10237,7 @@ struct FbwStoreJournalRootArea {
     published_inline_frame: *const std::cell::Cell<*mut pyre_interpreter::PyFrame>,
     published_last_instr: *const std::cell::Cell<Option<PublishedLastInstr>>,
     published_inline_shadow: *const std::cell::RefCell<Option<PublishedInlineShadow>>,
-    active_frame_escape: *const std::cell::Cell<Option<(usize, Option<usize>)>>,
+    active_frame_escape: *const std::cell::Cell<Option<usize>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
     parked_stack: *const std::cell::RefCell<Vec<fbw_state::ParkedWalkTls>>,
@@ -14591,19 +14570,22 @@ fn guarded_branch_core<Sym: WalkSym>(
                         kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
                     );
                 }
-                // Stamp the abort coordinate at the raise point so the
-                // driver gate cannot observe an unrelated prior abort.
-                //
-                // `MIFrame.run_one_step` has already advanced `frame.pc`, and
-                // `opimpl_goto_if_not` has already selected its link, when a
-                // tracing abort converts the frame to a blackhole
-                // (`pyjitpl.py`, `blackhole.py:1800-1810`).  Preserve  allow-line-citation
-                // that post-branch Python continuation and its popped stack,
-                // rather than making the interpreter re-run the guard opcode.
-                // The latter needs the transient truth operand which JitCode
-                // keeps only in an Int register, and replaying from the trace
-                // entry when it is absent double-applies prior residuals.
-                latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
+                // `opimpl_goto_if_not` has already selected the taken link
+                // (`self.pc = target` or fall-through) when `generate_guard`
+                // records the guard. `run_blackhole_interp_to_cancel_tracing`
+                // → `convert_and_run_from_pyjitpl` → `_copy_data_from_miframe`
+                // resumes this MIFrame at that pc. Latch the convert image
+                // there; the error pc stays the guard for `DONT_TRACE_HERE`.
+                if ctx.fbw_mode.inline_subwalk {
+                    residual_call::discard_staged_abort(ctx.session);
+                }
+                let latched =
+                    residual_call::latch_abort_blackhole(ctx, taken_pc, "branch-kept-stack");
+                if latched && ctx.fbw_mode.transparent_helper_subwalk {
+                    let splice_ok =
+                        inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                    let _ = residual_call::finish_helper_abort_latch(ctx.session, splice_ok);
+                }
                 // Stamp only at the root: a sub-walk raise must leave
                 // `abort_in_subwalk` clear so `claim_abort_coordinate` can
                 // own this pc. Overwrite a leftover true from a recovered
@@ -14641,64 +14623,6 @@ fn guarded_branch_core<Sym: WalkSym>(
     }
     write_branch_result(ctx, op.pc, result_write)?;
     Ok((DispatchOutcome::Continue, taken_pc))
-}
-
-/// Preserve the already-selected Python successor for a kept-stack branch
-/// abort, matching the forward `MIFrame.pc` copied by
-/// `convert_and_run_from_pyjitpl`.
-fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    frame: Option<&ActiveResumeFrame>,
-    guard_opcode: OpCode,
-) {
-    let Some(frame) = frame else {
-        return;
-    };
-    let py_pc = ctx.vstack_cur_pypc as usize;
-    let pjc = &frame.0;
-    if pjc.code_ptr.is_null() {
-        return;
-    }
-    let code = unsafe { &*pjc.code_ptr };
-    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, py_pc) else {
-        return;
-    };
-    let truth = match guard_opcode {
-        OpCode::GuardTrue => true,
-        OpCode::GuardFalse => false,
-        _ => return,
-    };
-    let jump = match instr {
-        pyre_interpreter::Instruction::PopJumpIfTrue { .. } => truth,
-        pyre_interpreter::Instruction::PopJumpIfFalse { .. } => !truth,
-        _ => return,
-    };
-    let successor = if jump {
-        crate::liveness::target_pc(code, &instr, py_pc, op_arg)
-    } else {
-        Some(crate::pyjitpl::semantic_fallthrough_pc(code, py_pc))
-    };
-    let Some(successor) = successor else {
-        return;
-    };
-    let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
-        .depth_at_py_pc()
-        .get(successor)
-        .copied()
-        .map(usize::from)
-    else {
-        return;
-    };
-    if !ctx.vstack_valid
-        || depth > ctx.vstack_depth
-        || depth > ctx.frame_state.borrow().vstack_boxes.len()
-    {
-        return;
-    }
-    fbw_branch_abort_stack_latch(
-        successor,
-        ctx.frame_state.borrow().vstack_boxes[..depth].to_vec(),
-    );
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(

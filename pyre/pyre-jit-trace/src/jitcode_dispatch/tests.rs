@@ -1049,9 +1049,9 @@ fn constructor_assembler_caller_frame(jitcode_index: u32) -> InlineParentFrame {
     }
 }
 
-/// `capture_vstack_mirror_image` returns `None` when the walk mirror is
-/// invalid. The pre-inline admission must then decline so the walk takes
-/// the ordinary residual instead of entering the dunder.
+/// `capture_vable_shadow_stack_image` returns `None` when the virtualizable
+/// image is missing. The pre-inline admission must then decline so the walk
+/// takes the ordinary residual instead of entering the dunder.
 #[test]
 fn operator_tail_latch_without_a_mirror_declines_before_inline() {
     reset_single_frame_blackhole();
@@ -1091,7 +1091,7 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
             crate::operator_continuation::OperatorTail::Len,
             None,
         ),
-        "a missing vstack mirror must refuse the resume image before inline",
+        "a missing vable shadow image must refuse the resume image before inline",
     );
     assert!(
         !can_latch_operator_tail_return(
@@ -1100,11 +1100,136 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
             crate::operator_continuation::OperatorTail::Len,
             None,
         ),
-        "a missing vstack mirror must refuse the latch before inline",
+        "a missing vable shadow image must refuse the latch before inline",
     );
     assert!(
         !multi_frame_blackhole_is_latched(),
         "a refused pre-inline admission must publish nothing",
+    );
+}
+
+/// A walk that stops inside an opcode after `emit_popvalue_ref!` has
+/// already run `_opimpl_setfield_vable`. The abort image is the
+/// virtualizable's remaining operand stack (`synchronize_virtualizable` /
+/// `write_box_at`), not the opcode-entry height.
+#[test]
+fn abort_latch_image_after_a_pop_publishes_the_vable_depth() {
+    use pyre_interpreter::locals_w_mut;
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code_obj = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code_obj).expect("frame allocation");
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let remaining = pyre_object::w_int_new(7);
+    let nlocals = crate::state::concrete_nlocals(frame_ptr).expect("nlocals");
+    let valuestackdepth = nlocals + 1;
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        assert!(
+            slots.len() >= valuestackdepth,
+            "the frame array must hold the remaining operand"
+        );
+        slots[nlocals] = remaining;
+        frame.valuestackdepth = valuestackdepth;
+        frame.last_instr = 6;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth");
+    let last_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr");
+    let nstatic = info.num_static_extra_boxes;
+    // Opcode-entry TOS sits at nlocals+1; the pop has already dropped it
+    // from valuestackdepth, so the image must not publish that slot.
+    let leftover_index = nlocals + 1;
+    let array_len = leftover_index + 1;
+    let vable = tc.const_ref(frame_ptr as i64);
+    let remaining_box = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(
+        remaining_box,
+        Value::Ref(majit_ir::GcRef(remaining as usize)),
+    );
+    let leftover = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(leftover, Value::Ref(majit_ir::GcRef(0xDEAD)));
+    let mut boxes = vec![tc.const_null(); nstatic + array_len];
+    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic + array_len];
+    boxes[last_idx] = tc.const_int(6);
+    values[last_idx] = Value::Int(6);
+    boxes[vsd_idx] = tc.const_int(valuestackdepth as i64);
+    values[vsd_idx] = Value::Int(valuestackdepth as i64);
+    boxes[nstatic + nlocals] = remaining_box;
+    values[nstatic + nlocals] = Value::Ref(majit_ir::GcRef(remaining as usize));
+    boxes[nstatic + leftover_index] = leftover;
+    values[nstatic + leftover_index] = Value::Ref(majit_ir::GcRef(0xDEAD));
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr)),
+        &boxes,
+        &values,
+        &[array_len],
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: nlocals + 2,
+        vstack_cur_pypc: 6,
+        vstack_valid: true,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let image = capture_vable_shadow_stack_image(&wc, frame_ptr, "test-pop")
+        .expect("vable image after a pop");
+    let captured = image
+        .capture_for(frame_ptr)
+        .expect("vable image is publishable");
+    drop(wc);
+    std::hint::black_box((&frame, remaining));
+    assert_eq!(
+        image.slots.len(),
+        1,
+        "the image must drop the slot the opcode already popped"
+    );
+    assert_eq!(image.valuestackdepth, Some(valuestackdepth));
+    assert_eq!(image.last_instr, Some(6));
+    assert_eq!(
+        captured.roots_snapshot(),
+        vec![remaining as i64],
+        "publish must keep the remaining operand, not the opcode-entry TOS"
     );
 }
 

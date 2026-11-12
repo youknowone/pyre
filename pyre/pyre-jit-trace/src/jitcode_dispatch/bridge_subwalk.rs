@@ -771,23 +771,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             pin_nonconst_standing_exception_class(&mut wc, walk_position)?;
             walk(jitcode_code, walk_position, &mut wc)
         };
-        if matches!(
-            &outcome,
-            Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. })
-                | Err(DispatchError::BranchGuardKeptStackUnsupported { .. })
-        ) && wc.vstack_valid
-            && wc.vstack_depth <= wc.frame_state.borrow().vstack_boxes.len()
-        {
-            // `MIFrame.registers_r` is the authoritative source upstream when
-            // an abort converts the metainterp framestack to blackholes
-            // (`blackhole.py _copy_data_from_miframe`).  Preserve pyre's equivalent mirror
-            // before `wc` drops; the epilogue checks this coordinate against
-            // the decoded abort resume pc before it mutates the live frame.
-            fbw_branch_abort_stack_latch(
-                wc.vstack_cur_pypc as usize,
-                wc.frame_state.borrow().vstack_boxes[..wc.vstack_depth].to_vec(),
-            );
-        }
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value();
