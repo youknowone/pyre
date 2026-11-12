@@ -6939,19 +6939,25 @@ pub(in crate::front::mir) fn is_deref_call_for(
     false
 }
 
-/// String/Vec deref is identity in the lifted model (`rpy_string` /
-/// `rpy_list`). Box is identity only when the dest is a slice
-/// (`Box<[T]>` → `&[T]`); `Box<Struct>` is [`deref_cast_root`] and
-/// `Box<i64>` is a thin integer pointer.
+/// `alloc::string::String` / `alloc::vec::Vec` deref is identity in the
+/// lifted model (`rpy_string` / `rpy_list`). `alloc::boxed::Box` is
+/// identity only when the dest is a slice (`Box<[T]>` → `&[T]`);
+/// `Box<Struct>` is [`deref_cast_root`] and `Box<i64>` is a thin integer
+/// pointer. `owner_path` is the impl owner's declaration path
+/// (`rclass.py` `getgcflavor`); a user `foo::Vec` is not identity.
 pub(in crate::front::mir) fn container_identity_deref_owner(
-    owner_leaf: &str,
+    owner_path: &str,
     dest_ty: Option<&TyRef>,
     llbc: &Llbc,
 ) -> bool {
-    match owner_leaf {
-        "String" | "Vec" => true,
-        "Box" => dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc)),
-        _ => false,
+    if path_ends_with_segments(owner_path, "alloc::vec::Vec")
+        || path_ends_with_segments(owner_path, "alloc::string::String")
+    {
+        true
+    } else if path_ends_with_segments(owner_path, "alloc::boxed::Box") {
+        dest_ty.is_some_and(|ty| tyref_strips_to_slice(ty, llbc))
+    } else {
+        false
     }
 }
 

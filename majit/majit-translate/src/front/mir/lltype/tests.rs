@@ -5920,23 +5920,38 @@ fn trait_box_slice_deref_is_container_identity() {
     assert!(super::tyref_strips_to_slice(&slice_ty, &llbc));
     assert!(!super::tyref_strips_to_slice(&i64_ty, &llbc));
     assert!(super::container_identity_deref_owner(
-        "Box",
+        "alloc::boxed::Box",
         Some(&slice_ty),
         &llbc
     ));
     assert!(!super::container_identity_deref_owner(
-        "Box",
+        "alloc::boxed::Box",
         Some(&i64_ty),
         &llbc
     ));
-    assert!(!super::container_identity_deref_owner("Box", None, &llbc));
+    assert!(!super::container_identity_deref_owner(
+        "alloc::boxed::Box",
+        None,
+        &llbc
+    ));
     assert!(!super::container_identity_deref_owner(
         "Constants",
         Some(&slice_ty),
         &llbc
     ));
-    assert!(super::container_identity_deref_owner("Vec", None, &llbc));
-    assert!(super::container_identity_deref_owner("String", None, &llbc));
+    assert!(super::container_identity_deref_owner(
+        "alloc::vec::Vec",
+        None,
+        &llbc
+    ));
+    assert!(super::container_identity_deref_owner(
+        "alloc::string::String",
+        None,
+        &llbc
+    ));
+    assert!(!super::container_identity_deref_owner(
+        "foo::Vec", None, &llbc
+    ));
 }
 
 #[test]

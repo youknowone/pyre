@@ -614,6 +614,10 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         super::spelling_pair_field_kind("&[usize]"),
         Some(VecItemKind::Int)
     );
+    assert_eq!(
+        super::spelling_pair_field_kind("&&[usize]"),
+        Some(VecItemKind::Int)
+    );
     assert_eq!(super::spelling_pair_field_kind("&[u8]"), None);
     assert_eq!(super::spelling_pair_field_kind("[u8]"), None);
     assert_eq!(
@@ -630,4 +634,29 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         None,
         "object-pointer &[T] stays the length-prefixed object array"
     );
+}
+
+/// `tyref_pair_field_kind` peels one extra `Ref`, so `&&[usize]` is a
+/// pair. The spelling path peels `&` / `&mut ` / `*mut ` / `*const `
+/// until the slice remains.
+#[test]
+fn spelling_pair_field_kind_peels_nested_ref_prefixes() {
+    use majit_ir::rvec::VecItemKind;
+    assert_eq!(
+        super::spelling_pair_field_kind("&&[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("&mut &[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("*const &[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("*mut &mut [usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(super::spelling_pair_field_kind("&&[u8]"), None);
 }

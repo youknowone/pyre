@@ -4242,17 +4242,23 @@ pub(in crate::front::mir) fn tyref_pair_field_kind(
 pub(in crate::front::mir) fn spelling_pair_field_kind(
     spelling: &str,
 ) -> Option<majit_ir::rvec::VecItemKind> {
-    let spelling = spelling.trim();
+    let mut spelling = spelling.trim();
     // `PtrRepr.rtype_getattr` keeps declared `&` / `*const` wrappers, so a
     // substituted `&[T]` field still spells the borrowed slice. Peel those
-    // constructors: no field holds an unsized `[T]` by value.
-    let spelling = spelling
-        .strip_prefix("*const ")
-        .or_else(|| spelling.strip_prefix("*mut "))
-        .or_else(|| spelling.strip_prefix("&mut "))
-        .or_else(|| spelling.strip_prefix('&'))
-        .map(str::trim)
-        .unwrap_or(spelling);
+    // constructors until none remains: no field holds an unsized `[T]` by
+    // value. `tyref_pair_field_kind` peels one extra `Ref` after
+    // `strip_ty_indirections`, so `&&[T]` is a pair on the TyRef path too.
+    loop {
+        let Some(inner) = spelling
+            .strip_prefix("*const ")
+            .or_else(|| spelling.strip_prefix("*mut "))
+            .or_else(|| spelling.strip_prefix("&mut "))
+            .or_else(|| spelling.strip_prefix('&'))
+        else {
+            break;
+        };
+        spelling = inner.trim();
+    }
     if !(spelling.starts_with('[') && spelling.ends_with(']'))
         || shaped_array_parts(spelling).is_some()
     {
