@@ -336,7 +336,7 @@ fn lazy_import_add_exception_cause(lz: PyObjectRef, mut err: crate::PyError) -> 
     let context = unsafe { w_exception_get_context(exc) };
     let suppress = unsafe { w_exception_get_suppress_context(exc) };
     if !cause.is_null() || !context.is_null() || suppress {
-        let note = w_str_new(&format!(
+        let note = w_str_new_managed(&format!(
             "lazy import of '{name_s}' declared in {funcname} at {filename}:{lineno}"
         ));
         let note_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -379,7 +379,12 @@ fn lazy_import_add_exception_cause(lz: PyObjectRef, mut err: crate::PyError) -> 
     }
     let cause_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(cause);
-    // `_PyTraceback_Add` has no interpreter helper; the cause is still set.
+    crate::pytraceback::traceback_add(
+        pyre_object::gc_roots::shadow_stack_get(cause_slot),
+        &funcname,
+        &filename,
+        lineno as i64,
+    );
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
     unsafe {
@@ -924,7 +929,7 @@ pub fn try_load_lazy_submodule(
         return Ok(None);
     }
     let attr_s = attr_name.to_owned();
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(module);
     module = pyre_object::gc_roots::shadow_stack_get(module_slot);
@@ -989,7 +994,8 @@ pub fn try_load_lazy_submodule(
         }
     };
     match load_result {
-        Err(e) => {
+        Err(mut e) => {
+            let e_slot = e.pin(&roots);
             if let Some(loaded) = crate::importing::sys_modules_entry(&full_s)
                 && unsafe { !is_none(loaded) }
             {
@@ -1020,6 +1026,7 @@ pub fn try_load_lazy_submodule(
                     );
                 }
             }
+            e.reload(&roots, e_slot);
             Err(e)
         }
         Ok(mod_) if mod_.is_null() || unsafe { is_none(mod_) } => Ok(None),
@@ -1625,14 +1632,14 @@ fn module_dict_contains_path(obj: PyObjectRef) -> Result<bool, crate::PyError> {
     .is_some())
 }
 
-fn err_matches_exception(err: &crate::PyError) -> bool {
+fn err_matches_exception(err: &mut crate::PyError) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
-    let mut err = err.clone();
     let err_slot = err.pin(&roots);
-    let Some(w_exc) = crate::builtins::lookup_exc_class("Exception") else {
+    let w_exc = crate::builtins::lookup_exc_class("Exception");
+    err.reload(&roots, err_slot);
+    let Some(w_exc) = w_exc else {
         return false;
     };
-    err.reload(&roots, err_slot);
     err.match_(PY_NULL, w_exc)
 }
 
@@ -1651,8 +1658,8 @@ fn lazy_submodule_is_initializing(module: PyObjectRef) -> Result<bool, crate::Py
     ) {
         Ok(None) => return Ok(false),
         Ok(Some(spec)) => spec,
-        Err(e) => {
-            if err_matches_exception(&e) {
+        Err(mut e) => {
+            if err_matches_exception(&mut e) {
                 return Ok(false);
             }
             return Err(e);
@@ -1663,8 +1670,13 @@ fn lazy_submodule_is_initializing(module: PyObjectRef) -> Result<bool, crate::Py
     match crate::importing::is_spec_initializing(pyre_object::gc_roots::shadow_stack_get(spec_slot))
     {
         Ok(v) => Ok(v),
-        Err(e) if err_matches_exception(&e) => Ok(false),
-        Err(e) => Err(e),
+        Err(mut e) => {
+            if err_matches_exception(&mut e) {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
