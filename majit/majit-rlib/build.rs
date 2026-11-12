@@ -1,8 +1,9 @@
 //! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
 //! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
 //! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
-//! `configure(CConfig)`), `rposix.py` `pipe_config`, and `advise_config`
-//! probes go through `majit_eci::rffi_platform`, and
+//! `configure(CConfig)`), `rposix.py` `pipe_config`, `advise_config`, and
+//! the "f... and ...at families" `CConfig` probes go through
+//! `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -48,6 +49,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_pipe2)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fadvise)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_fallocate)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_chflags)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_lchflags)");
+    println!("cargo:rustc-check-cfg=cfg(rposix_have_fexecve)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -66,11 +70,19 @@ fn main() {
     {
         write_clibffi_cconfig();
     }
-    let (have_pipe2, have_fadvise, have_fallocate, have_d_type) = if target_is_unix_or_windows() {
+    let (
+        have_pipe2,
+        have_fadvise,
+        have_fallocate,
+        have_d_type,
+        have_chflags,
+        have_lchflags,
+        have_fexecve,
+    ) = if target_is_unix_or_windows() {
         write_rdynload_cconfig();
         write_rposix_cconfig(&pipe_config)
     } else {
-        (false, false, false, false)
+        (false, false, false, false, false, false, false)
     };
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
@@ -83,6 +95,9 @@ fn main() {
     println!("cargo::metadata=HAVE_FADVISE={}", have_fadvise as u8);
     println!("cargo::metadata=HAVE_FALLOCATE={}", have_fallocate as u8);
     println!("cargo::metadata=HAVE_D_TYPE={}", have_d_type as u8);
+    println!("cargo::metadata=HAVE_CHFLAGS={}", have_chflags as u8);
+    println!("cargo::metadata=HAVE_LCHFLAGS={}", have_lchflags as u8);
+    println!("cargo::metadata=HAVE_FEXECVE={}", have_fexecve as u8);
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -149,6 +164,43 @@ const RPOSIX_POSIX_FADV_NAMES: [&str; 6] = [
     "POSIX_FADV_RANDOM",
     "POSIX_FADV_NOREUSE",
     "POSIX_FADV_DONTNEED",
+];
+
+/// `rposix.py` `CConfig` "f... and ...at families" `Has(_name)` names.
+const RPOSIX_AT_FAMILY_NAMES: &[&str] = &[
+    "faccessat",
+    "fchdir",
+    "fchmod",
+    "fchmodat",
+    "fchown",
+    "fchownat",
+    "fexecve",
+    "fdopendir",
+    "fpathconf",
+    "fstat",
+    "fstatat",
+    "fstatvfs",
+    "ftruncate",
+    "futimens",
+    "futimes",
+    "futimesat",
+    "linkat",
+    "chflags",
+    "lchflags",
+    "lchmod",
+    "lchown",
+    "lstat",
+    "lutimes",
+    "mkdirat",
+    "mkfifoat",
+    "mknodat",
+    "openat",
+    "readlinkat",
+    "renameat",
+    "symlinkat",
+    "unlinkat",
+    "utimensat",
+    "sched_getparam",
 ];
 
 /// `rdynload.py` `CConfig` / `configure(CConfig)`. The probe ECI is
@@ -297,7 +349,7 @@ fn rposix_pipe_config() -> Vec<(String, ConfigValue)> {
 /// The probe ECI is `rposix.eci`.
 fn write_rposix_cconfig(
     pipe_config: &Option<Vec<(String, ConfigValue)>>,
-) -> (bool, bool, bool, bool) {
+) -> (bool, bool, bool, bool, bool, bool, bool) {
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
     let unix = std::env::var("CARGO_CFG_UNIX").is_ok();
 
@@ -644,10 +696,93 @@ fn write_rposix_cconfig(
         println!("cargo:rustc-cfg=rposix_have_fallocate");
     }
 
+    let (have_chflags, have_lchflags, have_fexecve) = write_rposix_at_family(&mut text, windows);
+
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rposix_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-    (have_pipe2, have_fadvise, have_fallocate, have_d_type)
+    (
+        have_pipe2,
+        have_fadvise,
+        have_fallocate,
+        have_d_type,
+        have_chflags,
+        have_lchflags,
+        have_fexecve,
+    )
+}
+
+/// `rposix.py` `CConfig` "f... and ...at families" `HAVE_<NAME>`.
+fn rposix_at_family_have_name(name: &str) -> String {
+    format!("HAVE_{}", name.to_ascii_uppercase())
+}
+
+/// `rposix.py` `CConfig` "f... and ...at families" / `configure(CConfig)` /
+/// `if _LINUX: cConfig["HAVE_LCHMOD"] = False` / `globals().update(cConfig)`.
+///
+/// Upstream merges `sys/statvfs.h` into `eci` unconditionally. That header is
+/// absent on Windows, so the probe would fail; every `HAVE_*` is false there.
+fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool) {
+    text.push_str("// rposix.py CConfig (f... and ...at families)\n");
+    if windows {
+        for name in RPOSIX_AT_FAMILY_NAMES {
+            let have = rposix_at_family_have_name(name);
+            text.push_str(&format!("pub const {have}: bool = false;\n"));
+        }
+        return (false, false, false);
+    }
+    let at_eci = rposix_eci().merge(&[&ExternalCompilationInfo {
+        includes: vec!["sys/statvfs.h".into()],
+        ..Default::default()
+    }]);
+    let single_entries = RPOSIX_AT_FAMILY_NAMES
+        .iter()
+        .map(|name| {
+            (
+                rposix_at_family_have_name(name),
+                CConfigSingleEntry::Has((*name).into()),
+            )
+        })
+        .collect();
+    let at_config = CConfig {
+        compilation_info: at_eci,
+        entries: vec![],
+        single_entries,
+    };
+    let at_results = configure(&at_config, false).unwrap_or_else(|err| panic!("{err}"));
+    let linux = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux";
+    let mut have_chflags = false;
+    let mut have_lchflags = false;
+    let mut have_fexecve = false;
+    for name in RPOSIX_AT_FAMILY_NAMES {
+        let have = rposix_at_family_have_name(name);
+        if have == "HAVE_LCHMOD" && linux {
+            text.push_str("pub const HAVE_LCHMOD: bool = false;\n");
+            continue;
+        }
+        let value = cconfig_lookup(&at_results, &have);
+        emit_bool(text, &have, value);
+        let flag = match value {
+            ConfigValue::Bool(v) => *v,
+            other => panic!("{have}: {other:?}"),
+        };
+        match have.as_str() {
+            "HAVE_CHFLAGS" => have_chflags = flag,
+            "HAVE_LCHFLAGS" => have_lchflags = flag,
+            "HAVE_FEXECVE" => have_fexecve = flag,
+            _ => {}
+        }
+    }
+    if have_chflags {
+        println!("cargo:rustc-cfg=rposix_have_chflags");
+    }
+    if have_lchflags {
+        println!("cargo:rustc-cfg=rposix_have_lchflags");
+    }
+    if have_fexecve {
+        println!("cargo:rustc-cfg=rposix_have_fexecve");
+    }
+    (have_chflags, have_lchflags, have_fexecve)
 }
 
 fn cconfig_lookup<'a>(results: &'a [(String, ConfigValue)], name: &str) -> &'a ConfigValue {

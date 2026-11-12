@@ -50,6 +50,16 @@ pub use cConfig::{
 pub use cConfig::{DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN};
 #[cfg(unix)]
 pub use cConfig::{GID_T, ID_T, NCCS, TMS, UID_T};
+/// `rposix.py` `CConfig` "f... and ...at families".
+#[cfg(any(unix, windows))]
+pub use cConfig::{
+    HAVE_CHFLAGS, HAVE_FACCESSAT, HAVE_FCHDIR, HAVE_FCHMOD, HAVE_FCHMODAT, HAVE_FCHOWN,
+    HAVE_FCHOWNAT, HAVE_FDOPENDIR, HAVE_FEXECVE, HAVE_FPATHCONF, HAVE_FSTAT, HAVE_FSTATAT,
+    HAVE_FSTATVFS, HAVE_FTRUNCATE, HAVE_FUTIMENS, HAVE_FUTIMES, HAVE_FUTIMESAT, HAVE_LCHFLAGS,
+    HAVE_LCHMOD, HAVE_LCHOWN, HAVE_LINKAT, HAVE_LSTAT, HAVE_LUTIMES, HAVE_MKDIRAT, HAVE_MKFIFOAT,
+    HAVE_MKNODAT, HAVE_OPENAT, HAVE_READLINKAT, HAVE_RENAMEAT, HAVE_SCHED_GETPARAM, HAVE_SYMLINKAT,
+    HAVE_UNLINKAT, HAVE_UTIMENSAT,
+};
 /// `rposix.py` `advise_config`.
 #[cfg(rposix_have_fadvise)]
 pub use cConfig::{
@@ -1399,20 +1409,28 @@ crate::rffi::llexternal!(
 // `rposix.py` `CConfig` `HAVE_CHFLAGS` / `HAVE_LCHFLAGS`.  The product
 // `interp_posix.py` names are documentation stubs; the calls are the
 // llexternals those stubs would use.  Flags are `unsigned int` on Apple
-// and OpenBSD, `unsigned long` on FreeBSD/NetBSD/DragonFly.
+// and OpenBSD, `unsigned long` on FreeBSD/NetBSD/DragonFly. The remaining
+// unix hosts keep `unsigned long` so `rposix_have_chflags` can be true
+// off the BSD list.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "openbsd"))]
 pub type ChflagsFlags = libc::c_uint;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "dragonfly"))]
 pub type ChflagsFlags = libc::c_ulong;
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+#[cfg(all(
+    unix,
+    any(rposix_have_chflags, rposix_have_lchflags),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "openbsd",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))
 ))]
+pub type ChflagsFlags = libc::c_ulong;
+
+#[cfg(rposix_have_chflags)]
 crate::rffi::llexternal!(
     pub c_chflags = "chflags",
     [*const libc::c_char, ChflagsFlags],
@@ -1421,14 +1439,7 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
+#[cfg(rposix_have_lchflags)]
 crate::rffi::llexternal!(
     pub c_lchflags = "lchflags",
     [*const libc::c_char, ChflagsFlags],
@@ -1888,7 +1899,7 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_fexecve` is behind `HAVE_FEXECVE` and saves errno.
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+#[cfg(rposix_have_fexecve)]
 crate::rffi::llexternal!(
     pub c_fexecve = "fexecve",
     [
@@ -3795,14 +3806,7 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ))]
+    #[cfg(all(rposix_have_chflags, rposix_have_lchflags))]
     #[test]
     fn c_chflags_zero_on_temp_file() {
         use std::os::unix::ffi::OsStrExt;

@@ -6195,11 +6195,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     const HOST_WINDOWS_CRT: bool =
         cfg!(all(windows, feature = "host_env", not(feature = "sandbox")));
 
-    /// The `HAVE_*` macros `_have_functions` advertises, each spelled as the
-    /// condition under which the entry point it names really does take an open
-    /// descriptor. `os.py:140-155` reads them into `supports_fd`, so a bit set
-    /// where the call still rejects an integer hands the caller a capability it
-    /// cannot use.
+    /// The `HAVE_*` macros `_have_functions` advertises. Each is
+    /// `getattr(rposix, "HAVE_%s" % name)` (`interp_posix.py` `have_functions`)
+    /// and the pyre condition under which the matching entry point is compiled.
+    /// `os.py` reads them into `supports_fd`, so a bit set where the
+    /// call still rejects an integer hands the caller a capability it cannot
+    /// use.
     /// `rposix.HAVE_FACCESSAT` — what `access` types its `dir_fd` as
     /// (`interp_posix.py`) and what its two flag modifiers are tested
     /// against (`:771-775`). All three of `access`'s modifiers are the one
@@ -6207,102 +6208,105 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// it into `supports_dir_fd`, `supports_effective_ids` and
     /// `supports_follow_symlinks` alike, and it is the only bit any of those
     /// three reads for `access`.
-    const HAVE_FACCESSAT: bool = HOST_POSIX;
-    const HAVE_FCHDIR: bool = HOST_POSIX;
-    const HAVE_FCHMOD: bool = HOST_POSIX;
-    const HAVE_FCHOWN: bool = HOST_POSIX;
+    const HAVE_FACCESSAT: bool = majit_rlib::rposix::HAVE_FACCESSAT && HOST_POSIX;
+    const HAVE_FCHDIR: bool = majit_rlib::rposix::HAVE_FCHDIR && HOST_POSIX;
+    const HAVE_FCHMOD: bool = majit_rlib::rposix::HAVE_FCHMOD && HOST_POSIX;
+    const HAVE_FCHOWN: bool = majit_rlib::rposix::HAVE_FCHOWN && HOST_POSIX;
     /// `chown` resolves a name against `dir_fd` and honours
     /// `follow_symlinks=False` through the one `fchownat` call
     /// (`interp_posix.py`), which is also how `lchown` is spelled.
-    const HAVE_FCHOWNAT: bool = HOST_POSIX;
-    const HAVE_FPATHCONF: bool = HOST_POSIX;
-    const HAVE_FSTATVFS: bool = HOST_POSIX;
+    const HAVE_FCHOWNAT: bool = majit_rlib::rposix::HAVE_FCHOWNAT && HOST_POSIX;
+    const HAVE_FPATHCONF: bool = majit_rlib::rposix::HAVE_FPATHCONF && HOST_POSIX;
+    const HAVE_FSTATVFS: bool = majit_rlib::rposix::HAVE_FSTATVFS && HOST_POSIX;
+    /// [3.15-spec] ours: rposix HAVE_FTRUNCATE on POSIX, plus the C runtime's _chsize_s on Windows ↔ pypy: getattr(rposix, "HAVE_FTRUNCATE") only — "HAVE_FTRUNCATE" in os._have_functions on Windows; evidence: posixmodule.c have_functions[] `defined HAVE_FTRUNCATE || defined MS_WINDOWS`.
     /// Windows serves this one too — `_chsize_s` behind `os.ftruncate` — so
     /// `os.truncate` belongs in `supports_fd` on both.
-    const HAVE_FTRUNCATE: bool = HOST_POSIX || HOST_WINDOWS_CRT;
+    const HAVE_FTRUNCATE: bool =
+        (majit_rlib::rposix::HAVE_FTRUNCATE && HOST_POSIX) || HOST_WINDOWS_CRT;
     /// `utime` reaches `futimens` and `utimensat` through `libc` rather than
     /// `host_env`, so it needs one less condition than the rest.
-    const HAVE_FUTIMENS: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FUTIMENS: bool =
+        majit_rlib::rposix::HAVE_FUTIMENS && cfg!(all(unix, not(feature = "sandbox")));
     /// The name form of `utime` is one `utimensat`, so the same bit carries
     /// both of its modifiers: `dir_fd` is the descriptor the name resolves
     /// against and `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
-    const HAVE_UTIMENSAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_UTIMENSAT: bool =
+        majit_rlib::rposix::HAVE_UTIMENSAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
     /// (`interp_posix.py`). `stat_at` calls `fstatat` through `libc`.
-    const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FSTATAT: bool =
+        majit_rlib::rposix::HAVE_FSTATAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FCHMODAT` — what `chmod` types its `dir_fd` as
     /// (`interp_posix.py`), and what `_chmod_path` calls to honour either
     /// modifier. `os.py:118` reads it as `chmod` honouring `dir_fd`; `os.py:179`
     /// deliberately does *not* read it for `follow_symlinks`, because a host can
     /// have `fchmodat` and still not honour `AT_SYMLINK_NOFOLLOW`.
-    const HAVE_FCHMODAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_FCHMODAT: bool =
+        majit_rlib::rposix::HAVE_FCHMODAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `os.py:183` reads this as `chmod` honouring `follow_symlinks`, which is
     /// the `AT_SYMLINK_NOFOLLOW` arm of that same `fchmodat`. It is a narrower
     /// claim than `HAVE_FCHMODAT`: `os.py:159-177` records that where a host's
     /// `lchmod` is a stub returning ENOTSUP, the flag does not work either, so
     /// only the hosts that carry a working `lchmod` may say it — and those are
     /// exactly the ones `os.lchmod` is registered on below.
-    const HAVE_LCHMOD: bool = HOST_POSIX && BSD_FLAVOURED;
+    const HAVE_LCHMOD: bool = majit_rlib::rposix::HAVE_LCHMOD && HOST_POSIX;
     /// `os.py` reads this as `chflags` honouring `follow_symlinks`, which
     /// is the `lchflags` arm of the pair. `chflags` is a BSD interface, so the
     /// two names exist on exactly the hosts this is true for — and where they
     /// do not, `shutil.copystat`'s `lookup("chflags")` finds nothing and skips
     /// the flags rather than believing a stub that copied none.
-    const HAVE_LCHFLAGS: bool = HOST_POSIX && BSD_FLAVOURED;
-    /// Where `lchmod` and `chflags` are the host's own calls rather than stubs
-    /// that report ENOTSUP — the platform half of the two bits above.
-    const BSD_FLAVOURED: bool = cfg!(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ));
+    const HAVE_LCHFLAGS: bool = majit_rlib::rposix::HAVE_LCHFLAGS && HOST_POSIX;
     /// `rposix.HAVE_MKNODAT` — what `mknod` types its `dir_fd` as
     /// (`interp_posix.py`). Registered beside `mkfifo`, so it carries the
     /// same condition.
-    const HAVE_MKNODAT: bool = HOST_POSIX;
+    const HAVE_MKNODAT: bool = majit_rlib::rposix::HAVE_MKNODAT && HOST_POSIX;
     /// `rposix.HAVE_OPENAT` — what `open` types its `dir_fd` as
     /// (`interp_posix.py`). `openat` is reached through `libc`, so it needs
     /// no `host_env`; the Windows arm serves the name through `_wopen` and
     /// resolves nothing against a descriptor.
-    const HAVE_OPENAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_OPENAT: bool =
+        majit_rlib::rposix::HAVE_OPENAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_MKDIRAT` — `mkdir`'s (`interp_posix.py`).
-    const HAVE_MKDIRAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_MKDIRAT: bool =
+        majit_rlib::rposix::HAVE_MKDIRAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_UNLINKAT`. `os.py:131-132` reads it twice, for `unlink` and
     /// for `rmdir`, which are the same `unlinkat` told apart by `AT_REMOVEDIR`
     /// (`rposix.py`) — so the two cannot be advertised apart.
-    const HAVE_UNLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_UNLINKAT: bool =
+        majit_rlib::rposix::HAVE_UNLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_MKFIFOAT` — `mkfifo`'s (`interp_posix.py`). Narrower
     /// than the three above only because `os.mkfifo` itself is registered on
     /// the `host_env` POSIX builds; elsewhere the name is a noop placeholder
     /// that resolves nothing.
-    const HAVE_MKFIFOAT: bool = HOST_POSIX;
+    const HAVE_MKFIFOAT: bool = majit_rlib::rposix::HAVE_MKFIFOAT && HOST_POSIX;
     /// `rposix.HAVE_LINKAT` — what `link` takes its `src_dir_fd`/`dst_dir_fd`
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
-    const HAVE_LINKAT: bool = HOST_POSIX;
+    const HAVE_LINKAT: bool = majit_rlib::rposix::HAVE_LINKAT && HOST_POSIX;
     /// `rposix.HAVE_READLINKAT` — what `readlink` types its `dir_fd` as.
-    const HAVE_READLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_READLINKAT: bool =
+        majit_rlib::rposix::HAVE_READLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_RENAMEAT` — what `rename`/`replace` take `src_dir_fd` and
     /// `dst_dir_fd` as.
-    const HAVE_RENAMEAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_RENAMEAT: bool =
+        majit_rlib::rposix::HAVE_RENAMEAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_SYMLINKAT` — what `symlink` types its `dir_fd` as.
-    const HAVE_SYMLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    const HAVE_SYMLINKAT: bool =
+        majit_rlib::rposix::HAVE_SYMLINKAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `os.py` reads this as `listdir` and `scandir` taking a
     /// descriptor, which `fdlistdir` serves through `fdopendir`. `readdir`
     /// reports the end of a directory and a failure alike, so reading it apart
     /// needs the errno seam the host layer wraps — hence `HOST_POSIX` and not
     /// `HAVE_FSTATAT`'s weaker condition, which `HOST_POSIX` implies anyway for
     /// the `fstatat` a descriptor's entries stat themselves with.
-    const HAVE_FDOPENDIR: bool = HOST_POSIX;
+    const HAVE_FDOPENDIR: bool = majit_rlib::rposix::HAVE_FDOPENDIR && HOST_POSIX;
     /// `os.py:118` reads this as `lstat` honouring `dir_fd`, which is the same
     /// `fstatat` `stat` resolves one with — so the two cannot be advertised
     /// apart. `os.py:189` reads it a second time as `stat` honouring
     /// `follow_symlinks`; where this bit is false, `MS_WINDOWS` carries that
     /// second claim instead (`os.py:192`).
-    const HAVE_LSTAT: bool = HAVE_FSTATAT;
+    const HAVE_LSTAT: bool =
+        majit_rlib::rposix::HAVE_LSTAT && cfg!(all(unix, not(feature = "sandbox")));
     /// `_WIN32` (`interp_posix.py`). `os.py` reads it as `chmod`
     /// taking a descriptor (`:143`), and as `chmod` and `stat` honouring
     /// `follow_symlinks` (`:184`, `:192`) — all three of which the C runtime
@@ -10964,14 +10968,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // rather than an unknown keyword.
         #[cfg(all(
             not(feature = "sandbox"),
-            any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly",
-            )
+            rposix_have_chflags,
+            rposix_have_lchflags
         ))]
         {
             fn chflags_entry(
