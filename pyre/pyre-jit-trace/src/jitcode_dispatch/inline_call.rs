@@ -9977,27 +9977,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fresh_debugdata,
         );
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
-    // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
-    // A seeded frame already exists here, and a walk abort converts through
-    // `convert_and_run_from_pyjitpl` (`blackhole.py`). A callee's own
-    // FOR_ITER items are keyed by its frame (`InflightForiterOwner`), so a
-    // callee that loops, or re-enters the caller's code, keeps them apart
-    // from the caller's. The remaining term is unported OTHER: the
-    // constant-callable screen. That screen pins `Function.code`
-    // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
-    // unwraps — not function identity, so a fresh lambda with one code
-    // object is admitted the same way a closure is.
+    // `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) pushes an MIFrame
+    // for every callee that admits; `_opimpl_recursive_call` does the same
+    // for a recursive one. An in-flight FOR_ITER of the caller is a live box
+    // in that caller's frame. A seeded frame already exists here, and a walk
+    // abort converts through `convert_and_run_from_pyjitpl` (`blackhole.py`).
+    // A callee's own FOR_ITER items are keyed by its frame
+    // (`InflightForiterOwner`), so a callee that loops, or re-enters the
+    // caller's code, keeps them apart from the caller's. Admission while a
+    // FOR_ITER item is in flight is the same seeded-inline test as any other
+    // call (`try_multiframe || strict_seed`). The callee pin the ordinary
+    // path records — `callable_guard_op` `GuardValue`,
+    // `walker_pin_function_code`, or the type-call class pin — is recorded
+    // below, unchanged.
     if fbw_foriter_inflight_active() && !instance_next_route {
-        let foriter_seeded_admit = (try_multiframe || strict_seed)
-            && (callable_guard_op.is_constant()
-                || receiver_pinned_by_class
-                || guards_the_callee_function);
+        let foriter_seeded_admit = try_multiframe || strict_seed;
         if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} const_callable={} mf={try_multiframe} \
-                 strict={strict_inlinable} guards_fn={guards_the_callee_function}",
+                "[inline-foriter-gate] pc={} mf={try_multiframe} strict={strict_inlinable}",
                 op.pc,
-                callable_guard_op.is_constant(),
             );
         }
         if !foriter_seeded_admit {
