@@ -1245,15 +1245,12 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
 /// coordinate, so this resolves per level exactly as
 /// [`LiveLastInstrGuard::enter`] retargets its publication: inside an inline
 /// sub-walk the callee's own jitcode pc resolved through the callee's
-/// metadata, at the portal the walk's `vstack_cur_pypc`.
+/// metadata, at the portal the virtualizable `last_instr` static
+/// (`pyopcode.py dispatch_bytecode`, `pyjitpl.py _opimpl_setfield_vable`).
 ///
-/// The virtualizable boxes are NOT a source here, which a probe against the
-/// residual's own answers settled rather than an argument: at three portal
-/// sites the boxes' `last_instr` entry read 110/165/185 against executing
-/// pcs of 115/170/197, and at an inlined-callee site it read 232 -- the
-/// caller's CALL boundary -- against the callee's own 22.  They describe the
-/// PORTAL frame and carry whichever of the field's two conventions their last
-/// writer left.
+/// The portal boxes describe the PORTAL frame, so an inlined callee answers
+/// from its own jitcode metadata (`inline_callee_py_pc`) rather than that
+/// static.
 ///
 /// A receiver that is not this level's own frame declines, which is what keeps
 /// a suspended generator's frame, a traceback node's frame and a caller's
@@ -1398,13 +1395,15 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     if current_inline_concrete_frame() != 0 {
         return Some((frame_box, residual_call::inline_callee_py_pc(ctx, op_pc)?));
     }
-    // An inline sub-walk with no concrete callee frame has no level-local
-    // coordinate to answer with: `vstack_cur_pypc` is the outer walk's mirror
-    // and a sub-walk never advances it.
+    // A portal walk that has not seeded a current opcode declines rather
+    // than answering with a `last_instr` left at the merge point.
     if !ctx.vstack_valid {
         return None;
     }
-    Some((frame_box, ctx.vstack_cur_pypc))
+    Some((
+        frame_box,
+        residual_call::portal_vable_last_instr_py_pc(ctx)?,
+    ))
 }
 
 /// Pin a frame-attribute receiver to the frame type's getset.

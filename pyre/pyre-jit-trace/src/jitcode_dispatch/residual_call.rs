@@ -471,6 +471,23 @@ pub(crate) fn current_inline_concrete_frame() -> usize {
     })
 }
 
+/// Concrete executing Python pc from the portal virtualizable's `last_instr`
+/// static. `pyopcode.py dispatch_bytecode` writes
+/// `self.last_instr = intmask(next_instr)` before every opcode;
+/// `pyjitpl.py _opimpl_setfield_vable` records that store into
+/// `virtualizable_boxes`.
+pub(crate) fn portal_vable_last_instr_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<u32> {
+    let op = ctx
+        .trace_ctx
+        .virtualizable_box_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)?;
+    match ctx.trace_ctx.concrete_of_opref(op) {
+        Some(majit_ir::Value::Int(v)) if (0..=i64::from(u32::MAX)).contains(&v) => Some(v as u32),
+        _ => None,
+    }
+}
+
 pub(crate) struct EscapeFlushUndo {
     pub(crate) frame: usize,
     /// Owner-root for `frame`. A minor collection forwards the nursery
@@ -9246,19 +9263,16 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
 /// Publish the opcode this walk is inside onto the portal frame before a
 /// residual that hands that frame to Python.
 ///
-/// `try_execute_residual_call_via_executor_inner` does this ahead of a may-force
-/// call. `dispatch_bytecode` writes `last_instr` before every opcode; a
-/// portal loop carries only the merge point's coordinate in its
-/// virtualizable, and a reader inside the residual (`f_lineno` from an
-/// audit hook) otherwise reports that line. The mirror keeps the
-/// tracing-time shadow and live frame on this opcode.
-/// `vable_setfield_descr` is the store compiled code executes: the
-/// following call receives the frame, so the heap cache flushes the lazy
-/// store before the call.
+/// `pyopcode.py dispatch_bytecode` writes `self.last_instr = intmask(next_instr)`
+/// before every opcode; `pyjitpl.py _opimpl_setfield_vable` records that
+/// store. The residual that hands the frame to Python (`f_lineno` from an
+/// audit hook) reads the heap, so this republishes the virtualizable
+/// `last_instr` static onto the live frame and records the matching
+/// `vable_setfield_descr` for compiled execution. The heap cache flushes
+/// the lazy store before the call.
 ///
 /// Returns `None` when this walk is inside an inline callee — that frame's
-/// coordinate is [`record_and_publish_inline_callee_last_instr`], and
-/// `vstack_cur_pypc` indexes the outer code.
+/// coordinate is [`record_and_publish_inline_callee_last_instr`].
 pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_op: OpRef,
@@ -9274,9 +9288,9 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
         ctx.fbw_mode
             .inline_caller_py_pc
-            .unwrap_or(ctx.vstack_cur_pypc)
+            .or_else(|| portal_vable_last_instr_py_pc(ctx))?
     } else {
-        ctx.vstack_cur_pypc
+        portal_vable_last_instr_py_pc(ctx)?
     };
     if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
         return None;
