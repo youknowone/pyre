@@ -5749,19 +5749,6 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
         "vable writes must preserve the concrete half of a non-constant register Box",
     );
-    assert_eq!(
-        super::vable_ops::vable_effective_value_concrete(
-            &code,
-            &op,
-            0,
-            &wc,
-            'r',
-            wc.registers_r.get(1).expect("ref register in range"),
-            wc.registers_r.get(0).expect("ref register in range"),
-        ),
-        Some(Value::Ref(majit_ir::GcRef(0xC0DE_0000))),
-        "a TOS override must resolve its own box instead of the stale encoded register shadow",
-    );
     let forwarded_code = [0u8, 2u8];
     assert_eq!(
         super::vable_ops::vable_value_concrete(
@@ -26616,12 +26603,11 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
     reset_single_frame_blackhole();
 }
 
-/// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
+/// A pcdep `ConstPtr(NULL)` fills a hole only for a stored live NULL.
 ///
-/// `publish_frame_array_slots_for_snapshot` keeps a real vable box
-/// (`_opimpl_setarrayitem_vable` last_exc) and fills only a hole from the
-/// mirror; a mirror ConstPtr(NULL) fills that hole only for a stored live
-/// NULL (CALL `self_or_null`). Otherwise `bhimpl_raise` sees a null ref.
+/// `snapshot_stack_box` keeps a real vable box; a ConstPtr(NULL) fills a
+/// hole only for a stored live NULL (CALL `self_or_null`). Otherwise
+/// `bhimpl_raise` sees a null ref.
 #[test]
 fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
     let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
@@ -32440,14 +32426,11 @@ fn after_residual_pcdep_does_not_publish_stack_slot_at_or_above_valuestackdepth(
     std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
 }
 
-/// Guard-capture `stack_sync` overlay must not write a
-/// `locals_cells_stack_w` index at or above the snapshot's
-/// `valuestackdepth` box (`pyjitpl.py capture_resumedata` copies
-/// `virtualizable_boxes` as `write_box_at` left them;
-/// `pyframe.py popvalue_maybe_none` stores None in the dead slots).
-/// Fail-before: with `vstack_valid` the first overlay loop
-/// (`0..resume_depth`) publishes `vstack_boxes[s]` onto slot
-/// `nlocals+s` even when that index is >= the vsd box.
+/// Guard capture must not write a `locals_cells_stack_w` index at or
+/// above the snapshot's `valuestackdepth` box (`pyjitpl.py
+/// capture_resumedata` copies `virtualizable_boxes` as `write_box_at`
+/// left them; `pyframe.py popvalue_maybe_none` stores None in the dead
+/// slots).
 #[test]
 fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdepth() {
     use crate::state::PyreSym;
@@ -32883,7 +32866,6 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         &snapshot_sym,
         &sub_body,
         nested_entry,
-        "helper_subwalk_vable_scalars",
         &[guard_src],
         &[ConcreteValue::Int(0)],
         &[],

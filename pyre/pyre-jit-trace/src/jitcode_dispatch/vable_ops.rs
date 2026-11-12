@@ -584,29 +584,6 @@ pub(super) fn vable_value_concrete<Sym: WalkSym>(
     }
 }
 
-/// Resolve the concrete value after an operand-stack recovery may have
-/// replaced the bytecode register's box.
-///
-/// The register shadow is authoritative only while `effective_value` is the
-/// box encoded by the instruction. Once TOS recovery substitutes another box,
-/// re-reading that original color can return a stale concrete value from a
-/// prior loop iteration.
-pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    operand_offset: usize,
-    ctx: &WalkContext<'_, '_, Sym>,
-    bank: char,
-    encoded_value: OpRef,
-    effective_value: OpRef,
-) -> Option<Value> {
-    if effective_value == encoded_value {
-        vable_value_concrete(code, op, operand_offset, ctx, bank, effective_value)
-    } else {
-        ctx.trace_ctx.concrete_of_opref(effective_value)
-    }
-}
-
 /// Pin a Ref store's concrete across a collecting call (`walker_promote_vable_array_index`
 /// / `record_op` Trace-pool append / `set_ref`). The captured `Value` is not a
 /// root; `push_roots` / `pin_root` keep it, and `live` re-reads the slot the
@@ -630,17 +607,6 @@ impl VableStoreRoot {
         Self {
             _scope: scope,
             slot,
-        }
-    }
-
-    fn recapture(&mut self, captured: Value) {
-        if let Value::Ref(r) = captured
-            && !r.is_null()
-            && r != majit_ir::GcRef::NO_CONCRETE
-        {
-            let base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(r.as_usize() as pyre_object::PyObjectRef);
-            self.slot = Some(base);
         }
     }
 
@@ -1837,54 +1803,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // nursery-backed Trace pool. Pin the value first so the store below
     // reloads a live GCREF (`write_box_at` / `vable_write_array_item_at`).
     // `try_set_opref_concrete` skips Const OpRefs and InputArg holes.
-    let encoded_captured =
-        vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
-    let mut store_root = VableStoreRoot::capture(encoded_captured);
-    // Pin a TOS-recovered box's concrete now; recapturing the stamp after
-    // `walker_promote_vable_array_index` is a from-space copy
-    // (`fwd=false free=true`).
-    if encoded_value.is_none()
-        && value_bank == 'r'
-        && ctx.vstack_valid
-        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
-        && !tos.is_none()
-    {
-        if let Some(tos_c) = ctx
-            .trace_ctx
-            .lookup_opref_concrete(tos)
-            .or_else(|| ctx.trace_ctx.concrete_of_opref(tos))
-        {
-            store_root.recapture(tos_c);
-        }
-    }
-    let mut value = encoded_value;
-    // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
-    // it into a local slot.  When the popped value lives in an operand-stack
-    // temp that spans a nested loop, the loop-header merge-point seeds no
-    // operand-stack color (`trace.rs` loop-header entry), so the codewriter's
-    // value register reads back `OpRef::NONE` even though the box is live.
-    // The walk-level operand-stack mirror (`vstack_boxes`, the analog of
-    // `MIFrame.registers_r`) is the authoritative kept-stack source and was
-    // maintained across the nested loop; recover the TOS box from it.  Writing
-    // the unbound `NONE` into the vable array otherwise leaves an untyped slot
-    // that fails the guard-snapshot buildability precondition
-    // (`GuardSnapshotVableUntyped`).  Gate on a live mirror + a Ref store into
-    // the local region so a genuine null / non-mirrored slot keeps the legacy
-    // read.
-    if value.is_none()
-        && value_bank == 'r'
-        && ctx.vstack_valid
-        && let Some(nlocals) = active_frame_nlocals(ctx)
-        && index_value >= 0
-        && index_value < nlocals
-        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
-        && !tos.is_none()
-    {
-        value = tos;
-    }
+    // `_opimpl_setarrayitem_vable` stores `valuebox` from the jitcode
+    // operand; `read_ref_reg` already refuses `OpRef::NONE`
+    // (`RegisterReadUnbound`), so there is no second TOS copy to pin.
     let captured =
-        vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
-            .unwrap_or(Value::Void);
+        vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
+    let store_root = VableStoreRoot::capture(captured);
+    let value = encoded_value;
     // Pre-call word. Reconstructability is a property of this captured
     // concrete (`Void` / `Ref(NO_CONCRETE)` vs a stored box value) and is
     // known before `walker_promote_vable_array_index`. `VableStoreRoot`
