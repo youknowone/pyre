@@ -786,11 +786,14 @@ pub unsafe fn malloc_varsize_clear<T: GcArrayType>(n: i64) -> *mut T {
             None => return std::ptr::null_mut(),
         }
     }
-    match T::payload_layout(n).and_then(|layout| unsafe { T::alloc_fallback(layout) }) {
-        Some(ptr) => {
-            unsafe { T::write_length_header(ptr, n) };
-            ptr
-        }
+    match T::payload_layout(n) {
+        Some(layout) => match unsafe { T::alloc_fallback(layout) } {
+            Some(ptr) => {
+                unsafe { T::write_length_header(ptr, n) };
+                ptr
+            }
+            None => std::ptr::null_mut(),
+        },
         None => std::ptr::null_mut(),
     }
 }
