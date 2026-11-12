@@ -245,6 +245,37 @@ fn derive_program_metadata_harvests_opaque_adt_as_declared_layout_identity() {
     );
 }
 
+/// A Deduplicated body first reached at the walk cutoff is still walked
+/// when the same id appears later at a shallow depth. `seen_dedup` is
+/// the cycle guard; entering `llbc.dedup_body` restarts depth at 0.
+#[test]
+fn deduplicated_opaque_raw_ptr_survives_truncated_first_visit() {
+    let opaque = opaque_type_decl(0, &["ffi_raw", "NativeSession"]);
+    let seed = type_decl_struct(
+        1,
+        &["fixture", "Seed"],
+        vec![serde_json::json!({
+            "name": "ty",
+            "ty": {"Value": [7, {"RawPtr": [adt_node(0), "Mut"]}]},
+            "attr_info": null
+        })],
+    );
+    let llbc = llbc_with_types("fixture", vec![opaque, seed], vec![]);
+    assert!(
+        llbc.dedup_body(7).is_some(),
+        "Value:[7, RawPtr] must fill dedup_body"
+    );
+    let node = serde_json::json!({"Deduplicated": 7});
+    let mut ids = std::collections::HashSet::new();
+    let mut seen_dedup = std::collections::HashSet::new();
+    super::super::collect_opaque_raw_ptr_from_node(&llbc, &node, &mut ids, &mut seen_dedup, 24);
+    super::super::collect_opaque_raw_ptr_from_node(&llbc, &node, &mut ids, &mut seen_dedup, 0);
+    assert!(
+        ids.contains(&0),
+        "Opaque pointee of a Deduplicated body must survive a truncated first visit; ids={ids:?}"
+    );
+}
+
 #[test]
 fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     let intern_none = |s: &str| is_niche_option_gc_payload_spelling(s, None);
@@ -456,6 +487,67 @@ fn utf8str_pointee_is_not_a_raw_word() {
     assert!(
         !super::pointee_is_raw_word(&node, &llbc, &gc),
         "Utf8Str pointee is rstr STR, not a raw word"
+    );
+}
+
+/// rstr `STR` identity is the declaration path
+/// (`is_rstr_str_layout_declaration`). `other::Utf8Str` is a different
+/// type (`rstr.py` `GcStruct('rpy_string')`, `TO._gckind == 'gc'`).
+#[test]
+fn raw_ptr_to_other_utf8str_pointee_follows_declaration() {
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let lookalike = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["other", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let owner_rstr = struct_decl(
+        2,
+        ident_path(&["fixture", "RstrOwner"]),
+        serde_json::json!([{
+            "name": "p",
+            "ty": {"RawPtr": [adt_node(0), "Mut"]},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_other = struct_decl(
+        3,
+        ident_path(&["fixture", "OtherOwner"]),
+        serde_json::json!([{
+            "name": "p",
+            "ty": {"RawPtr": [adt_node(1), "Mut"]},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = window_llbc(vec![utf8, lookalike, owner_rstr, owner_other], vec![]);
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "builtin": null, "generics": window_empty_generics()}
+        })
+    };
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    assert!(
+        !super::pointee_is_raw_word(&adt(0), &llbc, &gc),
+        "unicodeobject::Utf8Str is rstr STR"
+    );
+    assert!(
+        super::pointee_is_raw_word(&adt(1), &llbc, &gc),
+        "other::Utf8Str is not rstr STR"
+    );
+    assert!(
+        !adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of *mut unicodeobject::Utf8Str is not raw storage"
+    );
+    assert!(
+        adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of *mut other::Utf8Str is classified by its own declaration"
     );
 }
 
@@ -4534,6 +4626,76 @@ fn option_instantiation_of_raw_payload_is_a_raw_word() {
     assert!(
         adt_def_is_raw_storage(2, &llbc, &gc, immut, &mut Vec::new()),
         "owner of Option<RawCell> is raw storage"
+    );
+}
+
+/// Nested `Option<Option<&T>>` re-enters the Option def by value.
+/// `lltype.py` `Struct._first_struct` classifies from the declared field
+/// types, so a GC referent is not raw storage and a raw referent is.
+#[test]
+fn option_of_option_of_ref_is_not_raw_storage_for_gc_referent() {
+    let option = option_enum(0);
+    let gc_t = struct_decl(
+        1,
+        ident_path(&["pyre_object", "pyobject", "PyObject"]),
+        serde_json::json!([]),
+        false,
+    );
+    let raw = struct_decl(
+        2,
+        ident_path(&["fixture", "RawCell"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I32"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let nested = |inner: serde_json::Value| option_adt_node(0, option_adt_node(0, inner));
+    let owner_gc = struct_decl(
+        3,
+        ident_path(&["fixture", "GcSlot"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": nested(option_shared_ref(adt_node(1))),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let owner_raw = struct_decl(
+        4,
+        ident_path(&["fixture", "RawSlot"]),
+        serde_json::json!([{
+            "name": "slot",
+            "ty": nested(option_shared_ref(adt_node(2))),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option, gc_t, raw, owner_gc, owner_raw],
+        vec![],
+    );
+    let gc = std::collections::HashSet::new();
+    let immut = no_immutable_fields();
+    let inst_gc = TyRef::Other(nested(option_shared_ref(adt_node(1))));
+    let inst_raw = TyRef::Other(nested(option_shared_ref(adt_node(2))));
+    assert!(
+        !field_ty_is_raw_word(&inst_gc, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<Option<&PyObject>> is not a raw word"
+    );
+    assert!(
+        !adt_def_is_raw_storage(3, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<Option<&PyObject>> is not raw storage"
+    );
+    assert!(
+        field_ty_is_raw_word(&inst_raw, &llbc, &gc, immut, &mut Vec::new()),
+        "Option<Option<&RawCell>> is a raw word"
+    );
+    assert!(
+        adt_def_is_raw_storage(4, &llbc, &gc, immut, &mut Vec::new()),
+        "owner of Option<Option<&RawCell>> is raw storage"
     );
 }
 

@@ -2563,6 +2563,10 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
         // `Option<usize>` is a raw word by layout, but intern is still
         // the tagged Instance and assembler `getfield_raw_r` of that
         // field is refused (`rewrite_op_getfield`).
+        // Instantiation of a generic (`Option<Option<T>>`) re-enters this
+        // def_id by value. `lltype.py` `Struct._first_struct` classifies
+        // by the declared field types; the pointer-cycle `stack` is only
+        // for an actual pointer cycle in `adt_def_is_raw_storage_at`.
         if !adt_node_type_subst(node, llbc).is_empty() {
             if adt_node_type_subst_names_an_adt(node, llbc) {
                 return adt_def_is_raw_storage_at(
@@ -2571,10 +2575,16 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
                     llbc,
                     gc_struct_ids,
                     immutable_fields,
-                    stack,
+                    &mut Vec::new(),
                 );
             }
-            return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
+            return adt_def_is_raw_storage(
+                def_id,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+                &mut Vec::new(),
+            );
         }
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
@@ -2670,12 +2680,13 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
             return false;
         }
         // rstr `STR` (`GcStruct('rpy_string')`): `TO._gckind == 'gc'`.
-        // A `*mut Utf8Str` / `*mut BytesBlock` is a GC pointer, so an
-        // enum that holds one (`BlockRoute::Managed`) is not a raw
-        // word bag (`adt_def_is_raw_storage`).
-        let path = td.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
-        if is_rstr_str_family_spelling(leaf) {
+        // Identity is the declaration path
+        // (`is_rstr_str_layout_declaration`); `other::Utf8Str` is a
+        // different type. A `*mut Utf8Str` / `*mut BytesBlock` of that
+        // layout is a GC pointer, so an enum that holds one
+        // (`BlockRoute::Managed`) is not a raw word bag
+        // (`adt_def_is_raw_storage`).
+        if is_rstr_str_layout_declaration(td.item_meta.name_path_str()) {
             return false;
         }
         return match &td.kind {
@@ -5522,8 +5533,7 @@ pub(in crate::front::mir) fn is_rust_heap_string_root(root: &str) -> bool {
 /// Leaf spellings of the rstr `STR` family (`ValueType::Str`).
 ///
 /// `rstr.py` `GcStruct('rpy_string', ...)`: `TO._gckind == 'gc'`.
-/// Shared by [`super::tuple_field_value_type`] and the raw-storage
-/// pointee predicate (`pointee_is_raw_word`). A Rust-heap `String` is
+/// Shared by [`super::tuple_field_value_type`]. A Rust-heap `String` is
 /// not this family (`is_rust_heap_string_root`).
 pub(crate) fn is_rstr_str_family_spelling(spelling: &str) -> bool {
     matches!(
@@ -13058,7 +13068,7 @@ fn type_arg_referent_is_raw_storage(
     let canon = strip_crate_prefix(&path);
     if is_str_family_class_root(&canon)
         || is_str_family_class_root(leaf)
-        || is_rstr_str_family_spelling(leaf)
+        || is_rstr_str_layout_declaration(td.item_meta.name_path_str())
     {
         return false;
     }
