@@ -2044,6 +2044,24 @@ fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
     );
 }
 
+/// `descr_call_tail`'s None-check residual (`bh_check_init_returned_none`)
+/// is a real fnaddr the blackhole runs (`reject_unresolved_call` only
+/// concerns a symbolic placeholder). The scan must read that residual's
+/// `BhCallDescr` from the payload pool (`JitCode.descr_at`).
+#[test]
+fn descr_call_tail_resume_does_not_reach_a_blocker() {
+    let Some(index) = crate::ctor_continuation::jitcode_index() else {
+        return;
+    };
+    let Some(resume_pc) = crate::ctor_continuation::resume_pc() else {
+        return;
+    };
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(index as usize, resume_pc, None),
+        "descr_call_tail resume must not treat bh_check_init_returned_none as a blocker",
+    );
+}
+
 /// Resume does not treat a residual whose funcbox register is a runtime-only
 /// unknown as a blocker: `ResumeDataDirectReader.consume_one_section`
 /// restores it. Whole-body admission already agreed.

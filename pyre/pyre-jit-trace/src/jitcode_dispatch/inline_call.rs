@@ -832,6 +832,26 @@ fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
         .unwrap_or(&[])
 }
 
+/// Walker-side descrs of a runtime-installed codeless payload
+/// (`install_codeless_jitcode`) whose builder filled `exec.descrs`.
+/// `JitCode.descr_at` / `blackhole.py` `read_descr` read that pool for a
+/// `d` argcode. A Python `code_ptr` body, or a codeless shell that never
+/// got a pool, keeps the build-time `descr_ref_table`.
+fn helper_resume_codeless_descrs(payload: &PyJitCode) -> Option<&'static [DescrRef]> {
+    if payload.code_ptr.is_null() && !payload.jitcode.exec.descrs.is_empty() {
+        Some(crate::state::sub_descr_pool_for_payload(payload).0)
+    } else {
+        None
+    }
+}
+
+fn helper_resume_descr_at(payload_descrs: Option<&[DescrRef]>, index: usize) -> Option<DescrRef> {
+    match payload_descrs {
+        Some(refs) => refs.get(index).cloned(),
+        None => crate::jitcode_runtime::descr_ref_table().at(index),
+    }
+}
+
 /// The FBW fast-path inline convention (`try_walker_inline_user_call`) first
 /// checks whether the callee body can be followed, before the full inline path
 /// seeds the callee's positional arguments and its own frame/ec reds. A callee
@@ -1603,23 +1623,31 @@ pub(crate) fn helper_resume_reaches_blocker(
     let payload = std::sync::Arc::clone(&pjc);
     let scan = || {
         let jitcode = &payload.jitcode;
-        let descrs = crate::jitcode_runtime::descr_ref_table();
+        // `JitCode.descr_at` / `blackhole.py` `read_descr` (`self.descrs[index]`)
+        // read this jitcode's own `exec.descrs`. A codeless payload the
+        // builder filled (`ctor_continuation` `build` → `add_call_descr`)
+        // must not resolve `d` against the build-time `descr_ref_table`.
+        let payload_descrs = helper_resume_codeless_descrs(&payload);
+        let descr_refs =
+            payload_descrs.unwrap_or_else(|| descr_refs_for_jitcode_index(jitcode_index));
         let entry_array_lengths: Vec<(usize, usize)> =
             entry_array_len.map(|len| (0, len)).into_iter().collect();
+        let mut call_effect_free = |index| residual_call_is_effect_free_in(payload_descrs, index);
+        let mut switch_targets = |index| switch_descr_targets_in(payload_descrs, index);
+        let mut callee_fnaddr = |index| jitcode_fnaddr_for_descr_in(payload_descrs, index);
         let summary = summarize_body_blockers_from(
             Some(pc),
             jitcode.code.as_slice(),
             jitcode.num_regs_i(),
             jitcode.constants_i.as_slice(),
             |descr_index, _caller_effect, _entry_lens| {
-                descrs
-                    .at(descr_index)
+                helper_resume_descr_at(payload_descrs, descr_index)
                     .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
                     .map(|callee_index| {
                         // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
                         // not interpret this body; the native call can still
                         // allocate, raise or write the heap.
-                        let calls_native = jitcode_fnaddr_for_descr(descr_index)
+                        let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
                             .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
                         if calls_native {
                             DescentBlockerSummary {
@@ -1632,11 +1660,11 @@ pub(crate) fn helper_resume_reaches_blocker(
                     })
             },
             &mut |_blocker, _effect| true,
-            &mut residual_call_is_effect_free,
-            &mut switch_descr_targets,
+            &mut call_effect_free,
+            &mut switch_targets,
             &entry_array_lengths,
-            &mut jitcode_fnaddr_for_descr,
-            descr_refs_for_jitcode_index(jitcode_index),
+            &mut callee_fnaddr,
+            descr_refs,
         );
         summary.body_not_walked
             || summary.blocker_effect_free.is_some()
@@ -2197,8 +2225,14 @@ fn conditional_call_skips(
 /// The runtime `fnaddr` of the JitCode named by `descr_index`, when the
 /// descriptor pool and jitcode table both hold it.
 fn jitcode_fnaddr_for_descr(descr_index: usize) -> Option<i64> {
-    crate::jitcode_runtime::descr_ref_table()
-        .at(descr_index)
+    jitcode_fnaddr_for_descr_in(None, descr_index)
+}
+
+fn jitcode_fnaddr_for_descr_in(
+    payload_descrs: Option<&[DescrRef]>,
+    descr_index: usize,
+) -> Option<i64> {
+    helper_resume_descr_at(payload_descrs, descr_index)
         .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
         .and_then(crate::jitcode_runtime::get_jitcode_ref_by_index)
         .map(|jc| jc.fnaddr)
@@ -2343,8 +2377,14 @@ pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -
 /// residual that writes live heap, has random effects, or forces a frame.
 /// [`extra_info_is_rewindable_allocation`] is the static form of that.
 fn residual_call_is_effect_free(descr_index: usize) -> bool {
-    let descrs = crate::jitcode_runtime::descr_ref_table();
-    let Some(descr) = descrs.at(descr_index) else {
+    residual_call_is_effect_free_in(None, descr_index)
+}
+
+fn residual_call_is_effect_free_in(
+    payload_descrs: Option<&[DescrRef]>,
+    descr_index: usize,
+) -> bool {
+    let Some(descr) = helper_resume_descr_at(payload_descrs, descr_index) else {
         return false;
     };
     let Some(call) = descr.as_call_descr() else {
@@ -2357,8 +2397,14 @@ fn residual_call_is_effect_free(descr_index: usize) -> bool {
 /// order, or `None` when the descr is not a switch table or a listed key
 /// does not resolve to a target.
 fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
-    let descrs = crate::jitcode_runtime::descr_ref_table();
-    let descr = descrs.at(descr_index)?;
+    switch_descr_targets_in(None, descr_index)
+}
+
+fn switch_descr_targets_in(
+    payload_descrs: Option<&[DescrRef]>,
+    descr_index: usize,
+) -> Option<Vec<usize>> {
+    let descr = helper_resume_descr_at(payload_descrs, descr_index)?;
     let switch = descr.as_switch_descr()?;
     // Every listed key must resolve: dropping one would narrow the successor
     // set, and a region this scan does not traverse is a region it wrongly
