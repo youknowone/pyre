@@ -9496,6 +9496,20 @@ mod tests {
             None,
             "the write leaf is shared with other functions"
         );
+        let mut origin = LegacyGraph::new("write");
+        origin.source_identity = Some("core::ptr::write".into());
+        assert_eq!(
+            registration_decline_graph_origin(&origin, &[]),
+            Some(SKIP_PTR_WRITE),
+            "bare-leaf write whose source_identity is core::ptr::write is declined"
+        );
+        let mut foreign_origin = LegacyGraph::new("write");
+        foreign_origin.source_identity = Some("user_mod::write".into());
+        assert_eq!(
+            registration_decline_graph_origin(&foreign_origin, &[]),
+            None,
+            "an unrelated write source_identity is not ptr::write"
+        );
         assert_eq!(
             registration_decline(&["core".into(), "ptr".into(), "write_unaligned".into()]),
             None
@@ -9521,11 +9535,22 @@ mod tests {
             graph.set_return(graph.startblock.clone(), None);
             graphs.insert(path, graph);
         }
+        let alias_path = crate::parse::CallPath::from_segments(["write"]);
+        let mut alias_graph = LegacyGraph::new("write");
+        alias_graph.set_return(alias_graph.startblock.clone(), None);
+        alias_graph.source_identity = Some("core::ptr::write".into());
+        graphs.insert(alias_path, alias_graph);
+        let foreign_path = crate::parse::CallPath::from_segments(["user_mod", "write"]);
+        let mut foreign_graph = LegacyGraph::new("write");
+        foreign_graph.set_return(foreign_graph.startblock.clone(), None);
+        foreign_graph.source_identity = Some("user_mod::write".into());
+        graphs.insert(foreign_path, foreign_graph);
         populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         for segments in [
             &["core", "ptr", "write"][..],
             &["std", "ptr", "write"][..],
             &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
+            &["write"][..],
         ] {
             let key = FunctionPathKey::from_segments(segments.iter().copied());
             assert!(
@@ -9533,6 +9558,12 @@ mod tests {
                 "user graph still registered for {segments:?}"
             );
         }
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["user_mod", "write"]))
+                .is_some(),
+            "an unrelated write stays registered"
+        );
         let host = crate::flowspace::model::host_env_callable(
             &["core", "ptr", "write"]
                 .into_iter()
@@ -20188,9 +20219,9 @@ mod tests {
         use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::transform::link_not_in_links_followed;
 
+        let _lock = anchor_lock();
         let (layouts, _ids) =
             crate::test_support::raw_layout_table_for(&["ffi_raw::NativeSession"]);
-        let _lock = anchor_lock();
         let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
         registry.set_struct_layouts(layouts);
         let specs = vec![(
