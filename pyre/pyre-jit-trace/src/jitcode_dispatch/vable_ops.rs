@@ -720,18 +720,57 @@ fn durable_resume_frame<Sym: WalkSym>(
         return None;
     }
     // The body walk records ops and can minor-collect. `resume.frame` is a
-    // copy; the root slot is forwarded. Compare against the live address
-    // so a nursery generator frame still matches after a drag-out.
-    if ctx.fbw_mode.generator_resume.is_some_and(|resume| {
-        pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize == frame
-    }) {
-        return Some(frame);
+    // copy; the root slot is forwarded. A store whose target is that copy
+    // (callee_shadow / opref concrete taken before the move) still belongs
+    // to the generator: journal and write the live object, matching
+    // `cpu.bh_setarrayitem_gc_r` / `write_box_at` on the forwarded GCREF.
+    if let Some(resume) = ctx.fbw_mode.generator_resume {
+        let live = pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize;
+        if live != 0 && generator_resume_frame_copy(frame, live, resume) {
+            return Some(live);
+        }
     }
     let sym = ctx.fbw_mode.snapshot_sym;
     if !sym.is_null() && unsafe { (*sym).live_vable_frame_addr() } == frame {
         return Some(frame);
     }
     None
+}
+
+/// A heap pointer that is the live generator or a pre-move copy of it.
+///
+/// `new_with_vtable` can minor-collect more than once; an opref concrete
+/// or `InlineConcreteFrameGuard` may still name an intermediate copy.
+/// `cpu.bh_setarrayitem_gc_r` writes the forwarded GCREF.
+fn generator_resume_frame_copy(
+    frame: usize,
+    live: usize,
+    resume: super::GeneratorResumeSubwalk,
+) -> bool {
+    if frame == 0 || live == 0 {
+        return false;
+    }
+    if frame == live || frame == resume.frame {
+        return true;
+    }
+    let obj = frame as pyre_object::PyObjectRef;
+    unsafe {
+        if obj.is_null() || !pyre_object::py_type_check(obj, &pyre_interpreter::pyframe::FRAME_TYPE)
+        {
+            return false;
+        }
+        (*(frame as *const pyre_interpreter::PyFrame)).pycode as usize == resume.w_pycode
+    }
+}
+
+/// Own-frame extra-store target after forwarding a durable generator/portal.
+fn arm_durable_store_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, frame: usize) -> usize {
+    if let Some(live) = durable_resume_frame(ctx, frame) {
+        fbw_arm_durable_frame_undo(live);
+        live
+    } else {
+        frame
+    }
 }
 
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its
@@ -1014,6 +1053,19 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
 ) -> Option<usize> {
+    if let Some(resume) = ctx.fbw_mode.generator_resume {
+        let live = pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize;
+        if live != 0 {
+            // This walk's virtualizable is the generator frame
+            // (`walk_generator_resume` / `_opimpl_setarrayitem_vable`).
+            // After `jit_merge_point` the operand is a loop-input red
+            // (`do_recursive_call` reds), a different OpRef than
+            // `resume.frame_box` and often without a concrete.
+            // Nested helpers clear `generator_resume` so their stores
+            // do not take this arm.
+            return Some(live);
+        }
+    }
     if let Some(frame) = current_inline_vable_target(ctx, vable) {
         return Some(frame);
     }
@@ -1075,10 +1127,8 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
                 .and_then(|info| info.static_field_by_descr(&descr)),
             ctx.frame_state.borrow().callee_shadow.as_ref(),
         ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
-                fbw_arm_durable_frame_undo(frame);
-            }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
+            let frame = arm_durable_store_frame(ctx, shadow.concrete_frame);
+            crate::state::store_live_frame_static_int(frame, field_index, value);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
@@ -1159,10 +1209,10 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         captured,
         inline_field_index,
     ) {
-        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
-            if let Some(frame) = durable_resume_frame(ctx, frame) {
-                fbw_arm_durable_frame_undo(frame);
-            }
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
+            || ctx.fbw_mode.generator_resume.is_some()
+        {
+            let frame = arm_durable_store_frame(ctx, frame);
             crate::state::store_live_frame_static_int(frame, field_index, value);
         }
     }
@@ -1188,10 +1238,8 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
                 .and_then(|info| info.static_field_by_descr(&descr)),
             ctx.frame_state.borrow().callee_shadow.as_ref(),
         ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
-                fbw_arm_durable_frame_undo(frame);
-            }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
+            let frame = arm_durable_store_frame(ctx, shadow.concrete_frame);
+            crate::state::store_live_frame_static_int(frame, field_index, imm);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setfield_vable_via_metainterp`: only the standard
@@ -1234,10 +1282,10 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     if let (Some(frame), Some(field_index)) =
         (own_frame_array_store_target(ctx, obj), inline_field_index)
     {
-        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
-            if let Some(frame) = durable_resume_frame(ctx, frame) {
-                fbw_arm_durable_frame_undo(frame);
-            }
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
+            || ctx.fbw_mode.generator_resume.is_some()
+        {
+            let frame = arm_durable_store_frame(ctx, frame);
             crate::state::store_live_frame_static_int(frame, field_index, imm);
         }
     }
@@ -1876,27 +1924,28 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     };
     if index_value >= 0
         && let Some(frame) = own_frame_array_store_target(ctx, vable)
-        && ctx.trace_ctx.standard_virtualizable_box() != Some(vable)
     {
-        // Standard virtualizable already landed through `write_box_at`.
-        // Extra store is the inlined-callee / `callee_shadow` object.
-        if let Some(frame) = durable_resume_frame(ctx, frame) {
-            fbw_arm_durable_frame_undo(frame);
+        let extra = ctx.trace_ctx.standard_virtualizable_box() != Some(vable)
+            || ctx.fbw_mode.generator_resume.is_some();
+        if extra {
+            // Standard virtualizable already landed through `write_box_at`.
+            // Extra store is the inlined-callee / `callee_shadow` object.
+            let frame = arm_durable_store_frame(ctx, frame);
+            if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
+                crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
+            }
+            // Re-read after `vable_setarrayitem_checked`. The array store may
+            // itself collect, so the shadow reads the pin again below.
+            let live = live_after_vable_store(&store_root, value_bank, concrete);
+            crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
+            // Only this level's own frame: a store to a foreign vable must not
+            // bind in `locals()` through this shadow. The published word is the
+            // pin after both calls. A `NONE` Ref has no box and is not stored.
+            // Record the virtualizable object `write_box_at` targeted, not the
+            // operand register that held its address (`_opimpl_setarrayitem_vable`).
+            let live = live_after_vable_store(&store_root, value_bank, concrete);
+            publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
         }
-        if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
-            crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
-        }
-        // Re-read after `vable_setarrayitem_checked`. The array store may
-        // itself collect, so the shadow reads the pin again below.
-        let live = live_after_vable_store(&store_root, value_bank, concrete);
-        crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
-        // Only this level's own frame: a store to a foreign vable must not
-        // bind in `locals()` through this shadow. The published word is the
-        // pin after both calls. A `NONE` Ref has no box and is not stored.
-        // Record the virtualizable object `write_box_at` targeted, not the
-        // operand register that held its address (`_opimpl_setarrayitem_vable`).
-        let live = live_after_vable_store(&store_root, value_bank, concrete);
-        publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an
