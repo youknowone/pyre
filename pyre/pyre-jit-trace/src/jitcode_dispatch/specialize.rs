@@ -5225,6 +5225,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // STORE_ATTR in the trace (`MapdictStorageMixin._set_mapdict_increase_storage1`).
         // The shape guard and the holder pins can minor-collect. Both pointers
         // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
+        // Old storage is read before the transition, as in
+        // `_set_mapdict_increase_storage1`; the existing `live_box_ref`
+        // lines after it already cover a collection the GETFIELD recording
+        // may trigger.
+        let old_block = (add.storageindex > 0)
+            .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         let concrete_value = live_box_ref(ctx, value, concrete_value);
         let committed = unsafe {
@@ -5241,12 +5247,29 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             drop(pyre_interpreter::runtime_ops::fetch_memory_error());
             return Ok(None);
         }
+        // `MetaInterp.execute_and_record` / `History.record` / `_make_op(..., value)`:
+        // the recorded `NewArrayClear` is born with the block commit installed.
+        let (new_block_value, new_block_ptr) = match ctx.trace_ctx.field_sanity_load(
+            majit_gc::gc_current_object_address(concrete_obj as usize) as i64,
+            &storage_descr,
+            majit_ir::Type::Ref,
+        ) {
+            Some(majit_ir::Value::Ref(r)) if !r.is_null() => {
+                (majit_ir::Value::Ref(r), r.as_usize() as i64)
+            }
+            got => panic!(
+                "mapdict store_attr_add fold: store_attr_add_commit installed \
+                 W_ObjectObject.storage, field_sanity_load returned {got:?}"
+            ),
+        };
         match unboxed_raw {
             None => {
                 crate::helpers::emit_mapdict_add_attr_inline(
                     ctx.trace_ctx,
                     obj,
                     add.storageindex,
+                    old_block,
+                    new_block_value,
                     new_map_const,
                     value,
                     map_descr,
@@ -5254,10 +5277,26 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 );
             }
             Some(raw) => {
+                let list_block_value = match ctx.trace_ctx.array_sanity_load(
+                    new_block_ptr,
+                    add.storageindex as i64,
+                    &crate::state::mapdict_storage_gcarray_descr(),
+                    majit_ir::Type::Ref,
+                ) {
+                    Some(majit_ir::Value::Ref(r)) if !r.is_null() => majit_ir::Value::Ref(r),
+                    got => panic!(
+                        "mapdict store_attr_add unboxed fold: committed int list \
+                         block in slot {} is {got:?}",
+                        add.storageindex
+                    ),
+                };
                 crate::helpers::emit_mapdict_add_unboxed_attr_inline(
                     ctx.trace_ctx,
                     obj,
                     add.storageindex,
+                    old_block,
+                    new_block_value,
+                    list_block_value,
                     new_map_const,
                     raw,
                     map_descr,
