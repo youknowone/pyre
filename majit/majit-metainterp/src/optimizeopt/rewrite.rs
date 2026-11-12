@@ -2262,7 +2262,7 @@ impl Default for OptRewrite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operands;
+
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
 
@@ -2889,13 +2889,13 @@ mod tests {
         let ops = {
             let mut guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
             guard.pos().set(OpRef::void_op(0));
-            let mut finish = Op::new(OpCode::Finish, &[p0]);
+            let mut finish = Op::new(OpCode::Finish, &[p0.clone()]);
             finish.pos().set(OpRef::void_op(1));
             vec![guard, finish]
         };
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        opt.trace_inputargs = rooted_inputarg_operands(&[majit_ir::Type::Ref]);
+        opt.trace_inputargs = vec![p0.clone()];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -3674,7 +3674,10 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        opt.trace_inputargs = rooted_inputarg_operands(&[majit_ir::Type::Int; 2]);
+        opt.trace_inputargs = vec![
+            Operand::from_bound_inputarg(&i0_rc),
+            Operand::from_bound_inputarg(&i1_rc),
+        ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -3692,12 +3695,12 @@ mod tests {
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Int, 0);
         let neg_one = b.const_int(-1);
-        let prod = b.op(OpCode::IntMul, &[x, neg_one]);
+        let prod = b.op(OpCode::IntMul, &[x.clone(), neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![x.clone()];
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
@@ -3719,12 +3722,12 @@ mod tests {
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Float, 0);
         let neg_one = Operand::const_from_value(Value::Float(-1.0));
-        let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
+        let prod = b.op(OpCode::FloatMul, &[x.clone(), neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![x.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
@@ -3741,11 +3744,11 @@ mod tests {
         let cond = Operand::const_from_value(Value::Int(0));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
-        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::CondCallN, &[cond, func.clone(), arg.clone()]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![func.clone(), arg.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
@@ -3765,11 +3768,11 @@ mod tests {
         let cond = Operand::const_from_value(Value::Int(1));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
-        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::CondCallN, &[cond, func.clone(), arg.clone()]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![func.clone(), arg.clone()];
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();

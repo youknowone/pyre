@@ -2928,7 +2928,7 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operands;
+    use crate::history::test_support::trace_inputargs_from_ops;
     use crate::optimizeopt::info::RawBufferPtrInfo;
     use crate::optimizeopt::optimizer::Optimizer;
     use std::sync::Arc;
@@ -4276,16 +4276,16 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = rooted_inputarg_operands(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
-        opt.trace_inputargs = rooted_inputarg_operands(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![Type::Ref; 1024]);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -4299,8 +4299,8 @@ mod tests {
         for &idx in float_slots {
             types[idx as usize] = Type::Float;
         }
-        opt.trace_inputargs = rooted_inputarg_operands(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -6125,7 +6125,7 @@ mod tests {
         let mut types = vec![Type::Ref; 1024];
         types[60] = Type::Float;
         types[61] = Type::Float;
-        opt.trace_inputargs = rooted_inputarg_operands(&types);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);

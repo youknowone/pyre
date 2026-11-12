@@ -4863,7 +4863,6 @@ impl OptContext {
     /// `setinfo_from_preamble` yet. The `preamble_op` object is the box
     /// (`resoperation.py AbstractResOp`); register it so a later position
     /// reader shares that host.
-
     pub(crate) fn set_preamble_forwarded_info(
         &mut self,
         preamble_op: &majit_ir::OpRc,

@@ -4342,7 +4342,7 @@ mod tests {
 
     use super::{OptHeap, OptHeapState};
     use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_inputarg_operands, rooted_resop_operand,
+        rooted_inputarg_operand, rooted_resop_operand, trace_inputargs_from_ops,
     };
 
     /// oparser-faithful drop-in for `Operand::from_opref(o)` at op-arg /
@@ -5286,8 +5286,8 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = rooted_inputarg_operands(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -6129,8 +6129,8 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputargs = rooted_inputarg_operands(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
@@ -8279,8 +8279,8 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
         opt.set_vrefinfo(vrefinfo);
-        opt.trace_inputargs = rooted_inputarg_operands(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![Type::Ref; 1024]);
         opt.snapshot_boxes = snapshots;
 
         let result =

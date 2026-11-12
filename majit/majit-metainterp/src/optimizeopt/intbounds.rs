@@ -2013,7 +2013,7 @@ mod tests {
     //! integration.
 
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operands;
+    use crate::history::test_support::trace_inputargs_from_ops;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::{Descr, DescrRef};
     use std::sync::Arc;
@@ -3367,8 +3367,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         // IntLt/IntAddOvf operate on Int-typed inputs — override the
         // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
-        opt.trace_inputargs = rooted_inputarg_operands(&vec![majit_ir::Type::Int; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![majit_ir::Type::Int; 1024]);
         opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);

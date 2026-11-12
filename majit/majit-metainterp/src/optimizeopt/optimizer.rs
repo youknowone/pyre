@@ -2838,19 +2838,22 @@ impl Optimizer {
         // The caller's slice does not reallocate during this pass. Bridge
         // `input_ops` stays empty, so this span is the prepared-op holder.
         let _input_span = self.publish_live_op_span(ops);
-        // Test-only auto-seed of `trace_inputargs` from the variant
-        // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
-        // a slot index in `[0, num_inputs)`. Production callers populate
-        // the list from the recorder's InputArg{Int,Ref,Float} objects
-        // via `setup_optimizations` (optimizer.py:34 self.inputargs).
+        // Test-only auto-seed of `trace_inputargs` from the bound InputArg
+        // boxes the ops already hold (`history.py TreeLoop.inputargs`).
+        // Production callers populate the list from the recorder's
+        // InputArg{Int,Ref,Float} objects — the trace's `inputargs` ARE
+        // the boxes the operations use (`history.py TreeLoop.inputargs`,
+        // `optimizer.py Optimizer.propagate_all_forward`).
         //
-        // Falls back to `Type::Ref` for slots that no arg references —
-        // RPython never sees that case (every InputArg flows through some
-        // op), but unit fixtures can omit references to unused slots.
+        // Unused slots fall back to `Type::Ref` (or a type the existing
+        // variant-tag walk infers from an arg at that index). RPython never
+        // sees an unread InputArg, but unit fixtures can omit references
+        // to unused slots.
         #[cfg(test)]
         if self.trace_inputargs.is_empty() && num_inputs > 0 {
             // RPython InputArg variants are Int/Ref/Float only
-            // (resoperation.py InputArgInt/727/739) — Void inputargs do not exist.
+            // (`resoperation.py InputArgInt` / `InputArgFloat` /
+            // `InputArgRef`) — Void inputargs do not exist.
             // VoidOp args at inputarg slots leave the slot at the Ref
             // fallback because the actual inputarg-side Box would have
             // been Int/Ref/Float per producer-side typing.
@@ -2871,7 +2874,8 @@ impl Optimizer {
                     }
                 }
             }
-            self.trace_inputargs = crate::history::test_support::rooted_inputarg_operands(&types);
+            self.trace_inputargs =
+                crate::history::test_support::trace_inputargs_from_ops(ops, &types);
         }
         self.imported_label_args = None;
         self.terminal_op = None;
@@ -6972,10 +6976,10 @@ mod tests {
         let x = b.input(Type::Int, 0);
         let y = b.input(Type::Int, 1);
         b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
-        b.op(OpCode::IntAdd, &[x, y]);
+        b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
         b.op(OpCode::Jump, &[]);
         let (ops, inputs) = b.build();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![x.clone(), y.clone()];
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -7181,11 +7185,11 @@ mod tests {
             std::slice::from_ref(&x),
             crate::compile::make_resume_guard_descr_typed(Vec::new()),
         );
-        b.op(OpCode::IntAdd, &[x.clone(), y]);
-        b.op(OpCode::GuardNonnull, &[x]);
+        b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
+        b.op(OpCode::GuardNonnull, &[x.clone()]);
         b.op(OpCode::Finish, &[]);
         let (ops, inputs) = b.build();
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![x.clone(), y.clone()];
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
@@ -8039,7 +8043,7 @@ mod tests {
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
         ops[1].setfailargs(vec![x.clone(), y.clone()].into());
-        opt.trace_inputargs = rooted_inputarg_operands(&inputs);
+        opt.trace_inputargs = vec![x.clone(), y.clone()];
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
@@ -8221,12 +8225,12 @@ mod tests {
             crate::compile::make_resume_guard_descr_typed(Vec::new()),
         );
         guard_value.pos().set(OpRef::void_op(4));
-        let mut jump = Op::new(OpCode::Jump, &[a, b_arg]);
+        let mut jump = Op::new(OpCode::Jump, &[a.clone(), b_arg.clone()]);
         jump.pos().set(OpRef::void_op(5));
         let ops = vec![cmp, guard_true, guard_value, jump];
         let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
         let mut unroll = UnrollOptimizer::new();
-        unroll.trace_inputargs = rooted_inputarg_operands(&[Type::Int, Type::Int]);
+        unroll.trace_inputargs = vec![a.clone(), b_arg.clone()];
         unroll.snapshot_boxes = snapshots;
         let (result, _) = unroll.optimize_trace_with_constants_and_inputs(
             &ops,

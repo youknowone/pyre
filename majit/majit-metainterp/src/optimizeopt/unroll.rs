@@ -6104,6 +6104,7 @@ mod tests {
     use super::*;
     use crate::history::test_support::{
         rooted_inputarg_operand, rooted_inputarg_operands, rooted_resop_operand,
+        trace_inputargs_from_ops,
     };
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
@@ -7289,22 +7290,17 @@ mod tests {
         // IntAdd operates on Int-typed inputs — seed the inner phase1/2
         // optimizers' trace_inputargs via UnrollOptimizer so the
         // intbounds pass sees Int on the two inputargs.
-        unroll_opt.trace_inputargs =
-            rooted_inputarg_operands(&[majit_ir::Type::Int, majit_ir::Type::Int]);
         // Use optimize_trace_with_constants_and_inputs to properly set
         // num_inputs so input args don't collide with op positions. Args
         // address inputarg slots via `InputArg*` OpRef variants so the
         // operand shape (`with_inputarg_types` plants the inputarg operands)
         // and the orthodox `_forwarded` mirror agree on the namespace.
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        let i1 = rooted_inputarg_operand(Type::Int, 1);
+        unroll_opt.trace_inputargs = vec![i0.clone(), i1.clone()];
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_inputarg_operand(Type::Int, 0),
-                    rooted_inputarg_operand(Type::Int, 1),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
+            Op::new(OpCode::IntAdd, &[i0.clone(), i1]),
+            Op::new(OpCode::Jump, &[i0]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
@@ -7325,13 +7321,13 @@ mod tests {
                     &[Operand::const_from_value(Value::Int(0))],
                 ));
             }
-            recorded.push(Op::new(OpCode::Jump, &[input]));
+            recorded.push(Op::new(OpCode::Jump, &[input.clone()]));
             assign_positions(&mut recorded, 1);
             let canonical: Vec<_> = recorded.into_iter().map(OpRc::new).collect();
             let source: Vec<_> = canonical.iter().map(|op| (**op).clone()).collect();
             let backup = source.clone();
             let mut unroll = UnrollOptimizer::new();
-            unroll.trace_inputargs = rooted_inputarg_operands(&[Type::Int]);
+            unroll.trace_inputargs = vec![input.clone()];
             unroll.phase2_input_ops_seed = Some(canonical.clone());
             let result = unroll.optimize_trace_with_constants_and_inputs_vable_out(
                 &canonical,
@@ -7366,17 +7362,12 @@ mod tests {
         let mut unroll_opt = UnrollOptimizer::new();
         let inputarg_box = majit_ir::InputArg::new_int_rc(0);
         inputarg_box.set_value(Value::Int(73));
-        unroll_opt.trace_inputargs = vec![Operand::from_bound_inputarg(&inputarg_box)];
+        let input = Operand::from_bound_inputarg(&inputarg_box);
+        unroll_opt.trace_inputargs = vec![input.clone()];
 
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_inputarg_operand(Type::Int, 0),
-                    rooted_inputarg_operand(Type::Int, 0),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
+            Op::new(OpCode::IntAdd, &[input.clone(), input.clone()]),
+            Op::new(OpCode::Jump, &[input]),
         ];
         assign_positions(&mut ops, 1);
         let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
@@ -7410,14 +7401,9 @@ mod tests {
     #[test]
     fn test_recorded_jump_resop_keeps_observed_runtime_value() {
         let mut unroll_opt = UnrollOptimizer::new();
-        unroll_opt.trace_inputargs = rooted_inputarg_operands(&[Type::Int]);
-        let mut add = Op::new(
-            OpCode::IntAdd,
-            &[
-                rooted_inputarg_operand(Type::Int, 0),
-                rooted_inputarg_operand(Type::Int, 0),
-            ],
-        );
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        unroll_opt.trace_inputargs = vec![i0.clone()];
+        let mut add = Op::new(OpCode::IntAdd, &[i0.clone(), i0]);
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
         let add_rc = OpRc::new(add);
@@ -10519,7 +10505,7 @@ mod tests {
 
         let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
         let mut unroll = UnrollOptimizer::new();
-        unroll.trace_inputargs = rooted_inputarg_operands(&[Type::Int, Type::Int]);
+        unroll.trace_inputargs = trace_inputargs_from_ops(&ops, &[Type::Int, Type::Int]);
         unroll.snapshot_boxes = snapshots;
         let (result, _) = unroll.optimize_trace_with_constants_and_inputs(
             &ops,
