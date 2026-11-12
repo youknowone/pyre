@@ -2044,21 +2044,46 @@ fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
     );
 }
 
-/// `descr_call_tail`'s None-check residual (`bh_check_init_returned_none`)
-/// is a real fnaddr the blackhole runs (`reject_unresolved_call` only
-/// concerns a symbolic placeholder). The scan must read that residual's
-/// `BhCallDescr` from the payload pool (`JitCode.descr_at`).
+/// Helper levels numbered for `list(iterable)`'s type call.
+///
+/// `descr_call`'s None-check residual (`bh_check_init_returned_none`) is a
+/// real fnaddr the blackhole runs (`reject_unresolved_call` only concerns a
+/// symbolic placeholder). The scan must read that residual's `BhCallDescr`
+/// from the payload pool (`JitCode.descr_at`).
+///
+/// `__majit_wrap_list_descr_init` `inline_call_r_v`s `list_extend_items`.
+/// `call.py get_jitcode` stores `getfunctionptr(graph)` in `JitCode.fnaddr`,
+/// and `blackhole.py bhimpl_inline_call_r_v` native-calls it, so the resume
+/// scan must not treat that callee's reachable abort as a blocker.
 #[test]
-fn descr_call_tail_resume_does_not_reach_a_blocker() {
-    let Some(index) = crate::ctor_continuation::jitcode_index() else {
+fn list_type_call_resume_levels_do_not_reach_a_blocker() {
+    if let (Some(index), Some(resume_pc)) = (
+        crate::ctor_continuation::jitcode_index(),
+        crate::ctor_continuation::resume_pc(),
+    ) {
+        assert!(
+            !super::inline_call::helper_resume_reaches_blocker(index as usize, resume_pc, None),
+            "descr_call_tail resume must not treat bh_check_init_returned_none as a blocker",
+        );
+    }
+
+    let Some(wrap) = named_jitcode("__majit_wrap_list_descr_init") else {
         return;
     };
-    let Some(resume_pc) = crate::ctor_continuation::resume_pc() else {
-        return;
-    };
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&wrap.code).collect();
+    let call = ops
+        .iter()
+        .find(|op| inline_call_callee_name(&wrap.code, op) == Some("list_extend_items"))
+        .expect("wrap_list_descr_init inline_call of list_extend_items");
+    let resume_pc = ops
+        .iter()
+        .rev()
+        .find(|op| op.opname == "live" && op.pc < call.pc)
+        .map(|op| op.pc)
+        .expect("live marker immediately before list_extend_items");
     assert!(
-        !super::inline_call::helper_resume_reaches_blocker(index as usize, resume_pc, None),
-        "descr_call_tail resume must not treat bh_check_init_returned_none as a blocker",
+        !super::inline_call::helper_resume_reaches_blocker(wrap.index(), resume_pc, Some(2)),
+        "wrap_list_descr_init resume at the live marker before list_extend_items must not reach a blocker",
     );
 }
 
