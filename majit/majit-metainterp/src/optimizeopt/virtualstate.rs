@@ -3095,6 +3095,42 @@ mod tests {
     }
 
     #[test]
+    fn generate_guards_reads_observation_from_runtime_box() {
+        // virtualstate.py NotVirtualStateInfoInt._generate_guards_unkown
+        // reads `runtime_box.getint()` off the runtime box itself. A
+        // fresh OptContext whose index-0 InputArg has no observed value
+        // must not hide the 73 carried on a different InputArgInt object.
+        let target = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
+            0, 100,
+        ))]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let mut ctx = OptContext::new(128);
+        let ctx_ia = majit_ir::InputArg::new_int_rc(0);
+        ctx.inputargs = vec![Operand::from_bound_inputarg(&ctx_ia)];
+        ctx.ensure_inputarg_bindings();
+        let boxes = vec![Operand::from_bound_inputarg(&ctx_ia)];
+        let runtime_ia = majit_ir::InputArg::new_int_rc(0);
+        runtime_ia.set_value(Value::Int(73));
+        let runtime_boxes = vec![Operand::from_bound_inputarg(&runtime_ia)];
+        let guards = target
+            .generate_guards(&incoming, &boxes, &runtime_boxes, &mut ctx, false)
+            .unwrap();
+        assert_eq!(guards.len(), 1);
+        match &guards[0] {
+            GuardRequirement::GuardBounds {
+                arg_index: 0,
+                box_,
+                bounds,
+            } => {
+                assert!(box_.same_box(&boxes[0]));
+                assert_eq!(bounds.lower, 0);
+                assert_eq!(bounds.upper, 100);
+            }
+            other => panic!("expected GuardBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_int_bounded_compatibility() {
         let mut ctx = OptContext::new(128);
         let b1 = vs1(VirtualStateInfo::IntBounded(IntBound::bounded(0, 100)));

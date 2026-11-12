@@ -1515,13 +1515,22 @@ pub(crate) fn translate_trace_iter_opref(
 /// `opencoder.py` `TraceIterator._get`: rewrite one original JUMP /
 /// `runtime_boxes` entry into the fresh-iterator namespace. Const boxes
 /// stay the same object (`ConstInt` identity); they never occupy `_cache`.
-/// Bound boxes look up `_cache` by recorder position (class-C key).
+/// Bound boxes look up `_cache` by recorder position (class-C key),
+/// except when the box already *is* a cache entry: in-place remint
+/// (`prepare_bridge_trace_from_owned`) rewrites `pos` on the live
+/// producer, so `to_opref()` is the reminted index and the original-key
+/// lookup would miss. That box is already the `_get` result.
 fn translate_trace_iter_runtime_box(box_: Operand, cache: &[Option<Operand>]) -> Operand {
     if box_.is_none() {
         return Operand::None;
     }
     if box_.is_constant() {
         return box_;
+    }
+    for slot in cache.iter().flatten() {
+        if box_.same_box(slot) {
+            return box_;
+        }
     }
     let opref = box_.to_opref();
     cache
@@ -32128,6 +32137,64 @@ mod tests {
             "runtime_boxes remap onto the reminted JUMP args"
         );
         assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[2].arg(1)));
+    }
+
+    /// `prepare_bridge_trace_from_owned` remints producer `OpRc`s in place
+    /// (`pos` is interior-mutable). `runtime_boxes` bound to those same
+    /// objects must still resolve to the prepared producer after the
+    /// reminted position diverges from the original recorder index
+    /// (`opencoder.py TraceIterator._get`).
+    #[test]
+    fn prepare_bridge_from_owned_runtime_boxes_follow_in_place_remint() {
+        let ia = InputArg::new_int_rc(0);
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_inputarg(&ia),
+                Operand::from_bound_inputarg(&ia),
+            ],
+        );
+        add.pos().set(OpRef::int_op(5));
+        let add_rc = OpRc::new(add);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                Operand::from_bound_op(&add_rc),
+                Operand::from_bound_inputarg(&ia),
+            ],
+        );
+        jump.pos().set(OpRef::NONE);
+        let jump_rc = OpRc::new(jump);
+        let runtime_boxes = vec![
+            Operand::from_bound_op(&add_rc),
+            Operand::from_bound_inputarg(&ia),
+        ];
+        let prepared = prepare_bridge_trace_from_owned(
+            vec![add_rc, jump_rc],
+            std::slice::from_ref(&ia),
+            Vec::new(),
+            SnapshotFrameSizes::new(),
+            Vec::new(),
+            Vec::new(),
+            SnapshotFramePcs::new(),
+            None,
+            runtime_boxes,
+            100,
+        );
+        assert_ne!(
+            prepared.ops[0].pos().get().raw(),
+            5,
+            "reminted producer position must differ from the original recorder index"
+        );
+        assert!(
+            prepared.runtime_boxes[0].same_box(&Operand::from_bound_op(&prepared.ops[0])),
+            "op-bound runtime box must be the in-place reminted producer"
+        );
+        assert!(
+            prepared.runtime_boxes[1]
+                .same_box(&Operand::from_bound_inputarg(&prepared.inputargs[0])),
+            "InputArg-bound runtime box must be the reminted inputarg"
+        );
     }
 
     #[test]
