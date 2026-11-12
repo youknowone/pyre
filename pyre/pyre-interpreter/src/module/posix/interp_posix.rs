@@ -306,140 +306,6 @@ fn collect_env_entries(
     Ok(env)
 }
 
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
-fn sysconf_names() -> &'static [(&'static str, i32)] {
-    &[
-        ("SC_2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
-        ("SC_2_C_BIND", libc::_SC_2_C_BIND),
-        ("SC_2_C_DEV", libc::_SC_2_C_DEV),
-        ("SC_2_FORT_DEV", libc::_SC_2_FORT_DEV),
-        ("SC_2_FORT_RUN", libc::_SC_2_FORT_RUN),
-        ("SC_2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
-        ("SC_2_SW_DEV", libc::_SC_2_SW_DEV),
-        ("SC_2_UPE", libc::_SC_2_UPE),
-        ("SC_2_VERSION", libc::_SC_2_VERSION),
-        ("SC_AIO_LISTIO_MAX", libc::_SC_AIO_LISTIO_MAX),
-        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
-        ("SC_AIO_PRIO_DELTA_MAX", libc::_SC_AIO_PRIO_DELTA_MAX),
-        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
-        ("SC_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
-        ("SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
-        ("SC_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
-        ("SC_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
-        ("SC_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
-        ("SC_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
-        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
-        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
-        ("SC_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
-        ("SC_DELAYTIMER_MAX", libc::_SC_DELAYTIMER_MAX),
-        ("SC_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
-        ("SC_FSYNC", libc::_SC_FSYNC),
-        ("SC_GETGR_R_SIZE_MAX", libc::_SC_GETGR_R_SIZE_MAX),
-        ("SC_GETPW_R_SIZE_MAX", libc::_SC_GETPW_R_SIZE_MAX),
-        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
-        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
-        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
-        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
-        ("SC_MAPPED_FILES", libc::_SC_MAPPED_FILES),
-        ("SC_MEMLOCK", libc::_SC_MEMLOCK),
-        ("SC_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
-        ("SC_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
-        ("SC_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
-        ("SC_MQ_OPEN_MAX", libc::_SC_MQ_OPEN_MAX),
-        ("SC_MQ_PRIO_MAX", libc::_SC_MQ_PRIO_MAX),
-        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
-        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
-        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
-        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
-        ("SC_PAGE_SIZE", libc::_SC_PAGE_SIZE),
-        ("SC_PAGESIZE", libc::_SC_PAGE_SIZE),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_PASS_MAX", libc::_SC_PASS_MAX),
-        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
-        ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
-        ("SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
-        ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
-        ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
-        ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
-        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
-        ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
-        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
-        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
-        ("SC_SHARED_MEMORY_OBJECTS", libc::_SC_SHARED_MEMORY_OBJECTS),
-        ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
-        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
-        ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
-        ("SC_THREADS", libc::_SC_THREADS),
-        ("SC_THREAD_ATTR_STACKADDR", libc::_SC_THREAD_ATTR_STACKADDR),
-        ("SC_THREAD_ATTR_STACKSIZE", libc::_SC_THREAD_ATTR_STACKSIZE),
-        (
-            "SC_THREAD_DESTRUCTOR_ITERATIONS",
-            libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
-        ),
-        ("SC_THREAD_KEYS_MAX", libc::_SC_THREAD_KEYS_MAX),
-        (
-            "SC_THREAD_PRIORITY_SCHEDULING",
-            libc::_SC_THREAD_PRIORITY_SCHEDULING,
-        ),
-        ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
-        ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
-        ("SC_THREAD_PROCESS_SHARED", libc::_SC_THREAD_PROCESS_SHARED),
-        ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
-        ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
-        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
-        ("SC_TIMERS", libc::_SC_TIMERS),
-        ("SC_TIMER_MAX", libc::_SC_TIMER_MAX),
-        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
-        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
-        ("SC_VERSION", libc::_SC_VERSION),
-        ("SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
-        ("SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
-        ("SC_XOPEN_LEGACY", libc::_SC_XOPEN_LEGACY),
-        ("SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
-        (
-            "SC_XOPEN_REALTIME_THREADS",
-            libc::_SC_XOPEN_REALTIME_THREADS,
-        ),
-        ("SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
-        ("SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
-        ("SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
-        ("SC_XOPEN_XCU_VERSION", libc::_SC_XOPEN_XCU_VERSION),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_ILP32_OFF32", libc::_SC_XBS5_ILP32_OFF32),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_ILP32_OFFBIG", libc::_SC_XBS5_ILP32_OFFBIG),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_LP64_OFF64", libc::_SC_XBS5_LP64_OFF64),
-        #[cfg(any(
-            target_os = "linux",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "fuchsia"
-        ))]
-        ("SC_XBS5_LPBIG_OFFBIG", libc::_SC_XBS5_LPBIG_OFFBIG),
-    ]
-}
-
 pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock();
     let ApplevelForkCallbacks {
@@ -13491,60 +13357,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             pyre_object::w_int_new(majit_rlib::rposix::PRIO_USER.expect("missing PRIO_USER") as i64)
         );
 
-        // `posixmodule.c` `pathconf_names` — the `_PC_*` table
-        // `conv_path_confname` resolves a string `name` argument through.
-        // `libc` exports the constants only on the BSD family, so the glibc
-        // values (`bits/confname.h`) are spelled out for Linux.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_ALLOC_SIZE_MIN", libc::_PC_ALLOC_SIZE_MIN),
-            ("PC_ASYNC_IO", libc::_PC_ASYNC_IO),
-            ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
-            ("PC_FILESIZEBITS", libc::_PC_FILESIZEBITS),
-            ("PC_LINK_MAX", libc::_PC_LINK_MAX),
-            ("PC_MAX_CANON", libc::_PC_MAX_CANON),
-            ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
-            ("PC_MIN_HOLE_SIZE", libc::_PC_MIN_HOLE_SIZE),
-            ("PC_NAME_MAX", libc::_PC_NAME_MAX),
-            ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
-            ("PC_PATH_MAX", libc::_PC_PATH_MAX),
-            ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
-            ("PC_PRIO_IO", libc::_PC_PRIO_IO),
-            ("PC_REC_INCR_XFER_SIZE", libc::_PC_REC_INCR_XFER_SIZE),
-            ("PC_REC_MAX_XFER_SIZE", libc::_PC_REC_MAX_XFER_SIZE),
-            ("PC_REC_MIN_XFER_SIZE", libc::_PC_REC_MIN_XFER_SIZE),
-            ("PC_REC_XFER_ALIGN", libc::_PC_REC_XFER_ALIGN),
-            ("PC_SYMLINK_MAX", libc::_PC_SYMLINK_MAX),
-            ("PC_SYNC_IO", libc::_PC_SYNC_IO),
-            ("PC_VDISABLE", libc::_PC_VDISABLE),
-        ];
-        // glibc `bits/confname.h`. `libc` does not export `_PC_*` on linux.
-        #[cfg(target_os = "linux")]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_2_SYMLINKS", 20),
-            ("PC_ALLOC_SIZE_MIN", 18),
-            ("PC_ASYNC_IO", 10),
-            ("PC_CHOWN_RESTRICTED", 6),
-            ("PC_FILESIZEBITS", 13),
-            ("PC_LINK_MAX", 0),
-            ("PC_MAX_CANON", 1),
-            ("PC_MAX_INPUT", 2),
-            ("PC_NAME_MAX", 3),
-            ("PC_NO_TRUNC", 7),
-            ("PC_PATH_MAX", 4),
-            ("PC_PIPE_BUF", 5),
-            ("PC_PRIO_IO", 11),
-            ("PC_REC_INCR_XFER_SIZE", 14),
-            ("PC_REC_MAX_XFER_SIZE", 15),
-            ("PC_REC_MIN_XFER_SIZE", 16),
-            ("PC_REC_XFER_ALIGN", 17),
-            ("PC_SOCK_MAXBUF", 12),
-            ("PC_SYMLINK_MAX", 19),
-            ("PC_SYNC_IO", 9),
-            ("PC_VDISABLE", 8),
-        ];
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-        const PATHCONF_NAMES: &[(&str, i32)] = &[];
+        // `interp_posix.py` `pathconf_names` / `sysconf_names` return
+        // `rposix.pathconf_names` / `rposix.sysconf_names`.
+        const PATHCONF_NAMES: &[(&str, i32)] = majit_rlib::rposix::PATHCONF_NAMES;
+        const SYSCONF_NAMES: &[(&str, i32)] = majit_rlib::rposix::SYSCONF_NAMES;
         /// The dict a `conv_confname` table is published as — `pathconf_names`
         /// for `pathconf`, `confstr_names` for `confstr`.
         fn store_names_dict(ns: PyObjectRef, key: &str, table: &[(&str, i32)]) {
@@ -13722,7 +13538,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("sysconf() requires name"));
                     }
-                    let name = confname_arg(args[0], sysconf_names())?;
+                    let name = confname_arg(args[0], SYSCONF_NAMES)?;
                     // `rposix.c_sysconf` uses `RFFI_FULL_ERRNO_ZERO`. `-1`
                     // with errno 0 is a published answer.
                     let v = unsafe { majit_rlib::rposix::c_sysconf(name) };
@@ -13741,7 +13557,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_sysconf_names);
         let names_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        for (name, value) in sysconf_names() {
+        for (name, value) in SYSCONF_NAMES {
             // Build the value first: call arguments evaluate left to right, so
             // reading the rooted dict inline would take its address before
             // `w_int_new` allocates, and a collection there would leave the
@@ -13761,72 +13577,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             pyre_object::gc_roots::shadow_stack_get(names_slot)
         );
 
-        // `posixmodule.c` `posix_constants_confstr` — the `_CS_*` table
-        // `conv_confstr_confname` resolves a string `name` argument through,
-        // and the same candidate set `rposix.py:2248-2300` names. Every entry
-        // there is `#ifdef`-guarded, so a host publishes exactly the names its
-        // own `<unistd.h>` defines; `libc` carries `_CS_PATH` alone, and the
-        // two numberings disagree from that first entry on — it is 1 on the
-        // Apple targets and 0 in glibc's `bits/confname.h` enum. The ten names
-        // the candidate set carries for the System V hosts (`CS_ARCHITECTURE`,
-        // `CS_HOSTNAME`, `CS_HW_PROVIDER`, `CS_HW_SERIAL`, `CS_INITTAB_NAME`,
-        // `CS_MACHINE`, `CS_RELEASE`, `CS_SRPC_DOMAIN`, `CS_SYSNAME`,
-        // `CS_VERSION`) are defined by neither header, so neither table has
-        // them.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[
-            ("CS_PATH", 1),
-            ("CS_XBS5_ILP32_OFF32_CFLAGS", 20),
-            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 21),
-            ("CS_XBS5_ILP32_OFF32_LIBS", 22),
-            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 23),
-            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 24),
-            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 25),
-            ("CS_XBS5_ILP32_OFFBIG_LIBS", 26),
-            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 27),
-            ("CS_XBS5_LP64_OFF64_CFLAGS", 28),
-            ("CS_XBS5_LP64_OFF64_LDFLAGS", 29),
-            ("CS_XBS5_LP64_OFF64_LIBS", 30),
-            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 31),
-            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 32),
-            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 33),
-            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 34),
-            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 35),
-        ];
-        // glibc numbers the enum from zero and restarts it twice, at 1000 for
-        // the large-file names and at 1100 for the XBS5 ones.
-        #[cfg(target_os = "linux")]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[
-            ("CS_PATH", 0),
-            ("CS_GNU_LIBC_VERSION", 2),
-            ("CS_GNU_LIBPTHREAD_VERSION", 3),
-            ("CS_LFS_CFLAGS", 1000),
-            ("CS_LFS_LDFLAGS", 1001),
-            ("CS_LFS_LIBS", 1002),
-            ("CS_LFS_LINTFLAGS", 1003),
-            ("CS_LFS64_CFLAGS", 1004),
-            ("CS_LFS64_LDFLAGS", 1005),
-            ("CS_LFS64_LIBS", 1006),
-            ("CS_LFS64_LINTFLAGS", 1007),
-            ("CS_XBS5_ILP32_OFF32_CFLAGS", 1100),
-            ("CS_XBS5_ILP32_OFF32_LDFLAGS", 1101),
-            ("CS_XBS5_ILP32_OFF32_LIBS", 1102),
-            ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 1103),
-            ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 1104),
-            ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 1105),
-            ("CS_XBS5_ILP32_OFFBIG_LIBS", 1106),
-            ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 1107),
-            ("CS_XBS5_LP64_OFF64_CFLAGS", 1108),
-            ("CS_XBS5_LP64_OFF64_LDFLAGS", 1109),
-            ("CS_XBS5_LP64_OFF64_LIBS", 1110),
-            ("CS_XBS5_LP64_OFF64_LINTFLAGS", 1111),
-            ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 1112),
-            ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 1113),
-            ("CS_XBS5_LPBIG_OFFBIG_LIBS", 1114),
-            ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 1115),
-        ];
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-        const CONFSTR_NAMES: &[(&str, i32)] = &[];
+        // `interp_posix.py` `confstr_names` returns `rposix.confstr_names`.
+        const CONFSTR_NAMES: &[(&str, i32)] = majit_rlib::rposix::CONFSTR_NAMES;
         store_names_dict(
             pyre_object::gc_roots::shadow_stack_get(ns_slot),
             "confstr_names",

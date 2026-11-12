@@ -44,6 +44,9 @@ pub use cConfig::{
     PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
     SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
 };
+/// `rposix.py` `ConfConfig` `pathconf_names` / `confstr_names` / `sysconf_names`.
+#[cfg(unix)]
+pub use cConfig::{CONFSTR_NAMES, PATHCONF_NAMES, SYSCONF_NAMES};
 /// `rposix.py` `constants` (`pipe_config`).
 #[cfg(any(unix, windows))]
 pub use cConfig::{
