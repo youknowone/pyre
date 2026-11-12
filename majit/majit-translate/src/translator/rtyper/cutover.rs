@@ -4090,7 +4090,16 @@ fn declared_return_annotation(
     }
     // `*mut T` / `*const T` whose T has no harvested layout is unknown.
     // Do not intern a ClassDef of the pointer spelling.
+    // `llannotation.py` `lltype_to_annotation` of `Ptr(OpaqueType)`
+    // (`rffi.py` `COpaquePtr`) is a classdef-less nullable instance so
+    // `SomeInstance.bool_behavior` / `binaryop.py` `is__default` does
+    // not fold the live null arm.
     if root.trim().starts_with("*mut ") || root.trim().starts_with("*const ") {
+        if token == Some("ref") && graph.return_can_be_none {
+            if let Some(s) = bk.undeclared_raw_ptr_nullable_annotation(root) {
+                return Some(s);
+            }
+        }
         return None;
     }
     let classdef = bk
@@ -5367,6 +5376,20 @@ fn foreign_opaque_method_return_shell(
         }
         if crate::front::semantic::is_list_family_spelling(root) {
             return Some(projected);
+        }
+        // Pointer-niche `Option<&T>` of a GC instance / str-family
+        // pointee is the nullable payload (`annotator/model.py`
+        // `SomeInstance.noneify` / `SomeString.noneify`). Intern the
+        // same shell `declared_return_annotation` uses. A ClassDef of
+        // the Option or pointer spelling would leave `can_be_None`
+        // false and `binaryop.py` `is__default` folds `is None`.
+        if bk.is_niche_option_gc_payload_spelling(root) {
+            return Some(
+                crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
+                    Some(bk),
+                    root,
+                ),
+            );
         }
         let host = bk.intern_class_by_qualname(root);
         if let Ok(classdef) = bk.getuniqueclassdef(&host) {
@@ -19885,6 +19908,31 @@ mod tests {
     }
 
     #[test]
+    fn foreign_opaque_niche_option_ref_result_annotates_nullable_instance() {
+        // HashMap::get-shaped residual `Option<&T>` of a GC instance.
+        // `tyref_to_value_type_with` names the pointee; collection keeps
+        // the Option spelling so intern uses
+        // `Bookkeeper::niche_option_gc_payload_annotation`
+        // (`annotator/model.py` `SomeInstance.noneify`). A non-nullable
+        // ClassDef would let `binaryop.py` `is__default` fold `is None`.
+        use crate::annotator::model::SomeValue;
+        let (layouts, _ids) = crate::test_support::gc_layout_table_for(&["pyobject::PyObject"]);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_layouts(layouts);
+        let result_ty = crate::model::ValueType::Ref(Some("Option<&pyobject::PyObject>".into()));
+        let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
+            .expect("a pointer-niche Option residual has a shell");
+        let SomeValue::Instance(inst) = &shell else {
+            panic!("niche Option<&GC> residual is SomeInstance, got {shell:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "niche Option<&GC> residual is SomeInstance(can_be_None=True)"
+        );
+    }
+
+    #[test]
     fn declared_return_annotation_raw_class_root_is_someptr() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
@@ -20033,6 +20081,36 @@ mod tests {
         assert!(
             declared.is_none(),
             "uppercase pointee with no harvested layout is unknown, got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_undeclared_raw_ptr_nullable_when_return_can_be_none() {
+        // Unknown `*mut T` with residual `"ref"` and `return_can_be_none`
+        // is `llannotation.py` `lltype_to_annotation` of
+        // `Ptr(OpaqueType)` (`rffi.py` `COpaquePtr`): a classdef-less
+        // nullable instance. Interning a ClassDef of the pointer
+        // spelling would leave `can_be_None` false and
+        // `binaryop.py` `is__default` folds the live null arm.
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("dont_look_inside_unknown_ptr");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut UnknownAdt".into());
+        graph.return_can_be_none = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("unknown *mut T with return_can_be_none intern's");
+        let SomeValue::Instance(inst) = declared else {
+            panic!("undeclared *mut T residual is SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "undeclared *mut T residual is SomeInstance(can_be_None=True)"
+        );
+        assert!(
+            inst.classdef.is_none(),
+            "do not intern a ClassDef of the pointer spelling"
         );
     }
 

@@ -1512,9 +1512,11 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// (`is_str_family_class_root`) which keeps `Ref(Some(root))`; a
 /// payload-carrying enum keeps `Ref(Some(root))` when
 /// `tyref_to_value_type` painted a class root (`unaryop.py`
-/// `SomeInstance.getattr` needs `self.classdef`). A payload enum with
-/// no class root is declined. A fieldless enum, tuple, reference, or
-/// non-opaque struct is declined.
+/// `SomeInstance.getattr` needs `self.classdef`). A pointer-niche
+/// `Option<&T>` keeps the Option spelling so intern noneifies
+/// (`Bookkeeper::niche_option_gc_payload_annotation`). A payload enum
+/// with no class root is declined. A fieldless enum, tuple, reference,
+/// or non-opaque struct is declined.
 pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
     output: &TyRef,
     llbc: &Llbc,
@@ -1553,9 +1555,31 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   keep `Ref(Some(root))` so registration intern's the
         //   enum-base ClassDef a caller `match` getattr's.
         //
-        // A non-opaque struct / `Option` / fieldless enum would be
-        // mis-typed as an opaque GcRef, so decline it.
+        // A non-opaque struct / tagged `Option<i64>` / fieldless enum
+        // would be mis-typed as an opaque GcRef, so decline it. A
+        // pointer-niche `Option<&T>` is the nullable payload word
+        // (`annotator/model.py` `SomeObject.noneify`); keep that Option
+        // spelling so intern noneifies
+        // (`Bookkeeper::niche_option_gc_payload_annotation`).
         ValueType::Ref(root) => {
+            if tyref_is_niche_option(output, llbc) {
+                let inputs = value_type_inputs(llbc);
+                if let Some(opt_root) = tyref_niche_option_gc_payload_spelling(
+                    output,
+                    llbc,
+                    &inputs.gc_struct_ids,
+                    &inputs.raw_alloc_flavor_structs,
+                ) {
+                    return Some(ValueType::Ref(Some(opt_root)));
+                }
+                if let Some(payload) = crate::front::result_exc::tyref_option_payload(output, llbc)
+                {
+                    let inner = niche_option_payload_inner_spelling(&payload, llbc);
+                    if peel_niche_option_payload_pointer(&inner).0 {
+                        return Some(ValueType::Ref(Some(format!("Option<{inner}>"))));
+                    }
+                }
+            }
             let def_id = output_adt_def_id_free(output, llbc)?;
             let td = llbc.type_by_id(def_id)?;
             let str_family_root = root
@@ -3206,7 +3230,9 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // class (`model.py` `SomeObject.noneify`). Name the pointee so dest
     // intern's `SomePtr` of that owner (`by_value_payload_annotation`)
     // rather than the tagged `Option<T>` class `tyref_to_ast_string`
-    // would strip `&` onto.
+    // would strip `&` onto. Residual collection keeps the Option
+    // spelling (`foreign_opaque_method_result_valuetype`) so intern
+    // can noneify (`Bookkeeper::niche_option_gc_payload_annotation`).
     if tyref_is_niche_option(ty, llbc)
         && let Some(root) = niche_option_pointee_class_root(ty, llbc, tombstoned)
     {

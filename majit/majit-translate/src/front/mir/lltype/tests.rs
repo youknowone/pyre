@@ -6864,6 +6864,101 @@ fn foreign_opaque_string_new_keeps_str_family_root() {
     );
 }
 
+/// Foreign opaque `HashMap::get` returning pointer-niche `Option<&V>`.
+/// `tyref_to_value_type_with` names the pointee and drops Option
+/// nullability; collection keeps the Option spelling so intern can
+/// noneify (`Bookkeeper::niche_option_gc_payload_annotation`).
+fn hashmap_get_option_ref_fixture() -> Llbc {
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": name,
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let generics = empty_generics();
+    let hashmap_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics.clone()}
+    });
+    let gc_obj_ty = serde_json::json!({
+        "Adt": {"id": 2, "generics": generics.clone()}
+    });
+    let option_of_ref = option_adt_node(1, option_shared_ref(gc_obj_ty));
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, hashmap_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let hashmap_decl = opaque_type_decl(0, &["alloc", "collections", "hashmap", "HashMap"]);
+    let option_decl = option_enum(1);
+    let gc_obj_decl = code_struct(2, &["pyre_object", "pyobject", "PyObject"]);
+    let hashmap_get = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(
+            vec![
+                ident("alloc"),
+                ident("collections"),
+                ident("hashmap"),
+                impl_seg,
+                ident("get"),
+            ],
+            false,
+        ),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [
+                {"Ref": ["Erased", hashmap_ty, "Shared"]},
+                {"Ref": ["Erased", {"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Shared"]},
+            ],
+            "output": option_of_ref
+        },
+        "body": "Opaque"
+    });
+    llbc_with_types(
+        "fixture",
+        vec![hashmap_decl, option_decl, gc_obj_decl],
+        vec![hashmap_get],
+    )
+}
+
+#[test]
+fn foreign_opaque_hashmap_get_keeps_niche_option_spelling() {
+    let llbc = hashmap_get_option_ref_fixture();
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let row = harvested.iter().find(|(segments, _, _)| {
+        segments.last().map(String::as_str) == Some("get")
+            && segments.iter().any(|s| s == "HashMap" || s == "hashmap")
+    });
+    assert!(
+        row.is_some(),
+        "HashMap::get must be harvested: {harvested:?}"
+    );
+    let (_, _, result_ty) = row.unwrap();
+    let crate::model::ValueType::Ref(Some(root)) = result_ty else {
+        panic!("HashMap::get residual must keep a named Ref, got {result_ty:?}");
+    };
+    assert!(
+        root.contains("Option<") && root.contains('&') && root.contains("PyObject"),
+        "HashMap::get residual must keep Option<&T> spelling, got {root:?}"
+    );
+}
+
 #[test]
 fn range_contains_is_not_harvested_as_function_path() {
     // A bodyless `Range::contains` is not harvested as an opaque
