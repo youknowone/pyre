@@ -2266,6 +2266,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         for &(name, val) in majit_rlib::rposix::MFD_NAMES {
             crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
         }
+        // `moduledef.py` publishes `CLONE_*` when `rposix.unshare` exists,
+        // and only the names whose probe value is not None.
+        #[cfg(rposix_have_unshare)]
+        for &(name, val) in majit_rlib::rposix::CLONE_NAMES {
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val as i64));
+        }
         // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`
         // and `getattr(rposix, _name) is not None`.
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -8853,6 +8859,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["name", "flags"],
                 &[],
+                1,
+            )
+        );
+
+        // interp_posix.py `unshare`. `rposix.c_unshare` releases the GIL and
+        // saves errno. `wrap_oserror(..., eintr_retry=False)`.
+        #[cfg(all(not(feature = "sandbox"), rposix_have_unshare))]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "unshare",
+            crate::make_builtin_function_with_arity(
+                "unshare",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("unshare() requires 1 argument"));
+                    }
+                    // interp_posix.py `@unwrap_spec(flags=c_int)`.
+                    let flags = crate::baseobjspace::c_int_w(args[0])? as majit_rlib::rffi::INT;
+                    let ret = unsafe { majit_rlib::rposix::c_unshare(flags) };
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_none())
+                },
                 1,
             )
         );
@@ -15561,6 +15594,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ns_slot,
             "memfd_create",
             crate::make_builtin_function("memfd_create", sandbox_unavailable)
+        );
+        #[cfg(rposix_have_unshare)]
+        crate::__pyre_put_new!(
+            ns_slot,
+            "unshare",
+            crate::make_builtin_function("unshare", sandbox_unavailable)
         );
         #[cfg(rposix_have_fadvise)]
         for name in ["posix_fallocate", "posix_fadvise"] {

@@ -59,6 +59,13 @@ pub use cConfig::{
     PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_FIFO, SCHED_OTHER, SCHED_RR, SEEK_CUR,
     SEEK_END, SEEK_SET, SETPGRP_HAVE_ARG, UTIMBUF,
 };
+/// `rposix.py` linux `CConfig` `CLONE_*` / `HAVE_UNSHARE`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use cConfig::{
+    CLONE_FILES, CLONE_FS, CLONE_NAMES, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
+    CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SIGHAND, CLONE_SYSVSEM,
+    CLONE_THREAD, CLONE_VM, HAVE_UNSHARE,
+};
 /// `rposix.py` `ConfConfig` `pathconf_names` / `confstr_names` / `sysconf_names`.
 #[cfg(unix)]
 pub use cConfig::{CONFSTR_NAMES, PATHCONF_NAMES, SYSCONF_NAMES};
@@ -2512,10 +2519,11 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
-// `rposix.c_unshare`, `c_sched_getaffinity`, and `c_sched_setaffinity`
-// save errno. `sys.platform.startswith('linux')`. The affinity mask is a
+// `rposix.c_unshare` saves errno. Behind `HAVE_UNSHARE`.
+// `c_sched_getaffinity` and `c_sched_setaffinity` save errno.
+// `sys.platform.startswith('linux')`. The affinity mask is a
 // `c_ulong` word array (`rposix.CPU_MASK_P`), not `cpu_set_t`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(rposix_have_unshare)]
 crate::rffi::llexternal!(
     pub c_unshare = "unshare",
     [crate::rffi::INT],
@@ -3655,6 +3663,8 @@ mod tests {
             assert_eq!(BUF_SIZES, [256, 65536]);
             assert!(HAVE_MEMFD_CREATE);
             assert_eq!(MFD_CLOEXEC, Some(libc::MFD_CLOEXEC as i32));
+            assert!(HAVE_UNSHARE);
+            assert_eq!(CLONE_FILES, Some(libc::CLONE_FILES as i32));
         }
         assert_eq!(AT_FDCWD, Some(libc::AT_FDCWD as i32));
         assert_eq!(AT_REMOVEDIR, Some(libc::AT_REMOVEDIR as i32));
@@ -4918,6 +4928,15 @@ mod tests {
                 return;
             }
             assert_ne!(err, 0);
+        }
+    }
+
+    #[cfg(rposix_have_unshare)]
+    #[test]
+    fn c_unshare_zero_flags_or_saves_errno() {
+        let ret = unsafe { c_unshare(0) };
+        if ret < 0 {
+            assert_ne!(get_saved_errno(), 0);
         }
     }
 
