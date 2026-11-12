@@ -154,11 +154,14 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
-/// `interp_posix.py DEFAULT_DIR_FD` — `rposix.AT_FDCWD` when the host
-/// header defines it, else `-100`. `_unwrap_dirfd` maps `None` to it, so
-/// an explicit `dir_fd=AT_FDCWD` is the same as an omitted one.
+/// `interp_posix.py` `DEFAULT_DIR_FD = rposix.AT_FDCWD if _HAVE_AT_FDCWD else -100`.
+/// `_unwrap_dirfd` maps `None` to it, so an explicit `dir_fd=AT_FDCWD` is the
+/// same as an omitted one.
 #[cfg(unix)]
-const DEFAULT_DIR_FD: i32 = libc::AT_FDCWD;
+const DEFAULT_DIR_FD: i32 = match majit_rlib::rposix::AT_FDCWD {
+    Some(fd) => fd,
+    None => -100,
+};
 #[cfg(not(unix))]
 const DEFAULT_DIR_FD: i32 = -100;
 
@@ -4408,7 +4411,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rposix::c_unlinkat(
                                 _dir_fd,
                                 c_path.as_ptr(),
-                                libc::AT_REMOVEDIR,
+                                majit_rlib::rposix::AT_REMOVEDIR.expect("missing AT_REMOVEDIR"),
                             )
                         }
                     } else {
@@ -4594,15 +4597,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// descriptor onto someone else's file answers `utime(fd)` and refuses
     /// `utime(fd, ns=(now, now))` with EPERM.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn timespec_of(t: UTime, now: bool) -> libc::timespec {
-        libc::timespec {
-            tv_sec: t.sec as libc::time_t,
-            tv_nsec: if now {
-                libc::UTIME_NOW as _
-            } else {
-                t.nsec as _
-            },
-        }
+    fn timespec_of(t: UTime, now: bool) -> majit_rlib::rposix::TIMESPEC {
+        let mut ts = unsafe { std::mem::zeroed::<majit_rlib::rposix::TIMESPEC>() };
+        ts.c_tv_sec = t.sec as _;
+        ts.c_tv_nsec = if now {
+            majit_rlib::rposix::UTIME_NOW.expect("missing UTIME_NOW") as _
+        } else {
+            t.nsec as _
+        };
+        ts
     }
 
     // PyPy `interp_posix.utime` → rposix `utimensat`/`SetFileTime`.  `times` is a
@@ -4914,7 +4917,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flag = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
@@ -6346,7 +6349,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flags = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             // `rposix_stat.c_fstatat` releases the GIL and saves errno.
             let ret = unsafe {
@@ -6460,7 +6463,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let flags = if follow_symlinks {
             0
         } else {
-            libc::AT_SYMLINK_NOFOLLOW
+            majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
         };
         // `rposix_stat.c_fstatat` releases the GIL and saves errno.
         let ret = unsafe {
@@ -11480,7 +11483,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         Some(w) => crate::baseobjspace::is_true(w)?,
                         None => true,
                     };
-                    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+                    let flags = if follow {
+                        majit_rlib::rposix::AT_SYMLINK_FOLLOW.expect("missing AT_SYMLINK_FOLLOW")
+                    } else {
+                        0
+                    };
                     let ret = unsafe {
                         majit_rlib::rposix::c_linkat(
                             src_dir_fd,
@@ -11591,7 +11598,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let flag = if follow_symlinks {
                         0
                     } else {
-                        libc::AT_SYMLINK_NOFOLLOW
+                        majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
                     };
                     unsafe {
                         majit_rlib::rposix::c_fchmodat(
@@ -11884,7 +11891,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let flag = if follow_symlinks {
                 0
             } else {
-                libc::AT_SYMLINK_NOFOLLOW
+                majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW")
             };
             loop {
                 let ret = unsafe {
@@ -14227,10 +14234,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let mut flags = 0;
                     if !follow_symlinks {
-                        flags |= libc::AT_SYMLINK_NOFOLLOW;
+                        flags |= majit_rlib::rposix::AT_SYMLINK_NOFOLLOW.expect("missing AT_SYMLINK_NOFOLLOW");
                     }
                     if effective_ids {
-                        flags |= libc::AT_EACCESS;
+                        flags |= majit_rlib::rposix::AT_EACCESS.expect("missing AT_EACCESS");
                     }
                     unsafe {
                         majit_rlib::rposix::c_faccessat(dir_fd, c_path.as_ptr(), mode, flags) == 0

@@ -2,7 +2,8 @@
 //! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
 //! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
 //! `configure(CConfig)`), `rposix.py` `pipe_config`, `advise_config`, and
-//! the "f... and ...at families" `CConfig` probes go through
+//! the "f... and ...at families" `CConfig`, and the `AT_*`/`UTIME_*`/
+//! `TIMESPEC` `CConfig` probes go through
 //! `majit_eci::rffi_platform`, and
 //! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
 //! (`cbuild.py` `compile_shared_lib`).
@@ -201,6 +202,19 @@ const RPOSIX_AT_FAMILY_NAMES: &[&str] = &[
     "unlinkat",
     "utimensat",
     "sched_getparam",
+];
+
+/// `rposix.py` `CConfig` `AT_*` / `UTIME_*` (`DefinedConstantInteger`).
+/// `AT_EACCESS` is declared twice upstream; probe once.
+const RPOSIX_AT_CONST_NAMES: &[&str] = &[
+    "AT_FDCWD",
+    "AT_SYMLINK_NOFOLLOW",
+    "AT_SYMLINK_FOLLOW",
+    "AT_EACCESS",
+    "AT_REMOVEDIR",
+    "AT_EMPTY_PATH",
+    "UTIME_NOW",
+    "UTIME_OMIT",
 ];
 
 /// `rdynload.py` `CConfig` / `configure(CConfig)`. The probe ECI is
@@ -697,6 +711,9 @@ fn write_rposix_cconfig(
     }
 
     let (have_chflags, have_lchflags, have_fexecve) = write_rposix_at_family(&mut text, windows);
+    if unix {
+        write_rposix_at_timespec_config(&mut text);
+    }
 
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rposix_cconfig.rs");
@@ -783,6 +800,47 @@ fn write_rposix_at_family(text: &mut String, windows: bool) -> (bool, bool, bool
         println!("cargo:rustc-cfg=rposix_have_fexecve");
     }
     (have_chflags, have_lchflags, have_fexecve)
+}
+
+/// `rposix.py` `CConfig` `AT_*` / `UTIME_*` / `TIMESPEC` under `if not _WIN32`.
+/// Fresh `ExternalCompilationInfo(includes=['sys/stat.h', 'unistd.h', 'fcntl.h'])`,
+/// not `rposix.eci`.
+fn write_rposix_at_timespec_config(text: &mut String) {
+    let mut entries = Vec::new();
+    for name in RPOSIX_AT_CONST_NAMES {
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    entries.push((
+        "TIMESPEC".into(),
+        CConfigEntry::struct_type(
+            "struct timespec",
+            vec![
+                ("tv_sec".into(), FieldType::signed_word()),
+                ("tv_nsec".into(), FieldType::signed_word()),
+            ],
+            None,
+        ),
+    ));
+    let at_config = CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes: vec!["sys/stat.h".into(), "unistd.h".into(), "fcntl.h".into()],
+            ..Default::default()
+        },
+        entries,
+        single_entries: vec![],
+    };
+    let at_results = configure(&at_config, false).unwrap_or_else(|err| panic!("{err}"));
+    text.push_str("// rposix.py CConfig AT_*/UTIME_*/TIMESPEC\n");
+    for name in RPOSIX_AT_CONST_NAMES {
+        emit_option_i32(text, name, cconfig_lookup(&at_results, name));
+    }
+    text.push_str(
+        &struct_layout("TIMESPEC", cconfig_lookup(&at_results, "TIMESPEC"))
+            .rust_struct_source("TIMESPEC", &[]),
+    );
 }
 
 fn cconfig_lookup<'a>(results: &'a [(String, ConfigValue)], name: &str) -> &'a ConfigValue {
