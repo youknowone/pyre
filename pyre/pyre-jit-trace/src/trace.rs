@@ -3,7 +3,8 @@
 //! `trace_bytecode` drives the authoritative full-body walk
 //! (`full_body_walk_trace`): the walker-as-tracer that walks the per-CodeObject
 //! JitCode body, combining symbolic IR recording
-//! with the per-step concrete frame snapshot.  Any location the walk declines
+//! with the live virtualizable (`pyjitpl.py` `initialize_virtualizable` /
+//! `virtualizable.py` `read_boxes`).  Any location the walk declines
 //! re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
 //! retired).
 
@@ -219,17 +220,16 @@ pub(crate) enum WalkEndCommitLeg {
     /// the paused-CALL OpRef mirror is `_copy_data_from_miframe` of the live
     /// root, so `_run_forever` delivers the callee result into the caller's
     /// pending CALL (`make_result_of_lastop` / `_resume_mainloop`) and runs
-    /// the root's remaining body. The snapshot array is the pre-walk stack
-    /// and would Finish the portal before that body ran.
+    /// the root's remaining body. Publishing the live array instead would
+    /// Finish the portal before that body ran.
     CarrierAbort = 10,
     /// An aborting `DispatchError` from the walker capability-gap family
     /// ([`crate::jitcode_dispatch::DispatchError::leaves_complete_image`])
     /// whose mid-opcode MIFrame image was converted to blackhole frames and run
     /// forward.  Same contract as [`Self::TraceTooLong`]; kept a separate leg
     /// so the census can tell a bounded-length abort from a capability gap.
-    /// Both legs publish the walker's OpRef mirror — a root walk never
-    /// refreshes the virtualizable snapshot array, so that array is the
-    /// pre-walk stack (`capture_frame_stack_from_mirror`).
+    /// Both legs publish the walker's OpRef mirror
+    /// (`capture_frame_stack_from_mirror`).
     WalkAbort = 11,
     /// `SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`
     /// (`pyjitpl.py _create_segmented_trace_and_blackhole`): the walk cut
@@ -1146,9 +1146,9 @@ fn debug_variant_name(value: &dyn std::fmt::Debug) -> String {
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
 /// walker walks the per-CodeObject JitCode body, recording symbolic IR against
-/// the per-step concrete frame snapshot.  A location the walk declines
-/// re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
-/// retired).
+/// the live virtualizable (`initialize_virtualizable` / `read_boxes`).  A
+/// location the walk declines re-interprets without JIT (the trait
+/// `PyreMetaInterp` interpret loop is retired).
 ///
 /// A portal walk (`!TraceCtx.is_bridge_trace`) publishes the abort image
 /// onto the aborting `MetaInterp`; a bridge walk drives in place.
@@ -1157,11 +1157,11 @@ pub fn trace_bytecode<Sym: WalkSym>(
     sym: &mut Sym,
     _code: &CodeObject,
     start_pc: usize,
-    mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
+    concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
     prepare_resume_from_failure: bool,
-) -> (TraceAction, pyre_interpreter::pyframe::FrameBox, bool) {
+) -> (TraceAction, bool) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
     // `bh_strgetitem` family routes through rstr `STR` `str_descr`
@@ -1225,20 +1225,17 @@ pub fn trace_bytecode<Sym: WalkSym>(
     } else {
         start_pc
     };
-    // RPython MetaInterp._interpret() parity: the walker (sole tracer)
-    // executes as it records over a concrete `PyFrame` snapshot
-    // (`snapshot_for_tracing`); the interpreter does not run during tracing.
-    // The snapshot copies frame-LOCAL state (abort-safety) while sharing
-    // `w_globals`; vable-statics capture reads pointer-valued fields from the
-    // live frame (`live_vable_frame_addr` below), not the snapshot copy.
+    // `pyjitpl.py MetaInterp._interpret`: the walker is the sole tracer and
+    // runs over the live virtualizable (`FrameBox::pin_existing`, or
+    // `FrameBox::non_owning` when the collector does not own the frame).
+    // STOREs are record-only, and `flush_walk_end_state_to_frame`
+    // (`raise_continue_running_normally`) advances the real frame so the
+    // interpreter resumes after the walked region.
     //
-    // The former snapshot double-apply (inline-frame SHARED-heap STOREs
-    // leaking during tracing and re-applying on the compiled loop's re-run)
-    // is resolved because the concrete executor is deleted so STOREs are
-    // record-only, and `flush_walk_end_state_to_frame`
-    // (`raise_continue_running_normally` parity) advances the real frame so
-    // the interpreter resumes AFTER the walked region, not from its start.
-    concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    // The walk does not stamp `last_instr` here: `pyopcode.py
+    // dispatch_bytecode` writes it with a traced `setfield_vable` at each
+    // opcode, so the object stays equal to `virtualizable_boxes`
+    // (`virtualizable.py check_boxes`).
     let w_code = concrete_frame.pycode;
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
@@ -1247,15 +1244,10 @@ pub fn trace_bytecode<Sym: WalkSym>(
         dump_perfn_jitcode_for_trace(w_code, lasti_pc);
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
-    // The snapshot stands in for concrete stepping only; vable-statics
-    // capture must read the pointer-valued `debugdata` field from the live
-    // frame the compiled loop will run on. See the
-    // `live_vable_frame_addr` field doc (state.rs).  Set before the
-    // full-body-walk leg below so the production tracer sees it.
-    //
-    // Set this BEFORE `init_symbolic` so the root vable
-    // identity (seed_virtualizable_boxes) is baked against the live frame
-    // address, not the discarded snapshot's.
+    // `concrete_frame` is the live virtualizable (`FrameBox::pin_existing`
+    // / `FrameBox::non_owning`). Publish it before `init_symbolic` so
+    // `seed_virtualizable_boxes` bakes the root identity against this
+    // same object (`initialize_virtualizable` / `read_boxes`).
     sym.set_live_vable_frame_addr(live_frame_addr);
     // pyjitpl.py MIFrame.__init__: sym fields populated once at frame
     // construction. Callee (inline) frames are set up by `inline_call.rs`'s
@@ -1271,6 +1263,9 @@ pub fn trace_bytecode<Sym: WalkSym>(
     if prepare_resume_from_failure {
         crate::jitcode_dispatch::seed_standing_exception_for_walk(sym, ctx);
     }
+    // `init_symbolic` and the standing-exception seed can collect; read the
+    // frame back from `concrete_frame`'s root before the walks take it.
+    let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
             unsafe { (*sym.jitcode()).index as i32 },
@@ -1294,7 +1289,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
             carrier,
         );
         finish_trace_namespace_dependency(meta);
-        return (action, concrete_frame, flush_committed.get());
+        return (action, flush_committed.get());
     }
     // Gated diagnostic: `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the
     // per-CodeObject JitCode body via `dispatch_via_miframe` from the resume
@@ -1306,7 +1301,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     if carrier.is_none() && walk_perfn_jitcode_enabled() {
         probe_walk_perfn_jitcode(meta, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
-        return (TraceAction::Abort, concrete_frame, false);
+        return (TraceAction::Abort, false);
     }
     // The per-CodeObject JitCode body is traced via the authoritative
     // full-body walk — the walker-as-tracer path that makes
@@ -1336,14 +1331,14 @@ pub fn trace_bytecode<Sym: WalkSym>(
             None,
         );
         finish_trace_namespace_dependency(meta);
-        return (action, concrete_frame, flush_committed.get());
+        return (action, flush_committed.get());
     }
     // Any path the walker did not trace above re-interprets without JIT for
     // this key. The location stays trace-eligible (no `DONT_TRACE_HERE`).
     crate::jitcode_dispatch::census_record("Trait::DeclinedAbort");
     let action = TraceAction::Decline;
     finish_trace_namespace_dependency(meta);
-    (action, concrete_frame, flush_committed.get())
+    (action, flush_committed.get())
 }
 
 /// Read-only walker-as-tracer diagnostic probe.
@@ -2234,7 +2229,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             sym,
             w_code,
             root_pc,
-            cf_addr,
             root_ec,
             root_ec_box,
             root_frame_box,
@@ -2272,7 +2266,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             sym,
             w_code,
             root_pc,
-            cf_addr,
             root_ec,
             root_ec_box,
             root_frame_box,
@@ -2330,7 +2323,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         && try_adopt_blackhole(
             flush_committed,
             meta,
-            cf_addr,
+            live_root_addr,
             live_root_addr,
             WalkEndCommitLeg::CarrierAbort,
             crossed_inline_subwalk,
@@ -2494,7 +2487,6 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
-    cf_addr: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
     root_frame_box: majit_ir::OpRef,
@@ -2525,7 +2517,6 @@ fn drive_middles_finishframe<Sym: WalkSym>(
                     sym,
                     w_code,
                     root_pc,
-                    cf_addr,
                     root_ec,
                     root_ec_box,
                     root_frame_box,
@@ -2538,16 +2529,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
             None => return None,
         }
     }
-    compile_root_from_carrier_result(
-        meta,
-        flush_committed,
-        sym,
-        w_code,
-        root_pc,
-        cf_addr,
-        carrier,
-        result,
-    )
+    compile_root_from_carrier_result(meta, flush_committed, sym, w_code, root_pc, carrier, result)
 }
 
 /// `pyjitpl.py finishframe_exception` over `middles` (a prefix of the
@@ -2566,7 +2548,6 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
-    cf_addr: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
     root_frame_box: majit_ir::OpRef,
@@ -2676,7 +2657,6 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                             sym,
                             w_code,
                             root_pc,
-                            cf_addr,
                             root_ec,
                             root_ec_box,
                             root_frame_box,
@@ -2727,7 +2707,6 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                         sym,
                         w_code,
                         root_pc,
-                        cf_addr,
                         root_ec,
                         root_ec_box,
                         root_frame_box,
@@ -2769,6 +2748,9 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     let root_py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(carrier.root_jitcode_index, root_pc as i32)
             as usize;
+    // The sub-walks above ran residual calls; read the root frame back
+    // from its root (`gc_restore_root` after a call that can collect).
+    let cf_addr = sym.live_vable_frame_addr();
     let action = full_body_walk_trace(
         meta,
         flush_committed,
@@ -2793,7 +2775,6 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
-    cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
     result: majit_ir::OpRef,
 ) -> Option<TraceAction> {
@@ -2805,6 +2786,9 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     let root_py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(carrier.root_jitcode_index, root_pc as i32)
             as usize;
+    // The sub-walks above ran residual calls; read the root frame back
+    // from its root (`gc_restore_root` after a call that can collect).
+    let cf_addr = sym.live_vable_frame_addr();
     let action = full_body_walk_trace(
         meta,
         flush_committed,
@@ -3358,9 +3342,7 @@ fn frame_resume_py_pc(frame: usize) -> usize {
     unsafe { (*(frame as *const pyre_interpreter::PyFrame)).next_instr() }
 }
 
-/// Hand a blackhole `ContinueRunningNormally` back the way upstream does:
-/// resume on the frame the blackhole has been writing, not on one rebuilt from
-/// the terminal register banks.
+/// Stamp the CRN resume coordinate on the frame the blackhole wrote.
 ///
 /// `handle_jitexception` (`warmspot.py`) re-enters the portal with the
 /// greens and reds the exception carries; the frame is among the reds, and
@@ -3374,22 +3356,19 @@ fn frame_resume_py_pc(frame: usize) -> usize {
 /// frame: `convert_and_run_from_pyjitpl` links `framestack[0]` last, so
 /// `nextblackholeinterp is None` names the root and no other.
 ///
-/// pyre's walked frame has two representations, so "the frame the blackhole was
-/// writing" has to be named.  The drive's vable ops address the frame held in
-/// the jitcode's own frame register, which the caller gates to be the LIVE
-/// root; the portal epilogue then publishes the SNAPSHOT
-/// (`eval.rs` `restore_resume_state_from(&executed_frame)`).  Mirroring live
-/// into the snapshot is what makes that epilogue hand over the drive's result
-/// instead of the walk's stale copy — the same move, for the same reason, that
-/// the escape leg makes.
+/// The drive's vable ops address the frame held in the jitcode's own
+/// frame register, which the caller gates to be the live virtualizable
+/// (`initialize_virtualizable` / `read_boxes`). Portal and bridge walks
+/// pin or borrow that same object (`FrameBox::pin_existing` /
+/// `FrameBox::non_owning`).
 ///
 /// `last_instr` is the one coordinate the drive does not leave resume-ready: it
 /// stops at the merge point having recorded the pc it is AT, and resuming there
-/// needs the pc before it.  Mirroring without this normalization resumes one
+/// needs the pc before it.  Stamping without this normalization resumes one
 /// opcode past the loop header — measured on
 /// `getframe_root_loop_force_blackhole_crn` and
 /// `getframe_root_loop_force_while_merge`, which then produce no output at all.
-/// The adopt stamps that resume coordinate. It does not recompute
+/// The adopt stores `last_instr = resume_py_pc - 1`. It does not recompute
 /// `valuestackdepth` or clear the stack.
 ///
 /// ⭐Infallible, and that is the whole point.  The register-image rebuild this
@@ -3398,17 +3377,9 @@ fn frame_resume_py_pc(frame: usize) -> usize {
 /// executed the region — a decline that hands an executed region back to a
 /// replay that runs it again.  Upstream has no such path, and neither does
 /// this.
-///
-/// Both adopt arms come here.  The multi-frame one has already folded its live
-/// root into the snapshot by the time it does, so the mirror is a no-op there
-/// and only the coordinate lands; routing it through anyway keeps one
-/// definition of what adopting a CRN means.
-fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
+fn adopt_blackhole_crn(frame: usize, resume_py_pc: usize) {
     unsafe {
-        let live = &*(live_root as *const pyre_interpreter::PyFrame);
-        let snap = &mut *(snapshot as *mut pyre_interpreter::PyFrame);
-        snap.restore_resume_state_from(live);
-        snap.set_last_instr_from_next_instr(resume_py_pc);
+        (*(frame as *mut pyre_interpreter::PyFrame)).set_last_instr_from_next_instr(resume_py_pc);
         // `handle_jitexception` (`warmspot.py`) ContinueRunningNormally calls
         // `portal_ptr(*args)`. It neither recomputes `valuestackdepth` nor
         // clears the stack: `bhimpl_setfield_vable_i` /
@@ -3463,17 +3434,14 @@ fn latched_is_live_root_code(latched_index: usize, root_addr: usize) -> bool {
     live_root_code_key(root_addr) == Some(latched.code_ptr as usize)
 }
 
-/// In-place (bridge) path folds live→snapshot and records a restart pc.
-/// Portal cash has no snapshot: the net of that round trip is `last_instr`
-/// on the live root, and `WALK_END_RESTART_PC` stays empty.
+/// In-place (bridge) path stamps the CRN resume coordinate on the walk's
+/// live frame and records a restart pc. Portal cash has already
+/// dropped that handle: the net of that round trip is `last_instr` on
+/// the live root, and `WALK_END_RESTART_PC` stays empty.
 fn apply_blackhole_crn_outcome(cf_addr: Option<usize>, live_root: usize, resume_py_pc: usize) {
-    if let Some(cf_addr) = cf_addr {
-        adopt_blackhole_crn(cf_addr, live_root, resume_py_pc);
+    adopt_blackhole_crn(cf_addr.unwrap_or(live_root), resume_py_pc);
+    if cf_addr.is_some() {
         WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
-    } else {
-        unsafe {
-            (*(live_root as *mut pyre_interpreter::PyFrame)).last_instr = resume_py_pc as isize - 1;
-        }
     }
 }
 
@@ -3505,10 +3473,11 @@ struct MultiFrameBlackholeCash {
 
 /// Drive a staged single-frame blackhole and publish its outcome.
 ///
-/// `cf_addr` is the tracing snapshot. The portal cash path has already torn
-/// that snapshot down (`run_blackhole_interp_to_cancel_tracing` order:
-/// `aborted_tracing` then `convert_and_run_from_pyjitpl`), so it passes
-/// `None` and writes the resume coordinate onto the live root directly.
+/// `cf_addr` is the walk's concrete virtualizable (the live `PyFrame`).
+/// The portal cash path has already torn its handle down
+/// (`run_blackhole_interp_to_cancel_tracing` order: `aborted_tracing`
+/// then `convert_and_run_from_pyjitpl`), so it passes `None` and writes
+/// the resume coordinate onto the live root directly.
 fn cash_single_frame_blackhole(
     mut staged: SingleFrameBlackholeCash,
     live_frame: *mut pyre_interpreter::PyFrame,
@@ -3554,16 +3523,6 @@ fn cash_single_frame_blackhole(
         forwarded_root_addr != 0,
         "post-blackhole drive returned no virtualizable for a preflighted frame"
     );
-    if let Some(cf_addr) = cf_addr
-        && forwarded_root_addr != cf_addr
-    {
-        unsafe {
-            (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                &*(forwarded_root_addr as *const pyre_interpreter::PyFrame),
-            );
-        }
-    }
-
     // Its own prefix: this is not a decline, and reading it as one is exactly
     // the confusion that made the CRN arm look unreachable.
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3761,8 +3720,9 @@ fn cash_multi_frame_blackhole(
     // a compiled trace allocates an inlined callee's `PyFrame` with its own
     // `NewWithVtable`, which the GC rewriter lowers to a nursery allocation,
     // so the first minor collection the chain triggers moves it.  Every read
-    // of the live root below the drive — the fold into the snapshot, the CRN
-    // handoff, the raise coordinate — would otherwise take the vacated block,
+    // of the live root below the drive — the CRN handoff, the raise
+    // coordinate — would otherwise take
+    // the vacated block,
     // whose `valuestackdepth` and locals are free nursery space.  This is the
     // same recovery the single-frame path makes from its post-drive frame
     // register, and the same hazard `resume_mainloop` roots each level's
@@ -3901,30 +3861,8 @@ fn cash_multi_frame_blackhole(
     }
     // Frame 0's blackhole level ran against `per_frame[0]`, the LIVE frame,
     // because `convert_and_run_from_pyjitpl` overrides each level's
-    // `virtualizable_ptr` from `per_frame` — so its `setfield_vable` stores
-    // landed there, not in the snapshot.  EVERY adopted arm below sets
-    // the flush bit `trace_bytecode` returns, and the portal epilogue then copies the
-    // SNAPSHOT's whole locals array onto the live frame
-    // (`restore_resume_state_from`), which would revert every one of those
-    // stores.  Fold them into the snapshot before the arms so it is once again
-    // the committed image, which is the contract the epilogue and the
-    // single-frame arm both assume.  This has to sit outside the match: a
-    // `DoneWithThisFrame*` or `ExitFrameWithExceptionRef` terminal writes no
-    // resume state of its own, and for the exception terminal the traceback
-    // keeps the root frame reachable, so a stale copy is observable through
-    // `tb_frame.f_locals` long after the walk.
-    //
-    // Portal cash has no snapshot: the live frame is already the committed
-    // image, and folding would be a round trip whose net effect is the live
-    // frame as the drive left it.
-    if let Some(cf_addr) = cf_addr
-        && root_addr != cf_addr
-    {
-        unsafe {
-            (*(cf_addr as *mut pyre_interpreter::PyFrame))
-                .restore_resume_state_from(&*(root_addr as *const pyre_interpreter::PyFrame));
-        }
-    }
+    // `virtualizable_ptr` from `per_frame`. That is also the walk's
+    // concrete virtualizable (`initialize_virtualizable` / `read_boxes`).
     match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally(ref args) => {
             let &resume_py_pc = args.green_int.first().expect(
@@ -3956,11 +3894,7 @@ fn cash_multi_frame_blackhole(
             // bottommost level, which `convert_and_run_from_pyjitpl` makes the
             // portal frame.  So the frame already holds the driven result and
             // nothing has to be rebuilt from the terminal register banks.
-            //
-            // The fold above the match has already made the snapshot the
-            // committed image, so the mirror inside is a no-op here and only
-            // the resume coordinate is left to set.  Taking the same path
-            // anyway keeps one definition of what adopting a CRN means.
+            // Only the resume coordinate is left to set.
             //
             // This retires three post-drive declines at once — the absent
             // terminal image, the out-of-range terminal jitcode index, and the
@@ -4449,22 +4383,23 @@ fn try_adopt_single_frame_blackhole(
     // only because nothing has run at that point.
     //
     // Trace-too-long is also post-step: its MIFrame `resume_pc` and concrete
-    // banks already describe the next jitcode instruction.  The detached
-    // `snapshot_for_tracing` therefore owns the matching active operand stack
-    // and Python-frame coordinate.  RPython's MIFrame and red frame are one
-    // coherent per-call state at this boundary; publish the snapshot stack to
-    // the same live red frame before driving instead of leaving only
-    // `valuestackdepth` to advance over null slots.
+    // banks already describe the next jitcode instruction. The live
+    // virtualizable owns the matching active operand stack and Python-frame
+    // coordinate. RPython's MIFrame and red frame are one coherent per-call
+    // state at this boundary; publish that stack onto the same live red
+    // frame before driving instead of leaving only `valuestackdepth` to
+    // advance over null slots.
     //
-    // Which frame gets it is an identity question, and the walked frame has two
-    // representations: `cf_addr` is the `snapshot_for_tracing` copy the walk
-    // steps concretely, `live_root_addr` the frame the compiled loop runs on.
+    // The walked frame is the live virtualizable
+    // (`initialize_virtualizable` / `read_boxes`). `live_root_addr` is
+    // that object's GC-forwarded identity; `cf_addr` is the walk handle.
+    // Production portal/bridge walks pin or borrow the same object, so
+    // the fallback is only a missing-identity default.
     // The register is recovered the same way `try_adopt_multi_frame_blackhole`
     // recovers `per_frame[0]`, and `seed_virtualizable_boxes` bakes that root
-    // vable identity against the live address whenever there is one, so the
-    // comparison uses the same address under the same fallback.  Code-object
-    // equality would not do: two invocations of one function share a code
-    // object, and the shadow belongs to exactly one of them.
+    // vable identity against the live address whenever there is one.
+    // Code-object equality would not do: two invocations of one function
+    // share a code object, and the shadow belongs to exactly one of them.
     let root_addr = if live_root_addr != 0 {
         live_root_addr
     } else {
@@ -4503,11 +4438,9 @@ fn try_adopt_single_frame_blackhole(
         return false;
     }
     // Portal tracing that pinned the live virtualizable already wrote
-    // locals through `own_frame_array_store_target` /
-    // `store_live_frame_array_slot`. Publishing them again is a live→live
-    // copy (`write_back_outer_locals`). Bridges still step a snapshot.
-    let already_on_live =
-        !live_trace_ctx(meta).is_bridge_trace && cf_addr == root_addr && vable_frame == root_addr;
+    // locals through `write_box_at` on `virtualizable_heap_ptr`.
+    // Publishing them again is a live→live copy (`write_back_outer_locals`).
+    let already_on_live = !live_trace_ctx(meta).is_bridge_trace;
     let mut locals_undo = if already_on_live {
         Vec::new()
     } else {
@@ -4663,11 +4596,6 @@ fn try_adopt_single_frame_blackhole(
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
     }
-    committed_root_addr = latched
-        .banks
-        .ref_word(frame_reg as usize)
-        .expect("preflighted frame register disappeared after forwarding")
-        as usize;
     // Locals plus the no-allocation stack publication are the last recoverable
     // adoption gates. Their undo image only needs rooting through this point,
     // including the abort; after it the blackhole may execute irreversible
@@ -4900,13 +4828,13 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("frame {index}: {unflushed:#x} was forced without a locals write");
         return false;
     }
-    // The walked frame has two representations here: `cf_addr` is the
-    // `snapshot_for_tracing` copy the walk steps concretely, and
-    // `live_root_addr` is the frame the compiled loop runs on.  `per_frame[0]`
-    // is recovered from the trace's frame register, and
-    // `seed_virtualizable_boxes` bakes that root vable identity against the
-    // live address whenever there is one (`state.rs`), so an identity question
-    // has to be asked against the same address under the same fallback.
+    // The walked frame is the live virtualizable
+    // (`initialize_virtualizable` / `read_boxes`). `live_root_addr` is
+    // that object's GC-forwarded identity; `cf_addr` is the walk handle.
+    // Production portal/bridge walks pin or borrow the same object.
+    // `per_frame[0]` is recovered from the trace's frame register, and
+    // `seed_virtualizable_boxes` bakes that root vable identity against
+    // the live address whenever there is one (`state.rs`).
     let root_addr = if live_root_addr != 0 {
         live_root_addr
     } else {
@@ -5005,10 +4933,8 @@ fn try_adopt_multi_frame_blackhole(
     // the chain must be live before the run; it also stays live afterwards for
     // a frame the residual captured.  `frames[0]` is the walked frame, already
     // entered by its own caller, so the `ptr::eq` skip leaves its `f_backref`
-    // alone — which is exactly why the root operand must be `root_addr` and not
-    // the snapshot.  The snapshot is freed at the end of this walk, so a link
-    // to it would survive as a dangling `f_back` for any later
-    // `sys._getframe().f_back` or traceback walk.
+    // alone — which is why the root operand is `root_addr`, the live
+    // virtualizable the walk traces.
     //
     // The links are recorded as they are overwritten, because they only hold
     // for a chain that is actually driven.  An adopt keeps them; every decline
@@ -5091,23 +5017,20 @@ fn try_adopt_multi_frame_blackhole(
     // Every INNER level already owns the concrete red frame created at the
     // inline push.  Its standard-vable writes are mirrored directly onto that
     // frame while walking, matching RPython's one-red-frame-per-MIFrame shape;
-    // no slot side-table or root-frame anchor is involved.  Frame 0 remains
-    // the sole detached-snapshot case and therefore needs the explicit publish
-    // below.
+    // no slot side-table or root-frame anchor is involved.  Frame 0 is the
+    // live virtualizable the walk traces, so the explicit publish below
+    // captures that same object.
     let Some(mut locals_undo) = crate::state::capture_frame_locals(frame_ptrs[0] as usize) else {
         mfdbg!("frame 0: {:#x} locals not capturable", frame_ptrs[0]);
         restore_links(&saved_links);
         crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     };
-    // Same split as the single-frame arm: a root walk never writes the
-    // snapshot array (`current_inline_vable_target` is none), so the array
-    // is the pre-walk stack — including a NULL FOR_ITER iterator.  RPython
-    // copies the live MIFrame banks (`_copy_data_from_miframe`); the
-    // walker's OpRef mirror is that bank.  `WalkAbort` / `VableEscape`
-    // stop INSIDE an opcode; `ABORT_TOO_LONG` / `CarrierAbort` stop after
-    // the reconstructed callee has run, still on a root walk whose array
-    // was never refreshed.  Multi-frame latches publish frame 0 from the
+    // Same split as the single-frame arm: RPython copies the live MIFrame
+    // banks (`_copy_data_from_miframe`); the walker's OpRef mirror is that
+    // bank.  `WalkAbort` / `VableEscape` stop INSIDE an opcode;
+    // `ABORT_TOO_LONG` / `CarrierAbort` stop after the reconstructed
+    // callee has run.  Multi-frame latches publish frame 0 from the
     // portal virtualizable's boxes (`capture_root_vable_stack_image`,
     // `synchronize_virtualizable`); `ctx` being the innermost callee does
     // not change which boxes those are.  A latch that could not build one
@@ -6133,7 +6056,11 @@ fn run_perfn_walk<Sym: WalkSym>(
     ) else {
         return None;
     };
-    let cf_addr = cf_root.as_ref().map_or(cf_addr, |root| root.get().0);
+    // Read the frame back from its root at every use: the close-loop args,
+    // the adopt and the end-state flushes below allocate, and a minor
+    // collection between two uses moves a nursery frame again
+    // (`gc_restore_root` after each call that can collect).
+    let cf_addr_now = || cf_root.as_ref().map_or(cf_addr, |root| root.get().0);
 
     // Full-body-walk loop close: the walker's `jit_merge_point` handler
     // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the
@@ -6222,7 +6149,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // before the compiled-target check. Reuse that guard.
             let rebuilt = sym.close_loop_args_at(
                 ctx,
-                cf_addr,
+                cf_addr_now(),
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
@@ -6279,8 +6206,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc)
-                {
+                } else if crate::state::flush_walk_loop_end_state_to_frame(
+                    ctx,
+                    cf_addr_now(),
+                    header_pc,
+                ) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
@@ -6333,7 +6263,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         ) && try_adopt_blackhole(
             flush_committed,
             meta,
-            cf_addr,
+            cf_addr_now(),
             live_root_addr,
             WalkEndCommitLeg::TraceTooLong,
             crossed_inline_subwalk,
@@ -6354,7 +6284,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         ) && try_adopt_blackhole(
             flush_committed,
             meta,
-            cf_addr,
+            cf_addr_now(),
             live_root_addr,
             WalkEndCommitLeg::SegmentTrace,
             crossed_inline_subwalk,
@@ -6399,7 +6329,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             && try_adopt_blackhole(
                 flush_committed,
                 meta,
-                cf_addr,
+                cf_addr_now(),
                 live_root_addr,
                 WalkEndCommitLeg::WalkAbort,
                 crossed_inline_subwalk,
@@ -6415,7 +6345,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             walk_abort_adopted = try_adopt_blackhole(
                 flush_committed,
                 meta,
-                cf_addr,
+                cf_addr_now(),
                 live_root_addr,
                 WalkEndCommitLeg::WalkAbort,
                 crossed_inline_subwalk,
@@ -6432,7 +6362,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             && try_adopt_blackhole(
                 flush_committed,
                 meta,
-                cf_addr,
+                cf_addr_now(),
                 live_root_addr,
                 WalkEndCommitLeg::VableEscape,
                 crossed_inline_subwalk,
@@ -6451,17 +6381,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                 WalkEndResume::AfterApplied,
             );
             crate::jitcode_dispatch::discard_escape_flush_undo();
-            // Same live→snapshot mirror as the exact-escape commit: the portal
-            // copies `executed_frame` onto the live frame, so a stale snapshot
-            // would overwrite the flushed resume state while heap writes stay
-            // committed and replay is off.
-            if live_root_addr != 0 && cf_addr != 0 && live_root_addr != cf_addr {
-                unsafe {
-                    (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                        &*(live_root_addr as *const pyre_interpreter::PyFrame),
-                    );
-                }
-            }
             crate::jitcode_dispatch::fbw_foriter_inflight_clear();
         };
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -6491,19 +6410,6 @@ fn run_perfn_walk<Sym: WalkSym>(
             };
             if commit_walk_end(flush_committed, WalkEndCommitLeg::VableEscape, resume) {
                 crate::jitcode_dispatch::discard_escape_flush_undo();
-                // The force-time escape flush wrote the resume state into the
-                // LIVE frame (the frame the callee inspected).  The portal
-                // epilogue propagates `executed_frame` → live on a committed
-                // flush, so mirror the live frame's resume state into the walk
-                // snapshot to make that copy the identity.
-                let live = sym.live_vable_frame_addr();
-                if live != 0 && cf_addr != 0 && live != cf_addr {
-                    unsafe {
-                        (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                            &*(live as *const pyre_interpreter::PyFrame),
-                        );
-                    }
-                }
                 // The committed flush owns the iteration count (the resume pc
                 // is PAST the FOR_ITER consume); drop any in-flight item so
                 // the legacy deliver cannot re-apply one.
@@ -6547,11 +6453,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         // the chain ran forward from the flushed frame, so restoring the
         // pre-flush image here would roll the vable back underneath it.
         // A loop-end flush that already committed is the same kind of owner:
-        // the portal copies that snapshot onto the live frame after this
-        // returns, and restoring first would only be undone. The marker
+        // the portal already wrote that resume state onto the live frame,
+        // and restoring first would only be undone. The marker
         // flush below has not run yet, so a walk that is still uncommitted
         // restores, and a marker commit that then succeeds replaces the
-        // snapshot the portal copies.
+        // live resume state.
         if crate::jitcode_dispatch::take_escape_flush_undo_pending()
             && !force_blackhole_adopted
             && !escape_pc_adopted
@@ -6607,7 +6513,9 @@ fn run_perfn_walk<Sym: WalkSym>(
                     let rebuilt = match resolve_midbody_flush_words(payload) {
                         Some(words) => {
                             let outcome = match meta.trace_ctx() {
-                                Some(ctx) => try_commit_midbody_abort(ctx, cf_addr, payload, words),
+                                Some(ctx) => {
+                                    try_commit_midbody_abort(ctx, cf_addr_now(), payload, words)
+                                }
                                 None => Err(MidBodyDecline::BeforeRun("history already aborted")),
                             };
                             if outcome.is_ok() && crate::jitcode_dispatch::fbw_debug_abort_enabled()
@@ -6661,7 +6569,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // (`blackhole.py`) continues the live frames;
                             // entry replay would re-run that region. The
                             // flush's remaining post-run failure is
-                            // `store_boxed_frame_local` after a collection
+                            // `store_pinned_frame_locals` after a collection
                             // moved the outer frame, which cannot be known
                             // before the run — commit AfterApplied anyway.
                             crate::jitcode_dispatch::census_record("MidBodyDeclineAfterRun");
@@ -6687,7 +6595,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                         crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
                     {
                         if meta.trace_ctx().is_some_and(|ctx| {
-                            crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc)
+                            crate::state::flush_walk_end_state_to_frame(
+                                ctx,
+                                cf_addr_now(),
+                                resume_py_pc,
+                            )
                         }) {
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(
@@ -8142,8 +8054,8 @@ fn full_body_walk_trace<Sym: WalkSym>(
         // resumes one opcode past the call and drops the iteration. Snapshot
         // the live portal before any walk-time write: last_instr,
         // valuestackdepth, and the whole locals_cells_stack_w array.
-        // Residual `flush_live_virtualizable_to_frame` writes replaced stack
-        // slots; first-write-wins here keeps the pre-walk image the
+        // Walk-time `setarrayitem_vable` (`write_box_at` on the live frame)
+        // replaces stack slots; first-write-wins here keeps the pre-walk image the
         // non-commit epilogue restores. A restored coordinate must never
         // meet later stack contents — `convert_and_run_from_pyjitpl`
         // (blackhole.py) copies the current MIFrame chain and runs from
@@ -9373,26 +9285,19 @@ mod tests {
         live.valuestackdepth = live_vsd;
         pyre_interpreter::locals_w_mut!(live)[table_vsd] = sentinel;
 
-        let mut snap = live.snapshot_for_tracing().expect("frame allocation");
-        snap.fix_array_ptrs();
-        snap.valuestackdepth = 0;
-        snap.last_instr = -1;
-        pyre_interpreter::locals_w_mut!(snap)[table_vsd] = pyre_object::PY_NULL;
-
         let live_addr = (&mut *live) as *mut PyFrame as usize;
-        let snap_addr = (&mut *snap) as *mut PyFrame as usize;
-        super::adopt_blackhole_crn(snap_addr, live_addr, resume_py_pc);
+        super::adopt_blackhole_crn(live_addr, resume_py_pc);
 
         assert_eq!(
-            snap.valuestackdepth, live_vsd,
+            live.valuestackdepth, live_vsd,
             "ContinueRunningNormally keeps the blackhole valuestackdepth"
         );
         assert_eq!(
-            pyre_interpreter::locals_w!(snap)[table_vsd],
+            pyre_interpreter::locals_w!(live)[table_vsd],
             sentinel,
             "ContinueRunningNormally keeps the live stack word above the table depth"
         );
-        assert_eq!(snap.last_instr, resume_py_pc as isize - 1);
+        assert_eq!(live.last_instr, resume_py_pc as isize - 1);
     }
 
     #[test]

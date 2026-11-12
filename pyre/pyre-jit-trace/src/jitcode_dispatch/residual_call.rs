@@ -579,7 +579,7 @@ impl PinnedConcretes {
 ///
 /// The call collects. Afterwards the nursery word is poison, and
 /// `gc_current_object_address` cannot recover the new address. Drop
-/// publishes the forwarded word back onto the snapshot so the next
+/// publishes the forwarded word onto `live_vable_frame_addr` so the next
 /// residual does not start from the abandoned address.
 struct LiveFrameRoot<Sym: WalkSym> {
     root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
@@ -610,14 +610,12 @@ impl<Sym: WalkSym> Drop for LiveFrameRoot<Sym> {
 /// The operand stack an abort image publishes, resolved from the walker's
 /// OpRef mirror while the walk's concrete side tables are still live.
 ///
-/// The detached tracing snapshot cannot supply it.  A root walk's
-/// `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy, so that
-/// copy's `locals_cells_stack_w` still holds the stack from before the walk
-/// ran. Walk-owned frames are stored through `own_frame_array_store_target`;
-/// the portal live frame is flushed only at nested-trace / residual
-/// boundaries. This abort image still comes from the walker mirror because
-/// the snapshot is not that live frame. The locals half has no such gap:
-/// `write_back_outer_locals` publishes those from the virtualizable shadow.
+/// A walk that stops inside a Python opcode has no other source for that
+/// stack: `write_box_at` on the live virtualizable
+/// (`initialize_virtualizable` / `read_boxes`) has not flushed mid-opcode
+/// pops, so this abort image comes from the walker mirror.
+/// The locals half has no such gap: `write_back_outer_locals` publishes
+/// those from the virtualizable shadow.
 pub(crate) struct MirrorStackImage {
     /// Python pc of the opcode the walk stopped inside.  Pairs with the slots:
     /// the mirror reflects the depth ON ENTRY to this opcode, which is the
@@ -1107,8 +1105,9 @@ macro_rules! latchdbg {
 /// Same resolution [`flush_escape_state_with_latched_stack`] performs for the
 /// escape flush, and for the same reason: the walk-abort latch and the
 /// vable-escape latch both stop inside a Python opcode, where no other source
-/// describes the operand stack.  The tracing snapshot's array is not it — a
-/// root walk mirrors nothing into that frame (see [`MirrorStackImage`]).
+/// describes the operand stack. The live virtualizable's array is not it —
+/// a root walk mirrors mid-opcode pops into the walker, not into the frame
+/// (see [`MirrorStackImage`]).
 ///
 /// A recorded concrete NULL is a REAL operand — it is `PUSH_NULL`'s
 /// `self_or_null` sentinel — so only `GcRef::NO_CONCRETE`, which is what
@@ -1725,11 +1724,9 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             return false;
         }
         // Keep the per-frame red identity seeded by `frame_box`.  The
-        // authoritative walk executed against `snapshot_for_tracing`, but the
-        // adopter validates this identity and publishes that snapshot's locals
-        // to the matching live frame before driving the blackhole. Replacing
-        // the register with the snapshot address would collapse those two
-        // identities and fail the live-root check.
+        // walk traces the live virtualizable (`initialize_virtualizable` /
+        // `read_boxes`); the adopter validates this identity before
+        // driving the blackhole.
         // `ctx` IS the root walk on this arm, so the virtualizable's boxes describe
         // the very frame whose operand stack the adopter publishes.  The MIFrame
         // resumes at a jitcode pc that may sit inside a Python opcode, after that
@@ -6744,10 +6741,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // traced, mirroring RPython's separate-state isolation.
     let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
     // The call can allocate, and a minor collection moves a nursery frame.
-    // The token object (`vable_obj_root`, the live identity) and the
-    // synchronization target (`saved_vable_heap_ptr`, the snapshot) are
-    // separate objects, and each is rooted on its own. Restore writes the
-    // forwarded snapshot address (`pyjitpl.py` holds the virtualizable in a
+    // `saved_vable_heap_ptr` is the live virtualizable
+    // (`initialize_virtualizable` / `read_boxes`). Restore writes the
+    // forwarded address (`pyjitpl.py` holds the virtualizable in a
     // box the GC traces).
     let mut saved_vable_root = Some(SavedVableRoot::push(
         saved_vable_heap_ptr.filter(|p| !p.is_null()),
@@ -7102,20 +7098,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         sym: ctx.fbw_mode.snapshot_sym as *mut Sym,
     };
     // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: "The values in
-    // the virtualizable are always correct during tracing." RPython keeps
-    // that true because `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable`
-    // call `synchronize_virtualizable` onto the real object (`write_boxes`:
-    // every static, then every array item). pyre traces a
-    // `snapshot_for_tracing` copy and `synchronize_virtualizable` writes
-    // that copy (`virtualizable_heap_ptr`), so a residual that runs Python
-    // would `extract_live` from the interpreter frame and see pre-walk
-    // statics (`last_instr`, `valuestackdepth`) and any array slot the walk
-    // had not already mirrored. Write the boxes onto the live frame at the
-    // same moment `vable_and_vrefs_before_residual_call` arms the token.
+    // the virtualizable are always correct during tracing."
+    // `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` already
+    // `write_box_at` the live object (`synchronize_virtualizable_at`).
+    // An inlined callee frame is not that object: publish its
+    // `CalleeLocalsShadow` locals region before the residual may read it.
     // Nested `bound_reached` during that residual parks without a second
     // write: `force_now` only clears the token, and `vable_after_residual_call`
-    // reloads `load_fields_from_virtualizable`. An unreadable slot declines
-    // the residual (`ResidualDecline::ValueUnavailable`) before the token
+    // reloads `load_fields_from_virtualizable`. An unpublishable callee
+    // region declines (`ResidualDecline::ValueUnavailable`) before the token
     // is armed, so a declined residual never strands TOKEN_TRACING_RESCALL.
     if !flush_live_virtualizable_before_residual_call(ctx, live_frame_root.current(live_frame)) {
         return Ok(ResidualExecOutcome::Declined(
@@ -7165,7 +7156,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
-    let mut armed_snapshot = false;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -7257,20 +7247,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
             // Upstream has one virtualizable object and one token
-            // (`vable_and_vrefs_before_residual_call`). A walk carries it as the
-            // live frame plus the tracing snapshot; a callee can force either
-            // (`f_locals` the live frame, `sys._getframe`/`_current_frames` the
-            // snapshot) → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
-            let identity = **obj as usize;
-            if let Some(snapshot_ptr) = saved_vable_root
-                .as_ref()
-                .and_then(SavedVableRoot::forwarded)
-                .or_else(|| ctx.trace_ctx.virtualizable_heap_ptr())
-                .filter(|p| !p.is_null() && *p as usize != identity)
-            {
-                info.tracing_before_residual_call(snapshot_ptr as *mut u8);
-                armed_snapshot = true;
-            }
+            // (`vable_and_vrefs_before_residual_call`). Portal/bridge walks
+            // pin that same live object (`initialize_virtualizable` /
+            // `read_boxes`); a callee that forces it
+            // (`f_locals` / `sys._getframe` / `_current_frames`)
+            // → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
         }
         Some(root_depth)
     } else {
@@ -7579,8 +7560,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
     }
-    // Restore the synchronization target (snapshot), not the token object
-    // (identity). The two are separate and each was rooted on its own.
+    // Restore `virtualizable_heap_ptr` from the rooted slot: a collection
+    // during the residual forwards the live virtualizable.
     let restored_vable_heap_ptr = saved_vable_root
         .as_ref()
         .and_then(SavedVableRoot::forwarded)
@@ -7636,18 +7617,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced_identity =
-            unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
-        let snapshot_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
-        let forced_snapshot = if armed_snapshot {
-            snapshot_ptr
-                .filter(|p| !p.is_null() && *p as usize != **obj as usize)
-                .map(|p| unsafe { info.tracing_after_residual_call(p as *mut u8) })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        let forced = forced_identity || forced_snapshot;
+        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
@@ -7975,22 +7945,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // consumes it — discard on adoption, restore when the flush is
             // not adopted.  On the cancel arm the restore is only MARKED
             // pending, so no restore has run by the time this refresh does.
-            // The reload is `load_fields_from_virtualizable()` on the object
-            // whose token the callee cleared: the live identity when
-            // `forced_identity`, otherwise the tracing snapshot. That object
+            // The reload is `load_fields_from_virtualizable()` on the live
+            // virtualizable whose token the callee cleared. That object
             // holds the callee's writes.
             if let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() {
-                let reload_ptr = if forced_identity {
-                    ctx.trace_ctx.standard_virtualizable_ptr()
-                } else if forced_snapshot {
-                    ctx.trace_ctx
-                        .virtualizable_heap_ptr()
-                        .map(|p| p as usize)
-                        .filter(|&p| p != 0)
-                } else {
-                    None
-                };
-                if let Some(ptr) = reload_ptr {
+                if forced && let Some(ptr) = ctx.trace_ctx.standard_virtualizable_ptr() {
                     ctx.trace_ctx
                         .load_fields_from_virtualizable(&info, ptr as *const u8);
                 }
@@ -8625,61 +8584,23 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Write tracing boxes onto the live virtualizable before a residual that
-/// may run Python.
+/// Publish an inlined callee's locals region before a residual that may
+/// run Python.
 ///
-/// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` assumes the
-/// real object already holds the boxes (`synchronize_virtualizable` /
-/// `write_boxes` after every `_opimpl_setfield_vable` /
-/// `_opimpl_setarrayitem_vable`). pyre's walker steps a
-/// `snapshot_for_tracing` copy and points `virtualizable_heap_ptr` at that
-/// copy, so the live interpreter frame lags until this write.
+/// The standard virtualizable is already the live object:
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` call
+/// `synchronize_virtualizable_at` (`virtualizable.py write_box_at`).
+/// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` only clears
+/// the token. An inlined callee frame is not that object; it is built
+/// with `vable_token: 0` and its locals live in `CalleeLocalsShadow`
+/// until this write (`write_boxes` of that frame).
 ///
-/// Root `setfield_vable` does not store `last_instr` / `valuestackdepth`
-/// onto the live frame (`store_live_frame_static_int` follows
-/// `current_inline_vable_target` only). Array items are mirrored on each
-/// `setarrayitem_vable` (`own_frame_array_store_target`); this write still
-/// covers every array item `0..len(lst)` (`write_boxes`) so a slot that
-/// lived only in the boxes — including above `valuestackdepth` — is not
-/// left behind. [`LiveLastInstrGuard`] then overwrites `last_instr` with
-/// the executing pc for the residual's duration.
-///
-/// Returns `false` when a declared slot is unreadable (`Void` /
-/// `NO_CONCRETE` / missing). Nothing was written; the caller declines
-/// the residual (`ResidualDecline::ValueUnavailable`).
-fn flush_live_virtualizable_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
-    if frame == 0 {
-        return true;
-    }
-    // `fbw_note_last_instr_undo` is first-write-wins and is already armed
-    // at walk start (`trace_bytecode`); noting again is a no-op that keeps
-    // the pre-walk coordinate the non-commit epilogue restores.
-    fbw_note_last_instr_undo(frame);
-    fbw_note_frame_vsd_undo(frame);
-    // Locals undo stays the `nlocals` prefix. `write_boxes` also writes
-    // cells and the whole value stack (`0..len(lst)`), including slots
-    // above `valuestackdepth`. Those stack slots are already written by
-    // `setarrayitem_vable` without a stack-region undo
-    // (`fbw_note_locals_mirror_undo` leaves that region out so rollback
-    // cannot revert a slot another walk-time write owns), and first-write
-    // wins cannot extend an earlier nlocals capture. Completing the array
-    // write here does not add undo entries: a declined walk keeps the
-    // walk's array image, matching those stores. `last_instr` and
-    // `valuestackdepth` already have first-write-wins undos; the other
-    // statics are frame identity (`pycode`, `debugdata`).
-    if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
-        fbw_note_locals_mirror_undo(frame, nlocals);
-    }
-    crate::state::flush_known_virtualizable_to_frame(ctx, frame)
-}
-
+/// Returns `false` when the shadow cannot reproduce every locals slot.
+/// The caller declines (`ResidualDecline::ValueUnavailable`).
 pub(crate) fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     live_frame: usize,
 ) -> bool {
-    if !flush_live_virtualizable_to_frame(ctx.trace_ctx, live_frame) {
-        return false;
-    }
     let callee_frame = {
         let state = ctx.frame_state.borrow();
         match state.callee_shadow.as_ref() {

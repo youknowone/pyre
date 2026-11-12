@@ -30845,8 +30845,8 @@ fn residual_preflight_declines_when_callee_locals_cannot_publish() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    // Root flush is a no-op on a zero live frame; the callee shadow is
-    // the only write this preflight has to complete.
+    // The standard virtualizable is already the live object; this
+    // preflight only publishes an inlined callee's locals region.
     assert!(
         !super::flush_live_virtualizable_before_residual_call(&mut wc, 0),
         "an unpublishable callee locals region must decline the residual"
@@ -31712,12 +31712,9 @@ fn bridge_resume_vsd_survives_first_live_step() {
         .expect("valuestackdepth is a declared static vable field");
     const RESUME_VSD: i64 = 23;
     let resume_op = tc.const_int(RESUME_VSD);
-    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-        &mut tc,
-        "valuestackdepth",
-        resume_op,
-        Value::Int(RESUME_VSD),
-    );
+    // `rebuild_state_after_failure` installs the resume box; the heap still
+    // holds the compiled-loop leftover until a `setfield_vable` writes it.
+    tc.set_virtualizable_entry_at(vsd_idx, resume_op, Value::Int(RESUME_VSD));
 
     assert_eq!(
         unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) },
@@ -33066,18 +33063,17 @@ fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
     std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
 }
 
-/// `virtualizable.py VirtualizableInfo.write_boxes` writes every static
-/// then every array item `0..len(lst)`, including slots above
-/// `valuestackdepth`. The residual flush must do the same onto the live
-/// interpreter frame.
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` write the live
+/// object immediately (`synchronize_virtualizable_at` /
+/// `write_virtualizable_heap_value_at` → `virtualizable.py write_box_at`).
+/// The residual path does not bulk-copy boxes onto that object.
 #[test]
-fn flush_known_virtualizable_writes_every_static_and_array_item() {
+fn setfield_and_setarrayitem_vable_land_on_heap_ptr_without_flush() {
     use majit_ir::{GcRef, Value};
     use pyre_interpreter::bytecode::ConstantData;
     use pyre_interpreter::locals_w_mut;
     use pyre_interpreter::{Mode, compile_source};
 
-    // Tests run in parallel so bootstrap the GIL here.
     pyre_interpreter::module::thread::ensure_runtime_thread();
     let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
         .expect("compile should succeed");
@@ -33096,8 +33092,8 @@ fn flush_known_virtualizable_writes_every_static_and_array_item() {
         .expect("frame must have locals_cells_stack_w");
     let nlocals = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
     assert!(
-        nlocals > 0 && array_len > nlocals,
-        "the fixture needs locals and stack slots above nlocals so write_boxes walks the full array"
+        nlocals > 0 && array_len > 0,
+        "the fixture needs a locals_cells_stack_w slot for setarrayitem_vable"
     );
 
     {
@@ -33111,11 +33107,10 @@ fn flush_known_virtualizable_writes_every_static_and_array_item() {
             as *mut isize;
         *last_instr = 11;
     }
-    frame.valuestackdepth = array_len;
+    frame.valuestackdepth = nlocals;
 
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let static_count = info.num_static_extra_boxes;
-    let slot_count = static_count + array_len;
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let vable = tc.const_ref(frame_ptr as i64);
     let pycode = unsafe {
@@ -33125,60 +33120,272 @@ fn flush_known_virtualizable_writes_every_static_and_array_item() {
         *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET)
             as *const usize)
     };
-    let mut boxes = Vec::with_capacity(slot_count);
-    let mut values = Vec::with_capacity(slot_count);
-    boxes.push(tc.const_int(37));
-    values.push(Value::Int(37));
-    boxes.push(tc.const_ref(pycode as i64));
-    values.push(Value::Ref(GcRef(pycode)));
-    boxes.push(tc.const_int(nlocals as i64));
-    values.push(Value::Int(nlocals as i64));
-    boxes.push(tc.const_ref(debugdata as i64));
-    values.push(Value::Ref(GcRef(debugdata)));
-    assert_eq!(boxes.len(), static_count, "PyFrame static field order");
+    let mut scalar_oprefs = Vec::with_capacity(static_count);
+    let mut input_values = Vec::with_capacity(static_count + array_len);
+    scalar_oprefs.push(tc.const_int(11));
+    input_values.push(Value::Int(11));
+    scalar_oprefs.push(tc.const_ref(pycode as i64));
+    input_values.push(Value::Ref(GcRef(pycode)));
+    scalar_oprefs.push(tc.const_int(nlocals as i64));
+    input_values.push(Value::Int(nlocals as i64));
+    scalar_oprefs.push(tc.const_ref(debugdata as i64));
+    input_values.push(Value::Ref(GcRef(debugdata)));
+    assert_eq!(
+        scalar_oprefs.len(),
+        static_count,
+        "PyFrame static field order"
+    );
+    let mut array_items = Vec::with_capacity(array_len);
     for j in 0..array_len {
-        let ptr = 0x1000 + j * 0x10;
-        boxes.push(tc.const_ref(ptr as i64));
-        values.push(Value::Ref(GcRef(ptr)));
+        let ptr = 0xBEEF0000 + j;
+        array_items.push(tc.const_ref(ptr as i64));
+        input_values.push(Value::Ref(GcRef(ptr)));
     }
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
+    crate::state::seed_virtualizable_boxes(
+        &mut tc,
         vable,
         Value::Ref(GcRef(frame_ptr)),
-        &boxes,
-        &values,
-        &[array_len],
+        &scalar_oprefs,
+        &array_items,
+        array_len,
+        &input_values,
+        frame_ptr as *const u8,
+    );
+    assert_eq!(
+        tc.virtualizable_heap_ptr().map(|ptr| ptr as usize),
+        Some(frame_ptr),
+        "the store target is the frame virtualizable_heap_ptr names"
     );
 
-    assert!(
-        crate::state::flush_known_virtualizable_to_frame(&tc, frame_ptr),
-        "every static and array item is readable, so write_boxes must complete"
-    );
+    let last_descr = info.static_field_descr(0);
+    let published_last = tc.const_int(37);
+    let _ = tc.vable_setfield_checked(false, vable, last_descr, published_last, Value::Int(37));
 
     let last_instr = unsafe {
         *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
             as *const isize)
     };
-    assert_eq!(last_instr, 37, "write_boxes writes last_instr");
     assert_eq!(
-        frame.valuestackdepth, nlocals,
-        "write_boxes writes valuestackdepth"
+        last_instr, 37,
+        "setfield_vable of last_instr must land on virtualizable_heap_ptr immediately"
+    );
+
+    let fdescr = info.array_pointer_field_descr(0);
+    let adescr = info.array_item_descr(0);
+    let index = tc.const_int(0);
+    let published_slot = tc.const_ref(0x1000);
+    let store = tc.vable_setarrayitem_checked(
+        false,
+        0,
+        vable,
+        index,
+        0,
+        fdescr,
+        adescr,
+        published_slot,
+        Value::Ref(GcRef(0x1000)),
+        false,
+    );
+    assert!(
+        matches!(store, VableArrayStore::Stored(_)),
+        "setarrayitem_vable must take the standard write_box_at arm"
     );
 
     let slots = pyre_interpreter::locals_w!(frame).as_slice();
-    for j in 0..array_len {
-        assert_eq!(
-            slots[j],
-            (0x1000 + j * 0x10) as pyre_object::PyObjectRef,
-            "write_boxes writes array item {j} of {array_len} (nlocals={nlocals}); gc_owns={}",
-            pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF)
-        );
+    assert_eq!(
+        slots[0], 0x1000 as pyre_object::PyObjectRef,
+        "setarrayitem_vable must land on virtualizable_heap_ptr immediately"
+    );
+}
+
+/// Walk-time `setarrayitem_vable` of the standard virtualizable writes the
+/// live frame exactly once, through `write_box_at` / `virtualizable_heap_ptr`.
+/// `own_frame_array_store_target`'s standard branch still names
+/// `live_vable_frame_addr`; that extra store is skipped when the vable is
+/// the standard virtualizable (`_opimpl_setarrayitem_vable`).
+#[test]
+fn setarrayitem_vable_standard_writes_heap_ptr_once() {
+    use crate::state::PyreSym;
+    use majit_ir::{GcRef, Value};
+    use pyre_interpreter::bytecode::ConstantData;
+    use pyre_interpreter::locals_w_mut;
+    use pyre_interpreter::{Mode, compile_source};
+
+    pyre_interpreter::module::thread::ensure_runtime_thread();
+    let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
+        .expect("compile should succeed");
+    let raw_code = module
+        .constants
+        .iter()
+        .find_map(|c| match c {
+            ConstantData::Code { code } => Some((**code).clone()),
+            _ => None,
+        })
+        .expect("source should contain a function body");
+    let mut live =
+        pyre_interpreter::pyframe::PyFrame::new(raw_code.clone()).expect("frame allocation");
+    live.fix_array_ptrs();
+    let mut snap = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
+    snap.fix_array_ptrs();
+    let live_ptr = (&mut *live) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let snap_ptr = (&mut *snap) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let array_len = crate::state::concrete_frame_array_len(live_ptr)
+        .expect("frame must have locals_cells_stack_w");
+    let nlocals = crate::state::concrete_nlocals(live_ptr).unwrap_or(0);
+    assert!(
+        nlocals > 0 && array_len > 0,
+        "the fixture needs a locals_cells_stack_w slot for setarrayitem_vable"
+    );
+    let sentinel = 0xBEEF0000 as pyre_object::PyObjectRef;
+    {
+        let slots = locals_w_mut!(live).as_mut_slice();
+        slots[0] = sentinel;
     }
+    {
+        let slots = locals_w_mut!(snap).as_mut_slice();
+        slots[0] = sentinel;
+    }
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let static_count = info.num_static_extra_boxes;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref]);
+    let vable = tc.const_ref(live_ptr as i64);
+    let pycode = unsafe {
+        *((live_ptr as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
+    };
+    let debugdata = unsafe {
+        *((live_ptr as *const u8).add(crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET)
+            as *const usize)
+    };
+    let mut scalar_oprefs = Vec::with_capacity(static_count);
+    let mut input_values = Vec::with_capacity(static_count + array_len);
+    scalar_oprefs.push(tc.const_int(0));
+    input_values.push(Value::Int(0));
+    scalar_oprefs.push(tc.const_ref(pycode as i64));
+    input_values.push(Value::Ref(GcRef(pycode)));
+    scalar_oprefs.push(tc.const_int(nlocals as i64));
+    input_values.push(Value::Int(nlocals as i64));
+    scalar_oprefs.push(tc.const_ref(debugdata as i64));
+    input_values.push(Value::Ref(GcRef(debugdata)));
+    assert_eq!(
+        scalar_oprefs.len(),
+        static_count,
+        "PyFrame static field order"
+    );
+    let mut array_items = Vec::with_capacity(array_len);
+    for j in 0..array_len {
+        let ptr = 0xBEEF0000 + j;
+        array_items.push(tc.const_ref(ptr as i64));
+        input_values.push(Value::Ref(GcRef(ptr)));
+    }
+    crate::state::seed_virtualizable_boxes(
+        &mut tc,
+        vable,
+        Value::Ref(GcRef(live_ptr)),
+        &scalar_oprefs,
+        &array_items,
+        array_len,
+        &input_values,
+        live_ptr as *const u8,
+    );
+    assert_eq!(
+        tc.virtualizable_heap_ptr().map(|ptr| ptr as usize),
+        Some(live_ptr),
+        "the store target is the frame virtualizable_heap_ptr names"
+    );
+    assert_eq!(
+        tc.standard_virtualizable_box(),
+        Some(vable),
+        "the walk names the standard virtualizable"
+    );
+
+    let published = 0x1000usize;
+    let value = tc.const_ref(published as i64);
+    let zero = tc.const_int(0);
+    let index = tc.const_int(0);
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+    let op = DecodedOp {
+        key: "setarrayitem_vable_r/rirdd",
+        opname: "setarrayitem_vable_r",
+        argcodes: "rirdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let regs_r = [vable, OpRef::NONE, value];
+    let regs_i = [zero, index];
+    let mut snapshot_sym = PyreSym::new_uninit(vable);
+    snapshot_sym.set_live_vable_frame_addr(snap_ptr);
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    drop(wc);
+    assert!(
+        result.is_ok(),
+        "standard setarrayitem_vable must take the write_box_at arm: {result:?}"
+    );
+    let live_slots = pyre_interpreter::locals_w!(live).as_slice();
+    let snap_slots = pyre_interpreter::locals_w!(snap).as_slice();
+    assert_eq!(
+        live_slots[0], published as pyre_object::PyObjectRef,
+        "setarrayitem_vable of the standard virtualizable writes virtualizable_heap_ptr"
+    );
+    assert_eq!(
+        snap_slots[0], sentinel,
+        "live_vable_frame_addr is not a second store target for the standard virtualizable"
+    );
+    std::hint::black_box(&mut snapshot_sym);
 }
 
 /// Walk-start FWW undo captures the whole `locals_cells_stack_w` array, so a
-/// residual flush that overwrites a value-stack slot above `nlocals` is
+/// walk-time store that overwrites a value-stack slot above `nlocals` is
 /// restored on a non-commit exit rather than meeting a restored
 /// `valuestackdepth` with later stack contents.
 #[test]
@@ -33245,258 +33452,6 @@ fn walk_start_undo_restores_value_stack_slot_above_nlocals() {
     assert_eq!(
         frame.valuestackdepth, pre_walk_vsd,
         "non-commit rollback must restore the pre-walk valuestackdepth"
-    );
-}
-
-/// `virtualizable.py VirtualizableInfo.write_boxes` unwraps the current box
-/// for every array item. `_opimpl_setarrayitem_vable` replaces
-/// `virtualizable_boxes[index]` with the stored valuebox, so after
-/// STORE_FAST `a = b` of a loop input, slot `a` holds `InputArg(b)` and
-/// flush writes `b`'s concrete into `a`. An operand-stack slot holding an
-/// InputArg of a local is written the same way.
-#[test]
-fn flush_known_virtualizable_writes_aliased_inputarg_array_items() {
-    use majit_ir::{GcRef, OpRef, Value};
-    use pyre_interpreter::bytecode::ConstantData;
-    use pyre_interpreter::locals_w_mut;
-    use pyre_interpreter::{Mode, compile_source};
-
-    let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
-        .expect("compile should succeed");
-    let raw_code = module
-        .constants
-        .iter()
-        .find_map(|c| match c {
-            ConstantData::Code { code } => Some((**code).clone()),
-            _ => None,
-        })
-        .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
-    frame.fix_array_ptrs();
-    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
-    let array_len = crate::state::concrete_frame_array_len(frame_ptr)
-        .expect("frame must have locals_cells_stack_w");
-    let nlocals = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
-    assert!(
-        nlocals >= 2 && array_len > nlocals,
-        "the fixture needs two locals (a, b) and a stack slot above nlocals"
-    );
-    let slot_a = 0usize;
-    let slot_b = 1usize;
-    let stack_slot = nlocals;
-
-    {
-        let slots = locals_w_mut!(frame).as_mut_slice();
-        for (j, slot) in slots.iter_mut().enumerate() {
-            *slot = (0xBEEF0000 + j) as pyre_object::PyObjectRef;
-        }
-    }
-    unsafe {
-        let last_instr = (frame_ptr as *mut u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-            as *mut isize;
-        *last_instr = 11;
-    }
-    frame.valuestackdepth = array_len;
-
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let static_count = info.num_static_extra_boxes;
-    let slot_count = static_count + array_len;
-    let mut tc = TraceCtx::for_test_types(&vec![Type::Ref; nlocals]);
-    let vable = tc.const_ref(frame_ptr as i64);
-    let pycode = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
-    };
-    let debugdata = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET)
-            as *const usize)
-    };
-    let mut boxes = Vec::with_capacity(slot_count);
-    let mut values = Vec::with_capacity(slot_count);
-    boxes.push(tc.const_int(37));
-    values.push(Value::Int(37));
-    boxes.push(tc.const_ref(pycode as i64));
-    values.push(Value::Ref(GcRef(pycode)));
-    boxes.push(tc.const_int(nlocals as i64));
-    values.push(Value::Int(nlocals as i64));
-    boxes.push(tc.const_ref(debugdata as i64));
-    values.push(Value::Ref(GcRef(debugdata)));
-    assert_eq!(boxes.len(), static_count, "PyFrame static field order");
-    for j in 0..array_len {
-        let live = 0xBEEF0000 + j;
-        if j < nlocals {
-            boxes.push(OpRef::input_arg_ref(j as u32));
-            values.push(Value::Ref(GcRef(live)));
-        } else {
-            boxes.push(tc.const_ref(live as i64));
-            values.push(Value::Ref(GcRef(live)));
-        }
-    }
-    // `a = b`: slot a's current box is slot b's InputArg, carrying b's word.
-    boxes[static_count + slot_a] = OpRef::input_arg_ref(slot_b as u32);
-    values[static_count + slot_a] = Value::Ref(GcRef(0xBEEF0000 + slot_b));
-    // Operand stack above the locals holds an InputArg of local b.
-    boxes[static_count + stack_slot] = OpRef::input_arg_ref(slot_b as u32);
-    values[static_count + stack_slot] = Value::Ref(GcRef(0xBEEF0000 + slot_b));
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable,
-        Value::Ref(GcRef(frame_ptr)),
-        &boxes,
-        &values,
-        &[array_len],
-    );
-
-    assert!(
-        crate::state::flush_known_virtualizable_to_frame(&tc, frame_ptr),
-        "aliased InputArg array items are readable, so write_boxes must complete"
-    );
-
-    let last_instr = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-            as *const isize)
-    };
-    assert_eq!(last_instr, 37, "write_boxes writes last_instr");
-
-    let slots = pyre_interpreter::locals_w!(frame).as_slice();
-    assert_eq!(
-        slots[slot_a],
-        (0xBEEF0000 + slot_b) as pyre_object::PyObjectRef,
-        "write_boxes writes aliased InputArg of b into slot a"
-    );
-    assert_eq!(
-        slots[stack_slot],
-        (0xBEEF0000 + slot_b) as pyre_object::PyObjectRef,
-        "write_boxes writes an operand-stack InputArg of local b"
-    );
-    for j in 0..array_len {
-        if j == slot_a || j == stack_slot {
-            continue;
-        }
-        assert_eq!(
-            slots[j],
-            (0xBEEF0000 + j) as pyre_object::PyObjectRef,
-            "unaliased array item {j} is unchanged"
-        );
-    }
-}
-
-/// An unreadable array item declines the whole write_boxes image: no
-/// static and no array slot is stored.
-#[test]
-fn flush_known_virtualizable_unreadable_array_item_leaves_frame_untouched() {
-    use majit_ir::{GcRef, Value};
-    use pyre_interpreter::bytecode::ConstantData;
-    use pyre_interpreter::locals_w_mut;
-    use pyre_interpreter::{Mode, compile_source};
-
-    pyre_interpreter::module::thread::ensure_runtime_thread();
-    let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
-        .expect("compile should succeed");
-    let raw_code = module
-        .constants
-        .iter()
-        .find_map(|c| match c {
-            ConstantData::Code { code } => Some((**code).clone()),
-            _ => None,
-        })
-        .expect("source should contain a function body");
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
-    frame.fix_array_ptrs();
-    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
-    let array_len = crate::state::concrete_frame_array_len(frame_ptr)
-        .expect("frame must have locals_cells_stack_w");
-    let nlocals = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
-    assert!(
-        nlocals > 0 && array_len > nlocals,
-        "the fixture needs locals and stack slots above nlocals so write_boxes walks the full array"
-    );
-
-    {
-        let slots = locals_w_mut!(frame).as_mut_slice();
-        for (j, slot) in slots.iter_mut().enumerate() {
-            *slot = (0xBEEF0000 + j) as pyre_object::PyObjectRef;
-        }
-    }
-    unsafe {
-        let last_instr = (frame_ptr as *mut u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-            as *mut isize;
-        *last_instr = 11;
-    }
-    frame.valuestackdepth = array_len;
-
-    let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let static_count = info.num_static_extra_boxes;
-    let slot_count = static_count + array_len;
-    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let vable = tc.const_ref(frame_ptr as i64);
-    let pycode = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
-    };
-    let debugdata = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET)
-            as *const usize)
-    };
-    let mut boxes = Vec::with_capacity(slot_count);
-    let mut values = Vec::with_capacity(slot_count);
-    boxes.push(tc.const_int(37));
-    values.push(Value::Int(37));
-    boxes.push(tc.const_ref(pycode as i64));
-    values.push(Value::Ref(GcRef(pycode)));
-    boxes.push(tc.const_int(nlocals as i64));
-    values.push(Value::Int(nlocals as i64));
-    boxes.push(tc.const_ref(debugdata as i64));
-    values.push(Value::Ref(GcRef(debugdata)));
-    assert_eq!(boxes.len(), static_count, "PyFrame static field order");
-    for j in 0..array_len {
-        let ptr = 0x1000 + j * 0x10;
-        boxes.push(tc.const_ref(ptr as i64));
-        values.push(Value::Ref(GcRef(ptr)));
-    }
-    tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable,
-        Value::Ref(GcRef(frame_ptr)),
-        &boxes,
-        &values,
-        &[array_len],
-    );
-    let unreadable = static_count;
-    // A non-constant box stamped Void has no runtime concrete
-    // (`box_runtime_concrete` filters Void / NO_CONCRETE), and this
-    // fixture has no heap fallback, so `virtualizable_entry_at` is None.
-    tc.set_virtualizable_entry_at(unreadable, OpRef::input_arg_ref(0), Value::Void);
-
-    let last_instr_before = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-            as *const isize)
-    };
-    let vsd_before = frame.valuestackdepth;
-    let slots_before = pyre_interpreter::locals_w!(frame).as_slice().to_vec();
-
-    assert!(
-        !crate::state::flush_known_virtualizable_to_frame(&tc, frame_ptr),
-        "one unreadable array item must decline the whole write"
-    );
-
-    let last_instr_after = unsafe {
-        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-            as *const isize)
-    };
-    assert_eq!(
-        last_instr_after, last_instr_before,
-        "a declined write_boxes must leave last_instr unchanged"
-    );
-    assert_eq!(
-        frame.valuestackdepth, vsd_before,
-        "a declined write_boxes must leave valuestackdepth unchanged"
-    );
-    let slots_after = pyre_interpreter::locals_w!(frame).as_slice();
-    assert_eq!(
-        slots_after,
-        slots_before.as_slice(),
-        "a declined write_boxes must leave every array slot unchanged"
     );
 }
 

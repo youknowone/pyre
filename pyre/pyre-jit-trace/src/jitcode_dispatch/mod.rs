@@ -2805,8 +2805,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
         }
         // The executing inline frame's `f_back` is still on this trace. When
         // that caller is the loop portal, its locals are the virtualizable
-        // boxes even if the traceback names the live object and the vable
-        // cell names the snapshot copy.
+        // boxes (`initialize_virtualizable` / `read_boxes`).
         let inline = current_inline_concrete_frame();
         if inline != 0 && concrete != 0 {
             let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };

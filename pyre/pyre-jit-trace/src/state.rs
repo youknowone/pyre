@@ -1650,6 +1650,28 @@ pub(crate) fn seed_virtualizable_boxes(
     // can mirror their shadow updates into the live virtualizable.  Pass
     // a null pointer to disable (unit-test / init-before-run path).
     ctx.set_virtualizable_heap_ptr(heap_ptr);
+    // Reserved tail / overlay holes are a shared Const NULL OpRef, not extra
+    // InputArgs (`load_list_of_boxes` length is the heap array). A Const
+    // box's concrete is NULL (`try_set_opref_concrete` does not stamp a
+    // Const), so `write_box_at` of that slot is NULL. `synchronize_virtualizable_at`
+    // is that write; without it the live array keeps a leftover word.
+    if !heap_ptr.is_null() {
+        for j in 0..array_len {
+            let index = expected_scalars + j;
+            let Some(opref) = ctx.virtualizable_box_at(index) else {
+                continue;
+            };
+            if !opref.is_constant() {
+                continue;
+            }
+            if matches!(
+                ctx.virtualizable_entry_at(index),
+                Some((_, majit_ir::Value::Ref(r))) if r.is_null()
+            ) {
+                ctx.synchronize_virtualizable_at(index);
+            }
+        }
+    }
 }
 
 /// `pyjitpl.py rebuild_state_after_failure` trailing
@@ -2886,20 +2908,14 @@ pub struct PyreSym {
     concrete_vable_raw: *mut u8,
     /// Forwards [`Self::concrete_vable_raw`] across a minor.
     ///
-    /// The tracing snapshot (`snapshot_for_tracing`) is a GC-owned nursery
-    /// frame, and the walk runs residual calls concretely, so a minor moves
-    /// it while this field still names the old copy.  Once the nursery is
-    /// reused, a read through the raw word lands on a new occupant.
+    /// The tracing virtualizable can be a GC-owned nursery frame, and the
+    /// walk runs residual calls concretely, so a minor moves it while this
+    /// field still names the old copy.  Once the nursery is reused, a read
+    /// through the raw word lands on a new occupant.
     concrete_vable_root: LiveVableFrameRoot,
-    /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
-    /// snapshot, or 0 when tracing runs without one (tests).
-    /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
-    /// `debugdata` is an owned clone freed when the snapshot drops;
-    /// vable-statics capture (`flush_to_frame`) reads that pointer-valued
-    /// field from this frame so the trace's resume data never carries a
-    /// snapshot-owned pointer. RPython has no snapshot —
-    /// `read_boxes` (virtualizable.py) always reads the live
-    /// virtualizable, which is what this field restores.
+    /// Live interpreter-owned virtualizable `PyFrame`, or 0 when tracing
+    /// runs without one (tests). `pyjitpl.py` `initialize_virtualizable` /
+    /// `virtualizable.py` `read_boxes` read this same object.
     pub(crate) live_vable_frame_addr: usize,
     /// Forwards [`Self::live_vable_frame_addr`] across a minor.
     ///
@@ -2969,7 +2985,8 @@ pub trait WalkSym {
     fn set_valuestackdepth(&mut self, value: usize);
     fn jitcode(&self) -> *const JitCode;
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
-    /// Interpreter-frame snapshot the authoritative walker steps concretely.
+    /// Concrete virtualizable the walker steps (`pyjitpl.py`
+    /// `initialize_virtualizable` / `virtualizable.py` `read_boxes`).
     fn tracing_vable_frame_addr(&self) -> usize;
     fn live_vable_frame_addr(&self) -> usize;
     fn set_live_vable_frame_addr(&mut self, value: usize);
@@ -5268,16 +5285,12 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
 }
 
 /// Write the absolute valuestackdepth into the concrete `PyFrame` at
-/// `frame`. The trait `interpret()` leg traces on a heap snapshot that
-/// is never concretely stepped (`trace.rs` KNOWN DIVERGENCE), so a
-/// multi-frame bridge's snapshot keeps the `valuestackdepth` it was
-/// reconstructed with (the guard-failure resume depth, mid-iteration).
-/// The symbolic walk DOES track the live depth (`push_typed_value` /
+/// `frame`. The walker tracks the live depth (`push_typed_value` /
 /// `pop_value`). At the loop-header close the back-edge depth is the
-/// loop-header invariant — the live symbolic value — so syncing the
-/// snapshot here lets `concrete_valuestackdepth()` (the reader
-/// `close_loop_args_at` trusts, matching RPython reading the single real
-/// frame) report the merge-point depth instead of the stale seed.
+/// loop-header invariant — the live symbolic value — so writing it here
+/// lets `concrete_valuestackdepth()` (the reader `close_loop_args_at`
+/// trusts, matching RPython reading the single real frame) report the
+/// merge-point depth.
 pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
     if frame != 0 {
         let frame = majit_gc::gc_current_object_address(frame);
@@ -5980,120 +5993,6 @@ pub(crate) fn concrete_frame_local_is_writable(value: &Value) -> bool {
     !matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE)
 }
 
-/// Write every static field then every array item `0..len(lst)` onto `frame`.
-/// Returns whether the whole image was stored.
-///
-/// `virtualizable.py VirtualizableInfo.write_boxes` walks `unroll_static_fields`
-/// then each array's items `for j in range(len(lst))`, unwrapping the current
-/// box. `_opimpl_setarrayitem_vable` (`pyjitpl.py`) replaces
-/// `virtualizable_boxes[index]` with the stored valuebox, so an aliased
-/// `AbstractInputArg` (STORE_FAST `a = b` of a loop input) is written into
-/// slot `a`. `pyjitpl.py MetaInterp.synchronize_virtualizable` is the caller
-/// of that write. pyre's `synchronize_virtualizable` targets
-/// `virtualizable_heap_ptr` (the `snapshot_for_tracing` copy;
-/// `TraceCtx::standard_virtualizable_ptr` is the live identity), so the
-/// interpreter frame lags until this write.
-/// `setarrayitem_vable` already mirrors array items onto the live frame
-/// (`own_frame_array_store_target` → `store_live_frame_array_slot`); this
-/// write still covers every slot, including those above `valuestackdepth`
-/// (`pyframe.py popvalue` stores None there). `write_boxes` unwraps every
-/// box, including an InputArg. A missing entry, `Void`, or `NO_CONCRETE`
-/// declines the whole write so the frame is left untouched.
-pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) -> bool {
-    if frame == 0 {
-        return false;
-    }
-    let Some(info) = ctx.virtualizable_info() else {
-        return false;
-    };
-    let Some(len) = concrete_frame_array_len(frame) else {
-        return false;
-    };
-    let static_count = info.num_static_extra_boxes;
-    let base = static_count;
-    for index in 0..static_count {
-        if !known_vable_slot_is_readable(ctx, index) {
-            return false;
-        }
-    }
-    for j in 0..len {
-        if !known_vable_slot_is_readable(ctx, base + j) {
-            return false;
-        }
-    }
-    for index in 0..static_count {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(index) else {
-            return false;
-        };
-        let Some(bits) = known_vable_bits(&value) else {
-            return false;
-        };
-        match info.static_fields.get(index).map(|field| field.field_type) {
-            Some(Type::Int) => store_live_frame_static_int(frame, index, bits),
-            _ => unsafe {
-                info.write_field(frame as *mut u8, index, bits);
-            },
-        }
-        frame = pyre_object::gc_hook::try_gc_current_object_address(
-            frame as pyre_object::gc_hook::GCREF,
-        ) as usize;
-        if frame == 0 {
-            return false;
-        }
-    }
-    for j in 0..len {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + j) else {
-            return false;
-        };
-        if known_vable_bits(&value).is_none() {
-            return false;
-        }
-        frame = pyre_object::gc_hook::try_gc_current_object_address(
-            frame as pyre_object::gc_hook::GCREF,
-        ) as usize;
-        if frame == 0 {
-            return false;
-        }
-        // GCREF array items (`write_boxes` unwrap + setarrayitem) are
-        // already boxed; `store_live_frame_array_slot` is the same
-        // store `setarrayitem_vable` uses. Int/Float still box, and
-        // boxing can move a nursery frame — take the returned address.
-        match &value {
-            Value::Ref(_) => store_live_frame_array_slot(frame, j, value),
-            _ => {
-                if let Some(frame_now) = store_boxed_frame_local(frame, j, &value) {
-                    frame = frame_now;
-                }
-            }
-        }
-    }
-    true
-}
-
-fn known_vable_slot_is_readable(ctx: &TraceCtx, index: usize) -> bool {
-    match ctx.virtualizable_entry_at(index) {
-        Some((_, value)) => known_vable_bits(&value).is_some(),
-        None => false,
-    }
-}
-
-fn known_vable_bits(value: &Value) -> Option<i64> {
-    match value {
-        Value::Void => None,
-        Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE => None,
-        Value::Int(v) => Some(*v),
-        Value::Float(f) => Some(f.to_bits() as i64),
-        Value::Ref(r) => Some(r.as_usize() as i64),
-    }
-}
-
-/// Boxing an Int/Float local allocates. Pin the slot first
-/// (`store_pinned_frame_locals`) so a minor cannot leave a from-space
-/// shadow word.
-fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
-    store_pinned_frame_locals(frame, &[(abs, *value)])
-}
-
 /// One shadow slot held across a boxing loop.
 ///
 /// `Ref` pins are owner-roots for the whole loop. `w_int_new` and
@@ -6314,7 +6213,7 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     // `flush_walk_end_state_after_outer_call` still calls
     // `write_back_outer_locals` after the callee returns. Prove that publish
     // target here so the only remaining post-run failure is
-    // `store_boxed_frame_local` after a collection moved the outer frame to
+    // `store_pinned_frame_locals` after a collection moved the outer frame to
     // an address the GC no longer owns — that case commits AfterApplied
     // rather than replaying.
     can_write_back_outer_locals(ctx, frame)
@@ -6382,17 +6281,16 @@ pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
 }
 
-/// The active operand-stack half of a tracer snapshot that must be published
-/// to its live virtualizable before an overlong trace is continued in the
-/// blackhole.
+/// The active operand-stack half that must be published to the live
+/// virtualizable before an overlong trace is continued in the blackhole.
 ///
 /// RPython has no separate copy step here: `convert_and_run_from_pyjitpl`
 /// copies the already-advanced MIFrame, whose red virtualizable is the one
-/// frame object carrying that call's locals and stack.  Pyre concretely steps
-/// a detached `snapshot_for_tracing`, so the corresponding state has to cross
-/// back to that same live frame explicitly.  The raw Ref words are exposed as
-/// a mutable slice because publishing locals can allocate; callers root the
-/// slice so nursery forwarding is reflected before the stack is stored.
+/// frame object carrying that call's locals and stack. Portal/bridge walks
+/// trace that same live object (`initialize_virtualizable` / `read_boxes`).
+/// The raw Ref words are exposed as a mutable slice because publishing
+/// locals can allocate; callers root the slice so nursery forwarding is
+/// reflected before the stack is stored.
 pub(crate) struct CapturedFrameStack {
     stack_base: usize,
     scalars: FrameScalars,
@@ -6454,7 +6352,7 @@ pub(crate) fn can_publish_frame_stack(snapshot: usize, live_frame: usize) -> boo
     frame_stack_transfer_shape(snapshot, live_frame).is_some()
 }
 
-/// Copy the tracer snapshot's active operand stack into a rootable carrier.
+/// Copy the live virtualizable's active operand stack into a rootable carrier.
 /// The destination is checked at capture time and checked again at commit, so
 /// no partial stack is ever published if frame identity or layout changes.
 pub(crate) fn capture_frame_stack_for_publish(
@@ -6475,15 +6373,14 @@ pub(crate) fn capture_frame_stack_for_publish(
 }
 
 /// Build the same carrier from the walker's operand-stack MIRROR instead of
-/// the tracing snapshot's slot array.
+/// the live virtualizable's slot array.
 ///
-/// [`capture_frame_stack_for_publish`] reads the detached snapshot frame.
-/// `virtualizable_heap_ptr` names that copy, so its array still holds the
-/// pre-walk stack; publishing it would resume the blackhole on a stack from
-/// before the walk ran. Walk-owned frames store through
-/// `own_frame_array_store_target`; the portal live frame is flushed at
-/// nested-trace / residual boundaries. Locals are unaffected —
-/// `write_back_outer_locals` takes those from the virtualizable shadow.
+/// [`capture_frame_stack_for_publish`] reads the walk's concrete frame, which
+/// is the live virtualizable. Walk-owned inlined callees store through
+/// `own_frame_array_store_target`; the portal live frame is the
+/// `virtualizable_heap_ptr` object `write_box_at` already wrote.
+/// Locals are unaffected — `write_back_outer_locals` takes those from
+/// the virtualizable shadow.
 ///
 /// The walker's opcode-entry mirror pairs with `last_instr = py_pc - 1`,
 /// the same coordinate [`flush_walk_end_state_to_frame_with_full_stack`]
@@ -7610,7 +7507,7 @@ impl PyreSym {
             // virtualizable.py read_boxes iterates `len(lst)` — the heap
             // array, not the live valuestackdepth window. Prefer the live
             // interpreter frame (the compiled loop's object), then the
-            // tracing snapshot, then jitcode metadata. Never shrink below
+            // walk's concrete virtualizable, then jitcode metadata. Never shrink below
             // an already-seeded `initialize_virtualizable` layout: that
             // length is the LABEL `inputarg_types`, and a shorter re-seed
             // made the walker JUMP one box short of it.
@@ -7675,8 +7572,8 @@ impl PyreSym {
                         // the tagged `CastPtrToInt`+`IntAnd` arm. The runtime
                         // (`execute_assembler`) converts the live frame's local
                         // slots to heap boxes before the compiled loop reads them;
-                        // the tracer works on a `snapshot_for_tracing` copy whose
-                        // slots are still tagged, so the same conversion must run
+                        // the tracer reads the same live slots, which can still
+                        // hold tagged immediates, so the same conversion must run
                         // here at record time. Only the locals region is converted
                         // (cells/free vars and stack temps stay untouched).
                         if pyre_object::tagged_int::CAN_BE_TAGGED
@@ -7698,14 +7595,11 @@ impl PyreSym {
                     values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
                 }
                 // Bake the virtualizable identity against the
-                // LIVE interpreter frame (the frame the compiled loop runs on),
-                // not the discarded `snapshot_for_tracing` copy.  At root entry
-                // the snapshot is a fresh copy so its field VALUES equal the
-                // live frame's (read_boxes above); only the identity ADDRESS
-                // must be the live one, matching the SYM_FRAME_IDX input arg's
-                // runtime value (the live frame supplied by extract_live_values).
-                // Falls back to the snapshot address when no live frame was
-                // threaded (unit-test / init-before-run path).
+                // LIVE interpreter frame (the frame the compiled loop runs on).
+                // `read_boxes` above already ran on that object
+                // (`pyjitpl.py` `initialize_virtualizable`). Falls back to
+                // `concrete_frame` when no live frame was threaded
+                // (unit-test / init-before-run path).
                 let vable_identity_addr = {
                     let live = self.current_live_vable_frame();
                     if live != 0 { live } else { concrete_frame }
@@ -14387,21 +14281,18 @@ mod tests {
 
         let code = compile_function_body("def f(xs):\n    for x in xs:\n        pass\n");
         let mut live = PyFrame::new(code).expect("frame allocation");
-        let mut snapshot = live.snapshot_for_tracing().expect("frame allocation");
-        let stack_base = snapshot.stack_base();
+        let stack_base = live.stack_base();
         let iterator = pyre_object::w_none();
         let item = pyre_object::w_bool_from(true);
-        snapshot.push(iterator);
-        snapshot.push(item);
-        snapshot.last_instr = 37;
+        live.push(iterator);
+        live.push(item);
+        live.last_instr = 37;
 
-        let snapshot_addr = (&mut *snapshot) as *mut PyFrame as usize;
         let live_addr = (&mut *live) as *mut PyFrame as usize;
-        assert_eq!(live.valuestackdepth, stack_base);
-        assert!(can_publish_frame_stack(snapshot_addr, live_addr));
+        assert!(can_publish_frame_stack(live_addr, live_addr));
 
-        let mut captured = capture_frame_stack_for_publish(snapshot_addr, live_addr)
-            .expect("matching snapshot/live frame shapes must be capturable");
+        let mut captured = capture_frame_stack_for_publish(live_addr, live_addr)
+            .expect("the live virtualizable's stack must be capturable");
         assert_eq!(captured.stack_base, stack_base);
         assert_eq!(captured.scalars.valuestackdepth, stack_base + 2);
         assert_eq!(captured.scalars.last_instr, 37);
@@ -14409,8 +14300,7 @@ mod tests {
 
         // The adoption path roots this slice while publishing locals. Model a
         // moving collection forwarding both active FOR_ITER stack values and
-        // prove that publication reads the updated roots, not the stale raw
-        // words still held by the detached tracing snapshot.
+        // prove that publication reads the updated roots.
         let forwarded_iterator = pyre_object::w_bool_from(false);
         let forwarded_item = pyre_object::w_none();
         captured.roots_mut()[0] = forwarded_iterator as i64;
@@ -14421,8 +14311,6 @@ mod tests {
         assert_eq!(live.last_instr, 37);
         assert_eq!(locals_w!(live)[stack_base], forwarded_iterator);
         assert_eq!(locals_w!(live)[stack_base + 1], forwarded_item);
-        assert_eq!(locals_w!(snapshot)[stack_base], iterator);
-        assert_eq!(locals_w!(snapshot)[stack_base + 1], item);
     }
 
     fn contains_instruction(code: &CodeObject, predicate: impl Fn(Instruction) -> bool) -> bool {

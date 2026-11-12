@@ -1064,11 +1064,12 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
         }
     }
     // Standard virtualizable: `_opimpl_setarrayitem_vable` +
-    // `synchronize_virtualizable` write the real object. pyre's
-    // `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy
-    // (abort-safety), so the live interpreter frame would otherwise lag
-    // until a residual flush. Nested `compile_and_run_once` reads that
-    // live frame (`warmstate.py bound_reached`).
+    // `synchronize_virtualizable` write the live object
+    // (`virtualizable.py` `write_box_at`). This branch still names that
+    // object so ordinary `setfield_gc` of non-vable fields
+    // (`heapcache_ops`) can execute. The extra `store_live_frame_*` in
+    // `setfield_vable` / `setarrayitem_vable` skips this object; those
+    // writes already went through `write_box_at`.
     if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
         let sym = ctx.fbw_mode.snapshot_sym;
         if !sym.is_null() {
@@ -1154,8 +1155,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `_opimpl_setfield_vable` (`pyjitpl.py`) takes
     // `_nonstandard_virtualizable` first. The standard arm assigns
     // `virtualizable_boxes[index] = valuebox` then
-    // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
-    // Int statics of the walk's own frame through
+    // `synchronize_virtualizable_at` → `write_box_at`. An inlined
+    // callee / reconstructed `callee_shadow` is a second object, so
+    // pyre also writes its Int statics through
     // `own_frame_array_store_target` + `store_live_frame_static_int`.
     // A nonstandard store records `setfield_gc` only
     // (`vable_setfield_checked`); that arm does not unwrap the box.
@@ -1183,17 +1185,20 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // its blackhole-resume image. `_opimpl_setfield_gc_any` executes the
     // store (`execute_and_record` → `cpu.bh_setfield_gc`); pyre records
     // only, so the live `last_instr` / `valuestackdepth` write uses the same
-    // own-frame target as `setarrayitem_vable` (published inline frame,
-    // reconstructed `callee_shadow`, or the standard virtualizable).
+    // own-frame target as `setarrayitem_vable` (published inline frame or
+    // reconstructed `callee_shadow`). The standard virtualizable already
+    // landed through `write_box_at`; do not store it a second time.
     if let (Some(frame), Value::Int(value), Some(field_index)) = (
         own_frame_array_store_target(ctx, obj),
         captured,
         inline_field_index,
     ) {
-        if let Some(frame) = durable_resume_frame(ctx, frame) {
-            fbw_arm_durable_frame_undo(frame);
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
+            crate::state::store_live_frame_static_int(frame, field_index, value);
         }
-        crate::state::store_live_frame_static_int(frame, field_index, value);
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1263,10 +1268,12 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     if let (Some(frame), Some(field_index)) =
         (own_frame_array_store_target(ctx, obj), inline_field_index)
     {
-        if let Some(frame) = durable_resume_frame(ctx, frame) {
-            fbw_arm_durable_frame_undo(frame);
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
+            crate::state::store_live_frame_static_int(frame, field_index, imm);
         }
-        crate::state::store_live_frame_static_int(frame, field_index, imm);
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1892,8 +1899,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) takes
     // `_nonstandard_virtualizable` first. The standard arm assigns
     // `virtualizable_boxes[index] = valuebox` then
-    // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
-    // the walk's own frame through `store_live_frame_array_slot` when
+    // `synchronize_virtualizable_at` → `write_box_at`. An inlined
+    // callee / reconstructed `callee_shadow` is a second object, so
+    // pyre also writes it through `store_live_frame_array_slot` when
     // `own_frame_array_store_target` hits. A nonstandard store with no
     // own-frame target records `getfield_gc_r` + `setarrayitem_gc` only
     // (`vable_setarrayitem_impl`).
@@ -1943,7 +1951,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     };
     if index_value >= 0
         && let Some(frame) = own_frame_array_store_target(ctx, vable)
+        && ctx.trace_ctx.standard_virtualizable_box() != Some(vable)
     {
+        // Standard virtualizable already landed through `write_box_at`.
+        // Extra store is the inlined-callee / `callee_shadow` object.
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
         }
