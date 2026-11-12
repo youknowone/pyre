@@ -1394,11 +1394,9 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     if current_inline_concrete_frame() != 0 {
         return Some((frame_box, residual_call::inline_callee_py_pc(ctx, op_pc)?));
     }
-    // A portal walk that has not seeded a current opcode declines rather
-    // than answering with a `last_instr` left at the merge point.
-    if !ctx.vstack_valid {
-        return None;
-    }
+    // `dispatch_bytecode` writes `last_instr` before the opcode body;
+    // `_opimpl_setfield_vable` keeps the virtualizable box equal. A missing
+    // box means this portal has no current opcode.
     Some((
         frame_box,
         residual_call::portal_vable_last_instr_py_pc(ctx)?,

@@ -1048,7 +1048,6 @@ macro_rules! latchdbg {
 pub(crate) fn capture_vable_shadow_stack_image<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable_frame: usize,
-    py_pc: usize,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
     let (Some(valuestackdepth), Some(last_instr)) = latched_vable_scalars(ctx) else {
@@ -1081,7 +1080,10 @@ pub(crate) fn capture_vable_shadow_stack_image<Sym: WalkSym>(
         }
     }
     Some(MirrorStackImage {
-        py_pc,
+        // Diagnostic only (`capture_for` publishes `last_instr`). The
+        // executing coordinate is the virtualizable static
+        // `dispatch_bytecode` wrote (`_opimpl_setfield_vable`).
+        py_pc: usize::try_from(last_instr).unwrap_or(0),
         slots,
         valuestackdepth: Some(valuestackdepth),
         last_instr: Some(last_instr),
@@ -1247,7 +1249,9 @@ fn capture_root_vable_stack_image<Sym: WalkSym>(
             ) as usize
         }
     };
-    capture_vable_shadow_stack_image(ctx, vable_frame, resume_py_pc, origin)
+    let mut image = capture_vable_shadow_stack_image(ctx, vable_frame, origin)?;
+    image.py_pc = resume_py_pc;
+    Some(image)
 }
 
 /// Runtime `JitCode` for a translated helper at `MetaInterpStaticData.jitcodes[index]`.
@@ -1622,12 +1626,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // opcode's pops; `synchronize_virtualizable` (`pyjitpl.py`) hands the
         // blackhole the virtualizable as it stands there, so the stack comes from
         // those boxes, not from an opcode-entry reconstruction.
-        let mirror_stack = capture_vable_shadow_stack_image(
-            ctx,
-            vable_frame,
-            ctx.vstack_cur_pypc as usize,
-            origin,
-        );
+        let mirror_stack = capture_vable_shadow_stack_image(ctx, vable_frame, origin);
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[latch-accept] origin={origin} single-frame pc={} jitcode={:?} index={:?}",
@@ -3728,11 +3727,8 @@ impl LiveLastInstrGuard {
     fn enter(live_frame: usize, py_pc: u32, inline_py_pc: Option<u32>) -> Option<Self> {
         let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         // The frame and the pc have to name the same code.  Retargeting the
-        // frame to the callee while keeping the outer walk's `vstack_cur_pypc`
-        // publishes a pc from the CALLER's code onto the callee's frame — and
-        // for a sub-walk that mirror is never advanced (`vstack_valid` is
-        // false), so the published value is a constant 0 and a frame reader
-        // inside the callee reports the function's first line.
+        // frame to the callee while keeping the caller's executing pc
+        // publishes a pc from the CALLER's code onto the callee's frame.
         let (frame, py_pc) = match (inline.is_null(), inline_py_pc) {
             (false, Some(callee_pc)) => (inline, callee_pc),
             (false, None) => (inline, py_pc),
@@ -6418,13 +6414,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
     // accounting so an escaping residual later in the same body does not
     // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
-    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
-    // the PREVIOUS opcode), so at this residual it names the opcode being
-    // walked.  `inflight_foriter_body_pc` is `semantic_fallthrough_pc` of the
+    // The store's executing Python pc is the jitcode pc of this residual
+    // mapped through the live MIFrame (`walk_executing_py_pc`).
+    // `inflight_foriter_body_pc` is `semantic_fallthrough_pc` of the
     // owning `FOR_ITER` (`handle_jit_marker__jit_merge_point` only at
     // instruction starts), so the loop-var store is the opcode at `body_pc`.
-    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
+    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper, op_pc);
     // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
     // alone counts it.  The slot it writes exists only to keep a propagating
     // exception rooted for the collector — nothing reads it back as a value —
@@ -6536,8 +6531,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         }
         ctx.trace_ctx.vrefs_before_residual_call();
     }
-    // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
-    // the outer walk's mirror and a sub-walk never advances it.
+    // Resolved against the callee's OWN metadata; a callee jit_pc has no
+    // meaning in the outer jitcode's py_pc tables.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
@@ -6547,34 +6542,19 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // the executing line rather than the one the last resume point left
         // behind.
         //
-        // Only while the pc indexes the walk's own virtualizable.  Inside an
-        // inline sub-walk `vstack_cur_pypc` is in the CALLEE's code, and both
-        // halves below name the outer frame, so publishing there stamps a
-        // foreign pc onto it — `offset2lineno` then resolves it against the
-        // outer code object and reports whatever line that byte happens to sit
-        // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
+        // Only while the pc indexes the walk's own virtualizable.  An inline
+        // sub-walk's executing pc is in the CALLEE's code, and both halves
+        // below name the outer frame, so publishing there stamps a foreign pc
+        // onto it — `offset2lineno` then resolves it against the outer code
+        // object and reports whatever line that byte happens to sit on.
+        // [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
-            // A transparent helper is not a Python frame: its
-            // `vstack_cur_pypc` stays 0.  Publish the CALL-site opcode
-            // instead of writing last_instr=0 over the portal coordinate.
-            let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
-                ctx.fbw_mode
-                    .inline_caller_py_pc
-                    .unwrap_or(ctx.vstack_cur_pypc)
-            } else if !ctx.fbw_mode.inline_subwalk {
-                // The dispatch's trace callback runs before the opcode's
-                // stack mirror advances. Publish its own JitCode coordinate,
-                // as LiveLastInstrGuard does for the heap half below.
-                // Otherwise a force in the callback writes the previous
-                // opcode back over the executing last_instr.
-                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
-            } else {
-                ctx.vstack_cur_pypc
-            };
-            if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
-                // Keep the last portal store rather than clobber it with 0.
-            } else {
+            // A transparent helper is not a Python frame. Publish the CALL-site
+            // opcode instead of writing last_instr=0 over the portal coordinate.
+            if let Some(py_pc) = portal_residual_last_instr_py_pc(ctx, op_pc)
+                && !(ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0)
+            {
                 let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
                 // Scope the box half to the residual just as
                 // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
@@ -6794,16 +6774,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         let portal_frame_chain = portal_call_frame
             .and_then(|(frame, vref)| Some((concrete_ref(ctx, frame)?, concrete_ref(ctx, vref)?)))
             .and_then(|(frame, vref)| ResidualFrameChainGuard::enter_chain_only(frame, vref));
-        let live_py_pc = if ctx.fbw_mode.inline_subwalk {
-            ctx.vstack_cur_pypc
-        } else {
-            live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
-        };
-        let _callee_last_instr = LiveLastInstrGuard::enter(
-            live_frame_root.current(live_frame),
-            live_py_pc,
-            inline_callee_pc,
-        );
+        let live_py_pc = walk_executing_py_pc(ctx, op_pc);
+        let _callee_last_instr = live_py_pc.and_then(|py_pc| {
+            LiveLastInstrGuard::enter(live_frame_root.current(live_frame), py_pc, inline_callee_pc)
+        });
         let _caller_last_instr = ctx.fbw_mode.inline_caller_py_pc.map(|py_pc| {
             LiveLastInstrGuard::enter_frame(
                 live_frame_root.current(live_frame) as *mut pyre_interpreter::PyFrame,
@@ -8043,6 +8017,43 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
     Some(executing_py_pc(&jc.payload, jit_pc))
 }
 
+/// Python pc of the opcode this walk's current MIFrame is executing at
+/// `jit_pc`. An inlined Python callee uses that body's metadata
+/// (`inline_callee_py_pc`); the portal uses the snapshot symbol. A helper
+/// jitcode has no Python pc. `inline_subwalk` is not the discriminator:
+/// `run_orthodox_helper_subwalk` sets it on the parent before the child
+/// helper context is built.
+pub(super) fn walk_executing_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
+    if ctx.inline_callee_consts.is_some() {
+        return inline_callee_py_pc(ctx, jit_pc);
+    }
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return None;
+    }
+    live_py_pc_from_snapshot(ctx, jit_pc)
+}
+
+/// Python pc published onto the portal virtualizable for a residual that
+/// hands that frame to Python (`current_inline_concrete_frame()==0`).
+/// A sub-walk's executing pc is in the callee; the portal stays at the
+/// CALL that entered this level (`inline_caller_py_pc`) or the vable
+/// `last_instr` `dispatch_bytecode` already wrote.
+fn portal_residual_last_instr_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
+    if ctx.fbw_mode.inline_subwalk {
+        ctx.fbw_mode
+            .inline_caller_py_pc
+            .or_else(|| portal_vable_last_instr_py_pc(ctx))
+    } else {
+        live_py_pc_from_snapshot(ctx, jit_pc)
+    }
+}
+
 fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) -> u32 {
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
@@ -8628,19 +8639,18 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
 /// `_find_nearby_operation(+1)` requires that guard at +1. The matching
 /// shadow write stays in `try_execute_residual_call_via_executor` so the
 /// pre-residual merge-point box can still be restored after the call.
-fn record_portal_last_instr_before_residual_call<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+fn record_portal_last_instr_before_residual_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
     if current_inline_concrete_frame() != 0 {
         return;
     }
     let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box() else {
         return;
     };
-    let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
-        ctx.fbw_mode
-            .inline_caller_py_pc
-            .unwrap_or(ctx.vstack_cur_pypc)
-    } else {
-        ctx.vstack_cur_pypc
+    let Some(py_pc) = portal_residual_last_instr_py_pc(ctx, jit_pc) else {
+        return;
     };
     if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
         return;
@@ -8660,7 +8670,7 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     jit_pc: usize,
 ) {
     record_and_publish_inline_callee_last_instr(ctx, jit_pc);
-    record_portal_last_instr_before_residual_call(ctx);
+    record_portal_last_instr_before_residual_call(ctx, jit_pc);
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -8912,12 +8922,14 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 fn is_loop_var_binding_store<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     helper: majit_ir::RuntimeHelperKind,
+    op_pc: usize,
 ) -> bool {
     matches!(
         helper,
         majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
-    ) && fbw_foriter_inflight_top_body_pc()
-        .is_some_and(|body_pc| body_pc == ctx.vstack_cur_pypc as usize)
+    ) && fbw_foriter_inflight_top_body_pc().is_some_and(|body_pc| {
+        walk_executing_py_pc(ctx, op_pc).is_some_and(|py| body_pc == py as usize)
+    })
 }
 
 /// Journal the namespace binding a `STORE_NAME` / `STORE_GLOBAL` /
@@ -8936,6 +8948,7 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     helper: majit_ir::RuntimeHelperKind,
     r_args: &[OpRef],
+    op_pc: usize,
 ) -> Option<()> {
     use majit_ir::RuntimeHelperKind as K;
     if !ctx.is_authoritative_executor {
@@ -8993,7 +9006,7 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     // `body_pc`, recognised the way the R1 in-flight accounting recognises it.
     // An in-flight delivery re-runs the body from that pc, so this one binding
     // is re-applied by the delivery itself and its rollback closes no road.
-    let loop_var = is_loop_var_binding_store(ctx, helper);
+    let loop_var = is_loop_var_binding_store(ctx, helper, op_pc);
     fbw_namespace_store_journal_push(namespace, name, displaced, loop_var, None);
     Some(())
 }
@@ -10338,7 +10351,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     // No IR. The displaced binding is journaled while the write is still
     // entirely ahead of the walk, before the concrete call.
     let namespace_write_journaled =
-        journal_walker_namespace_write(ctx, ei.runtime_helper, r_args).is_some();
+        journal_walker_namespace_write(ctx, ei.runtime_helper, r_args, op_pc).is_some();
 
     // `posted`: the hook already invalidated and, when the result has a
     // value, wrote the dst. The Ok arm refreshes that box after

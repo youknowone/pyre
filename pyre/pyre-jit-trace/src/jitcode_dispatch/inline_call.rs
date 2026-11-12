@@ -23492,10 +23492,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 helper_return: ctx.fbw_mode.helper_return.child_helper_return(),
                 // A helper has no Python PC. Residual last_instr publication
                 // reads this field when `current_inline_concrete_frame()==0`.
+                // The parent MIFrame's CALL-site jitcode pc maps to that
+                // Python opcode (`executing_py_pc`).
                 inline_caller_py_pc: ctx
                     .fbw_mode
                     .inline_caller_py_pc
-                    .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
+                    .or_else(|| super::residual_call::walk_executing_py_pc(ctx, pc)),
                 // `FbwWalkMode.generator_resume` is only the resume
                 // sub-walk. Cloning the parent mode onto a helper would
                 // journal that helper's stores as the generator's durable frame.
