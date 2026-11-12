@@ -6267,8 +6267,6 @@ fn run_perfn_walk<Sym: WalkSym>(
         // here.  A qmut abort converts here at either depth
         // (`opimpl_jit_force_quasi_immutable` raises `SwitchToBlackhole`,
         // continued past the force by `convert_and_run_from_pyjitpl`).
-        // A kept-stack branch abort converts at the post-branch MIFrame.pc
-        // (`opimpl_goto_if_not` / `generate_guard`).
         let mut walk_abort_adopted = !trace_too_long_adopted
             && !segment_adopted
             && matches!(&walk_result, Err(error) if error.can_convert_seeded_inline()
@@ -6371,49 +6369,32 @@ fn run_perfn_walk<Sym: WalkSym>(
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
-        // The third field marks an abort that must not consume a `MidBody`
-        // carrier: that carrier is latched exclusively by the first two
-        // variants (`inline_call.rs`), so a kept-stack abort matching a MidBody
-        // payload would be reading another abort's rebuild plan.
         let midbody_or_abortpc = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
-                Some((*pc, true, false))
+                Some((*pc, true))
             }
             Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
                 pc,
                 ..
-            }) => Some((*pc, false, false)),
-            Err(
-                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
-                    pc,
-                },
-            )
-            | Err(crate::jitcode_dispatch::DispatchError::BranchGuardKeptStackUnsupported { pc }) => {
-                Some((*pc, false, true))
-            }
+            }) => Some((*pc, false)),
             _ => None,
         };
-        if !walk_abort_adopted
-            && let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = midbody_or_abortpc
-        {
+        if !walk_abort_adopted && let Some((abort_jit_pc, is_marker_abort)) = midbody_or_abortpc {
             // A supported abort fired inside a TOP-level inline sub-walk,
             // and this block is under `!walk_abort_adopted`: WalkAbort did
             // not convert the live framestack through
             // `convert_and_run_from_pyjitpl` (`blackhole.py`). A MidBody
             // carrier still rebuilds the callee at its abort pc; a marker
             // abort without a carrier resumes at the abort pc itself.
-            // Kept-stack aborts must not consume a MidBody payload latched
-            // for a different abort.
             let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
             match carrier.as_ref() {
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
-                    if !entry_carrier_only
-                        && ((is_marker_abort
+                    if (is_marker_abort
+                        && payload.abort_kind
+                            == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
+                        || (!is_marker_abort
                             && payload.abort_kind
-                                == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
-                            || (!is_marker_abort
-                                && payload.abort_kind
-                                    == crate::jitcode_dispatch::MidBodyAbortKind::Structural)) =>
+                                == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
                 {
                     let rebuilt = match resolve_midbody_flush_words(payload) {
                         Some(words) => {
@@ -7945,12 +7926,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
             }
             match e {
                 DE::TraceTooLong { .. } => abort_too_long_action(),
-                // A kept-stack branch guard whose not-taken arm reads an
-                // unrestorable boxed Ref register is a structural abort.
-                // Keeping the permanent mapping is behavior-neutral: a plain
-                // `Abort` reaches the same `DONT_TRACE_HERE` terminal state
-                // through pyre's abort ceiling.
-                DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
                 // #57 (Finding #1): a non-journalable in-place container mutation
                 // in a FOR_ITER body cannot be rolled back on abort, so this
                 // location can never trace soundly — interpret it permanently
@@ -7958,7 +7933,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
                 DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
                 DE::GuardSnapshotVableUntyped { .. }
-                | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 | DE::ResidualCallArgUnbound { .. }
                 // The callee, not this portal, is what `disable_noninlinable_function`

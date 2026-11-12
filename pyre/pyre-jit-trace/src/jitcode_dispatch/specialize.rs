@@ -10558,18 +10558,23 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         iter_op,
         majit_ir::Value::Ref(majit_ir::GcRef(iter_obj as usize)),
     );
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        &[],
-        &[],
-        &[iter_op],
-        &[ConcreteValue::Ref(iter_obj)],
-        &[],
-    );
+    let parked_result = take_completed_nested_subwalk(ctx, op_pc);
+    let helper_already_ran = parked_result.is_some();
+    let walk = match parked_result {
+        Some(done) => done.map(|outcome| (outcome, pre_fold_pos)),
+        None => run_orthodox_helper_subwalk(
+            ctx,
+            op_pc,
+            sym,
+            &sub_body,
+            nested_entry,
+            &[],
+            &[],
+            &[iter_op],
+            &[ConcreteValue::Ref(iter_obj)],
+            &[],
+        ),
+    };
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
         Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
@@ -10607,7 +10612,11 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
             Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
         );
     // The store the body recorded, for a walk that could not execute it.
-    let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
+    // A residual CALL replay has already run `descr_next` on the parked
+    // child (`finishframe` / `make_result_of_lastop`); the cursor sampled
+    // here is post-advance, so `cursor_unchanged` must not mean "replay".
+    let replay =
+        !helper_already_ran && cursor_unchanged && !seq_before.is_null() && index_before >= 0;
     // A kept store has no undo entry.  A bridge walk snapshots the pre-walk
     // cursor, whichever side moved it, so a bridge that aborts with its
     // delivery refused can put the cursor back.  A root walk does not roll
@@ -10615,7 +10624,8 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     // cannot decline into an entry replay that would call `__next__` again,
     // and its abort continues forward from the latched image
     // (`convert_and_run_from_pyjitpl`).
-    let cursor_moved = !cursor_unchanged || (replay && (item.is_some() || exhausted));
+    let cursor_moved =
+        helper_already_ran || !cursor_unchanged || (replay && (item.is_some() || exhausted));
     let journaled = cursor_moved && ctx.trace_ctx.is_bridge_trace;
     if journaled {
         fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
@@ -19801,26 +19811,38 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
     walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
-        return Ok(None);
-    };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let journal_mark = fbw_effect_journal_mark();
     ctx.trace_ctx
         .set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(iter_obj as usize)));
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        &[],
-        &[],
-        &[iter_op],
-        &[ConcreteValue::Ref(iter_obj)],
-        &[],
-    );
+    // Residual CALL replay consumes the parked helper
+    // (`take_completed_nested_subwalk` / `finishframe` /
+    // `make_result_of_lastop`) before a second `newframe`.
+    let parked_result = take_completed_nested_subwalk(ctx, op_pc);
+    let helper_already_ran = parked_result.is_some();
+    let walk = match parked_result {
+        Some(done) => done.map(|outcome| (outcome, pre_fold_pos)),
+        None => {
+            let sym = unsafe { &*sym_ptr };
+            let Ok(nested_entry) =
+                orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted)
+            else {
+                return Ok(None);
+            };
+            run_orthodox_helper_subwalk(
+                ctx,
+                op_pc,
+                sym,
+                &sub_body,
+                nested_entry,
+                &[],
+                &[],
+                &[iter_op],
+                &[ConcreteValue::Ref(iter_obj)],
+                &[],
+            )
+        }
+    };
     // The subwalk can collect; the op's stamped value is the forwarded address.
     let iter_now: Option<pyre_object::PyObjectRef> = if iter_op.is_constant() {
         Some(iter_obj)
@@ -19863,10 +19885,17 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     // field stores moved the live cursor.  Run the same step once for a walk
     // that could not execute them, i.e. while the cursor is still the
     // pre-iteration value.
+    //
+    // A residual CALL that yielded into `SubWalkDriver` replays from the
+    // opcode start so the cut specialize preamble is recorded again. The
+    // parked child already ran `W_IntRange*Iterator.next`; `shape.replay`
+    // would run next a second time and skip an item. `finishframe` /
+    // `make_result_of_lastop` (`pyjitpl.py`) deliver that executed return;
+    // `convert_and_run_from_pyjitpl` continues from it.
     fbw_gc_store_journal_keep_since(journal_mark, iter_obj);
     if concrete_continues {
         let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
-        if after == concrete_current {
+        if after == concrete_current && !helper_already_ran {
             let concrete_item = unsafe { shape.replay(iter_obj) };
             if concrete_item.is_null() {
                 return Ok(None);

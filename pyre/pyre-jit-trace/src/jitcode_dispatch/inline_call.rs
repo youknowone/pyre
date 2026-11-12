@@ -12020,7 +12020,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
         if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
             if frame.body_matches(&body) {
-                seed_callee_vstack_mirror(&mut sub_wc, &frame);
+                seed_callee_vstack_mirror(&mut sub_wc, &frame, 0);
             }
         }
         // Seed the callee's per-slot concrete-locals shadow from the param
@@ -19268,36 +19268,6 @@ fn walk_generator_resume<Sym: WalkSym>(
             // `run_blackhole_interp_to_cancel_tracing`, which drives the
             // frame the walker left. Restoring the parked yield is only for
             // the no-effect residual so `jit_next` can send again.
-            //
-            // A kept-stack branch abort already selected the taken link
-            // (`opimpl_goto_if_not`). Root walks latch at that pc and
-            // convert (`_copy_data_from_miframe`). Converting here
-            // cancels the caller's FOR_ITER and its portal loop
-            // (`generator_frame_handout_image`). `jit_next` is
-            // `_send_ex`: restore the parked yield and residualize
-            // (`do_residual_call`).
-            if matches!(
-                error,
-                DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
-                    | DispatchError::BranchGuardKeptStackUnsupported { .. }
-            ) {
-                if fbw_debug_abort_enabled() {
-                    let gf = live_generator_frame(frame_root);
-                    if !gf.is_null() {
-                        eprintln!(
-                            "[gen-resume] kept-stack residualize-at-yield last={} vsd={} \
-                             err={error:?}",
-                            unsafe { (*gf).last_instr },
-                            unsafe { (*gf).valuestackdepth },
-                        );
-                    }
-                }
-                discard_staged_abort(ctx.session);
-                fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
-                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-                ctx.trace_ctx.heap_cache_mut().reset();
-                return Ok(None);
-            }
             if abort_blackhole_latched() || fbw_executed_effect_count() != executed_effects_before {
                 return Err(error);
             }
@@ -19334,6 +19304,17 @@ fn walk_generator_resume<Sym: WalkSym>(
             // result is this portal frame's return, which continues into
             // `_send_ex` and FOR_ITER the same way `SubReturn` does.
             let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+            // GET_ITER's `new_with_vtable` can minor-collect. The box still
+            // names the generator; stamp the forwarded frame so preflight
+            // and `ll_portal_runner` read the same object the extra stores
+            // just wrote (`durable_resume_frame`).
+            let live = live_generator_frame(frame_root);
+            if !live.is_null() {
+                ctx.trace_ctx.set_opref_concrete(
+                    frame_box,
+                    majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+                );
+            }
             if !loop_callee_portal_call_can_record(ctx, frame_box, w_code, target_pc) {
                 record_deferred_portal_leave(deferred_portal_leave);
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -21942,7 +21923,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 ActiveResumeFrame::current(walk_ctx.session, walk_ctx.fbw_mode.snapshot_sym)
                 && frame.body_matches(&self.body)
             {
-                seed_callee_vstack_mirror(&mut walk_ctx, &frame);
+                seed_callee_vstack_mirror(&mut walk_ctx, &frame, self.pc);
             }
         }
         // ChangeFrame: dest-write from the finished callee, then walk at
@@ -23448,6 +23429,74 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
     }
 }
 
+/// Locals shadow for a generator-resume portal frame (`newframe` of the
+/// body's jitcode). `active_frame_nlocals` / `active_frame_code` read this
+/// so `setarrayitem_vable` splits the generator's locals from its operand
+/// stack, not the driver's.
+fn python_portal_callee_shadow<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    inline_w_code: usize,
+    extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
+    sub_body: &SubJitCodeBody,
+    start_pc: usize,
+) -> CalleeLocalsShadow {
+    let code_ptr =
+        unsafe { pyre_interpreter::w_code_get_ptr(inline_w_code as pyre_object::PyObjectRef) };
+    let resume = ctx
+        .fbw_mode
+        .generator_resume
+        .filter(|resume| resume.w_pycode == inline_w_code);
+    let (frame_box, concrete_frame) = match resume {
+        Some(resume) => (
+            resume.frame_box,
+            pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize,
+        ),
+        None => (OpRef::NONE, 0),
+    };
+    let mut shadow = CalleeLocalsShadow {
+        code_ptr,
+        frame_box,
+        concrete_frame,
+        frame_materialized: concrete_frame != 0,
+        ..Default::default()
+    };
+    if concrete_frame == 0 {
+        return shadow;
+    }
+    let Some(index) = sub_body.jitcode_index else {
+        return shadow;
+    };
+    let Ok(jitcode_index) = i32::try_from(index) else {
+        return shadow;
+    };
+    let Some(pcdep) = crate::state::pcdep_trivia_at(jitcode_index, start_pc as i32) else {
+        return shadow;
+    };
+    for &(bank, color, slot) in &pcdep {
+        if bank != 1 {
+            continue;
+        }
+        let Some((_, opref, concrete)) = extra_ref_seeds
+            .iter()
+            .rev()
+            .find(|(reg, _, _)| *reg == color as usize)
+        else {
+            continue;
+        };
+        shadow.set_opref(slot as i64, *opref);
+        if let ConcreteValue::Ref(ptr) = *concrete
+            && !ptr.is_null()
+        {
+            shadow.set_concrete(
+                concrete_frame,
+                slot as i64,
+                majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+            );
+        }
+    }
+    shadow
+}
+
 /// Same as [`run_sub_jitcode_walk`], but enter the callee body at
 /// `start_pc` and seed extra Ref-bank registers after the call args.
 ///
@@ -23616,8 +23665,19 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         Some(site) => site.outer_active_boxes.clone(),
         None => ctx.frame_state.borrow().outer_active_boxes.clone(),
     };
+    let callee_shadow = if is_python_portal && inline_w_code != 0 {
+        Some(python_portal_callee_shadow(
+            ctx,
+            inline_w_code,
+            extra_ref_seeds,
+            sub_body,
+            start_pc,
+        ))
+    } else {
+        None
+    };
     let frame_state = WalkFrameState::new(WalkFrameStateData {
-        callee_shadow: None,
+        callee_shadow,
         concrete_registers_r: callee_concrete_r,
         current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
@@ -23750,7 +23810,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         caller_exc_before: ctx.last_exc_value(),
         pc: start_pc,
         body: sub_body.clone(),
-        seed_from_active_resume: start_pc == 0,
+        seed_from_active_resume: is_python_portal || start_pc == 0,
         registers_r: callee_regs_r,
         registers_i,
         registers_f,

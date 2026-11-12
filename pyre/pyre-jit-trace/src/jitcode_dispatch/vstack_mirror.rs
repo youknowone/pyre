@@ -129,7 +129,7 @@ pub(crate) fn classify_vstack_opcode(
         // push chokepoint (`emit_pushvalue_ref!`, codewriter.rs), so it is
         // the same `ResultToTos` shape as the value producers above.  Left
         // unmodeled it killed the mirror for the rest of the walk at the first
-        // nested `def`, declining any later depth > 1 kept-stack branch guard.
+        // nested `def`.
         | Instruction::MakeFunction
         // SET_FUNCTION_ATTRIBUTE follows MAKE_FUNCTION for defaults,
         // annotations, and closures, and pushes the updated function back to
@@ -433,20 +433,11 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
     stack_slot: usize,
 ) -> OpRef {
     if ctx.fbw_mode.inline_subwalk {
-        // `walk_generator_resume` is portal-shaped and keeps the
-        // empty-parents collapse (`walker_inline_guard_resumes_in_callee`).
-        // Filling the mirror here makes a kept-stack `FOR_ITER` look
-        // covered so the guard compiles against that collapse snapshot
-        // and drops an item (`generator_frame_handout_image` 2999/3000).
-        if ctx.fbw_mode.generator_resume.is_some() {
-            return OpRef::NONE;
-        }
         // Same pcdep color → `registers_r` read as the outer path, keyed off
         // the innermost inlined callee (`ActiveResumeFrame::current`) rather
         // than `fbw_mode.snapshot_sym` (the portal).  Returning NONE here
         // left MATCH_CLASS / LOAD_FAST TOS holes; COPY of a missing source
-        // then latched `vstack_valid = false`, and a later kept-stack
-        // POP_JUMP_IF_NONE raised `BranchGuardUnrestorableKeptStackPermanent`.
+        // then latched `vstack_valid = false`.
         let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
             return OpRef::NONE;
         };
@@ -1568,12 +1559,22 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame: &ActiveResumeFrame,
+    start_pc: usize,
 ) {
-    let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
+    let Some((first_pypc, _code_ptr, depth)) = frame.vstack_coordinate_for_jitcode_pc(start_pc)
+    else {
         return;
     };
-    ctx.frame_state.borrow_mut().vstack_boxes.clear();
-    ctx.vstack_depth = 0;
+    let mut boxes = Vec::with_capacity(depth);
+    for s in 0..depth {
+        let b = vstack_slot_box_from_pcdep_registers(ctx, start_pc, s);
+        if b == OpRef::NONE {
+            return;
+        }
+        boxes.push(b);
+    }
+    ctx.frame_state.borrow_mut().vstack_boxes = boxes;
+    ctx.vstack_depth = depth;
     ctx.vstack_cur_pypc = first_pypc;
     ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = None;

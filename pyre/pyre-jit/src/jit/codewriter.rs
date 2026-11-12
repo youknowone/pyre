@@ -18584,8 +18584,7 @@ impl CodeWriter {
         let mut const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         // Trivia-aware predecessor twin of the STATIC dense
-        // liveness depth.  The ENCODE-side branch-resume depth reader
-        // (`branch_resume_target_stack_depth`) does NOT
+        // liveness depth.  The encode-side reader does NOT
         // read `depth_at_py_pc[inv(target)]` directly — it advances the inverted
         // py through `skip_python_trivia_forward` (a not-taken branch coordinate
         // can land on a `NOT_TAKEN`/`Cache` trivia op) BEFORE indexing the
