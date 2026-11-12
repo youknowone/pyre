@@ -1813,106 +1813,92 @@ impl Optimizer {
                 seen.push(ptr);
             }
         }
-        let convert_produced = |result: OpRef,
-                                produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
-                                const_group: bool| {
-            let canonical_result = ctx.get_replacement_opref(result);
-            let replay_result = if const_group {
-                None
-            } else {
-                // pure.py `produce_potential_short_preamble_ops` walks
-                // `_newoperations`, not their replacements.  In particular,
-                // `postprocess_GUARD_TRUE` can forward an already-emitted
-                // pure comparison to CONST_1; PyPy still exports that
-                // comparison Box and `PureOp.produce_op` installs it in the
-                // next iteration's pure cache.  Keep the original result
-                // identity for that case.  Using the inline Const as the
-                // replay position would collapse distinct comparison Boxes
-                // that happen to prove the same value.
-                Some(exported_short_box_replay_result(
-                    result,
-                    canonical_result,
-                    &produced.kind,
-                )?)
-            };
-            let preamble_op = produced.preamble_op.clone();
-            // shortpreamble.py keeps two boxes: `short_op.res` (body) and
-            // `preamble_op` (replay). `add_op_to_short` already minted the
-            // replay result. `exported_short_box_replay_result` only
-            // decides whether a forwarded-to-Const entry is kept; it must
-            // not be written onto `preamble_op.pos`.
-            if replay_result.is_none() && !const_group {
-                return None;
-            }
-            // optimizer.py force_box loop parity.
-            //
-            // Resolve POSITIONALLY when a producer is registered at
-            // this slot: replay-op args carry the dep replay handle
-            // (produce_arg, shortpreamble.py) whose forwarded slot
-            // is empty, so only the body producer registered at the
-            // same position carries the Phase-1 forwarding to the
-            // canonical end box this export boundary needs.
-            //
-            // When positional resolution finds NO producer, the carried
-            // handle is unforwarded and resolves to itself
-            // (resoperation.py `get_box_replacement`): keep the handle OBJECT instead of
-            // re-minting a producer-less position-only box, so its
-            // identity (and the `Operand::Op`/`InputArg` shed) survives
-            // the export. The encoded OpRef is identical either way
-            // (`from_opref(arg.to_opref()) == arg.to_opref()`).
-            for i in 0..preamble_op.num_args() {
-                let arg = preamble_op.arg(i);
-                // The `OpRef::none()` sentinel has no producer box
-                // (`materialize_operand_at` doc) — routing it through the
-                // producer lookup is meaningless and trips the
-                // `get_box_replacement` "box must exist" debug tripwire.
-                if arg.is_none() {
-                    continue;
+        let mut convert_produced =
+            |result: &Operand,
+             produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
+             const_group: bool| {
+                let canonical = result.get_box_replacement(false);
+                let canonical_result = canonical.to_opref(); // class-C replay pos only
+                let replay_result = if const_group {
+                    None
+                } else {
+                    // pure.py `produce_potential_short_preamble_ops` walks
+                    // `_newoperations`, not their replacements.  In particular,
+                    // `postprocess_GUARD_TRUE` can forward an already-emitted
+                    // pure comparison to CONST_1; PyPy still exports that
+                    // comparison Box and `PureOp.produce_op` installs it in the
+                    // next iteration's pure cache.  Keep the original result
+                    // identity for that case.  Using the inline Const as the
+                    // replay position would collapse distinct comparison Boxes
+                    // that happen to prove the same value.
+                    Some(exported_short_box_replay_result(
+                        result.to_opref(),
+                        canonical_result,
+                        &produced.kind,
+                    )?)
+                };
+                let preamble_op = produced.preamble_op.clone();
+                // shortpreamble.py keeps two boxes: `short_op.res` (body) and
+                // `preamble_op` (replay). `add_op_to_short` already minted the
+                // replay result. `exported_short_box_replay_result` only
+                // decides whether a forwarded-to-Const entry is kept; it must
+                // not be written onto `preamble_op.pos`.
+                if replay_result.is_none() && !const_group {
+                    return None;
                 }
-                let resolved = ctx
-                    .heal_arg_to_canonical(&arg)
-                    .or_else(|| ctx.resolve_operand_operand_opt(&arg))
-                    .unwrap_or_else(|| arg.clone());
-                preamble_op.setarg(i, resolved);
-            }
-            if let Some(mut fail_args) = preamble_op.getfailargs() {
-                for arg in fail_args.iter_mut() {
+                // shortpreamble.py produce_arg already stored the dep
+                // replay handle / renamed short InputArg / Const on
+                // preamble_op.args. Keep that object.
+                for i in 0..preamble_op.num_args() {
+                    let arg = preamble_op.arg(i);
+                    // The `OpRef::none()` sentinel has no producer box
+                    // (`materialize_operand_at` doc) — routing it through the
+                    // producer lookup is meaningless and trips the
+                    // `get_box_replacement` "box must exist" debug tripwire.
                     if arg.is_none() {
                         continue;
                     }
-                    *arg = arg.get_box_replacement(false);
+                    let resolved = arg.get_box_replacement(false);
+                    preamble_op.setarg(i, resolved);
                 }
-                preamble_op.setfailargs(fail_args);
-            }
-            // An InputArg label arg whose canonical result forwards away
-            // is absent from `short_boxes.label_args`, so a re-lookup of
-            // `canonical_result` returns None and the per-slot original
-            // is lost. `produced.label_arg_idx` is the slot stamped at
-            // `add_short_input_arg` (the slot the renamed
-            // `short_inputargs[i]` pairs with — consumed by
-            // `slot_to_original`). Non-InputArg entries keep the same
-            // stamped field; `inline_short_preamble` does not read it.
-            Some(crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op,
-                source_op: Some(produced.source_op.clone()),
-                // short_op.res travels with the entry as the
-                // exported `PreambleOp.res` operand; the preview
-                // ProducedShortOp already carries the bound producer
-                // / const operand, so it moves across unchanged.
-                res: produced.res.clone(),
-                kind: produced.kind,
-                label_arg_idx: produced.label_arg_idx,
-                invented_name: produced.invented_name,
-                same_as_source: produced.same_as_source.clone(),
-            })
-        };
+                if let Some(mut fail_args) = preamble_op.getfailargs() {
+                    for arg in fail_args.iter_mut() {
+                        if arg.is_none() {
+                            continue;
+                        }
+                        *arg = arg.get_box_replacement(false);
+                    }
+                    preamble_op.setfailargs(fail_args);
+                }
+                // An InputArg label arg whose canonical result forwards away
+                // is absent from `short_boxes.label_args`, so a re-lookup of
+                // `canonical_result` returns None and the per-slot original
+                // is lost. `produced.label_arg_idx` is the slot stamped at
+                // `add_short_input_arg` (the slot the renamed
+                // `short_inputargs[i]` pairs with — consumed by
+                // `slot_to_original`). Non-InputArg entries keep the same
+                // stamped field; `inline_short_preamble` does not read it.
+                Some(crate::optimizeopt::shortpreamble::PreambleOp {
+                    op: preamble_op,
+                    source_op: Some(produced.source_op.clone()),
+                    // short_op.res travels with the entry as the
+                    // exported `PreambleOp.res` operand; the preview
+                    // ProducedShortOp already carries the bound producer
+                    // / const operand, so it moves across unchanged.
+                    res: produced.res.clone(),
+                    kind: produced.kind,
+                    label_arg_idx: produced.label_arg_idx,
+                    invented_name: produced.invented_name,
+                    same_as_source: produced.same_as_source.clone(),
+                })
+            };
         let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> = produced
             .into_iter()
-            .filter_map(|(result, produced)| convert_produced(result, produced, false))
+            .filter_map(|(result, produced)| convert_produced(&result, produced, false))
             .collect();
         let exported_const_short_boxes = produced_const
             .into_iter()
-            .filter_map(|produced| convert_produced(produced.res.to_opref(), produced, true))
+            .filter_map(|produced| convert_produced(&produced.res.clone(), produced, true))
             .collect();
         ctx.exported_const_short_boxes = exported_const_short_boxes;
         if crate::majit_log_enabled() {

@@ -911,16 +911,16 @@ impl ShortBoxes {
     pub fn produced_ops(
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
-    ) -> Vec<(OpRef, ProducedShortOp)> {
-        // shortpreamble.py `for shortop in self.potential_ops.values()` —
-        // the stored boxes themselves, not a re-resolution of their positions.
+    ) -> Vec<(Operand, ProducedShortOp)> {
+        // shortpreamble.py `for shortop in self.potential_ops.values()`
+        // / `produced_short_boxes` — the stored boxes, not their positions.
         let keys: Vec<majit_ir::operand::Operand> = self.potential_ops.keys().cloned().collect();
         for key in keys {
             let _ = self.materialize_one(ctx, key);
         }
         self.produced_short_boxes
             .iter()
-            .map(|(k, v)| (k.to_opref(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
 
@@ -2114,20 +2114,26 @@ impl ShortPreambleBuilder {
         let mut produced_short_boxes =
             FxIndexMap::with_capacity_and_hasher(short_boxes.len(), FxBuildHasher);
         for (k, v) in short_boxes {
-            // shortpreamble.py: __init__ plants
-            // `preamble_op.set_forwarded(info)` on every replay op. The
-            // exported infos themselves are seeded through ctx position
-            // slots (`set_preamble_forwarded_info`), so the on-object
-            // marker is the `empty_info` sentinel: its presence tells
-            // `use_box` "this operand is a short-box replay op", and
-            // consuming it (`set_forwarded(None)`) is the dedup.
-            // `OpInfo::EmptyInfo` never appears in exported infos
-            // (mod.rs guard), so the marker is unambiguous; Op::clone
-            // resets `forwarded`, so built ShortPreamble copies never
-            // carry it.
-            *v.preamble_op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::Info(
-                crate::optimizeopt::info::OpInfo::EmptyInfo(crate::optimizeopt::info::EmptyInfo),
-            );
+            // shortpreamble.py ShortPreambleBuilder.__init__:
+            //   info = exported_infos.get(op, None)
+            //   if info is None:
+            //       info = empty_info
+            //   preamble_op.set_forwarded(info)
+            // `plant_imported_info` already wrote that slot on the imported
+            // clone (`use_box` `info = arg.get_forwarded()`). Only the
+            // empty-info sentinel belongs here, and only when the slot is
+            // still None — overwriting a planted IntBound / PtrInfo would
+            // drop the guards `make_guards` needs.
+            if matches!(
+                v.preamble_op.forwarded().borrow(),
+                majit_ir::forwarding::Forwarded::None
+            ) {
+                *v.preamble_op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::Info(
+                    crate::optimizeopt::info::OpInfo::EmptyInfo(
+                        crate::optimizeopt::info::EmptyInfo,
+                    ),
+                );
+            }
             // Const res boxes are ptr-unstable (minted fresh per resolution),
             // so they can never be a stable box-identity key; export already
             // filters const short boxes (`optimizer.rs`'s
@@ -3846,7 +3852,9 @@ mod tests {
         // The label arg OpRef::int_op(10) itself is produced (as ShortInputArg),
         // but the pure op depending on unknown OpRef::int_op(999) is rejected.
         assert!(
-            !produced.iter().any(|(r, _)| *r == OpRef::int_op(20)),
+            !produced
+                .iter()
+                .any(|(r, _)| r.to_opref() == OpRef::int_op(20)),
             "pure op with unknown dependency should be rejected"
         );
     }
@@ -3879,7 +3887,7 @@ mod tests {
         assert_eq!(non_input.len(), 1);
         let pure = produced
             .iter()
-            .find(|(result, _)| *result == OpRef::int_op(20))
+            .find(|(result, _)| result.to_opref() == OpRef::int_op(20))
             .expect("missing produced pure op");
         // The label-arg dep is renamed to its short_inputargs box; the known
         // constant 999 passes through unchanged.
@@ -3936,14 +3944,18 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| *result == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
+            .find(|(result, p)| {
+                result.to_opref() == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
+            })
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let alias = produced
             .iter()
-            .find(|(result, p)| *result != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg)
+            .find(|(result, p)| {
+                result.to_opref() != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
+            })
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
@@ -4069,7 +4081,9 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| *result == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg)
+            .find(|(result, p)| {
+                result.to_opref() == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
+            })
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
@@ -4077,7 +4091,7 @@ mod tests {
         let aliases: Vec<_> = produced
             .iter()
             .filter(|(result, p)| {
-                *result != OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
+                result.to_opref() != OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
             })
             .collect();
         assert_eq!(aliases.len(), 2);
@@ -4115,7 +4129,7 @@ mod tests {
         // invented alias. (Label arg 30 is also produced as a ShortInputArg.)
         let chosen = produced
             .iter()
-            .find(|(result, _)| *result == OpRef::int_op(10))
+            .find(|(result, _)| result.to_opref() == OpRef::int_op(10))
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
         assert!(!chosen.1.invented_name);
@@ -4248,7 +4262,7 @@ mod tests {
         // invented alias.
         let chosen = produced
             .iter()
-            .find(|(result, _)| *result == OpRef::int_op(10))
+            .find(|(result, _)| result.to_opref() == OpRef::int_op(10))
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
         assert!(!chosen.1.invented_name);
@@ -4339,7 +4353,9 @@ mod tests {
         let produced = sb.produced_ops(&mut ctx);
         let inputarg_entries: Vec<_> = produced
             .iter()
-            .filter(|(r, p)| *r == OpRef::ref_op(50) && p.kind == PreambleOpKind::InputArg)
+            .filter(|(r, p)| {
+                r.to_opref() == OpRef::ref_op(50) && p.kind == PreambleOpKind::InputArg
+            })
             .collect();
         assert_eq!(inputarg_entries.len(), 1);
         // THE REGRESSION LOCK: the overwriting (later) call must record the LAST
@@ -4396,7 +4412,7 @@ mod tests {
             .collect();
         let res10 = produced
             .iter()
-            .find(|(r, _)| *r == OpRef::int_op(10))
+            .find(|(r, _)| r.to_opref() == OpRef::int_op(10))
             .unwrap()
             .1
             .res
@@ -4466,8 +4482,8 @@ mod tests {
         let produced = sb.produced_ops(&mut __ctx);
         let (alias_result, alias_res) = produced
             .iter()
-            .find(|(result, pop)| *result != OpRef::int_op(20) && pop.invented_name)
-            .map(|(result, pop)| (*result, pop.res.clone()))
+            .find(|(result, pop)| result.to_opref() != OpRef::int_op(20) && pop.invented_name)
+            .map(|(result, pop)| (result.clone(), pop.res.clone()))
             .unwrap();
 
         // #146: re-key the produced_ops list to res for new() + look up the
@@ -4487,7 +4503,7 @@ mod tests {
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
-        assert_eq!(extra[0].pos().get(), alias_result);
+        assert_eq!(extra[0].pos().get(), alias_result.to_opref());
         assert_eq!(
             extra[0]
                 .args_slice()

@@ -3238,29 +3238,6 @@ impl OptContext {
         None
     }
 
-    /// Write `Forwarded::None` to the canonical host for
-    /// `opref` (`resoperation.py` `set_forwarded(None)` /
-    /// `:50` clear semantics). No-op for sentinel `OpRef::none()`,
-    /// constants (whose `_forwarded` is permanently `None`), and
-    /// positions without a canonical Op/InputArg.
-    pub(crate) fn clear_forwarded(&self, opref: OpRef) {
-        if opref.is_none() || opref.is_constant() {
-            return;
-        }
-        match opref {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                if let Some(ia) = self.inputarg_refs.get(&opref.raw()) {
-                    *ia.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
-                }
-            }
-            _ => {
-                if let Some(op) = self.find_producer_op(opref) {
-                    *op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
-                }
-            }
-        }
-    }
-
     /// Test-only: seed the canonical producer stores (`resop_refs` /
     /// `inputarg_refs`) from a list of already-bound operands, mirroring
     /// what the production recorder→optimizer handoff populates. Each box
@@ -4612,17 +4589,13 @@ impl OptContext {
         // preamble_op.set_forwarded(None);
         // optimizer.setinfo_from_preamble(box, info, None)
         //
-        // RPython reads `_forwarded` from the replay Op object
+        // Reads `_forwarded` from the replay Op object
         // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
-        // the alt for invented). The flat-OpRef equivalent is
-        // `pop.preamble_op.pos` — the OpRef the replay Op was
-        // constructed at by `ImportedShortPureOp::new`.
-        // For invented Pure that OpRef differs from `pop.op` (the
-        // alt) so the alt's `make_equal_to(...)` chain at
-        // `forwarded[pop.op]` does not collide with the replay's
-        // info at `forwarded[pop.preamble_op.pos]`.
-        if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
-        {
+        // the alt for invented). For invented Pure the replay object
+        // differs from `pop.op` (the alt) so the alt's
+        // `make_equal_to(...)` chain does not collide with the replay's
+        // info.
+        if let Some(info) = self.take_preamble_forwarded_opinfo(&preamble_op.preamble_op) {
             self.setinfo_from_preamble_item_option(&resolved, &info, None);
         }
         // `unroll.py setinfo_from_preamble` rebuilds an imported string as
@@ -4687,35 +4660,17 @@ impl OptContext {
         preamble_op.op.clone()
     }
 
-    /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
-    /// info of preamble_op's args and result. RPython's `info = arg.get_forwarded()`
-    /// returns whatever is stored — PtrInfo *or* IntBound — and calls
+    /// shortpreamble.py `use_box`: collect guards from the forwarded
+    /// info of preamble_op's args and result (`info = arg.get_forwarded()`).
+    /// RPython returns whatever is stored — PtrInfo *or* IntBound — and calls
     /// `info.make_guards(...)` uniformly. None declines reconstruction when a
     /// required pointer-layout guard cannot name its runtime tid.
     fn collect_use_box_guards(
         &mut self,
-        preamble_op: &Op,
+        preamble_op: &majit_ir::OpRc,
     ) -> Option<(Vec<majit_ir::OpRc>, Vec<majit_ir::OpRc>)> {
-        // shortpreamble.py:383-401 line-by-line:
-        //
-        //   for arg in preamble_op.getarglist():
-        //       if isinstance(arg, Const):
-        //           continue
-        //       if isinstance(arg, AbstractInputArg):
-        //           info = arg.get_forwarded()
-        //           if info is not None and info is not empty_info:
-        //               info.make_guards(arg, self.short, optimizer)
-        //       elif arg.get_forwarded() is None:
-        //           pass
-        //       else:
-        //           self.short.append(arg)
-        //           info = arg.get_forwarded()
-        //           if info is not empty_info:
-        //               info.make_guards(arg, self.short, optimizer)
-        //           arg.set_forwarded(None)
-        //
-        // RPython has three branches per arg:
-        //   * Const → skip (pyre: `OpRef::is_constant()`).
+        // shortpreamble.py `use_box` three branches per arg:
+        //   * Const → skip (`isinstance(arg, Const)`).
         //   * AbstractInputArg with forwarded info → emit guards, do NOT
         //     clear (info lives across iterations on input args).
         //   * non-input non-Const with forwarded info → also append the
@@ -4723,20 +4678,16 @@ impl OptContext {
         //     dependency walk in `shortpreamble.rs`), emit
         //     guards, AND clear the replay op's marker to prevent double-emission.
         //
-        // RPython's non-input `arg` is the replay ResOperation object, while
-        // its live body Box keeps separate optimizer info. In pyre's flat-OpRef
-        // model the IntBound/PtrInfo lives in the canonical operand forwarding
-        // slot, so clearing that slot here would drop live body facts before
-        // loop-close virtualstate.py:491-492 can see them. The builder consumes
-        // the replay op's own marker (`Op.forwarded`) in `shortpreamble.rs`'s
-        // `use_box`
-        // to mirror `arg.set_forwarded(None)` without clearing optimizer info.
+        // The non-input `arg` is the replay ResOperation object; its live
+        // body Box keeps separate optimizer info. Clearing the replay
+        // marker is `arg.set_forwarded(None)` in the builder's `use_box`,
+        // not a walk of `get_box_replacement`.
         enum ForwardedInfo {
             // shortpreamble.py EmptyInfo / empty_info sentinel.
             // Its presence is meaningful for short-preamble dedup, but it
             // intentionally emits no guards.
             Empty,
-            // info.py PtrInfo + ConstPtrInfo (info.py). PtrInfo
+            // info.py PtrInfo + ConstPtrInfo. PtrInfo
             // dispatches further to ConstPtrInfo::make_guards when the
             // PtrInfo is a Constant variant.
             Ptr(PtrInfo),
@@ -4744,25 +4695,16 @@ impl OptContext {
             // through this arm via IntBound::is_constant().
             Int(crate::optimizeopt::intutils::IntBound),
             // info.py FloatConstInfo carries a single ConstFloat;
-            // make_guards (info.py) emits a GUARD_VALUE pinning `op`
+            // make_guards emits a GUARD_VALUE pinning `op`
             // to the ConstFloat. `set_preamble_forwarded_info` plants this
-            // shape per shortpreamble.py:416
-            // `preamble_op.set_forwarded(info)`.
+            // shape per `preamble_op.set_forwarded(info)`.
             FloatConst(f64),
         }
-        let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
-            // shortpreamble.py:387 `info = arg.get_forwarded()` — PyPy
-            // returns the AbstractInfo subtype stored in `_forwarded`.
-            // Pyre's canonical `_forwarded` host carries:
-            //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py PtrInfo
-            //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
-            //   `Forwarded::Info(OpInfo::FloatConstInfo(_))` — info.py
-            //       FloatConstInfo planted via set_preamble_forwarded_info.
-            //   `Forwarded::Info(OpInfo::EmptyInfo(_))` —
-            //       shortpreamble.py empty_info.
-            let forwarded = ctx.read_forwarded(arg)?;
+        let snapshot_forwarded = |arg: &Operand| -> Option<ForwardedInfo> {
+            // shortpreamble.py `use_box`: info = arg.get_forwarded()
+            // — the AbstractInfo on this object, no get_box_replacement.
             use crate::optimizeopt::info::OpInfo;
-            match &forwarded {
+            match arg.get_forwarded() {
                 majit_ir::forwarding::Forwarded::Info(OpInfo::EmptyInfo(_)) => {
                     Some(ForwardedInfo::Empty)
                 }
@@ -4778,17 +4720,13 @@ impl OptContext {
                 _ => None,
             }
         };
-        // Phase 1 (read-only): classify each arg per the PyPy three-branch
-        // shape and snapshot the info-bearing slot.
         struct ArgEntry {
-            arg: OpRef,
+            arg: Operand,
             info: ForwardedInfo,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
         for arg_operand in preamble_op.args_slice().iter() {
-            let arg = arg_operand.to_opref();
-            // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
-            if arg.is_constant() || arg.is_none() {
+            if arg_operand.is_constant() || arg_operand.is_none() {
                 continue;
             }
             // shortpreamble.py `isinstance(arg, AbstractInputArg)` — the
@@ -4796,10 +4734,7 @@ impl OptContext {
             // `short_inputargs`. A renamed short inputarg and an original
             // label arg are both AbstractInputArg; either way an input arg's
             // forwarded info must NOT be cleared (it lives across iterations).
-            let is_input = matches!(
-                arg,
-                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-            );
+            let is_input = arg_operand.is_inputarg();
             let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
                 !matches!(
                     &op.forwarded().borrow(),
@@ -4807,22 +4742,20 @@ impl OptContext {
                 )
             });
             if (is_input || has_replay_marker)
-                && let Some(info) = snapshot_forwarded(self, arg)
+                && let Some(info) = snapshot_forwarded(arg_operand)
             {
-                arg_entries.push(ArgEntry { arg, info });
+                arg_entries.push(ArgEntry {
+                    arg: arg_operand.clone(),
+                    info,
+                });
             }
-            // shortpreamble.py:391 `elif arg.get_forwarded() is None: pass`
-            // is the no-info branch; falling out of `snapshot_forwarded`
-            // returning None is the equivalent.
+            // shortpreamble.py `elif arg.get_forwarded() is None: pass`
+            // is the no-info branch; `snapshot_forwarded` returning None
+            // is the equivalent.
         }
-        let result_info: Option<(OpRef, ForwardedInfo)> =
-            snapshot_forwarded(self, preamble_op.pos().get())
-                .map(|info| (preamble_op.pos().get(), info));
+        let result_box = Operand::from_bound_op(preamble_op);
+        let result_info = snapshot_forwarded(&result_box).map(|info| (result_box.clone(), info));
 
-        // Phase 2: generate guards — `make_guards` takes `&mut self`
-        // directly. Constants seed via reserve_const_ref + seed_constant
-        // (mirroring `ConstInt` / `ConstPtr` inline construction); producer
-        // OpRefs come from `alloc_op_position_typed`.
         let mut arg_guards = Vec::new();
         // info.py FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
@@ -4841,33 +4774,31 @@ impl OptContext {
             )));
         };
         for entry in &arg_entries {
-            let arg = self.materialize_operand_at(entry.arg);
             match &entry.info {
                 ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => {
-                    if !p.make_guards(&arg, &mut arg_guards, self) {
+                    if !p.make_guards(&entry.arg, &mut arg_guards, self) {
                         return None;
                     }
                 }
-                ForwardedInfo::Int(b) => b.make_guards(&arg, &mut arg_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(&entry.arg, &mut arg_guards, self),
                 ForwardedInfo::FloatConst(f) => {
-                    emit_const_guard(&arg, &Value::Float(*f), &mut arg_guards)
+                    emit_const_guard(&entry.arg, &Value::Float(*f), &mut arg_guards)
                 }
             }
         }
         let mut result_guards = Vec::new();
-        if let Some((result_ref, info)) = &result_info {
-            let result = self.materialize_operand_at(*result_ref);
+        if let Some((result, info)) = &result_info {
             match info {
                 ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => {
-                    if !p.make_guards(&result, &mut result_guards, self) {
+                    if !p.make_guards(result, &mut result_guards, self) {
                         return None;
                     }
                 }
-                ForwardedInfo::Int(b) => b.make_guards(&result, &mut result_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(result, &mut result_guards, self),
                 ForwardedInfo::FloatConst(f) => {
-                    emit_const_guard(&result, &Value::Float(*f), &mut result_guards)
+                    emit_const_guard(result, &Value::Float(*f), &mut result_guards)
                 }
             }
         }
@@ -4907,7 +4838,7 @@ impl OptContext {
         }
     }
 
-    /// shortpreamble.py:401-405 line-by-line:
+    /// shortpreamble.py `use_box`:
     ///
     /// ```python
     /// info = preamble_op.get_forwarded()
@@ -4916,79 +4847,50 @@ impl OptContext {
     ///     optimizer.setinfo_from_preamble(box, info, None)
     /// ```
     ///
-    /// RPython reads `_forwarded` from the `preamble_op` Op object directly
-    /// — `get_box_replacement` is NOT applied to the slot. Box replacement
+    /// Reads `_forwarded` from the `preamble_op` Op object directly —
+    /// `get_box_replacement` is NOT applied to the slot. Box replacement
     /// only matters for the `box` argument that subsequently receives the
-    /// info via `setinfo_from_preamble(box, info, None)`. Walking the
-    /// replacement chain on the source side would point at the body-visible
-    /// OpRef whose slot is empty (the seed at `forwarded[source]` was
-    /// installed by `set_preamble_forwarded_info`).
+    /// info via `setinfo_from_preamble(box, info, None)`.
     ///
     /// `set_forwarded(None)` clears the slot so a second `use_box` for the
-    /// same preamble op never re-fires `info.make_guards`. In majit's flat
-    /// OpRef model the slot is shared with the box replacement chain
-    /// (`Forwarded::Op` / `Forwarded::InputArg`), which other code follows
-    /// via `get_box_replacement`; clearing that variant would silently break
-    /// downstream replacement, so only the info-bearing variants
-    /// (Info / IntBound / Const) take + clear, matching PyPy's clear
-    /// semantics on the info-bearing branches.
+    /// same preamble op never re-fires `info.make_guards`. Only the
+    /// info-bearing variants (Info / Const) take + clear, matching PyPy's
+    /// clear semantics on the info-bearing branches.
     fn take_preamble_forwarded_opinfo(
         &mut self,
-        source: OpRef,
+        preamble_op: &majit_ir::OpRc,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::OpInfo;
-        // Forwarding-slot-authoritative read. PyPy stores the replay op's forwarded
-        // info directly on `preamble_op._forwarded`; pyre stores the same
-        // state in the operand's forwarding slot keyed by `source`. Non-constant
-        // `Forwarded::Op`/`InputArg` is a replacement chain and is excluded.
-        // Const targets can still appear from legacy bridge/fixture replay
-        // paths; normalize them to the OpInfo shape consumed by
-        // `setinfo_from_preamble_item_option`.
-        let result = {
-            let fwd = self.read_forwarded(source)?;
-            match &fwd {
-                majit_ir::forwarding::Forwarded::Info(OpInfo::EmptyInfo(e)) => {
-                    Some(OpInfo::EmptyInfo(*e))
+        // shortpreamble.py `use_box`:
+        //   info = preamble_op.get_forwarded()
+        //   preamble_op.set_forwarded(None)
+        let b = Operand::from_bound_op(preamble_op);
+        let fwd = b.get_forwarded();
+        let result = match &fwd {
+            majit_ir::forwarding::Forwarded::Info(info) => Some(info.clone()),
+            majit_ir::forwarding::Forwarded::Const(_)
+            | majit_ir::forwarding::Forwarded::SmallConst(_)
+            | majit_ir::forwarding::Forwarded::SmallWide(_) => {
+                // optimizer.py `getinfo` parity for the Const
+                // terminal — Refs surface as `ConstPtrInfo`, Floats as
+                // `FloatConstInfo`, Ints as `IntBound::from_constant`.
+                match fwd.const_value() {
+                    Some(majit_ir::Value::Ref(gcref)) => Some(OpInfo::ptr(
+                        crate::optimizeopt::info::PtrInfo::Constant(gcref),
+                    )),
+                    Some(majit_ir::Value::Float(f)) => Some(OpInfo::FloatConstInfo(
+                        crate::optimizeopt::info::FloatConstInfo::new(f),
+                    )),
+                    Some(majit_ir::Value::Int(i)) => Some(OpInfo::int_bound(
+                        crate::optimizeopt::intutils::IntBound::from_constant(i),
+                    )),
+                    Some(majit_ir::Value::Void) | None => None,
                 }
-                majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(p)) => {
-                    Some(OpInfo::Ptr(p.clone()))
-                }
-                majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(ib)) => {
-                    Some(OpInfo::IntBound(ib.clone()))
-                }
-                // info.py FloatConstInfo planted via
-                // `set_preamble_forwarded_info` (shortpreamble.py:416
-                // `preamble_op.set_forwarded(info)`).
-                majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
-                    Some(OpInfo::FloatConstInfo(*f))
-                }
-                majit_ir::forwarding::Forwarded::Const(_)
-                | majit_ir::forwarding::Forwarded::SmallConst(_)
-                | majit_ir::forwarding::Forwarded::SmallWide(_) => {
-                    // optimizer.py `getinfo` parity for the Const
-                    // terminal — Refs surface as `ConstPtrInfo`, Floats as
-                    // `FloatConstInfo`, Ints as `IntBound::from_constant`.
-                    match fwd.const_value() {
-                        Some(majit_ir::Value::Ref(gcref)) => Some(OpInfo::ptr(
-                            crate::optimizeopt::info::PtrInfo::Constant(gcref),
-                        )),
-                        Some(majit_ir::Value::Float(f)) => Some(OpInfo::FloatConstInfo(
-                            crate::optimizeopt::info::FloatConstInfo::new(f),
-                        )),
-                        Some(majit_ir::Value::Int(i)) => Some(OpInfo::int_bound(
-                            crate::optimizeopt::intutils::IntBound::from_constant(i),
-                        )),
-                        Some(majit_ir::Value::Void) | None => None,
-                    }
-                }
-                _ => None,
             }
+            _ => None,
         };
         if result.is_some() {
-            // shortpreamble.py:401 preamble_op.set_forwarded(None) —
-            // write directly to the canonical host so we don't
-            // re-fetch the operand wrapper.
-            self.clear_forwarded(source);
+            b.clear_forwarded();
         }
         result
     }
@@ -5948,8 +5850,11 @@ impl OptContext {
         if slot >= self.num_inputs {
             return None;
         }
-        let host = OpRef::input_arg_typed(self.inputarg_base + slot, arg.type_());
-        let imported = self.get_box_replacement_operand_opt(host)?;
+        // optimizer.py `self.inputargs[idx]`. `import_state` wrote
+        // `source.set_forwarded(target)` onto these InputArg boxes.
+        // This Vec is this iteration's slots `0..num_inputs`.
+        let imported = self.inputarg_at(slot as usize)?;
+        let imported = imported.get_box_replacement(false);
         if imported.same_box(arg) {
             return None;
         }
@@ -6015,7 +5920,13 @@ impl OptContext {
             return arg.clone();
         }
         if !arg.is_resop() && !arg.is_inputarg() {
-            return self.get_box_replacement_operand(arg.to_opref());
+            // Const already returned. Operand::None / a position-only view
+            // is a bind-at-alloc gap (`ResOperation(...)` / `InputArg()` at alloc).
+            debug_assert!(
+                arg.is_none() || arg.is_constant(),
+                "resolve_operand_operand: unbound {arg:?}; mint at allocation"
+            );
+            return arg.clone();
         }
         let resolved = arg.get_box_replacement(false);
         // `resoperation.py AbstractValue.get_box_replacement` is the walk
@@ -6054,57 +5965,20 @@ impl OptContext {
 
     /// `Option`-returning sibling of
     /// [`resolve_operand_operand`](Self::resolve_operand_operand): `None`
-    /// only for the NONE sentinel or a position-only operand whose position
-    /// resolves to nothing, so callers can supply their own fallback.
+    /// for the NONE sentinel or an unbound operand, so callers can supply
+    /// their own fallback.
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
         if arg.is_constant() || arg.is_resop() || arg.is_inputarg() {
             return Some(self.resolve_operand_operand(arg));
         }
-        self.get_box_replacement_operand_opt(arg.to_opref())
+        debug_assert!(
+            arg.is_none() || arg.is_constant(),
+            "resolve_operand_operand_opt: unbound {arg:?}; mint at allocation"
+        );
+        None
     }
 
-    /// Link an unforwarded ResOp `arg` to the producer registered at its
-    /// position (`arg.set_forwarded(canonical)`) and return that producer's
-    /// terminal; `None` when `arg` is unbound, already forwarded, or its
-    /// position has no producer.
-    ///
-    /// The one caller is `export_state`'s short-preamble conversion: a
-    /// replay op's args are the dependencies' replay handles, which share a
-    /// position with the body producer and carry no forwarding of their own.
-    ///
-    /// The cycle guard compares the bound `Op`s: a store wrapper around the
-    /// same `Rc<Op>` as `arg` is returned without linking, since linking would
-    /// be a one-node self-cycle. The canonical is a terminal, so no chain
-    /// cycle forms once a distinct op is linked.
-    pub(crate) fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
-        arg.bound_op()?;
-        if !matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
-            return None;
-        }
-        let canon = self.get_box_replacement_operand_opt(arg.to_opref())?;
-        if arg.same_box(&canon) {
-            return Some(canon);
-        }
-        // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
-        // host — linking would be a one-node self-cycle.
-        if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op())
-            && OpRc::ptr_eq(&ao, &co)
-        {
-            return Some(canon);
-        }
-        if let Some(value) = canon.const_value() {
-            arg.set_forwarded_const(majit_ir::Const::from_value(value));
-        } else if let Some(canon_op) = canon.bound_op() {
-            arg.set_forwarded_op(&canon_op);
-        } else if let Some(canon_ia) = canon.bound_inputarg() {
-            arg.set_forwarded_inputarg(&canon_ia);
-        }
-        // A constant link mints its own Const box; return that carried object,
-        // just as the caller's subsequent native walk did before this reuse.
-        Some(arg.get_box_replacement(false))
-    }
-
-    /// `not_const=True` operand resolver (resoperation.py:64-65): walk the
+    /// `not_const=True` operand resolver (`AbstractValue.get_box_replacement`): walk the
     /// `_forwarded` chain on the `Operand` carrier but stop before stepping
     /// into a `Const` target, so a guard fail_arg keeps the runtime identity
     /// while resume numbering carries constants as TAGCONST. Returns `None`
@@ -6114,11 +5988,14 @@ impl OptContext {
         if op.is_constant() || op.is_none() {
             return None;
         }
-        if op.bound_op().is_some() {
+        if op.bound_op().is_some() || op.bound_inputarg().is_some() {
             Some(op.get_box_replacement(true))
         } else {
-            let start = self.resolve_to_operand(op.to_opref())?;
-            Some(start.get_box_replacement(true))
+            debug_assert!(
+                op.is_none() || op.is_constant(),
+                "get_box_replacement_not_const_operand: unbound {op:?}; mint at allocation"
+            );
+            None
         }
     }
 
@@ -10136,9 +10013,10 @@ mod opt_context_pos_tests {
         let op = Op::new(OpCode::SameAsI, &[]);
         op.pos().set(pos);
         op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
-        ctx.resop_refs.insert(pos, OpRc::new(op));
+        let op_rc = OpRc::new(op);
+        ctx.resop_refs.insert(pos, op_rc.clone());
         let info = ctx
-            .take_preamble_forwarded_opinfo(pos)
+            .take_preamble_forwarded_opinfo(&op_rc)
             .expect("SmallConst must produce preamble IntBound info");
         match info {
             crate::optimizeopt::info::OpInfo::IntBound(ib) => {
@@ -10148,10 +10026,7 @@ mod opt_context_pos_tests {
             other => panic!("expected IntBound, got {other:?}"),
         }
         assert!(
-            matches!(
-                ctx.read_forwarded(pos),
-                None | Some(majit_ir::forwarding::Forwarded::None)
-            ),
+            matches!(op_rc.get_forwarded(), majit_ir::forwarding::Forwarded::None),
             "consumed SmallConst forwarding must be cleared"
         );
     }
@@ -11476,6 +11351,8 @@ mod boxref_forwarding_tests {
         host_arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&host_arg);
+        ctx.inputargs = vec![Operand::none(); NUM_INPUTS];
+        ctx.inputargs[SLOT as usize] = host_arg.clone();
 
         let body_arg = Operand::from_bound_inputarg(&recorder);
         let resolved = ctx
@@ -11516,6 +11393,8 @@ mod boxref_forwarding_tests {
         let host_arg = Operand::from_bound_inputarg(&host);
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&host_arg);
+        ctx.inputargs = vec![Operand::none(); NUM_INPUTS];
+        ctx.inputargs[SLOT as usize] = host_arg.clone();
 
         // The import lands on a result the trace produces — what a loop-carried
         // `head = Node(i, head)` forwards to, in place of the constant the
@@ -11566,6 +11445,8 @@ mod boxref_forwarding_tests {
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&host_arg);
         ctx.register_carried_host(&other_arg);
+        ctx.inputargs = vec![Operand::none(); NUM_INPUTS];
+        ctx.inputargs[SLOT as usize] = host_arg.clone();
 
         // The import lands on a sibling label arg, in place of the constant
         // `a_peeled_body_reads_the_slot_the_import_forwarded` proves is
