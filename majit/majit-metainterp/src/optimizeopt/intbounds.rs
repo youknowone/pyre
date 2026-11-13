@@ -2117,6 +2117,11 @@ mod tests {
             }
             let op_rc = OpRc::new(resolved_op.clone());
             ctx.register_extra_producer(&op_rc);
+            // Hold the extra-producer box the helper just built. Production
+            // folds write `from_bound_op(op_rc)`; a later position lookup
+            // (`materialize_operand_at` / `_opt`) must land on that same
+            // host (`seed_boxes_canonical`).
+            ctx.seed_boxes_canonical(std::slice::from_ref(&Operand::from_bound_op(&op_rc)));
             let emitted_op = match pass.propagate_forward(&resolved_op, &op_rc, &mut None, &mut ctx)
             {
                 OptimizationResult::Emit(emit_op) => {
@@ -3331,36 +3336,63 @@ mod tests {
     /// propagate_bounds_backward_op() / intbounds.py propagate_bounds_INT_LT.
     #[test]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
+        use crate::history::test_support::rooted_inputarg_operand;
         use crate::optimizeopt::optimizer::Optimizer;
+        use majit_ir::Type;
 
-        // i0/i1 are unproduced header inputs (modelled as InputArgs so the
-        // production driver resolves them positionally); i2/i4 are produced by
-        // the trace; the addend is ConstInt(1), the object the recorder
-        // would have placed in the arg.
-        let ops = vec![
-            make_op(
-                OpCode::IntLt,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-                2,
-            ),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
-            make_op(
-                OpCode::IntAddOvf,
-                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
-                4,
-            ),
-            make_op(OpCode::GuardNoOverflow, &[], 5),
-            make_op(OpCode::Jump, &[OpRef::int_op(4)], 6),
-        ];
+        // i0/i1 are header InputArg boxes; GuardTrue's arg is the IntLt
+        // producer itself (`as_operation(op.getarg(0))`), and IntAddOvf
+        // reuses the same i0. Thread the OpRcs through `_oprc` so identity
+        // does not depend on a position→box registry catch-up.
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        let i1 = rooted_inputarg_operand(Type::Int, 1);
+        let int_lt = OpRc::new(Op::new(OpCode::IntLt, &[i0.clone(), i1]));
+        int_lt.pos().set(OpRef::op_typed(2, int_lt.result_type()));
+        let guard_true = OpRc::new(Op::new(
+            OpCode::GuardTrue,
+            &[Operand::from_bound_op(&int_lt)],
+        ));
+        guard_true
+            .pos()
+            .set(OpRef::op_typed(3, guard_true.result_type()));
+        let add_ovf = OpRc::new(Op::new(
+            OpCode::IntAddOvf,
+            &[i0, Operand::const_from_value(majit_ir::Value::Int(1))],
+        ));
+        add_ovf
+            .pos()
+            .set(OpRef::op_typed(4, add_ovf.result_type()));
+        let guard_no_ovf = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        guard_no_ovf
+            .pos()
+            .set(OpRef::op_typed(5, guard_no_ovf.result_type()));
+        let jump = OpRc::new(Op::new(
+            OpCode::Jump,
+            &[Operand::from_bound_op(&add_ovf)],
+        ));
+        jump.pos().set(OpRef::op_typed(6, jump.result_type()));
 
+        let ops: Vec<OpRc> = vec![int_lt, guard_true, add_ovf, guard_no_ovf, jump];
         let mut opt = Optimizer::default_pipeline();
-        // IntLt/IntAddOvf operate on Int-typed inputs — override the
-        // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![majit_ir::Type::Int; 1024]);
+        // Reuse the i0/i1 already on the ops. Snapshot seed copies
+        // rd_resume_position onto the live Rcs.
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &[Type::Int, Type::Int]);
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded.iter()) {
+            op.set_rd_resume_position(seed.rd_resume_position());
+        }
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
+        let result: Vec<Op> = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::default(),
+                2,
+            )
+            .expect("test: unexpected InvalidLoop")
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect();
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

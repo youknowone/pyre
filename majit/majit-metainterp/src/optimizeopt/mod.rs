@@ -2862,15 +2862,20 @@ impl OptContext {
                 Operand::from_bound_inputarg(&inputarg)
             })
             .collect();
-        ctx.inputarg_refs = ctx
-            .inputargs
-            .iter()
-            .filter_map(|inputarg| {
-                inputarg
-                    .bound_inputarg()
-                    .map(|inputarg| (inputarg.index, inputarg))
-            })
-            .collect();
+        // Production readers of `inputarg_refs` are gone (4f-3). Tests still
+        // resolve InputArg slots through `materialize_operand_at` until 4g.
+        #[cfg(test)]
+        {
+            ctx.inputarg_refs = ctx
+                .inputargs
+                .iter()
+                .filter_map(|inputarg| {
+                    inputarg
+                        .bound_inputarg()
+                        .map(|inputarg| (inputarg.index, inputarg))
+                })
+                .collect();
+        }
         ctx
     }
 
@@ -2886,6 +2891,7 @@ impl OptContext {
     /// optimizer will hand to `make_equal_to` (`optimizer.py
     /// op.set_forwarded(newop)`, `OptUnroll.import_state`). Idempotent — re-running
     /// re-mirrors each slot to the same `InputArgRc`.
+    #[cfg(test)]
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
         // Reuse a reminted / recorder InputArg already in `input_ops`
         // (`inputarg_from_tp` / `history.inputargs`) so the mint below
@@ -2927,6 +2933,7 @@ impl OptContext {
     /// `_forwarded` chain and the chain targets naming it) and only
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
     /// the `materialize_operand_at` InputArg arm).
+    #[cfg(test)]
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         let pos = pos as u32;
         match self.inputarg_refs.get(&pos) {
@@ -2971,49 +2978,21 @@ impl OptContext {
         self.resop_refs.get(&opref).cloned()
     }
 
-    /// Append an emitted op and mirror it into `new_operations_index` so
-    /// `find_producer_op`'s highest-priority lookup stays O(1). Insert
-    /// overwrites, so the last push at a given position wins — matching the
-    /// `iter().rfind(...)` (last-occurrence) scan the index replaces.
+    /// Append an emitted op (`optimizer.py Optimizer._emit_operation`
+    /// `_newoperations.append(op)`). The position index is test-only
+    /// (`find_producer_op` / `materialize_operand_at`) until 4g.
     pub(crate) fn push_new_operation(&mut self, op: majit_ir::OpRc) {
+        #[cfg(test)]
         self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations.push(op);
     }
 
     /// Overwrite an already-emitted op in place (the guard-strengthening
-    /// replacements of `optimizer.py:716-718` / `rewrite.py:343`) and mirror
-    /// the new op into `new_operations_index`, so the index keeps agreeing
-    /// with `new_operations` for the rest of the forward phase.
+    /// replacements of `optimizer.py:716-718` / `rewrite.py:343`).
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
+        #[cfg(test)]
         self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations[idx] = op;
-    }
-
-    /// Rebuild `new_operations_index` from the current `new_operations`.
-    /// Called after the rare structural mutations (tail truncate, jump
-    /// reorder) that the incremental `push_new_operation` maintenance cannot
-    /// track by itself.
-    pub(crate) fn rebuild_new_operations_index(&mut self) {
-        self.new_operations_index.clear();
-        self.new_operations_index.reserve(self.new_operations.len());
-        for op in &self.new_operations {
-            self.new_operations_index.insert(op.pos().get(), op.clone());
-        }
-    }
-
-    /// Rebuild `phase1_emit_ops_index` from `phase1_emit_ops`. Called once
-    /// at the Phase 1→2 handoff right after `phase1_emit_ops` is assigned;
-    /// the field is never mutated afterwards. Forward iteration with
-    /// `insert` makes the last occurrence at each position win, matching the
-    /// `rfind` the index replaces.
-    pub(crate) fn rebuild_phase1_emit_ops_index(&mut self) {
-        self.phase1_emit_ops_index.clear();
-        self.phase1_emit_ops_index
-            .reserve(self.phase1_emit_ops.len());
-        for op in &self.phase1_emit_ops {
-            self.phase1_emit_ops_index
-                .insert(op.pos().get(), op.clone());
-        }
     }
 
     /// Append `op` to `live_synthetics`. Recorder ops are not stored here
@@ -3054,6 +3033,7 @@ impl OptContext {
         };
         let synthetic = OpRc::new(Op::new(opcode, &[]));
         synthetic.pos().set(opref);
+        #[cfg(test)]
         self.resop_refs.insert(opref, synthetic.clone());
         self.live_synthetics_push(synthetic.clone());
         synthetic
@@ -3108,15 +3088,12 @@ impl OptContext {
             return;
         }
         // Drop the superseded stand-in at this position and carry its
-        // accumulated `_forwarded` onto `op` (replace_op_with's `opinfo`
-        // hand-off). The current box is a live synthetic if one was minted,
-        // otherwise the recorder `OpRc` in `resop_refs` (`optimizer.py`
-        // `replace_op_with` / `op.set_forwarded(newop)`). The `ptr_eq`
-        // guard skips the self-clone — and its `RefCell` double-borrow —
-        // when `op` is already the registered stand-in.
-        if let Some(superseded) = self
-            .live_synthetics_swap_remove_pos(pos)
-            .or_else(|| self.resop_refs.get(&pos).cloned())
+        // accumulated `_forwarded` onto `op` (`Optimizer.replace_op_with`
+        // `opinfo` hand-off). The current box is a live synthetic if one
+        // was minted. The `ptr_eq` guard skips the self-clone — and its
+        // `RefCell` double-borrow — when `op` is already the registered
+        // stand-in.
+        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
             && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
@@ -3126,20 +3103,15 @@ impl OptContext {
             if !matches!(carried, majit_ir::forwarding::Forwarded::Op(_)) {
                 *op.forwarded().borrow_mut() = carried;
             }
-            // replace_op_with parity (optimizer.py): forward the
-            // superseded stand-in to `op`. A consumer dispatched before
-            // this supersession bound its operand to `superseded` (the
-            // producer registered at its dispatch-entry rebind); without
-            // this link its box-native walk freezes on the orphaned
-            // stand-in while `find_producer_op` resolves `op`, so a later
-            // operand fold lands on a different host than the OpRef path
-            // observes. Mirrors `emit`'s live-synthetic catch-up so a
-            // supersession chain (stand-in → extra-producer → emitted op)
-            // stays transitively resolvable to the final producer.
+            // replace_op_with: forward the superseded stand-in to `op`. A
+            // consumer dispatched before this supersession bound its operand
+            // to `superseded`; without this link its box-native walk freezes
+            // on the orphaned stand-in. Mirrors `emit`'s live-synthetic
+            // catch-up so a supersession chain (stand-in → extra-producer →
+            // emitted op) stays transitively resolvable to the final producer.
             use majit_ir::forwarding::ForwardingHost;
             superseded.set_forwarded_op(op);
         }
-        self.resop_refs.insert(pos, op.clone());
         self.live_synthetics_push(op.clone());
     }
 
@@ -3158,10 +3130,8 @@ impl OptContext {
             return None;
         }
         if opref.is_constant() {
-            if let Some(cached) = self.const_operands.borrow().get(&opref).cloned() {
-                return Some(cached);
-            }
-            let minted = match opref {
+            // `ConstInt.__init__` mints a fresh instance per use; no intern.
+            return match opref {
                 OpRef::ConstInt(v) => Some(Operand::const_from_value(Value::Int(v))),
                 OpRef::ConstFloat(v) => Some(Operand::const_from_value(Value::Float(v))),
                 OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(
@@ -3169,10 +3139,6 @@ impl OptContext {
                 ))),
                 _ => None,
             };
-            if let Some(ref op) = minted {
-                self.const_operands.borrow_mut().insert(opref, op.clone());
-            }
-            return minted;
         }
         // `resoperation.py AbstractInputArg` is not an `AbstractResOp`;
         // `inputarg_refs` is the owner. Classify before `find_producer_op`
@@ -3239,6 +3205,7 @@ impl OptContext {
     /// phase's own positions (Phase 2 body ops sit above the Phase 1 emit
     /// namespace, so they never collide with an inherited bound slot), and
     /// the `resop_refs[opref]` dedup covers intra-`ops` repeats.
+    #[cfg(test)]
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         // The loop over the caller-threaded `ops` self-guards (no-op on an
         // empty slice) and records each resop producer into `resop_refs` —
@@ -3706,16 +3673,8 @@ impl OptContext {
         self.next_pos = self
             .next_pos
             .max(self.inputarg_base + self.num_inputs + self.new_operations.len() as u32);
-        // Skip positions already claimed by a constant forwarding
-        // (`make_constant`/`seed_constant`'s `set_forwarded_const` write) —
-        // those positions' canonical host is already a constant identity and
-        // cannot be reused for a fresh op. Reads the canonical `_forwarded`
-        // host for the position (`resop_refs[pos]` / `inputarg_refs[pos]`):
-        // `make_constant` writes `Forwarded::Const` to that host
-        // (resoperation.py AbstractResOpOrInputArg).
-        while self.position_is_const_forwarded(self.next_pos) {
-            self.next_pos += 1;
-        }
+        // `History.record` / `ResOperation()` allocate a new object; they
+        // never reuse a const-forwarded slot by scanning a position map.
         debug_assert!(
             !OpRef::raw_is_constant(self.next_pos),
             "reserve_pos overflowed into constant namespace: {}",
@@ -3724,48 +3683,6 @@ impl OptContext {
         let raw = self.next_pos;
         self.next_pos += 1;
         raw
-    }
-
-    /// Whether the canonical `_forwarded` host for raw position `raw`
-    /// (any `resop_refs` entry whose `OpRef` shares this raw, or
-    /// `inputarg_refs[raw]` for an InputArg slot) carries `Forwarded::Const`.
-    /// The position-keyed const probe used by `allocate_next_pos_raw`.
-    fn position_is_const_forwarded(&self, raw: u32) -> bool {
-        use majit_ir::forwarding::Forwarded;
-        // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
-        // can host more than one entry (typed vs untyped). Any host at this
-        // raw carrying `Forwarded::Const` claims the position.
-        //
-        // Every key is the value's own `op.pos` (`install_canonical_producer`,
-        // `materialize_operand_at`), so the hosts at `raw` are exactly the
-        // OpRef variants that carry it. Probing those keys keeps this O(1):
-        // scanning `resop_refs` made `allocate_next_pos_raw` linear in the
-        // trace, and it runs once per `reserve_pos_typed`, so the whole
-        // optimizer emit path was quadratic in trace length.
-        let resop_const = [
-            OpRef::IntOp(raw),
-            OpRef::FloatOp(raw),
-            OpRef::RefOp(raw),
-            OpRef::VoidOp(raw),
-            OpRef::InputArgInt(raw),
-            OpRef::InputArgFloat(raw),
-            OpRef::InputArgRef(raw),
-        ]
-        .iter()
-        .filter_map(|key| self.resop_refs.get(key))
-        .any(|op| {
-            matches!(
-                op.forwarded().borrow(),
-                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
-            )
-        });
-        let inputarg_const = self.inputarg_refs.get(&raw).is_some_and(|ia| {
-            matches!(
-                ia.forwarded.borrow(),
-                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
-            )
-        });
-        resop_const || inputarg_const
     }
 
     /// RPython `box.type` invariant (history.py:220
@@ -3854,19 +3771,11 @@ impl OptContext {
     /// one-node cycle.
     fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
         let op_pos = op_rc.pos().get();
-        // A live SameAs/extra stand-in, else the recorder box in
-        // `resop_refs` (dropped in 4f once `bind_input_resops` no longer
-        // writes the recorder box for `emit(Op)` catch-up).
-        // `optimizer.py replace_op_with` forwards the old box
-        // (`op.set_forwarded(newop)`) when emit clones a new
-        // ResOperation (`copy_and_change`). `ptr_eq` with the recorder
-        // itself is a no-op carry.
-        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos).or_else(|| {
-            self.resop_refs
-                .get(&op_pos)
-                .cloned()
-                .filter(|old| !OpRc::ptr_eq(old, op_rc))
-        }) else {
+        // A live SameAs/extra stand-in. `emit_rc` of the recorder box is
+        // `ptr_eq` with itself — no catch-up. `emit(Op)` mints a new
+        // `OpRc`; the old box is the `live_synthetics` extra/SameAs,
+        // forwarded via `set_forwarded_op` (`Optimizer.replace_op_with`).
+        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) else {
             return;
         };
         let carried = synth.forwarded().borrow().clone();
@@ -4092,6 +4001,7 @@ impl OptContext {
     /// split one position across two boxes. The InputArg branch below
     /// is the exception: it overwrites `inputarg_refs` so the carried
     /// box replaces the stand-in.
+    #[cfg(test)]
     pub(crate) fn register_carried_host(&mut self, o: &Operand) {
         let pos = o.to_opref();
         if pos.is_none() || pos.is_constant() {
@@ -4197,15 +4107,8 @@ impl OptContext {
         };
 
         // shortpreamble.py `preamble_op.set_forwarded(info)` writes the
-        // ResOperation object `add_op_to_short` created. Phase 2's
-        // OptContext does not inherit Phase 1 `resop_refs`, so bind those
-        // boxes here (`bind_input_resops` / TraceIterator `_cache`) before
-        // `set_preamble_forwarded_info` resolves them by position.
-        let preamble_ops: Vec<majit_ir::OpRc> = short_boxes
-            .iter()
-            .map(|(_, produced_op)| produced_op.preamble_op.clone())
-            .collect();
-        self.bind_input_resops(&preamble_ops);
+        // ResOperation object `add_op_to_short` created. The preamble_op
+        // is already the box (`from_bound_op`).
 
         // shortpreamble.py ShortPreambleBuilder.__init__ parity:
         //
@@ -4771,12 +4674,6 @@ impl OptContext {
         let source = preamble_op.pos().get();
         if source.is_constant() || source.is_none() {
             return;
-        }
-        if !matches!(
-            source,
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-        ) {
-            self.bind_input_resops(std::slice::from_ref(preamble_op));
         }
         let b = Operand::from_bound_op(preamble_op);
         // shortpreamble.py ShortPreambleBuilder.__init__:
@@ -5685,6 +5582,7 @@ impl OptContext {
     /// this never returns `None` for a value-bearing OpRef. The sentinel
     /// `OpRef::none()` has no operand (debug-asserted); resolve it with
     /// `resolve_to_operand` / `get_box_replacement_operand` instead.
+    #[cfg(test)]
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
         debug_assert!(
             !opref.is_none(),
@@ -7972,6 +7870,7 @@ impl OptContext {
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
+        #[cfg(test)]
         self.new_operations_index.clear();
         // Reset next_pos to the iteration's first fresh OpRef position
         // (right after the inputarg slice in the OpRef namespace), but
@@ -8033,33 +7932,6 @@ impl OptContext {
             && op.type_ != majit_ir::Type::Void
         {
             return Some(op.type_);
-        }
-        // 3. PtrInfo-derived type (box.type parity for
-        //    virtual heads across phase boundaries). Phase 1 virtualizes
-        //    NewWithVtable / New / NewArray etc. by returning
-        //    `OptimizationResult::Remove` from the relevant `optimize_*`
-        //    method (virtualize.py:208-225) — the op never lands in
-        //    `new_operations` and is therefore absent from
-        //    `phase1_emit_ops`. Phase 2 imports the virtual head's
-        //    `PtrInfo` via `setinfo_from_preamble` (unroll.py) but
-        //    starts with a fresh `value_types` map, so the prior four
-        //    sources all miss. RPython preserves the type intrinsically
-        //    on the Box object; pyre recovers it from the PtrInfo variant
-        //    because every variant maps to a unique RPython box type.
-        //    Ref-typed: Virtual / VirtualArray / VirtualStruct /
-        //    VirtualArrayStruct / Array / Struct / Instance / Constant /
-        //    NonNull / Virtualizable / Str (RPython instances of
-        //    AbstractStructPtrInfo / ArrayPtrInfo / StrPtrInfo carry 'r').
-        //    Int-typed: VirtualRawBuffer / VirtualRawSlice
-        //    (info.py RawBufferPtrInfo + getrawptrinfo() — these
-        //    describe raw pointers stored in 'i' Boxes).
-        let resolved_box = self.get_box_replacement_operand_opt(opref);
-        if let Some(info) = resolved_box.as_ref().and_then(Operand::ptr_info) {
-            return Some(match &*info {
-                crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
-                | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
-                _ => majit_ir::Type::Ref,
-            });
         }
         None
     }
@@ -9877,33 +9749,6 @@ mod opt_context_pos_tests {
     use super::*;
     use majit_ir::OpRef;
     use majit_ir::resoperation::{Op, OpCode};
-
-    /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
-    /// `allocate_next_pos_raw` must treat that as a claimed position.
-    #[test]
-    fn reserve_pos_skips_a_smallconst_forwarded_position() {
-        use majit_ir::forwarding::ForwardingHost;
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
-        let pos = OpRef::int_op(5);
-        let op = Op::new(OpCode::SameAsI, &[]);
-        op.pos().set(pos);
-        op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
-        assert!(
-            matches!(
-                op.forwarded().borrow(),
-                majit_ir::forwarding::Forwarded::SmallConst(_)
-            ),
-            "i32 ConstInt must pack as SmallConst"
-        );
-        ctx.resop_refs.insert(pos, OpRc::new(op));
-        ctx.next_pos = 5;
-        let reserved = ctx.reserve_pos_typed(majit_ir::Type::Int);
-        assert_eq!(
-            reserved.raw(),
-            6,
-            "SmallConst-forwarded position 5 must stay claimed"
-        );
-    }
 
     #[test]
     fn take_preamble_forwarded_opinfo_reads_smallconst() {

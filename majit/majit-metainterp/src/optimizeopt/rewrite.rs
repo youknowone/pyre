@@ -901,6 +901,8 @@ impl OptRewrite {
             let and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
             let and_op = OpRc::new(and_op);
+            // replace_op_with: forward the CALL box to the rewrite (op.set_forwarded(newop)).
+            OptContext::link_replaced_producer(op_rc, &and_op);
             send_extra_operation_from(opt, &and_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -960,6 +962,7 @@ impl OptRewrite {
                     let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
                     let rshift_op = OpRc::new(rshift_op);
+                    OptContext::link_replaced_producer(op_rc, &rshift_op);
                     send_extra_operation_from(opt, &rshift_op, ctx);
                     ctx.last_op_removed = true;
                     return Some(OptimizationResult::Remove);
@@ -973,6 +976,7 @@ impl OptRewrite {
             let neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
             let neg_op = OpRc::new(neg_op);
+            OptContext::link_replaced_producer(op_rc, &neg_op);
             send_extra_operation_from(opt, &neg_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -996,6 +1000,7 @@ impl OptRewrite {
             let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
             let rshift_op = OpRc::new(rshift_op);
+            OptContext::link_replaced_producer(op_rc, &rshift_op);
             send_extra_operation_from(opt, &rshift_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -2423,9 +2428,12 @@ mod tests {
                     // optimizer.py `send_extra_operation`: autogen rewrites
                     // return Restart so chained rules re-fire on the new op
                     // (`sub_const_canonicalize` then `add_zero` / OptPure).
+                    let walked = op_rc;
                     op_rc = OpRc::new(new_op);
+                    crate::optimizeopt::OptContext::link_replaced_producer(&walked, &op_rc);
                     ctx.supersede_restart_producer(&op_rc);
                     op = (*op_rc).clone();
+                    ctx.seed_boxes_canonical(std::slice::from_ref(&Operand::from_bound_op(&op_rc)));
                     ctx.bind_input_resops(std::slice::from_ref(&op_rc));
                 }
                 other => break other,
@@ -2686,7 +2694,7 @@ mod tests {
         oopspecindex: majit_ir::OopSpecIndex,
         divisor: i64,
         supports_efficient_uint_mul_high: bool,
-    ) -> (OptimizationResult, OptContext) {
+    ) -> (OptimizationResult, OptContext, OpRc) {
         let ops = build_specs(&[same_i(), same_i(), same_i()]);
         let mut ctx = OptContext::new(4);
         ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
@@ -2718,7 +2726,7 @@ mod tests {
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let pass = OptRewrite::new();
         let result = pass.propagate_forward(&call, &op_rc, &mut None, &mut ctx);
-        (result, ctx)
+        (result, ctx, op_rc)
     }
 
     /// `rewrite.py` / `:758-766` reach `intdiv.modulo_operations` /
@@ -2733,11 +2741,32 @@ mod tests {
             majit_ir::OopSpecIndex::IntPyMod,
         ] {
             for mul_high in [false, true] {
-                let (result, ctx) = run_int_py_call(oopspecindex, 100, mul_high);
+                let (result, ctx, _) = run_int_py_call(oopspecindex, 100, mul_high);
                 assert_remove(&result);
                 assert!(
                     emitted_uint_mul_high(&ctx),
                     "{oopspecindex:?} left the residual call (mul_high={mul_high})"
+                );
+            }
+        }
+        for (oopspecindex, expected) in [
+            (majit_ir::OopSpecIndex::IntPyMod, OpCode::IntAnd),
+            (majit_ir::OopSpecIndex::IntPyDiv, OpCode::IntRshift),
+        ] {
+            for mul_high in [false, true] {
+                let (result, ctx, call_op) = run_int_py_call(oopspecindex, 8, mul_high);
+                assert_remove(&result);
+                let emitted = ctx
+                    .new_operations
+                    .iter()
+                    .find(|op| op.opcode == expected)
+                    .unwrap_or_else(|| {
+                        panic!("{oopspecindex:?} did not emit {expected:?} (mul_high={mul_high})")
+                    });
+                let replacement = Operand::from_bound_op(&call_op).get_box_replacement(false);
+                assert!(
+                    replacement.same_box(&Operand::from_bound_op(emitted)),
+                    "{oopspecindex:?} CALL box did not resolve to the emitted {expected:?} (mul_high={mul_high})"
                 );
             }
         }

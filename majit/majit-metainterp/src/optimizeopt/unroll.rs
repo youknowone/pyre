@@ -4587,19 +4587,11 @@ impl OptUnroll {
     }
 
     /// resoperation.py `OpHelpers.inputarg_from_tp` — a fresh typed InputArg
-    /// box.
-    ///
-    /// The box is registered as the host of its position. Virtual field lists
-    /// and resume numbering still name it by `OpRef`, and an unregistered
-    /// InputArg position resolves to a freshly minted box on every lookup.
-    /// `register_box` and `_gettagged` would then key two different objects,
-    /// and the guard's resume data would carry `UNASSIGNED` for the field.
+    /// box. The returned Operand holds that object.
     pub(crate) fn inputarg_from_tp(ctx: &mut OptContext, tp: Type) -> Operand {
         let pos = ctx.alloc_op_position_typed(tp).raw();
         let inputarg = majit_ir::InputArg::from_type_rc(tp, pos);
-        let operand = Operand::from_bound_inputarg(&inputarg);
-        ctx.register_carried_host(&operand);
-        operand
+        Operand::from_bound_inputarg(&inputarg)
     }
 
     pub fn import_short_preamble_state(
@@ -8708,16 +8700,13 @@ mod tests {
         assert!(imported_result.bound_inputarg().is_some());
         assert_ne!(imported_result.to_opref(), OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
-        let forced = ctx2.force_op_from_preamble_op(&pop).to_opref();
+        let forced_box = ctx2.force_op_from_preamble_op(&pop);
         // force_op_from_preamble may return the imported position (not necessarily 30)
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).
         // shortpreamble.py record the SameAs Box at use-box time, not
         // at produce_op time — verify the lazy population fires.
-        let forced_box = ctx2
-            .get_box_replacement_operand_opt(forced)
-            .unwrap_or_else(|| Operand::bound_from_opref(forced));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(&forced_box, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();

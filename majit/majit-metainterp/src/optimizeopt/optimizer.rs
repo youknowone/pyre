@@ -2922,43 +2922,6 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
-        for inputarg in &ctx.inputargs {
-            if let Some(inputarg) = inputarg.bound_inputarg() {
-                ctx.inputarg_refs.entry(inputarg.index).or_insert(inputarg);
-            }
-        }
-        // The `&[Op]` wrap carries the fixture's InputArg objects. Install
-        // those before `ensure_inputarg_bindings` mints a second host per
-        // slot (`or_insert` / same-type keep).
-        for op in ops {
-            for arg in op.args_slice() {
-                if let Some(ia) = arg.bound_inputarg() {
-                    ctx.inputarg_refs.entry(ia.index).or_insert(ia);
-                }
-            }
-            if let Some(failargs) = op.guard_fail_args() {
-                for arg in failargs {
-                    if let Some(ia) = arg.bound_inputarg() {
-                        ctx.inputarg_refs.entry(ia.index).or_insert(ia);
-                    }
-                }
-            }
-        }
-        // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
-        // chain steps through `Forwarded::InputArg(_)` (the orphan-box
-        // forwarding fallback has been retired). Phase 2 enters with a
-        // fresh per-iteration inputarg set whose TreeLoop-owned strong
-        // `InputArgRc`s were dropped, so re-bind them here.
-        ctx.ensure_inputarg_bindings();
-        // Bind every input op's resop operand so chain-walker
-        // terminals are guaranteed bound before any `&self` reader
-        // (e.g. `OptIntBounds::getintbound_box`) reaches a
-        // `set_forwarded_*` write. `TraceIterator::next()`
-        // (`opencoder.rs`) plants unbound resop slots; without this
-        // pre-pass, `get_box_replacement_operand_opt(&self)` could return an
-        // unbound terminal that fails `write_forwarded`'s bound-
-        // precondition assert.
-        ctx.bind_input_resops(ops);
         // unroll.py:188 — the bridge iterator's fresh inputargs must enter
         // optimization without forwarding.  This is deliberately a
         // debug-only invariant, matching the upstream assertion without
@@ -2970,9 +2933,6 @@ impl Optimizer {
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
-        // Single write site for the OptContext field: rebuild its O(1)
-        // producer index in lockstep (never mutated afterwards).
-        ctx.rebuild_phase1_emit_ops_index();
         // 3. (removed) 5: transformed trace ops carry `op.type_`
         //    intrinsically (resoperation.py:1693 parity); the pipeline
         //    emits each op into `new_operations` before moving to the
@@ -4977,10 +4937,14 @@ impl Optimizer {
                     // 5: Restart's new op carries `Op.type_` from
                     // construction; no side-table refresh needed.
                     let restart_op_rc = OpRc::new(op);
-                    // replace_op_with parity: the rewrite supersedes the
-                    // original as the producer at its position so the
-                    // re-dispatch reads/writes one canonical `_forwarded` host
-                    // and the bound it accumulates survives emit's catch-up.
+                    // replace_op_with: the walked-in producer (recorder /
+                    // iterator box) is in hand. Forward it onto the rewrite
+                    // before re-dispatch so later args that still name the
+                    // original follow `_forwarded` (`op.set_forwarded(newop)`).
+                    // `install_canonical_producer` only sees `live_synthetics`
+                    // stand-ins; the recorder box is not one of those.
+                    let walked = minted.as_ref().unwrap_or(op_rc);
+                    OptContext::link_replaced_producer(walked, &restart_op_rc);
                     ctx.supersede_restart_producer(&restart_op_rc);
                     self.propagate_from_pass_range(0, end_pass, &restart_op_rc, ctx)?;
                     // Run any postprocess callbacks accumulated in the outer
@@ -5801,10 +5765,6 @@ impl Optimizer {
             return;
         };
         ctx.new_operations.insert(i, OpRc::new(guard_op));
-        // `new_operations_index` maps position -> op with last-occurrence-wins
-        // semantics, which an insert in the middle cannot maintain
-        // incrementally.
-        ctx.rebuild_new_operations_index();
     }
 
     fn collect_optimizer_knowledge_for_resume(
@@ -7698,11 +7658,10 @@ mod tests {
         let new_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr.clone()));
         new_rc.pos().set(OpRef::ref_op(10));
         ctx.register_extra_producer(&new_rc);
-        let b10 = ctx.materialize_operand_at(OpRef::ref_op(10));
-        // The field value box is materialized THROUGH the context so it binds
-        // to the context's producer host; force_box's `resolve_operand_operand` then
-        // resolves it to a bound box (sheds to Operand::Op), not a fresh
-        // position-only `from_opref` box.
+        let b10 = Operand::from_bound_op(&new_rc);
+        // The field value box is the bound host the test builds; force_box's
+        // `resolve_operand_operand` then resolves it to a bound box (sheds to
+        // Operand::Op), not a fresh position-only `from_opref` box.
         let field_value = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.set_ptr_info(
             &b10,
@@ -7713,10 +7672,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let op = Op::new(
-            OpCode::GuardNonnull,
-            &[ctx.materialize_operand_at(OpRef::ref_op(10))],
-        );
+        let op = Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b10));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
@@ -7786,7 +7742,7 @@ mod tests {
         ));
         call_rc.pos().set(OpRef::int_op(10));
         ctx.register_extra_producer(&call_rc);
-        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
+        let b10 = Operand::from_bound_op(&call_rc);
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0x2000, 24, call_rc.getdescr())),
@@ -7796,7 +7752,7 @@ mod tests {
         let op = Op::with_descr(
             OpCode::RawLoadI,
             &[
-                ctx.materialize_operand_at(OpRef::int_op(10)),
+                b10,
                 Operand::const_from_value(majit_ir::Value::Int(16)),
             ],
             array_descr,

@@ -794,10 +794,10 @@ pub struct OptHeapState {
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
     /// Postponed operation: held back until the next GUARD_NO_EXCEPTION.
-    /// RPython heap.py: `postponed_op` — delays emission of operations
-    /// that may raise (CALL_MAY_FORCE, comparison ops) until we see
-    /// a GUARD_NO_EXCEPTION, ensuring correct exception semantics.
-    postponed_op: Option<Op>,
+    /// `heap.py postponed_op = op` keeps the op object itself
+    /// (`pure.py postponed_op: Option<OpRc>`), so a later
+    /// `emit_extra(postponed_op, emit=False)` appends that same box.
+    postponed_op: Option<OpRc>,
     // ── Aliasing analysis state — RPython: PtrInfo flags ──
     seen_allocation: BitSet,
     /// heapcache.py `_check_flag(box, HF_IS_UNESCAPED)` — the set of
@@ -1879,7 +1879,20 @@ impl OptHeapState {
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
         if needs_postponed && let Some(p) = self.postponed_op.take() {
-            self.emit_extra(opt, OpRc::new(p), ctx);
+            self.emit_extra(opt, p, ctx);
+        }
+    }
+
+    /// `heap.py self.postponed_op = op` keeps the op object itself.
+    /// A previous pass's Replace mints once and `replace_op_with`s the
+    /// walked-in producer onto it (`pure.py postponed_received_nextop`).
+    fn postpone_held_op(op: &Op, op_rc: &OpRc) -> OpRc {
+        if std::ptr::eq(op, op_rc.as_ref()) {
+            op_rc.clone()
+        } else {
+            let created = OpRc::new(op.clone());
+            OptContext::link_replaced_producer(op_rc, &created);
+            created
         }
     }
 
@@ -2395,7 +2408,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 self.emit_lazy_setfield(opt, &lazy_op, ctx);
@@ -2685,7 +2698,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
@@ -2856,7 +2869,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
@@ -3020,7 +3033,7 @@ impl OptHeapState {
                         if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
-                            self.emit_extra(opt, OpRc::new(p), ctx);
+                            self.emit_extra(opt, p, ctx);
                         }
                     }
                     self.emit_lazy_setfield(opt, &lazy_op, ctx);
@@ -3539,7 +3552,7 @@ impl OptHeapState {
                 // residuals carry `effectinfo_from_writeanalyze` descrs.
                 self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
-                self.postponed_op = Some(op.clone());
+                self.postponed_op = Some(Self::postpone_held_op(op, op_rc));
                 if Self::call_has_random_effects(op) {
                     self.force_all_lazy_sets(opt, ctx);
                     self.clean_caches(ctx);
@@ -3813,7 +3826,7 @@ impl OptHeapState {
                         op.pos().get()
                     );
                 }
-                self.emit_extra(opt, OpRc::new(postponed), ctx);
+                self.emit_extra(opt, postponed, ctx);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3822,10 +3835,10 @@ impl OptHeapState {
             OptimizationResult::Emit(emit_op)
                 if emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf() =>
             {
-                Some(emit_op.clone())
+                Some(Self::postpone_held_op(emit_op, op_rc))
             }
             OptimizationResult::PassOn if op.opcode.is_comparison() || op.opcode.is_ovf() => {
-                Some(op.clone())
+                Some(Self::postpone_held_op(op, op_rc))
             }
             _ => None,
         };
@@ -3885,7 +3898,7 @@ impl OptHeapState {
         self.corresponding_array_descrs.clear();
         self.force_all_lazy_sets(opt, ctx);
         if let Some(postponed) = self.postponed_op.take() {
-            self.emit_extra(opt, OpRc::new(postponed), ctx);
+            self.emit_extra(opt, postponed, ctx);
         }
     }
 
