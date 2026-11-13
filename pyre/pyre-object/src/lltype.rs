@@ -745,7 +745,7 @@ pub trait GcArrayType {
     fn payload_layout(n: i64) -> Option<std::alloc::Layout>;
     /// Store the GcArray length header. Called only from [`malloc_varsize_clear`].
     unsafe fn write_length_header(ptr: *mut Self, n: i64);
-    /// `std::alloc` fallback; items are not zeroed.
+    /// `std::alloc` fallback; the returned block is zero-filled (`zero=True`).
     unsafe fn alloc_fallback(layout: std::alloc::Layout) -> Option<*mut Self>;
 }
 
