@@ -8342,6 +8342,11 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
+    // Nested in an active `SubWalkDriver` (generator-next inlining a body
+    // that type-calls `list(...)`), the yield would cut this gateway args
+    // array and restore a heap cache that still names it. The wrapper body
+    // reads r0 at pc 0 (`arraylen_gc`).
+    keep_residual_recordings_across_suspend::<Sym>();
 
     // Build-time canonical helper JitCodes use the one global Assembler
     // descriptor pool.  Temporarily give the wrapper sub-frame that pool;
@@ -8877,6 +8882,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
+    // Same residual-step cut as `walk_translated_builtin_wrapper`.
+    keep_residual_recordings_across_suspend::<Sym>();
 
     let saved_entry = ctx.entry_py_pc;
     let saved_marker = ctx.outer_resume_marker_jit_pc;
