@@ -1848,6 +1848,28 @@ fn gnu_libpthread_version() -> Option<String> {
     None
 }
 
+/// `vm.py app_hookargs` `UnraisableHookArgs`. Upstream builds the applevel class during
+/// translation (`gateway.py ApplevelCache.build` is `@not_rpython`, `rlib/cache.py`
+/// `Cache.getorbuild` is `specialize:memo`), so `error.py OperationError.write_unraisable`
+/// only looks it up. `register_module` builds it here; the reporter never runs the
+/// app-level class body.
+pub(crate) fn unraisable_hook_args_type() -> PyObjectRef {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq_with_extra(
+            "sys.UnraisableHookArgs",
+            &[
+                "exc_type",
+                "exc_value",
+                "exc_traceback",
+                "err_msg",
+                "object",
+            ],
+            &["extra_line"],
+        )
+    })
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2045,6 +2067,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "big"
         }),
     );
+    // `vm.py app_hookargs`: built with the module, not on the first unraisable report.
+    unraisable_hook_args_type();
     // sys.version_info — structseq(major, minor, micro, releaselevel,
     // serial); a tuple subclass so `>= (3, 15)` / `[0]` and `.major` both work.
     {

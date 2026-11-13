@@ -3394,12 +3394,12 @@ impl PyError {
         w_object = live[3];
         let mut w_first_line = live[4];
         let mut w_extra_line_obj = live[5];
-        // The hook-args class is created on first use, which allocates, so it
-        // is fetched while the fields are still rooted and before `seq`
-        // exists.
+        // `register_module` built the hook-args class; a report raised before
+        // `sys` is registered builds it here, which allocates, so it is fetched
+        // while the fields are still rooted and before `seq` exists.
         let mut w_hook_class = pyre_object::with_roots!(
             space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
-            => unraisable_hook_args_type()
+            => crate::module::sys::vm::unraisable_hook_args_type()
         );
         // `error.py OperationError.write_unraisable`:
         // `space.call_function(w_hook_class, space.newtuple(info_w))` then
@@ -3911,23 +3911,6 @@ fn wrap_pos(num: i64) -> PyObjectRef {
     } else {
         pyre_object::w_int_new(num)
     }
-}
-
-fn unraisable_hook_args_type() -> PyObjectRef {
-    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
-            "sys.UnraisableHookArgs",
-            &[
-                "exc_type",
-                "exc_value",
-                "exc_traceback",
-                "err_msg",
-                "object",
-            ],
-            &["extra_line"],
-        )
-    })
 }
 
 /// Resolve an exception instance's actual Python class name for display.
