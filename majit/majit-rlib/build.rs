@@ -62,6 +62,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_sched_getparam)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_memfd_create)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_unshare)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_qrtr)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -89,9 +90,11 @@ fn main() {
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
     }
-    if target_is_unix_or_windows() {
-        write_rsocket_cconfig();
-    }
+    let have_sockaddr_qrtr = if target_is_unix_or_windows() {
+        write_rsocket_cconfig()
+    } else {
+        false
+    };
     majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
         ..Default::default()
@@ -112,6 +115,10 @@ fn main() {
         haves.memfd_create as u8
     );
     println!("cargo::metadata=HAVE_UNSHARE={}", haves.unshare as u8);
+    println!(
+        "cargo::metadata=HAVE_SOCKADDR_QRTR={}",
+        have_sockaddr_qrtr as u8
+    );
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -2294,12 +2301,14 @@ fn rsocket_eci() -> ExternalCompilationInfo {
             includes.push("sys/kern_control.h".into());
         } else if target_os == "linux" || target_os == "android" {
             includes.push("net/ethernet.h".into());
+            // socketmodule.h `HAVE_LINUX_VM_SOCKETS_H`
+            includes.push("linux/vm_sockets.h".into());
         }
         let header: String = includes
             .iter()
             .map(|filename| format!("#include <{filename}>\n"))
             .collect();
-        let cond_header = "\
+        let mut cond_header = "\
 #ifdef AF_NETLINK
 #include <linux/netlink.h>
 #endif
@@ -2311,6 +2320,12 @@ fn rsocket_eci() -> ExternalCompilationInfo {
 #endif
 "
         .to_string();
+        // Appended to COND_HEADER so post_include_bits stays the upstream
+        // HEADER / COND_HEADER pair. socketmodule.h `#undef AF_VSOCK` when
+        // `HAVE_LINUX_VM_SOCKETS_H` is absent.
+        if target_os != "linux" && target_os != "android" {
+            cond_header.push_str("#undef AF_VSOCK\n");
+        }
         let libraries = if target_os == "solaris" || target_os == "illumos" {
             vec!["socket".into(), "nsl".into()]
         } else {
@@ -2351,7 +2366,8 @@ fn rsocket_intmask(name: &str, value: i128) -> i64 {
 }
 
 /// `_rsocket_rffi.py` `CConfig` / `configure(CConfig)`, then `constants`.
-fn write_rsocket_cconfig() {
+/// Returns whether `cConfig.sockaddr_qrtr` is a struct (`HAVE_SOCKADDR_QRTR`).
+fn write_rsocket_cconfig() -> bool {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
     let has_af_packet = target_os == "linux" || target_os == "android";
@@ -2385,6 +2401,19 @@ fn write_rsocket_cconfig() {
             CConfigEntry::DefinedConstantInteger((*name).into()),
         ));
     }
+    // `_rsocket_rffi.py` `CConfig.sockaddr_qrtr`
+    entries.push((
+        "sockaddr_qrtr".into(),
+        CConfigEntry::struct_type(
+            "struct sockaddr_qrtr",
+            vec![
+                ("sq_family".into(), FieldType::int()),
+                ("sq_node".into(), FieldType::int()),
+                ("sq_port".into(), FieldType::int()),
+            ],
+            Some("AF_QIPCRTR".into()),
+        ),
+    ));
 
     let cconfig = CConfig {
         compilation_info: rsocket_eci(),
@@ -2429,9 +2458,20 @@ fn write_rsocket_cconfig() {
     }
     text.push_str("];\n");
 
+    let have_sockaddr_qrtr = match cconfig_lookup(&results, "sockaddr_qrtr") {
+        ConfigValue::Struct(layout) => {
+            text.push_str(&layout.rust_struct_source("sockaddr_qrtr", &[]));
+            println!("cargo:rustc-cfg=rsocket_have_sockaddr_qrtr");
+            true
+        }
+        ConfigValue::None => false,
+        other => panic!("sockaddr_qrtr: {other:?}"),
+    };
+
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rsocket_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    have_sockaddr_qrtr
 }
 
 /// Emit `&[(&str, i32)]` of keys whose `DefinedConstantInteger` is not None.

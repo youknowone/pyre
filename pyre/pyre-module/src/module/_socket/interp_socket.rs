@@ -411,7 +411,7 @@ enum SocketmoduleGuard {
     /// Never published by socketmodule.c.
     Never,
     /// Published only with a family header (`USE_BLUETOOTH`,
-    /// `HAVE_LINUX_TIPC_H`, `HAVE_LINUX_CAN_*_H`, `HAVE_LINUX_VM_SOCKETS_H`,
+    /// `HAVE_LINUX_TIPC_H`, `HAVE_LINUX_CAN_*_H`,
     /// `HAVE_AF_HYPERV`) that `_rsocket_rffi.eci` does not include.
     FamilyHeader,
     /// Published only when this other constant is defined.
@@ -500,16 +500,15 @@ const SOCKETMODULE_GUARDS: &[(&str, SocketmoduleGuard)] = &[
     ("TIPC_WAIT_FOREVER", SocketmoduleGuard::FamilyHeader),
     ("TIPC_WITHDRAWN", SocketmoduleGuard::FamilyHeader),
     ("TIPC_ZONE_SCOPE", SocketmoduleGuard::FamilyHeader),
-    // socketmodule.h HAVE_LINUX_VM_SOCKETS_H
-    ("AF_VSOCK", SocketmoduleGuard::FamilyHeader),
-    ("IOCTL_VM_SOCKETS_GET_LOCAL_CID", SocketmoduleGuard::FamilyHeader),
-    ("SO_VM_SOCKETS_BUFFER_MAX_SIZE", SocketmoduleGuard::FamilyHeader),
-    ("SO_VM_SOCKETS_BUFFER_MIN_SIZE", SocketmoduleGuard::FamilyHeader),
-    ("SO_VM_SOCKETS_BUFFER_SIZE", SocketmoduleGuard::FamilyHeader),
-    ("VMADDR_CID_ANY", SocketmoduleGuard::FamilyHeader),
-    ("VMADDR_CID_HOST", SocketmoduleGuard::FamilyHeader),
-    ("VMADDR_PORT_ANY", SocketmoduleGuard::FamilyHeader),
-    ("VM_SOCKETS_INVALID_VERSION", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c `#ifdef AF_VSOCK`
+    ("IOCTL_VM_SOCKETS_GET_LOCAL_CID", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_MAX_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_MIN_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_CID_ANY", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_CID_HOST", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_PORT_ANY", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VM_SOCKETS_INVALID_VERSION", SocketmoduleGuard::Requires("AF_VSOCK")),
     // socketmodule.c HAVE_AF_HYPERV
     ("AF_HYPERV", SocketmoduleGuard::FamilyHeader),
     ("HV_PROTOCOL_RAW", SocketmoduleGuard::FamilyHeader),
@@ -4217,6 +4216,36 @@ fn pack_inet_addr(
         return Ok((storage, addrlen));
     }
 
+    // `interp_socket.py` `addr_from_object` `AF_QIPCRTR` / `QrtrAddress`.
+    #[cfg(rsocket_have_sockaddr_qrtr)]
+    if family as i64 == majit_rlib::rsocket::af_qipcrtr() {
+        let pieces = pyre_interpreter::baseobjspace::unpackiterable(addr, -1)?;
+        if pieces.len() != 2 {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "AF_QIPCRTR address must be a tuple of length 2 not {}",
+                pieces.len()
+            )));
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::pin_roots(&[pieces[0], pieces[1]]);
+        let node = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot,
+        ))?;
+        let port = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 1,
+        ))?;
+        let qrtr = majit_rlib::rsocket::QrtrAddress::new(node, port);
+        let src = qrtr.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (&raw mut storage).cast::<u8>(),
+                src.len(),
+            );
+        }
+        return Ok((storage, src.len() as rffi::SockLen));
+    }
+
     if !unsafe { pyre_object::is_tuple(addr) } {
         // [3.14-spec] PyPy's tuple unpacking exposes its generic iterable
         // error here; 3.14 names the operation and rejected type
@@ -4490,6 +4519,20 @@ fn unpack_inet_addr(
         #[cfg(windows)]
         if family == AF_BTH {
             return unpack_bluetooth_addr(storage);
+        }
+        #[cfg(rsocket_have_sockaddr_qrtr)]
+        if family as i64 == majit_rlib::rsocket::af_qipcrtr() {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (storage as *const rffi::sockaddr_storage).cast::<u8>(),
+                    core::mem::size_of::<rffi::sockaddr_storage>(),
+                )
+            };
+            let (node, port) = majit_rlib::rsocket::QrtrAddress::from_sockaddr(bytes).get_data();
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(node));
+            fields.push(pyre_object::w_int_new(port));
+            return pyre_object::w_tuple_new(fields.take());
         }
         pyre_object::w_tuple_new(vec![])
     }

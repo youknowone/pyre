@@ -857,6 +857,60 @@ pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
     Ok(result)
 }
 
+/// `rsocket.py` `HAS_AF_QIPCRTR` / `AF_QIPCRTR` from `constants`.
+#[cfg(rsocket_have_sockaddr_qrtr)]
+pub fn af_qipcrtr() -> i64 {
+    constants()
+        .find(|(name, _)| *name == "AF_QIPCRTR")
+        .map(|(_, value)| value)
+        .expect("AF_QIPCRTR")
+}
+
+/// `rsocket.py` `class QrtrAddress(Address)`.
+#[cfg(rsocket_have_sockaddr_qrtr)]
+pub struct QrtrAddress {
+    addr: crate::_rsocket_rffi::sockaddr_qrtr,
+}
+
+#[cfg(rsocket_have_sockaddr_qrtr)]
+impl QrtrAddress {
+    /// `QrtrAddress.__init__`.
+    pub fn new(node: i64, port: i64) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_qrtr = unsafe { std::mem::zeroed() };
+        crate::setintfield!(&mut addr, c_sq_family, af_qipcrtr());
+        crate::setintfield!(&mut addr, c_sq_node, node);
+        crate::setintfield!(&mut addr, c_sq_port, port);
+        Self { addr }
+    }
+
+    /// `QrtrAddress.get_data`. Unsigned fields widen to a non-negative `i64`.
+    pub fn get_data(&self) -> (i64, i64) {
+        (
+            crate::rffi::cast::<i64>(self.addr.c_sq_node),
+            crate::rffi::cast::<i64>(self.addr.c_sq_port),
+        )
+    }
+
+    /// Copy a `sockaddr_qrtr` out of `sockaddr_storage` bytes.
+    pub fn from_sockaddr(bytes: &[u8]) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_qrtr = unsafe { std::mem::zeroed() };
+        let n = bytes.len().min(std::mem::size_of_val(&addr));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut addr).cast::<u8>(), n);
+        }
+        Self { addr }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (&raw const self.addr).cast::<u8>(),
+                std::mem::size_of_val(&self.addr),
+            )
+        }
+    }
+}
+
 #[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 fn defining_module() -> &'static str {
     module_path!()
