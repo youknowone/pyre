@@ -1043,7 +1043,7 @@ impl<'a> Lowering<'a> {
                         .static_addrs
                         .scalar_field_stores
                         .iter()
-                        .find(|store| fd.item_meta.name_path() == store.function_path)
+                        .find(|store| fd.item_meta.name_path_str() == store.function_path)
                 {
                     if args.len() != 2 {
                         return Err(LowerError::Schema(format!(
@@ -1103,7 +1103,7 @@ impl<'a> Lowering<'a> {
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
-                    let want_align = match fd.item_meta.name_path().as_str() {
+                    let want_align = match fd.item_meta.name_path_str() {
                         "core::mem::size_of" => Some(false),
                         "core::mem::align_of" => Some(true),
                         _ => None,
@@ -1185,7 +1185,7 @@ impl<'a> Lowering<'a> {
                     && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                     && matches!(
-                        fd.item_meta.name_path().as_str(),
+                        fd.item_meta.name_path_str(),
                         "core::intrinsics::transmute" | "core::mem::transmute"
                     )
                 {
@@ -1288,7 +1288,7 @@ impl<'a> Lowering<'a> {
                     && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                     && matches!(
-                        fd.item_meta.name_path().as_str(),
+                        fd.item_meta.name_path_str(),
                         "core::intrinsics::saturating_add" | "core::intrinsics::saturating_sub"
                     )
                 {
@@ -1299,10 +1299,7 @@ impl<'a> Lowering<'a> {
                         args[0].clone(),
                         args[1].clone(),
                         &call.dest.ty,
-                        fd.item_meta
-                            .name_path()
-                            .as_str()
-                            .ends_with("saturating_add"),
+                        fd.item_meta.name_path_str().ends_with("saturating_add"),
                     );
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
@@ -1326,7 +1323,7 @@ impl<'a> Lowering<'a> {
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
-                    let path = fd.item_meta.name_path();
+                    let path = fd.item_meta.name_path_str();
                     let folded = if path_ends_with_segments(&path, "jit::we_are_jitted") {
                         Some(true)
                     } else if path_ends_with_segments(&path, "majit_gc::gc_alloc_failed_pending") {
@@ -4425,7 +4422,7 @@ impl<'a> Lowering<'a> {
                     && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
-                    let path = fd.item_meta.name_path();
+                    let path = fd.item_meta.name_path_str();
                     let src = first_arg_ty.as_ref().map(|ty| self.value_type_of(ty));
                     let dst = self.value_type_of(&call.dest.ty);
                     if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
@@ -4541,7 +4538,7 @@ impl<'a> Lowering<'a> {
                     && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
-                    let path = fd.item_meta.name_path();
+                    let path = fd.item_meta.name_path_str();
                     match host_rthread_threadlocalref_llop(&path) {
                         Some(ThreadLocalRefLlop::Get) if self.var_is_const_int(&args[0]) => {
                             let result_ty = self.value_type_of(&call.dest.ty);
@@ -6554,7 +6551,7 @@ impl<'a> Lowering<'a> {
                         .as_ref()
                         .and_then(|t| self.tyref_ref_adt_def_id(t))
                         .and_then(|id| self.llbc.type_by_id(id))
-                        .map(|td| td.item_meta.name_path())
+                        .map(|td| td.item_meta.name_path_str())
                     {
                         Some(name_path) => {
                             let canon = decl_path_for_tombstone(&name_path, self.tombstoned_leaves);
@@ -9380,7 +9377,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let owner_is_cell = |owner: &str| owner == "Cell" || owner.ends_with("::Cell");
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if let Some((owner, leaf)) = path.rsplit_once("::")
             && leaf == method
             && owner_is_cell(owner)
@@ -9449,7 +9446,7 @@ impl<'a> Lowering<'a> {
         if self.callee_is_host_builtin(fd) {
             return None;
         }
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if !self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
             return None;
         }
@@ -9580,7 +9577,7 @@ impl<'a> Lowering<'a> {
             }
             return self.opaque_nullary_impl_target(fd);
         }
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
         if self.spec_body
             && let Some(segments) = self.enqueue_spec(fd, &generics)
@@ -9610,7 +9607,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         foreign_opaque_method_result_valuetype(&fd.signature.output, self.llbc)?;
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
@@ -9640,7 +9637,7 @@ impl<'a> Lowering<'a> {
         // An impl method has no HELPER_FNADDRS row (`HelperFnAddrSkip::Generic`
         // and the impl-path split), so `FunctionDesc.cachedgraph` is its
         // specialized graph.
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if self.dont_look_inside.contains(&strip_crate_prefix(&path))
             && impl_method_owner_for_fundecl(self.llbc, fd).is_none()
         {
@@ -9782,7 +9779,7 @@ impl<'a> Lowering<'a> {
         let method_hint = if method_hint.is_some()
             && self
                 .dont_look_inside
-                .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+                .contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
         {
             None
         } else {
@@ -9799,7 +9796,7 @@ impl<'a> Lowering<'a> {
             spec_segments(self.llbc, fd, &leaf)
         } else {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .split("::")
                 .map(|s| s.to_string())
                 .collect()
@@ -9990,7 +9987,7 @@ impl<'a> Lowering<'a> {
         let fd = self.llbc.fn_by_id(*id)?;
         if self
             .dont_look_inside
-            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+            .contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
         {
             return None;
         }
@@ -10038,7 +10035,7 @@ impl<'a> Lowering<'a> {
         if type_decl_is_fieldless_enum(td, self.llbc) {
             return None;
         }
-        let name = td.item_meta.name_path();
+        let name = td.item_meta.name_path_str();
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             return None;
@@ -10140,7 +10137,7 @@ impl<'a> Lowering<'a> {
                 ) {
                     let owner = td
                         .item_meta
-                        .name_path()
+                        .name_path_str()
                         .rsplit("::")
                         .next()
                         .unwrap_or("")
@@ -10167,7 +10164,7 @@ impl<'a> Lowering<'a> {
                 }
                 let owner = td
                     .item_meta
-                    .name_path()
+                    .name_path_str()
                     .rsplit("::")
                     .next()
                     .unwrap_or("")

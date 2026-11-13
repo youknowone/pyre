@@ -1020,7 +1020,7 @@ impl<'a> Lowering<'a> {
         // Fail-closed: no splitting generic yields "" → bare owner.
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
@@ -1284,7 +1284,7 @@ impl<'a> Lowering<'a> {
         let err_is_utf8 = self
             .tyref_adt_def_id(&err_ty)
             .and_then(|id| self.llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path().ends_with("::Utf8Error"));
+            .is_some_and(|td| td.item_meta.name_path_str().ends_with("::Utf8Error"));
         if !err_is_utf8 {
             return Ok(false);
         }
@@ -1296,7 +1296,7 @@ impl<'a> Lowering<'a> {
         };
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
@@ -1378,7 +1378,7 @@ impl<'a> Lowering<'a> {
         };
         let segments: Vec<String> = fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .split("::")
             .map(String::from)
             .collect();
@@ -1391,7 +1391,7 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.type_by_id(def_id) else {
             return Ok(false);
         };
-        let layout_owner = td.item_meta.name_path();
+        let layout_owner = td.item_meta.name_path_str();
         if !crate::front::from_size_align::is_layout_adt_owner(&layout_owner) {
             return Ok(false);
         }
@@ -1529,7 +1529,7 @@ impl<'a> Lowering<'a> {
         };
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let tuple_owner = format!("Tuple{suffix}");
@@ -1675,7 +1675,7 @@ impl<'a> Lowering<'a> {
         // Fail-closed: no splitting generic yields "" → bare owner.
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
@@ -1853,7 +1853,7 @@ impl<'a> Lowering<'a> {
         };
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
@@ -2055,7 +2055,7 @@ impl<'a> Lowering<'a> {
         };
         let owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
@@ -2287,7 +2287,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == path)
+            .is_some_and(|fd| fd.item_meta.name_path_str() == path)
     }
 
     /// Resolve the reflexive blanket `IntoIterator::into_iter`

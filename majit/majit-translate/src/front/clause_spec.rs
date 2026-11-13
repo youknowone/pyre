@@ -1488,7 +1488,7 @@ pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     let row = llbc.trait_impls_raw().get(impl_id as usize)?;
     let impl_trait = row.get("impl_trait")?;
     let trait_id = impl_trait.get("id")?.as_u64()?;
-    let name = llbc.trait_by_id(trait_id)?.item_meta.name_path();
+    let name = llbc.trait_by_id(trait_id)?.item_meta.name_path_str();
     let types = impl_trait
         .pointer("/generics/types")
         .and_then(Value::as_array)

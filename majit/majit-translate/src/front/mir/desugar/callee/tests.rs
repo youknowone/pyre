@@ -55,14 +55,18 @@ fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
     let llbc = crate::test_support::load_ullbc(path);
     let wrapper = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+        .find(|fd| {
+            fd.item_meta
+                .name_path_str()
+                .ends_with("::__majit_wrap_random")
+        })
         .expect("_random::__majit_wrap_random");
     assert!(super::fun_decl_is_builtin_code_fn(wrapper, llbc));
     let non_member = llbc
         .iter_local_fns()
         .find(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("::function::funccall_valuestack")
         })
         .expect("function::funccall_valuestack");

@@ -628,7 +628,7 @@ impl Llbc {
                 .flatten()
                 .find(|fd| {
                     fd.item_meta
-                        .name_path()
+                        .name_path_str()
                         .ends_with("::call::register_eval_override")
                 })
                 .and_then(|fd| fd.signature.inputs.first())
@@ -1007,7 +1007,7 @@ impl Llbc {
     pub fn local_fn(&self, name: &str) -> Option<&FunDecl> {
         let suffix = format!("::{name}");
         for f in self.iter_local_fns() {
-            let path = f.item_meta.name_path();
+            let path = f.item_meta.name_path_str();
             if path == name || path.ends_with(&suffix) {
                 return Some(f);
             }
@@ -1312,7 +1312,7 @@ impl Llbc {
                             .and_then(serde_json::Value::as_u64)
                             .and_then(|trait_id| self.trait_by_id(trait_id))
                             .is_none_or(|decl| {
-                                decl.item_meta.name_path() == "core::ops::drop::Drop"
+                                decl.item_meta.name_path_str() == "core::ops::drop::Drop"
                             })
                             .then_some(owner)
                     })

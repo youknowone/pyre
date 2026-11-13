@@ -243,7 +243,7 @@ fn profilefunc_type_info(llbc: &Llbc) -> ProfileFuncTypeInfo {
         spellings: Vec::new(),
     };
     for td in llbc.iter_type_decls() {
-        if !path_leaf_is(&td.item_meta.name_path(), "ProfileFunc") {
+        if !path_leaf_is(td.item_meta.name_path_str(), "ProfileFunc") {
             continue;
         }
         push_unique_u64(&mut info.alias_def_ids, td.def_id);
@@ -410,7 +410,7 @@ fn place_is_profilefunc_field(place: &Place, llbc: &Llbc) -> bool {
 }
 
 fn is_profilefunc_store_fun(fd: &FunDecl) -> bool {
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     path.ends_with("::setllprofile")
         || path.ends_with("::store_profilefunc")
         || path.ends_with("::setprofile")
@@ -529,7 +529,7 @@ pub(in crate::front::mir) fn registrar_fun_ids(llbc: &Llbc) -> Vec<u64> {
     llbc.iter_fun_decls()
         .filter(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("::call::register_eval_override")
         })
         .map(|fd| fd.def_id)
@@ -979,7 +979,7 @@ pub(in crate::front::mir) fn str_builder_ctor_leaf(
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
-    let np = fd.item_meta.name_path();
+    let np = fd.item_meta.name_path_str();
     let (leaf, owner_accepted): (&'static str, fn(Option<&str>) -> bool) =
         match np.rsplit("::").next()? {
             "new" => ("new", is_str_builder_owner),
@@ -1004,7 +1004,7 @@ pub(in crate::front::mir) fn string_builder_method_leaf(
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
-    let leaf = match fd.item_meta.name_path().rsplit("::").next()? {
+    let leaf = match fd.item_meta.name_path_str().rsplit("::").next()? {
         "new" => "new",
         "append" => "append",
         "build" => "build",
@@ -1032,7 +1032,7 @@ pub(in crate::front::mir) fn str_builder_append_args(
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
-    let np = fd.item_meta.name_path();
+    let np = fd.item_meta.name_path_str();
     match np.rsplit("::").next()? {
         "push" | "push_str" | "push_wtf8" => {
             is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some((0, 1))
@@ -1371,7 +1371,7 @@ pub(in crate::front::mir) fn format_str_call_def(
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
-    let np = fd.item_meta.name_path();
+    let np = fd.item_meta.name_path_str();
     let segs: Vec<String> = np.split("::").map(str::to_string).collect();
     if fmt_path_ends_with(&segs, &["fmt", "format"]) {
         return Some(FormatStrDef::Format);
@@ -1804,7 +1804,7 @@ pub(in crate::front::mir) fn is_string_identity_call(llbc: &Llbc, call: &CallPay
     let Some(fd) = llbc.fn_by_id(*id) else {
         return false;
     };
-    let np = fd.item_meta.name_path();
+    let np = fd.item_meta.name_path_str();
     if is_as_view_noop(llbc, reg, Some(first_ty), &call.dest.ty) {
         return true;
     }
@@ -2539,7 +2539,7 @@ pub(in crate::front::mir) fn is_workspace_index_regular(reg: &RegularCall, llbc:
     let Some(fd) = llbc.fn_by_id(*id) else {
         return false;
     };
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or("");
     if leaf != "index" && leaf != "index_mut" {
         return false;
@@ -2565,7 +2565,7 @@ pub(in crate::front::mir) fn string_array_index_owner(
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let path = llbc.fn_by_id(*id)?.item_meta.name_path();
+    let path = llbc.fn_by_id(*id)?.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or("");
     if leaf != "index" && leaf != "index_mut" {
         return None;
@@ -2925,7 +2925,7 @@ pub(in crate::front::mir) fn place_is_chars_offset_global(
         return false;
     };
     llbc.global_by_id(*id)
-        .is_some_and(|global| global.item_meta.name_path() == LOWLEVEL_STRING_CHARS_OFFSET_PATH)
+        .is_some_and(|global| global.item_meta.name_path_str() == LOWLEVEL_STRING_CHARS_OFFSET_PATH)
 }
 
 /// rstr `STR` (`rstr.py` `STR`) — `W_UnicodeObject._utf8` and the layout
@@ -3118,7 +3118,7 @@ pub(in crate::front::mir) fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &L
     };
     llbc.fn_by_id(*id).is_some_and(|fd| {
         matches!(
-            fd.item_meta.name_path().as_str(),
+            fd.item_meta.name_path_str(),
             "core::ptr::mut_ptr::<Impl>::add" | "core::ptr::const_ptr::<Impl>::add"
         )
     })
@@ -3139,7 +3139,7 @@ pub(in crate::front::mir) fn regular_call_is_ptr_wrapping_add(
     };
     llbc.fn_by_id(*id).is_some_and(|fd| {
         matches!(
-            fd.item_meta.name_path().as_str(),
+            fd.item_meta.name_path_str(),
             "core::ptr::mut_ptr::<Impl>::wrapping_add"
                 | "core::ptr::const_ptr::<Impl>::wrapping_add"
         )
@@ -3167,7 +3167,7 @@ pub(in crate::front::mir) fn regular_call_is_items_block_accessor(
         return false;
     };
     llbc.fn_by_id(*id)
-        .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
+        .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path_str()))
 }
 
 pub(in crate::front::mir) fn regular_call_name_path(
@@ -3720,7 +3720,7 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
         }
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
     }
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
     let module = stripped
         .rsplit_once("::")
         .map(|(module, _)| module)
@@ -3758,7 +3758,7 @@ pub(in crate::front::mir) fn registered_path_for_fun_decl(
         Some(leaf) => leaf,
         None => fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .rsplit("::")
             .next()
             .unwrap_or("fn")
@@ -3792,7 +3792,7 @@ pub(in crate::front::mir) fn regular_call_is_typed_items_block_accessor(
         return false;
     };
     llbc.fn_by_id(*id).is_some_and(|fd| {
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         is_typed_items_block_base_accessor(&name) || is_typed_array_base_adapter(&name)
     })
 }
@@ -3810,7 +3810,7 @@ pub(in crate::front::mir) fn regular_call_is_string_items_block_accessor(
         return false;
     };
     llbc.fn_by_id(*id)
-        .is_some_and(|fd| is_string_array_base_adapter(&fd.item_meta.name_path()))
+        .is_some_and(|fd| is_string_array_base_adapter(fd.item_meta.name_path_str()))
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -3920,7 +3920,7 @@ pub(in crate::front::mir) fn regular_call_is_slice_as_ptr(reg: &RegularCall, llb
     };
     llbc.fn_by_id(*id).is_some_and(|fd| {
         matches!(
-            fd.item_meta.name_path().as_str(),
+            fd.item_meta.name_path_str(),
             "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
         )
     })
