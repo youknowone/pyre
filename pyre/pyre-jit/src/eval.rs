@@ -17634,16 +17634,16 @@ mod tests {
             majit_ir::GuardPendingFieldEntry {
                 descr: Some(field_descr),
                 item_index: -1,
-                target: majit_ir::OpRef::input_arg_ref(0),
-                value: majit_ir::OpRef::input_arg_int(1),
+                target: majit_ir::operand::Operand::None,
+                value: majit_ir::operand::Operand::None,
                 target_tagged: tagged(0),
                 value_tagged: tagged(1),
             },
             majit_ir::GuardPendingFieldEntry {
                 descr: Some(array_descr),
                 item_index: 1,
-                target: majit_ir::OpRef::input_arg_ref(2),
-                value: majit_ir::OpRef::input_arg_int(3),
+                target: majit_ir::operand::Operand::None,
+                value: majit_ir::operand::Operand::None,
                 target_tagged: tagged(2),
                 value_tagged: tagged(3),
             },
@@ -17700,8 +17700,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(field_descr),
             item_index: -1,
-            target: majit_ir::OpRef::input_arg_ref(0),
-            value: majit_ir::OpRef::input_arg_int(0),
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_virtual(0),
             value_tagged: tagged_box(0),
         }];
@@ -17838,8 +17838,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(field_descr),
             item_index: -1,
-            target: majit_ir::OpRef::input_arg_ref(0),
-            value: majit_ir::OpRef::input_arg_ref(0),
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_const(0),
             value_tagged: tagged_virtual(0),
         }];
@@ -17904,8 +17904,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(field_descr),
             item_index: -1,
-            target: majit_ir::OpRef::input_arg_ref(0),
-            value: majit_ir::OpRef::input_arg_ref(0),
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];

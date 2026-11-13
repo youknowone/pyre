@@ -5550,8 +5550,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.resolve_operand_operand(&target).to_opref(),
-                            value: ctx.resolve_operand_operand(&value).to_opref(),
+                            target: ctx.resolve_operand_operand(&target),
+                            value: ctx.resolve_operand_operand(&value),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
@@ -5829,7 +5829,7 @@ impl Optimizer {
         for pass in &self.passes {
             for (func_ptr, result) in pass.serialize_optrewrite() {
                 let replaced = result.get_box_replacement(false);
-                loopinvariant_results.push((func_ptr, replaced.to_opref()));
+                loopinvariant_results.push((func_ptr, replaced));
             }
         }
 
@@ -5838,18 +5838,18 @@ impl Optimizer {
         // ensure_descr_index should not occur — ensure_descr_index always
         // assigns. The filter_map here mirrors the RPython path where
         // heap.py:828 skips descriptors not in the CPU cache.
-        let heap_fields: Vec<(OpRef, i32, OpRef)> = heap_fields_raw
+        let heap_fields: Vec<(Operand, i32, Operand)> = heap_fields_raw
             .into_iter()
             .map(|(obj, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj.to_opref(), idx, val.to_opref())
+                (obj, idx, val)
             })
             .collect();
-        let heap_arrayitems: Vec<(OpRef, i64, i32, OpRef)> = heap_arrayitems_raw
+        let heap_arrayitems: Vec<(Operand, i64, i32, Operand)> = heap_arrayitems_raw
             .into_iter()
             .map(|(obj, index, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj.to_opref(), index, idx, val.to_opref())
+                (obj, index, idx, val)
             })
             .collect();
 

@@ -6168,8 +6168,9 @@ mod tests {
         };
 
         let env = SimpleBoxEnv::new();
-        let caught = env.get_box_replacement_operand(OpRef::ref_op(27));
-        let null_result = env.get_box_replacement_operand(OpRef::ref_op(26));
+        let caught = crate::history::test_support::rooted_operand_from_opref(OpRef::ref_op(27));
+        let null_result =
+            crate::history::test_support::rooted_operand_from_opref(OpRef::ref_op(26));
         assert!(
             !caught.same_box(&null_result),
             "the two refs must be distinct boxes"
@@ -6247,7 +6248,15 @@ mod tests {
                 },
             ],
             &ref_map,
-            |opref| Some(env.get_box_replacement_operand(opref)),
+            |opref| {
+                if opref == OpRef::ref_op(27) {
+                    Some(caught.clone())
+                } else if opref == OpRef::ref_op(26) {
+                    Some(null_result.clone())
+                } else {
+                    None
+                }
+            },
         );
         let mut peel_memo = ResumeDataLoopMemo::new();
         let peel_snapshot = Snapshot::single_frame_boxes(0, 4518, peel_slots.to_vec());

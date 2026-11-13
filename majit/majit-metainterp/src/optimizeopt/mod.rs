@@ -2045,13 +2045,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
-        // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
-        // host is the producer Op / InputArg, so two reaches of one logical box
-        // return the same producer Rc (ptr_eq) — the #160 livebox dedup key.
-        if opref.is_none() {
-            return Operand::None;
-        }
-        self.ctx.get_box_replacement_operand(opref)
+        panic!(
+            "BoxEnv::get_box_replacement_operand({opref:?}): numbering must \
+             receive the iterator-cache box (TraceIterator._get)"
+        )
     }
 
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
@@ -2145,9 +2142,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         info.get_last_guard_pos().is_some()
     }
 
-    fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let info = resolved_box.as_ref().and_then(Operand::ptr_info)?;
+    fn get_virtual_fields(&self, box_: &Operand) -> Option<majit_ir::VirtualFieldsInfo> {
+        let resolved = box_.get_box_replacement(false);
+        let info = resolved.ptr_info()?;
         let fielddescrs = info.all_fielddescrs_from_descr();
         match &*info {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -2157,30 +2154,28 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 // `descr.get_all_fielddescrs()` order. Storage keys by
                 // `parent_list_slot` (identity in the field's parent list),
                 // which is not always the enumerate index of this list.
-                field_oprefs: virtual_field_oprefs_for_descrs(
+                field_boxes: virtual_field_oprefs_for_descrs(
                     &vi.fields,
                     &fielddescrs,
-                    self.ctx,
                     Some(&vi.descr),
                 ),
             }),
             PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: None,
-                field_oprefs: virtual_field_oprefs_for_descrs(
+                field_boxes: virtual_field_oprefs_for_descrs(
                     &vi.fields,
                     &fielddescrs,
-                    self.ctx,
                     Some(&vi.descr),
                 ),
             }),
             PtrInfo::VirtualArray(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: None,
-                field_oprefs: vi
+                field_boxes: vi
                     .items
                     .iter()
-                    .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
+                    .map(|vref| vref.get_box_replacement(false))
                     .collect(),
             }),
             PtrInfo::VirtualArrayStruct(vi) => {
@@ -2191,23 +2186,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 Some(majit_ir::VirtualFieldsInfo {
                     descr: Some(vi.descr.clone()),
                     known_class: None,
-                    field_oprefs: vi
+                    field_boxes: vi
                         .element_fields
                         .iter()
-                        .flat_map(|ef| {
-                            virtual_field_oprefs_for_descrs(ef, fielddescrs, self.ctx, None)
-                        })
+                        .flat_map(|ef| virtual_field_oprefs_for_descrs(ef, fielddescrs, None))
                         .collect(),
                 })
             }
             PtrInfo::VirtualRawBuffer(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: None,
                 known_class: None,
-                field_oprefs: vi
+                field_boxes: vi
                     .buffer
                     .values()
                     .iter()
-                    .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
+                    .map(|vref| vref.get_box_replacement(false))
                     .collect(),
             }),
             // `info.py` `RawSlicePtrInfo._visitor_walk_recursive`:
@@ -2220,10 +2213,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             //         self.parent.visitor_walk_recursive(source_op, visitor)
             // ```
             //
-            // pyre's consumer (the virtual worklist in
-            // `ResumeDataLoopMemo::finish`) drives the recursion off
+            // The consumer (the virtual worklist in
+            // `ResumeDataVirtualAdder.finish`) drives the recursion off
             // `get_virtual_fields`
-            // — registering the parent OpRef here lets the worklist enqueue
+            // — registering the parent box here lets the worklist enqueue
             // the parent and re-enter `get_virtual_fields` on it, which
             // matches RPython's `parent.visitor_walk_recursive(source_op,
             // visitor)` follow-up.  Only fires while the slice is still
@@ -2234,7 +2227,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 Some(majit_ir::VirtualFieldsInfo {
                     descr: None,
                     known_class: None,
-                    field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent.to_opref())],
+                    field_boxes: vec![vi.parent.get_box_replacement(false)],
                 })
             }
             // vstring.py VStringPlainInfo._visitor_walk_recursive:
@@ -2251,7 +2244,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             // `VStringVariant::Ptr` skips this arm (falls through to None).
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => {
                 use crate::optimizeopt::info::VStringVariant;
-                let field_oprefs: Vec<OpRef> = match &sinfo.variant {
+                let field_boxes: Vec<Operand> = match &sinfo.variant {
                     // vstring.py _visitor_walk_recursive: self._chars. `None` slots represent
                     // unfilled positions — the resume encoder later tags those
                     // with UNINITIALIZED (matching how RPython treats missing
@@ -2262,20 +2255,20 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         .iter()
                         .map(|slot| {
                             slot.as_ref()
-                                .map(|r| self.ctx.get_replacement_opref(r.to_opref()))
-                                .unwrap_or(OpRef::NONE)
+                                .map(|r| r.get_box_replacement(false))
+                                .unwrap_or(Operand::None)
                         })
                         .collect(),
                     // vstring.py _visitor_walk_recursive: [self.s, self.start, self.lgtop].
                     VStringVariant::Slice(s) => vec![
-                        self.ctx.get_replacement_opref(s.s.to_opref()),
-                        self.ctx.get_replacement_opref(s.start.to_opref()),
-                        self.ctx.get_replacement_opref(s.lgtop.to_opref()),
+                        s.s.get_box_replacement(false),
+                        s.start.get_box_replacement(false),
+                        s.lgtop.get_box_replacement(false),
                     ],
                     // vstring.py _visitor_walk_recursive: [self.vleft, self.vright].
                     VStringVariant::Concat(c) => vec![
-                        self.ctx.get_replacement_opref(c.vleft.to_opref()),
-                        self.ctx.get_replacement_opref(c.vright.to_opref()),
+                        c.vleft.get_box_replacement(false),
+                        c.vright.get_box_replacement(false),
                     ],
                     // Non-virtual `VStringVariant::Ptr` would not reach
                     // here because of the `is_virtual()` guard above.
@@ -2284,7 +2277,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 Some(majit_ir::VirtualFieldsInfo {
                     descr: None,
                     known_class: None,
-                    field_oprefs,
+                    field_boxes,
                 })
             }
             _ => None,
@@ -2293,11 +2286,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 
     fn make_virtual_info(
         &self,
-        opref: OpRef,
+        box_: &Operand,
         fieldnums: Vec<i16>,
     ) -> Option<std::rc::Rc<majit_ir::RdVirtualInfo>> {
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let info = resolved_box.as_ref().and_then(Operand::ptr_info)?;
+        let resolved = box_.get_box_replacement(false);
+        let info = resolved.ptr_info()?;
         // resume.py `ResumeDataVirtualAdder.make_virtual_info`:
         //
         //     vinfo = info._cached_vinfo
@@ -2333,10 +2326,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         Some(shared)
     }
 
-    fn virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {
+    fn virtual_info_would_be_reused(&self, box_: &Operand, fieldnums: &[i16]) -> bool {
         // resume.py reads the same info._cached_vinfo written above.
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let Some(info) = resolved_box.as_ref().and_then(Operand::ptr_info) else {
+        let resolved = box_.get_box_replacement(false);
+        let Some(info) = resolved.ptr_info() else {
             return false;
         };
         let Some(cache) = info.cached_vinfo() else {
@@ -2395,14 +2388,13 @@ fn visitor_fielddescr_storage_slot(
     ))
 }
 
-/// `field_oprefs[i]` is the value stored for `fielddescrs[i]`, so
+/// `field_boxes[i]` is the value stored for `fielddescrs[i]`, so
 /// `set_content` fieldnums pair 1:1 with the snapshot `visit_*` wrote.
 fn virtual_field_oprefs_for_descrs(
     fields: &[(u32, Operand)],
     fielddescrs: &[majit_ir::DescrRef],
-    ctx: &OptContext,
     owner: Option<&majit_ir::DescrRef>,
-) -> Vec<OpRef> {
+) -> Vec<Operand> {
     fielddescrs
         .iter()
         .enumerate()
@@ -2411,8 +2403,8 @@ fn virtual_field_oprefs_for_descrs(
             fields
                 .iter()
                 .find(|(field_idx, _)| *field_idx == slot)
-                .map(|(_, vref)| ctx.get_replacement_opref(vref.to_opref()))
-                .unwrap_or(OpRef::NONE)
+                .map(|(_, vref)| vref.get_box_replacement(false))
+                .unwrap_or(Operand::None)
         })
         .collect()
 }
@@ -7244,14 +7236,17 @@ impl OptContext {
         }
 
         if !use_byte && crate::callee_rca_enabled() {
-            let env = OptBoxEnv { ctx: self };
             let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = vable_oprefs
                 .iter()
                 .map(|boxref| {
                     let opref = boxref.opref();
                     let resolved = self.get_replacement_opref(opref);
                     let is_virtual = boxref.cached.as_ref().is_some_and(|b| self.is_virtual(b));
-                    let tp = majit_ir::BoxEnv::get_type(&env, opref);
+                    let tp = boxref
+                        .cached
+                        .as_ref()
+                        .map(|b| b.get_box_replacement(false).type_())
+                        .unwrap_or(Type::Int);
                     (opref, resolved, is_virtual, tp)
                 })
                 .collect();
@@ -7265,14 +7260,17 @@ impl OptContext {
         }
 
         if !use_byte && majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
-            let env = OptBoxEnv { ctx: self };
             let snapshot_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot_boxes
                 .iter()
                 .map(|boxref| {
                     let opref = boxref.opref();
                     let resolved = self.get_replacement_opref(opref);
                     let is_virtual = boxref.cached.as_ref().is_some_and(|b| self.is_virtual(b));
-                    let tp = majit_ir::BoxEnv::get_type(&env, opref);
+                    let tp = boxref
+                        .cached
+                        .as_ref()
+                        .map(|b| b.get_box_replacement(false).type_())
+                        .unwrap_or(Type::Int);
                     (opref, resolved, is_virtual, tp)
                 })
                 .collect();
@@ -7282,7 +7280,11 @@ impl OptContext {
                     let opref = boxref.opref();
                     let resolved = self.get_replacement_opref(opref);
                     let is_virtual = boxref.cached.as_ref().is_some_and(|b| self.is_virtual(b));
-                    let tp = majit_ir::BoxEnv::get_type(&env, opref);
+                    let tp = boxref
+                        .cached
+                        .as_ref()
+                        .map(|b| b.get_box_replacement(false).type_())
+                        .unwrap_or(Type::Int);
                     (opref, resolved, is_virtual, tp)
                 })
                 .collect();
@@ -12397,11 +12399,11 @@ mod rd_virtual_info_builder_tests {
 
         let env = OptBoxEnv { ctx: &ctx };
         let vf = env
-            .get_virtual_fields(virtual_op)
+            .get_virtual_fields(&virtual_box)
             .expect("virtual must expose fields");
-        let int_opref = env.get_box_replacement(int_val.to_opref());
-        let ref_opref = env.get_box_replacement(ref_val.to_opref());
-        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+        assert_eq!(vf.field_boxes.len(), 2);
+        assert!(vf.field_boxes[0].same_box(&int_val.get_box_replacement(false)));
+        assert!(vf.field_boxes[1].same_box(&ref_val.get_box_replacement(false)));
 
         let visitor_descrs: Vec<DescrRef> =
             vec![int_fd.clone() as DescrRef, ref_fd.clone() as DescrRef];
@@ -12413,8 +12415,8 @@ mod rd_virtual_info_builder_tests {
         };
         assert_eq!(fielddescrs[0].field_type, Type::Int);
         assert_eq!(fielddescrs[1].field_type, Type::Ref);
-        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
-        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
+        assert_eq!(vf.field_boxes[0].type_(), Type::Int);
+        assert_eq!(vf.field_boxes[1].type_(), Type::Ref);
     }
 
     #[test]
@@ -12461,7 +12463,7 @@ mod rd_virtual_info_builder_tests {
 
         let env = OptBoxEnv { ctx: &ctx };
         let vf = env
-            .get_virtual_fields(virtual_op)
+            .get_virtual_fields(&virtual_box)
             .expect("virtual must expose fields");
         let mut builder = RdVirtualInfoBuilder;
         let visitor_descrs: Vec<DescrRef> = vec![ref_fd.clone() as DescrRef];
@@ -12471,7 +12473,7 @@ mod rd_virtual_info_builder_tests {
             panic!("expected VirtualInfo");
         };
         assert_eq!(fielddescrs[0].field_type, Type::Ref);
-        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Ref);
+        assert_eq!(vf.field_boxes[0].type_(), Type::Ref);
         assert_eq!(
             super::snapshot_field_descr_info(&(ref_fd as DescrRef)).field_type,
             Type::Ref
@@ -12520,11 +12522,11 @@ mod rd_virtual_info_builder_tests {
 
         let env = OptBoxEnv { ctx: &ctx };
         let vf = env
-            .get_virtual_fields(virtual_op)
+            .get_virtual_fields(&virtual_box)
             .expect("array struct must expose fields");
-        let int_opref = env.get_box_replacement(int_val.to_opref());
-        let ref_opref = env.get_box_replacement(ref_val.to_opref());
-        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+        assert_eq!(vf.field_boxes.len(), 2);
+        assert!(vf.field_boxes[0].same_box(&int_val.get_box_replacement(false)));
+        assert!(vf.field_boxes[1].same_box(&ref_val.get_box_replacement(false)));
 
         let mut builder = RdVirtualInfoBuilder;
         let Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
@@ -12537,8 +12539,8 @@ mod rd_virtual_info_builder_tests {
         };
         assert_eq!(field_types, vec![1u8, 0u8]);
         assert_eq!(fielddescrs.len(), 2);
-        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
-        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
+        assert_eq!(vf.field_boxes[0].type_(), Type::Int);
+        assert_eq!(vf.field_boxes[1].type_(), Type::Ref);
     }
 
     fn same_offset_empty_name_fields() -> (
@@ -12649,11 +12651,11 @@ mod rd_virtual_info_builder_tests {
 
         let env = OptBoxEnv { ctx: &ctx };
         let vf = env
-            .get_virtual_fields(virtual_op)
+            .get_virtual_fields(&virtual_box)
             .expect("virtual must expose fields");
-        let int_opref = env.get_box_replacement(int_val.to_opref());
-        let ref_opref = env.get_box_replacement(ref_val.to_opref());
-        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+        assert_eq!(vf.field_boxes.len(), 2);
+        assert!(vf.field_boxes[0].same_box(&int_val.get_box_replacement(false)));
+        assert!(vf.field_boxes[1].same_box(&ref_val.get_box_replacement(false)));
 
         let visitor_descrs: Vec<DescrRef> = vec![
             visitor_int.clone() as DescrRef,
@@ -12667,8 +12669,8 @@ mod rd_virtual_info_builder_tests {
         };
         assert_eq!(fielddescrs[0].field_type, Type::Int);
         assert_eq!(fielddescrs[1].field_type, Type::Ref);
-        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
-        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
+        assert_eq!(vf.field_boxes[0].type_(), Type::Int);
+        assert_eq!(vf.field_boxes[1].type_(), Type::Ref);
     }
 }
 
@@ -12811,7 +12813,7 @@ mod opt_box_env_tests {
         let source_box = ctx.materialize_operand_at(source);
         let target_box = ctx.materialize_operand_at(target);
         ctx.make_equal_to(&source_box, &target_box);
-        let resolved = OptBoxEnv { ctx: &ctx }.get_box_replacement_operand(source);
+        let resolved = source_box.get_box_replacement(false);
         ctx.set_ptr_info(
             &target_box,
             PtrInfo::Virtual(VirtualInfo {
@@ -12836,7 +12838,7 @@ mod opt_box_env_tests {
         let mut ctx = OptContext::with_num_inputs(16, 0);
         let producer = ctx.materialize_operand_at(OpRef::ref_op(21));
         let env = OptBoxEnv { ctx: &ctx };
-        let resolved = env.get_box_replacement_operand(producer.to_opref());
+        let resolved = producer.get_box_replacement(false);
         assert!(!env.is_const(&resolved));
         ctx.set_ptr_info(&producer, PtrInfo::Constant(GcRef(0x1234)));
         assert!(env.is_const(&resolved));
@@ -12872,19 +12874,19 @@ mod opt_box_env_tests {
             }),
         );
         let env = OptBoxEnv { ctx: &ctx };
-        let first = env.make_virtual_info(source, vec![1, 2]).unwrap();
-        assert!(env.virtual_info_would_be_reused(target, &[1, 2]));
-        let same = env.make_virtual_info(target, vec![1, 2]).unwrap();
+        let first = env.make_virtual_info(&source_box, vec![1, 2]).unwrap();
+        assert!(env.virtual_info_would_be_reused(&target_box, &[1, 2]));
+        let same = env.make_virtual_info(&target_box, vec![1, 2]).unwrap();
         assert!(std::rc::Rc::ptr_eq(&first, &same));
         {
             let info = target_box.ptr_info().unwrap();
             let cached = info.cached_vinfo().unwrap().borrow();
             assert!(std::rc::Rc::ptr_eq(cached.as_ref().unwrap(), &first));
         }
-        let changed = env.make_virtual_info(source, vec![2, 1]).unwrap();
+        let changed = env.make_virtual_info(&source_box, vec![2, 1]).unwrap();
         assert!(!std::rc::Rc::ptr_eq(&first, &changed));
         assert!(first.equals(&[1, 2]));
-        assert!(env.virtual_info_would_be_reused(target, &[2, 1]));
+        assert!(env.virtual_info_would_be_reused(&target_box, &[2, 1]));
     }
 
     #[test]
