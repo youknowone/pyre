@@ -2285,6 +2285,16 @@ fn rsocket_eci() -> ExternalCompilationInfo {
             includes.push("netpacket/packet.h".into());
             includes.push("sys/ioctl.h".into());
         }
+        // [3.15-spec] socketmodule.c / socketmodule.h header context that decides which constant_names are defined.
+        let mut pre_include_bits = Vec::new();
+        if std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default() == "apple" {
+            pre_include_bits.push("#define __APPLE_USE_RFC_3542 1".into());
+            includes.push("net/ethernet.h".into());
+            includes.push("sys/sys_domain.h".into());
+            includes.push("sys/kern_control.h".into());
+        } else if target_os == "linux" || target_os == "android" {
+            includes.push("net/ethernet.h".into());
+        }
         let header: String = includes
             .iter()
             .map(|filename| format!("#include <{filename}>\n"))
@@ -2307,6 +2317,7 @@ fn rsocket_eci() -> ExternalCompilationInfo {
             vec![]
         };
         ExternalCompilationInfo {
+            pre_include_bits,
             includes,
             libraries,
             post_include_bits: vec![header, cond_header],

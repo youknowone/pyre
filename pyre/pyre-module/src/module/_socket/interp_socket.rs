@@ -401,54 +401,246 @@ fn socket_writebuf(
     }
 }
 
-/// [3.15-spec] `moduledef.py` skips the names in `if constant in ()`; pyre
-/// skips the `rsocket.constants` entries that socketmodule.c never
-/// publishes, so `hasattr(socket, name)` agrees with 3.15 (measured on
-/// macOS: `socket.POLLIN` / `socket.FD_SETSIZE` exist on PyPy, not on 3.15).
+/// [3.15-spec] The condition socketmodule.c's `socket_exec` publishes a
+/// `rsocket.constants` name under, where it is more than `#ifdef NAME`.
+/// `moduledef.py` publishes every entry (`if constant in (): continue`);
+/// pyre skips the ones 3.15 would not publish on the same headers.
 #[cfg(unix)]
-const CONSTANTS_NOT_IN_CPYTHON: &[&str] = &[
-    "AD_DECnet",
-    "AF_DEC",
-    "NETLINK_ARPD",
-    "NETLINK_ROUTE6",
-    "NETLINK_SKIP",
-    "NETLINK_TAPBASE",
-    "NETLINK_TCPDIAG",
-    "NETLINK_W1",
-    "POLLIN",
-    "POLLPRI",
-    "POLLOUT",
-    "POLLERR",
-    "POLLHUP",
-    "POLLNVAL",
-    "POLLRDNORM",
-    "POLLRDBAND",
-    "POLLWRNORM",
-    "POLLWEBAND",
-    "POLLMSG",
-    "FD_READ",
-    "FD_WRITE",
-    "FD_ACCEPT",
-    "FD_CONNECT",
-    "FD_CLOSE",
-    "WSA_WAIT_TIMEOUT",
-    "WSA_WAIT_FAILED",
-    "INFINITE",
-    "FD_CONNECT_BIT",
-    "FD_CLOSE_BIT",
-    "WSA_IO_PENDING",
-    "WSA_IO_INCOMPLETE",
-    "WSA_INVALID_HANDLE",
-    "WSA_INVALID_PARAMETER",
-    "WSA_NOT_ENOUGH_MEMORY",
-    "WSA_OPERATION_ABORTED",
-    "WSA_FLAG_OVERLAPPED",
-    "WSA_FLAG_NO_HANDLE_INHERIT",
-    "SIOCGIFNAME",
-    "SIOCGIFINDEX",
-    "FD_SETSIZE",
-    "ALG_SET_PUB_KEY",
+#[derive(Clone, Copy)]
+enum SocketmoduleGuard {
+    /// Never published by socketmodule.c.
+    Never,
+    /// Published only with a family header (`USE_BLUETOOTH`,
+    /// `HAVE_LINUX_TIPC_H`, `HAVE_LINUX_CAN_*_H`, `HAVE_LINUX_VM_SOCKETS_H`,
+    /// `HAVE_AF_HYPERV`) that `_rsocket_rffi.eci` does not include.
+    FamilyHeader,
+    /// Published only when this other constant is defined.
+    Requires(&'static str),
+    /// `#ifdef MS_WINDOWS` / `SIO_RCVALL`.
+    Windows,
+    /// `#if defined(__APPLE__)`.
+    Apple,
+}
+
+#[cfg(unix)]
+const SOCKETMODULE_GUARDS: &[(&str, SocketmoduleGuard)] = &[
+    // socketmodule.c: never published
+    ("AD_DECnet", SocketmoduleGuard::Never),
+    ("AF_DEC", SocketmoduleGuard::Never),
+    ("NETLINK_ARPD", SocketmoduleGuard::Never),
+    ("NETLINK_ROUTE6", SocketmoduleGuard::Never),
+    ("NETLINK_SKIP", SocketmoduleGuard::Never),
+    ("NETLINK_TAPBASE", SocketmoduleGuard::Never),
+    ("NETLINK_TCPDIAG", SocketmoduleGuard::Never),
+    ("NETLINK_W1", SocketmoduleGuard::Never),
+    ("POLLIN", SocketmoduleGuard::Never),
+    ("POLLPRI", SocketmoduleGuard::Never),
+    ("POLLOUT", SocketmoduleGuard::Never),
+    ("POLLERR", SocketmoduleGuard::Never),
+    ("POLLHUP", SocketmoduleGuard::Never),
+    ("POLLNVAL", SocketmoduleGuard::Never),
+    ("POLLRDNORM", SocketmoduleGuard::Never),
+    ("POLLRDBAND", SocketmoduleGuard::Never),
+    ("POLLWRNORM", SocketmoduleGuard::Never),
+    ("POLLWEBAND", SocketmoduleGuard::Never),
+    ("POLLMSG", SocketmoduleGuard::Never),
+    ("FD_READ", SocketmoduleGuard::Never),
+    ("FD_WRITE", SocketmoduleGuard::Never),
+    ("FD_ACCEPT", SocketmoduleGuard::Never),
+    ("FD_CONNECT", SocketmoduleGuard::Never),
+    ("FD_CLOSE", SocketmoduleGuard::Never),
+    ("WSA_WAIT_TIMEOUT", SocketmoduleGuard::Never),
+    ("WSA_WAIT_FAILED", SocketmoduleGuard::Never),
+    ("INFINITE", SocketmoduleGuard::Never),
+    ("FD_CONNECT_BIT", SocketmoduleGuard::Never),
+    ("FD_CLOSE_BIT", SocketmoduleGuard::Never),
+    ("WSA_IO_PENDING", SocketmoduleGuard::Never),
+    ("WSA_IO_INCOMPLETE", SocketmoduleGuard::Never),
+    ("WSA_INVALID_HANDLE", SocketmoduleGuard::Never),
+    ("WSA_INVALID_PARAMETER", SocketmoduleGuard::Never),
+    ("WSA_NOT_ENOUGH_MEMORY", SocketmoduleGuard::Never),
+    ("WSA_OPERATION_ABORTED", SocketmoduleGuard::Never),
+    ("WSA_FLAG_OVERLAPPED", SocketmoduleGuard::Never),
+    ("WSA_FLAG_NO_HANDLE_INHERIT", SocketmoduleGuard::Never),
+    ("SIOCGIFNAME", SocketmoduleGuard::Never),
+    ("SIOCGIFINDEX", SocketmoduleGuard::Never),
+    ("FD_SETSIZE", SocketmoduleGuard::Never),
+    ("ALG_SET_PUB_KEY", SocketmoduleGuard::Never),
+    // socketmodule.c USE_BLUETOOTH
+    ("AF_BLUETOOTH", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_HCI", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_L2CAP", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_SCO", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_RFCOMM", SocketmoduleGuard::FamilyHeader),
+    ("HCI_DATA_DIR", SocketmoduleGuard::FamilyHeader),
+    ("HCI_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("HCI_TIME_STAMP", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_LINUX_TIPC_H
+    ("AF_TIPC", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_ID", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_NAME", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_NAMESEQ", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CFG_SRV", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CLUSTER_SCOPE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CONN_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CRITICAL_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_DEST_DROPPABLE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_HIGH_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_LOW_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_MEDIUM_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_NODE_SCOPE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_PUBLISHED", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SRC_DROPPABLE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUBSCR_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_CANCEL", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_PORTS", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_SERVICE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_TOP_SRV", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_WAIT_FOREVER", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_WITHDRAWN", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ZONE_SCOPE", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.h HAVE_LINUX_VM_SOCKETS_H
+    ("AF_VSOCK", SocketmoduleGuard::FamilyHeader),
+    ("IOCTL_VM_SOCKETS_GET_LOCAL_CID", SocketmoduleGuard::FamilyHeader),
+    ("SO_VM_SOCKETS_BUFFER_MAX_SIZE", SocketmoduleGuard::FamilyHeader),
+    ("SO_VM_SOCKETS_BUFFER_MIN_SIZE", SocketmoduleGuard::FamilyHeader),
+    ("SO_VM_SOCKETS_BUFFER_SIZE", SocketmoduleGuard::FamilyHeader),
+    ("VMADDR_CID_ANY", SocketmoduleGuard::FamilyHeader),
+    ("VMADDR_CID_HOST", SocketmoduleGuard::FamilyHeader),
+    ("VMADDR_PORT_ANY", SocketmoduleGuard::FamilyHeader),
+    ("VM_SOCKETS_INVALID_VERSION", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_AF_HYPERV
+    ("AF_HYPERV", SocketmoduleGuard::FamilyHeader),
+    ("HV_PROTOCOL_RAW", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_ADDRESS_FLAG_PASSTHRU", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECTED_SUSPEND", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECT_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECT_TIMEOUT_MAX", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_LINUX_CAN_*_H / HAVE_NETCAN_CAN_H
+    ("SO_J1939_ERRQUEUE", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_PROMISC", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_SEND_PRIO", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_DEST_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_DEST_NAME", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_ERRQUEUE", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_PRIO", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_CAN_FD_FRAME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_ANNOUNCE_RESUME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_CHANGED", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_CHECK_DLC", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_DELETE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_FILTER_ID", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_NO_AUTOTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_READ", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_RTR_FRAME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_SETUP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_STATUS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_SETTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_STARTTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_ANNOUNCE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_COUNTEVT", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_CP_CAN_ID", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_DELETE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_EXPIRED", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_READ", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_RESET_MULTI_IDX", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_SEND", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_SETUP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_STATUS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_EFF_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_EFF_MASK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ERR_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ERR_MASK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ISOTP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_J1939", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_ERR_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_FD_FRAMES", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_JOIN_FILTERS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_LOOPBACK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_RECV_OWN_MSGS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RTR_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_SFF_MASK", SocketmoduleGuard::FamilyHeader),
+    ("J1939_EE_INFO_NONE", SocketmoduleGuard::FamilyHeader),
+    ("J1939_EE_INFO_TX_ABORT", SocketmoduleGuard::FamilyHeader),
+    ("J1939_FILTER_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_IDLE_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_MAX_UNICAST_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NLA_BYTES_ACKED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NLA_PAD", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_NAME", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_PGN", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_ADDRESS_CLAIMED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_ADDRESS_COMMANDED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_PDU1_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_REQUEST", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_SOCKADDR_ALG
+    ("ALG_OP_DECRYPT", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_ENCRYPT", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_SIGN", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_VERIFY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_AEAD_ASSOCLEN", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_AEAD_AUTHSIZE", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_IV", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_KEY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_OP", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_PUBKEY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("SOL_ALG", SocketmoduleGuard::Requires("AF_ALG")),
+    // socketmodule.c `#ifdef AF_NETLINK`
+    ("NETLINK_CRYPTO", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_DNRTMSG", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_FIREWALL", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_IP6_FW", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_NFLOG", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_ROUTE", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_USERSOCK", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_XFRM", SocketmoduleGuard::Requires("AF_NETLINK")),
+    // socketmodule.c IPPROTO_UDPLITE
+    ("UDPLITE_RECV_CSCOV", SocketmoduleGuard::Requires("IPPROTO_UDPLITE")),
+    ("UDPLITE_SEND_CSCOV", SocketmoduleGuard::Requires("IPPROTO_UDPLITE")),
+    // socketmodule.c SOL_CAN_RAW
+    ("CAN_RAW", SocketmoduleGuard::Requires("SOL_CAN_RAW")),
+    // socketmodule.c `#ifdef MS_WINDOWS`
+    ("IPPROTO_CBT", SocketmoduleGuard::Windows),
+    ("IPPROTO_ICLFXBM", SocketmoduleGuard::Windows),
+    ("IPPROTO_IGP", SocketmoduleGuard::Windows),
+    ("IPPROTO_L2TP", SocketmoduleGuard::Windows),
+    ("IPPROTO_PGM", SocketmoduleGuard::Windows),
+    ("IPPROTO_RDP", SocketmoduleGuard::Windows),
+    ("IPPROTO_ST", SocketmoduleGuard::Windows),
+    // socketmodule.c `#ifdef SIO_RCVALL`
+    ("RCVALL_IPLEVEL", SocketmoduleGuard::Windows),
+    ("RCVALL_MAX", SocketmoduleGuard::Windows),
+    ("RCVALL_OFF", SocketmoduleGuard::Windows),
+    ("RCVALL_ON", SocketmoduleGuard::Windows),
+    ("RCVALL_SOCKETLEVELONLY", SocketmoduleGuard::Windows),
+    // socketmodule.c `#if defined(__APPLE__) && defined(TCP_KEEPALIVE)`
+    ("TCP_KEEPALIVE", SocketmoduleGuard::Apple),
 ];
+
+#[cfg(unix)]
+fn socketmodule_publishes(name: &str) -> bool {
+    for &(n, guard) in SOCKETMODULE_GUARDS {
+        if n == name {
+            return match guard {
+                SocketmoduleGuard::Never
+                | SocketmoduleGuard::FamilyHeader
+                | SocketmoduleGuard::Windows => false,
+                SocketmoduleGuard::Apple => cfg!(target_vendor = "apple"),
+                SocketmoduleGuard::Requires(other) => {
+                    majit_rlib::rsocket::constants().any(|(constant, _)| constant == other)
+                }
+            };
+        }
+    }
+    true
+}
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
@@ -466,7 +658,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // `for constant, value in rsocket.constants.iteritems(): wrap(value)`.
     #[cfg(unix)]
     for (name, value) in majit_rlib::rsocket::constants() {
-        if CONSTANTS_NOT_IN_CPYTHON.contains(&name) {
+        if !socketmodule_publishes(name) {
             continue;
         }
         pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(value));
