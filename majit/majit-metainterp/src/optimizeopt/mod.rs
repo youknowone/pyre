@@ -2988,7 +2988,8 @@ impl OptContext {
     }
 
     /// Overwrite an already-emitted op in place (the guard-strengthening
-    /// replacements of `optimizer.py:716-718` / `rewrite.py:343`).
+    /// replacements of `Optimizer.replace_guard_op`, reached from
+    /// `OptRewrite.replace_old_guard_with_guard_value`).
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
         #[cfg(test)]
         self.new_operations_index.insert(op.pos().get(), op.clone());
