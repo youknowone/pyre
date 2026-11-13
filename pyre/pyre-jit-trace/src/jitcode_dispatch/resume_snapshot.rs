@@ -819,6 +819,15 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             op_pc,
                         )
                     });
+                // Head offsets floor to py 0; the `next_instr` green is the
+                // opcode this head is running (`pyopcode.py dispatch_bytecode`).
+                // A transparent helper sub-walk's registers are the helper's.
+                if !ctx.fbw_mode.transparent_helper_subwalk
+                    && let Some(head_py) =
+                        super::vstack_mirror::dispatch_head_py_pc(ctx, &jc.payload, op_pc)
+                {
+                    py = head_py;
+                }
                 // A resolved py must be a real opcode, never Python trivia
                 // (e.g. a branch target whose block lowers `NOT_TAKEN`): the
                 // interpreter resumes branches at `semantic_fallthrough_pc` /
@@ -1108,12 +1117,26 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // the `-live-` before it, `generate_guard(resumepc=orgpc)`
                 // (`pyjitpl.py`).
                 let payload = unsafe { &(&walked_owned).payload };
-                match payload.resume_marker_for_jitcode_pc(op_pc) {
-                    Some(jp) if merge_point_between(payload, op_pc, jp) => {
-                        live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
+                // A guard in the shared dispatch-loop head resumes at that
+                // head's own `-live-` (`generate_guard(resumepc=orgpc)`), so
+                // blackhole rebuilds `next_instr` there. The opcode-start twin
+                // floors head offsets to function-entry.
+                let head_marker = if payload.metadata.dispatch_head_contains(op_pc) {
+                    live_marker_at_or_before(payload, op_pc)
+                        .filter(|&marker| payload.metadata.dispatch_head_contains(marker))
+                } else {
+                    None
+                };
+                if let Some(m) = head_marker {
+                    m as i32
+                } else {
+                    match payload.resume_marker_for_jitcode_pc(op_pc) {
+                        Some(jp) if merge_point_between(payload, op_pc, jp) => {
+                            live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
+                        }
+                        Some(jp) => jp as i32,
+                        None => majit_ir::resumedata::NO_JITCODE_PC,
                     }
-                    Some(jp) => jp as i32,
-                    None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
             };
             let liveness_py_pc = py_pc;
