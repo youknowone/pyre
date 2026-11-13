@@ -12540,23 +12540,93 @@ impl CodeWriter {
                                 // covered bare raise escapes the frame.
                                 let covered = catch_for_pc.get(py_pc).copied().flatten().is_some();
                                 if current_state.last_exception.is_none() {
-                                    // No statically-live handler exception seeded the
-                                    // FrameState, so the runtime current-exception may
-                                    // be null / None — a bare `raise` reached by normal
-                                    // fall-through (e.g. in a `finally`) rather than by
-                                    // exception propagation.  Materialize the value the
-                                    // interpreter's `raise_varargs(0)` (eval.rs)
-                                    // re-raises: the active exception when live, else a
-                                    // `RuntimeError("No active exception to reraise")`.
-                                    // `bh_reraise_varargs_zero` performs that
-                                    // null/None/non-exception → RuntimeError
-                                    // normalization so the `raise/r` op always receives
-                                    // a non-null value (`blackhole.py` asserts
-                                    // non-null); materializing raw `get_current_exception()`
-                                    // here would pass null and trip that assert.
-                                    // `emit_raise!` consults `catch_for_pc`, routing a
-                                    // covered PC to its catch landing and an uncovered
-                                    // PC to `graph.exceptblock`.
+                                    // pyopcode.py RAISE_VARARGS nbargs==0: read
+                                    // `ec.sys_exc_info()`, raise RuntimeError if
+                                    // None, otherwise re-raise it. A dispatch-loop
+                                    // case enters with last_exception == None;
+                                    // materialize the current exception and split
+                                    // on ptr_nonzero like LOAD_FAST.
+                                    let current_exc = residual_call!(
+                                        get_current_exception_fn_idx,
+                                        CallFlavor::PlainCannotRaiseNoHeap,
+                                        majit_ir::RuntimeHelperKind::GetCurrentException,
+                                        vec![],
+                                        vec![],
+                                        vec![],
+                                        vec![],
+                                        ResKind::Ref,
+                                        py_pc as i64,
+                                    )
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                    current_block.block().borrow_mut().exitswitch =
+                                        Some(super::flow::ExitSwitch::Tuple(vec![
+                                            super::flow::ExitSwitchElement::Marker(
+                                                "ptr_nonzero".to_owned(),
+                                            ),
+                                            super::flow::ExitSwitchElement::Value(
+                                                current_exc.clone(),
+                                            ),
+                                            super::flow::ExitSwitchElement::Marker(
+                                                "-live-before".to_owned(),
+                                            ),
+                                        ]));
+                                    exception_edge_handled = true;
+                                    let threaded_exc =
+                                        current_exc.as_variable().map(super::flow::FlowValue::from);
+
+                                    let nonnull_state = current_state.clone();
+                                    let nonnull_block = SpamBlockRef::new(
+                                        graph.new_block(Vec::new()),
+                                        Some(nonnull_state.clone()),
+                                    );
+                                    let mut nonnull_inputs = nonnull_state.getvariables();
+                                    if let Some(threaded) = threaded_exc.clone()
+                                        && !nonnull_inputs.iter().any(|arg| arg == &threaded)
+                                    {
+                                        nonnull_inputs.push(threaded);
+                                    }
+                                    nonnull_block.block().borrow_mut().inputargs =
+                                        nonnull_inputs.clone();
+                                    all_walker_blocks.push(nonnull_block.clone());
+                                    append_exit(
+                                        &current_block.block(),
+                                        super::flow::Link::new(
+                                            nonnull_inputs,
+                                            Some(nonnull_block.block()),
+                                            None,
+                                        )
+                                        .into_ref(),
+                                    );
+                                    set_last_bool_exitcase(&current_block.block(), true);
+
+                                    let mut null_state = current_state.clone();
+                                    null_state.next_offset = py_pc;
+                                    null_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                    let null_block = SpamBlockRef::new(
+                                        graph.new_block(Vec::new()),
+                                        Some(null_state.clone()),
+                                    );
+                                    null_block.block().borrow_mut().inputargs =
+                                        null_state.getvariables();
+                                    all_walker_blocks.push(null_block.clone());
+                                    append_exit(
+                                        &current_block.block(),
+                                        output_link(
+                                            &current_state,
+                                            &null_state,
+                                            null_block.block(),
+                                        ),
+                                    );
+                                    set_last_bool_exitcase(&current_block.block(), false);
+
+                                    current_block = nonnull_block;
+                                    current_state = nonnull_state;
+                                    emit_raise!(0u16, current_exc, py_pc as i64, true);
+                                    exception_edge_handled = true;
+
+                                    current_block = null_block;
+                                    current_state = null_state;
                                     let reraise_value = residual_call!(
                                         reraise_varargs_zero_fn_idx,
                                         CallFlavor::Plain,
@@ -12571,6 +12641,7 @@ impl CodeWriter {
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                     emit_raise!(0u16, reraise_value, py_pc as i64, true);
+                                    exception_edge_handled = true;
                                 } else if covered {
                                     // Catch-covered bare raise with a live
                                     // `last_exception` pair: the runtime current-
