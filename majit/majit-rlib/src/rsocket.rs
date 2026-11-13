@@ -30,6 +30,27 @@ pub fn rsocket_startup() {
 #[cfg(not(windows))]
 pub fn rsocket_startup() {}
 
+/// `rsocket.py` `constants`: `_c.constants` plus the `AF_ALG` names it
+/// adds when the headers leave them out.
+pub fn constants() -> impl Iterator<Item = (&'static str, i64)> {
+    const AF_ALG_EXTRAS: &[(&str, i64)] = &[
+        ("SOL_ALG", 279),
+        ("ALG_SET_AEAD_ASSOCLEN", 4),
+        ("ALG_SET_AEAD_AUTHSIZE", 5),
+        ("ALG_SET_PUB_KEY", 6),
+        ("ALG_OP_SIGN", 2),
+        ("ALG_OP_VERIFY", 3),
+    ];
+    crate::_rsocket_rffi::CONSTANTS
+        .iter()
+        .copied()
+        .chain(AF_ALG_EXTRAS.iter().copied().filter(|(name, _)| {
+            !crate::_rsocket_rffi::CONSTANTS
+                .iter()
+                .any(|(existing, _)| existing == name)
+        }))
+}
+
 #[cfg(unix)]
 type Fd = INT;
 #[cfg(windows)]
@@ -844,6 +865,24 @@ fn defining_module() -> &'static str {
 #[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn constants_table() {
+        let table: Vec<_> = constants().collect();
+        let lookup = |name: &str| table.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        assert_eq!(lookup("AF_INET"), Some(i64::from(libc::AF_INET)));
+        assert_eq!(lookup("SOCK_STREAM"), Some(i64::from(libc::SOCK_STREAM)));
+        assert_eq!(lookup("SOMAXCONN"), Some(i64::from(libc::SOMAXCONN)));
+        assert_eq!(lookup("INADDR_NONE"), Some(0xffff_ffff));
+        assert!(lookup("SOL_ALG").is_some());
+        for (i, (name, _)) in table.iter().enumerate() {
+            assert!(
+                table[..i].iter().all(|(n, _)| n != name),
+                "duplicate {name}"
+            );
+        }
+    }
 
     #[test]
     fn stream_socket_option_and_family() {
