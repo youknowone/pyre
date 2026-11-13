@@ -4575,16 +4575,37 @@ impl<M: Clone> MetaInterp<M> {
     /// tally is split — the census, the per-guard warm-state counter, and the
     /// hook see every failure, since bridge-compilation thresholds and guard
     /// attribution still apply to the poll.
-    #[inline]
     ///
     /// The descr identity distinguishes the original guard from each new
     /// bridge's guards.
+    #[inline]
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
         descr: &dyn majit_ir::FailDescr,
         back_edge_poll: bool,
     ) {
+        // jitprof.py integer counters. `AbstractResumeGuardDescr.handle_fail`
+        // has no per-fail logger; `debug_print` is `have_debug_prints`.
+        let tally = if back_edge_poll {
+            &mut self.stats.back_edge_polls
+        } else {
+            &mut self.stats.guard_failures
+        };
+        *tally += 1;
+        if self.hooks.on_guard_failure.is_none()
+            && !guardlog_enabled()
+            && !crate::majit_log_enabled()
+            && !crate::guard_census_enabled()
+        {
+            return;
+        }
+        self.record_guard_failure_event_diag(green_key, descr);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_guard_failure_event_diag(&self, green_key: u64, descr: &dyn majit_ir::FailDescr) {
         let descr_id = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         if guardlog_enabled() {
             eprintln!("@@@GUARD key={green_key} descr=0x{descr_id:x}");
@@ -4595,16 +4616,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key, descr_id
             );
         }
-        let tally = if back_edge_poll {
-            &mut self.stats.back_edge_polls
-        } else {
-            &mut self.stats.guard_failures
-        };
-        *tally += 1;
         crate::guard_census_record(green_key, descr_id);
-        // logger.py has no per-fail IndexMap; jitprof.py counts
-        // Counters.OPS / ABORT_* as integers. The integer
-        // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, descr_id, 0);
         }

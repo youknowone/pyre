@@ -9192,6 +9192,11 @@ where
     while !resumereader.done_reading() {
         // resume.py:1334-1336
         let mut nextbh = builder.acquire_interp();
+        // First acquired is the outermost (dispatch) frame. State-field
+        // ops live there; inlined callees keep the default empty layout.
+        if curbh.is_none() {
+            nextbh.state_field_layout = builder.state_field_layout.clone();
+        }
         nextbh.nextblackholeinterp = curbh;
 
         // resume.py:1338-1340
