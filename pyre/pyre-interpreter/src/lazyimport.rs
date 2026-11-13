@@ -1983,7 +1983,6 @@ fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), Compil
             continue;
         }
         if at_stmt && rest_is_ident(bytes, i, b"from") {
-            let start = i;
             i += 4;
             i = skip_ws_and_comments(bytes, i);
             // Leading dots, then an optional dotted name: a name ends at the
@@ -2016,8 +2015,8 @@ fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), Compil
                 let after = skip_ws_and_comments(bytes, i + 4);
                 if rest_is_ident(bytes, after, b"import") {
                     let range = ruff_text_size::TextRange::new(
-                        ruff_text_size::TextSize::from(start as u32),
-                        ruff_text_size::TextSize::from((after + 6).min(bytes.len()) as u32),
+                        ruff_text_size::TextSize::from(i as u32),
+                        ruff_text_size::TextSize::from((i + 4) as u32),
                     );
                     return Err(lazy_syntax_error(
                         source,
