@@ -2015,6 +2015,8 @@ fn caller_operand_slots<Sym: WalkSym>(
         pyre_interpreter::Instruction::MapAdd { .. } => 2,
         // `[a, b]`. `is_op` pops b then a.
         pyre_interpreter::Instruction::IsOp { .. } => 2,
+        // `[needle, haystack]`. `contains_op` pops the haystack then the needle.
+        pyre_interpreter::Instruction::ContainsOp { .. } => 2,
         // `[obj, index]`. `delete_subscript` pops index then obj.
         pyre_interpreter::Instruction::DeleteSubscr => 2,
         // `[value]`. `opcode_unary_negative` / `unary_not` / `unary_invert`
