@@ -401,6 +401,55 @@ fn socket_writebuf(
     }
 }
 
+/// [3.15-spec] `moduledef.py` skips the names in `if constant in ()`; pyre
+/// skips the `rsocket.constants` entries that socketmodule.c never
+/// publishes, so `hasattr(socket, name)` agrees with 3.15 (measured on
+/// macOS: `socket.POLLIN` / `socket.FD_SETSIZE` exist on PyPy, not on 3.15).
+#[cfg(unix)]
+const CONSTANTS_NOT_IN_CPYTHON: &[&str] = &[
+    "AD_DECnet",
+    "AF_DEC",
+    "NETLINK_ARPD",
+    "NETLINK_ROUTE6",
+    "NETLINK_SKIP",
+    "NETLINK_TAPBASE",
+    "NETLINK_TCPDIAG",
+    "NETLINK_W1",
+    "POLLIN",
+    "POLLPRI",
+    "POLLOUT",
+    "POLLERR",
+    "POLLHUP",
+    "POLLNVAL",
+    "POLLRDNORM",
+    "POLLRDBAND",
+    "POLLWRNORM",
+    "POLLWEBAND",
+    "POLLMSG",
+    "FD_READ",
+    "FD_WRITE",
+    "FD_ACCEPT",
+    "FD_CONNECT",
+    "FD_CLOSE",
+    "WSA_WAIT_TIMEOUT",
+    "WSA_WAIT_FAILED",
+    "INFINITE",
+    "FD_CONNECT_BIT",
+    "FD_CLOSE_BIT",
+    "WSA_IO_PENDING",
+    "WSA_IO_INCOMPLETE",
+    "WSA_INVALID_HANDLE",
+    "WSA_INVALID_PARAMETER",
+    "WSA_NOT_ENOUGH_MEMORY",
+    "WSA_OPERATION_ABORTED",
+    "WSA_FLAG_OVERLAPPED",
+    "WSA_FLAG_NO_HANDLE_INHERIT",
+    "SIOCGIFNAME",
+    "SIOCGIFINDEX",
+    "FD_SETSIZE",
+    "ALG_SET_PUB_KEY",
+];
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -413,352 +462,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     #[cfg(any(unix, windows))]
     rffi::init();
 
-    // `_rsocket_rffi.py constant_names` + `:234-262
-    // constants_w_defaults` — populated through the libc crate where
-    // available, hardcoded for platform-specific constants the crate
-    // does not expose.  Mirrors PyPy's
-    // `for constant, value in rsocket.constants.iteritems(): wrap(value)`
-    // loop in `_socket/moduledef.py:48-50`.
+    // `_socket/moduledef.py` `buildloaders`:
+    // `for constant, value in rsocket.constants.iteritems(): wrap(value)`.
     #[cfg(unix)]
-    {
-        macro_rules! cst {
-            ($name:literal, $val:expr) => {
-                pyre_interpreter::__pyre_put_new!(
-                    ns_slot,
-                    $name,
-                    pyre_object::w_int_new($val as i64)
-                );
-            };
+    for (name, value) in majit_rlib::rsocket::constants() {
+        if CONSTANTS_NOT_IN_CPYTHON.contains(&name) {
+            continue;
         }
-        // ── Address families ──
-        cst!("AF_UNSPEC", libc::AF_UNSPEC);
-        cst!("AF_UNIX", libc::AF_UNIX);
-        cst!("AF_INET", libc::AF_INET);
-        cst!("AF_INET6", libc::AF_INET6);
-        cst!("AF_ROUTE", libc::AF_ROUTE);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("AF_PACKET", libc::AF_PACKET);
-            cst!("AF_NETLINK", libc::AF_NETLINK);
-            cst!("AF_VSOCK", libc::AF_VSOCK);
-        }
-        // ── Socket types ──
-        cst!("SOCK_STREAM", libc::SOCK_STREAM);
-        cst!("SOCK_DGRAM", libc::SOCK_DGRAM);
-        cst!("SOCK_RAW", libc::SOCK_RAW);
-        cst!("SOCK_RDM", libc::SOCK_RDM);
-        cst!("SOCK_SEQPACKET", libc::SOCK_SEQPACKET);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("SOCK_CLOEXEC", libc::SOCK_CLOEXEC);
-            cst!("SOCK_NONBLOCK", libc::SOCK_NONBLOCK);
-        }
-        // ── Protocols ──
-        cst!("IPPROTO_IP", libc::IPPROTO_IP);
-        cst!("IPPROTO_HOPOPTS", libc::IPPROTO_HOPOPTS);
-        cst!("IPPROTO_ICMP", libc::IPPROTO_ICMP);
-        cst!("IPPROTO_IGMP", libc::IPPROTO_IGMP);
-        cst!("IPPROTO_IPIP", libc::IPPROTO_IPIP);
-        cst!("IPPROTO_TCP", libc::IPPROTO_TCP);
-        cst!("IPPROTO_EGP", libc::IPPROTO_EGP);
-        cst!("IPPROTO_PUP", libc::IPPROTO_PUP);
-        cst!("IPPROTO_UDP", libc::IPPROTO_UDP);
-        cst!("IPPROTO_IDP", libc::IPPROTO_IDP);
-        cst!("IPPROTO_TP", libc::IPPROTO_TP);
-        cst!("IPPROTO_IPV6", libc::IPPROTO_IPV6);
-        cst!("IPPROTO_ROUTING", libc::IPPROTO_ROUTING);
-        cst!("IPPROTO_FRAGMENT", libc::IPPROTO_FRAGMENT);
-        cst!("IPPROTO_ESP", libc::IPPROTO_ESP);
-        cst!("IPPROTO_AH", libc::IPPROTO_AH);
-        cst!("IPPROTO_ICMPV6", libc::IPPROTO_ICMPV6);
-        cst!("IPPROTO_NONE", libc::IPPROTO_NONE);
-        cst!("IPPROTO_DSTOPTS", libc::IPPROTO_DSTOPTS);
-        cst!("IPPROTO_PIM", libc::IPPROTO_PIM);
-        cst!("IPPROTO_SCTP", libc::IPPROTO_SCTP);
-        cst!("IPPROTO_RAW", libc::IPPROTO_RAW);
-        // libc deprecates this: the kernel raised the value and libc will
-        // follow upstream in a later release (rust-lang/libc#1896). Keep
-        // reading it from libc rather than freezing a literal, so the new
-        // value arrives with the dependency; `socketmodule.c` likewise takes
-        // whatever the platform header defines.
-        #[allow(deprecated)]
-        {
-            cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
-        }
-        cst!("IPPROTO_GRE", libc::IPPROTO_GRE);
-        cst!("IPPROTO_RSVP", libc::IPPROTO_RSVP);
-        // `_rsocket_rffi.py constants_w_defaults` — SOL_IP/TCP/UDP
-        // and IPPROTO_* duplicates kept for PyPy compatibility.
-        cst!("SOL_IP", 0);
-        cst!("SOL_TCP", 6);
-        cst!("SOL_UDP", 17);
-        // ── INADDR_* (host byte order) ──
-        cst!("INADDR_ANY", libc::INADDR_ANY);
-        cst!("INADDR_LOOPBACK", libc::INADDR_LOOPBACK);
-        cst!("INADDR_BROADCAST", libc::INADDR_BROADCAST);
-        cst!("INADDR_NONE", libc::INADDR_NONE);
-        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32);
-        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32);
-        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32);
-        cst!("IPPORT_RESERVED", 1024);
-        cst!("IPPORT_USERRESERVED", 5000);
-        // ── SOL_* / SO_* (socket level) ──
-        cst!("SOL_SOCKET", libc::SOL_SOCKET);
-        cst!("SO_REUSEADDR", libc::SO_REUSEADDR);
-        cst!("SO_REUSEPORT", libc::SO_REUSEPORT);
-        cst!("SO_KEEPALIVE", libc::SO_KEEPALIVE);
-        cst!("SO_BROADCAST", libc::SO_BROADCAST);
-        cst!("SO_DEBUG", libc::SO_DEBUG);
-        cst!("SO_DONTROUTE", libc::SO_DONTROUTE);
-        cst!("SO_LINGER", libc::SO_LINGER);
-        cst!("SO_OOBINLINE", libc::SO_OOBINLINE);
-        cst!("SO_RCVBUF", libc::SO_RCVBUF);
-        cst!("SO_SNDBUF", libc::SO_SNDBUF);
-        cst!("SO_RCVTIMEO", libc::SO_RCVTIMEO);
-        cst!("SO_SNDTIMEO", libc::SO_SNDTIMEO);
-        cst!("SO_RCVLOWAT", libc::SO_RCVLOWAT);
-        cst!("SO_SNDLOWAT", libc::SO_SNDLOWAT);
-        cst!("SO_ERROR", libc::SO_ERROR);
-        cst!("SO_TYPE", libc::SO_TYPE);
-        cst!("SO_ACCEPTCONN", libc::SO_ACCEPTCONN);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("SO_DOMAIN", libc::SO_DOMAIN);
-            cst!("SO_PROTOCOL", libc::SO_PROTOCOL);
-            cst!("SO_PEERCRED", libc::SO_PEERCRED);
-            cst!("SO_PASSCRED", libc::SO_PASSCRED);
-            cst!("SO_PEERSEC", libc::SO_PEERSEC);
-            cst!("SO_PASSSEC", libc::SO_PASSSEC);
-        }
-        // ── TCP-level ──
-        cst!("TCP_NODELAY", libc::TCP_NODELAY);
-        cst!("TCP_MAXSEG", libc::TCP_MAXSEG);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("TCP_KEEPIDLE", libc::TCP_KEEPIDLE);
-            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
-            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
-            cst!("TCP_CORK", libc::TCP_CORK);
-            cst!("TCP_DEFER_ACCEPT", libc::TCP_DEFER_ACCEPT);
-            cst!("TCP_INFO", libc::TCP_INFO);
-            cst!("TCP_LINGER2", libc::TCP_LINGER2);
-            cst!("TCP_QUICKACK", libc::TCP_QUICKACK);
-            cst!("TCP_SYNCNT", libc::TCP_SYNCNT);
-            cst!("TCP_WINDOW_CLAMP", libc::TCP_WINDOW_CLAMP);
-            cst!("TCP_USER_TIMEOUT", libc::TCP_USER_TIMEOUT);
-            cst!("TCP_CONGESTION", libc::TCP_CONGESTION);
-            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
-            cst!("TCP_NOTSENT_LOWAT", libc::TCP_NOTSENT_LOWAT);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            cst!("TCP_KEEPALIVE", libc::TCP_KEEPALIVE);
-        }
-        // ── IP-level ──
-        cst!("IP_TTL", libc::IP_TTL);
-        cst!("IP_TOS", libc::IP_TOS);
-        cst!("IP_MULTICAST_TTL", libc::IP_MULTICAST_TTL);
-        cst!("IP_MULTICAST_LOOP", libc::IP_MULTICAST_LOOP);
-        cst!("IP_MULTICAST_IF", libc::IP_MULTICAST_IF);
-        cst!("IP_ADD_MEMBERSHIP", libc::IP_ADD_MEMBERSHIP);
-        cst!("IP_DROP_MEMBERSHIP", libc::IP_DROP_MEMBERSHIP);
-        cst!("IP_HDRINCL", libc::IP_HDRINCL);
-        // IP_OPTIONS / IP_RECVOPTS / IP_RECVRETOPTS / IP_RETOPTS are
-        // POSIX but the libc crate does not expose them; `_rsocket_rffi.py`
-        // lists them in `constant_names`, and
-        // `platform.DefinedConstantInteger` drops them when the header does
-        // not define them.  The darwin values are spelled out below; on the
-        // other unices they stay unexposed.
-        cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
-        cst!("IP_DEFAULT_MULTICAST_TTL", 1);
-        // `<netinet/in.h>` sizes the membership table per platform: 4095 on
-        // darwin, 20 on linux.
-        #[cfg(target_vendor = "apple")]
-        cst!("IP_MAX_MEMBERSHIPS", 4095);
-        #[cfg(not(target_vendor = "apple"))]
-        cst!("IP_MAX_MEMBERSHIPS", 20);
-        // ── IPv6 ──
-        cst!("IPV6_V6ONLY", libc::IPV6_V6ONLY);
-        cst!("IPV6_MULTICAST_HOPS", libc::IPV6_MULTICAST_HOPS);
-        cst!("IPV6_MULTICAST_LOOP", libc::IPV6_MULTICAST_LOOP);
-        cst!("IPV6_MULTICAST_IF", libc::IPV6_MULTICAST_IF);
-        cst!("IPV6_UNICAST_HOPS", libc::IPV6_UNICAST_HOPS);
-        cst!("IPV6_CHECKSUM", libc::IPV6_CHECKSUM);
-        // `<netinet/in.h>` IPV6_JOIN_GROUP=20 / IPV6_LEAVE_GROUP=21 on Linux;
-        // libc crate omits the symbols on linux-gnu though the kernel headers
-        // define them.  Apple / BSD expose them with the BSD numbering (12 /
-        // 13) — keep using `libc::*` there for header parity.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("IPV6_JOIN_GROUP", 20);
-            cst!("IPV6_LEAVE_GROUP", 21);
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            cst!("IPV6_JOIN_GROUP", libc::IPV6_JOIN_GROUP);
-            cst!("IPV6_LEAVE_GROUP", libc::IPV6_LEAVE_GROUP);
-        }
-        cst!("IPV6_RECVTCLASS", libc::IPV6_RECVTCLASS);
-        cst!("IPV6_TCLASS", libc::IPV6_TCLASS);
-        cst!("IPV6_RECVPKTINFO", libc::IPV6_RECVPKTINFO);
-        cst!("IPV6_PKTINFO", libc::IPV6_PKTINFO);
-        cst!("IPV6_RECVHOPLIMIT", libc::IPV6_RECVHOPLIMIT);
-        cst!("IPV6_HOPLIMIT", libc::IPV6_HOPLIMIT);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("IPV6_DSTOPTS", libc::IPV6_DSTOPTS);
-            cst!("IPV6_HOPOPTS", libc::IPV6_HOPOPTS);
-            cst!("IPV6_NEXTHOP", libc::IPV6_NEXTHOP);
-            cst!("IPV6_RECVDSTOPTS", libc::IPV6_RECVDSTOPTS);
-            cst!("IPV6_RECVHOPOPTS", libc::IPV6_RECVHOPOPTS);
-            cst!("IPV6_RECVRTHDR", libc::IPV6_RECVRTHDR);
-            cst!("IPV6_RTHDR", libc::IPV6_RTHDR);
-            cst!("IPV6_RTHDRDSTOPTS", libc::IPV6_RTHDRDSTOPTS);
-            // `<netinet/in.h>` IPV6_RTHDR_TYPE_0=0; symbol omitted from
-            // libc crate on linux-gnu but the kernel header defines it.
-            cst!("IPV6_RTHDR_TYPE_0", 0);
-        }
-        // ── shutdown how ──
-        cst!("SHUT_RD", libc::SHUT_RD);
-        cst!("SHUT_WR", libc::SHUT_WR);
-        cst!("SHUT_RDWR", libc::SHUT_RDWR);
-        // ── Message flags ──
-        cst!("MSG_OOB", libc::MSG_OOB);
-        cst!("MSG_PEEK", libc::MSG_PEEK);
-        cst!("MSG_DONTROUTE", libc::MSG_DONTROUTE);
-        cst!("MSG_DONTWAIT", libc::MSG_DONTWAIT);
-        cst!("MSG_WAITALL", libc::MSG_WAITALL);
-        cst!("MSG_CTRUNC", libc::MSG_CTRUNC);
-        cst!("MSG_TRUNC", libc::MSG_TRUNC);
-        cst!("MSG_EOR", libc::MSG_EOR);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        cst!("MSG_ERRQUEUE", libc::MSG_ERRQUEUE);
-        // ── Address-info flags ──
-        cst!("AI_PASSIVE", libc::AI_PASSIVE);
-        cst!("AI_CANONNAME", libc::AI_CANONNAME);
-        cst!("AI_NUMERICHOST", libc::AI_NUMERICHOST);
-        cst!("AI_NUMERICSERV", libc::AI_NUMERICSERV);
-        cst!("AI_ADDRCONFIG", libc::AI_ADDRCONFIG);
-        cst!("AI_V4MAPPED", libc::AI_V4MAPPED);
-        cst!("AI_ALL", libc::AI_ALL);
-        #[cfg(target_os = "macos")]
-        {
-            cst!("AI_DEFAULT", libc::AI_DEFAULT);
-            cst!("AI_MASK", libc::AI_MASK);
-            cst!("AI_V4MAPPED_CFG", libc::AI_V4MAPPED_CFG);
-        }
-        // ── Name-info flags ──
-        cst!("NI_NUMERICHOST", libc::NI_NUMERICHOST);
-        cst!("NI_NUMERICSERV", libc::NI_NUMERICSERV);
-        cst!("NI_NOFQDN", libc::NI_NOFQDN);
-        cst!("NI_NAMEREQD", libc::NI_NAMEREQD);
-        cst!("NI_DGRAM", libc::NI_DGRAM);
-        cst!("NI_MAXHOST", libc::NI_MAXHOST);
-        // POSIX <netdb.h> NI_MAXSERV = 32; libc crate omits it on linux-gnu
-        cst!("NI_MAXSERV", 32);
-        // ── EAI_* (gai_strerror codes) ──
-        cst!("EAI_AGAIN", libc::EAI_AGAIN);
-        cst!("EAI_BADFLAGS", libc::EAI_BADFLAGS);
-        cst!("EAI_FAIL", libc::EAI_FAIL);
-        cst!("EAI_FAMILY", libc::EAI_FAMILY);
-        cst!("EAI_MEMORY", libc::EAI_MEMORY);
-        cst!("EAI_NODATA", libc::EAI_NODATA);
-        cst!("EAI_NONAME", libc::EAI_NONAME);
-        cst!("EAI_OVERFLOW", libc::EAI_OVERFLOW);
-        cst!("EAI_SERVICE", libc::EAI_SERVICE);
-        cst!("EAI_SOCKTYPE", libc::EAI_SOCKTYPE);
-        cst!("EAI_SYSTEM", libc::EAI_SYSTEM);
-        // `_rsocket_rffi.py` names these four alongside the rest and
-        // `platform.DefinedConstantInteger` keeps whichever the platform's
-        // `<netdb.h>` defines.  Darwin defines all four; the libc crate does
-        // not re-export them, so they are spelled out here the way
-        // `NI_MAXSERV` above is.
-        #[cfg(target_vendor = "apple")]
-        {
-            cst!("EAI_ADDRFAMILY", 1);
-            cst!("EAI_BADHINTS", 12);
-            cst!("EAI_PROTOCOL", 13);
-            cst!("EAI_MAX", 15);
-        }
-        // ── SCM_* (ancillary data types) ──
-        cst!("SCM_RIGHTS", libc::SCM_RIGHTS);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        cst!("SCM_CREDENTIALS", libc::SCM_CREDENTIALS);
-        // ── socket-level cap ──
-        cst!("SOMAXCONN", libc::SOMAXCONN);
-
-        // Names `<sys/socket.h>`, `<netinet/in.h>`, `<netinet/tcp.h>`,
-        // `<net/ethernet.h>` and `<sys/sys_domain.h>` define only on darwin,
-        // or define there with a different value than on linux.  Every value
-        // was read back from the headers themselves.  `socketmodule.c` guards
-        // the RFC 3542 half with `#define __APPLE_USE_RFC_3542 1`, which is
-        // why those names exist on this platform at all.
-        #[cfg(target_vendor = "apple")]
-        {
-            // ── Address / protocol families ──
-            cst!("AF_APPLETALK", libc::AF_APPLETALK);
-            cst!("AF_DECnet", libc::AF_DECnet);
-            cst!("AF_IPX", libc::AF_IPX);
-            cst!("AF_LINK", libc::AF_LINK);
-            cst!("AF_SNA", libc::AF_SNA);
-            cst!("AF_SYSTEM", libc::AF_SYSTEM);
-            cst!("PF_SYSTEM", libc::PF_SYSTEM);
-            cst!("SYSPROTO_CONTROL", libc::SYSPROTO_CONTROL);
-            // ── IPPROTO_* ──
-            cst!("IPPROTO_EON", libc::IPPROTO_EON);
-            cst!("IPPROTO_GGP", libc::IPPROTO_GGP);
-            cst!("IPPROTO_HELLO", libc::IPPROTO_HELLO);
-            cst!("IPPROTO_IPCOMP", libc::IPPROTO_IPCOMP);
-            cst!("IPPROTO_IPV4", 4);
-            cst!("IPPROTO_ND", libc::IPPROTO_ND);
-            cst!("IPPROTO_XTP", libc::IPPROTO_XTP);
-            // ── IPv4 socket options ──
-            cst!("IP_ADD_SOURCE_MEMBERSHIP", libc::IP_ADD_SOURCE_MEMBERSHIP);
-            cst!("IP_BLOCK_SOURCE", libc::IP_BLOCK_SOURCE);
-            cst!("IP_DROP_SOURCE_MEMBERSHIP", libc::IP_DROP_SOURCE_MEMBERSHIP);
-            cst!("IP_UNBLOCK_SOURCE", libc::IP_UNBLOCK_SOURCE);
-            cst!("IP_OPTIONS", 1);
-            cst!("IP_RECVOPTS", 5);
-            cst!("IP_RECVRETOPTS", 6);
-            cst!("IP_RETOPTS", 8);
-            cst!("IP_PKTINFO", libc::IP_PKTINFO);
-            cst!("IP_RECVDSTADDR", libc::IP_RECVDSTADDR);
-            cst!("IP_RECVTOS", libc::IP_RECVTOS);
-            cst!("IP_RECVTTL", libc::IP_RECVTTL);
-            // ── IPv6 socket options ──
-            cst!("IPV6_DONTFRAG", libc::IPV6_DONTFRAG);
-            cst!("IPV6_DSTOPTS", 50);
-            cst!("IPV6_HOPOPTS", 49);
-            cst!("IPV6_NEXTHOP", 48);
-            cst!("IPV6_PATHMTU", 44);
-            cst!("IPV6_RECVDSTOPTS", 40);
-            cst!("IPV6_RECVHOPOPTS", 39);
-            cst!("IPV6_RECVPATHMTU", 43);
-            cst!("IPV6_RECVRTHDR", 38);
-            cst!("IPV6_RTHDR", 51);
-            cst!("IPV6_RTHDRDSTOPTS", 57);
-            cst!("IPV6_RTHDR_TYPE_0", 0);
-            cst!("IPV6_USE_MIN_MTU", 42);
-            // ── TCP ──
-            cst!("TCP_CONNECTION_INFO", libc::TCP_CONNECTION_INFO);
-            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
-            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
-            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
-            cst!("TCP_NOTSENT_LOWAT", 513);
-            // ── SO_* / MSG_* / SCM_* ──
-            cst!("SO_BINDTODEVICE", 4404);
-            cst!("SO_USELOOPBACK", libc::SO_USELOOPBACK);
-            cst!("LOCAL_PEERCRED", libc::LOCAL_PEERCRED);
-            cst!("MSG_EOF", libc::MSG_EOF);
-            cst!("MSG_NOSIGNAL", libc::MSG_NOSIGNAL);
-            cst!("SCM_CREDS", libc::SCM_CREDS);
-            // ── `<net/ethernet.h>` ──
-            cst!("ETHERTYPE_ARP", 2054);
-            cst!("ETHERTYPE_IP", 2048);
-            cst!("ETHERTYPE_IPV6", 34525);
-            cst!("ETHERTYPE_VLAN", 33024);
-        }
+        pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(value));
     }
+    // [3.15-spec] socketmodule.c publishes IP_RECVTTL under #ifdef; rsocket's constant_names lacks it.
+    #[cfg(all(unix, target_vendor = "apple"))]
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "IP_RECVTTL",
+        pyre_object::w_int_new(i64::from(libc::IP_RECVTTL))
+    );
 
     // `_rsocket_rffi.py` keeps a separate `_MSVC` constant list because the
     // two headers name overlapping but different sets; this is that list.
