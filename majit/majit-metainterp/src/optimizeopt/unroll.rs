@@ -1001,15 +1001,15 @@ impl UnrollOptimizer {
                 .iter()
                 .map(Operand::from_bound_inputarg)
                 .collect();
+            let cache = std::mem::take(&mut p1_iter._cache);
+            crate::optimizeopt::attach_resume_snapshot_caches(
+                &mut opt_p1.snapshot_boxes,
+                &mut opt_p1.snapshot_vable_boxes,
+                &mut opt_p1.snapshot_vref_boxes,
+                &cache,
+            );
             if let Some(recorder) = self.snapshot_recorder {
                 // SAFETY: the caller keeps the recorder alive across optimize.
-                let cache = std::mem::take(&mut p1_iter._cache);
-                crate::optimizeopt::attach_resume_snapshot_caches(
-                    &mut opt_p1.snapshot_boxes,
-                    &mut opt_p1.snapshot_vable_boxes,
-                    &mut opt_p1.snapshot_vref_boxes,
-                    &cache,
-                );
                 opt_p1.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
                     unsafe { &*recorder },
                     cache,
@@ -5945,9 +5945,10 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 /// TraceIterator._get` / `SnapshotIterator._untag`). One snapshot
 /// coordinate, one current-namespace cache box: `map_opref` alone
 /// would keep the source box and `_number_one` would tag the slot as
-/// the stale failarg. Constants / none keep `cached` empty; a miss
-/// also clears it so numbering falls back to
-/// `get_box_replacement_operand`.
+/// the stale failarg. Constants / none keep `cached` empty. A translated
+/// miss panics (`remapped_producer_operand`); an unmapped slot keeps the
+/// planted iterator box (`TraceIterator._get` `assert res is not None`
+/// when that box was never planted).
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
     ref_map: &crate::FxIndexMap<OpRef, OpRef>,
@@ -5956,11 +5957,23 @@ fn remap_snapshot_boxes(
     boxes
         .iter()
         .map(|boxref| {
+            let old = boxref.opref;
             let mut r = boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref));
             if r.opref.is_none() || r.opref.is_constant() {
                 r.cached = None;
-            } else {
-                r.cached = current_box(r.opref);
+            } else if let Some(b) = current_box(r.opref) {
+                r.cached = Some(b);
+            } else if r.opref != old {
+                panic!(
+                    "remap_snapshot_boxes: TraceIterator._get({:?}) is None \
+                     (translated from {old:?})",
+                    r.opref
+                );
+            } else if r.cached.is_none() {
+                panic!(
+                    "remap_snapshot_boxes: TraceIterator._get({:?}) is None",
+                    r.opref
+                );
             }
             r
         })
@@ -5988,9 +6001,8 @@ fn clone_guard_snapshot_remapped(
     // entry with the same raw-box -> cloned-box mapping used for op args.
     // Rebind `cached` to the reserved remapped producer so numbering
     // walks that box, not the source-namespace cache `map_opref` keeps.
-    // Unmapped slots (input args outside the peel buffer) miss `box_map`
-    // and clear `cached`; numbering falls back to
-    // `get_box_replacement_operand`.
+    // Unmapped slots (input args outside the peel buffer) keep the
+    // planted iterator box.
     let new_pos = fresh_snapshot_key(ctx);
     let remapped_boxes = remap_snapshot_boxes(&snapshot_boxes, ref_map, |opref| {
         box_map.get(&opref).cloned()
@@ -6352,7 +6364,7 @@ mod tests {
             // semantics that RPython gets from opencoder.py.
             guard
                 .guard_fail_args()
-                .map(|fail_args| fail_args.iter().map(|a| a.to_opref()).collect())
+                .map(|fail_args| fail_args.to_vec())
                 .unwrap_or_default()
         });
         opt.snapshot_boxes = snapshots;

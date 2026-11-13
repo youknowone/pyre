@@ -9828,7 +9828,7 @@ pub(crate) fn seed_guard_snapshots_with<F>(
     mut snapshot_for_guard: F,
 ) -> (Vec<Op>, SnapshotBoxes)
 where
-    F: FnMut(&Op) -> Vec<OpRef>,
+    F: FnMut(&Op) -> Vec<Operand>,
 {
     let mut seeded = ops.to_vec();
     let mut snapshots: SnapshotBoxes = Vec::new();
@@ -9851,7 +9851,10 @@ where
         snapshot_insert(
             &mut snapshots,
             resume_pos,
-            snapshot_boxes.into_iter().map(SnapshotBox::from).collect(),
+            snapshot_boxes
+                .into_iter()
+                .map(SnapshotBox::from_cached)
+                .collect(),
         );
     }
     (seeded, snapshots)

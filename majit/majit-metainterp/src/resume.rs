@@ -267,9 +267,9 @@ pub struct SnapshotBox {
     /// collected `*mut OpRef` slot address.
     pub opref: majit_ir::OpRef,
     /// Box from `TraceIterator._cache` / `unique_cache` for this slot.
-    /// `None` when the iterator cache did not supply one (tests that
-    /// seed OpRefs only); `_number_one` then falls back to the
-    /// positional resolver.
+    /// Constants and none keep this empty. A non-const miss in
+    /// `_number_one` is a bind-at-alloc / iterator-cache bug
+    /// (`opencoder.py TraceIterator._get`).
     pub cached: Option<Operand>,
     /// opencoder.py SnapshotIterator._untag TAGCONSTPTR: ConstPtr(trace._refs[v]),
     /// read at the untag. Numbering passes it to getconst without an OpRef.
@@ -289,6 +289,23 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached: None,
+            const_gcref: None,
+        }
+    }
+
+    /// Iterator-cache box for this snapshot coordinate
+    /// (`opencoder.py TraceIterator._get` / `SnapshotIterator._untag`).
+    /// Constants and none keep `cached` empty (`ConstInt.__init__`).
+    pub fn from_cached(op: Operand) -> Self {
+        let opref = op.to_opref();
+        let cached = if op.is_none() || op.is_constant() {
+            None
+        } else {
+            Some(op)
+        };
+        SnapshotBox {
+            opref,
+            cached,
             const_gcref: None,
         }
     }
@@ -325,15 +342,25 @@ impl SnapshotBox {
     /// (`opencoder.py TraceIterator._get` / `SnapshotIterator._untag`).
     /// One snapshot coordinate, one current cache box: a remapped slot
     /// never keeps an earlier namespace's box. Constants and none keep
-    /// `cached` empty. A miss on a non-constant slot also clears `cached`
-    /// so `_number_one` falls back to `get_box_replacement_operand`.
-    /// Call before `map_opref` rewrites the OpRef.
+    /// `cached` empty. A non-const miss panics (`TraceIterator._get`
+    /// `assert res is not None`). Call before `map_opref` rewrites the OpRef.
     pub fn rebind_iter_cache(&mut self, cache: &[Option<Operand>]) {
         if self.opref.is_none() || self.opref.is_constant() {
             self.cached = None;
             return;
         }
-        self.cached = cache.get(self.opref.raw() as usize).cloned().flatten();
+        self.cached = Some(
+            cache
+                .get(self.opref.raw() as usize)
+                .and_then(Clone::clone)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "rebind_iter_cache: TraceIterator._get({:?}) is None (cache_len={})",
+                        self.opref,
+                        cache.len(),
+                    )
+                }),
+        );
     }
 }
 
@@ -3498,11 +3525,14 @@ impl ResumeDataLoopMemo {
         }
         // TraceIterator._get / SnapshotIterator._untag hold the slot's
         // box in `cached`; ResumeDataLoopMemo._number_boxes walks that
-        // object. Miss: class-C BoxEnv.get_box_replacement_operand.
+        // object. A miss is a bind-at-alloc / iterator-cache bug.
         let held = cached.or(snapshot_box.cached.as_ref());
         let b = match held {
             Some(cached) => cached.get_box_replacement(false),
-            None => env.get_box_replacement_operand(raw_opref),
+            None => panic!(
+                "_number_one: snapshot slot {raw_opref:?} has no iterator-cache box \
+                 (TraceIterator._get)"
+            ),
         };
         let opref = b.to_opref();
         if opref.is_none() {
@@ -3529,12 +3559,12 @@ impl ResumeDataLoopMemo {
         //     if box.type == 'r':
         //
         // The type used for virtual classification is the replacement
-        // box's type, not the original snapshot slot's fallback type.  A
-        // snapshot slot can carry an Int fallback from tracing but forward
-        // to a Ref virtual after optimization; keeping the stale fallback
-        // would number that virtual as a TAGBOX and the subsequent
-        // fail-arg force would materialize it.
-        let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
+        // box's type (`AbstractValue.type`), not the original snapshot
+        // slot's fallback type. A snapshot slot can carry an Int fallback
+        // from tracing but forward to a Ref virtual after optimization;
+        // keeping the stale fallback would number that virtual as a TAGBOX
+        // and the subsequent fail-arg force would materialize it.
+        let box_type = b.type_();
         let is_virtual = match box_type {
             majit_ir::Type::Ref => env.is_virtual_ref(&b),
             majit_ir::Type::Int => env.is_virtual_raw(&b),
@@ -3546,8 +3576,6 @@ impl ResumeDataLoopMemo {
             t
         } else {
             // resume.py `_number_boxes` reads `box.type` off the box.
-            // `box_type` above is `opref.ty()` (Operand::type_ / OpRef::ty),
-            // with `env.get_type` only when the variant carries no tag.
             let t = tag(numb_state.num_boxes, TAGBOX)?;
             numb_state.num_boxes += 1;
             t
@@ -3775,11 +3803,11 @@ impl ResumeDataLoopMemo {
     /// RPython patches it later in ResumeDataVirtualAdder.finish()
     /// (resume.py). Callers must call
     /// `numb_state.writer.patch(1, num_liveboxes)` after finish().
-    fn number_slices(
+    fn number_slices<'c>(
         &mut self,
-        vable_array: &[SnapshotBox],
-        vref_array: &[SnapshotBox],
-        frames: &[(i32, i32, &[SnapshotBox])],
+        vable_array: &'c [SnapshotBox],
+        vref_array: &'c [SnapshotBox],
+        frames: &'c [(i32, i32, &'c [SnapshotBox])],
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
@@ -3794,15 +3822,17 @@ impl ResumeDataLoopMemo {
         self.number_sections(
             vable_array.len() as i64,
             || {
+                let cached = vable_array[vable_i].cached.as_ref();
                 let snap_box = vable_array[vable_i].clone();
                 vable_i += 1;
-                (snap_box, None)
+                (snap_box, cached)
             },
             vref_array.len() as i64,
             || {
+                let cached = vref_array[vref_i].cached.as_ref();
                 let snap_box = vref_array[vref_i].clone();
                 vref_i += 1;
-                (snap_box, None)
+                (snap_box, cached)
             },
             &frame_meta,
             || {
@@ -3810,9 +3840,10 @@ impl ResumeDataLoopMemo {
                     frame_i += 1;
                     box_i = 0;
                 }
+                let cached = frames[frame_i].2[box_i].cached.as_ref();
                 let snap_box = frames[frame_i].2[box_i].clone();
                 box_i += 1;
-                (snap_box, None)
+                (snap_box, cached)
             },
             env,
             minimum_virtualizable_size,
@@ -4279,6 +4310,12 @@ pub fn decode_box(
 
 #[cfg(test)]
 mod tests {
+    fn planted(opref: majit_ir::OpRef) -> super::SnapshotBox {
+        super::SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+            opref,
+        ))
+    }
+
     /// A collection between two guards of one optimizer moves a `ConstPtr`
     /// the memo already pooled. The walk must forward the pool entry and
     /// re-key `refs`, so the next guard's `getconst_ref` answers the moved
@@ -4469,28 +4506,40 @@ mod tests {
                 self.inner.is_virtual_raw(box_)
             }
         }
-        let mut env = Env {
+        let env = Env {
             inner: SimpleBoxEnv::new(),
             resolutions: std::cell::Cell::new(0),
         };
-        env.inner.replacements.insert(1, majit_ir::OpRef::int_op(0));
-        env.inner
-            .replacements
-            .insert(2, majit_ir::OpRef::const_int(7));
+        let (canon, canon_op) =
+            crate::history::test_support::bound_resop_operand(majit_ir::Type::Int, 0);
+        let (src, _src_op) =
+            crate::history::test_support::bound_resop_operand(majit_ir::Type::Int, 1);
+        src.set_forwarded_op(&canon_op);
+        let (fwd_const, _fwd_op) =
+            crate::history::test_support::bound_resop_operand(majit_ir::Type::Int, 2);
+        fwd_const.set_forwarded_const(majit_ir::Const::Int(7));
         let boxes = [
-            majit_ir::OpRef::int_op(1),
-            majit_ir::OpRef::int_op(1),
-            majit_ir::OpRef::int_op(2),
-            majit_ir::OpRef::const_int(9),
-        ]
-        .map(SnapshotBox::untyped);
+            SnapshotBox::from_cached(src.clone()),
+            SnapshotBox::from_cached(src.clone()),
+            SnapshotBox::from_cached(fwd_const),
+            SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                majit_ir::OpRef::const_int(9),
+            )),
+        ];
         let mut state = NumberingState::new(4);
         ResumeDataLoopMemo::new()
             ._number_boxes(&boxes, &mut state, &env)
             .unwrap();
         assert_eq!(state.num_boxes, 1);
         assert_eq!(state.liveboxes.iter().count(), 1);
-        assert_eq!(env.resolutions.get(), 3);
+        assert!(
+            state
+                .liveboxes
+                .iter()
+                .next()
+                .is_some_and(|(b, _)| b.same_box(&canon))
+        );
+        assert_eq!(env.resolutions.get(), 0);
     }
 
     #[test]
@@ -4632,10 +4681,14 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let env = SimpleBoxEnv::new();
-        let snapshot = Snapshot::single_frame(
+        let snapshot = Snapshot::single_frame_boxes(
             0,
             8,
-            vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![
+                planted(OpRef::const_int(42)),
+                planted(OpRef::int_op(1)),
+                planted(OpRef::int_op(2)),
+            ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
@@ -4673,10 +4726,7 @@ mod tests {
         // pyjitpl.py finishframe has popped the last MIFrame.
         let snapshot = Snapshot {
             framestack: Vec::new(),
-            vable_array: vec![
-                SnapshotBox::from(OpRef::ref_op(0)),
-                SnapshotBox::from(OpRef::const_int(7)),
-            ],
+            vable_array: vec![planted(OpRef::ref_op(0)), planted(OpRef::const_int(7))],
             vref_array: Vec::new(),
         };
         let env = SimpleBoxEnv::new();
@@ -4702,9 +4752,9 @@ mod tests {
                 pc: 4,
                 py_pc: 5,
                 boxes: vec![
-                    SnapshotBox::from(OpRef::ref_op(0)),
-                    SnapshotBox::from(OpRef::const_int(9)),
-                    SnapshotBox::from(OpRef::ref_op(1)),
+                    planted(OpRef::ref_op(0)),
+                    planted(OpRef::const_int(9)),
+                    planted(OpRef::ref_op(1)),
                 ],
             }],
             vable_array: Vec::new(),
@@ -4732,10 +4782,14 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let env = SimpleBoxEnv::new();
-        let snapshot = Snapshot::single_frame(
+        let snapshot = Snapshot::single_frame_boxes(
             0,
             8,
-            vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![
+                planted(OpRef::const_int(42)),
+                planted(OpRef::int_op(1)),
+                planted(OpRef::int_op(2)),
+            ],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
@@ -4770,10 +4824,14 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.virtuals.insert(2); // OpRef::ref_op(2) is virtual (Ref type)
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(
+        let snapshot = Snapshot::single_frame_boxes(
             0,
             10,
-            vec![OpRef::int_op(1), OpRef::ref_op(2), OpRef::int_op(3)],
+            vec![
+                planted(OpRef::int_op(1)),
+                planted(OpRef::ref_op(2)),
+                planted(OpRef::int_op(3)),
+            ],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: finish() patches with len(newboxes) which is num_boxes
@@ -4804,10 +4862,14 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(
+        let snapshot = Snapshot::single_frame_boxes(
             0,
             10,
-            vec![OpRef::int_op(1), OpRef::ref_op(2), OpRef::int_op(3)],
+            vec![
+                planted(OpRef::int_op(1)),
+                planted(OpRef::ref_op(2)),
+                planted(OpRef::int_op(3)),
+            ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
@@ -4924,17 +4986,16 @@ mod tests {
         // RPython resume.py reads box.type after get_box_replacement().
         // Model a stale Int-typed snapshot slot that now forwards to a Ref
         // virtual, the shape produced by optimized boxed-int locals.
-        let source = OpRef::int_op(1);
-        let target = OpRef::ref_op(2);
-        env.replacements.insert(source.raw(), target);
-        env.virtuals.insert(target.raw());
-        env.types.insert(target.raw(), majit_ir::Type::Ref);
+        let (source, _source_op) =
+            crate::history::test_support::bound_resop_operand(majit_ir::Type::Int, 1);
+        let (target, target_op) =
+            crate::history::test_support::bound_resop_operand(majit_ir::Type::Ref, 2);
+        source.set_forwarded_op(&target_op);
+        env.virtuals.insert(target.to_opref().raw());
+        env.types
+            .insert(target.to_opref().raw(), majit_ir::Type::Ref);
 
-        let snapshot = Snapshot::single_frame_boxes(
-            0,
-            10,
-            vec![SnapshotBox::typed(source, majit_ir::Type::Int)],
-        );
+        let snapshot = Snapshot::single_frame_boxes(0, 10, vec![SnapshotBox::from_cached(source)]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
@@ -4960,13 +5021,13 @@ mod tests {
                     jitcode_index: 0,
                     pc: 10,
                     py_pc: 10,
-                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(99).into()],
+                    boxes: vec![planted(OpRef::int_op(1)), planted(OpRef::const_int(99))],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
                     py_pc: 20,
-                    boxes: vec![OpRef::int_op(2).into(), OpRef::int_op(3).into()],
+                    boxes: vec![planted(OpRef::int_op(2)), planted(OpRef::int_op(3))],
                 },
             ],
         };
@@ -5019,14 +5080,14 @@ mod tests {
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
-        let snapshot = Snapshot::single_frame(
+        let snapshot = Snapshot::single_frame_boxes(
             0,
             8,
             vec![
-                OpRef::const_int(42),
-                OpRef::int_op(1),
-                OpRef::ref_op(2),
-                OpRef::int_op(3),
+                planted(OpRef::const_int(42)),
+                planted(OpRef::int_op(1)),
+                planted(OpRef::ref_op(2)),
+                planted(OpRef::int_op(3)),
             ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
@@ -5130,7 +5191,8 @@ mod tests {
         let second = env.get_box_replacement_operand(collapsed);
         assert!(first.same_box(&second));
         assert_eq!(first.to_opref(), second.to_opref());
-        let snapshot = Snapshot::single_frame(0, 8, vec![numbered, collapsed, numbered]);
+        let snap = SnapshotBox::from_cached(env.collapsed_operand.clone());
+        let snapshot = Snapshot::single_frame_boxes(0, 8, vec![snap.clone(), snap.clone(), snap]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // `_number_boxes` inserts the canonical replacement producer.
         assert_eq!(
@@ -5183,12 +5245,12 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let env = SimpleBoxEnv::new();
 
-        let first = Snapshot::single_frame(0, 1, vec![OpRef::const_int(1)]);
+        let first = Snapshot::single_frame_boxes(0, 1, vec![planted(OpRef::const_int(1))]);
         let first_state = memo.number(&first, &env, -1).unwrap();
         let (_, first_pool, _, _) = memo.finish(first_state, &env, &mut [], None).unwrap();
         assert!(first_pool.is_empty());
 
-        let second = Snapshot::single_frame(0, 2, vec![OpRef::const_int(100_000)]);
+        let second = Snapshot::single_frame_boxes(0, 2, vec![planted(OpRef::const_int(100_000))]);
         let second_state = memo.number(&second, &env, -1).unwrap();
         let (_, second_pool, _, _) = memo.finish(second_state, &env, &mut [], None).unwrap();
 
@@ -5205,16 +5267,21 @@ mod tests {
         env.types.insert(7, majit_ir::Type::Ref);
         env.types.insert(1, majit_ir::Type::Int);
 
+        let payload = crate::history::test_support::rooted_operand_from_opref(OpRef::int_op(1));
+        let ident = crate::history::test_support::rooted_operand_from_opref(OpRef::ref_op(7));
         let snapshot = Snapshot {
             // pyjitpl.py:3326-3330 parity: payload slots first,
             // virtualizable identity (`virtualizable_boxes[-1]`) last.
-            vable_array: vec![OpRef::int_op(1).into(), OpRef::ref_op(7).into()],
+            vable_array: vec![
+                SnapshotBox::from_cached(payload.clone()),
+                SnapshotBox::from_cached(ident),
+            ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
                 py_pc: 8,
-                boxes: vec![OpRef::int_op(1).into()],
+                boxes: vec![SnapshotBox::from_cached(payload)],
             }],
         };
 

@@ -1199,8 +1199,8 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operand;
-    use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_operand_from_opref};
+    use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotBox, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
     /// `normalize_closing_jump_args` repairs a JUMP slot from the LABEL slot
@@ -1299,18 +1299,20 @@ mod tests {
 
         let snapshot = Snapshot {
             vable_array: vec![
-                OpRef::input_arg_ref(0).into(),
-                OpRef::const_int(8).into(),
-                OpRef::const_int(777).into(), // code object payload
-                OpRef::const_int(2).into(),
-                OpRef::const_int(999).into(), // namespace payload
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::input_arg_ref(0))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(8))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(777))), // code object payload
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(2))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(999))), // namespace payload
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
                 py_pc: 8,
-                boxes: vec![OpRef::input_arg_int(1).into()],
+                boxes: vec![SnapshotBox::from_cached(rooted_operand_from_opref(
+                    OpRef::input_arg_int(1),
+                ))],
             }],
         };
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();

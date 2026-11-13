@@ -2634,7 +2634,7 @@ impl Optimizer {
     /// Wrap each recorded `Op` in a fresh `OpRc` and rebind later args the
     /// way `TraceIterator::_cache` does: a non-void result is the object
     /// later positions name. Positions stay as the fixture recorded them.
-    fn rebind_wrapped_trace_ops(ops: &[Op]) -> Vec<majit_ir::OpRc> {
+    pub(crate) fn rebind_wrapped_trace_ops(ops: &[Op]) -> Vec<majit_ir::OpRc> {
         let mut wrapped: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
         // First InputArg at each index. Later args at that index reuse it,
         // the same way `TraceIterator` seeds `_cache` once per input.
@@ -6093,7 +6093,7 @@ mod tests {
         mut snapshot_for_guard: F,
     ) -> crate::optimizeopt::SnapshotBoxes
     where
-        F: FnMut(&Op) -> Vec<OpRef>,
+        F: FnMut(&Op) -> Vec<Operand>,
     {
         use crate::resume::SnapshotBox;
         let mut snapshots: crate::optimizeopt::SnapshotBoxes = Vec::new();
@@ -6116,7 +6116,10 @@ mod tests {
             crate::optimizeopt::snapshot_insert(
                 &mut snapshots,
                 resume_pos,
-                snapshot_boxes.into_iter().map(SnapshotBox::from).collect(),
+                snapshot_boxes
+                    .into_iter()
+                    .map(SnapshotBox::from_cached)
+                    .collect(),
             );
         }
         snapshots
@@ -7902,8 +7905,6 @@ mod tests {
         let mut b = TraceBuilder::new();
         let x = b.input(Type::Int, 0);
         let y = b.input(Type::Int, 1);
-        let x_ref = x.to_opref();
-        let y_ref = y.to_opref();
         b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
         b.op(OpCode::GuardTrue, std::slice::from_ref(&x));
         b.op(OpCode::Finish, &[]);
@@ -7913,7 +7914,7 @@ mod tests {
         ops[1].setfailargs(vec![x.clone(), y.clone()].into());
         opt.trace_inputargs = vec![x.clone(), y.clone()];
         let num_inputs = inputs.len();
-        opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
+        opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x.clone(), y.clone()]);
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
