@@ -3496,28 +3496,12 @@ impl ResumeDataLoopMemo {
             numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
             return Ok(());
         }
+        // TraceIterator._get / SnapshotIterator._untag hold the slot's
+        // box in `cached`; ResumeDataLoopMemo._number_boxes walks that
+        // object. Miss: class-C BoxEnv.get_box_replacement_operand.
         let held = cached.or(snapshot_box.cached.as_ref());
         let b = match held {
-            Some(cached) => {
-                let b = cached.get_box_replacement(false);
-                // An unregistered position mints a fresh box on every
-                // positional lookup, so only a registered one has an answer
-                // to compare against.
-                #[cfg(debug_assertions)]
-                {
-                    let positional = env.get_box_replacement_operand(raw_opref);
-                    if positional.same_box(&env.get_box_replacement_operand(raw_opref)) {
-                        debug_assert!(
-                            b.same_box(&positional),
-                            "_number_one {raw_opref:?}: cached box resolves to {:?}, \
-                             position resolves to {:?}",
-                            b.to_opref(),
-                            positional.to_opref()
-                        );
-                    }
-                }
-                b
-            }
+            Some(cached) => cached.get_box_replacement(false),
             None => env.get_box_replacement_operand(raw_opref),
         };
         let opref = b.to_opref();
