@@ -10621,7 +10621,9 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    // The helper's return is the ForIterNext dest, so the paused caller resumes past the call (`_setup_return_value_r`).
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
 
@@ -19888,8 +19890,9 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         }
         None => {
             let sym = unsafe { &*sym_ptr };
+            // The helper's return is the ForIterNext dest, so the paused caller resumes past the call (`_setup_return_value_r`).
             let Ok(nested_entry) =
-                orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted)
+                orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
             else {
                 return Ok(None);
             };
