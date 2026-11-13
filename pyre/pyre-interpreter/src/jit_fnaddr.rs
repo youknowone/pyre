@@ -8010,6 +8010,34 @@ mod tests {
             bindings.contains_key("pyre_interpreter::typedef::set_type_error_matched"),
             "missing pyre_interpreter::typedef::set_type_error_matched"
         );
+
+        let index_strict: extern "C" fn(i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_index_result_strict_int_subclass;
+        let index_strict = index_strict as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::index_result_strict_int_subclass"],
+            index_strict
+        );
+        let raw_index_strict =
+            crate::baseobjspace::index_result_strict_int_subclass as *const () as usize as i64;
+        assert_ne!(
+            index_strict, raw_index_strict,
+            "must not publish the raw Result item"
+        );
+
+        let take_pending: extern "C" fn(i64, i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_take_pending_mapping_key_error;
+        let take_pending = take_pending as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::take_pending_mapping_key_error"],
+            take_pending
+        );
+        let raw_take_pending =
+            crate::baseobjspace::take_pending_mapping_key_error as *const () as usize as i64;
+        assert_ne!(
+            take_pending, raw_take_pending,
+            "must not publish the raw PyError item"
+        );
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
