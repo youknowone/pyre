@@ -1146,12 +1146,15 @@ pub fn emit_mapdict_add_attr_inline(
 /// `list_block_value` is that one-element int list, already installed in
 /// slot `old_len` of the committed storage; `NewArray` is born with it
 /// (`history.py` `_make_op(..., value)` / `MetaInterp.execute_and_record`).
+/// The committed storage is rooted by the caller (`new_block_slot`) and
+/// re-read after the int-list recordings, which can collect (`history.py`
+/// `*FrontendOp.value`).
 pub fn emit_mapdict_add_unboxed_attr_inline(
     ctx: &mut TraceCtx,
     obj: OpRef,
     old_len: usize,
     old_block: Option<OpRef>,
-    new_block_value: majit_ir::Value,
+    new_block_slot: usize,
     list_block_value: majit_ir::Value,
     new_map: OpRef,
     raw: OpRef,
@@ -1168,6 +1171,9 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
     ctx.heap_cache_mut().new_array(list_block, one, true);
     let zero = ctx.const_int(0);
     crate::state::trace_int_block_setitem_value(ctx, list_block, zero, raw);
+    let new_block_value = majit_ir::Value::Ref(majit_ir::GcRef(
+        pyre_object::gc_roots::shadow_stack_get(new_block_slot) as usize,
+    ));
     emit_mapdict_add_attr_inline(
         ctx,
         obj,
