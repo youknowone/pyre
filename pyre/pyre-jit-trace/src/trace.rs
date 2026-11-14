@@ -1239,12 +1239,25 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
     concrete_frame.set_last_instr_from_next_instr(lasti_pc);
-    let w_code = concrete_frame.pycode;
+    // Nursery-born `W_Code` must sit on the extra-area shadow stack
+    // before `init_symbolic` intern (`const_ref` of `w_globals` /
+    // `id_or_identityhash` / `_allocate_shadow`) and before
+    // `make_green_key` (`get_uhash`). Re-read from the slot after every
+    // collecting call (`gctransform/shadowstack.py` `push_roots`).
+    // Extra-area, not `GreenRefPin`: a walk-duration `majit_gc` pin
+    // `pop_to(save)` would truncate later `ExportedState` slots
+    // (`unroll.py` `root_all_gcrefs` / `refresh_from_gc`).
+    let _trace_code_roots = pyre_object::gc_roots::push_roots();
+    let trace_code_slot =
+        _trace_code_roots.pin_roots(&[concrete_frame.pycode as pyre_object::PyObjectRef]);
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
     // so that `miframe.pc == jitcode_pc`.
     if dump_perfn_jitcode_enabled() {
-        dump_perfn_jitcode_for_trace(w_code, lasti_pc);
+        dump_perfn_jitcode_for_trace(
+            pyre_object::gc_roots::shadow_stack_get(trace_code_slot) as *const (),
+            lasti_pc,
+        );
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     // The snapshot stands in for concrete stepping only; vable-statics
@@ -1288,7 +1301,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
             meta,
             &flush_committed,
             sym,
-            w_code,
+            trace_code_slot,
             start_pc,
             cf_addr,
             carrier,
@@ -1304,7 +1317,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // The generic probe is gated on `carrier.is_none()` because multi-frame
     // bridge resumes are handled by the dedicated carrier walkers above.
     if carrier.is_none() && walk_perfn_jitcode_enabled() {
-        probe_walk_perfn_jitcode(meta, sym, w_code, start_pc, cf_addr);
+        probe_walk_perfn_jitcode(
+            meta,
+            sym,
+            pyre_object::gc_roots::shadow_stack_get(trace_code_slot) as *const (),
+            start_pc,
+            cf_addr,
+        );
         finish_trace_namespace_dependency(meta);
         return (TraceAction::Abort, concrete_frame, false);
     }
@@ -1320,7 +1339,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // permanently blacklisted (`DONT_TRACE_HERE`).
     if carrier.is_none()
         && !fbw_declined(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(trace_code_slot) as *const (),
             start_pc,
             concrete_frame.get_is_being_profiled(),
         ))
@@ -1329,7 +1348,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
             meta,
             &flush_committed,
             sym,
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(trace_code_slot) as *const (),
             start_pc,
             cf_addr,
             WalkJournals::Reset,
@@ -1786,14 +1805,24 @@ fn record_carrier_crossed_frame_traceback(
     if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
         return true;
     }
+    let tb_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = tb_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
     let w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe);
     if w_globals.is_null() {
         return false;
     }
+    // The recording hook and `const_ref` can collect. Pin the Ref operands
+    // before the first call (`gctransform/shadowstack.py` `push_roots`), and
+    // reload them from the pinned slots afterward.
+    let tb_base = tb_roots.pin_roots(&[
+        exc_ptr as pyre_object::PyObjectRef,
+        tb_roots.get(code_slot),
+        w_globals,
+    ]);
     majit_metainterp::record_inline_application_traceback_for_recording(
-        exc_ptr as usize as i64,
-        w_code as usize as i64,
-        w_globals as usize as i64,
+        tb_roots.get(tb_base) as usize as i64,
+        tb_roots.get(tb_base + 1) as i64,
+        tb_roots.get(tb_base + 2) as i64,
         recipe.jitcode_index,
         recipe.jitcode_pc,
     );
@@ -1801,8 +1830,8 @@ fn record_carrier_crossed_frame_traceback(
     if hook.is_null() || exc.is_none() {
         return true;
     }
-    let w_code_op = ctx.const_ref(w_code as usize as i64);
-    let w_globals_op = ctx.const_ref(w_globals as usize as i64);
+    let w_code_op = ctx.const_ref(tb_roots.get(tb_base + 1) as i64);
+    let w_globals_op = ctx.const_ref(tb_roots.get(tb_base + 2) as i64);
     let jitcode_op = ctx.const_int(i64::from(recipe.jitcode_index));
     let opcode_op = ctx.const_int(i64::from(recipe.jitcode_pc));
     ctx.call_void_typed_with_effect(
@@ -1938,7 +1967,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     meta: &mut MetaInterp<PyreMeta>,
     flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
@@ -2232,7 +2261,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             flush_committed,
             &session,
             sym,
-            w_code,
+            code_slot,
             root_pc,
             cf_addr,
             root_ec,
@@ -2270,7 +2299,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             flush_committed,
             &session,
             sym,
-            w_code,
+            code_slot,
             root_pc,
             cf_addr,
             root_ec,
@@ -2492,7 +2521,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     cf_addr: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
@@ -2523,7 +2552,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
                     flush_committed,
                     session,
                     sym,
-                    w_code,
+                    code_slot,
                     root_pc,
                     cf_addr,
                     root_ec,
@@ -2542,7 +2571,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
         meta,
         flush_committed,
         sym,
-        w_code,
+        code_slot,
         root_pc,
         cf_addr,
         carrier,
@@ -2564,7 +2593,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     cf_addr: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
@@ -2674,7 +2703,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                             flush_committed,
                             session,
                             sym,
-                            w_code,
+                            code_slot,
                             root_pc,
                             cf_addr,
                             root_ec,
@@ -2725,7 +2754,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                         flush_committed,
                         session,
                         sym,
-                        w_code,
+                        code_slot,
                         root_pc,
                         cf_addr,
                         root_ec,
@@ -2773,7 +2802,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
         meta,
         flush_committed,
         sym,
-        w_code,
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
         root_py_pc,
         cf_addr,
         WalkJournals::Keep,
@@ -2791,7 +2820,7 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     meta: &mut MetaInterp<PyreMeta>,
     flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
@@ -2809,7 +2838,7 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
         meta,
         flush_committed,
         sym,
-        w_code,
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
         root_py_pc,
         cf_addr,
         WalkJournals::Keep,
@@ -5467,6 +5496,12 @@ fn run_perfn_walk<Sym: WalkSym>(
     authoritative: bool,
     carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
+    // Extra-area, not `GreenRefPin`: this walk can `compile_trace` /
+    // `compile_retrace`, and a `majit_gc` pin `pop_to(save)` would
+    // truncate later `ExportedState` slots (`unroll.py` `root_all_gcrefs`).
+    let _perfn_code_roots = pyre_object::gc_roots::push_roots();
+    let perfn_code_slot = _perfn_code_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(perfn_code_slot) as *const ();
     let ctx = live_trace_ctx(meta);
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
         carrier_raise_seed,
@@ -5527,7 +5562,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(perfn_code_slot) as *const (),
             start_pc,
             is_being_profiled,
         ));
@@ -5584,7 +5619,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(perfn_code_slot) as *const (),
             start_pc,
             is_being_profiled,
         ));
@@ -5639,7 +5674,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // bridge compiled from this loop.  `argboxes_r[i] -> top_regs_r[i]` is
     // the seed channel.
     let ec_box = sym.execution_context();
-    let pycode_box = ctx.const_ref(w_code as i64);
+    let pycode_box = ctx.const_ref(pyre_object::gc_roots::shadow_stack_get(perfn_code_slot) as i64);
     let static_entry_green_regs = if is_bridge_trace {
         None
     } else {
@@ -8052,6 +8087,15 @@ fn full_body_walk_trace<Sym: WalkSym>(
     carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
 ) -> TraceAction {
     let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
+    // Nursery-born `W_Code` must sit on the extra-area shadow stack
+    // before `make_green_key` / `get_uhash` (`hash_whatever(Ref)` →
+    // `id_or_identityhash` / `_find_shadow`). Extra-area, not
+    // `GreenRefPin`: a walk-duration `majit_gc` pin `pop_to(save)` would
+    // truncate later `ExportedState` slots (`unroll.py` `root_all_gcrefs`).
+    // CloseLoop takes a short `GreenRefPin` immediately before `get_uhash`.
+    let _fbw_code_roots = pyre_object::gc_roots::push_roots();
+    let fbw_code_slot = _fbw_code_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const ();
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
     // guard, exit early, and concretely double-execute the post-loop tail;
@@ -8068,7 +8112,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc} {owner}");
         }
         fbw_decline(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
             start_pc,
             is_being_profiled,
         ));
@@ -8082,7 +8126,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
             start_pc,
             is_being_profiled,
         ));
@@ -8104,7 +8148,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             );
         }
         fbw_decline(crate::driver::make_green_key(
-            w_code,
+            pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
             start_pc,
             is_being_profiled,
         ));
@@ -8165,16 +8209,25 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // treat the resume pc as a fresh loop header (the portal entry signature),
     // which only a MAIN trace should do.  So skip it for bridges.
     if !live_trace_ctx(meta).is_bridge_trace {
-        let start_key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
+        let start_key = crate::driver::make_green_key(
+            pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
+            start_pc,
+            is_being_profiled,
+        );
         let ctx = live_trace_ctx(meta);
         let input_args: Vec<majit_metainterp::GreenBox> = ctx.inputarg_greenboxes();
         ctx.add_merge_point_with_key(
             start_key,
-            crate::driver::make_green_key_typed(w_code, start_pc, is_being_profiled),
+            crate::driver::make_green_key_typed(
+                pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
+                start_pc,
+                is_being_profiled,
+            ),
             input_args,
             start_pc,
         );
     }
+    let w_code = pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const ();
     let walk_result = run_perfn_walk(
         meta,
         flush_committed,
@@ -8219,11 +8272,21 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // a close that leaves only the bucket hash makes
                 // `attach_procedure_to_interp` mint a cell without a
                 // `comparekey`, which no `get_jitcell` walk can match.
-                let typed =
-                    crate::driver::make_green_key_typed(w_code, loop_header_pc, is_being_profiled);
+                // Short `GreenRefPin` immediately before `get_uhash`, as
+                // HEAD CloseLoop did, so the hash sees a live nursery
+                // wrapper. Dropped at the end of this arm, before the
+                // driver compile (`unroll.py` `root_all_gcrefs`).
+                let w_code = pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const ();
+                let code_pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+                let mut typed = crate::driver::make_green_key_typed(
+                    code_pin.get() as *const (),
+                    loop_header_pc,
+                    is_being_profiled,
+                );
                 let key = typed.get_uhash();
+                code_pin.reload(&mut typed);
                 let ctx = live_trace_ctx(meta);
-                ctx.set_green_key(key, (w_code as usize, loop_header_pc));
+                ctx.set_green_key(key, (code_pin.get(), loop_header_pc));
                 ctx.header_pc = loop_header_pc;
                 if loop_header_pc != start_pc {
                     ctx.cut_inner_green_key = Some(typed.clone());
@@ -8338,8 +8401,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                let raw_code =
-                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+                let raw_code = unsafe {
+                    pyre_interpreter::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(
+                        fbw_code_slot,
+                    ))
+                };
                 let (name, path) = if raw_code.is_null() {
                     ("<unknown>", "<unknown>")
                 } else {
@@ -8405,7 +8471,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::GotoIfNotValueNotConcrete { .. }
                 | DE::ForceQuasiImmutableValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(
-                        w_code,
+                        pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
                         start_pc,
                         is_being_profiled,
                     ));
@@ -8425,7 +8491,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
             if fbw_declined(crate::driver::make_green_key(
-                w_code,
+                pyre_object::gc_roots::shadow_stack_get(fbw_code_slot) as *const (),
                 start_pc,
                 is_being_profiled,
             )) {
@@ -8903,13 +8969,17 @@ mod tests {
         let _idx = meta.register_jitdriver_sd(sd.clone());
         meta.finish_setup_descrs_for_jitdrivers();
         let key = majit_ir::GreenKey::new(vec![0x1a01]);
-        let action = meta.force_start_tracing(
-            key.get_uhash(),
-            (0, 0),
-            Some((&key.values, &key.types)),
-            Some(std::sync::Arc::new(sd)),
-            &[],
-        );
+        let action = {
+            let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+            meta.force_start_tracing(
+                key.get_uhash(),
+                _zbh_pin.save(),
+                0,
+                Some((&key.values, &key.types)),
+                Some(std::sync::Arc::new(sd)),
+                &[],
+            )
+        };
         assert!(matches!(
             action,
             majit_metainterp::BackEdgeAction::StartedTracing
@@ -9469,13 +9539,18 @@ mod tests {
         let _idx = meta.register_jitdriver_sd(sd.clone());
         meta.finish_setup_descrs_for_jitdrivers();
         let tracing_key = majit_ir::GreenKey::new(vec![0x1a01]);
-        let action = meta.force_start_tracing(
-            tracing_key.get_uhash(),
-            (0, 0),
-            Some((&tracing_key.values, &tracing_key.types)),
-            Some(std::sync::Arc::new(sd)),
-            &[],
-        );
+        let action = {
+            let _zbh_pin =
+                majit_metainterp::GreenRefPin::pin_slices(&tracing_key.values, &tracing_key.types);
+            meta.force_start_tracing(
+                tracing_key.get_uhash(),
+                _zbh_pin.save(),
+                0,
+                Some((&tracing_key.values, &tracing_key.types)),
+                Some(std::sync::Arc::new(sd)),
+                &[],
+            )
+        };
         assert!(matches!(
             action,
             majit_metainterp::BackEdgeAction::StartedTracing
