@@ -5626,6 +5626,30 @@ impl TraceCtx {
         self.virtualizable_info.as_ref()
     }
 
+    /// The `VirtualizableInfo` a jitcode vable descriptor belongs to
+    /// (`warmspot.py` `vinfos[VTYPEPTR]`; the descriptor is
+    /// `vinfo.static_field_descrs[i]` whichever driver is being traced, and
+    /// `pyjitpl.py _nonstandard_virtualizable` reads it back as
+    /// `fielddescr.get_vinfo()`). The serialized `VableField { index }` keeps
+    /// only the index, so recover the owner: the active driver's vinfo, else the
+    /// one vinfo the static data declares. `None` when no driver declares one,
+    /// or when drivers declare distinct ones, which an index alone cannot tell
+    /// apart.
+    pub fn vable_descr_owner_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        if let Some(info) = self.virtualizable_info.as_ref() {
+            return Some(info);
+        }
+        let mut owners = self
+            .metainterp_sd
+            .jitdrivers_sd
+            .iter()
+            .filter_map(|jd| jd.virtualizable_info.as_ref());
+        let first = owners.next()?;
+        owners
+            .all(|info| std::sync::Arc::ptr_eq(info, first))
+            .then_some(first)
+    }
+
     /// pyjitpl.py `_do_jit_force_virtual` reads
     /// `self.metainterp.jitdriver_sd.greenfield_info` — the current
     /// driver, not the first registered one.
@@ -6966,6 +6990,14 @@ impl TraceCtx {
             // `concrete` via `set_opref_concrete`, so cache-hit sanity
             // readers retrieve it through `box_value(cached)`.
             self.heapcache_setfield_cached(vable_opref, field_index, value);
+            // executor.py do_setfield_gc: `_opimpl_setfield_gc_any`
+            // (pyjitpl.py) runs the store inside execute_and_record.
+            // The funnel here only records; field_store is the store
+            // half of field_sanity_load. A cache-hit getfield then
+            // loads the same word the heapcache carries.
+            if let Some(ptr) = self.live_ptr_of(vable_opref) {
+                let _ = self.field_store(ptr, &fielddescr, concrete);
+            }
             return None;
         }
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -7905,11 +7937,22 @@ impl TraceCtx {
         record_only: bool,
     ) -> VableArrayStore {
         if nonstandard {
-            // `execute_setarrayitem_gc` records `SETARRAYITEM_GC` and updates
-            // the heapcache. It does not write the concrete array.
+            // pyjitpl.py `_opimpl_setarrayitem_vable` nonstandard arm →
+            // `_opimpl_setarrayitem_gc_any`. `execute_setarrayitem_gc`
+            // records `SETARRAYITEM_GC` and updates the heapcache; the
+            // funnel does not write live. `array_store` is
+            // `executor.py do_setarrayitem_gc`, the store half of
+            // `array_sanity_load`. A later getarrayitem_vable on a
+            // different OpRef of the same array (portal red after
+            // recursive Inline) then loads the word the store wrote.
+            // `record_only` is `optimize_VIRTUAL_REF_FINISH` after the
+            // residual already wrote the frame.
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+            self.execute_setarrayitem_gc(array_opref, index, value, adescr.clone());
+            if !record_only && let Some(ptr) = self.live_ptr_of(array_opref) {
+                let _ = self.array_store(ptr, index_runtime_value, &adescr, concrete);
+            }
             return VableArrayStore::Stored(None);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -8492,6 +8535,68 @@ mod tests {
             _fielddescr: &majit_jitcode::jitcode::BhDescr,
         ) -> f64 {
             self.float_value
+        }
+    }
+
+    /// Trait-default `bh_getfield_gc_*` / `bh_setfield_gc_*` read and
+    /// write the live struct. Compilation methods panic; this fixture
+    /// only exercises the executor field store.
+    struct LiveFieldCpu;
+    impl majit_backend::Backend for LiveFieldCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("LiveFieldCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("LiveFieldCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("LiveFieldCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("LiveFieldCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("LiveFieldCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("LiveFieldCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            self.get_int_value(frame, slot)
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("LiveFieldCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("LiveFieldCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("LiveFieldCpu::invalidate_loop")
         }
     }
 
@@ -10093,6 +10198,104 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+    }
+
+    /// `_opimpl_setfield_gc_any` (pyjitpl.py) executes the store via
+    /// `execute_and_record` / `do_setfield_gc` (executor.py). A
+    /// nonstandard setfield_vable that only heapcaches last_instr=0
+    /// while live memory still holds the constructor's -1 panics on
+    /// the next getfield_vable cache-hit sanity check
+    /// (`_opimpl_getfield_gc_any_pureornot`).
+    #[test]
+    fn nonstandard_vable_setfield_writes_live_then_getfield_matches() {
+        let mut storage = [-1i64; 4];
+        let ptr = storage.as_mut_ptr() as i64;
+        let cpu = LiveFieldCpu;
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(ptr as usize)));
+
+        let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let nonstandard = decide_nonstandard(&mut ctx, vable, &fd);
+        assert!(
+            nonstandard,
+            "no virtualizable_boxes: the store is a heap SETFIELD_GC"
+        );
+        let new_val = ctx.const_int(0);
+        ctx.vable_setfield_checked(nonstandard, vable, fd.clone(), new_val, Value::Int(0));
+        assert_eq!(
+            storage[0], 0,
+            "do_setfield_gc must write live last_instr so the next \
+             getfield_vable cache-hit sanity load matches the heapcache"
+        );
+
+        let (got, live) = ctx.vable_getfield_int_checked(
+            nonstandard,
+            crate::cpu::default_cpu().as_ref(),
+            vable,
+            ptr,
+            fd,
+        );
+        assert_eq!(got, new_val);
+        assert_eq!(live, Some(Value::Int(0)));
+        assert_eq!(storage[0], 0);
+    }
+
+    /// `_opimpl_setarrayitem_gc_any` (pyjitpl.py) executes the store via
+    /// `execute_and_record` / `do_setarrayitem_gc` (executor.py). A
+    /// nonstandard setarrayitem_vable that only heapcaches locals[0]
+    /// while live memory still holds the constructor's 0 leaves
+    /// unique look-inside of LOAD_FAST reading a null slot.
+    #[test]
+    fn nonstandard_vable_setarrayitem_writes_live_then_getarrayitem_matches() {
+        let mut array = [0i64; 4];
+        let mut vable = [0usize; 1];
+        vable[0] = array.as_mut_ptr() as usize;
+        let vable_ptr = vable.as_mut_ptr() as i64;
+        let cpu = LiveFieldCpu;
+        let mut recorder = Trace::new();
+        let vable_op = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(vable_op, Value::Ref(majit_ir::GcRef(vable_ptr as usize)));
+
+        let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
+        let adesc = majit_ir::make_array_descr(0, 8, Type::Int);
+        let nonstandard = decide_nonstandard(&mut ctx, vable_op, &fd);
+        assert!(
+            nonstandard,
+            "no virtualizable_boxes: the store is a heap SETARRAYITEM_GC"
+        );
+        let index = ctx.const_int(0);
+        let new_val = ctx.const_int(42);
+        ctx.vable_setarrayitem_checked(
+            nonstandard,
+            0,
+            vable_op,
+            index,
+            0,
+            fd.clone(),
+            adesc.clone(),
+            new_val,
+            Value::Int(42),
+            false,
+        );
+        assert_eq!(
+            array[0], 42,
+            "do_setarrayitem_gc must write live locals[0] so a later \
+             getarrayitem_vable on a different OpRef of the same array \
+             loads the stored word"
+        );
     }
 
     #[test]

@@ -88,6 +88,13 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "finish_for_call_with_globals_obj",
         "pyframe.py initialize_frame_scopes",
     ),
+    // `pyframe.py` `initialize_frame_scopes` `@jit.unroll_safe`. FrameBox::new
+    // loops are the non-jitted FRAME_BOX publish slots; the jitted path is
+    // `new_malloc_typed` (pyframe.py PyFrame malloc).
+    (
+        "new",
+        "pyframe.py initialize_frame_scopes; FRAME_BOX publish slots, jitted path new_malloc_typed",
+    ),
     // `typeobject.py` `lookup_starting_at`, the MRO-suffix walk `super`
     // attribute lookup runs.  Without the hint `look_inside_graph` rejects the
     // graph for its loop and the whole lookup is one opaque residual.

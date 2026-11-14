@@ -17921,9 +17921,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
             pyre_object::gc_roots::pin_root(closure)
         };
         let closure_root = (stack_base != freevar_base).then_some(slot_root + valuestackdepth);
-        let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
-            .collect();
         let current_code = pyre_object::gc_roots::shadow_stack_get(root_base) as *const ();
         let current_globals = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let current_closure = closure_root
@@ -17932,7 +17929,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let mut concrete_frame = match pyre_interpreter::pyframe::FrameBox::new(
             match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 current_code,
-                &concrete_locals,
                 current_globals,
                 execution_context,
                 current_closure,
@@ -17951,6 +17947,11 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 return None;
             }
         };
+        // `function.py` writes locals after `createframe`. The prefix
+        // already sits on the shadow stack (`slot_root`).
+        for i in 0..nlocals {
+            concrete_frame.set_locals_w(i, pyre_object::gc_roots::shadow_stack_get(slot_root + i));
+        }
         // The `drop(concrete_frame)` below relinquishes only the host handle for a
         // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the
         // stable allocator answers null, and that box's `drop` FREES the frame —

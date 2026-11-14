@@ -441,6 +441,10 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+///
+/// RootScope is the native shadow-stack guard. Jitcode graphs erase it
+/// (`shadow_stack_erase`), as the gctransformer's `push_roots` /
+/// `pop_roots` run after the codewriter.
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
@@ -923,26 +927,35 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     })
 }
 
-/// Reload the current top shadow-stack entry after a call that may have moved
-/// it. `root` names the value the top slot was published with; the runtime read
-/// ignores that copy and answers the slot, which a collection forwards in
-/// place.
+/// Reload `root` after a call that may have moved it.
 ///
-/// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing it
-/// to its argument would leave a trace carrying the pre-move word, and nothing
-/// else forwards a value the trace holds.
+/// Native compiled traces publish the portal red as the top slot
+/// (`gc_enter_roots_frame`); a collection forwards that slot in place, so
+/// the live word is the slot. Unique look-inside of leftover residuals
+/// runs this body without that publish (`shadowstack.py`): an empty stack
+/// answers `root`, and a stack whose top is a *different* object — the
+/// caller's `FrameRoot` still sitting there while unique look-inside of a
+/// nested `execute_frame` reloads the callee — also answers `root`. Both
+/// are `ExtRegistryEntry::GcRootReload` (`nonconst.py`
+/// `EntryNonConstant.specialize_call`). The portal red is a `FrameBox`
+/// (young-nonmoving), so that word is the live frame.
+///
+/// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing
+/// it to its argument in the graph would leave a compiled trace carrying
+/// the pre-move word, and nothing else forwards a value the trace holds.
 #[inline]
 #[must_use = "a top root may have moved; use the reloaded live word"]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
-    let _ = root;
-    majit_gc::shadow_stack::top_ref().0 as PyObjectRef
+    if majit_gc::shadow_stack::depth() == 0 {
+        return reload_published_root(root, 0);
+    }
+    reload_published_root(root, majit_gc::shadow_stack::top_ref().0)
 }
 
 /// Same top-root read as [`reload_top_root`], through a slot resolved once
 /// for this activation. `root` names the value the slot was published with
-/// (first argument, matching [`reload_top_root`]); the runtime read ignores
-/// that copy and answers the slot, which a collection forwards in place.
+/// (first argument, matching [`reload_top_root`]).
 ///
 /// The gctransformer inserts these reloads after the codewriter
 /// (`rpython/memory/gctransform/shadowstack.py`, `framework.py
@@ -955,8 +968,27 @@ pub fn reload_top_root_at(
     root: PyObjectRef,
     slot: majit_gc::shadow_stack::ShadowStackSlot,
 ) -> PyObjectRef {
-    let _ = root;
-    unsafe { majit_gc::shadow_stack::slot_top_ref(slot).0 as PyObjectRef }
+    if slot.depth() == 0 {
+        return reload_published_root(root, 0);
+    }
+    reload_published_root(root, unsafe {
+        majit_gc::shadow_stack::slot_top_ref(slot).0
+    })
+}
+
+/// Slot word when it holds `root` (or its forwarding); otherwise `root`
+/// itself, forwarded. `top == 0` is the empty-stack identity.
+#[inline]
+fn reload_published_root(root: PyObjectRef, top: usize) -> PyObjectRef {
+    let live = majit_gc::gc_current_object_address(root as usize);
+    if top == 0 {
+        return live as PyObjectRef;
+    }
+    let top_live = majit_gc::gc_current_object_address(top);
+    if top_live == live || top == root as usize {
+        return top_live as PyObjectRef;
+    }
+    live as PyObjectRef
 }
 
 /// `extern "C"` residual entry for [`reload_top_root`], with the same
@@ -1651,6 +1683,54 @@ mod tests {
 
     fn dummy(addr: usize) -> PyObjectRef {
         addr as PyObjectRef
+    }
+
+    /// Unique look-inside of leftover residuals runs this body without
+    /// `gc_enter_roots_frame`. An empty stack answers `root`, matching
+    /// `ExtRegistryEntry::GcRootReload` (`nonconst.py`
+    /// `EntryNonConstant.specialize_call`).
+    #[test]
+    fn reload_top_root_empty_stack_is_the_extregistry_identity() {
+        std::thread::spawn(|| {
+            assert_eq!(majit_gc::shadow_stack::depth(), 0);
+            let root = dummy(0x1111);
+            assert_eq!(reload_top_root(root), root);
+            let slot = majit_gc::shadow_stack::shadow_stack_slot();
+            assert_eq!(reload_top_root_at(root, slot), root);
+            assert_eq!(reload_top_root_jit_abi(root), root);
+            assert_eq!(reload_top_root_at_jit_abi(root, slot.as_raw()), root);
+        })
+        .join()
+        .expect("empty-stack reload thread");
+    }
+
+    /// A live top slot that published `root` answers the slot
+    /// (`shadowstack.py` `pop_roots` in-place forward).
+    #[test]
+    fn reload_top_root_reads_the_live_slot() {
+        let depth = majit_gc::shadow_stack::depth();
+        majit_gc::shadow_stack::push(majit_ir::GcRef(0x2222));
+        assert_eq!(reload_top_root(dummy(0x2222)) as usize, 0x2222);
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        assert_eq!(reload_top_root_at(dummy(0x2222), slot) as usize, 0x2222);
+        majit_gc::shadow_stack::pop_to(depth);
+    }
+
+    /// Unique look-inside of a nested `execute_frame` reloads the callee
+    /// while the caller's `FrameRoot` is still the top. The top is a
+    /// different object, so `ExtRegistryEntry::GcRootReload` is identity
+    /// of arg0 (`nonconst.py` `EntryNonConstant.specialize_call`).
+    #[test]
+    fn reload_top_root_nested_callee_is_the_extregistry_identity() {
+        let depth = majit_gc::shadow_stack::depth();
+        majit_gc::shadow_stack::push(majit_ir::GcRef(0x2222));
+        let callee = dummy(0x3333);
+        assert_eq!(reload_top_root(callee), callee);
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        assert_eq!(reload_top_root_at(callee, slot), callee);
+        assert_eq!(reload_top_root_jit_abi(callee), callee);
+        assert_eq!(reload_top_root_at_jit_abi(callee, slot.as_raw()), callee);
+        majit_gc::shadow_stack::pop_to(depth);
     }
 
     #[test]

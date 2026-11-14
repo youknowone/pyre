@@ -8753,6 +8753,107 @@ fn transparent_scalar_struct_uses_inner_register_bank() {
     );
 }
 
+/// Linked colouring is the ADT **value** representation. A `Ref` /
+/// `RawPtr` to the same declaration is an address (`history.getkind`).
+#[test]
+fn linked_transparent_scalar_struct_is_its_scalar() {
+    let type_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Word", 0]}],
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 16}
+            }},
+            "source_text": "struct Word(u32);",
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Value": [7, {"Scalar": {"Integer": {"Unsigned": "U32"}}}]},
+            "attr_info": null
+        }]},
+        "layout": [{
+            "key": "x86_64-unknown-linux-gnu",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": false}
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [null, type_decl],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(1).expect("Word decl");
+    assert!(
+        matches!(
+            decl.kind,
+            majit_charon_reader::ullbc::TypeDeclKind::Struct(_)
+        ),
+        "fixture is a Struct, not Opaque"
+    );
+    assert!(
+        !decl.published_struct_copy && !decl.is_repr_transparent(),
+        "fixture is a non-published, non-transparent Struct"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Word".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    let adt = serde_json::json!({
+        "Adt": {"id": 1, "generics": {"types": []}}
+    });
+    let word_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [8, adt.clone()]
+    }))
+    .expect("fixture TyRef parses");
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::new();
+    let inner = |ty: &super::TyRef| {
+        super::tyref_transparent_inner_value_type(ty, &llbc, no_tombstoned_leaves(), &gc, &raw)
+    };
+    assert_eq!(inner(&word_ty), Some(crate::model::ValueType::Unsigned));
+
+    let ref_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [9, {"Ref": ["Erased", adt.clone(), "Shared"]}]
+    }))
+    .expect("fixture Ref TyRef parses");
+    assert_eq!(inner(&ref_ty), None);
+    assert!(
+        matches!(
+            super::tyref_to_value_type(&ref_ty, &llbc),
+            crate::model::ValueType::Ref(_)
+        ),
+        "&Word is an address, got {:?}",
+        super::tyref_to_value_type(&ref_ty, &llbc)
+    );
+
+    let raw_ptr_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [10, {"RawPtr": [adt, "Const"]}]
+    }))
+    .expect("fixture RawPtr TyRef parses");
+    assert_eq!(inner(&raw_ptr_ty), None);
+    let raw_vt = super::tyref_to_value_type(&raw_ptr_ty, &llbc);
+    assert!(
+        !matches!(raw_vt, crate::model::ValueType::Unsigned),
+        "*const Word is an address, got {raw_vt:?}"
+    );
+}
+
 /// `BuildHasherDefault<H>` is Opaque in std LLBC and has no layout.
 /// RPython `RDict` has no hasher field (`rordereddict.py`).
 #[test]
@@ -10175,6 +10276,56 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
     assert_eq!(
         paint_handle(gc_int, serde_json::json!([null]), 1),
         ValueType::Ref(None)
+    );
+}
+
+/// A linked transparent scalar is one word even when its field is named.
+/// `integer_newtype_inner_field` rejects a named payload (`RangeFrom.start`),
+/// so `RootScope.save_point` would otherwise expand as a dotted leaf that
+/// the owner layout does not have.
+#[test]
+fn linked_transparent_scalar_with_named_field_is_not_a_by_value_struct() {
+    let decls = vec![(
+        1,
+        struct_decl(
+            1,
+            ident_path(&["fixture", "Scope"]),
+            serde_json::json!([{
+                "name": "save_point",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+                "attr_info": null
+            }]),
+            false,
+        ),
+    )];
+    let (llbc, scope_ty) = load_handle(decls, serde_json::json!([null]), 1);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &scope_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_some(),
+        "named one-field wrapper is an inlined STRUCT before linking"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Scope".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &scope_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_none(),
+        "a linked transparent scalar is one word, not an inlined STRUCT"
     );
 }
 
@@ -16982,18 +17133,32 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
 #[test]
 fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
     let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
-    let mut decls = vec![type_decl_struct(
+    // The walk is fail-closed on Charon size/align/offset (`type_decl_size_align`,
+    // `type_decl_struct_field_offset`). `type_decl_struct` has no layout, so each
+    // decl here carries a single-entry word layout with the unique field at offset 0.
+    let with_word_layout = |mut decl: serde_json::Value| {
+        decl["layout"] = serde_json::json!([{
+            "key": "",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}]
+            }
+        }]);
+        decl
+    };
+    let mut decls = vec![with_word_layout(type_decl_struct(
         0,
         &["fixture", "N0"],
         vec![field("x", i64_ty())],
-    )];
+    ))];
     for k in 1..=20u64 {
         let name = format!("N{k}");
-        decls.push(type_decl_struct(
+        decls.push(with_word_layout(type_decl_struct(
             k,
             &["fixture", name.as_str()],
             vec![field("inner", named_adt(k - 1, vec![]))],
-        ));
+        )));
     }
     let llbc = window_llbc(decls, vec![]);
     let outer = llbc.type_by_id(20).expect("N20 decl");
@@ -17010,6 +17175,312 @@ fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
     let dotted = format!("{}{}", leaves[0].super_path, leaves[0].field.name);
     let expected = format!("{}x", "inner.".repeat(20));
     assert_eq!(dotted, expected);
+    assert_eq!(leaves[0].offset, 0);
+    assert_eq!(leaves[0].size, 8);
+    assert_eq!(leaves[0].align, 8);
+    assert_eq!(
+        super::tyref_to_ast_string(&leaves[0].source_ty, &llbc),
+        "i64"
+    );
+}
+
+/// Instantiated `Result<Pair,()>::Ok` records exact dotted leaf offsets.
+/// The logical `__pos_0` row stays in `struct_fields` and is absent from
+/// `ExactLayout.field_offsets` (`GcStructLayout::apply_exact_layout`).
+#[test]
+fn inline_variant_struct_payload_has_exact_leaf_layout() {
+    let pair_ty = named_adt(7, vec![]);
+    let unit = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": window_empty_generics()}
+    });
+    let result_ty = result_adt_node(6, pair_ty.clone(), unit.clone());
+    let result_head = serde_json::json!({
+        "id": 6,
+        "generics": {
+            "regions": [],
+            "types": [pair_ty.clone(), unit.clone()],
+            "const_generics": [],
+            "trait_refs": []
+        }
+    });
+    let pair_fields = vec![
+        serde_json::json!({"name": "a", "ty": i64_ty(), "attr_info": null}),
+        serde_json::json!({"name": "b", "ty": mut_u8_ty_json(), "attr_info": null}),
+    ];
+    let mut pair = type_decl_struct(7, &["fixture", "Pair"], pair_fields);
+    // Stage-1 walk is fail-closed on missing Charon layout.
+    pair["layout"] = serde_json::json!([{
+        "key": "",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}]
+        }
+    }]);
+    let decls = vec![(6, result_enum(6)), (7, pair)];
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ok_by_value_pair"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [pair_ty.clone()],
+            "output": result_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &result_ty),
+                window_local(1, &pair_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &result_ty),
+                        {"Aggregate": [
+                            {"Adt": [result_head, 0, null]},
+                            [{"Move": window_place(
+                                serde_json::json!({"Local": 1}),
+                                &pair_ty
+                            )}]
+                        ]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("intern instantiated Result<Pair,()>::Ok layout");
+    let sid = majit_ir::descr::StructId::from_canonical_spelling("result::Result<Pair,()>::Ok");
+    let layout = program.exact_layouts.get(&sid).expect("exact Ok layout");
+    assert_eq!(layout.size, Some(24));
+    assert_eq!(layout.align, Some(8));
+    assert_eq!(layout.field_offsets.get("__discriminant"), Some(&0));
+    assert_eq!(layout.field_offsets.get("__pos_0.a"), Some(&8));
+    assert_eq!(layout.field_offsets.get("__pos_0.b"), Some(&16));
+    assert!(!layout.field_offsets.contains_key("__pos_0"));
+    let rows = &program.struct_fields.fields["result::Result<Pair,()>::Ok"];
+    assert!(rows.iter().any(|row| row.name == "__discriminant"));
+    assert!(rows.iter().any(|row| row.name == "__pos_0"));
+    assert!(rows.iter().any(|row| row.name == "__pos_0.a"));
+    assert!(rows.iter().any(|row| row.name == "__pos_0.b"));
+}
+
+fn ok_by_value_pair_llbc(
+    err_ty: serde_json::Value,
+    extra_decls: Vec<(u64, serde_json::Value)>,
+) -> Llbc {
+    let pair_ty = named_adt(7, vec![]);
+    let result_ty = result_adt_node(6, pair_ty.clone(), err_ty.clone());
+    let result_head = serde_json::json!({
+        "id": 6,
+        "generics": {
+            "regions": [],
+            "types": [pair_ty.clone(), err_ty],
+            "const_generics": [],
+            "trait_refs": []
+        }
+    });
+    let pair_fields = vec![
+        serde_json::json!({"name": "a", "ty": i64_ty(), "attr_info": null}),
+        serde_json::json!({"name": "b", "ty": mut_u8_ty_json(), "attr_info": null}),
+    ];
+    let mut pair = type_decl_struct(7, &["fixture", "Pair"], pair_fields);
+    // Stage-1 walk is fail-closed on missing Charon layout.
+    pair["layout"] = serde_json::json!([{
+        "key": "",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}]
+        }
+    }]);
+    let mut decls = vec![(6, result_enum(6)), (7, pair)];
+    decls.extend(extra_decls);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ok_by_value_pair"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [pair_ty.clone()],
+            "output": result_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &result_ty),
+                window_local(1, &pair_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &result_ty),
+                        {"Aggregate": [
+                            {"Adt": [result_head, 0, null]},
+                            [{"Move": window_place(
+                                serde_json::json!({"Local": 1}),
+                                &pair_ty
+                            )}]
+                        ]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+/// `Ok(move pair)` of a by-value `Pair` is one allocation and one setfield
+/// per leaf on the Result object (`heaptracker.all_fielddescrs`).
+#[test]
+fn inline_variant_struct_payload_constructor_writes_leaves() {
+    let unit = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": window_empty_generics()}
+    });
+    let llbc = ok_by_value_pair_llbc(unit, Vec::new());
+    let graph = crate::test_support::lower_function(&llbc, "ok_by_value_pair")
+        .expect("lower Ok(move pair) of a by-value struct payload");
+    let ctor_count = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        ctor_count,
+        1,
+        "exactly one SyntheticTransparentCtor allocation; graph={}",
+        graph.dump()
+    );
+    let writes: Vec<&crate::model::FieldDescriptor> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field),
+            _ => None,
+        })
+        .collect();
+    let write_names: Vec<&str> = writes.iter().map(|field| field.name.as_str()).collect();
+    assert!(
+        write_names.iter().all(|name| *name != "__pos_0"),
+        "no FieldWrite named __pos_0; writes={write_names:?} graph={}",
+        graph.dump()
+    );
+    let sid = majit_ir::descr::StructId::from_canonical_spelling("result::Result<Pair,()>::Ok");
+    for leaf_name in ["__pos_0.a", "__pos_0.b"] {
+        let leaf = writes
+            .iter()
+            .find(|field| field.name == leaf_name)
+            .unwrap_or_else(|| panic!("missing {leaf_name} FieldWrite; writes={write_names:?}"));
+        assert_eq!(
+            leaf.owner_root.as_deref(),
+            Some("result::Result<Pair,()>::Ok"),
+            "{leaf_name} owner_root is the variant; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            leaf.owner_id,
+            Some(sid),
+            "{leaf_name} owner_id is the variant; graph={}",
+            graph.dump()
+        );
+    }
+}
+
+/// Carrier lowering still sees one logical `__pos_0` FieldWrite; leaf
+/// stores are emitted only after `lower_result_exc_returns_inner`.
+#[test]
+fn result_exception_lowering_precedes_inline_leaf_writes() {
+    let err_ty = named_adt(8, vec![]);
+    let llbc = ok_by_value_pair_llbc(
+        err_ty,
+        vec![(8, opaque_type_decl(8, &["fixture", "PyError"]))],
+    );
+    let addrs = crate::HostStaticAddrs {
+        error_carrier: crate::ErrorCarrierSpec {
+            carrier_path: "fixture::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        },
+        ..Default::default()
+    };
+    let graph =
+        crate::test_support::lower_function_with_static_addrs(&llbc, "ok_by_value_pair", addrs)
+            .unwrap_or_else(|err| {
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("expected one __pos_0 FieldWrite")
+                        && !msg.contains("only __discriminant and a single __pos_0"),
+                    "carrier transform must see one logical __pos_0 FieldWrite: {msg}"
+                );
+                panic!("full lowering of Result<Pair, PyError> Ok ctor: {msg}");
+            });
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldWrite { field, .. } = &op.kind else {
+            continue;
+        };
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if !(owner.contains("Result") && owner.contains("::Ok")) {
+            continue;
+        }
+        assert_ne!(
+            field.name,
+            "__pos_0",
+            "surviving non-carrier Ok shell has dotted leaves only; graph={}",
+            graph.dump()
+        );
+        if field.name != "__discriminant" {
+            assert!(
+                field.name.starts_with("__pos_0."),
+                "surviving Ok shell FieldWrite is a dotted leaf, got {}; graph={}",
+                field.name,
+                graph.dump()
+            );
+        }
+    }
 }
 
 #[test]

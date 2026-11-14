@@ -270,8 +270,8 @@ pub(crate) fn authoritative_result_types(
 ///
 /// Walk every surviving GC field/array access (unknown owner defaults
 /// to `_gckind='gc'`, matching `jtransform.py rewrite_op_getfield`'s
-/// `getattr(STRUCT, '_gckind', 'gc')`) and publish `GcRef` on a
-/// `Signed`/`Unknown`/`Void` base.
+/// `getattr(STRUCT, '_gckind', 'gc')`). An already-Signed base keeps
+/// that cell; Unknown/Void bases are published as GcRef.
 ///
 /// Raw owners (`CallControl::struct_storage_for` →
 /// `is_gc_managed=false`) are left alone: a `Signed` base stays an
@@ -282,17 +282,15 @@ pub(crate) fn authoritative_result_types(
 /// `ArrayRead` / `ArrayWrite` / `ArrayLen` are the GC-array family
 /// (`jtransform.py` emits `getarrayitem_gc` / `arraylen_gc` only when
 /// `ARRAY._gckind == 'gc'`; raw arrays go through `raw_load` /
-/// `getarrayitem_raw`).  A Signed base on those ops is the same
-/// mis-banked GC pointer FieldRead had.
+/// `getarrayitem_raw`).  A Signed base on those ops takes the same
+/// Signed-keep / `cast_int_to_ptr` path as FieldRead.
 ///
-/// A Signed base keeps its cell when the word is still an int at another
-/// use. `make_three_lists_from_vars` stores that word in an int argument
-/// list, and `emit_list_of_kind` requires the cell to still say int. A
-/// later block can also read the same word as Signed: `Variable::copy`
-/// gives the threaded inputarg its own concretetype cell, so stamping
-/// only the field base makes `insert_renamings` emit `int_copy` from a
-/// Ref register. The access reads `cast_int_to_ptr` of the word, so
-/// regalloc colours a ref base and every int use keeps the Signed cell.
+/// A Signed base keeps its cell: a call result or inputarg already has
+/// the kind its producer fixed. `LowLevelOpList.convertvar` / `genop`
+/// add a new op/result for a repr change instead of retyping that
+/// producer (`rtyper.py`). The access reads `cast_int_to_ptr` of the
+/// word, so regalloc colours a ref base and every int use keeps the
+/// Signed cell.
 pub(crate) fn promote_gc_field_bases(
     graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
@@ -1255,6 +1253,18 @@ pub(crate) fn field_owner_is_gc(
     if field.is_vtable_method_slot() {
         return false;
     }
+    // `_alloc_flavor_ = "raw"` (`rclass.py getgcflavor`) is STRUCT._gckind
+    // even when the front storage classifier stamped a GC owner. A Signed
+    // base stays an address (`jtransform.py rewrite_op_getfield` `argname
+    // != 'gc'` → `getfield_raw`). `promote_gc_field_bases` must not
+    // `cast_int_to_ptr` that word into a GCREF (`blackhole.py`
+    // `bhimpl_cast_int_to_ptr` is tagged-immediate only).
+    if let Some(owner) = field.owner_root.as_deref()
+        && let Some(cc) = callcontrol
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+    {
+        return false;
+    }
     // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
     // front's structural stamp is used only when no row exists.
     let Some(owner) = field.owner_root.as_deref() else {
@@ -1391,6 +1401,71 @@ mod tests {
             FunctionGraph::concretetype_of(&base),
             ConcreteType::GcRef,
             "a GC FieldRead base that arrived as Signed must be published as GcRef"
+        );
+    }
+
+    /// Host `bytecode::CodeObject` is `_alloc_flavor_ = "raw"`. A Signed
+    /// `*const CodeObject` stays an address (`history.getkind` of a raw
+    /// Ptr is `'int'`); `promote_gc_field_bases` must not insert
+    /// `cast_int_to_ptr` for `CodeObject.flags`.
+    #[test]
+    fn promote_gc_field_bases_leaves_a_flavor_raw_signed_base() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("raw_codeobject_getfield");
+        let base = push_input(&mut graph, "code", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("flags", Some("bytecode::CodeObject".into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "flavor-raw CodeObject* keeps the producer Signed cell"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let casts: Vec<_> = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
+                )
+            })
+            .collect();
+        assert!(
+            casts.is_empty(),
+            "no cast_int_to_ptr of a flavor-raw Signed base; ops={ops:?}"
+        );
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read")
+            .kind
+        else {
+            unreachable!("field read");
+        };
+        assert_eq!(
+            field_base.id(),
+            base.id(),
+            "getfield_raw reads the Signed CodeObject* directly"
         );
     }
 
@@ -2088,6 +2163,32 @@ mod tests {
         assert!(
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
+        );
+    }
+
+    /// `_alloc_flavor_ = "raw"` (`rclass.py getgcflavor`) is STRUCT._gckind
+    /// even when the front storage classifier stamped `owner_declared_gc`.
+    /// `rewrite_op_getfield` then emits `getfield_raw`; a Signed CodeObject*
+    /// must not become `cast_int_to_ptr` GCREF.
+    #[test]
+    fn field_owner_is_gc_flavor_raw_owner_is_raw() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let stamped_gc = FieldDescriptor::new("flags", Some("bytecode::CodeObject".into()))
+            .with_owner_declared_gc(Some(true));
+        let unstamped = FieldDescriptor::new("flags", Some("bytecode::CodeObject".into()));
+        assert!(
+            !field_owner_is_gc(&stamped_gc, Some(&cc)),
+            "getgcflavor raw wins over a GC storage-classifier stamp"
+        );
+        assert!(
+            !field_owner_is_gc(&unstamped, Some(&cc)),
+            "getgcflavor raw is STRUCT._gckind when the producer left None"
+        );
+        assert!(
+            field_owner_is_gc(&stamped_gc, None),
+            "without CallControl the recorded owner_declared_gc stands"
         );
     }
 

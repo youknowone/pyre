@@ -887,12 +887,11 @@ fn try_commit_midbody_abort_inner(
     let mut w_globals = payload.w_globals;
     let _w_code_root = ObjectSlotRoot::new(&mut w_code);
     let _w_globals_root = ObjectSlotRoot::new(&mut w_globals);
-    // No positional seed: `finish_for_call_with_globals_obj` only binds
-    // `args` into the first `varnames` slots, and every one of them is
-    // cleared to PY_NULL and rewritten from `live_locals` just below.
+    // No positional seed: `baseobjspace.py createframe` leaves locals
+    // `[None] * size`; every varname slot is rewritten from `live_locals`
+    // just below.
     let frame = match pyre_interpreter::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code as *const (),
-        &[],
         w_globals,
         ec,
         pyre_object::PY_NULL,
@@ -5058,7 +5057,7 @@ fn try_adopt_multi_frame_blackhole(
             saved_links.push((*callee).f_backref as i64);
             relink_barrier(callee);
             majit_gc::bh_probe_note_store(
-                callee as usize,
+                callee as majit_gc::GCREF,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 5,
             );
@@ -5072,7 +5071,7 @@ fn try_adopt_multi_frame_blackhole(
             let f_back = pair[1] as *mut pyre_interpreter::PyFrame;
             relink_barrier(callee);
             majit_gc::bh_probe_note_store(
-                callee as usize,
+                callee as majit_gc::GCREF,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 6,
             );

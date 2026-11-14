@@ -6275,6 +6275,9 @@ impl<M: Clone> MetaInterp<M> {
                 assign(jd);
             }
         }
+        // `build_bh_jitdrivers_sd` now copies `virtualizable_info`, so the
+        // memoised blackhole projection is stale after this write.
+        sd.bh_jitdrivers_sd.take();
     }
 
     /// Get the active virtualizable info.
@@ -7491,7 +7494,12 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py MetaInterp._interpret` keeps all three on the metainterp;
     /// passing the disjoint fields preserves that owner while allowing the
     /// recursive-call resolver to borrow warmstate during a frame step.
-    fn with_trace_ctx_and_framestack<R>(
+    ///
+    /// Unique look-inside of an extracted portal (`trace_jitcode_from_merge_point`)
+    /// must use this seam so inlined `MIFrame`s sit on `self.framestack`.
+    /// `walk_active_trace_refs` walks those registers (`walk_framestack_ref_regs`);
+    /// a `StandaloneFrameStack` is invisible to that walk.
+    pub fn with_trace_ctx_and_framestack<R>(
         &mut self,
         f: impl FnOnce(
             &mut TraceCtx,
@@ -21873,9 +21881,9 @@ pub struct MetaInterpStaticData {
     /// clone of the one table instead of re-casting every row.
     ///
     /// Cleared by [`Self::finish_setup_descrs_for_jitdrivers`], which every
-    /// path that appends a driver or rewrites a result kind already ends in.
-    /// The other two `iter_mut` writers set `virtualizable_info` /
-    /// `greenfield_info`, neither of which this projection reads.
+    /// path that appends a driver or rewrites a result kind already ends in,
+    /// and by [`MetaInterp::set_virtualizable_info`], which this projection
+    /// now copies. `greenfield_info` is still not projected.
     pub(crate) bh_jitdrivers_sd:
         std::sync::OnceLock<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
     /// pyjitpl.py `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`
@@ -33196,6 +33204,123 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
         assert_eq!(ops[2].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcI); // caller fallback
+    }
+
+    #[test]
+    fn getfield_vable_under_novable_driver_reads_the_nonstandard_box() {
+        // pyjitpl.py `_nonstandard_virtualizable` on a novable driver:
+        // the jitcode operand is `vinfos[VTYPEPTR].static_field_descrs[i]`,
+        // recovered here via `vable_descr_owner_info` because the serialized
+        // `VableField { index }` keeps only the index.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pycode", Type::Ref, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = std::sync::Arc::new(info);
+        let expected_descr = info.static_field_descr(0);
+
+        let mut meta = MetaInterp::<()>::new(10);
+        let mut jd0 = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        jd0.virtualizable_info = Some(info.clone());
+        jd0.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let mut jd1 = JitDriverStaticData::new(vec![], vec![("frame", Type::Ref)]);
+        jd1.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = meta.register_jitdriver_sd(jd0);
+        let idx1 = meta.register_jitdriver_sd(jd1);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let mut builder = JitCodeBuilder::new();
+        builder.vable_getfield_ref_with_base(1, 0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        jitcode.set_jitdriver_sd(idx1);
+
+        const PC: i64 = 0x51;
+        let mut obj = ResidualCallVableObj::new(0, PC);
+        let obj_ptr = &mut obj as *mut ResidualCallVableObj;
+        let frame = Value::Ref(majit_ir::GcRef(obj_ptr as usize));
+        let jd1_desc = meta.staticdata.jitdrivers_sd[idx1].clone();
+        let key = gk(781);
+        let action = meta.force_start_tracing(
+            key.get_uhash(),
+            (0, 0),
+            Some((&key.values, &key.types)),
+            Some(std::sync::Arc::new(jd1_desc)),
+            &[frame],
+        );
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        {
+            let ctx = meta.trace_ctx().expect("active trace");
+            assert!(ctx.virtualizable_info().is_none());
+            ctx.heap_cache_mut().new_object(OpRef::input_arg_ref(0));
+        }
+
+        meta.seed_root_portal_frame(
+            jitcode,
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), obj_ptr as i64)],
+        );
+
+        struct NoopSym;
+        impl crate::JitCodeSym for NoopSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+        }
+        let action = meta.interpret(&mut NoopSym, 0);
+        assert!(
+            !matches!(action, crate::TraceAction::Abort),
+            "novable getfield_vable_r must not abort, got {action:?}"
+        );
+
+        let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
+        assert!(
+            ctx.collect_virtualizable_boxes().is_none(),
+            "novable driver must not grow a virtualizable section"
+        );
+        let ops = ctx.recorder.ops();
+        let matching = ops.iter().find(|op| {
+            op.opcode == OpCode::GetfieldGcR
+                && op
+                    .getdescr()
+                    .as_ref()
+                    .is_some_and(|d| std::sync::Arc::ptr_eq(d, &expected_descr))
+        });
+        let Some(op) = matching else {
+            panic!("expected GetfieldGcR with the VTYPE static field descr, ops={ops:?}");
+        };
+        assert_eq!(
+            op.args_slice().first().map(|a| a.to_opref()),
+            Some(OpRef::input_arg_ref(0)),
+            "GetfieldGcR base must be the novable box, ops={ops:?}"
+        );
+        match op.get_value() {
+            Some(Value::Ref(r)) => {
+                assert_eq!(r.as_usize() as i64, PC, "GetfieldGcR result must be obj.pc");
+            }
+            Some(other) => panic!("GetfieldGcR result stamped {other:?}, expected Ref(obj.pc)"),
+            None => {
+                // Residual GetfieldGcR result is not observable on this recorder.
+            }
+        }
     }
 
     #[test]

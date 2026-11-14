@@ -77,6 +77,7 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
     guard_words: &std::collections::HashSet<Variable>,
+    lower_inline_fields: bool,
     expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
 ) -> Result<(), LowerError> {
     // `GcRef(p as usize)` is a GCREF word (`ConstRefNull` for `GcRef::NULL`).
@@ -128,9 +129,14 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
         crate::model::fuse_boxing_alloc_with(graph, struct_field_attrs, expand_inline_struct) > 0;
     // After boxing fusion has read the header store, a leftover by-value
     // write of an inlined struct is one setfield per inner leaf.
-    dirty |= crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
-        .map_err(LowerError::Unsupported)?
-        > 0;
+    // Pre-result-exception simplify keeps the logical `__pos_0` store so
+    // `lower_result_exc_returns_inner` still matches one payload FieldWrite;
+    // `heaptracker.all_fielddescrs` scalarizes after that carrier rewrite.
+    if lower_inline_fields {
+        dirty |= crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
+            .map_err(LowerError::Unsupported)?
+            > 0;
+    }
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -242,15 +248,19 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     // the constructor.
     if sweep_dead_vars {
         scalar_replace_named_struct_aggregates(graph, struct_field_attrs);
-        crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
-            .map_err(LowerError::Unsupported)?;
+        if lower_inline_fields {
+            crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
+                .map_err(LowerError::Unsupported)?;
+        }
     }
     // `get().0 as *mut T` is emitted as `cast_int_to_ptr` while the
     // loaded word is still a reference field. After empty-block
     // elimination the cast's operand is that load (through block
     // arguments). Fold it back so the reference is what the cast returns.
     fold_int_to_ptr_of_ref_load(graph, guard_words);
-    refuse_inlined_struct_field_writes(graph, expand_inline_struct)?;
+    if lower_inline_fields {
+        refuse_inlined_struct_field_writes(graph, expand_inline_struct)?;
+    }
     Ok(())
 }
 
@@ -366,8 +376,9 @@ pub(in crate::front::mir) fn ref_load_root(
         .is_some_and(|result| guard_words.contains(result))
 }
 
-/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
-/// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
+/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed,
+/// stable, and young-nonmoving flavors — the boxing-cluster allocator
+/// `fuse_boxing_alloc` keys on.
 pub(in crate::front::mir) fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
     let CallTarget::FunctionPath { segments, .. } = target else {
         return false;
@@ -378,6 +389,10 @@ pub(in crate::front::mir) fn call_target_is_gc_malloc(target: &CallTarget) -> bo
     parent == "lltype"
         && matches!(
             leaf.as_str(),
-            "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+            "malloc"
+                | "malloc_typed"
+                | "malloc_typed_managed"
+                | "malloc_typed_stable"
+                | "malloc_typed_young_nonmoving"
         )
 }

@@ -290,6 +290,9 @@ impl crate::lltype::GcType for Weakref {
 /// Caller must ensure `target` outlives the weakref or accept that a
 /// subsequent collection will null the slot (GC-allocated path only; the
 /// Box-immortal bootstrap slot is never cleared).
+// `jtransform.py rewrite_op_weakref_create = _do_builtin_call`: the JIT calls
+// the `support.py _ll_1_weakref_create` helper residually.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
     // gct_weakref_create: `push_roots(keep_current_args=True)` then
     // malloc_fixedsize(..., contains_weakptr=True). Nursery overflow is

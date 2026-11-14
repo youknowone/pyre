@@ -907,13 +907,14 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
 /// SET_ADD — `set.add(value)`.  Shared by the interpreter's `set_add` and
 /// the JIT residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
 ///
-/// pyopcode.py uses `space.call_method(w_set, 'add', ...)`; this stores
-/// directly into an exact builtin `set`.  BUILD_SET / set comprehensions
-/// push `w_set_new()`.  A rebound `__conditional_annotations__` that is
-/// not an exact `set` raises `TypeError("'%T' object is not a set")`.
+/// Direct store used by `set.add`'s builtin wrapper and the
+/// `try_walker_specialize_set_add_method` fold. pyopcode.py BUILD_SET /
+/// SET_ADD go through `call_method_add` instead: inlining this helper
+/// from the bytecode portal numbers a raising user `__hash__` behind
+/// helper-resume `GUARD_NO_EXCEPTION`.
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
-        if pyre_object::is_exact_type(set, &pyre_object::setobject::SET_TYPE) {
+        if pyre_object::setobject::is_set(set) {
             // `IntegerSetStrategy.add` with `is_correct_type(w_key)`:
             // `d[self.unwrap(w_key)] = None`. A plain int is stored unwrapped
             // and needs no `try_hash_value` first. The helper reads the
@@ -1604,6 +1605,19 @@ pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObject
 #[inline(never)]
 pub extern "C" fn jit_type_methods_list_extend_items(list: PyObjectRef, other: PyObjectRef) {
     match crate::type_methods::list_extend_items(list, other) {
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
+    }
+}
+
+// SET_ADD's void `inline_call_r_v` calls this address. The recorded graph
+// is `call_method_add`; its Rust `Result` is a different ABI, so the
+// two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_call_method_add(set: PyObjectRef, value: PyObjectRef) {
+    match crate::baseobjspace::call_method_add(set, value) {
         Ok(()) => {}
         Err(err) => {
             crate::runtime_ops::jit_publish_residual_error(err);

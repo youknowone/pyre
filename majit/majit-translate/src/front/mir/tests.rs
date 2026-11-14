@@ -14621,6 +14621,192 @@ fn registered_transparent_scalar_union_lowers_to_integer_ops() {
     }
 }
 
+/// A residual `get(&Word)` of a linked transparent scalar is refused by
+/// `refuse_borrowed_transparent_scalar_residual`: the borrow is the word,
+/// not an address.
+#[test]
+fn linked_transparent_scalar_residual_borrow_is_refused() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path
+                .iter()
+                .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                .collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let word_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let word_ref = serde_json::json!({"Ref": ["_", word_adt.clone(), "Shared"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let word_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "Word"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "pass_word"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_adt.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "word", "span": span(), "ty": word_adt.clone()},
+                        {"index": 2, "name": null, "span": span(), "ty": word_ref.clone()}
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span(),
+                            "kind": {"Assign": [
+                                place(2, &word_ref),
+                                {"Ref": {
+                                    "place": place(1, &word_adt),
+                                    "kind": "Shared",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{
+                                            "Move": place(2, &word_ref)
+                                        }]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let callee = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "get"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_ref.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "self", "span": span(), "ty": word_ref}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span(), "kind": "Return"}
+                }]
+            }
+        }
+    });
+    let marker = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "_jit_look_inside_get"], true),
+        "global_kind": "NamedConst",
+        "ty": {"Scalar": "Bool"},
+        "value": [{"Bool": false}, {"Scalar": "Bool"}]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [word_decl],
+            "fun_decls": [caller, callee],
+            "global_decls": [marker],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Word".to_string(),
+        majit_charon_reader::TransparentScalarKind::Signed,
+    )]);
+    let refused = crate::test_support::lower_function(&llbc, "pass_word")
+        .expect_err("a residual callee cannot take &Word");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("repr(transparent) scalar"),
+        "refusal must name the scalar borrow, got {refused}"
+    );
+}
+
 pub(in crate::front::mir) fn ptr_ty() -> serde_json::Value {
     serde_json::json!({"RawPtr": [usize_ty(), "Const"]})
 }
@@ -30425,21 +30611,25 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
     let interpreter =
         crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
     let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
-    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[interpreter, object],
-        crate::HostStaticAddrs {
-            error_carrier: crate::ErrorCarrierSpec {
-                carrier_path: "pyre_interpreter::error::PyError",
-                carrier_class: "",
-                carrier_wrappers: &[],
-                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-                from_exc_object: Some(("PyError", "from_exc_object")),
+    let program = crate::test_support::with_shared_link_write([interpreter, object], || {
+        let touching = crate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[interpreter, object],
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_class: "",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        },
-        &["error"],
-        &["oefmt"],
-    )
+            &["error"],
+            &["oefmt"],
+        )
+    })
     .expect("lower oefmt");
     let graph = program
         .functions

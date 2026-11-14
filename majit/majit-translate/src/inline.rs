@@ -1710,8 +1710,43 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
         {
             true
         }
+        // Host calls that rtype to a pure llop or identity (`exception_cannot_occur`).
+        // Unique look-inside jitcode keeps the frontend `simple_call`, so DCE
+        // matches `CanRemove` / `enum_ops_without_sideeffects` on that spelling.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 1 && host_call_has_no_sideeffects(segments) => true,
         _ => is_pure_op(kind),
     }
+}
+
+fn host_call_has_no_sideeffects(segments: &[String]) -> bool {
+    lltype_cast_call_has_no_sideeffects(segments)
+        || rarithmetic_mask_call_has_no_sideeffects(segments)
+}
+
+fn lltype_cast_call_has_no_sideeffects(segments: &[String]) -> bool {
+    // `lloperation.py` `LLOp(sideeffects=False)` on `cast_ptr_to_int` /
+    // `cast_int_to_ptr`. `enum_ops_without_sideeffects` puts those names
+    // in `CanRemove` after rtyping (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+    matches!(
+        segments.last().map(String::as_str),
+        Some("cast_ptr_to_int") | Some("cast_int_to_ptr")
+    ) && segments.len() >= 2
+        && segments[segments.len() - 2] == "lltype"
+}
+
+fn rarithmetic_mask_call_has_no_sideeffects(segments: &[String]) -> bool {
+    // `rbuiltin.py` `rtype_intmask` / `rtype_r_uint`: identity retype,
+    // `exception_cannot_occur`. An unread `r_uint` of `p as usize` pins
+    // the `cast_ptr_to_int` producer unless this Call is CanRemove.
+    matches!(
+        segments.last().map(String::as_str),
+        Some("r_uint") | Some("intmask") | Some("longlongmask")
+    ) && segments.len() >= 2
+        && segments[segments.len() - 2] == "rarithmetic"
 }
 
 /// Whitelist of `OpKind::UnaryOp` opnames that are side-effect-free
@@ -1928,6 +1963,38 @@ mod tests {
     use crate::call::CallControl;
     use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
     use crate::parse::CallPath;
+
+    #[test]
+    fn lltype_cast_ptr_to_int_host_call_is_can_remove() {
+        let mut graph = FunctionGraph::new("cast_ptr_to_int_dce");
+        let ptr = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let kind = OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_ptr_to_int",
+            ]),
+            args: crate::model::call_args(vec![ptr]),
+            result_ty: ValueType::Int,
+        };
+        assert!(
+            can_remove_op(&kind),
+            "lloperation.py LLOp(sideeffects=False) is CanRemove"
+        );
+        assert!(!is_pure_op(&kind), "simple_call stays impure for CSE");
+        let word = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let r_uint = OpKind::Call {
+            target: CallTarget::function_path(["rpython", "rlib", "rarithmetic", "r_uint"]),
+            args: crate::model::call_args(vec![word]),
+            result_ty: ValueType::Unsigned,
+        };
+        assert!(
+            can_remove_op(&r_uint),
+            "rbuiltin.py rtype_r_uint is identity, exception_cannot_occur"
+        );
+    }
 
     #[test]
     fn dead_op_removal_and_float_purity_use_their_rpython_tables() {

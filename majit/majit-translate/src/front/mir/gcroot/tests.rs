@@ -581,6 +581,23 @@ fn root_scope_drop_is_classified_and_live() {
     assert!(super::is_frame_anchor_release_call(&release));
     assert!(super::is_shadow_stack_bracket_close(&release));
     assert!(!super::is_root_scope_drop_glue_call(&release));
+    let rec_release = crate::model::OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath {
+            segments: vec![
+                "pyre_interpreter".to_string(),
+                "call".to_string(),
+                "release_recursive_frame".to_string(),
+            ],
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        },
+        args: Vec::new(),
+        result_ty: crate::model::ValueType::Void,
+    };
+    assert!(
+        !super::is_shadow_stack_bracket_close(&rec_release),
+        "the recursive-frame leave belongs to the graph exit (`PyFrame.execute_frame` finally), not to inner-edge close replay"
+    );
 
     // `_1` is written in bb0 and read only by bb1's Drop.
     let span = || {
@@ -5097,5 +5114,1117 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
     assert!(
         !analyzer.regular_call_touches_root_stack(&caller),
         "the map caller does not inherit an unknown drop"
+    );
+}
+
+/// A resolved impl that inherits a generic trait default selects the default
+/// body's concrete graph. The sibling unresolved clause remains top.
+#[test]
+fn resolved_trait_default_uses_concrete_binder() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64| serde_json::json!({"kind": {"Local": index}, "ty": unit});
+    let local =
+        |index: u64| serde_json::json!({"index": index, "name": null, "span": span, "ty": unit});
+    let poly = |inner: serde_json::Value| {
+        serde_json::json!({
+            "regions": [], "regions_outlive": [], "types_outlive": [], "skip_binder": inner
+        })
+    };
+    let clause = |index: u64| {
+        poly(serde_json::json!({
+            "kind": {"Clause": [{"Bound": [1, index]}, {"regions": []}]}
+        }))
+    };
+    let concrete_shared = poly(serde_json::json!({
+        "kind": {"BuiltinOrAuto": {
+            "builtin_data": "NoopDestruct", "parent_trait_refs": [], "types": [], "vtable": null
+        }},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let resolved = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let body = |terminator: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+                "body": [
+                    {"statements": [], "terminator": {"kind": terminator}},
+                    {"statements": [], "terminator": {"kind": "Return"}}
+                ]
+            }
+        })
+    };
+    let helper_call = serde_json::json!({"Call": {
+        "call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 1},
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": [clause(1)]
+                }
+            }},
+            "args": []
+        },
+        "dest": place(0),
+        "target": 1,
+        "on_unwind": 1
+    }});
+    let fun = |def_id: u64,
+               path: &[&str],
+               generics: Option<serde_json::Value>,
+               src: Option<serde_json::Value>,
+               body: serde_json::Value| {
+        let mut row = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": body
+        });
+        if let Some(generics) = generics {
+            row["generics"] = generics;
+        }
+        if let Some(src) = src {
+            row["src"] = src;
+        }
+        row
+    };
+    let helper_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "H"}],
+        "const_generics": [],
+        "trait_clauses": [{}]
+    });
+    let default_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "Self"}],
+        "const_generics": [],
+        "trait_clauses": [{}, {}]
+    });
+    let funs = vec![
+        fun(
+            0,
+            &["fixture", "gc_roots", "pin_root"],
+            None,
+            None,
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "quiet_helper"],
+            Some(helper_generics),
+            None,
+            body(serde_json::json!("Return")),
+        ),
+        fun(
+            2,
+            &["fixture", "Subject", "provided"],
+            Some(default_generics),
+            Some(serde_json::json!({"TraitDefault": {"item_id": 0}})),
+            body(helper_call),
+        ),
+    ];
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Subject"]),
+        "methods": [{"skip_binder": {"name": "provided", "default": {"id": 2}}}]
+    });
+    let shared_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Shared"]),
+        "methods": []
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": []
+    });
+    let file = serde_json::json!({
+        "charon_version": "fixture",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [trait_decl, shared_decl],
+            "trait_impls": [impl_row]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let concrete: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [resolved, 0]},
+        "generics": {
+            "regions": [], "types": [], "const_generics": [],
+            "trait_refs": [concrete_shared]
+        }
+    }))
+    .expect("concrete call parses");
+    assert!(!analyzer.regular_call_touches_root_stack(&concrete));
+
+    let unresolved: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("unresolved call parses");
+    assert!(analyzer.regular_call_touches_root_stack(&unresolved));
+}
+
+/// Charon lists an inherited default on the impl `methods` row
+/// (`TraitDefault` FunDecl). That listing still uses the trait
+/// instantiation (`description.py` `FunctionDesc.cachedgraph`); a real
+/// override on a sibling impl stays on the impl parameter list.
+#[test]
+fn listed_trait_default_uses_concrete_binder() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64| serde_json::json!({"kind": {"Local": index}, "ty": unit});
+    let local =
+        |index: u64| serde_json::json!({"index": index, "name": null, "span": span, "ty": unit});
+    let poly = |inner: serde_json::Value| {
+        serde_json::json!({
+            "regions": [], "regions_outlive": [], "types_outlive": [], "skip_binder": inner
+        })
+    };
+    let clause = |index: u64| {
+        poly(serde_json::json!({
+            "kind": {"Clause": [{"Bound": [1, index]}, {"regions": []}]}
+        }))
+    };
+    let concrete_shared = poly(serde_json::json!({
+        "kind": {"BuiltinOrAuto": {
+            "builtin_data": "NoopDestruct", "parent_trait_refs": [], "types": [], "vtable": null
+        }},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let resolved = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let resolved_override = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 1, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let body = |terminator: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+                "body": [
+                    {"statements": [], "terminator": {"kind": terminator}},
+                    {"statements": [], "terminator": {"kind": "Return"}}
+                ]
+            }
+        })
+    };
+    let helper_call = serde_json::json!({"Call": {
+        "call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 1},
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": [clause(1)]
+                }
+            }},
+            "args": []
+        },
+        "dest": place(0),
+        "target": 1,
+        "on_unwind": 1
+    }});
+    let pin_call = serde_json::json!({"Call": {
+        "call": {
+            "func": {"Regular": {"kind": {"Fun": 0}, "generics": null}},
+            "args": []
+        },
+        "dest": place(0),
+        "target": 1,
+        "on_unwind": 1
+    }});
+    let fun = |def_id: u64,
+               path: &[&str],
+               generics: Option<serde_json::Value>,
+               src: Option<serde_json::Value>,
+               body: serde_json::Value| {
+        let mut row = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": body
+        });
+        if let Some(generics) = generics {
+            row["generics"] = generics;
+        }
+        if let Some(src) = src {
+            row["src"] = src;
+        }
+        row
+    };
+    let helper_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "H"}],
+        "const_generics": [],
+        "trait_clauses": [{}]
+    });
+    let default_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "Self"}],
+        "const_generics": [],
+        "trait_clauses": [{}, {}]
+    });
+    let funs = vec![
+        fun(
+            0,
+            &["fixture", "gc_roots", "pin_root"],
+            None,
+            None,
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "quiet_helper"],
+            Some(helper_generics),
+            None,
+            body(serde_json::json!("Return")),
+        ),
+        fun(
+            2,
+            &["fixture", "Subject", "provided"],
+            Some(default_generics.clone()),
+            Some(serde_json::json!({"TraitDefault": {"item_id": 0}})),
+            body(helper_call),
+        ),
+        fun(
+            3,
+            &["fixture", "Subject", "override_provided"],
+            Some(default_generics),
+            None,
+            body(pin_call),
+        ),
+    ];
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Subject"]),
+        "methods": [{"skip_binder": {"name": "provided", "default": {"id": 2}}}]
+    });
+    let shared_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Shared"]),
+        "methods": []
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 2}}]
+    });
+    let override_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 3}}]
+    });
+    let file = serde_json::json!({
+        "charon_version": "fixture",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [trait_decl, shared_decl],
+            "trait_impls": [impl_row, override_row]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let listed_payload = serde_json::json!([resolved, 0]);
+    assert!(
+        crate::front::clause_spec::trait_impl_method(&listed_payload, &llbc).is_none(),
+        "listed TraitDefault is not an override"
+    );
+    let concrete: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": listed_payload},
+        "generics": {
+            "regions": [], "types": [], "const_generics": [],
+            "trait_refs": [concrete_shared]
+        }
+    }))
+    .expect("concrete call parses");
+    assert!(!analyzer.regular_call_touches_root_stack(&concrete));
+
+    let unresolved: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("unresolved call parses");
+    assert!(analyzer.regular_call_touches_root_stack(&unresolved));
+
+    let override_payload = serde_json::json!([resolved_override, 0]);
+    let (override_fn, override_generics) =
+        crate::front::clause_spec::trait_impl_method(&override_payload, &llbc)
+            .expect("real override stays on trait_impl_method");
+    assert_eq!(override_fn, 3);
+    assert_eq!(override_generics["types"], serde_json::json!([]));
+    let overridden: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": override_payload},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("override call parses");
+    assert!(analyzer.regular_call_touches_root_stack(&overridden));
+}
+
+/// Taking a function item's address is not a call (`graphanalyze.py`
+/// `GraphAnalyzer.analyze` charges `direct_call` / `indirect_call` only).
+/// A callback an invoker residual receives is still charged
+/// (`analyze_external_call` `_callbacks`).
+#[test]
+fn fn_item_address_is_not_a_root_stack_call() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let ty = serde_json::json!({"Deduplicated": 0});
+    let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+    let copy = |i: u64| serde_json::json!({"Read": place(i)});
+    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let fn_def = serde_json::json!({
+        "Const": [
+            {"FnDef": {"kind": {"Fun": 0}, "generics": empty_g}},
+            ty
+        ]
+    });
+    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span});
+    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+    let ret = || block(vec![], serde_json::json!("Return"));
+    let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                "args": args
+            },
+            "dest": place(dest),
+            "target": target,
+            "on_unwind": 99
+        }})
+    };
+    let body = |blocks: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": blocks
+        })
+    };
+    let fun = |def_id: u64, path: &[&str], body: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Tuple": []}},
+            "body": body
+        })
+    };
+    let addr_of = body(vec![
+        block(
+            vec![
+                stmt(serde_json::json!({
+                    "Assign": [place(3), {"UnaryOp": [{"Cast": "FnDefToFnPtr"}, fn_def.clone()]}]
+                })),
+                stmt(serde_json::json!({
+                    "Assign": [place(0), {"UnaryOp": [
+                        {"Cast": "PtrExposeProvenance"},
+                        {"Move": place(3)}
+                    ]}]
+                })),
+            ],
+            serde_json::json!("Return"),
+        ),
+        ret(),
+    ]);
+    let unwrap_or_body = body(vec![ret()]);
+    let invoker_body = body(vec![
+        block(
+            vec![],
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Dynamic": [{"Read": place(1)}, []]},
+                    "args": []
+                },
+                "dest": place(2),
+                "target": 1,
+                "on_unwind": 99
+            }}),
+        ),
+        ret(),
+    ]);
+    let via_local = |callee: u64| {
+        body(vec![
+            block(
+                vec![stmt(serde_json::json!({
+                    "Assign": [place(3), {"UnaryOp": [{"Cast": "FnDefToFnPtr"}, fn_def.clone()]}]
+                }))],
+                call(callee, vec![serde_json::json!({"Move": place(3)})], 2, 1),
+            ),
+            ret(),
+        ])
+    };
+    let funs = vec![
+        fun(
+            0,
+            &["pyre_object", "gc_roots", "pin_root"],
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "addr_of_pin"],
+            serde_json::json!({"Unstructured": addr_of}),
+        ),
+        fun(
+            2,
+            &["fixture", "calls_pin"],
+            serde_json::json!({"Unstructured": body(vec![
+                block(vec![], call(0, vec![copy(1)], 2, 1)),
+                ret(),
+            ])}),
+        ),
+        fun(3, &["fixture", "residual"], serde_json::json!("Opaque")),
+        fun(
+            4,
+            &["fixture", "hands_const_callback"],
+            serde_json::json!({"Unstructured": body(vec![
+                block(vec![], call(3, vec![fn_def.clone()], 2, 1)),
+                ret(),
+            ])}),
+        ),
+        fun(
+            5,
+            &["fixture", "unwrap_or"],
+            serde_json::json!({"Unstructured": unwrap_or_body}),
+        ),
+        fun(
+            6,
+            &["fixture", "hands_unwrap_or"],
+            serde_json::json!({"Unstructured": via_local(5)}),
+        ),
+        fun(
+            7,
+            &["fixture", "conditional_call"],
+            serde_json::json!({"Unstructured": invoker_body}),
+        ),
+        fun(
+            8,
+            &["fixture", "hands_conditional_call"],
+            serde_json::json!({"Unstructured": via_local(7)}),
+        ),
+        fun(
+            9,
+            &["fixture", "hands_residual_via_local"],
+            serde_json::json!({"Unstructured": via_local(3)}),
+        ),
+        fun(
+            10,
+            &["fixture", "hands_const_unwrap_or"],
+            serde_json::json!({"Unstructured": body(vec![
+                block(vec![], call(5, vec![fn_def.clone()], 2, 1)),
+                ret(),
+            ])}),
+        ),
+    ];
+    let llbc = llbc_with_types("pyre_object", vec![], funs);
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let direct = |id: u64| -> RegularCall {
+        serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+            .expect("fixture call parses")
+    };
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&direct(1)),
+        "address-of a pin helper is not a call of that helper"
+    );
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(2)),
+        "a direct call of pin_root still touches"
+    );
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(4)),
+        "a Const FnDef argument of an opaque residual is a callback"
+    );
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&direct(6)),
+        "unwrap_or of a function item does not invoke it"
+    );
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(8)),
+        "a function item passed to a pointer-invoking callee is a callback"
+    );
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(9)),
+        "a function item moved into an opaque residual is a callback"
+    );
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&direct(10)),
+        "a Const FnDef argument of unwrap_or is not a call of that item"
+    );
+}
+
+/// A callback forwarded through a direct-call wrapper is charged
+/// (`graphanalyze.py` `GraphAnalyzer.analyze_direct_call` /
+/// `analyze_indirect_call` / `analyze_external_call` `_callbacks`).
+#[test]
+fn callback_forwarded_through_wrapper_touches() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let ty = serde_json::json!({"Deduplicated": 0});
+    let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let pins_def = serde_json::json!({
+        "Const": [
+            {"FnDef": {"kind": {"Fun": 1}, "generics": empty_g}},
+            ty
+        ]
+    });
+    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span});
+    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+    let ret = || block(vec![], serde_json::json!("Return"));
+    let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                "args": args,
+                "dest": place(dest)
+            },
+            "target": target,
+            "on_unwind": 99
+        }})
+    };
+    let body = |blocks: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": blocks
+        })
+    };
+    let fun = |def_id: u64, path: &[&str], body: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Tuple": []}},
+            "body": body
+        })
+    };
+    let invoke_body = body(vec![
+        block(
+            vec![],
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Dynamic": [{"Copy": place(1)}, []]},
+                    "args": [],
+                    "dest": place(2)
+                },
+                "target": 1,
+                "on_unwind": 99
+            }}),
+        ),
+        ret(),
+    ]);
+    let forward_body = body(vec![block(vec![], call(2, vec![copy(1)], 2, 1)), ret()]);
+    let handoff_body = body(vec![
+        block(
+            vec![stmt(serde_json::json!({
+                "Assign": [place(3), {"Use": [pins_def, "No"]}]
+            }))],
+            call(3, vec![serde_json::json!({"Move": place(3)})], 2, 1),
+        ),
+        ret(),
+    ]);
+    let funs = vec![
+        fun(
+            0,
+            &["pyre_object", "gc_roots", "pin_root"],
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "pins"],
+            serde_json::json!({"Unstructured": body(vec![
+                block(vec![], call(0, vec![copy(1)], 2, 1)),
+                ret(),
+            ])}),
+        ),
+        fun(
+            2,
+            &["fixture", "invoke"],
+            serde_json::json!({"Unstructured": invoke_body}),
+        ),
+        fun(
+            3,
+            &["fixture", "forward"],
+            serde_json::json!({"Unstructured": forward_body}),
+        ),
+        fun(
+            4,
+            &["fixture", "handoff"],
+            serde_json::json!({"Unstructured": handoff_body}),
+        ),
+    ];
+    let llbc = llbc_with_types("pyre_object", vec![], funs);
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let direct = |id: u64| -> RegularCall {
+        serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+            .expect("fixture call parses")
+    };
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(4)),
+        "handoff of a pinning callback through forward/invoke touches"
+    );
+}
+
+/// MIR is not SSA: a local assigned `quiet` then, on one branch, `pins`,
+/// still joins both targets (`analyze_indirect_call`).
+#[test]
+fn fn_item_local_joins_all_assigned_targets() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let ty = serde_json::json!({"Deduplicated": 0});
+    let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let fn_def = |id: u64| {
+        serde_json::json!({
+            "Const": [
+                {"FnDef": {"kind": {"Fun": id}, "generics": empty_g}},
+                ty
+            ]
+        })
+    };
+    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span});
+    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+    let ret = || block(vec![], serde_json::json!("Return"));
+    let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                "args": args,
+                "dest": place(dest)
+            },
+            "target": target,
+            "on_unwind": 99
+        }})
+    };
+    let body = |blocks: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": blocks
+        })
+    };
+    let fun = |def_id: u64, path: &[&str], body: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Tuple": []}},
+            "body": body
+        })
+    };
+    let invoke_body = body(vec![
+        block(
+            vec![],
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Dynamic": [{"Copy": place(1)}, []]},
+                    "args": [],
+                    "dest": place(2)
+                },
+                "target": 1,
+                "on_unwind": 99
+            }}),
+        ),
+        ret(),
+    ]);
+    let choose_body = body(vec![
+        block(
+            vec![stmt(serde_json::json!({
+                "Assign": [place(3), {"Use": [fn_def(2), "No"]}]
+            }))],
+            serde_json::json!({"Switch": {
+                "discr": copy(1),
+                "targets": {"If": [1, 2]}
+            }}),
+        ),
+        block(
+            vec![stmt(serde_json::json!({
+                "Assign": [place(3), {"Use": [fn_def(1), "No"]}]
+            }))],
+            serde_json::json!({"Goto": {"target": 2}}),
+        ),
+        block(
+            vec![],
+            call(3, vec![serde_json::json!({"Move": place(3)})], 2, 3),
+        ),
+        ret(),
+    ]);
+    let funs = vec![
+        fun(
+            0,
+            &["pyre_object", "gc_roots", "pin_root"],
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "pins"],
+            serde_json::json!({"Unstructured": body(vec![
+                block(vec![], call(0, vec![copy(1)], 2, 1)),
+                ret(),
+            ])}),
+        ),
+        fun(
+            2,
+            &["fixture", "quiet"],
+            serde_json::json!({"Unstructured": body(vec![ret()])}),
+        ),
+        fun(
+            3,
+            &["fixture", "invoke"],
+            serde_json::json!({"Unstructured": invoke_body}),
+        ),
+        fun(
+            4,
+            &["fixture", "choose"],
+            serde_json::json!({"Unstructured": choose_body}),
+        ),
+    ];
+    let llbc = llbc_with_types("pyre_object", vec![], funs);
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let direct = |id: u64| -> RegularCall {
+        serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+            .expect("fixture call parses")
+    };
+    assert!(
+        analyzer.regular_call_touches_root_stack(&direct(4)),
+        "a local assigned quiet then pins still charges the pinning target"
+    );
+}
+
+/// A listed TraitDefault whose body is a `ParentClause` of clause 0
+/// walks the implied supertrait default (`graphanalyze.py`
+/// `GraphAnalyzer.analyze_direct_call`; `description.py`
+/// `FunctionDesc.cachedgraph`). Unresolved `Clause` stays top.
+#[test]
+fn listed_trait_default_parent_clause_is_implied_supertrait() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64| serde_json::json!({"kind": {"Local": index}, "ty": unit});
+    let local =
+        |index: u64| serde_json::json!({"index": index, "name": null, "span": span, "ty": unit});
+    let poly = |inner: serde_json::Value| {
+        serde_json::json!({
+            "regions": [], "regions_outlive": [], "types_outlive": [], "skip_binder": inner
+        })
+    };
+    let clause0 = poly(serde_json::json!({
+        "kind": {"Clause": [{"Bound": [1, 0]}, {"regions": []}]}
+    }));
+    let parent_clause = serde_json::json!({
+        "kind": {"ParentClause": [clause0, 0, {"regions": []}]},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    });
+    let resolved_subject = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let implied_shared = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 1, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let body = |terminator: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+                "body": [
+                    {"statements": [], "terminator": {"kind": terminator}},
+                    {"statements": [], "terminator": {"kind": "Return"}}
+                ]
+            }
+        })
+    };
+    let parent_call = serde_json::json!({"Call": {
+        "call": {
+            "func": {"Regular": {
+                "kind": {"Trait": [parent_clause, 0]},
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }},
+            "args": []
+        },
+        "dest": place(0),
+        "target": 1,
+        "on_unwind": 1
+    }});
+    let fun = |def_id: u64,
+               path: &[&str],
+               generics: Option<serde_json::Value>,
+               src: Option<serde_json::Value>,
+               body: serde_json::Value| {
+        let mut row = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": body
+        });
+        if let Some(generics) = generics {
+            row["generics"] = generics;
+        }
+        if let Some(src) = src {
+            row["src"] = src;
+        }
+        row
+    };
+    let default_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "Self"}],
+        "const_generics": [],
+        "trait_clauses": [{}]
+    });
+    let funs = vec![
+        fun(
+            0,
+            &["fixture", "gc_roots", "pin_root"],
+            None,
+            None,
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "Shared", "guard"],
+            None,
+            Some(serde_json::json!({"TraitDefault": {"item_id": 0}})),
+            body(serde_json::json!("Return")),
+        ),
+        fun(
+            2,
+            &["fixture", "Subject", "checked"],
+            Some(default_generics),
+            Some(serde_json::json!({"TraitDefault": {"item_id": 0}})),
+            body(parent_call),
+        ),
+    ];
+    let subject_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Subject"]),
+        "methods": [{"skip_binder": {"name": "checked", "default": {"id": 2}}}]
+    });
+    let shared_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Shared"]),
+        "methods": [{"skip_binder": {"name": "guard", "default": {"id": 1}}}]
+    });
+    let subject_impl = serde_json::json!({
+        "def_id": 0,
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 2}}],
+        "implied_trait_refs": [implied_shared]
+    });
+    let shared_impl = serde_json::json!({
+        "def_id": 1,
+        "impl_trait": {"id": 1, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [{"kind": {"TraitMethod": [1, 0]}, "skip_binder": {"id": 1}}]
+    });
+    let file = serde_json::json!({
+        "charon_version": "fixture",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [subject_decl, shared_decl],
+            "trait_impls": [subject_impl, shared_impl]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let listed_payload = serde_json::json!([resolved_subject, 0]);
+    assert!(
+        crate::front::clause_spec::trait_impl_method(&listed_payload, &llbc).is_none(),
+        "listed TraitDefault is not an override"
+    );
+    let concrete: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": listed_payload},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("concrete call parses");
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&concrete),
+        "ParentClause of a listed default is the implied supertrait default"
+    );
+
+    let unresolved: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("unresolved call parses");
+    assert!(
+        analyzer.regular_call_touches_root_stack(&unresolved),
+        "unresolved Clause stays top"
+    );
+}
+
+/// A ParentClause of an impl whose generics still contain a caller Clause
+/// is classified Clause and refused by `concrete_trait_refs_or_empty`.
+#[test]
+fn open_parent_clause_is_refused_by_concrete_trait_refs() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let poly = |inner: serde_json::Value| {
+        serde_json::json!({
+            "regions": [], "regions_outlive": [], "types_outlive": [], "skip_binder": inner
+        })
+    };
+    let clause0 = poly(serde_json::json!({
+        "kind": {"Clause": [{"Bound": [0, 0]}, {"regions": []}]}
+    }));
+    let open_impl = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": [clause0]
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let parent_clause = serde_json::json!({
+        "kind": {"ParentClause": [open_impl, 0, {"regions": []}]},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    });
+    let implied = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 1, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let subject_impl = serde_json::json!({
+        "def_id": 0,
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty.clone()], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": [],
+        "implied_trait_refs": [implied]
+    });
+    let file = serde_json::json!({
+        "charon_version": "fixture",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": [subject_impl]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": [parent_clause]
+    });
+    assert!(
+        crate::front::clause_spec::concrete_trait_refs_or_empty(&generics, &llbc).is_none(),
+        "ParentClause of an open parent impl must stay Clause"
     );
 }

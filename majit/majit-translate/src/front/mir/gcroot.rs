@@ -1768,7 +1768,7 @@ impl<'a> RootStackAnalyzer<'a> {
             }
             // Builtins: arithmetic, `Box::new`, slice indexing.
             CallKind::Fun(FunId::Other(_)) => false,
-            CallKind::Trait(v) => self.analyze_trait_call(v, seen),
+            CallKind::Trait(v) => self.analyze_trait_call(v, &reg.generics, seen),
             // A body reached through a pointer cannot know which caller's
             // close would rewind a pin it left behind, so it closes its own:
             // the per-graph balance `ShadowStackFrameworkGCTransformer` gives
@@ -1957,6 +1957,7 @@ impl<'a> RootStackAnalyzer<'a> {
     pub(in crate::front::mir) fn analyze_trait_call(
         &self,
         v: &serde_json::Value,
+        method_generics: &serde_json::Value,
         seen: &mut RootStackTracker,
     ) -> bool {
         let Some(arr) = v.as_array() else {
@@ -1982,18 +1983,37 @@ impl<'a> RootStackAnalyzer<'a> {
         {
             return false;
         }
-        if let Some(impl_id) = traitref_impl_id(traitref, self.llbc, 0) {
+        // A `ParentClause` of a resolved impl is that impl's
+        // `implied_trait_refs` (`resolve_trait_ref`). `traitref_impl_id`
+        // reads `kind.TraitImpl` on the raw ref and misses it.
+        // `GraphAnalyzer.analyze_direct_call` walks the selected graph;
+        // `FunctionDesc.cachedgraph` keys the inherited default by the
+        // trait instantiation.
+        if let Some(impl_id) = crate::front::clause_spec::resolved_trait_impl_id(v, self.llbc) {
             let bodies = self
                 .state
                 .trait_methods
                 .get_or_init(|| trait_method_bodies(self.llbc));
-            if let Some(&target) = bodies.by_impl.get(&(impl_id, method)) {
+            if let Some(&target) = bodies.by_impl.get(&(impl_id, method))
+                && !crate::front::clause_spec::is_trait_default_decl(self.llbc, target)
+            {
                 return self.analyze_direct_call(target, None, seen);
             }
-            if let Some(default) = traitref_decl_id(traitref, self.llbc, 0)
-                .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
+            // A listed inherited default uses the trait instantiation
+            // (`description.py` `FunctionDesc.cachedgraph`), not the impl
+            // parameter list: fall through to `trait_default_method`.
+            // `traitref_decl_id` reads the raw ref; a `ParentClause` names
+            // the supertrait on the resolved implied proof instead.
+            if let Some((resolved_default, generics)) =
+                crate::front::clause_spec::trait_default_method(v, method_generics, self.llbc)
             {
-                return self.analyze_direct_call(default, None, seen);
+                return self.analyze_direct_call(resolved_default, Some(&generics), seen);
+            }
+            if traitref_decl_id(traitref, self.llbc, 0)
+                .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
+                .is_some()
+            {
+                return true;
             }
             // Resolved impl, no body in this artefact: same as a missing
             // graph (`analyze_external_call` of an unknown target).
@@ -2005,9 +2025,8 @@ impl<'a> RootStackAnalyzer<'a> {
         self.state.root_api_is_visible
     }
 
-    /// The function items a block names as values rather than calls, such as
-    /// the callback `jit.conditional_call` receives.  A value that is called
-    /// later is called from wherever it flows, so it is charged here.
+    /// `FnDef` constants on a call operand (`graphanalyze.py`
+    /// `GraphAnalyzer.analyze_external_call` `_callbacks`).
     pub(in crate::front::mir) fn analyze_fn_values(
         &self,
         v: &serde_json::Value,
@@ -2035,6 +2054,149 @@ impl<'a> RootStackAnalyzer<'a> {
             || self.analyze_fn_values(c, seen)
     }
 
+    /// A function item passed to a callee that may invoke that argument
+    /// (`graphanalyze.py` `GraphAnalyzer.analyze_external_call` `_callbacks`,
+    /// joined through `analyze_direct_call` / `analyze_indirect_call`).
+    /// `unwrap_or` of a function item is not that walk; taking
+    /// `f as *const () as usize` is not a call (`GraphAnalyzer.analyze`
+    /// charges `direct_call` / `indirect_call` only). `invokes` is the
+    /// per-argument answer from [`Self::callee_invokes_callback_arg`].
+    fn callback_operand_touches(
+        &self,
+        invokes: bool,
+        op: &Operand,
+        fn_locals: &[Vec<RegularCall>],
+        seen: &mut RootStackTracker,
+    ) -> bool {
+        if !invokes {
+            return false;
+        }
+        let Some(local) = operand_local(Some(op)) else {
+            return false;
+        };
+        fn_locals
+            .get(local)
+            .is_some_and(|targets| targets.iter().any(|cb| self.analyze_regular_call(cb, seen)))
+    }
+
+    /// Whether `callee` may invoke the argument at `arg_index`
+    /// (`graphanalyze.py` `GraphAnalyzer.analyze_direct_call` /
+    /// `analyze_indirect_call` / `analyze_external_call` `_callbacks`).
+    /// `CallKind::Ptr` / `CallKind::Unknown`, or a Regular fn with no
+    /// FunDecl or no body, is unknown and answers true. `visiting` is the
+    /// cycle guard: a `(fn id, arg_index)` already on it answers false.
+    fn callee_invokes_callback_arg(
+        &self,
+        callee: &RegularCall,
+        arg_index: usize,
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        match &callee.kind {
+            CallKind::Ptr(_) | CallKind::Unknown => true,
+            CallKind::Fun(FunId::Regular { id }) => {
+                if visiting
+                    .iter()
+                    .any(|&(fid, aidx)| fid == *id && aidx == arg_index)
+                {
+                    return false;
+                }
+                let Some(fd) = self.llbc.fn_by_id(*id) else {
+                    return true;
+                };
+                let Some(body) = fd.unstructured_shared() else {
+                    return true;
+                };
+                visiting.push((*id, arg_index));
+                let result = self.body_invokes_callback_arg(&body, arg_index, visiting);
+                visiting.pop();
+                result
+            }
+            // Trait / Fun Other: no FunDecl on this kind, same as a missing graph.
+            _ => true,
+        }
+    }
+
+    fn body_invokes_callback_arg(
+        &self,
+        body: &Unstructured,
+        arg_index: usize,
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        let forward_blocks = forward_reachable_mask(self.llbc, body);
+        let mut aliases = vec![false; body.locals.locals.len()];
+        let param = arg_index + 1;
+        if param >= aliases.len() {
+            return true;
+        }
+        aliases[param] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (bb_idx, bb) in body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
+                for stmt in &bb.statements {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        continue;
+                    };
+                    let PlaceKind::Local(dest) = place.kind else {
+                        continue;
+                    };
+                    let dest = dest as usize;
+                    if dest >= aliases.len() || aliases[dest] {
+                        continue;
+                    }
+                    if rvalue_aliases_callback(rvalue, &aliases) {
+                        aliases[dest] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+                continue;
+            };
+            if self.call_invokes_callback_arg(call, &aliases, visiting) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn call_invokes_callback_arg(
+        &self,
+        call: &CallPayload,
+        aliases: &[bool],
+        visiting: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        match &call.func {
+            CallFunc::Regular(reg) => match &reg.kind {
+                CallKind::Ptr(func_op) => ptr_operand_is_alias(func_op, aliases),
+                _ => {
+                    let name = regular_call_name_path(reg, self.llbc);
+                    if name.as_deref().is_some_and(is_ops_function_call) {
+                        call.args.iter().any(|op| operand_is_alias(op, aliases))
+                    } else {
+                        call.args.iter().enumerate().any(|(q, op)| {
+                            operand_is_alias(op, aliases)
+                                && self.callee_invokes_callback_arg(reg, q, visiting)
+                        })
+                    }
+                }
+            },
+            CallFunc::Dynamic(func_op, _) => {
+                operand_is_alias(func_op, aliases)
+                    || call.args.iter().any(|op| operand_is_alias(op, aliases))
+            }
+            CallFunc::Unknown => call.args.iter().any(|op| operand_is_alias(op, aliases)),
+        }
+    }
+
     /// The body's own result: some call it makes outside every bracket it
     /// opens and closes itself can change the root stack.
     ///
@@ -2054,6 +2216,7 @@ impl<'a> RootStackAnalyzer<'a> {
         });
         let covered = owned.covered_blocks(self.llbc, body, &name_of);
         let forward_blocks = forward_reachable_mask(self.llbc, body);
+        let fn_locals = fn_item_locals(self.llbc, body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -2061,58 +2224,71 @@ impl<'a> RootStackAnalyzer<'a> {
             if covered.contains(bb_idx) {
                 continue;
             }
-            let mut touches = bb
-                .statements
-                .iter()
-                .any(|stmt| self.analyze_fn_values(stmt.kind_value(), seen));
+            // Naming a function item is not a call (`GraphAnalyzer.analyze`
+            // only charges `direct_call` / `indirect_call`). Address-of
+            // (`FnDefToFnPtr` then `PtrExposeProvenance`) and `unwrap_or(f)`
+            // stay bottom; a callback a callee will invoke is charged on
+            // that call (`analyze_external_call` `_callbacks`).
             // An opener's own call is what its close truncates: a guard
             // constructor's pins land in the bracket this body now holds.
             let opens = owned.opener.values().any(|&open_bb| open_bb == bb_idx);
-            touches = touches
-                || match bb.term_ref(self.llbc) {
-                    Ok(TermKind::Call { .. }) if opens => false,
-                    Ok(TermKind::Call { call, .. }) => {
-                        // An explicit `drop` of a bracket this body opened is
-                        // its close, the same balance a `Drop` terminator is.
-                        if explicit_drop_guard_local(bb, self.llbc, &name_of)
-                            .is_some_and(|local| owned.opener.contains_key(&local))
-                        {
-                            false
-                        } else {
-                            match &call.func {
-                                CallFunc::Regular(reg) => {
-                                    self.analyze_regular_call(reg, seen)
-                                        || call
-                                            .args
-                                            .iter()
-                                            .any(|op| self.analyze_fn_operand(op, seen))
-                                }
-                                // `dyn Trait` dispatch: the pointer arm's reasoning.
-                                CallFunc::Dynamic(..) => false,
-                                CallFunc::Unknown => true,
+            let touches = match bb.term_ref(self.llbc) {
+                Ok(TermKind::Call { .. }) if opens => false,
+                Ok(TermKind::Call { call, .. }) => {
+                    // An explicit `drop` of a bracket this body opened is
+                    // its close, the same balance a `Drop` terminator is.
+                    if explicit_drop_guard_local(bb, self.llbc, &name_of)
+                        .is_some_and(|local| owned.opener.contains_key(&local))
+                    {
+                        false
+                    } else {
+                        match &call.func {
+                            CallFunc::Regular(reg) => {
+                                // A Const `FnDef` argument is a callback
+                                // only when this callee may invoke that
+                                // argument (`analyze_direct_call` /
+                                // `analyze_indirect_call` /
+                                // `analyze_external_call` `_callbacks`).
+                                // `unwrap_or(f)` is not that walk
+                                // (`GraphAnalyzer.analyze` charges
+                                // `direct_call` / `indirect_call` only).
+                                let mut visiting = Vec::new();
+                                self.analyze_regular_call(reg, seen)
+                                    || call.args.iter().enumerate().any(|(q, op)| {
+                                        let invokes =
+                                            self.callee_invokes_callback_arg(reg, q, &mut visiting);
+                                        (invokes && self.analyze_fn_operand(op, seen))
+                                            || self.callback_operand_touches(
+                                                invokes, op, &fn_locals, seen,
+                                            )
+                                    })
                             }
+                            // `dyn Trait` dispatch: the pointer arm's reasoning.
+                            CallFunc::Dynamic(..) => false,
+                            CallFunc::Unknown => true,
                         }
                     }
-                    // The close of a bracket this body opened is its balance,
-                    // not an effect. The temporary Charon moves the guard
-                    // through on the way to `mem::drop` is the same close.
-                    Ok(TermKind::Drop { place, fn_ptr, .. }) => {
-                        let owned_local = matches!(place.kind, PlaceKind::Local(l) if {
-                            let local = l as usize;
-                            owned.opener.contains_key(&local)
-                                || explicit_drop_temp_of_owned_guard(
-                                    body,
-                                    self.llbc,
-                                    &name_of,
-                                    local,
-                                    &owned.opener,
-                                )
-                        });
-                        !owned_local && self.analyze_regular_call(fn_ptr, seen)
-                    }
-                    Ok(_) => false,
-                    Err(_) => true,
-                };
+                }
+                // The close of a bracket this body opened is its balance,
+                // not an effect. The temporary Charon moves the guard
+                // through on the way to `mem::drop` is the same close.
+                Ok(TermKind::Drop { place, fn_ptr, .. }) => {
+                    let owned_local = matches!(place.kind, PlaceKind::Local(l) if {
+                        let local = l as usize;
+                        owned.opener.contains_key(&local)
+                            || explicit_drop_temp_of_owned_guard(
+                                body,
+                                self.llbc,
+                                &name_of,
+                                local,
+                                &owned.opener,
+                            )
+                    });
+                    !owned_local && self.analyze_regular_call(fn_ptr, seen)
+                }
+                Ok(_) => false,
+                Err(_) => true,
+            };
             if touches {
                 return true;
             }
@@ -2235,6 +2411,149 @@ pub(in crate::front::mir) fn for_each_fn_def_const(
         }
         _ => {}
     }
+}
+
+/// A unary/cast kind that turns a function item into an address word
+/// (`cast_ptr_to_int`). `FnDefToFnPtr` keeps a callable.
+fn cast_exposes_fn_addr(kind: &serde_json::Value) -> bool {
+    let Some(cast) = kind.get("Cast") else {
+        return false;
+    };
+    match cast {
+        serde_json::Value::String(s) => {
+            matches!(
+                s.as_str(),
+                "PtrExposeProvenance" | "PtrWithExposedProvenance"
+            )
+        }
+        serde_json::Value::Object(map) => map.contains_key("RawPtr") || map.contains_key("Scalar"),
+        _ => false,
+    }
+}
+
+fn operand_fn_items(llbc: &Llbc, op: &Operand, holds: &[Vec<RegularCall>]) -> Vec<RegularCall> {
+    match op {
+        Operand::Const(c) => fn_def_of_const(llbc, c).into_iter().collect(),
+        Operand::Copy(place) | Operand::Move(place) => match place.kind {
+            PlaceKind::Local(i) => holds.get(i as usize).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    }
+}
+
+fn rvalue_fn_items(llbc: &Llbc, rvalue: &Rvalue, holds: &[Vec<RegularCall>]) -> Vec<RegularCall> {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_fn_items(llbc, op, holds),
+        Rvalue::UnaryOp(kind, op) | Rvalue::Cast(kind, op, _) => {
+            if cast_exposes_fn_addr(kind) {
+                Vec::new()
+            } else {
+                operand_fn_items(llbc, op, holds)
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn regular_call_same(a: &RegularCall, b: &RegularCall) -> bool {
+    if a.generics != b.generics {
+        return false;
+    }
+    match (&a.kind, &b.kind) {
+        (CallKind::Fun(FunId::Regular { id: a }), CallKind::Fun(FunId::Regular { id: b })) => {
+            a == b
+        }
+        (CallKind::Fun(FunId::Other(a)), CallKind::Fun(FunId::Other(b))) => a == b,
+        (CallKind::Trait(a), CallKind::Trait(b)) => a == b,
+        (CallKind::Ptr(a), CallKind::Ptr(b)) => a == b,
+        (CallKind::Unknown, CallKind::Unknown) => true,
+        _ => false,
+    }
+}
+
+fn add_fn_items(dest: &mut Vec<RegularCall>, items: &[RegularCall]) -> bool {
+    let mut changed = false;
+    for item in items {
+        if !dest.iter().any(|have| regular_call_same(have, item)) {
+            dest.push(item.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Locals that still hold a function item, not an exposed address word.
+/// MIR is not SSA: every assignment is unioned (`analyze_indirect_call`
+/// joins every possible target).
+fn fn_item_locals(llbc: &Llbc, body: &Unstructured) -> Vec<Vec<RegularCall>> {
+    let mut holds = vec![Vec::new(); body.locals.locals.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if dest >= holds.len() {
+                    continue;
+                }
+                let items = rvalue_fn_items(llbc, rvalue, &holds);
+                if add_fn_items(&mut holds[dest], &items) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    holds
+}
+
+fn operand_is_alias(op: &Operand, aliases: &[bool]) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_is_alias(place, aliases),
+        Operand::Const(_) => false,
+    }
+}
+
+fn place_is_alias(place: &Place, aliases: &[bool]) -> bool {
+    match &place.kind {
+        PlaceKind::Local(i) => aliases.get(*i as usize).copied().unwrap_or(false),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(s)) if s == "Deref" => {
+            match &inner.kind {
+                PlaceKind::Local(i) => aliases.get(*i as usize).copied().unwrap_or(false),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_aliases_callback(rvalue: &Rvalue, aliases: &[bool]) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_is_alias(op, aliases),
+        Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => operand_is_alias(op, aliases),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_is_alias(place, aliases),
+        _ => false,
+    }
+}
+
+fn ptr_operand_is_alias(func_op: &serde_json::Value, aliases: &[bool]) -> bool {
+    serde_json::from_value::<Operand>(func_op.clone())
+        .ok()
+        .is_some_and(|op| operand_is_alias(&op, aliases))
+}
+
+fn is_ops_function_call(path: &str) -> bool {
+    matches!(
+        path,
+        "core::ops::function::Fn::call"
+            | "core::ops::function::FnMut::call_mut"
+            | "core::ops::function::FnOnce::call_once"
+    )
 }
 
 /// The brackets a body opens on a guard it keeps, and the blocks that run

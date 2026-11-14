@@ -4713,6 +4713,7 @@ fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
         crate::genentry_state::GENERATORENTRY_JD_INDEX => {
             crate::genentry_state::GENENTRY_PORTAL_KEY
         }
+        crate::sortkey_state::SORTKEY_JD_INDEX => crate::sortkey_state::SORTKEY_PORTAL_KEY,
         _ => return None,
     };
     crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())
@@ -18712,7 +18713,10 @@ fn handle<Sym: WalkSym>(
                 }
             }
         }
-        key if key.starts_with("recursive_call_") => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_i/iIRFIRF>i" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_r/iIRFIRF>r" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_f/iIRFIRF>f" => dispatch_recursive_call(code, op, ctx),
+        "recursive_call_v/iIRFIRF" => dispatch_recursive_call(code, op, ctx),
         other => Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: other,

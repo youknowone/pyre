@@ -2241,8 +2241,10 @@ impl<'a> Lowering<'a> {
             }
             let Some(group_index) = exact else {
                 // `q = &pair` names `pair`, not the spilled word. A field
-                // of `pair` can still be that word.
-                if self.place_payload_hides_spill_alias(&place, groups, 0) {
+                // of `pair` can still be that word. A sibling pointer
+                // cannot name a function-local primitive cell
+                // (`spill_group_is_fresh_cell`).
+                if !fresh_cell && self.place_payload_hides_spill_alias(&place, groups, 0) {
                     return Err(self.unspilled_raw_argument(mir_bb));
                 }
                 continue;

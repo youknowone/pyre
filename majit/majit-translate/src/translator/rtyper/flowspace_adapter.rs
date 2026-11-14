@@ -4414,6 +4414,7 @@ pub fn translate_op(
                                 | "malloc_typed"
                                 | "malloc_typed_managed"
                                 | "malloc_typed_stable"
+                                | "malloc_typed_young_nonmoving"
                         )
                     {
                         return Err(TyperError::message(
@@ -4908,6 +4909,26 @@ pub fn translate_op(
                         resolved_path.as_ref(),
                     ) {
                         return emit_rdict_insert_or_get(leaf, arg_hls, result);
+                    }
+                    // A Rust inherent method resolves statically to one graph:
+                    // call its registered funcobj with the receiver as the first
+                    // argument, as the `FunctionPath` arm does, so
+                    // `FunctionDesc.pycall` -> `recursivecall` gives the call the
+                    // callee's own return annotation (`rpbc.py
+                    // FunctionReprBase.call` `getrresult`). The `getattr` route
+                    // stays for an unresolved method.
+                    if let Some(path) = resolved_path.as_ref() {
+                        let key =
+                            crate::translator::rtyper::call_registry::FunctionPathKey::from(path);
+                        if let Some(entry) = call_registry.lookup(&key) {
+                            let callable = Hlvalue::Constant(Constant::new(
+                                ConstValue::HostObject(entry.host_object.clone()),
+                            ));
+                            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                            call_args.push(callable);
+                            call_args.extend(arg_hls);
+                            return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                        }
                     }
                     let mut iter = arg_hls.into_iter();
                     let receiver = iter.next().ok_or_else(|| {
@@ -11421,7 +11442,7 @@ mod tests {
                 target: crate::model::CallTarget::Method {
                     name: "jit_force_quasi_immutable".to_string(),
                     receiver_root: Some("Function".to_string()),
-                    resolved_path: Some(path),
+                    resolved_path: Some(path.clone()),
                     fun_decl_id: None,
                     branch_payloads: None,
                 },
@@ -11431,20 +11452,89 @@ mod tests {
         };
 
         let translated = translate_op(&op, &value_map, &registry)
-            .expect("unmarked same-named method lowers as getattr + simple_call");
-        assert_eq!(translated.len(), 2);
-        assert_eq!(translated[0].opname, "getattr");
-        assert_eq!(translated[1].opname, "simple_call");
-        let Hlvalue::Constant(name_const) = &translated[0].args[1] else {
-            panic!("getattr name must be constant");
+            .expect("unmarked same-named method lowers as a registry simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(callable) = &translated[0].args[0] else {
+            panic!("resolved method callable must be constant");
         };
-        assert_eq!(
-            name_const.value,
-            ConstValue::byte_str("jit_force_quasi_immutable")
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("resolved method callable must be a HostObject");
+        };
+        assert_ne!(
+            host.qualname(),
+            "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable"
         );
+        assert_eq!(
+            host,
+            &registry
+                .lookup(&FunctionPathKey::from(&path))
+                .expect("registered unmarked method")
+                .host_object
+        );
+    }
+
+    #[test]
+    fn resolved_method_call_is_one_registry_simple_call() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("resolved_method_call_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let receiver = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), receiver.clone());
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let path = crate::parse::CallPath::for_impl_method("PyFrame", "getcode");
+        let func = GraphFunc::new(
+            "getcode",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let registry = empty_call_registry();
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from(&path),
+            Signature::new(vec!["self".into()], None, None),
+            func,
+        );
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::Method {
+                    name: "getcode".to_string(),
+                    receiver_root: Some("PyFrame".to_string()),
+                    resolved_path: Some(path),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(Some("CodeObject".into())),
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("registered resolved method lowers as one registry simple_call");
+        assert_eq!(
+            translated.len(),
+            1,
+            "no getattr; one simple_call: {translated:?}"
+        );
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(callable) = &translated[0].args[0] else {
+            panic!(
+                "arg0 must be the registry HostObject constant, got {:?}",
+                translated[0].args[0]
+            );
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("arg0 must be a HostObject, got {:?}", callable.value);
+        };
+        assert_eq!(host, &entry.host_object);
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[0].args[1], receiver);
         assert!(
-            matches!(translated[1].args[0], Hlvalue::Variable(_)),
-            "ordinary method call args[0] is the bound method, not the ExtRegistry llop"
+            translated.iter().all(|op| op.opname != "getattr"),
+            "resolved method must not emit getattr"
         );
     }
 

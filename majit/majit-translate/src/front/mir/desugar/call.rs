@@ -5535,7 +5535,75 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                     // No containing field place: the call stays
-                    // (`jtransform.py rewrite_op_getfield` has no field to read).
+                    // (`jtransform.py rewrite_op_getfield` has no field to
+                    // read), except a GCREF `FieldRead` without
+                    // `taken_by_address` is still that field's value.
+                    if tyref_is_copy_scalar_or_thin_ptr(&call.dest.ty, self.llbc)
+                        && !first_arg_ty.as_ref().is_some_and(|ty| {
+                            tyref_is_borrowed_transparent_scalar(
+                                ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        })
+                    {
+                        let dest_ty = tyref_to_value_type_with(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        let field_kind = {
+                            let mut found = None;
+                            for block in &self.graph.blocks {
+                                for op in block.operations.iter().rev() {
+                                    let OpKind::FieldRead { field, .. } = &op.kind else {
+                                        continue;
+                                    };
+                                    if op.result.as_ref() == Some(&args[0])
+                                        && field.vec_part.is_none()
+                                        && !field.inline_vec
+                                    {
+                                        found = Some(op.kind.clone());
+                                        break;
+                                    }
+                                }
+                                if found.is_some() {
+                                    break;
+                                }
+                            }
+                            found
+                        };
+                        if let Some(OpKind::FieldRead {
+                            base,
+                            mut field,
+                            pure,
+                            ..
+                        }) = field_kind
+                        {
+                            field.taken_by_address = false;
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind: OpKind::FieldRead {
+                                    base,
+                                    field,
+                                    ty: dest_ty,
+                                    pure,
+                                },
+                            });
+                            self.local_var[dest_local] = Some(LocalValue::One(res));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                    }
                 }
                 // `Cell::set(&self, v)` is the containing field's own
                 // `setfield` (`jtransform.py rewrite_op_setfield`).
@@ -6033,6 +6101,16 @@ impl<'a> Lowering<'a> {
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_oparg_try_from(
+                    mir_bb,
                     &segments,
                     &args,
                     dest_local,
@@ -6910,7 +6988,12 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family =
+                    if operand_reads_family_field(self.llbc, self.body, &dyn_operand) {
+                        Some(FnPtrFamily::BuiltinFastFunc2)
+                    } else {
+                        operand_fn_ptr_family(&dyn_operand, self.llbc)
+                    };
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
@@ -6930,20 +7013,31 @@ impl<'a> Lowering<'a> {
                     // slot is the rustc method, which reads those words as
                     // `self` and `w_set`. Call the word trampoline that
                     // matches the residual instead. Do not recast the
-                    // receiver before this trampoline.
+                    // receiver before this trampoline. Inside the trampoline
+                    // the vtable call is the operation itself, so it stays
+                    // an `indirect_call` for the effect analysis (the
+                    // trampoline is `dont_look_inside`; its body is
+                    // analyzed, never run as jitcode).
+                    let leaf = match method_name.as_str() {
+                        "add" => "set_strategy_add_key_ptr",
+                        "remove" => "set_strategy_remove_key_ptr",
+                        _ => "set_strategy_has_key_ptr",
+                    };
+                    let trampoline_path = format!("pyre_object::setobject::{leaf}");
+                    let current_fn = self
+                        .graph
+                        .source_identity
+                        .as_deref()
+                        .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
+                        && current_fn != trampoline_path
                     {
                         let key_args = if args.len() == 3 {
                             vec![args[1].clone(), args[2].clone()]
                         } else {
                             vec![args[0].clone(), args[1].clone()]
-                        };
-                        let leaf = match method_name.as_str() {
-                            "add" => "set_strategy_add_key_ptr",
-                            "remove" => "set_strategy_remove_key_ptr",
-                            _ => "set_strategy_has_key_ptr",
                         };
                         OpKind::Call {
                             target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
@@ -6991,15 +7085,23 @@ impl<'a> Lowering<'a> {
                     }
                 } else if let Some(family) = fn_ptr_family {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
-                    let graphs = match family {
-                        FnPtrFamily::BuiltinWrapper => Some(Vec::new()),
-                        FnPtrFamily::Unknown => None,
+                    let (graphs, family_key) = match family {
+                        FnPtrFamily::BuiltinWrapper => (Some(Vec::new()), None),
+                        // rpbc.py FunctionReprBase.call — the family is the slot's value set.
+                        FnPtrFamily::BuiltinFastFunc2 => (
+                            Some(Vec::new()),
+                            Some((
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT.to_string(),
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD.to_string(),
+                            )),
+                        ),
+                        FnPtrFamily::Unknown => (None, None),
                     };
                     OpKind::IndirectCall {
                         funcptr,
                         args,
                         graphs,
-                        family_key: None,
+                        family_key,
                         result_ty,
                     }
                 } else if passes_pairs {
@@ -7876,6 +7978,10 @@ impl<'a> Lowering<'a> {
         } else {
             op_kind
         };
+        let stamp_result_ty = match &op_kind {
+            OpKind::Call { result_ty, .. } => Some(result_ty.clone()),
+            _ => None,
+        };
 
         // Allocate the result Variable now. Bind it to the destination
         // local after copy-in so `p = f(&mut p)` still reads the previous
@@ -7962,6 +8068,29 @@ impl<'a> Lowering<'a> {
         } else {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
+        }
+        // Integer leftover dests such as `enter_recursive_frame`
+        // (`RecursionDepthGuard` peels to Unsigned) must be Signed before
+        // `FrameState.copy`. Minting Unknown leaves the cell unset; copies
+        // then stay Unknown and `get_value_kind_var` banks them as GCREF,
+        // so leftover `release_recursive_frame` walks `stack.len()` as a
+        // PyObject. Stamp after rust-vec / CCHARP / fn-ptr overlays — those
+        // arms are gated on `concretetype().is_none()`.
+        if result_var.concretetype().is_none()
+            && let Some(ty) = stamp_result_ty.as_ref()
+        {
+            let concrete = crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+                ty,
+                &self.raw_alloc_flavor_structs,
+            );
+            if matches!(
+                concrete,
+                crate::model::ConcreteType::Signed
+                    | crate::model::ConcreteType::Float
+                    | crate::model::ConcreteType::Void
+            ) {
+                crate::model::FunctionGraph::set_concretetype_of_inline(&result_var, concrete);
+            }
         }
         // Carrier `Result::expect` via FunDecl / FunctionPath spelling.
         // `core::result::<Impl>::expect` on the `Method` spelling, and
@@ -9551,8 +9680,26 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
+        method_generics: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let (fn_id, generics) =
+            match crate::front::clause_spec::trait_impl_method(payload, self.llbc) {
+                Some(overridden) => overridden,
+                None => {
+                    let (fn_id, generics) = crate::front::clause_spec::trait_default_method(
+                        payload,
+                        method_generics,
+                        self.llbc,
+                    )?;
+                    let fd = self.llbc.fn_by_id(fn_id)?;
+                    if self.spec_body
+                        && let Some(spec) = self.enqueue_spec(fd, &generics)
+                    {
+                        return Some((spec, None));
+                    }
+                    return None;
+                }
+            };
         let fd = self.llbc.fn_by_id(fn_id)?;
         // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
         // Naming that graph residualizes the unspecialized Into path;
@@ -9921,7 +10068,7 @@ impl<'a> Lowering<'a> {
                 if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
                     return Ok((segments, None));
                 }
-                if let Some(target) = self.specialized_trait_target(v) {
+                if let Some(target) = self.specialized_trait_target(v, &reg.generics) {
                     return Ok(target);
                 }
                 // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy` when

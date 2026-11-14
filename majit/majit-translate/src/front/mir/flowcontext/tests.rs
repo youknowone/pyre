@@ -81,6 +81,7 @@ fn simplify_lowered_graph(
         struct_field_attrs,
         sweep_dead_vars,
         guard_words,
+        sweep_dead_vars,
         &|_, _| None,
     )
     .expect("inline-struct expansion is off");
@@ -204,6 +205,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            &[],
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
@@ -2186,6 +2188,8 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
 }
 
 /// `s.flag.get()` of `S { flag: Cell<bool> }` is that field's value read.
+/// `g(&Cell<bool>)` is an offset-0 `raw_load` (`FnPtrCell::get`).
+/// `h(s.ptr.get())` of `Cell<*mut u8>` is the `ptr` field's value read.
 /// The existing UnsafeCell identity test loads real majit-rlib LLBC and
 /// cannot spell a struct field plus `Cell::get`.
 #[test]
@@ -3274,6 +3278,811 @@ fn core_impl_call_count(graph: &crate::model::FunctionGraph, leaf: &str, owner_s
             _ => false,
         })
         .count()
+}
+
+/// Residual `usize::try_from` shells unique look-inside still executes:
+/// `ptr_try_from_impls::<Impl>::try_from`, `convert::num::<Impl>::try_from`,
+/// and the 2-segment `CallKind::Trait` path `TryFrom::try_from`.
+fn leftover_core_try_from_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| {
+                crate::front::clause_spec::unspecialized_leaf(leaf) == "try_from"
+            }) =>
+            {
+                Some(segments.join("::"))
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } if crate::front::clause_spec::unspecialized_leaf(name) == "try_from" => Some(
+                format!("Method({name}, path={resolved_path:?}, recv={receiver_root:?})"),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `Arg::<T>::get` / `try_get` that unique look-inside residualizes when
+/// `oparg_arg_get_alias` misses a `__spec_` leaf.
+fn leftover_oparg_get_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str)?;
+                let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+                (base == "get").then(|| segments.join("::"))
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => {
+                let base = crate::front::clause_spec::unspecialized_leaf(name);
+                (base == "get").then(|| format!("Method({name})"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Residual `gc_roots::push_roots` unique look-inside still executes.
+/// `gctransform` inserts the native bracket after `make_jitcodes`; pyre
+/// writes it in source, so lowering must erase it from jitcode
+/// (`shadow_stack_erase` / `zip_two_tuple_next`).
+fn leftover_push_roots_paths(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str)?;
+                let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+                (base == "push_roots" && segments.iter().any(|s| s == "gc_roots"))
+                    .then(|| segments.join("::"))
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    },
+                ..
+            } => {
+                let base = crate::front::clause_spec::unspecialized_leaf(name);
+                (base == "push_roots").then(|| format!("Method({name}, path={resolved_path:?})"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn leftover_root_scope_bracket_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallFuncPtr, CallTarget, OpKind};
+    fn is_leaf(leaf: &str, path: &str) -> bool {
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        let in_roots = path.contains("gc_roots") || path.contains("RootScope");
+        match base {
+            "pin_root" | "pin_roots" | "root_scope_close" | "push_roots" => true,
+            "publish" | "publish_roots" | "normalize" | "normalize_moved" | "normalize_roots" => {
+                in_roots
+            }
+            "get" | "shadow_stack_get" => in_roots,
+            "drop" | "drop_in_place" => in_roots,
+            _ => false,
+        }
+    }
+    fn path_of_segments(segments: &[String]) -> String {
+        segments.join("::")
+    }
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let path = path_of_segments(segments);
+                let leaf = segments.last().map(String::as_str)?;
+                is_leaf(leaf, &path).then_some(path)
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } => {
+                let path = match resolved_path {
+                    Some(p) => p.segments.join("::"),
+                    None => receiver_root
+                        .clone()
+                        .unwrap_or_else(|| format!("Method({name})")),
+                };
+                is_leaf(name, &path).then(|| format!("Method({name}, path={resolved_path:?})"))
+            }
+            OpKind::CallResidual { funcptr, .. } => match funcptr {
+                CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                    let path = path_of_segments(segments);
+                    let leaf = segments.last().map(String::as_str)?;
+                    is_leaf(leaf, &path).then_some(format!("CallResidual({path})"))
+                }
+                CallFuncPtr::Target(CallTarget::Method {
+                    name,
+                    resolved_path,
+                    receiver_root,
+                    ..
+                }) => {
+                    let path = match resolved_path {
+                        Some(p) => p.segments.join("::"),
+                        None => receiver_root
+                            .clone()
+                            .unwrap_or_else(|| format!("Method({name})")),
+                    };
+                    is_leaf(name, &path)
+                        .then(|| format!("CallResidual Method({name}, path={resolved_path:?})"))
+                }
+                CallFuncPtr::Value(v) => graph.blocks.iter().find_map(|b| {
+                    b.operations.iter().find_map(|prev| {
+                        (prev.result.as_ref() == Some(v))
+                            .then(|| match &prev.kind {
+                                OpKind::ConstFnAddr { path, .. } => {
+                                    let leaf = path.rsplit("::").next().unwrap_or(path);
+                                    is_leaf(leaf, path).then(|| format!("CallResidual({path})"))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                    })
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Leftover `__cast_instance_intrinsic` of leftover `push_roots` dest.
+/// A GCREF recast of the save-point word is the same crash as a GCREF dest.
+fn leftover_cast_of_push_roots_dest(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+    let Some(dest_id) = leftover_named_call_dest_id(graph, "push_roots") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let uses_dest = match &op.kind {
+                OpKind::Call { args, .. } => args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v.id() == dest_id)),
+                OpKind::UnaryOp { operand, .. } => operand.id() == dest_id,
+                _ => false,
+            };
+            if !uses_dest {
+                continue;
+            }
+            let is_cast = match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments
+                    .last()
+                    .is_some_and(|s| s.contains("cast_instance") || s.contains("cast_ptr")),
+                OpKind::UnaryOp { op: name, .. } => {
+                    name.contains("cast_instance") || name.contains("cast_ptr")
+                }
+                _ => false,
+            };
+            if !is_cast {
+                continue;
+            }
+            let dest = match op.result.as_ref() {
+                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                None => "_".into(),
+            };
+            out.push(format!(
+                "cast dest={dest} of leftover push_roots v{dest_id}"
+            ));
+        }
+    }
+    out
+}
+
+fn leftover_named_call_dest_id(graph: &crate::model::FunctionGraph, leaf: &str) -> Option<u64> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some(leaf) => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if crate::front::clause_spec::unspecialized_leaf(name) == leaf => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+    })
+}
+
+/// RED dump: leftover residual of unique look-inside is a Call whose
+/// fnaddr never rebinds. List FunctionPath and Method so a leftover
+/// `push_roots` assertion names the combinator (`map_err` / `inspect_err`)
+/// `shadow_stack_erase` refused on (`calls-stack-sensitive-fn`).
+fn leftover_call_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!("FunctionPath({})", segments.join("::"))),
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    },
+                ..
+            } => Some(format!("Method({name}, path={resolved_path:?})")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Leftover `enter_recursive_frame` dest bank. Unique look-inside is `r>i`;
+/// a GCREF dest puts the TLS stack-height token (`stack.len()`) in the
+/// jitframe gcmap and `walk_immortal_rec` loads it as a PyObject.
+fn leftover_enter_dest_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let dest = match op.result.as_ref() {
+                Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                None => "_".into(),
+            };
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some("enter_recursive_frame") => {
+                    Some(format!("Call dest={dest} ty={result_ty:?}"))
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    result_kind,
+                    ..
+                } => {
+                    let is_enter = match funcptr {
+                        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                            segments.last().map(String::as_str) == Some("enter_recursive_frame")
+                        }
+                        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
+                            b.operations.iter().any(|prev| {
+                                prev.result.as_ref() == Some(v)
+                                    && matches!(
+                                        &prev.kind,
+                                        OpKind::ConstFnAddr { path, .. }
+                                            if path.contains("enter_recursive_frame")
+                                    )
+                            })
+                        }),
+                        _ => false,
+                    };
+                    is_enter.then(|| format!("CallResidual dest={dest} res={result_kind}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Leftover `release_recursive_frame` takes the usize token. A GCREF arg
+/// puts that TLS stack-height (`stack.len()`) in the jitframe gcmap.
+fn leftover_release_arg_summaries(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind};
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("release_recursive_frame") => {
+                    let args = args
+                        .iter()
+                        .map(|arg| match arg {
+                            LinkArg::Value(v) => {
+                                format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v))
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.push(format!("Call args=[{args}]"));
+                }
+                OpKind::CallResidual {
+                    funcptr,
+                    args_i,
+                    args_r,
+                    result_kind,
+                    ..
+                } => {
+                    let is_release = match funcptr {
+                        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+                            segments.last().map(String::as_str) == Some("release_recursive_frame")
+                        }
+                        CallFuncPtr::Value(v) => graph.blocks.iter().any(|b| {
+                            b.operations.iter().any(|prev| {
+                                prev.result.as_ref() == Some(v)
+                                    && matches!(
+                                        &prev.kind,
+                                        OpKind::ConstFnAddr { path, .. }
+                                            if path.contains("release_recursive_frame")
+                                    )
+                            })
+                        }),
+                        _ => false,
+                    };
+                    if is_release {
+                        let i = args_i
+                            .iter()
+                            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let r = args_r
+                            .iter()
+                            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        out.push(format!("CallResidual i=[{i}] r=[{r}] res={result_kind}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.join(" | ")
+}
+
+fn leftover_release_arg_producers(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+    let mut args = Vec::new();
+    let mut release_blocks = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for op in &block.operations {
+            if let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args: call_args,
+                ..
+            } = &op.kind
+                && segments.last().map(String::as_str) == Some("release_recursive_frame")
+            {
+                release_blocks.push(bi);
+                for arg in call_args {
+                    if let Some(v) = arg.as_variable() {
+                        args.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &bi in &release_blocks {
+        let ins = graph.blocks[bi]
+            .inputargs
+            .iter()
+            .map(|v| format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(format!("release_block={bi} inputargs=[{ins}]"));
+    }
+    for want in &args {
+        let mut found = false;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                if op.result.as_ref() == Some(want) {
+                    found = true;
+                    out.push(format!(
+                        "v{}:{:?} <- {bi}.{oi} {:?}",
+                        want.id(),
+                        FunctionGraph::concretetype_of(want),
+                        op.kind
+                    ));
+                }
+            }
+            for (pos, v) in block.inputargs.iter().enumerate() {
+                if v == want {
+                    found = true;
+                    let preds = graph
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(pi, pred)| {
+                            pred.exits.iter().filter_map(move |link| {
+                                (link.target.0 == bi).then(|| {
+                                    let forwarded = link
+                                        .args
+                                        .get(pos)
+                                        .map(|a| match a {
+                                            LinkArg::Value(src) => format!(
+                                                "v{}:{:?}",
+                                                src.id(),
+                                                FunctionGraph::concretetype_of(src)
+                                            ),
+                                            other => format!("{other:?}"),
+                                        })
+                                        .unwrap_or_else(|| "?".into());
+                                    format!("pred={pi} arg{pos}={forwarded}")
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    out.push(format!(
+                        "v{}:{:?} <- block{bi} input{pos} [{preds}]",
+                        want.id(),
+                        FunctionGraph::concretetype_of(want)
+                    ));
+                }
+            }
+        }
+        if !found {
+            out.push(format!(
+                "v{}:{:?} <- (no producer)",
+                want.id(),
+                FunctionGraph::concretetype_of(want)
+            ));
+        }
+    }
+    out.join(" | ")
+}
+
+fn leftover_enter_window(graph: &crate::model::FunctionGraph) -> String {
+    use crate::model::{CallTarget, OpKind};
+    let ops = dump_graph_ops(graph);
+    let mut hits = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let is_enter = matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("enter_recursive_frame")
+            );
+            if is_enter {
+                let start = oi.saturating_sub(2);
+                let end = (oi + 8).min(block.operations.len());
+                for k in start..end {
+                    let prefix = format!("{bi}.{k} ");
+                    hits.push(
+                        ops.iter()
+                            .find(|s| s.starts_with(&prefix))
+                            .cloned()
+                            .unwrap_or_else(|| format!("{bi}.{k} ?")),
+                    );
+                }
+                for (ei, link) in block.exits.iter().enumerate() {
+                    let succ = link.target.0;
+                    let ins = graph.blocks[succ]
+                        .inputargs
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, v)| {
+                            let src = match link.args.get(pos) {
+                                Some(crate::model::LinkArg::Value(s)) => format!(
+                                    "v{}:{:?}",
+                                    s.id(),
+                                    crate::model::FunctionGraph::concretetype_of(s)
+                                ),
+                                other => format!("{other:?}"),
+                            };
+                            format!(
+                                "in{pos}=v{}:{:?}<= {src}",
+                                v.id(),
+                                crate::model::FunctionGraph::concretetype_of(v)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    hits.push(format!("exit{ei}->b{succ} [{ins}]"));
+                    for (k, sop) in graph.blocks[succ].operations.iter().take(12).enumerate() {
+                        let _ = sop;
+                        let prefix = format!("{succ}.{k} ");
+                        hits.push(
+                            ops.iter()
+                                .find(|s| s.starts_with(&prefix))
+                                .cloned()
+                                .unwrap_or_else(|| format!("{succ}.{k} ?")),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    hits.join(" || ")
+}
+
+/// Successor inputarg that receives leftover enter dest. FrameState.copy
+/// must inherit Signed; Unknown here banks the token as GCREF.
+fn leftover_enter_successor_input_kinds(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{FunctionGraph, LinkArg};
+    let Some(dest_id) = leftover_enter_dest_id(graph) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for (pos, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(src) = arg else {
+                    continue;
+                };
+                if src.id() != dest_id {
+                    continue;
+                }
+                let Some(input) = graph.blocks[link.target.0].inputargs.get(pos) else {
+                    continue;
+                };
+                out.push(format!(
+                    "v{}:{:?}<= v{dest_id}:{:?}",
+                    input.id(),
+                    FunctionGraph::concretetype_of(input),
+                    FunctionGraph::concretetype_of(src)
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn leftover_enter_dest_id(graph: &crate::model::FunctionGraph) -> Option<u64> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("enter_recursive_frame") => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+    })
+}
+
+fn leftover_var_uses(graph: &crate::model::FunctionGraph, id: u64) -> String {
+    use crate::model::{FunctionGraph, LinkArg};
+    let needle = format!("v{id}");
+    let mut out = dump_graph_ops(graph)
+        .into_iter()
+        .filter(|s| s.contains(&needle))
+        .collect::<Vec<_>>();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (pos, v) in block.inputargs.iter().enumerate() {
+            if v.id() == id {
+                out.push(format!(
+                    "input {bi}.{pos} v{}:{:?}",
+                    v.id(),
+                    FunctionGraph::concretetype_of(v)
+                ));
+            }
+        }
+        for (ei, link) in block.exits.iter().enumerate() {
+            for (pos, arg) in link.args.iter().enumerate() {
+                if matches!(arg, LinkArg::Value(v) if v.id() == id) {
+                    out.push(format!(
+                        "{bi} exit{ei} arg{pos}->{} {needle}",
+                        link.target.0
+                    ));
+                }
+            }
+        }
+    }
+    out.join(" | ")
+}
+
+/// Unique look-inside of `getcode` / `co_flags` residualizes
+/// `cast_int_to_ptr/i>r` of a flavor-raw `*const CodeObject`. PyPy
+/// `history.getkind` of a raw `Ptr` is `'int'`; BH `bhimpl_cast_int_to_ptr`
+/// asserts a tagged GCREF odd int (`blackhole.py` `bhimpl_cast_int_to_ptr`).
+fn leftover_cast_int_to_ptr_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let result_ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+            match &op.kind {
+                OpKind::UnaryOp {
+                    op: name,
+                    result_ty,
+                    ..
+                } if name == "cast_int_to_ptr" => Some(format!(
+                    "UnaryOp dest={result_ty:?} result_ct={result_ct:?}"
+                )),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") => {
+                    Some(format!("Call dest={result_ty:?} result_ct={result_ct:?}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn leftover_cast_ptr_to_int_summaries(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let result_ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+            match &op.kind {
+                OpKind::UnaryOp {
+                    op: name,
+                    operand,
+                    result_ty,
+                    ..
+                } if name == "cast_ptr_to_int" => {
+                    let src_ct = FunctionGraph::concretetype_of(operand);
+                    Some(format!(
+                        "UnaryOp dest={result_ty:?} result_ct={result_ct:?} src={operand} src_ct={src_ct:?}"
+                    ))
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_ptr_to_int") => {
+                    Some(format!("Call dest={result_ty:?} result_ct={result_ct:?}"))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn dump_graph_ops(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, block)| {
+            block.operations.iter().enumerate().map(move |(oi, op)| {
+                let dest = match op.result.as_ref() {
+                    Some(v) => format!("v{}:{:?}", v.id(), FunctionGraph::concretetype_of(v)),
+                    None => "_".into(),
+                };
+                match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        result_ty,
+                        ..
+                    } => format!(
+                        "{bi}.{oi} {dest} Call({}) ty={result_ty:?}",
+                        segments.join("::")
+                    ),
+                    OpKind::Call {
+                        target:
+                            CallTarget::Method {
+                                name,
+                                resolved_path,
+                                ..
+                            },
+                        result_ty,
+                        ..
+                    } => format!(
+                        "{bi}.{oi} {dest} Method({name}, {resolved_path:?}) ty={result_ty:?}"
+                    ),
+                    OpKind::UnaryOp {
+                        op: name,
+                        result_ty,
+                        operand,
+                    } => format!(
+                        "{bi}.{oi} {dest} Unary({name}) ty={result_ty:?} src=v{}:{:?}",
+                        operand.id(),
+                        FunctionGraph::concretetype_of(operand),
+                    ),
+                    OpKind::CallResidual {
+                        funcptr,
+                        args_i,
+                        args_r,
+                        result_kind,
+                        ..
+                    } => {
+                        let name = match funcptr {
+                            crate::model::CallFuncPtr::Target(target) => match target {
+                                CallTarget::FunctionPath { segments, .. } => segments.join("::"),
+                                CallTarget::Method { name, .. } => name.clone(),
+                                other => format!("{other:?}"),
+                            },
+                            crate::model::CallFuncPtr::Value(v) => format!("v{}", v.id()),
+                        };
+                        format!(
+                            "{bi}.{oi} {dest} CallResidual({name}) i={} r={} res={result_kind}",
+                            args_i.len(),
+                            args_r.len(),
+                        )
+                    }
+                    OpKind::Input { name, ty, .. } => {
+                        format!("{bi}.{oi} {dest} Input({name}) ty={ty:?}")
+                    }
+                    OpKind::FieldRead { field, ty, .. } => format!(
+                        "{bi}.{oi} {dest} FieldRead({}.{}) ty={ty:?} owner_gc={:?}",
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
+                        field.owner_declared_gc
+                    ),
+                    OpKind::Hint { kind, .. } => format!("{bi}.{oi} {dest} Hint({kind:?})"),
+                    OpKind::InlineCall {
+                        jitcode,
+                        args_i,
+                        args_r,
+                        arg_classes,
+                        result_kind,
+                        ..
+                    } => format!(
+                        "{bi}.{oi} {dest} InlineCall({:?}) i={} r={} classes={arg_classes} res={result_kind}",
+                        jitcode.name,
+                        args_i.len(),
+                        args_r.len(),
+                    ),
+                    other => format!("{bi}.{oi} {dest} {other:?}"),
+                }
+            })
+        })
+        .collect()
 }
 
 fn core_option_impl_expect_call_count(graph: &crate::model::FunctionGraph) -> usize {
@@ -9133,6 +9942,22 @@ fn push_direct_ptradd_rffi_casts_a_gc_pointer_operand() {
 }
 
 #[test]
+fn unused_push_cast_ptr_to_int_is_dropped() {
+    let mut graph = FunctionGraph::new("test");
+    let entry = graph.startblock;
+    let ptr = graph
+        .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+        .expect("pointer value");
+    let _signed = push_cast_ptr_to_int(&mut graph, entry, ptr);
+    crate::model::prune_dead_phis(&mut graph);
+    let leftover = leftover_cast_ptr_to_int_summaries(&graph);
+    assert!(
+        leftover.is_empty(),
+        "unread cast_ptr_to_int is CanRemove, leftover={leftover:?}"
+    );
+}
+
+#[test]
 fn push_cast_ptr_to_int_emits_the_lltype_helper() {
     let mut graph = FunctionGraph::new("test");
     let entry = graph.startblock;
@@ -10450,6 +11275,2292 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
         "range_list_length must not keep a live AssertionError raise after simplify"
     );
     assert_extracted_core_body_lowers(llbc, "::result::<Impl>::unwrap");
+}
+
+/// `range_list_length` is `usize::try_from(i64).unwrap()`. The opaque core
+/// `TryFrom` shell must decompose (`try_lower_usize_try_from`) rather than
+/// survive as leftover `TryFrom::try_from` unique look-inside residualizes.
+#[test]
+fn range_list_length_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(llbc, "range_list_length")
+        .expect("lower range_list_length");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "range_list_length leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// `pyopcode.rs` `u32_as_usize` is `usize::try_from(u32).expect(...)`. Unique
+/// look-inside of the portal residualizes an unbound `TryFrom::try_from`
+/// (`arg classes "i"`) when the MIR front keeps the trait-method CallPath.
+#[test]
+fn u32_as_usize_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller =
+        crate::test_support::lower_function(llbc, "u32_as_usize").expect("lower u32_as_usize");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "u32_as_usize leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// `execute_opcode_step` is generic over `OpcodeStepExecutor`. Charon
+/// leaves `usize::try_from(u32)` as `CallKind::Trait` (`TryFrom::try_from`)
+/// inside that body; unique look-inside of the portal residualizes the
+/// 2-segment path. Decompose it the same way the monomorph `u32_as_usize`
+/// already does.
+#[test]
+fn execute_opcode_step_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(llbc, "execute_opcode_step")
+        .expect("lower execute_opcode_step");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "execute_opcode_step leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// Unique look-inside residual of the split portal is leftover
+/// `TryFrom::try_from` (`arg classes "i"`). The portal graph is
+/// `eval_loop_jit` after `split_graph_and_record_jitdriver`.
+#[test]
+fn eval_loop_jit_decomposes_core_try_from() {
+    let path = crate::runtime_names::artifacts::JIT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller =
+        crate::test_support::lower_function(llbc, "eval_loop_jit").expect("lower eval_loop_jit");
+    let leftovers = leftover_core_try_from_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "eval_loop_jit leftover TryFrom: {leftovers:?}"
+    );
+}
+
+/// Census: every extracted body that names `TryFrom` in its MIR must
+/// decompose the integer shell. Unique look-inside leftover
+/// `TryFrom::try_from` (`arg classes "i"`) is a caller the isolated
+/// `u32_as_usize` / `execute_opcode_step` / `eval_loop_jit` graphs do
+/// not contain.
+#[test]
+fn extracted_try_from_callers_decompose_core_try_from() {
+    let mut hits: Vec<(String, String, Vec<String>)> = Vec::new();
+    for (label, path) in [
+        ("object", crate::runtime_names::artifacts::OBJECT_ULLBC),
+        (
+            "interpreter",
+            crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+        ),
+        ("jit", crate::runtime_names::artifacts::JIT_ULLBC),
+    ] {
+        let llbc = crate::test_support::load_ullbc(path);
+        crate::test_support::with_lowering(llbc, |ctx| {
+            for fd in llbc.iter_fun_decls() {
+                if !fd.has_unstructured_body() {
+                    continue;
+                }
+                let name_path = fd.item_meta.name_path();
+                if name_path.contains("ptr_try_from_impls")
+                    || name_path.contains("convert::num")
+                    || name_path.contains("convert::TryFrom")
+                {
+                    continue;
+                }
+                let Some(body) = fd.body.as_ref() else {
+                    continue;
+                };
+                if !body.get().contains("TryFrom") {
+                    continue;
+                }
+                let Ok(graph) = crate::front::mir::lower_fun_decl(ctx, fd) else {
+                    continue;
+                };
+                let leftovers = leftover_core_try_from_paths(&graph);
+                if !leftovers.is_empty() {
+                    hits.push((label.to_string(), name_path, leftovers));
+                }
+            }
+        });
+    }
+    assert!(
+        hits.is_empty(),
+        "leftover TryFrom after lowering: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of LOAD_ATTR walks the harvested
+/// `execute_load_attr` graph into `Arg::<LoadAttr>::get`. Isolated
+/// `lower_fun_decl` already aliases that call; harvest with the spec
+/// queue is what unique look-inside residualizes.
+#[test]
+fn harvested_execute_load_attr_aliases_arg_get() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["execute_load_attr"],
+    )
+    .expect("harvest execute_load_attr");
+    let harvested_leaves: Vec<&str> = program
+        .functions
+        .iter()
+        .filter(|f| f.lazy_graph().get().is_some())
+        .map(|f| f.name.rsplit("::").next().unwrap_or(f.name.as_str()))
+        .collect();
+    let mut hits: Vec<String> = Vec::new();
+    let mut load_attr_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        let get_leftovers = leftover_oparg_get_paths(graph);
+        // The blanket TryFrom body is a harvested callee; only an unresolved target is a leftover.
+        let try_from_leftovers: Vec<String> = leftover_core_try_from_paths(graph)
+            .into_iter()
+            .filter(|path| {
+                let path_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+                !harvested_leaves.iter().any(|h| *h == path_leaf)
+            })
+            .collect();
+        if base == "execute_load_attr" {
+            load_attr_found += 1;
+        }
+        if !get_leftovers.is_empty() || !try_from_leftovers.is_empty() {
+            hits.push(format!(
+                "{} get={get_leftovers:?} try_from={try_from_leftovers:?}",
+                f.name
+            ));
+        }
+    }
+    assert!(
+        load_attr_found >= 1,
+        "harvested execute_load_attr, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover Arg::get/TryFrom: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of `load_attr__AccessDirect_None` residualizes
+/// leftover `pyre_object::gc_roots::push_roots` (`arg classes ""`).
+/// PyPy `LOAD_ATTR` has no source bracket (`pyopcode.py LOAD_ATTR` is
+/// `space.getattr`); `gctransform` inserts `push_roots` after
+/// `make_jitcodes`. Isolated Regular `eval::<Impl>::load_attr` is the
+/// origin `copygraph` clones into the AccessDirect copy.
+#[test]
+fn eval_load_attr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr")
+        .expect("lower eval::<Impl>::load_attr");
+    let leftovers = leftover_push_roots_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "eval::<Impl>::load_attr leftover push_roots: {leftovers:?}"
+    );
+}
+
+/// Harvest of `load_attr` is the unique-look-inside graph, including
+/// spec copies. Isolated Regular must already erase; harvest keeps the
+/// same leftover out of every copy unique look-inside can enter.
+#[test]
+fn harvested_load_attr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["load_attr"],
+    )
+    .expect("harvest load_attr");
+    let mut hits: Vec<String> = Vec::new();
+    let mut load_attr_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "load_attr" {
+            load_attr_found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!("{} leftover={leftovers:?}", f.name));
+        }
+    }
+    assert!(
+        load_attr_found >= 1,
+        "harvested load_attr, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+/// Unique look-inside of `getattr_str` residualizes leftover
+/// `pyre_object::gc_roots::push_roots` (`arg classes ""`). PyPy
+/// `DescrOperation.getattr` has no source bracket; `gctransform`
+/// inserts `push_roots` after `make_jitcodes`. Isolated Regular
+/// `getattr_str` is the unique-look-inside graph after load_attr
+/// inlines (`jitcode=getattr_str` cursor leftover).
+#[test]
+fn eval_getattr_str_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller =
+        crate::test_support::lower_function(llbc, "pyre_interpreter::baseobjspace::getattr_str")
+            .expect("lower getattr_str");
+    let leftovers = leftover_push_roots_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "getattr_str leftover push_roots: {leftovers:?} calls={:?}",
+        leftover_call_summaries(&caller)
+    );
+}
+
+/// Harvest of `getattr_str` is the unique-look-inside graph, including
+/// spec copies. Isolated Regular must already erase; harvest keeps the
+/// same leftover out of every copy unique look-inside can enter.
+#[test]
+fn harvested_getattr_str_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["getattr_str"],
+    )
+    .expect("harvest getattr_str");
+    let mut hits: Vec<String> = Vec::new();
+    let mut getattr_str_found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "getattr_str" {
+            getattr_str_found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!(
+                "{} leftover={leftovers:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        getattr_str_found >= 1,
+        "harvested getattr_str, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+/// Unique look-inside of erased `getattr_str` inlines into
+/// `getattr_str_impl`, which residualizes leftover `push_roots`
+/// (`jitcode=getattr_str_impl` cursor leftover). PyPy
+/// `_handle_getattribute` has no source bracket; `gctransform`
+/// inserts `push_roots` after `make_jitcodes`.
+#[test]
+fn eval_getattr_str_impl_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(
+        llbc,
+        "pyre_interpreter::baseobjspace::getattr_str_impl",
+    )
+    .expect("lower getattr_str_impl");
+    let leftovers = leftover_push_roots_paths(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "getattr_str_impl leftover push_roots: {leftovers:?} calls={:?}",
+        leftover_call_summaries(&caller)
+    );
+}
+
+/// Harvest of `getattr_str_impl` is the unique-look-inside graph,
+/// including spec copies.
+#[test]
+fn harvested_getattr_str_impl_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["getattr_str_impl"],
+    )
+    .expect("harvest getattr_str_impl");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "getattr_str_impl" {
+            found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!(
+                "{} leftover={leftovers:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested getattr_str_impl, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+fn assert_baseobjspace_fn_erases_push_roots(leaf: &str) {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let full = format!("pyre_interpreter::baseobjspace::{leaf}");
+    let caller =
+        crate::test_support::lower_function(llbc, &full).unwrap_or_else(|_| panic!("lower {full}"));
+    let leftovers = leftover_push_roots_paths(&caller);
+    let status = crate::front::mir::shadow_stack_erase::erase_status(llbc, &full);
+    assert!(
+        leftovers.is_empty(),
+        "{leaf} leftover count={} erase_status={status} calls={:?}",
+        leftovers.len(),
+        leftover_call_summaries(&caller)
+    );
+}
+
+#[test]
+fn eval_getattr_str_module_erases_push_roots() {
+    assert_baseobjspace_fn_erases_push_roots("getattr_str_module");
+}
+
+#[test]
+fn eval_getattr_str_module_lookup_erases_push_roots() {
+    assert_baseobjspace_fn_erases_push_roots("getattr_str_module_lookup");
+}
+
+#[test]
+fn eval_getattr_str_instance_erases_push_roots() {
+    assert_baseobjspace_fn_erases_push_roots("getattr_str_instance");
+}
+
+#[test]
+fn eval_getattr_str_instance_like_override_erases_push_roots() {
+    assert_baseobjspace_fn_erases_push_roots("getattr_str_instance_like_override");
+}
+
+/// Nested wrap of `name` for `DescrOperation.get_and_call_function`
+/// lives in this helper so `getattr_str_impl` stays one depth.
+/// Unique look-inside residualizes leftover `push_roots` if the helper
+/// Open is not erased.
+#[test]
+fn eval_get_and_call_attribute_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(
+        llbc,
+        "pyre_interpreter::baseobjspace::get_and_call_attribute",
+    )
+    .expect("lower get_and_call_attribute");
+    let leftovers = leftover_push_roots_paths(&caller);
+    let helper_path = "pyre_interpreter::baseobjspace::get_and_call_attribute";
+    let status = crate::front::mir::shadow_stack_erase::erase_status(llbc, helper_path);
+    assert!(
+        leftovers.is_empty(),
+        "get_and_call_attribute leftover count={} erase_status={status} calls={:?}",
+        leftovers.len(),
+        leftover_call_summaries(&caller)
+    );
+}
+
+/// Harvest of `get_and_call_attribute` is the unique-look-inside graph,
+/// including spec copies.
+#[test]
+fn harvested_get_and_call_attribute_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["get_and_call_attribute"],
+    )
+    .expect("harvest get_and_call_attribute");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "get_and_call_attribute" {
+            found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!(
+                "{} leftover={leftovers:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested get_and_call_attribute, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+/// Unique look-inside of `space.getattr` residualizes leftover
+/// `push_roots` when the body uses `pin_roots` (ItemsOpen) or
+/// `map_err` (`calls-stack-sensitive-fn`). PyPy `DescrOperation.getattr`
+/// has no source bracket; `gctransform` inserts `push_roots` after
+/// `make_jitcodes`. Isolated Regular `getattr` is the unique-look-inside
+/// graph of jitted `LOAD_ATTR` (`pyopcode.py LOAD_ATTR` `space.getattr`).
+#[test]
+fn eval_getattr_erases_push_roots() {
+    assert_baseobjspace_fn_erases_push_roots("getattr");
+}
+
+fn function_path_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    leftover_call_summaries(graph)
+        .iter()
+        .filter_map(|summary| {
+            if let Some(path) = summary.strip_prefix("FunctionPath(") {
+                let path = path.trim_end_matches(')');
+                let leaf = path.rsplit("::").next().unwrap_or(path);
+                return Some(crate::front::clause_spec::unspecialized_leaf(leaf).to_string());
+            }
+            let rest = summary.strip_prefix("Method(")?;
+            let name = rest.split(',').next()?.trim();
+            Some(crate::front::clause_spec::unspecialized_leaf(name).to_string())
+        })
+        .collect()
+}
+
+/// Jitted `LOAD_ATTR` is `getname_w` plus `space.getattr` plus
+/// `pushvalue` (`pyopcode.py LOAD_ATTR`). Unique look-inside of
+/// `getattr_str` with a rust `&str` identity-aliases
+/// `prebuilt_wtf8_storage` and residual-calls `_pure_lookup_where_with_method_cache`
+/// with a non-STR pointer. The jitted arm keeps `self` as the GCREF
+/// local; `FrameAnchor` is the native cache arm only. A tracing-time
+/// shadow-stack index in the compiled loop `pop_to`s that depth in BH
+/// (`shadowstack.py` `pop_roots` uses the live top, not a recorded index).
+fn load_attr_cached_frame_anchor_leftovers(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    leftover_call_summaries(graph)
+        .into_iter()
+        .filter(|summary| {
+            summary.contains("FrameAnchor")
+                || summary.contains("frame_anchor")
+                || summary.contains("push_anchored")
+        })
+        .collect()
+}
+
+#[test]
+fn eval_to_bool_jitted_has_no_frame_anchor() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::to_bool")
+        .expect("lower eval::<Impl>::to_bool");
+    let calls = leftover_call_summaries(&caller);
+    let anchors = load_attr_cached_frame_anchor_leftovers(&caller);
+    assert!(
+        anchors.is_empty(),
+        "jitted TO_BOOL must not residualize FrameAnchor: {anchors:?} calls={calls:?}"
+    );
+}
+
+#[test]
+fn harvested_to_bool_jitted_has_no_frame_anchor() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["to_bool"],
+    )
+    .expect("harvest to_bool");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base != "to_bool" {
+            continue;
+        }
+        found += 1;
+        let anchors = load_attr_cached_frame_anchor_leftovers(graph);
+        if !anchors.is_empty() {
+            hits.push(format!(
+                "{} anchors={anchors:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested to_bool, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvested TO_BOOL FrameAnchor: {hits:#?}");
+}
+
+#[test]
+fn eval_load_attr_cached_jitted_uses_wrapped_getattr() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr_cached")
+        .expect("lower eval::<Impl>::load_attr_cached");
+    let leftovers = leftover_push_roots_paths(&caller);
+    let leaves = function_path_leaves(&caller);
+    let calls = leftover_call_summaries(&caller);
+    let anchors = load_attr_cached_frame_anchor_leftovers(&caller);
+    assert!(
+        leftovers.is_empty(),
+        "load_attr_cached leftover push_roots: {leftovers:?} calls={calls:?}"
+    );
+    assert!(
+        anchors.is_empty(),
+        "jitted LOAD_ATTR must not residualize FrameAnchor: {anchors:?} calls={calls:?}"
+    );
+    assert!(
+        leaves
+            .iter()
+            .any(|leaf| leaf == "getattr" || leaf == "load_attr_getattr"),
+        "jitted LOAD_ATTR should call getattr / load_attr_getattr: leaves={leaves:?} calls={calls:?}"
+    );
+    assert!(
+        leaves.iter().all(|leaf| leaf != "getattr_str"),
+        "jitted LOAD_ATTR must not call getattr_str with a rust &str: leaves={leaves:?} calls={calls:?}"
+    );
+}
+
+/// Value path of jitted `LOAD_ATTR` (`pyopcode.py LOAD_ATTR`
+/// `space.getattr`). Own Open so `FrameAnchor` in `load_attr_cached`
+/// does not refuse erase. The helper does not take `&mut PyFrame`.
+#[test]
+fn eval_load_attr_getattr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let caller =
+        crate::test_support::lower_function(llbc, "pyre_interpreter::eval::load_attr_getattr")
+            .unwrap_or_else(|err| panic!("lower load_attr_getattr: {err}"));
+    let leftovers = leftover_push_roots_paths(&caller);
+    let leaves = function_path_leaves(&caller);
+    let calls = leftover_call_summaries(&caller);
+    let status = crate::front::mir::shadow_stack_erase::erase_status(
+        llbc,
+        "pyre_interpreter::eval::load_attr_getattr",
+    );
+    assert!(
+        leftovers.is_empty(),
+        "load_attr_getattr leftover count={} erase_status={status} calls={calls:?}",
+        leftovers.len()
+    );
+    assert!(
+        leaves.iter().any(|leaf| leaf == "getattr"),
+        "load_attr_getattr should call getattr: leaves={leaves:?} calls={calls:?}"
+    );
+    assert!(
+        leaves.iter().all(|leaf| leaf != "getattr_str"),
+        "load_attr_getattr must not call getattr_str: leaves={leaves:?} calls={calls:?}"
+    );
+}
+
+/// Harvest of `getattr` is the unique-look-inside graph of jitted
+/// `LOAD_ATTR` (`pyopcode.py LOAD_ATTR` `space.getattr`), including
+/// spec copies.
+#[test]
+fn harvested_getattr_erases_push_roots() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["getattr"],
+    )
+    .expect("harvest getattr");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base == "getattr" {
+            found += 1;
+        }
+        let leftovers = leftover_push_roots_paths(graph);
+        if !leftovers.is_empty() {
+            hits.push(format!(
+                "{} leftover={leftovers:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested getattr, functions={}",
+        program.functions.len()
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+/// Harvest of `load_attr_cached` is the unique-look-inside graph of
+/// jitted `LOAD_ATTR`. Isolated Regular already asserts getattr not
+/// getattr_str; harvest includes spec copies.
+#[test]
+fn harvested_load_attr_cached_jitted_uses_wrapped_getattr() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["load_attr_cached"],
+    )
+    .expect("harvest load_attr_cached");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    let mut getattr_hits = 0usize;
+    let mut getattr_str_hits = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base != "load_attr_cached" {
+            continue;
+        }
+        found += 1;
+        let leftovers = leftover_push_roots_paths(graph);
+        let leaves = function_path_leaves(graph);
+        let anchors = load_attr_cached_frame_anchor_leftovers(graph);
+        if leaves
+            .iter()
+            .any(|leaf| leaf == "getattr" || leaf == "load_attr_getattr")
+        {
+            getattr_hits += 1;
+        }
+        if leaves.iter().any(|leaf| leaf == "getattr_str") {
+            getattr_str_hits += 1;
+        }
+        if !leftovers.is_empty()
+            || !anchors.is_empty()
+            || leaves.iter().any(|leaf| leaf == "getattr_str")
+        {
+            hits.push(format!(
+                "{} leftover={leftovers:?} anchors={anchors:?} leaves={leaves:?} calls={:?}",
+                f.name,
+                leftover_call_summaries(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested load_attr_cached, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        getattr_hits >= 1,
+        "harvested load_attr_cached should call getattr / load_attr_getattr: hits={hits:#?}"
+    );
+    assert_eq!(
+        getattr_str_hits, 0,
+        "harvested load_attr_cached must not call getattr_str: hits={hits:#?}"
+    );
+    assert!(hits.is_empty(), "harvest leftover push_roots: {hits:#?}");
+}
+
+fn local_fun_paths_ending(llbc: &Llbc, suffix: &str) -> Vec<String> {
+    llbc.iter_local_fns()
+        .filter_map(|fd| {
+            let path = fd.item_meta.name_path();
+            path.ends_with(suffix).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// Unique look-inside of `getcode` / `co_flags` from a novable sortkey
+/// loop records `cast_int_to_ptr/i>r` of the flavor-raw `*const
+/// CodeObject` `w_code_get_ptr` returns. BH then panics
+/// `bhimpl_cast_int_to_ptr: not an odd int` (`blackhole.py`
+/// `bhimpl_cast_int_to_ptr` is GCREF tagged-int). Isolated Regular
+/// `PyFrame::getcode` is the origin `copygraph` clones into
+/// `getcode__AccessDirect_None`. `rewrite_op_force_cast` /
+/// `_int_to_int_cast` identity-folds int → raw Ptr.
+#[test]
+fn eval_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let paths = local_fun_paths_ending(llbc, "::getcode");
+    assert!(!paths.is_empty(), "no local FunDecl ending ::getcode");
+    let mut hits: Vec<String> = Vec::new();
+    crate::test_support::with_lowering(llbc, |ctx| {
+        for fd in llbc.iter_local_fns() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            if !name_path.ends_with("::getcode") {
+                continue;
+            }
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let leftover = leftover_cast_int_to_ptr_summaries(&graph);
+            if !leftover.is_empty() {
+                hits.push(format!(
+                    "{name_path} leftover={leftover:?} ops={:?}",
+                    dump_graph_ops(&graph)
+                ));
+            }
+        }
+    });
+    assert!(
+        hits.is_empty(),
+        "getcode leftover cast_int_to_ptr: {hits:#?} paths={paths:?}"
+    );
+}
+
+/// Isolated Regular `PyFrame::co_flags` reads `getcode().flags.bits()`.
+/// The raw `CodeObject` pointer stays int-kind; flags is GETFIELD_RAW,
+/// not CAST_INT_TO_PTR of the even heap address.
+#[test]
+fn eval_co_flags_cast_int_to_ptr_of_codeobject_is_int_identity() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let paths = local_fun_paths_ending(llbc, "::co_flags");
+    assert!(!paths.is_empty(), "no local FunDecl ending ::co_flags");
+    let mut hits: Vec<String> = Vec::new();
+    crate::test_support::with_lowering(llbc, |ctx| {
+        for fd in llbc.iter_local_fns() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            if !name_path.ends_with("::co_flags") {
+                continue;
+            }
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let leftover = leftover_cast_int_to_ptr_summaries(&graph);
+            if !leftover.is_empty() {
+                hits.push(format!(
+                    "{name_path} leftover={leftover:?} ops={:?}",
+                    dump_graph_ops(&graph)
+                ));
+            }
+        }
+    });
+    assert!(
+        hits.is_empty(),
+        "co_flags leftover cast_int_to_ptr: {hits:#?} paths={paths:?}"
+    );
+}
+
+/// Harvest of `getcode` / `co_flags` is the unique-look-inside graph,
+/// including AccessDirect copies after jtransform. Isolated Regular
+/// must already keep the raw pointer int-kind; harvest + jtransform
+/// with production `raw_alloc_flavor_structs` must not emit
+/// `cast_int_to_ptr/i>r`.
+#[test]
+fn harvested_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["getcode", "co_flags", "w_code_get_ptr"],
+    )
+    .expect("harvest getcode/co_flags/w_code_get_ptr");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(graph) = func.lazy_graph().get() {
+            cc.register_function_graph(path, graph.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = f.name.rsplit("::").next().unwrap_or(f.name.as_str());
+        let base = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if base != "getcode" && base != "co_flags" {
+            continue;
+        }
+        found += 1;
+        let front_leftover = leftover_cast_int_to_ptr_summaries(graph);
+        let out = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph);
+        let mut xf = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut xf, Some(&cc));
+        let xf_leftover = leftover_cast_int_to_ptr_summaries(&xf);
+        if !front_leftover.is_empty() || !xf_leftover.is_empty() {
+            hits.push(format!(
+                "{} front={front_leftover:?} xf={xf_leftover:?} ops={:?} xf_ops={:?}",
+                f.name,
+                dump_graph_ops(graph),
+                dump_graph_ops(&xf)
+            ));
+        }
+    }
+    assert!(
+        found >= 2,
+        "harvested getcode and co_flags, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover cast_int_to_ptr of CodeObject: {hits:#?}"
+    );
+}
+
+/// `OwnerRootGuard::new(GcRef(ptr as usize))` is the GCREF word
+/// (`owner_root_guard.rs`). `ptr as usize` of the NewWithVtable frame
+/// must not survive as `cast_ptr_to_int/r>i`: BH
+/// `bhimpl_cast_ptr_to_int` asserts a tagged immediate.
+#[test]
+fn harvested_new_malloc_typed_has_no_cast_ptr_to_int() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["pyframe"],
+        &["new_malloc_typed"],
+    )
+    .expect("harvest new_malloc_typed");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(graph) = func.lazy_graph().get() {
+            cc.register_function_graph(path, graph.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        if !f.name.contains("new_malloc_typed") {
+            continue;
+        }
+        found += 1;
+        let front_leftover = leftover_cast_ptr_to_int_summaries(graph);
+        let out = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph);
+        let mut xf = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut xf, Some(&cc));
+        let xf_leftover = leftover_cast_ptr_to_int_summaries(&xf);
+        if !front_leftover.is_empty() || !xf_leftover.is_empty() {
+            hits.push(format!(
+                "{} front={front_leftover:?} xf={xf_leftover:?} xf_ops={:?}",
+                f.name,
+                dump_graph_ops(&xf)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested new_malloc_typed, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover cast_ptr_to_int of FrameBox: {hits:#?}"
+    );
+}
+
+/// `enter_recursive_frame` does `frame as usize` of a heap PyFrame and
+/// `getexecutioncontext() as RecursionHome`. Both are GCREF→Int
+/// `cast_ptr_to_int/r>i`. `blackhole.py bhimpl_cast_ptr_to_int` asserts
+/// a tagged immediate, so unique look-inside of this jitcode panics on
+/// the even heap pointer. `rstack.py stack_check` stays out of jitcodes
+/// (`driver.py stackcheckinsertion_lltype` after `make_jitcodes`); this
+/// function is that seam's Python-frame half and must be
+/// `dont_look_inside` (graphless) the same way.
+#[test]
+fn harvested_enter_recursive_frame_is_dont_look_inside() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["call"],
+        &["enter_recursive_frame"],
+    )
+    .expect("harvest enter_recursive_frame");
+    let mut found_header = 0usize;
+    let mut found_graph = 0usize;
+    let mut hits: Vec<String> = Vec::new();
+    let mut return_types: Vec<(String, Option<String>)> = Vec::new();
+    let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+    for f in &program.functions {
+        if !f.name.contains("enter_recursive_frame") {
+            continue;
+        }
+        found_header += 1;
+        return_types.push((f.name.clone(), f.return_type.clone()));
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        found_graph += 1;
+        let look = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, graph);
+        let leftover = leftover_cast_ptr_to_int_summaries(graph);
+        hits.push(format!(
+            "{} look={look} jit_look_inside={:?} hints={:?} leftover={leftover:?} ops={:?}",
+            f.name,
+            graph.func.jit_look_inside,
+            graph.hints,
+            dump_graph_ops(graph)
+        ));
+    }
+    assert!(
+        found_header >= 1,
+        "harvested enter_recursive_frame header, functions={}",
+        program.functions.len()
+    );
+    // Unique look-inside leftover is `r>i`: RecursionDepthGuard is
+    // `repr(transparent)` over usize, so FUNC.RESULT is the int word.
+    // A `"ref"` stamp puts the TLS stack-height token in the jitframe
+    // gcmap and `walk_immortal_rec` loads it as a PyObject.
+    assert!(
+        return_types
+            .iter()
+            .any(|(_, ty)| { matches!(ty.as_deref(), Some("u64" | "i64" | "usize" | "uSize")) }),
+        "enter_recursive_frame FUNC.RESULT must be the usize token, not a GCREF: {return_types:?}"
+    );
+    let looks_inside = hits.iter().any(|h| h.contains("look=true"));
+    assert!(
+        found_graph == 0 || !looks_inside,
+        "dont_look_inside enter_recursive_frame must residualize native; CAST of a heap GCREF is bhimpl_cast_ptr_to_int: {hits:#?}"
+    );
+}
+
+/// Unique look-inside leftover of `enter_recursive_frame` is `r>i`.
+/// `WordAbi::into_reg` forgets the guard so residual-exec of enter does
+/// not Drop before the dest holds the token. Dest is an INT, so Drop of
+/// `RecursionDepthGuard` is not in jitcode. `pyframe.py execute_frame`
+/// wraps `executioncontext.enter`/`leave` in try/finally; the Python-depth
+/// charge (`insert_stack_check_here`) must pair leftover enter with leftover
+/// `release_recursive_frame` in this graph, or compiled unique-look-inside
+/// of `execute_frame` leaks one unit per activation.
+#[test]
+fn harvested_eval_frame_with_resume_releases_recursive_frame() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["eval", "pyframe"],
+        &["eval_frame_with_resume", "execute_frame_portal"],
+    )
+    .expect("harvest eval_frame_with_resume");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let (resume_paths, portal_paths, mut cc) =
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = crate::codewriter::call::CallControl::new();
+            cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+            cc.set_known_struct_names(program.known_struct_names.clone());
+            cc.set_struct_fields(program.struct_fields.clone());
+            let mut resume_paths = Vec::new();
+            let mut portal_paths = Vec::new();
+            for func in &program.functions {
+                let leaf = crate::front::clause_spec::unspecialized_leaf(
+                    func.name.rsplit("::").next().unwrap_or(func.name.as_str()),
+                );
+                let Some(g) = func.lazy_graph().get() else {
+                    continue;
+                };
+                for path in crate::free_function_alias_paths(
+                    &func.name,
+                    &func.module_path,
+                    &program.struct_fields.foreign_callables,
+                ) {
+                    if leaf == "eval_frame_with_resume" {
+                        resume_paths.push(path.clone());
+                    }
+                    if leaf == "execute_frame_portal" {
+                        portal_paths.push(path.clone());
+                    }
+                    cc.register_function_graph(path, g.clone());
+                }
+            }
+            let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+            if let Some(root) = portal_paths.first() {
+                cc.find_helper_graphs(&mut policy, std::slice::from_ref(root));
+            }
+            (resume_paths, portal_paths, cc)
+        });
+    let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+    let mut found = 0usize;
+    let mut saw_enter = 0usize;
+    let mut hits: Vec<String> = Vec::new();
+    let mut portal_calls_resume = 0usize;
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "eval_frame_with_resume" && leaf != "execute_frame_portal" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        found += 1;
+        let calls = leftover_call_summaries(graph);
+        let unsupported =
+            crate::codewriter::policy::contains_unsupported_variable_type(graph, true, true, true);
+        let look = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, graph);
+        let xf = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+            .graph;
+        let unsupported_xf =
+            crate::codewriter::policy::contains_unsupported_variable_type(&xf, true, true, true);
+        let look_xf = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, &xf);
+        let path = if f.module_path.is_empty() {
+            crate::CallPath::from_segments([f.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([f.module_path.as_str(), f.name.as_str()])
+        };
+        eprintln!(
+            "{} look={look} unsupported={unsupported} look_xf={look_xf} unsupported_xf={unsupported_xf} candidate={} access_directly={} jit_look_inside={:?} elidable={} module={:?} hints={:?} leftover={calls:?}",
+            f.name,
+            cc.is_candidate(&path),
+            graph.access_directly,
+            graph.func.jit_look_inside,
+            graph.func.elidable,
+            graph.func.module,
+            graph.hints,
+        );
+        if leaf == "execute_frame_portal" {
+            portal_calls_resume += xf
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| match &op.kind {
+                    crate::model::OpKind::InlineCall { jitcode, .. } => {
+                        jitcode.name.contains("eval_frame_with_resume")
+                    }
+                    crate::model::OpKind::CallResidual { funcptr, .. } => match funcptr {
+                        crate::model::CallFuncPtr::Target(
+                            crate::model::CallTarget::FunctionPath { segments, .. },
+                        ) => segments
+                            .iter()
+                            .any(|s| s.contains("eval_frame_with_resume")),
+                        _ => false,
+                    },
+                    _ => false,
+                })
+                .count();
+        }
+        if leaf != "eval_frame_with_resume" {
+            continue;
+        }
+        let front_enter = leftover_enter_dest_summaries(graph);
+        let xf_enter = leftover_enter_dest_summaries(&xf);
+        if front_enter
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+            || !front_enter.iter().any(|s| s.contains("Signed"))
+        {
+            hits.push(format!(
+                "{} leftover enter dest must be Signed/Unsigned: {front_enter:?}",
+                f.name
+            ));
+        }
+        if xf_enter
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("res=r") || s.contains("Unknown"))
+        {
+            hits.push(format!(
+                "{} leftover enter dest is a GCREF (TLS stack-height token walked as PyObject): front={front_enter:?} xf={xf_enter:?}",
+                f.name
+            ));
+        }
+        let successor = leftover_enter_successor_input_kinds(graph);
+        if successor.is_empty()
+            || successor
+                .iter()
+                .any(|s| s.contains("Unknown") || s.contains("GcRef") || !s.contains("Signed"))
+        {
+            hits.push(format!(
+                "{} leftover enter successor inputarg must inherit Signed: {successor:?} window={} uses={}",
+                f.name,
+                leftover_enter_window(graph),
+                leftover_enter_dest_id(graph)
+                    .map(|id| leftover_var_uses(graph, id))
+                    .unwrap_or_default(),
+            ));
+        }
+        let front_release = leftover_release_arg_summaries(graph);
+        let xf_release = leftover_release_arg_summaries(&xf);
+        if front_release.is_empty()
+            || front_release.contains("Unknown")
+            || front_release.contains("GcRef")
+            || !front_release.contains("Signed")
+        {
+            hits.push(format!(
+                "{} leftover release arg must be Signed: front={front_release} producers={}",
+                f.name,
+                leftover_release_arg_producers(graph),
+            ));
+        }
+        if xf_release.is_empty()
+            || !xf_release.contains("r=[]")
+            || !xf_release.contains("Signed")
+            || xf_release.contains("Unknown")
+            || xf_release.contains("GcRef")
+        {
+            hits.push(format!(
+                "{} leftover release CallResidual must bank the token as INT: xf={xf_release}",
+                f.name
+            ));
+        }
+        let front_roots = leftover_push_roots_paths(graph);
+        let xf_roots = leftover_push_roots_paths(&xf);
+        if !front_roots.is_empty() || !xf_roots.is_empty() {
+            hits.push(format!(
+                "{} RootScope bracket survived: front={front_roots:?} xf={xf_roots:?}",
+                f.name
+            ));
+        }
+        let front_leaves = leftover_root_scope_bracket_leaves(graph);
+        let xf_leaves = leftover_root_scope_bracket_leaves(&xf);
+        if !front_leaves.is_empty() || !xf_leaves.is_empty() {
+            hits.push(format!(
+                "{} RootScope leaf survived: front={front_leaves:?} xf={xf_leaves:?}",
+                f.name
+            ));
+        }
+        let front_cast = leftover_cast_of_push_roots_dest(graph);
+        let xf_cast = leftover_cast_of_push_roots_dest(&xf);
+        if front_cast
+            .iter()
+            .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+            || xf_cast
+                .iter()
+                .any(|s| s.contains("GcRef") || s.contains("Unknown"))
+        {
+            hits.push(format!(
+                "{} leftover CAST of leftover push_roots dest recasts INT to GCREF: front={front_cast:?} xf={xf_cast:?}",
+                f.name
+            ));
+        }
+        let has_enter = calls.iter().any(|s| s.contains("enter_recursive_frame"));
+        let has_release = calls.iter().any(|s| s.contains("release_recursive_frame"));
+        if calls
+            .iter()
+            .any(|s| s.contains("eval_frame_after_recursion_enter"))
+        {
+            hits.push(format!(
+                "{} still Calls helper eval_frame_after_recursion_enter leftover={calls:?}",
+                f.name
+            ));
+        }
+        if has_enter {
+            saw_enter += 1;
+        }
+        if has_enter && !has_release {
+            hits.push(format!("{} leftover={calls:?}", f.name));
+        }
+    }
+    eprintln!(
+        "resume_paths={resume_paths:?} portal_paths={portal_paths:?} portal_calls_resume={portal_calls_resume}"
+    );
+    assert!(
+        found >= 1,
+        "harvested eval_frame_with_resume, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        saw_enter >= 1,
+        "eval_frame_with_resume must leftover-call enter_recursive_frame"
+    );
+    assert!(
+        hits.is_empty(),
+        "eval_frame_with_resume leftover enter must pair with leftover release_recursive_frame: {hits:#?}"
+    );
+    assert!(!portal_paths.is_empty(), "harvested execute_frame_portal");
+    assert!(
+        resume_paths.iter().any(|path| cc.is_candidate(path)),
+        "eval_frame_with_resume must be a find_all_graphs candidate from execute_frame_portal"
+    );
+    assert!(
+        portal_calls_resume >= 1,
+        "execute_frame_portal must look inside eval_frame_with_resume"
+    );
+}
+
+/// Unique look-inside of `funccall_flat_1` residualizes
+/// `eval_frame_with_resume` even though `execute_frame_portal` is a
+/// jitcode. Isolated BFS from `execute_frame_portal` InlineCalls it;
+/// production BFS reaches `execute_frame_portal` from `funccall_flat_*`
+/// as a `PyFrame` method. Register the method the way `lib.rs` does
+/// (`CallPath::for_impl_method`) and start BFS at `funccall_flat_1`.
+#[test]
+fn harvested_funccall_flat_looks_inside_eval_frame_with_resume() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["eval", "pyframe", "function"],
+        &[
+            "eval_frame_with_resume",
+            "execute_frame_portal",
+            "funccall_flat_1",
+        ],
+    )
+    .expect("harvest funccall_flat_1 / execute_frame_portal / eval_frame_with_resume");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let (funccall_paths, portal_paths, resume_paths, mut cc) =
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = crate::codewriter::call::CallControl::new();
+            cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+            cc.set_known_struct_names(program.known_struct_names.clone());
+            cc.set_struct_fields(program.struct_fields.clone());
+            let mut funccall_paths = Vec::new();
+            let mut portal_paths = Vec::new();
+            let mut resume_paths = Vec::new();
+            for func in &program.functions {
+                let leaf = crate::front::clause_spec::unspecialized_leaf(
+                    func.name.rsplit("::").next().unwrap_or(func.name.as_str()),
+                );
+                let Some(g) = func.lazy_graph().get() else {
+                    eprintln!(
+                        "graphless {} self={:?} module={:?}",
+                        func.name, func.self_ty_root, func.module_path
+                    );
+                    continue;
+                };
+                match func.self_ty_root.as_deref() {
+                    Some(owner) => {
+                        let path = crate::CallPath::for_impl_method(owner, &func.name);
+                        if leaf == "execute_frame_portal" {
+                            portal_paths.push(path.clone());
+                        }
+                        cc.register_function_graph(path, g.clone());
+                    }
+                    None => {
+                        for path in crate::free_function_alias_paths(
+                            &func.name,
+                            &func.module_path,
+                            &program.struct_fields.foreign_callables,
+                        ) {
+                            if leaf == "funccall_flat_1" {
+                                funccall_paths.push(path.clone());
+                            }
+                            if leaf == "eval_frame_with_resume" {
+                                resume_paths.push(path.clone());
+                            }
+                            cc.register_function_graph(path, g.clone());
+                        }
+                    }
+                }
+            }
+            let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+            if let Some(root) = funccall_paths.first() {
+                cc.find_helper_graphs(&mut policy, std::slice::from_ref(root));
+            }
+            (funccall_paths, portal_paths, resume_paths, cc)
+        });
+    let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut funccall_calls_portal = 0usize;
+    let mut portal_calls_resume = 0usize;
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if !matches!(
+            leaf,
+            "eval_frame_with_resume" | "execute_frame_portal" | "funccall_flat_1"
+        ) {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let unsupported =
+            crate::codewriter::policy::contains_unsupported_variable_type(graph, true, true, true);
+        let look = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, graph);
+        let xf = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+            .graph;
+        let path = match f.self_ty_root.as_deref() {
+            Some(owner) => crate::CallPath::for_impl_method(owner, &f.name),
+            None if f.module_path.is_empty() => crate::CallPath::from_segments([f.name.as_str()]),
+            None => crate::CallPath::from_segments([f.module_path.as_str(), f.name.as_str()]),
+        };
+        eprintln!(
+            "{} self={:?} module={:?} look={look} unsupported={unsupported} candidate={} hints={:?} jit_look_inside={:?} front={:?} xf={:?}",
+            f.name,
+            f.self_ty_root,
+            f.module_path,
+            cc.is_candidate(&path),
+            graph.hints,
+            graph.func.jit_look_inside,
+            leftover_call_summaries(graph),
+            dump_graph_ops(&xf),
+        );
+        let count_xf = |needle: &str| {
+            xf.blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| match &op.kind {
+                    crate::model::OpKind::InlineCall { jitcode, .. } => {
+                        jitcode.name.contains(needle)
+                    }
+                    crate::model::OpKind::CallResidual { funcptr, .. } => match funcptr {
+                        crate::model::CallFuncPtr::Target(
+                            crate::model::CallTarget::FunctionPath { segments, .. },
+                        ) => segments.iter().any(|s| s.contains(needle)),
+                        crate::model::CallFuncPtr::Target(crate::model::CallTarget::Method {
+                            name,
+                            ..
+                        }) => name.contains(needle),
+                        _ => false,
+                    },
+                    _ => false,
+                })
+                .count()
+        };
+        if leaf == "funccall_flat_1" {
+            funccall_calls_portal += count_xf("execute_frame_portal");
+            funccall_calls_portal += count_xf("eval_frame_with_resume");
+        }
+        if leaf == "execute_frame_portal" {
+            portal_calls_resume += count_xf("eval_frame_with_resume");
+        }
+    }
+    eprintln!(
+        "funccall_paths={funccall_paths:?} portal_paths={portal_paths:?} resume_paths={resume_paths:?} funccall_calls_portal={funccall_calls_portal} portal_calls_resume={portal_calls_resume} resume_candidate={}",
+        resume_paths.iter().any(|path| cc.is_candidate(path))
+    );
+    assert!(!funccall_paths.is_empty(), "harvested funccall_flat_1");
+    assert!(
+        resume_paths.iter().any(|path| cc.is_candidate(path)),
+        "eval_frame_with_resume must be a find_all_graphs candidate from funccall_flat_1"
+    );
+    assert!(
+        portal_calls_resume >= 1 || funccall_calls_portal >= 1,
+        "funccall_flat_1 / execute_frame_portal must look inside eval_frame_with_resume"
+    );
+}
+
+/// `executioncontext.py enter` stores the GCREF frame (`f_backref` /
+/// `topframeref = jit.virtual_ref(frame)`). A `frame as usize` probe in
+/// the look-inside-able body is `cast_ptr_to_int/r>i`; BH
+/// `bhimpl_cast_ptr_to_int` asserts a tagged immediate and panics on the
+/// even heap pointer. Keep the GCREF as GCREF.
+#[test]
+fn harvested_enter_has_no_cast_ptr_to_int() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["executioncontext"],
+        &["enter"],
+    )
+    .expect("harvest ExecutionContext::enter");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let is_enter = f.name == "enter" || f.name.starts_with("enter__");
+        if !is_enter {
+            continue;
+        }
+        found += 1;
+        let front_leftover = leftover_cast_ptr_to_int_summaries(graph);
+        if !front_leftover.is_empty() {
+            hits.push(format!(
+                "{} front={front_leftover:?} front_ops={:?}",
+                f.name,
+                dump_graph_ops(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested ExecutionContext::enter, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover cast_ptr_to_int of enter: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of the portal inlines `cached_root_raw`. The helper
+/// is `gc_enter_roots_frame`'s cache word (`shadowstack.py`). The load
+/// lives on `ExecutionContext` so looking inside is `getfield_gc_i` of
+/// that usize, not `cast_ptr_to_int/r>i` of an Opaque `*const` from
+/// pyre-jit LLBC. BH `bhimpl_cast_ptr_to_int` asserts a tagged immediate
+/// and panics on the even heap pointer.
+#[test]
+fn cached_root_raw_has_no_cast_ptr_to_int() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["executioncontext"],
+        &["cached_root_raw", "root_stack_slot_raw"],
+    )
+    .expect("harvest cached_root_raw");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(g) = func.lazy_graph().get() {
+            cc.register_function_graph(path, g.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut hits: Vec<String> = Vec::new();
+    let mut found_cached = 0usize;
+    let mut found_slot = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "cached_root_raw" && leaf != "root_stack_slot_raw" {
+            continue;
+        }
+        if leaf == "cached_root_raw" {
+            found_cached += 1;
+        } else {
+            found_slot += 1;
+        }
+        let front = leftover_cast_ptr_to_int_summaries(graph);
+        let out = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph);
+        let mut xf = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut xf, Some(&cc));
+        let xf_leftover = leftover_cast_ptr_to_int_summaries(&xf);
+        let slot_field = if leaf == "root_stack_slot_raw" {
+            let has_field = xf.blocks.iter().flat_map(|b| b.operations.iter()).any(|op| {
+                matches!(
+                    &op.kind,
+                    crate::model::OpKind::FieldRead { field, ty, .. }
+                        if field.name == "root_stack_slot"
+                            && !field.taken_by_address
+                            && matches!(ty, crate::model::ValueType::Int | crate::model::ValueType::Unsigned)
+                )
+            });
+            let has_raw = xf
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .any(|op| matches!(&op.kind, crate::model::OpKind::RawLoad { .. }));
+            has_field && !has_raw
+        } else {
+            true
+        };
+        if !front.is_empty() || !xf_leftover.is_empty() || !slot_field {
+            hits.push(format!(
+                "{} front={front:?} xf={xf_leftover:?} slot_field={slot_field} front_ops={:?} xf_ops={:?}",
+                f.name,
+                dump_graph_ops(graph),
+                dump_graph_ops(&xf)
+            ));
+        }
+    }
+    assert!(
+        found_cached >= 1 && found_slot >= 1,
+        "harvested cached_root_raw and root_stack_slot_raw, cached={found_cached} slot={found_slot} functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "cached_root_raw leftover cast_ptr_to_int: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of LOAD_GLOBAL walks `_getdictvalue_no_unwrapping_pure`
+/// (`celldict.py _getdictvalue_no_unwrapping_pure`) then leftover
+/// `residual_call_r_r` of the look_inside_iff-declined probe
+/// (`rordereddict.py ll_dict_lookup`). Native `&str` is fat; residual key
+/// is rstr `Ptr(STR)`. The Call stays; `jit_trace_fnaddrs` binds the STR
+/// trampoline.
+#[test]
+fn harvested_getdictvalue_no_unwrapping_pure_leftover_is_entries_get() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &["celldict"],
+        &[
+            "_getdictvalue_no_unwrapping_pure",
+            "_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "module_dict_entries_get",
+        ],
+    )
+    .expect("harvest _getdictvalue_no_unwrapping_pure");
+    let mut leftovers: Vec<(String, Vec<String>)> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if !leaf.contains("getdictvalue_no_unwrapping_pure") {
+            continue;
+        }
+        found += 1;
+        let calls = leftover_call_summaries(graph);
+        leftovers.push((f.name.clone(), calls));
+    }
+    assert!(
+        found >= 1,
+        "harvested _getdictvalue_no_unwrapping_pure, functions={}",
+        program.functions.len()
+    );
+    let probe = leftovers.iter().any(|(name, calls)| {
+        name.contains("_orig__getdictvalue_no_unwrapping_pure")
+            && calls.iter().any(|s| {
+                s.contains("module_dict_entries_get")
+                    || s.contains("ll_dict_lookup")
+                    || s.contains("RDict")
+                    || s.contains("entries_get")
+            })
+    });
+    assert!(
+        probe,
+        "_getdictvalue_no_unwrapping_pure leftover probe: {leftovers:#?}"
+    );
+}
+
+/// Unique look-inside of `load_global_value` (`pyopcode.py _load_global`)
+/// under `we_are_jitted` uses `getname_u` (`text_w(getname_w)`), not
+/// interned `code.names` `&str`. `getname_w` is `co_names_w[index]`; the
+/// getter body is inlined, so the jitted graph is that field/index, not a
+/// leftover `w_code_getname_w` Call.
+#[test]
+fn harvested_load_global_value_uses_getname_w() {
+    use crate::model::{CallFuncPtr, CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &["eval", "pyopcode", "pycode"],
+        &["load_global_value", "getname_u", "w_code_getname_w", "text_w"],
+    )
+    .expect("harvest load_global_value");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(graph) = func.lazy_graph().get() {
+            cc.register_function_graph(path, graph.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let residual_paths = |ops: &[&crate::model::SpaceOperation]| -> Vec<String> {
+        let mut addrs = Vec::new();
+        for op in ops {
+            if let OpKind::ConstFnAddr { path, .. } = &op.kind
+                && let Some(result) = op.result.as_ref()
+            {
+                addrs.push((result.clone(), path.clone()));
+            }
+        }
+        let mut out = Vec::new();
+        for op in ops {
+            match &op.kind {
+                OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(v),
+                    ..
+                } => {
+                    if let Some((_, path)) = addrs.iter().find(|(var, _)| var == v) {
+                        out.push(path.clone());
+                    }
+                }
+                OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }),
+                    ..
+                }
+                | OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => out.push(segments.join("::")),
+                _ => {}
+            }
+        }
+        out
+    };
+    let path_leaf = |path: &str| -> String { path.rsplit("::").next().unwrap_or(path).to_string() };
+    let field_index = |graph: &crate::model::FunctionGraph| {
+        let ops: Vec<&crate::model::SpaceOperation> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let mut names_w = Vec::new();
+        let mut index_inputs = Vec::new();
+        let mut native_names = false;
+        let mut pycode_owner = true;
+        for op in &ops {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } => {
+                    if field.name == "co_names_w" {
+                        let owner = field.owner_root.as_deref().unwrap_or("");
+                        if owner.rsplit("::").next() != Some("PyCode") {
+                            pycode_owner = false;
+                        }
+                        if let Some(result) = op.result.as_ref() {
+                            names_w.push(result.clone());
+                        }
+                    } else if field.name == "names" {
+                        native_names = true;
+                    }
+                }
+                OpKind::Input { name, .. }
+                    if matches!(name.as_str(), "nameindex" | "name_index" | "idx" | "index") =>
+                {
+                    if let Some(result) = op.result.as_ref() {
+                        index_inputs.push(result.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let indexes_table = ops.iter().any(|op| {
+            let (base, index) = match &op.kind {
+                OpKind::ArrayRead { base, index, .. }
+                | OpKind::GcLoadIndexed { base, index, .. }
+                | OpKind::InteriorFieldRead { base, index, .. }
+                | OpKind::VableArrayRead {
+                    base,
+                    elem_index: index,
+                    ..
+                } => (base, index),
+                _ => return false,
+            };
+            names_w.iter().any(|table| table == base)
+                && (index_inputs.iter().any(|idx| idx == index) || index_inputs.is_empty())
+        });
+        (names_w.len(), indexes_table, native_names, pycode_owner)
+    };
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "load_global_value" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let xf = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+            .graph;
+        let ops: Vec<&crate::model::SpaceOperation> = xf
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let has_nameindex = ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Input { name, .. } if name == "nameindex" || name == "name_index")
+        });
+        let uses_getname = residual_paths(&ops)
+            .iter()
+            .any(|path| matches!(path_leaf(path).as_str(), "getname_u" | "w_code_getname_w"));
+        let (names_w, indexes_table, native_names, pycode_owner) = field_index(&xf);
+        // NamespaceOpcodeHandler::load_global_value is a trampoline onto
+        // load_name_value; the jitted getname_u path is PyFrame's body.
+        if !has_nameindex || (!uses_getname && names_w == 0) {
+            continue;
+        }
+        found += 1;
+        let inlined = names_w > 0 && indexes_table && pycode_owner;
+        if native_names || !(uses_getname || inlined) {
+            hits.push(format!(
+                "{} uses_getname={uses_getname} names_w={names_w} indexes={indexes_table} pycode_owner={pycode_owner} native_names={native_names} ops={:?}",
+                f.name,
+                dump_graph_ops(&xf)
+            ));
+        }
+    }
+    let mut getter_found = 0usize;
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "w_code_getname_w" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        getter_found += 1;
+        let (names_w, indexes_table, native_names, pycode_owner) = field_index(graph);
+        if names_w == 0 || !indexes_table || !pycode_owner || native_names {
+            hits.push(format!(
+                "{} getter names_w={names_w} indexes={indexes_table} pycode_owner={pycode_owner} native_names={native_names} ops={:?}",
+                f.name,
+                dump_graph_ops(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested load_global_value, functions={} names={:?}",
+        program.functions.len(),
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        getter_found >= 1,
+        "harvested w_code_getname_w, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "load_global_value jitted graph reads PyCode.co_names_w and indexes that table: {hits:#?}"
+    );
+}
+
+/// `set_topframeref` pins through [`FrameAnchor`] for the native barrier.
+/// That pin is `dont_look_inside`; the look-inside-able body must not
+/// contain `from_raw` / `frame_anchor_push` / `frame_anchor_live`. BH of
+/// those ops `get`s a tracing-time shadow-stack index.
+#[test]
+fn harvested_set_topframeref_has_no_frame_anchor() {
+    use crate::model::{CallTarget, OpKind};
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["executioncontext"],
+        &["set_topframeref"],
+    )
+    .expect("harvest ExecutionContext::set_topframeref");
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let is_set = f.name == "set_topframeref" || f.name.starts_with("set_topframeref__");
+        if !is_set {
+            continue;
+        }
+        found += 1;
+        let forbidden: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str).unwrap_or("");
+                    if matches!(
+                        leaf,
+                        "from_raw" | "frame_anchor_push" | "frame_anchor_live" | "new"
+                    ) && segments
+                        .iter()
+                        .any(|s| s.contains("FrameAnchor") || s.contains("frame_anchor"))
+                    {
+                        Some(segments.join("::"))
+                    } else if matches!(leaf, "from_raw" | "frame_anchor_push" | "frame_anchor_live")
+                    {
+                        Some(segments.join("::"))
+                    } else {
+                        None
+                    }
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if matches!(name.as_str(), "from_raw" | "live" | "new") => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if !forbidden.is_empty() {
+            hits.push(format!(
+                "{} forbidden={forbidden:?} ops={:?}",
+                f.name,
+                dump_graph_ops(graph)
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested ExecutionContext::set_topframeref, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover FrameAnchor in set_topframeref: {hits:#?}"
+    );
+}
+
+/// `pyframe.py execute_frame` keeps `self` as a GCREF local; gctransform
+/// reloads it after collecting calls. `FrameAnchor` is that reload for
+/// the native interpreter. Unique look-inside residualizes
+/// `frame_anchor_push` (a live depth) and BH of the compiled loop `get`s
+/// a tracing-time shadow-stack index (`set_topframeref` pin).
+fn frame_anchor_forbidden_calls(graph: &crate::model::FunctionGraph) -> Vec<String> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str).unwrap_or("");
+                if matches!(
+                    leaf,
+                    "from_raw" | "frame_anchor_push" | "frame_anchor_live" | "new"
+                ) && segments
+                    .iter()
+                    .any(|s| s.contains("FrameAnchor") || s.contains("frame_anchor"))
+                {
+                    Some(segments.join("::"))
+                } else if matches!(leaf, "frame_anchor_push" | "frame_anchor_live") {
+                    Some(segments.join("::"))
+                } else {
+                    None
+                }
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "live" => Some(name.clone()),
+            OpKind::CallResidual {
+                funcptr:
+                    crate::model::CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }),
+                ..
+            } if segments
+                .iter()
+                .any(|s| s.contains("FrameAnchor") || s.contains("frame_anchor")) =>
+            {
+                Some(segments.join("::"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn harvested_eval_frame_with_resume_has_no_frame_anchor() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["eval"],
+        &[
+            "eval_frame_with_resume",
+            "eval_frame_after_enter",
+            "eval_frame_after_enter_pinned",
+        ],
+    )
+    .expect("harvest eval_frame_with_resume");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(graph) = func.lazy_graph().get() {
+            cc.register_function_graph(path, graph.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut hits: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        // `dont_look_inside` still has a front graph; unique look-inside
+        // of `eval_frame_with_resume` folds `we_are_jitted()` and stays
+        // on `eval_frame_after_enter`.
+        if leaf == "eval_frame_after_enter_pinned" {
+            continue;
+        }
+        if leaf != "eval_frame_with_resume" && leaf != "eval_frame_after_enter" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        found += 1;
+        let forbidden = frame_anchor_forbidden_calls(graph);
+        let front_cast = leftover_cast_ptr_to_int_summaries(graph);
+        let xf = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+            .graph;
+        let xf_cast = leftover_cast_ptr_to_int_summaries(&xf);
+        if !xf_cast.is_empty() {
+            eprintln!("{} xf_cast={xf_cast:?}", f.name);
+            let ops = dump_graph_ops(&xf);
+            for (i, line) in ops.iter().enumerate() {
+                if line.contains("cast_ptr_to_int") {
+                    let start = i.saturating_sub(6);
+                    eprintln!("CAST context {}..={i}: {:#?}", start, &ops[start..=i]);
+                }
+            }
+        }
+        if !forbidden.is_empty() || !front_cast.is_empty() {
+            hits.push(format!(
+                "{} forbidden={forbidden:?} front_cast={front_cast:?} xf_cast={xf_cast:?}",
+                f.name
+            ));
+        }
+    }
+    assert!(
+        found >= 1,
+        "harvested eval_frame_with_resume, functions={}",
+        program.functions.len()
+    );
+    assert!(
+        hits.is_empty(),
+        "harvest leftover FrameAnchor/CAST in eval_frame_with_resume: {hits:#?}"
+    );
+}
+
+/// Unique look-inside of `execute_frame` from a novable sortkey driver
+/// BH-interprets `frame_dispatch` → `next_instr`. `next_instr` reads
+/// vable `last_instr` off `self`; an empty `args_r` leaves BH `r0 = 0`
+/// and `GETFIELD_VABLE_I` walks a null PyFrame (`JitFrame::resolve`).
+/// `pyframe.py execute_frame` passes the live frame into `dispatch`.
+#[test]
+fn harvested_frame_dispatch_passes_the_frame_ref_to_next_instr() {
+    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+    fn const_fnaddr_path(
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| {
+                if op.result.as_ref() != Some(var) {
+                    return None;
+                }
+                match &op.kind {
+                    OpKind::ConstFnAddr { path, .. } => Some(path.clone()),
+                    _ => None,
+                }
+            })
+    }
+    fn callee_leaf_and_args_r(
+        graph: &FunctionGraph,
+        op: &crate::model::SpaceOperation,
+    ) -> Option<(String, usize)> {
+        match &op.kind {
+            OpKind::InlineCall {
+                jitcode, args_r, ..
+            } => Some((jitcode.name.clone(), args_r.len())),
+            OpKind::CallResidual {
+                funcptr, args_r, ..
+            } => {
+                let name = match funcptr {
+                    crate::model::CallFuncPtr::Target(CallTarget::FunctionPath {
+                        segments,
+                        ..
+                    }) => segments.last().cloned().unwrap_or_default(),
+                    crate::model::CallFuncPtr::Target(CallTarget::Method { name, .. }) => {
+                        name.clone()
+                    }
+                    crate::model::CallFuncPtr::Value(v) => const_fnaddr_path(graph, v)?,
+                    _ => return None,
+                };
+                Some((name, args_r.len()))
+            }
+            OpKind::Call { target, args, .. } => {
+                let leaf = match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.last().cloned().unwrap_or_default()
+                    }
+                    CallTarget::Method { name, .. } => name.clone(),
+                    _ => return None,
+                };
+                Some((leaf, args.len()))
+            }
+            _ => None,
+        }
+    }
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["eval", "pyframe"],
+        &[
+            "frame_dispatch",
+            "next_instr",
+            "eval_frame_with_resume",
+            "execute_frame_portal",
+            "frame_ptr",
+        ],
+    )
+    .expect("harvest frame_dispatch/next_instr");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let mut cc = crate::codewriter::call::CallControl::new();
+    cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc.set_struct_fields(program.struct_fields.clone());
+    for func in &program.functions {
+        let path = if func.module_path.is_empty() {
+            crate::CallPath::from_segments([func.name.as_str()])
+        } else {
+            crate::CallPath::from_segments([func.module_path.as_str(), func.name.as_str()])
+        };
+        if let Some(graph) = func.lazy_graph().get() {
+            cc.register_function_graph(path, graph.clone());
+        }
+    }
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut dumps: Vec<String> = Vec::new();
+    let mut next_instr_calls_with_r = 0usize;
+    let mut frame_dispatch_calls_with_r = 0usize;
+    let mut found_frame_dispatch = 0usize;
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if !matches!(
+            leaf,
+            "frame_dispatch"
+                | "next_instr"
+                | "eval_frame_with_resume"
+                | "execute_frame_portal"
+                | "frame_ptr"
+        ) {
+            continue;
+        }
+        if leaf == "frame_ptr" && !f.name.contains("FrameBox") {
+            continue;
+        }
+        let out = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph);
+        let xf = out.graph;
+        for op in xf.blocks.iter().flat_map(|b| b.operations.iter()) {
+            let Some((name, n_r)) = callee_leaf_and_args_r(&xf, op) else {
+                continue;
+            };
+            if name.contains("next_instr") && n_r >= 1 {
+                next_instr_calls_with_r += 1;
+            }
+            if name.contains("frame_dispatch") && n_r >= 1 {
+                frame_dispatch_calls_with_r += 1;
+            }
+        }
+        if leaf == "frame_dispatch" {
+            found_frame_dispatch += 1;
+            dumps.push(format!("{} ops={:?}", f.name, dump_graph_ops(&xf)));
+        }
+        if leaf == "next_instr" {
+            let has_ref_input = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Input {
+                            name,
+                            ty: ValueType::Ref(Some(root)),
+                            ..
+                        } if name == "self" && root.contains("PyFrame")
+                    )
+                });
+            dumps.push(format!(
+                "{} has_ref_input={has_ref_input} leftover_cast={:?} ops={:?}",
+                f.name,
+                leftover_cast_ptr_to_int_summaries(&xf),
+                dump_graph_ops(&xf)
+            ));
+            assert!(
+                has_ref_input,
+                "next_instr must take the frame as a Ref inputarg: {dumps:#?}"
+            );
+        }
+        if leaf == "eval_frame_with_resume" || leaf == "execute_frame_portal" || leaf == "frame_ptr"
+        {
+            dumps.push(format!(
+                "{} leftover_cast={:?} ops={:?}",
+                f.name,
+                leftover_cast_ptr_to_int_summaries(&xf),
+                dump_graph_ops(&xf)
+            ));
+        }
+    }
+    assert!(
+        found_frame_dispatch >= 1,
+        "harvested frame_dispatch, functions={}: {dumps:#?}",
+        program.functions.len()
+    );
+    assert!(
+        next_instr_calls_with_r >= 1,
+        "frame_dispatch must pass a Ref self into next_instr: {dumps:#?}"
+    );
+    assert!(
+        frame_dispatch_calls_with_r >= 1,
+        "eval_frame_with_resume must pass a Ref frame into frame_dispatch: {dumps:#?}"
+    );
 }
 
 /// A plain Result dest stays a regular call of the extracted core body
@@ -12362,15 +15473,10 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| {
-            fd.item_meta
-                .source_text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
-        })
-        .expect("FrameBox::new");
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::pytraceback::w_pytraceback_new")
+        .expect("w_pytraceback_new");
     crate::test_support::with_lowering(llbc, |context| {
-        let graph = super::lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = super::lower_fun_decl(context, fd).expect("lower w_pytraceback_new");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
@@ -12381,7 +15487,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
                 )
             }),
-            "FrameBox::new still has core::ptr::write"
+            "w_pytraceback_new still has core::ptr::write"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -12390,7 +15496,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     OpKind::FieldWrite { field, .. } if field.name == "ob_header"
                 )
             }),
-            "FrameBox::new must not store the inlined ob_header as one word"
+            "w_pytraceback_new must not store the inlined ob_header as one word"
         );
         let header_leaves: Vec<_> = graph
             .blocks
@@ -13447,5 +16553,193 @@ fn merge_phi_concretetype_requires_predecessor_agreement() {
             .is_some_and(super::lltype_is_ccharp),
         "agreeing CCHARP stamps the merge phi; ct={:?}",
         phi.concretetype()
+    );
+}
+
+fn harvested_value_type_kind(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => 'i',
+        ValueType::Float => 'f',
+        ValueType::Void => 'v',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+        ValueType::Unknown | ValueType::State => '?',
+    }
+}
+
+fn harvested_var_kind(graph: &FunctionGraph, var: &Variable) -> char {
+    match FunctionGraph::concretetype_of(var) {
+        crate::codewriter::type_state::ConcreteType::Signed => return 'i',
+        crate::codewriter::type_state::ConcreteType::GcRef => return 'r',
+        crate::codewriter::type_state::ConcreteType::Float => return 'f',
+        crate::codewriter::type_state::ConcreteType::Void => return 'v',
+        crate::codewriter::type_state::ConcreteType::Unknown => {}
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Input { ty, .. }
+                | OpKind::Call { result_ty: ty, .. }
+                | OpKind::FieldRead { ty, .. } => harvested_value_type_kind(ty),
+                OpKind::New { .. } => 'r',
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => 'i',
+                OpKind::ConstFloat(_) => 'f',
+                _ => '?',
+            };
+        }
+    }
+    '?'
+}
+
+fn harvested_link_arg_kind(graph: &FunctionGraph, arg: &LinkArg) -> char {
+    match arg {
+        LinkArg::Value(var) => harvested_var_kind(graph, var),
+        LinkArg::Const(_) => '?',
+    }
+}
+
+fn harvested_call_target_is_index_of(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.iter().any(|seg| seg.contains("index_of"))
+        }
+        CallTarget::Method { name, .. } => name.contains("index_of"),
+        _ => false,
+    }
+}
+
+/// `w_dict_delitem_object_strategy_checked` leftover `index_of` keeps the
+/// `ObjectKey` pointer (`backendopt/malloc.py`: a malloc whose pointer is
+/// a call argument is not removed). Callee inputargs are entries + key.
+#[test]
+fn harvested_w_dict_delitem_index_of_keeps_object_key_pointer() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &["dictmultiobject"],
+        &[
+            "w_dict_delitem_object_strategy_checked",
+            "index_of",
+            "object_key_for_checked",
+        ],
+    )
+    .expect("harvest w_dict_delitem_object_strategy_checked");
+    let mut callee_kinds: Option<Vec<char>> = None;
+    let mut caller_calls: Vec<(String, Vec<char>)> = Vec::new();
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf.contains("index_of") {
+            let kinds: Vec<char> = graph
+                .blocks
+                .first()
+                .map(|block| {
+                    block
+                        .inputargs
+                        .iter()
+                        .map(|arg| harvested_var_kind(graph, arg))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if graph.name.contains("ObjectKey") || callee_kinds.is_none() {
+                callee_kinds = Some(kinds);
+            }
+        }
+        if leaf.contains("object_key_for_checked") {
+            let mut news_object_key = false;
+            for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+                match &op.kind {
+                    OpKind::New { owner } if owner.ends_with("ObjectKey") => {
+                        news_object_key = true;
+                    }
+                    OpKind::FieldWrite { field, .. } => {
+                        assert!(
+                            !field.name.contains("__pos_0.hash")
+                                && !field.name.contains("__pos_0.obj"),
+                            "{} must not inline ObjectKey into Result (`lltype.GcStruct` / `backendopt/malloc.py`); field={}",
+                            f.name,
+                            field.name
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                news_object_key,
+                "{} must materialize ObjectKey (`backendopt/malloc.py`)",
+                f.name
+            );
+        }
+        if !leaf.contains("w_dict_delitem_object_strategy_checked") {
+            continue;
+        }
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !harvested_call_target_is_index_of(target) {
+                continue;
+            }
+            let kinds: Vec<char> = args
+                .iter()
+                .map(|arg| harvested_link_arg_kind(graph, arg))
+                .collect();
+            caller_calls.push((f.name.clone(), kinds));
+        }
+    }
+    let callee_kinds = callee_kinds.expect("harvested index_of inputargs");
+    assert!(
+        !caller_calls.is_empty(),
+        "harvested index_of call in w_dict_delitem_object_strategy_checked, functions={}",
+        program.functions.len()
+    );
+    for (name, kinds) in &caller_calls {
+        assert_eq!(
+            kinds, &callee_kinds,
+            "{name} index_of args {kinds:?} must match callee inputargs {callee_kinds:?}"
+        );
+    }
+}
+
+/// `W_ListObject.int_items` is the inlined `IntArray` STRUCT (`rlist.py`
+/// LIST length / items). `malloc_ptr_field_spelling` is the Result-payload
+/// path (`register_ref_enum_instantiation_rows`); a nested field still
+/// inlines so `fielddescrof` can `getattr` `int_items.len`.
+#[test]
+fn harvested_w_list_int_items_is_inlined_int_array() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program =
+        crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+            std::slice::from_ref(llbc),
+            crate::HostStaticAddrs::default(),
+            &["listobject", "int_array"],
+        )
+        .expect("harvest W_ListObject / IntArray");
+    let ty = ["listobject::W_ListObject", "W_ListObject"]
+        .into_iter()
+        .find_map(|owner| program.struct_fields.field_type(owner, "int_items"))
+        .expect("W_ListObject.int_items is harvested");
+    assert!(
+        !ty.starts_with('*') && !ty.starts_with('&'),
+        "int_items is an inlined IntArray, not a malloc Ptr; ty={ty}"
+    );
+    let leaf = ty.rsplit("::").next().unwrap_or(ty);
+    assert_eq!(
+        leaf, "IntArray",
+        "int_items field type is IntArray, got {ty}"
     );
 }

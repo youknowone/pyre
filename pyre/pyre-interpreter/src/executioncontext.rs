@@ -299,22 +299,17 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 /// "the callee forced this vref".  A reader that forced would report its own
 /// read as a callee escape.
 ///
-/// `#[dont_look_inside]` for the same reason as [`force_vref`]: the typeptr
-/// test lives in `majit-metainterp` (`ptr_is_virtual_ref`), which is not
-/// LLBC.  A look-inside residualized a symbolic hash and aborted with
-/// `OrthodoxSubWalkTraceUnsupported` on the generatorentry walk
-/// (enter-chain identity).  Inlining `is_virtual_ref`
-/// (`inst.typeptr == jit_virtual_ref_vtable`) plus `return vref.forced` as
-/// field reads is the interpreter copy; the jitcode copy cannot hold those
-/// reads.  `jtransform.py rewrite_op_getfield` refuses a non-pure
-/// `getfield_raw_r`, and `forced` is a raw ref that `continue_tracing`
-/// rewrites, so it is not `_pure`.  `rewrite_op_jit_is_virtual` also
-/// refuses `vref.virtual` from jit-visible code.  Upstream
-/// `replace_force_virtual_with_call` supplies the typeptr test only to the
-/// interpreter copy; this attribute is how pyre spells that for a reader
-/// that never forces.
-#[inline]
-#[majit_macros::dont_look_inside]
+/// Keep `dont_look_inside`: the typeptr test is `vref.virtual`, which
+/// `rewrite_op_jit_is_virtual` refuses from jit-visible code, and
+/// `ptr_is_virtual_ref` lives in `majit-metainterp`, which is not lowered
+/// to LLBC. Looking inside residualizes that helper as a symbolic path hash
+/// (`EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`) and aborts
+/// the trace. `inline(never)` keeps the call so Charon residualizes instead
+/// of inlining the typeptr test into `ExecutionContext::enter`.
+/// `dont_look_inside_cannot_raise` is the effect: this body never raises, so
+/// `enter` does not grow a `GUARD_NO_EXCEPTION` around the identity check.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as majit_gc::header::GCREF) } {
         unsafe {
@@ -324,6 +319,46 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     } else {
         ptr
     }
+}
+
+/// One-word residual-call ABI for [`vref_referent`].
+///
+/// The residual lowering types a value-returning call as `(i64) -> i64`; a
+/// raw `*mut PyFrame` is narrower than a word on wasm32, where
+/// `call_indirect` type-checks its callee.
+#[inline(never)]
+pub extern "C" fn vref_referent_jit_abi(ptr: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::vref_referent_jit_abi");
+    vref_referent(ptr) as i64
+}
+
+/// Pin `frame` across the `topframeref` write barrier and hand back the
+/// forwarded pointer.
+///
+/// `FrameAnchor` must stay out of look-inside-able `enter` /
+/// `set_topframeref`. Unique look-inside residualizes `from_raw` as
+/// `frame_anchor_push` (a live depth) then BH of the compiled loop
+/// `get`s that tracing-time index (`shadow_stack.rs` `get`). Native
+/// `FrameAnchor` Drop is LIFO; the jitcode copy is not.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn pin_frame_across_topframeref_barrier(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> *mut PyFrame {
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+    pyre_object::gc_hook::try_gc_write_barrier(ec as pyre_object::gc_hook::GCREF);
+    anchor.live()
+}
+
+/// One-word residual-call ABI for [`pin_frame_across_topframeref_barrier`].
+#[inline(never)]
+pub extern "C" fn pin_frame_across_topframeref_barrier_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::pin_frame_across_topframeref_barrier_jit_abi");
+    pin_frame_across_topframeref_barrier(ec, frame) as i64
 }
 
 /// An activation's pending result held in root slots across a call that can
@@ -884,6 +919,21 @@ pub struct ExecutionContext {
 
 pub type PyExecutionContext = ExecutionContext;
 
+/// Word `cache_root_stack_slot` stored (`shadowstack.py`
+/// `gc_enter_roots_frame`). Zero when the context is missing or the
+/// slot is not resolved yet. Lives next to [`ExecutionContext`] so
+/// unique look-inside of the portal inlines
+/// [`ExecutionContext::root_stack_slot_raw`] (`getfield_gc_i`) instead
+/// of a pyre-jit Opaque `*const` load.
+#[inline(never)]
+pub fn cached_root_raw(ec: *const ExecutionContext) -> usize {
+    if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).root_stack_slot_raw() }
+    }
+}
+
 /// Runtime-assigned GC type id. Stamped at the absolute tail of
 /// `pyre-jit::eval::build_gc` so no hardcoded / `#[pyre_class(type_id = N)]`
 /// id moves (`AllVirtuals` uses the same tail rule). portal-interpret
@@ -1010,21 +1060,6 @@ pub unsafe fn executioncontext_destructor(obj_addr: usize) {
     unsafe { std::ptr::drop_in_place(obj_addr as *mut ExecutionContext) };
 }
 
-/// `root_stack_slot` cache read (`gc_enter_roots_frame`). A concrete
-/// accessor keeps the rtyper from binding generic `std::cell::Cell<T>::get`. The dispatch loop
-/// loads this word; zero means the context is missing or the slot is
-/// unresolved. `#[inline(never)]` keeps the residual at this function so
-/// rustc does not paste `Cell::get` into `eval_loop_jit`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn execution_context_root_stack_slot_get(ec: *const ExecutionContext) -> usize {
-    if ec.is_null() {
-        0
-    } else {
-        unsafe { (*ec).root_stack_slot.get() }
-    }
-}
-
 /// `root_stack_slot` cache fill (`gc_enter_roots_frame`): resolve this
 /// thread's shadow-stack slot into the context once per activation. Takes the
 /// owner pointer because the field's JIT representation is its `usize` word,
@@ -1148,16 +1183,26 @@ impl ExecutionContext {
         self.topframeref
     }
 
+    /// `shadowstack.py` `gc_enter_roots_frame` cache word. Own graph so
+    /// `Cell::get` of this field is `getfield_gc_i` (`jtransform.py`
+    /// `rewrite_op_getfield` / `nestedscope.py` `CellFamily.ever_mutated`).
+    /// `#[inline(never)]` keeps rustc from splicing that load into a
+    /// `*const ExecutionContext` wrapper; pyre-jit's LLBC sees this
+    /// struct as Opaque and would `cast_ptr_to_int` the GCREF, which
+    /// `blackhole.py` `bhimpl_cast_ptr_to_int` rejects (tagged immediate).
+    #[inline(never)]
+    pub fn root_stack_slot_raw(&self) -> usize {
+        self.root_stack_slot.get()
+    }
+
     #[inline]
     pub fn set_topframeref(&mut self, frame: *mut PyFrame) {
         // The write barrier goes through the hook cell so the native scan
         // judges this store able to collect. Hand the frame back out of the
-        // anchor, as [`Self::gettopframe`] does around `force_frame`.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        pyre_object::gc_hook::try_gc_write_barrier(
-            self as *const Self as pyre_object::gc_hook::GCREF,
-        );
-        self.topframeref = anchor.live();
+        // anchor, as [`Self::gettopframe`] does around `force_frame`. The
+        // pin lives in [`pin_frame_across_topframeref_barrier`] so
+        // `FrameAnchor` is not in this look-inside-able graph.
+        self.topframeref = pin_frame_across_topframeref_barrier(self as *mut Self, frame);
     }
 
     #[inline]
@@ -1619,8 +1664,12 @@ impl ExecutionContext {
         if std::ptr::eq(vref_referent(self.topframeref), frame) {
             return;
         }
-        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
-        majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
+        // Probe takes the GCREF word. `frame as usize` is `cast_ptr_to_int`
+        // of a heap PyFrame (`blackhole.py bhimpl_cast_ptr_to_int` asserts a
+        // tagged immediate).
+        let gc_frame = frame as pyre_object::gc_hook::GCREF;
+        pyre_object::gc_hook::try_gc_write_barrier(gc_frame);
+        majit_gc::bh_probe_note_store(gc_frame, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         unsafe {
             (*frame).f_backref = self.topframeref;
         }
@@ -3490,6 +3539,29 @@ pub extern "C" fn call_trace_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFr
     }
 }
 
+/// One-word C-ABI entry for [`ExecutionContext::leave`].
+///
+/// Unique look-inside leftover of portal `RETURN_VALUE` residualizes
+/// `executioncontext.py leave` as `rrri` (ec, frame, exitvalue, got_exception).
+/// `Result<PyObjectRef, PyError>` projects to Ref; `Err` publishes through
+/// [`crate::runtime_ops::jit_publish_residual_error_ref`].
+#[inline(never)]
+pub extern "C" fn leave_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+    w_exitvalue: PyObjectRef,
+    got_exception: i64,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::leave_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::leave(ec, frame, w_exitvalue, got_exception != 0) {
+        Ok(value) => value as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
+    }
+}
+
 /// One-word C-ABI entry for [`ExecutionContext::run_trace_func`].
 ///
 /// Same void-result pairing as [`call_trace_jit_abi`].
@@ -4337,6 +4409,31 @@ mod tests {
         assert!(
             panicked,
             "a vref with no hook must panic, not return the vref as a frame"
+        );
+    }
+
+    #[test]
+    fn vref_referent_is_identity_or_forced_without_forcing() {
+        use super::vref_referent;
+        use majit_metainterp::virtualref::{ObjectHeader, VirtualRefInfo};
+
+        assert!(
+            std::ptr::eq(vref_referent(std::ptr::null_mut()), std::ptr::null_mut()),
+            "null is identity"
+        );
+        let mut header = ObjectHeader { typeptr: 1 };
+        let dummy = &mut header as *mut ObjectHeader as *mut PyFrame;
+        assert!(
+            std::ptr::eq(vref_referent(dummy), dummy),
+            "a non-vref is identity"
+        );
+
+        let info = VirtualRefInfo::new();
+        let forced = 0x1000 as majit_gc::header::GCREF;
+        let vref = info.virtual_ref_during_tracing(forced) as *mut PyFrame;
+        assert!(
+            std::ptr::eq(vref_referent(vref), forced as *mut PyFrame),
+            "a vref names the object stored in `forced`, without calling the hook"
         );
     }
 }

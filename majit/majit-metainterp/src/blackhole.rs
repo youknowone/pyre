@@ -172,6 +172,15 @@ pub struct BhJitDriverSd {
     /// `_handle_jitexception_in_portal` calls it on the driver whose
     /// `mainjitcode` is this frame's jitcode.
     pub handle_jitexc_from_bh: Option<PortalRunnerHook>,
+    /// `jitdriver_sd.virtualizable_info` (`warmspot.py` `vinfos[VTYPEPTR]`).
+    ///
+    /// `blackhole.py bhimpl_getfield_vable_r` reads `fielddescr.get_vinfo()`
+    /// off the FieldDescr, independent of the outer driver's vinfo. Pyre
+    /// serializes vable fields as `VableField { index }`, so recover the
+    /// owner here when `bh.virtualizable_info` is null (a novable driver
+    /// whose jitcode inlined a PyFrame helper). `TraceCtx::vable_descr_owner_info`
+    /// is the tracing-side analog.
+    pub virtualizable_info: Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 }
 
 /// How [`BlackholeInterpreter::run`]'s dispatch loop stopped.
@@ -2181,11 +2190,13 @@ impl BlackholeInterpreter {
             self.last_opcode_position = pos_before;
             if trace {
                 eprintln!(
-                    "[bh-trace] pos={} op={} reg0={} reg1={}",
+                    "[bh-trace] pos={} op={} i0={} i1={} r0={} r1={}",
                     pos_before,
                     opcode,
                     self.registers_i.first().copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
+                    self.registers_r.first().copied().unwrap_or(-1),
+                    self.registers_r.get(1).copied().unwrap_or(-1),
                 );
             }
             match self.dispatch_step(opcode, code) {
@@ -7416,6 +7427,55 @@ mod tests {
             assert_eq!(callee.jitdrivers_sd.len(), parent.jitdrivers_sd.len());
         }
 
+        /// A novable driver (`bh.virtualizable_info` null) still runs
+        /// `getfield_vable_r` when unique look-inside inlined a PyFrame
+        /// helper. `blackhole.py bhimpl_getfield_vable_r` recovers vinfo
+        /// from `fielddescr.get_vinfo()`; pyre keeps the owner on
+        /// `BhJitDriverSd.virtualizable_info` because `VableField { index }`
+        /// dropped the backref. Do not seed `bh.virtualizable_info` itself:
+        /// `BlackholeInterpreter::run` GC-walks `virtualizable_ptr` whenever
+        /// that handle is non-null.
+        #[test]
+        fn novable_getfield_vable_r_resolves_vable_field_via_jitdrivers_sd() {
+            #[repr(C)]
+            struct HostObj {
+                _pad: [u64; 2],
+                pycode: usize,
+            }
+            let mut obj = HostObj {
+                _pad: [0, 0],
+                pycode: 0xABC0_DEF0,
+            };
+            let expected = obj.pycode as i64;
+
+            let mut info = crate::virtualizable::VirtualizableInfo::without_vable_token();
+            info.add_field("pycode", majit_ir::Type::Ref, 16);
+            let info = std::sync::Arc::new(info);
+
+            let cpu = crate::pyjitpl::BackendImpl::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.set_cpu(&cpu);
+            builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
+                virtualizable_info: Some(info),
+                ..Default::default()
+            }]);
+            let table: &'static [BhDescr; 1] =
+                Box::leak(Box::new([BhDescr::VableField { index: 0 }]));
+            builder.setup_descrs(table);
+
+            let mut bh = builder.acquire_interp();
+            assert!(
+                bh.virtualizable_info.is_null(),
+                "novable resume leaves bh.virtualizable_info unset"
+            );
+            bh.registers_r = vec![&mut obj as *mut HostObj as i64, 0];
+            // getfield_vable_r/rd>r: struct reg, 2-byte descr idx, dest reg.
+            let next = handler_getfield_vable_r(&mut bh, &[0, 0, 0, 1], 0)
+                .expect("getfield_vable_r on a novable driver with unique vinfo owner");
+            assert_eq!(next, 4);
+            assert_eq!(bh.registers_r[1], expected);
+        }
+
         /// `handler_abort_marker` defines the pyre
         /// `BC_ABORT` marker semantics.  Reaching `OpKind::Abort` at
         /// runtime sets `aborted = true` and exits the frame —
@@ -10001,7 +10061,7 @@ fn bh_load_ref_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
 #[inline(always)]
 fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     let offset = descr.as_offset();
-    majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
+    majit_gc::bh_probe_note_store(struct_ptr as majit_gc::GCREF, offset, 9);
     // Barrier first, then the (possibly Release) store publishes the
     // pointer — same order as `Backend::bh_setfield_gc_r`.
     // dynasm `bh_setfield_gc_r` / cranelift `write_barrier_if_managed`:
@@ -10168,18 +10228,17 @@ fn read_descr_vable_field(
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
     // Resolve field_index -> byte offset via VirtualizableInfo.  PyPy gets
-    // this from fielddescr.get_vinfo(); pyre stores the equivalent vinfo on
-    // the active blackhole frame, so absence is a contract bug, not a
+    // this from fielddescr.get_vinfo(); pyre recovers the owner through
+    // `vable_descr_owner_info` because `VableField { index }` dropped the
+    // backref. Absence after that lookup is a contract bug, not a
     // byte-offset fallback.
-    let vinfo: &'static crate::virtualizable::VirtualizableInfo = if bh.virtualizable_info.is_null()
-    {
-        panic!(
+    let vinfo: &'static crate::virtualizable::VirtualizableInfo = match vable_descr_owner_info(bh) {
+        ptr if !ptr.is_null() => unsafe { &*ptr },
+        _ => panic!(
             "read_descr_vable_field: virtualizable_info must be set for VableField index {} \
-             (RPython blackhole.py:1446 fielddescr.get_vinfo() parity)",
+                 (RPython `bhimpl_getfield_vable_*` `fielddescr.get_vinfo()` parity)",
             field_index
-        );
-    } else {
-        unsafe { &*bh.virtualizable_info }
+        ),
     };
     (vinfo.bh_static_field_descr(field_index), pos)
 }
@@ -10198,15 +10257,13 @@ fn read_descr_vable_array(
 ) -> (&'static BhDescr, usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let array_index = descr.as_vable_array_index();
-    let vinfo: &'static crate::virtualizable::VirtualizableInfo = if bh.virtualizable_info.is_null()
-    {
-        panic!(
+    let vinfo: &'static crate::virtualizable::VirtualizableInfo = match vable_descr_owner_info(bh) {
+        ptr if !ptr.is_null() => unsafe { &*ptr },
+        _ => panic!(
             "read_descr_vable_array: virtualizable_info must be set for VableArray index {} \
-             (RPython `bhimpl_getarrayitem_vable_*` `fielddescr.get_vinfo()` parity)",
+                 (RPython `bhimpl_getarrayitem_vable_*` `fielddescr.get_vinfo()` parity)",
             array_index
-        );
-    } else {
-        unsafe { &*bh.virtualizable_info }
+        ),
     };
     (vinfo.bh_array_field_descr(array_index), array_index, pos)
 }
@@ -13520,7 +13577,25 @@ fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
     i
 }
 
-bhhandler_r_i!(handler_cast_ptr_to_int, bhimpl_cast_ptr_to_int);
+fn handler_cast_ptr_to_int(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    if a & 1 == 0 {
+        eprintln!(
+            "[bh] cast_ptr_to_int even jitcode={:?} pos={} a={:#x} r0={:#x} r1={:#x}",
+            bh.jitcode.name,
+            bh.last_opcode_position,
+            a as u64,
+            bh.registers_r.first().copied().unwrap_or(-1) as u64,
+            bh.registers_r.get(1).copied().unwrap_or(-1) as u64,
+        );
+    }
+    bh.registers_i[code[position + 1] as usize] = bhimpl_cast_ptr_to_int(a);
+    Ok(position + 2)
+}
 bhhandler_i_r!(handler_cast_int_to_ptr, bhimpl_cast_int_to_ptr);
 /// blackhole.py:
 /// ```python
@@ -13550,7 +13625,19 @@ fn handler_getfield_vable_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_r[code[p] as usize];
+    let struct_reg = code[p] as usize;
+    let struct_ptr = bh.registers_r[struct_reg];
+    if struct_ptr == 0 {
+        eprintln!(
+            "[bh] getfield_vable_i null struct jitcode={:?} pos={} reg={} rlen={} r0={:#x} r1={:#x}",
+            bh.jitcode.name,
+            bh.last_opcode_position,
+            struct_reg,
+            bh.registers_r.len(),
+            bh.registers_r.first().copied().unwrap_or(-1) as u64,
+            bh.registers_r.get(1).copied().unwrap_or(-1) as u64,
+        );
+    }
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
@@ -13646,35 +13733,60 @@ fn handler_setfield_vable_f(
 //   fielddescr.get_vinfo().clear_vable_token(vable)
 //   array = cpu.bh_getfield_gc_r(vable, fielddescr)
 //   return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
-/// Resolve `bh.virtualizable_info` to a non-null reference and clear the
-/// vable token on `vable`.  RPython parity: every
-/// `BlackholeInterpreter.bhimpl_{get,set}field_vable_*` and
-/// `bhimpl_{get,set}arrayitem_vable_*` obtains the vinfo from
+/// Resolve the `VirtualizableInfo` a jitcode vable descriptor belongs to
+/// (`warmspot.py` `vinfos[VTYPEPTR]`; `blackhole.py bhimpl_getfield_vable_r`
+/// `fielddescr.get_vinfo()`).
+///
+/// The serialized `VableField { index }` keeps only the index, so recover
+/// the owner the way `TraceCtx::vable_descr_owner_info` does: the active
+/// frame's `bh.virtualizable_info` if set, else the one vinfo every
+/// `BhJitDriverSd` that has one shares. Null when no driver declares one,
+/// or when drivers declare distinct ones, which an index alone cannot tell
+/// apart. Do not write the recovered pointer onto `bh.virtualizable_info`:
+/// `BlackholeInterpreter::run` GC-walks `virtualizable_ptr` whenever that
+/// handle is non-null, and a novable resume has ptr=0.
+fn vable_descr_owner_info(
+    bh: &BlackholeInterpreter,
+) -> *const crate::virtualizable::VirtualizableInfo {
+    if !bh.virtualizable_info.is_null() {
+        return bh.virtualizable_info;
+    }
+    let mut owners = bh
+        .jitdrivers_sd
+        .iter()
+        .filter_map(|jd| jd.virtualizable_info.as_ref());
+    let Some(first) = owners.next() else {
+        return std::ptr::null();
+    };
+    if owners.all(|info| std::sync::Arc::ptr_eq(info, first)) {
+        std::sync::Arc::as_ptr(first)
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// Resolve the vable-descr owner and clear the token on `vable`.
+/// RPython parity: every `BlackholeInterpreter.bhimpl_{get,set}field_vable_*`
+/// and `bhimpl_{get,set}arrayitem_vable_*` obtains the vinfo from
 /// `fielddescr.get_vinfo()` and clears the token before touching storage.
-/// Pyre stores the same handle on `bh.virtualizable_info` because its
-/// `BhDescr::VableField` and `BhDescr::VableArray` contain only indices into
-/// the vinfo-owned field tables.  Vable opcodes therefore require
-/// `bh.virtualizable_info` to be non-null; an unset pointer means a
-/// builder constructed vable bytecode outside a virtualizable
-/// context — a contract bug that must fail loud in both debug and
-/// release builds, since the alternative is silent unsafe deref of a
-/// null pointer.
+/// Pyre's `BhDescr::VableField` / `VableArray` keep only indices, so the
+/// owner is recovered by [`vable_descr_owner_info`]. A null result means a
+/// builder constructed vable bytecode with no unique owner — a contract bug
+/// that must fail loud in both debug and release builds.
 fn vable_clear_token_and_get_vinfo(
     bh: &BlackholeInterpreter,
     vable: i64,
 ) -> (&'static crate::virtualizable::VirtualizableInfo, i64) {
-    if bh.virtualizable_info.is_null() {
+    let ptr = vable_descr_owner_info(bh);
+    if ptr.is_null() {
         panic!(
             "vable opcode requires `bh.virtualizable_info` to be set \
              (RPython `BlackholeInterpreter.bhimpl_*field_vable_*` parity); \
              a null pointer here is a contract bug, not a recoverable case"
         );
     }
-    let bh_vinfo = unsafe { &*bh.virtualizable_info };
-    // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`;
-    // `bh.virtualizable_info` is that vinfo (the backref `finalize_arc`
-    // stamps on its field descrs points to it), so the token is cleared
-    // on it directly.
+    let bh_vinfo = unsafe { &*ptr };
+    // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`.
     let vable =
         unsafe { crate::virtualizable::bh_clear_vable_token(bh_vinfo, vable as *mut u8) } as i64;
     (bh_vinfo, vable)
@@ -14605,7 +14717,7 @@ fn interpret_unresolved_inline_call(
     if crate::majit_log_enabled() {
         eprintln!(
             "[bh] inline_call interpreting jitcodes[{jitcode_index}] name={:?} \
-             (fnaddr={fnaddr:#x} is not callable)",
+             (fnaddr={fnaddr:#x} is not callable) args_i={args_i_owned:?} args_r={args_r_owned:?}",
             sub_jitcode.name,
         );
     }

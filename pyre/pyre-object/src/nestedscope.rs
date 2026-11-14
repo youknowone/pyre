@@ -122,6 +122,9 @@ impl CellFamily {
 /// address and sweep the quasi-immut watchers of every unrelated cell that
 /// landed on the dummy — a process-wide effect rather than a data race, since
 /// the GIL (`majit-gc` `rgil`) already serialises mutators.
+// `nestedscope.py DUMMY_FAMILY` is a prebuilt module global; the lazy init here
+// is how pyre builds it, and elidable lets the trace fold the read to a constant.
+#[majit_macros::elidable_cannot_raise]
 pub fn dummy_family() -> *const CellFamily {
     static DUMMY_FAMILY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DUMMY_FAMILY.get_or_init(|| {

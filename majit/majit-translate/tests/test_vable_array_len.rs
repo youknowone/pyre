@@ -176,7 +176,7 @@ fn vable_array_never_rides_a_link_out_of_its_defining_block() {
     }
 }
 
-/// `FrameLocalsRoot::new` registers the frame's array **slot** as a GC
+/// `FrameLocalsRoot::register` registers the frame's array **slot** as a GC
 /// root:
 ///
 /// ```ignore

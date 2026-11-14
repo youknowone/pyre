@@ -345,6 +345,7 @@ impl CodeWriter {
             &subjects,
             callcontrol.function_graphs(),
             callcontrol.builtin_wrapper_indirect_graphs(),
+            callcontrol.builtin_fastfunc_2_indirect_graphs(),
             &portals,
             callcontrol.bfs_entry_roots(),
         );

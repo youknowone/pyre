@@ -1242,17 +1242,13 @@ fn real_main() {
                     "generator_frame_is_finished",
                 ]),
                 // SET_ADD's `inline_call` target (`flatten.rs
-                // inline_call_targets::SET_ADD`). `pyopcode.py SET_ADD` is
-                // `space.call_method(w_set, 'add', w_value)`; the exact-set
-                // helper is `opcode_ops::set_add_value`. The portal
-                // residualizes `PyFrame::set_add`, so the portal closure
-                // never names this graph (`call.py`
-                // `CallControl.register_helper_graph` /
-                // `grab_initial_jitcodes`).
+                // inline_call_targets`). The portal residual is
+                // `bh_set_add_fn`; the portal closure never names
+                // `call_method_add`.
                 majit_translate::CallPath::from_segments([
                     "pyre_interpreter",
-                    "opcode_ops",
-                    "set_add_value",
+                    "baseobjspace",
+                    "call_method_add",
                 ]),
                 // Handwritten JUMP_BACKWARD jitcode inline_calls these
                 // (`emit_jump_absolute_tick`); the portal never names them.
@@ -1265,6 +1261,21 @@ fn real_main() {
                     "pyre_jit",
                     "eval",
                     "_get_adapted_tick_counter",
+                ]),
+                // `pyframe.py execute_frame` calls `ec.call_trace` after
+                // `enter`. Unique look-inside of the portal folds
+                // `we_are_jitted()` true onto leftover
+                // `eval_frame_after_enter`, so `find_all_graphs` never
+                // reaches the method. Naming it on `eval_frame_with_resume`
+                // residualizes that graph (`Result` return shell around
+                // `release_recursive_frame`). The inline walker still
+                // walks this body (`walker_walk_call_trace` /
+                // `pyjitpl.py _opimpl_inline_call1`), so seed it like
+                // the other walker-descended helpers.
+                majit_translate::CallPath::from_segments([
+                    "executioncontext",
+                    "ExecutionContext",
+                    "call_trace",
                 ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
@@ -1307,8 +1318,8 @@ fn real_main() {
                 majit_translate::JitDriverSpec {
                     portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
                     portal_runner: Some(majit_translate::CallPath::from_segments([
-                        "call_jit",
-                        "ll_portal_runner_shim",
+                        "call",
+                        "pypyjit_portal_runner",
                     ])),
                     greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
                         .iter()
@@ -1389,6 +1400,27 @@ fn real_main() {
                     // `rewrite_jit_merge_point` leaves the original as the
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
+                    extends: None,
+                },
+                majit_translate::JitDriverSpec {
+                    // listobject.py `sortkey_jmp`. greens strategy_type+tp,
+                    // reds='auto'. Source-split like unpackiterable_portal.
+                    portal: majit_translate::CallPath::from_segments([
+                        "builtins",
+                        "sortkey_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_sortkey_portal_runner_shim",
+                    ])),
+                    greens: vec!["strategy_type".to_string(), "tp".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    split_portal: false,
                     extends: None,
                 },
             ],

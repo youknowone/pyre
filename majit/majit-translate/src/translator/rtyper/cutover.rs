@@ -2484,15 +2484,15 @@ fn canonical_dedup_key(
 /// Why a funcobj under the canonical path `canonical_strip` gets no
 /// registry entry: its callsites resolve elsewhere.
 pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
-    // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
-    // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
-    // `pyre_object.lltype` module). Their real bodies enter the host
-    // allocator (`malloc_typed` first reads the un-flowable
-    // `<T as GcType>::type_id()` trait accessor), so lifting either records
-    // a poison lift-error that surfaces on the first boxing caller. Skip
-    // registering it as a user function: with no registry entry, callsites
-    // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
-    // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+    // `pyre_object::lltype::malloc[_typed/_stable/_young_nonmoving]` are GC
+    // allocation intrinsics, recognised as host builtins (annotator
+    // `malloc_typed_alloc`, HOST_ENV `pyre_object.lltype` module). Their real
+    // bodies enter the host allocator (`malloc_typed` first reads the
+    // un-flowable `<T as GcType>::type_id()` trait accessor), so lifting
+    // either records a poison lift-error that surfaces on the first boxing
+    // caller. Skip registering it as a user function: with no registry entry,
+    // callsites resolve to the HOST_ENV builtin (translate_op Layer-3b)
+    // instead of this failed user-graph entry (Layer-1 `call_registry.lookup`).
     //
     // `fuse_boxing_alloc` now derives every payload from the registered
     // struct layout and rewrites a proven `malloc[_typed](T { ... })`
@@ -2501,13 +2501,14 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     // is still not a residual boundary: it means the frontend could not
     // prove the allocation header/type identity.  The fail-closed guard in
     // `flowspace_adapter::translate_op` therefore rejects every surviving
-    // `malloc`, `malloc_typed`, `malloc_typed_managed`, or
-    // `malloc_typed_stable` call instead of
+    // `malloc`, `malloc_typed`, `malloc_typed_managed`,
+    // `malloc_typed_stable`, or `malloc_typed_young_nonmoving` call instead of
     // emitting an executable symbolic fnaddr.
     if canonical_strip == ["lltype", "malloc"]
         || canonical_strip == ["lltype", "malloc_typed"]
         || canonical_strip == ["lltype", "malloc_typed_managed"]
         || canonical_strip == ["lltype", "malloc_typed_stable"]
+        || canonical_strip == ["lltype", "malloc_typed_young_nonmoving"]
     {
         return Some("skip-malloc-typed-intrinsic");
     }
@@ -6438,6 +6439,7 @@ pub(crate) fn run_two_phase_prepass(
         candidate_graphs,
         function_graphs,
         &[],
+        &[],
         portals,
         &[],
     );
@@ -6445,13 +6447,16 @@ pub(crate) fn run_two_phase_prepass(
 
 /// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
 /// `CallControl::builtin_wrapper_indirect_graphs` already unioned into
-/// the subject set by `CodeWriter::run_two_phase_prepass`, and the
+/// the subject set by `CodeWriter::run_two_phase_prepass`, the
+/// `BuiltinCode.fastfunc_2` PBC family
+/// (`CallControl::builtin_fastfunc_2_indirect_graphs`), and the
 /// BFS seed graphs (`find_all_graphs_bfs` todo) as entry roots.
 pub(crate) fn run_two_phase_prepass_with_wrappers(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    fastfunc_2_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     entry_roots: &[crate::parse::CallPath],
 ) {
@@ -6461,6 +6466,7 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
             candidate_graphs,
             function_graphs,
             builtin_wrapper_graphs,
+            fastfunc_2_graphs,
             portals,
             entry_roots,
         )
@@ -7311,6 +7317,7 @@ fn run_two_phase_prepass_inner(
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    fastfunc_2_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     entry_roots: &[crate::parse::CallPath],
 ) {
@@ -7541,7 +7548,8 @@ fn run_two_phase_prepass_inner(
     }
     let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); leftover_paths.len()];
     for (caller_i, caller) in leftover_paths.iter().enumerate() {
-        let callees = function_graphs.body_call_callees(caller, builtin_wrapper_graphs);
+        let callees =
+            function_graphs.body_call_callees(caller, builtin_wrapper_graphs, fastfunc_2_graphs);
         let mut seen: HashSet<usize> = HashSet::new();
         for callee in callees {
             let Some(&callee_i) = leftover_index.get(&callee) else {

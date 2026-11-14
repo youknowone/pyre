@@ -3084,6 +3084,7 @@ impl<'a> Lowering<'a> {
                         )));
                     }
                 }
+                self.graph.inherit_inputarg_concretetypes(tgt, &outputargs);
                 self.graph.block_mut(bb_id).exits[idx].args = outputargs;
             }
         }

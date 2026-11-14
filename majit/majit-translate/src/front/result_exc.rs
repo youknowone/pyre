@@ -2701,8 +2701,9 @@ fn lower_result_exc_returns_inner(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close` residual) and FrameAnchor closes are re-emitted
-        // at the raise site rather than left in a tail the rewrite bypasses.
+        // `root_scope_close` residual) and FrameAnchor closes are
+        // re-emitted at the raise site rather than left in a tail the
+        // rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
@@ -8506,6 +8507,9 @@ fn clone_result_hops(
     let mut pending: Option<(crate::model::BlockId, Vec<LinkArg>)> = None;
     for (index, hop) in hops.iter().enumerate() {
         let (id, inputs) = graph.create_block_with_arg_vars(hop.inputargs.len());
+        for (from, to) in hop.inputargs.iter().zip(inputs.iter()) {
+            copy_concretetype(from, to);
+        }
         if first.is_none() {
             first = Some(id);
         }
@@ -8525,6 +8529,7 @@ fn clone_result_hops(
             };
             let result = op.result.as_ref().map(|_| graph.alloc_value_var());
             if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                copy_concretetype(old, fresh);
                 map.push((old.clone(), fresh.clone()));
             }
             graph.blocks[id.0]

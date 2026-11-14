@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
 use majit_charon_reader::ullbc::{Signature, TyRef, TypeDecl, TypeDeclKind, duplicate_return};
-use majit_charon_reader::{FunDecl, Llbc, Unstructured};
+use majit_charon_reader::{FunDecl, FunSrc, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -544,7 +544,7 @@ pub(crate) fn generic_args_lists(generics: &Value) -> (Vec<Value>, Vec<Value>) {
 }
 
 /// `generics.types` / `generics.const_generics` when neither list contains
-/// a depth-0 type or const-generic variable. `None` leaves the callee
+/// a free caller type or const-generic variable. `None` leaves the callee
 /// unspecialized.
 pub(crate) fn concrete_type_args(
     generics: &Value,
@@ -554,7 +554,7 @@ pub(crate) fn concrete_type_args(
     let open = |items: &[Value], space: Space| {
         items
             .iter()
-            .any(|item| contains_depth0_var(item, llbc, space, None, 0))
+            .any(|item| contains_free_arg_var(item, llbc, space, None, 0, &mut Vec::new()))
     };
     if open(&types, Space::Ty) || open(&const_generics, Space::Const) {
         return None;
@@ -660,19 +660,111 @@ pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64
     trait_impl_id(&resolved, llbc, 0)
 }
 
-/// The impl method a resolved trait call names, plus the `trait_refs`
-/// that instantiate that method. `None` when the ref is still a clause.
+/// FunDecl `src` has a `TraitDefault` key. Charon lists an inherited
+/// default on the impl `methods` row; that listing is not an override.
+pub(crate) fn is_trait_default_decl(llbc: &Llbc, fn_id: u64) -> bool {
+    llbc.fn_by_id(fn_id)
+        .is_some_and(|fd| matches!(fd.src, Some(FunSrc::TraitDefault)))
+}
+
+/// The impl's own override a resolved trait call names, plus the
+/// `trait_refs` that instantiate that method. `None` when the ref is
+/// still a clause, or when the listed row is an inherited default
+/// ([`trait_default_method`] owns that graph; `description.py`
+/// `FunctionDesc.cachedgraph` keys a provided method by the trait
+/// instantiation, not the impl parameter list).
 pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Value)> {
     let arr = payload.as_array()?;
     let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
     let impl_id = trait_impl_id(&resolved, llbc, 0)?;
     let method_idx = arr.get(1)?.as_u64()?;
     let fn_id = impl_method_fn_id(llbc, impl_id, method_idx)?;
+    if is_trait_default_decl(llbc, fn_id) {
+        return None;
+    }
     let generics = resolved
         .pointer("/kind/TraitImpl/generics")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
     Some((fn_id, generics))
+}
+
+/// The inherited default body a resolved trait call names, plus the concrete
+/// arguments for that body's trait-and-method binder. An overriding impl
+/// method stays on [`trait_impl_method`]; an unresolved `Clause` stays `None`.
+///
+/// Charon's default FunDecl is bound by the trait parameters (`Self` first),
+/// then the method parameters. Its first trait clause is the `Self: Trait`
+/// proof; method clauses follow. Build that same key before either lowering
+/// or analysis selects the graph (`description.py` `FunctionDesc.cachedgraph`;
+/// `graphanalyze.py` `GraphAnalyzer.analyze_direct_call`).
+pub(crate) fn trait_default_method(
+    payload: &Value,
+    method_generics: &Value,
+    llbc: &Llbc,
+) -> Option<(u64, Value)> {
+    let arr = payload.as_array()?;
+    let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
+    let impl_id = trait_impl_id(&resolved, llbc, 0)?;
+    let method_idx = arr.get(1)?.as_u64()?;
+    let listed_fn_id = impl_method_fn_id(llbc, impl_id, method_idx);
+    if listed_fn_id.is_some_and(|fn_id| !is_trait_default_decl(llbc, fn_id)) {
+        return None;
+    }
+    let trait_id = trait_decl_pred(&resolved)?.get("id")?.as_u64()?;
+    let default_fn_id = llbc
+        .trait_by_id(trait_id)?
+        .methods
+        .get(method_idx as usize)?
+        .default_id?;
+    let fn_id = match listed_fn_id {
+        Some(listed) if listed != default_fn_id => listed,
+        _ => default_fn_id,
+    };
+
+    // The resolved ref's generics instantiate the impl declaration. Apply
+    // them to `impl_trait` to recover the concrete `Self` and trait args;
+    // passing the impl declaration's own generics directly would bind the
+    // default FunDecl to the wrong parameter space.
+    let impl_row = llbc.trait_impls_raw().get(impl_id as usize)?;
+    let impl_generics = resolved.pointer("/kind/TraitImpl/generics")?;
+    let impl_trait_refs = concrete_trait_refs_or_empty(impl_generics, llbc)?;
+    let (impl_types, impl_consts) = concrete_type_args(impl_generics, llbc)?;
+    let mut trait_generics = impl_row.pointer("/impl_trait/generics")?.clone();
+    substitute_type_vars(&mut trait_generics, llbc, &impl_types, &impl_consts);
+    substitute_clauses(&mut trait_generics, llbc, &impl_trait_refs);
+
+    let mut out = serde_json::Map::new();
+    for key in ["types", "const_generics"] {
+        let mut items = trait_generics
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(method_items) = method_generics.get(key).and_then(Value::as_array) {
+            items.extend(method_items.iter().cloned());
+        }
+        out.insert(key.to_string(), Value::Array(items));
+    }
+    let mut trait_refs = vec![resolved];
+    trait_refs.extend(
+        trait_generics
+            .get("trait_refs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    trait_refs.extend(
+        method_generics
+            .get("trait_refs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    out.insert("trait_refs".to_string(), Value::Array(trait_refs));
+    Some((fn_id, Value::Object(out)))
 }
 
 /// The impl's own body for the trait's `method_idx`-th method. Each impl
@@ -716,10 +808,58 @@ fn ref_class(v: &Value, llbc: &Llbc, depth: usize) -> RefClass {
     if kind.get("ParentClause").is_some() {
         return match resolve_trait_ref(v, llbc, depth) {
             Some(resolved) => ref_class(&resolved, llbc, depth + 1),
-            None => RefClass::Other,
+            None => {
+                // Open parent impl (caller `Clause` or a free type
+                // variable): an inherited ref that depends on the
+                // caller's clauses is refused by
+                // `concrete_trait_refs_or_empty`. Malformed / not-found
+                // stays Other.
+                if parent_clause_is_open(v, llbc, depth) {
+                    RefClass::Clause
+                } else {
+                    RefClass::Other
+                }
+            }
         };
     }
     RefClass::Other
+}
+
+/// True when `resolve_trait_ref` returned None because the parent impl's
+/// generics are still open, not because the ParentClause is malformed.
+fn parent_clause_is_open(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+    let Some(obj) = unwrap_ref(v, llbc, depth) else {
+        return false;
+    };
+    let Some(pair) = obj
+        .get("kind")
+        .and_then(|kind| kind.get("ParentClause"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(parent_ref) = pair.first() else {
+        return false;
+    };
+    let resolved_parent = resolve_trait_ref(parent_ref, llbc, depth + 1);
+    let parent = resolved_parent.as_ref().unwrap_or(parent_ref);
+    let Some(inner) = unwrap_ref(parent, llbc, depth + 1) else {
+        return false;
+    };
+    let Some(kind) = inner.get("kind") else {
+        return false;
+    };
+    if kind.get("Clause").is_some() {
+        return true;
+    }
+    let Some(generics) = kind
+        .get("TraitImpl")
+        .and_then(|impl_| impl_.get("generics"))
+    else {
+        return false;
+    };
+    concrete_trait_refs_or_empty(generics, llbc).is_none()
+        || concrete_type_args(generics, llbc).is_none()
 }
 
 fn trait_impl_id(v: &Value, llbc: &Llbc, depth: usize) -> Option<u64> {
@@ -747,7 +887,24 @@ fn resolve_trait_ref(v: &Value, llbc: &Llbc, depth: usize) -> Option<Value> {
         .get(impl_id as usize)?
         .get("implied_trait_refs")?
         .as_array()?;
-    resolve_trait_ref(implied.get(index)?, llbc, depth + 1)
+    // FunctionDesc.cachedgraph (description.py) selects the concrete callee;
+    // an impl's inherited proof is a template in that impl's parameters.
+    let generics = parent_ref.pointer("/kind/TraitImpl/generics")?;
+    let refs = concrete_trait_refs_or_empty(generics, llbc)?;
+    let (types, consts) = concrete_type_args(generics, llbc)?;
+    let mut inherited = implied.get(index)?.clone();
+    subst_vars(
+        &mut inherited,
+        llbc,
+        &types,
+        &consts,
+        Space::TraitRef,
+        None,
+        0,
+        0,
+    );
+    substitute_clauses_at(&mut inherited, llbc, &refs, Space::TraitRef, None, 0, 0);
+    resolve_trait_ref(&inherited, llbc, depth + 1)
 }
 
 /// A trait ref behind its `Deduplicated` / `Value` hash-cons wrapper
@@ -1111,6 +1268,79 @@ fn is_open_var(v: &Value, space: Space, key: Option<&str>) -> bool {
             .first()
             .and_then(Value::as_object)
             .is_some_and(|obj| obj.contains_key("Var"))
+}
+
+/// FunctionDesc.cachedgraph / specialize_argtype: a closed trait-object type
+/// is a concrete argument even though its own binder declares a Self type.
+/// Only this argument check distinguishes local binders; substitution's
+/// contains_depth0_var must still expose every variable in a shared node.
+fn contains_free_arg_var(
+    v: &Value,
+    llbc: &Llbc,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+    binders: &mut Vec<(usize, usize)>,
+) -> bool {
+    if depth > 64 {
+        return true;
+    }
+    if is_open_var(v, space, key) {
+        let var = v
+            .get("TypeVar")
+            .or_else(|| v.get("kind").and_then(|kind| kind.get("Var")))
+            .or_else(|| v.as_array()?.first()?.get("Var"));
+        let Some(var) = var else {
+            return true;
+        };
+        if var.get("Free").is_some() {
+            return true;
+        }
+        let Some((distance, index)) = debruijn_var(var) else {
+            return true;
+        };
+        let binding = usize::try_from(distance)
+            .ok()
+            .and_then(|d| d.checked_add(1))
+            .and_then(|d| binders.len().checked_sub(d))
+            .and_then(|i| binders.get(i));
+        return binding.is_none_or(|&(types, consts)| {
+            index
+                >= if v.get("TypeVar").is_some() {
+                    types
+                } else {
+                    consts
+                }
+        });
+    }
+    if let Some(body) = indirect_body(v, llbc, space) {
+        return contains_free_arg_var(&body, llbc, space, None, depth + 1, binders);
+    }
+    match v {
+        Value::Array(items) => items.iter().enumerate().any(|(i, item)| {
+            contains_free_arg_var(item, llbc, space.element(key, i), None, depth + 1, binders)
+        }),
+        Value::Object(map) => {
+            let binder = is_poly_binder(map);
+            if binder {
+                let count = |key: &str| {
+                    map.get("params")
+                        .and_then(|p| p.get(key))
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                };
+                binders.push((count("types"), count("const_generics")));
+            }
+            let open = map.iter().any(|(k, item)| {
+                contains_free_arg_var(item, llbc, space.field(k), Some(k), depth + 1, binders)
+            });
+            if binder {
+                binders.pop();
+            }
+            open
+        }
+        _ => false,
+    }
 }
 
 fn contains_depth0_var(
@@ -1890,6 +2120,100 @@ mod tests {
             br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[],"files":[]}}"#,
         )
         .expect("empty llbc")
+    }
+
+    #[test]
+    fn parent_clause_instantiates_impl_arguments() {
+        let poly = |v: Value| json!({"regions": [], "skip_binder": v});
+        let concrete_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let concrete = poly(json!({"kind": {"TraitImpl": {"id": 1, "generics": {
+            "types": [concrete_ty], "const_generics": [usize_const("4")], "trait_refs": []
+        }}}}));
+        let clause = |d| poly(json!({"kind": {"Clause": [{"Bound": [d, 0]}, {"regions": []}]}}));
+        let inherited = poly(json!({"kind": {"TraitImpl": {"id": 1, "generics": {
+            "types": [{"TypeVar": {"Bound": [1, 0]}}],
+            "const_generics": [[{"Var": {"Bound": [1, 0]}}, {"Scalar": {"Integer": {"Unsigned": "Usize"}}}]],
+            "trait_refs": [clause(2)]
+        }}}}));
+        // `impl_method_fn_id` reads `Llbc::trait_impl_methods`. That table
+        // is harvested at deserialize (`TraitImplRow`) and `methods` is
+        // stripped from the JSON row.
+        let llbc = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "c",
+                    "fun_decls": [],
+                    "files": [],
+                    "trait_impls": [
+                        {"implied_trait_refs": [clause(1), inherited]},
+                        {"methods": [{"kind": {"TraitMethod": [10, 0]}, "skip_binder": {"id": 42}}]}
+                    ]
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("fixture llbc");
+        let templates = llbc.file.translated.trait_impls.clone();
+        let parent = |index, proof: Value| {
+            json!([
+                {"kind": {"ParentClause": [poly(json!({"kind": {"TraitImpl": {
+                    "id": 0, "generics": {"types": [concrete_ty], "const_generics": [usize_const("4")], "trait_refs": [proof]}
+                }}})), index, {"regions": []}]}}, 0
+            ])
+        };
+        for index in [0, 1] {
+            let payload = parent(index, concrete.clone());
+            let (target, args) =
+                trait_impl_method(&payload, &llbc).expect("concrete inherited method");
+            assert_eq!(target, 42);
+            assert_eq!(args["types"], json!([concrete_ty]));
+            assert_eq!(args["const_generics"], json!([usize_const("4")]));
+            if index == 1 {
+                assert_eq!(args["trait_refs"], json!([concrete]));
+            }
+        }
+        assert!(trait_impl_method(&parent(0, clause(1)), &llbc).is_none());
+        assert_eq!(llbc.file.translated.trait_impls, templates);
+    }
+
+    #[test]
+    fn concrete_type_args_accepts_only_locally_bound_dyn_variables() {
+        let llbc = empty_llbc();
+        let dyn_ty = |var: Value| {
+            json!({"Value": [20, {"DynTrait": {"binder": {
+                "kind": "Dyn",
+                "params": {"types": [{"index": 0, "name": "_dyn"}], "const_generics": [],
+                    "trait_clauses": [{"trait_": {"regions": [], "skip_binder": {
+                        "id": 0, "generics": {"types": [{"Value": [21, var]}]}
+                    }}}]},
+                "skip_binder": {"Value": [22, {"TypeVar": {"Bound": [0, 0]}}]}
+            }}}]})
+        };
+        let closed = dyn_ty(json!({"TypeVar": {"Bound": [1, 0]}}));
+        assert!(concrete_type_args(&json!({"types": [closed]}), &llbc).is_some());
+        for var in [
+            json!({"TypeVar": {"Bound": [2, 0]}}),
+            json!({"TypeVar": {"Bound": [1, 1]}}),
+            json!({"TypeVar": {"Free": 0}}),
+        ] {
+            assert!(concrete_type_args(&json!({"types": [dyn_ty(var)]}), &llbc).is_none());
+        }
+        let region_only = json!({"regions": [], "skip_binder": {"TypeVar": {"Bound": [0, 0]}}});
+        assert!(concrete_type_args(&json!({"types": [region_only]}), &llbc).is_none());
+        assert!(
+            concrete_type_args(
+                &json!({"const_generics": [[{"Var": {"Bound": [0, 0]}}, {}]]}),
+                &llbc
+            )
+            .is_none()
+        );
+        assert!(
+            contains_depth0_var(&closed, &llbc, Space::Ty, None, 0),
+            "substitution must still expose local variables"
+        );
     }
 
     fn usize_const(n: &str) -> Value {

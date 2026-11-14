@@ -81,10 +81,15 @@ impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
+impl ResidualRet for crate::PyError {}
 
-/// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
-/// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
-/// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
+/// `RecursionDepthGuard` is `#[repr(transparent)]` over one `usize` token.
+impl ResidualSlot for crate::call::RecursionDepthGuard {}
+impl ResidualRet for crate::call::RecursionDepthGuard {}
+
+/// Word-ABI bridges for `majit_gc::shadow_stack::{push,get,try_pop_to}`.
+/// `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so each of
+/// the raw functions is `(usize) -> usize`, `(usize) -> usize` and
 /// `(usize) -> ()` — and `usize` is 32-bit on wasm32.  A residual call whose
 /// descr types are all words lowers to an in-module `(i64xn) -> i64` (or
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
@@ -134,10 +139,131 @@ extern "C" fn shadow_stack_slot_word() -> i64 {
     shadow_stack_slot_as_raw(majit_gc::shadow_stack::shadow_stack_slot())
 }
 
-/// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
+/// Residual ABI of `wtf8_key_is_utf8`: the name is rstr `Ptr(STR)` (one
+/// word), not a fat `&Wtf8`. Unique look-inside of `space.getattr`
+/// (`pyopcode.py LOAD_ATTR` `space.getattr`) executes this live; the fat
+/// pointer would read a second word the residual slot never wrote and
+/// send identifier names down `getattr_surrogate`.
+unsafe fn wtf8_key_is_utf8_str(
+    name: *const pyre_object::unicodeobject::UnicodeValueStorage,
+) -> bool {
+    std::str::from_utf8(unsafe { pyre_object::unicodeobject::utf8_payload_bytes(name) }).is_ok()
+}
+
+/// Residual ABI of `instance_node_getdictvalue_checked`: the name is
+/// rstr `Ptr(STR)` (one word), not a fat `&Wtf8`, and the result is the
+/// Ok payload (`Option<PyObjectRef>` as one ref, null = None). Err is
+/// `BH_LAST_EXC_VALUE` (`dont_look_inside_return_token` / `ResidualError`).
+/// Unique look-inside of `getattr_str_instance` (`mapdict.py
+/// MapdictDictSupport.getdictvalue`) leftover `residual_call_r_r` executes
+/// this live.
+unsafe fn instance_node_getdictvalue_checked_str(
+    obj: pyre_object::PyObjectRef,
+    name: *const pyre_object::unicodeobject::UnicodeValueStorage,
+) -> pyre_object::PyObjectRef {
+    match unsafe {
+        crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
+            obj,
+            pyre_object::unicodeobject::utf8_payload_wtf8(name),
+        )
+    } {
+        Ok(Some(value)) => value,
+        Ok(None) => pyre_object::PY_NULL,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
+/// Residual ABI of `module_dict_entries_get` (`celldict.py`
+/// `_getdictvalue_no_unwrapping_pure` `unerase(w_dict.dstorage).get(key)`).
+/// The native item takes fat `&str`; unique look-inside leftover
+/// `residual_call_r_r` passes rstr `Ptr(STR)` (`llmodel.py bh_call_r`).
+/// `look_inside_iff` declined (`rordereddict.py ll_dict_lookup`) residualizes
+/// the orig at this name (`mint_look_inside_iff`); this trampoline is that orig.
+unsafe fn module_dict_entries_get_str(
+    entries: *const pyre_object::celldict::ModuleDictEntries,
+    key: *const pyre_object::unicodeobject::UnicodeValueStorage,
+) -> pyre_object::PyObjectRef {
+    if entries.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    pyre_object::celldict::module_dict_entries_get(unsafe { &*entries }, unsafe {
+        core::str::from_utf8_unchecked(pyre_object::unicodeobject::utf8_payload_bytes(key))
+    })
+    .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// Residual ABI of leftover `opcode_build_tuple` (`pyopcode.py BUILD_TUPLE`).
+/// The helper is generic over `SharedOpcodeHandler`; only `PyFrame`
+/// implements it. Unique look-inside of the portal leftover `residual_call`
+/// with arg classes `ri` (frame, itemcount) executes this live. `Result<(),
+/// PyError>` projects to void; Err is `BH_LAST_EXC_VALUE`.
+fn opcode_build_tuple_pyframe(frame: &mut crate::pyframe::PyFrame, size: usize) {
+    if let Err(error) = crate::shared_opcode::opcode_build_tuple(frame, size) {
+        let _ = crate::runtime_ops::jit_publish_residual_error(error);
+    }
+}
+
+/// Residual `look_inside_iff` trampoline (`rlib/jit.py`, `rlist.py
+/// _ll_alloc_and_set_nonnull`) returns the raw three-word Vec header
+/// (`Ptr(Struct(raw) {ptr, len, cap})`, `history.getkind` int). Native
+/// `ll_vec_alloc_and_set_nonnull_*` returns `Vec<T>` by value; leftover
+/// unique look-inside residual is `ir>i` / `ii>i` / `if>i`.
+fn rust_vec_into_raw_header<T>(mut v: Vec<T>) -> i64 {
+    let header = majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char(
+        majit_ir::rvec::VEC_HEADER_WORDS * std::mem::size_of::<usize>(),
+    );
+    if header == 0 {
+        return 0;
+    }
+    unsafe {
+        let p = header as *mut usize;
+        *p.add(majit_ir::rvec::VEC_CAP_WORD) = v.capacity();
+        *p.add(majit_ir::rvec::VEC_PTR_WORD) = v.as_mut_ptr() as usize;
+        *p.add(majit_ir::rvec::VEC_LEN_WORD) = v.len();
+    }
+    std::mem::forget(v);
+    header as i64
+}
+
+fn residual_repeat_count(count: i64) -> usize {
+    if count < 0 { 0 } else { count as usize }
+}
+
+extern "C" fn ll_vec_alloc_and_set_nonnull_r_word(count: i64, item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::ll_vec_alloc_and_set_nonnull_r_word");
+    let v = majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r(
+        residual_repeat_count(count),
+        item as usize as majit_gc::GCREF,
+    );
+    rust_vec_into_raw_header(v)
+}
+
+extern "C" fn ll_vec_alloc_and_set_nonnull_i_word(count: i64, item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::ll_vec_alloc_and_set_nonnull_i_word");
+    let v = majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i(
+        residual_repeat_count(count),
+        item as usize,
+    );
+    rust_vec_into_raw_header(v)
+}
+
+extern "C" fn ll_vec_alloc_and_set_nonnull_f_word(count: i64, item: f64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::ll_vec_alloc_and_set_nonnull_f_word");
+    let v = majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f(
+        residual_repeat_count(count),
+        item,
+    );
+    rust_vec_into_raw_header(v)
+}
+
+/// Word ABI for `majit_gc::bh_probe_note_store(GCREF, usize, u32)`; the
 /// interpreter's traced frame-enter paths call it beside the write barrier.
 extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
-    majit_gc::bh_probe_note_store(obj as usize, offset as usize, site as u32);
+    majit_gc::bh_probe_note_store(
+        obj as usize as majit_gc::GCREF,
+        offset as usize,
+        site as u32,
+    );
 }
 
 /// One-word residual ABI for `w_list_pop_end`. Empty is NULL; the generated
@@ -916,6 +1042,20 @@ pub mod word_publish {
         }
         fn into_reg(self) -> i64 {
             self.as_raw() as usize as i64
+        }
+    }
+    impl WordAbi for crate::call::RecursionDepthGuard {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            crate::call::RecursionDepthGuard::from_residual_word(reg as usize)
+        }
+        fn into_reg(self) -> i64 {
+            let word = self.residual_word() as i64;
+            // The token names a live TLS restore record; dropping here would
+            // pop it before the unique-look-inside dest holds the guard.
+            std::mem::forget(self);
+            word
         }
     }
 
@@ -2378,6 +2518,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     crate::gateway::for_each_builtin_wrapper_descriptor(|wrapper| {
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     });
+    crate::gateway::for_each_builtin_fastfunc_2_descriptor(|descr| {
+        push_abi_unsound_fnaddr(&mut entries, descr.path, descr.func as *const ());
+    });
 
     // `type_object()` accessors are `dont_look_inside` (`majit-translate`
     // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
@@ -2646,9 +2789,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
     );
-    // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
-    // The graph is `set_add_value`; this bridge is the one-word address
-    // blackhole calls.
+    // SET_ADD flatten target is `call_method_add`; this bridge is the
+    // fold / `set_add_value` residual address.
     cp2!(
         &mut entries,
         "pyre_interpreter::opcode_ops::set_add_value",
@@ -2680,6 +2822,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value",
         pyframe_load_name_value_word,
+    );
+    // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+    // The graph is `call_method_add`; this bridge is the one-word address
+    // blackhole calls.
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::call_method_add",
+        crate::opcode_ops::jit_baseobjspace_call_method_add,
     );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
@@ -3261,14 +3411,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
     // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
     // `wtf8_surrogate_key_str_object` wraps the cold lone-surrogate
-    // `to_wtf8_buf` + `w_str_from_wtf8` into one objectptr call.
-    // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
+    // `to_wtf8_buf` + `w_str_from_wtf8` into one objectptr call. The
+    // residual name is rstr `Ptr(STR)`; unique look-inside executes the
+    // STR trampoline (`wtf8_key_is_utf8_str`).
+    upa1!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_object::dictmultiobject::wtf8_key_is_utf8",
         "pyre_object::wtf8_key_is_utf8",
-        pyre_object::dictmultiobject::wtf8_key_is_utf8 as *const (),
+        wtf8_key_is_utf8_str,
     );
     // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
     push_abi_unsound_argument_alias_pair(
@@ -3372,6 +3522,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
         "celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
         module_dict_getdictvalue_no_unwrapping_pure_word,
+    );
+    // Unique look-inside of `_getdictvalue_no_unwrapping_pure` promotes
+    // then leftover-calls the look_inside_iff-declined probe
+    // (`rordereddict.py ll_dict_lookup`). Native `&str` is fat; residual
+    // key is rstr `Ptr(STR)`. `look_inside_iff` keeps the orig at this
+    // name (`mint_look_inside_iff`); the sibling impl-method orig spelling
+    // is `_orig_<name>_unlikely_name` and is not used here. Crate-stripped
+    // `celldict::…` is the `register_macro_helper_trace_fnaddr` alias, not
+    // a hand-listed `{module}::{leaf}` next to `{crate}::{leaf}`.
+    upa2!(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_get",
+        "pyre_object::module_dict_entries_get",
+        module_dict_entries_get_str,
     );
     // The uncached arm's thin-pointer twins (`lookup_where_pair` under the
     // JIT): a boxed name in, a raw pointer (null for `None`) out.
@@ -3772,14 +3936,57 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_portal_call_3",
         crate::importing::jit_portal_call_3,
     );
-    // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
-    // unpublished so the `_initializing` read was a symbolic residual.
-    push_abi_unsound_argument_alias_pair(
+    // `getdictvalue` mapdict arm: already `#[dont_look_inside]`. The
+    // leftover residual is rstr `Ptr(STR)` (`getattr_str_instance`
+    // `Wtf8::new(name)` identity-aliases); unique look-inside executes
+    // the STR trampoline (`instance_node_getdictvalue_checked_str`).
+    upa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
         "pyre_interpreter::instance_node_getdictvalue_checked",
-        crate::objspace::std::mapdict::instance_node_getdictvalue_checked as *const (),
+        instance_node_getdictvalue_checked_str,
+    );
+    // Unique look-inside leftover of `BUILD_TUPLE` (`pyopcode.py BUILD_TUPLE`)
+    // is the generic `opcode_build_tuple`; only `PyFrame` implements
+    // `SharedOpcodeHandler`.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::shared_opcode::opcode_build_tuple",
+        "pyre_interpreter::opcode_build_tuple",
+        opcode_build_tuple_pyframe,
+    );
+    // Unique look-inside leftover of `look_inside_iff` (`rlib/jit.py`)
+    // declined `ll_vec_alloc_and_set_nonnull_*` (`rlist.py
+    // _ll_alloc_and_set_nonnull`) residualizes the minted trampoline.
+    // Native returns `Vec<T>` by value; leftover is `ir>i` / `ii>i` /
+    // `if>i` (`bh_call_i_by_classes`).
+    cpa2!(
+        &mut entries,
+        "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+        "lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+        ll_vec_alloc_and_set_nonnull_r_word,
+    );
+    cpa2!(
+        &mut entries,
+        "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+        "lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+        ll_vec_alloc_and_set_nonnull_i_word,
+    );
+    cpa2!(
+        &mut entries,
+        "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+        "lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+        ll_vec_alloc_and_set_nonnull_f_word,
+    );
+    // Unique look-inside leftover of CALL (`baseobjspace.py call_function`)
+    // residualizes `dont_look_inside` `call_non_function_callable_with_mode`
+    // as `rrrir>r`. The raw item takes `&[PyObjectRef]` plus `CallMode`;
+    // leftover is the GcArray word trampoline.
+    cpa5!(
+        &mut entries,
+        "pyre_interpreter::call::call_non_function_callable_with_mode",
+        "pyre_interpreter::call_non_function_callable_with_mode",
+        crate::call::call_non_function_callable_with_mode_jit_abi,
     );
     // The same shape over four more runtime-mutable cells:
     // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
@@ -3932,16 +4139,30 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::may_ignore_finalizer",
         crate::executioncontext::may_ignore_finalizer,
     );
-    // `vref_referent` is `dont_look_inside` (`virtualref.py is_virtual_ref`
-    // plus `return vref.forced`): the typeptr test is not LLBC, and a
-    // non-pure `getfield_raw_r` of `forced` is refused
-    // (`jtransform.py rewrite_op_getfield`). Publish so the residual on
-    // the enter-chain identity residual is a real address.
-    pa1!(
+    // `vref_referent` is `dont_look_inside_cannot_raise` so the tracer does
+    // not walk `ptr_is_virtual_ref` (unbound `majit-metainterp` path). Bind
+    // the word-ABI bridge under every spelling the codewriter hashes.
+    cpa1!(
         &mut entries,
         "pyre_interpreter::executioncontext::vref_referent",
         "pyre_interpreter::vref_referent",
-        crate::executioncontext::vref_referent,
+        crate::executioncontext::vref_referent_jit_abi,
+    );
+    cp1!(
+        &mut entries,
+        "executioncontext::vref_referent",
+        crate::executioncontext::vref_referent_jit_abi,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::executioncontext::pin_frame_across_topframeref_barrier",
+        "pyre_interpreter::pin_frame_across_topframeref_barrier",
+        crate::executioncontext::pin_frame_across_topframeref_barrier_jit_abi,
+    );
+    cp2!(
+        &mut entries,
+        "executioncontext::pin_frame_across_topframeref_barrier",
+        crate::executioncontext::pin_frame_across_topframeref_barrier_jit_abi,
     );
     // `rgc.FinalizerQueue.register_finalizer` is `@jit.dont_look_inside`
     // too; the same publication makes its residual call real.
@@ -3978,6 +4199,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::clear_references",
         crate::pyframe::PyFrame::clear_references,
+    );
+    // Unique look-inside of the portal residualizes `PyFrame::_load_fast_failed`
+    // (`pyopcode.py PyFrame._load_fast_failed`, `@dont_inline`). The leftover
+    // CallPath is the impl-method key; arg classes `ri` (frame + varindex).
+    p2!(
+        &mut entries,
+        "pyframe::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
+    );
+    p2!(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
+    );
+    p2!(
+        &mut entries,
+        "pyre_interpreter::PyFrame::_load_fast_failed",
+        crate::pyframe::PyFrame::_load_fast_failed,
     );
     p1!(
         &mut entries,
@@ -5806,11 +6045,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::ExecutionContext::run_trace_func",
         crate::executioncontext::run_trace_func_jit_abi,
     );
-    pa1!(
+    cpa4!(
         &mut entries,
-        "pyre_interpreter::executioncontext::execution_context_root_stack_slot_get",
-        "pyre_interpreter::execution_context_root_stack_slot_get",
-        crate::executioncontext::execution_context_root_stack_slot_get,
+        "executioncontext::ExecutionContext::leave",
+        "pyre_interpreter::executioncontext::ExecutionContext::leave",
+        crate::executioncontext::leave_jit_abi,
+    );
+    cp4!(
+        &mut entries,
+        "pyre_interpreter::ExecutionContext::leave",
+        crate::executioncontext::leave_jit_abi,
     );
     pa1!(
         &mut entries,
@@ -6052,6 +6296,30 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::call::take_last_exec_ctx",
         crate::call::take_last_exec_ctx,
+    );
+    // `dont_look_inside` Python-frame half of `rstack.py stack_check`.
+    // Unique look-inside leftover of `enter_recursive_frame` is `r>i`
+    // (`RecursionDepthGuard` is one usize); `release_recursive_frame`
+    // is Drop and the explicit leftover Call in `eval_frame_with_resume`.
+    // Native `frame as usize` stays out of jitcode so
+    // `blackhole.py bhimpl_cast_ptr_to_int` never sees a heap GCREF.
+    pa1!(
+        &mut entries,
+        "call::enter_recursive_frame",
+        "pyre_interpreter::call::enter_recursive_frame",
+        crate::call::enter_recursive_frame,
+    );
+    pa0!(
+        &mut entries,
+        "call::enter_native_dispatch",
+        "pyre_interpreter::call::enter_native_dispatch",
+        crate::call::enter_native_dispatch,
+    );
+    pa1!(
+        &mut entries,
+        "call::release_recursive_frame",
+        "pyre_interpreter::call::release_recursive_frame",
+        crate::call::release_recursive_frame,
     );
     // `take_pending_hash_error` deliberately remains unpublished: it returns
     // an error as a value, so routing it through `BH_LAST_EXC_VALUE` would
@@ -7834,12 +8102,12 @@ mod tests {
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
         pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
-        shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        shadow_stack_push_word, shadow_stack_try_pop_to_word, slot_from_cached_word,
+        switch_to_correct_strategy_word, unicode_dict_getitem_str_hashed_word,
+        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
+        w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7893,7 +8161,6 @@ mod tests {
     fn is_abi_unsound_argument_residual_matches_the_published_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         for path in [
-            "pyre_object::dictmultiobject::wtf8_key_is_utf8",
             "pyre_object::wtf8_surrogate_key_str_object",
             "pyre_interpreter::host_seam::emit_stdout",
             "emit_stdout",
@@ -7903,6 +8170,99 @@ mod tests {
                 "{path} is published with an argument wider than a residual slot"
             );
         }
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_object::dictmultiobject::wtf8_key_is_utf8"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_object::wtf8_key_is_utf8"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked"]
+                as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_interpreter::instance_node_getdictvalue_checked"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_interpreter::shared_opcode::opcode_build_tuple"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_interpreter::opcode_build_tuple"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_object::celldict::module_dict_entries_get"] as usize
+        ));
+        let r_word = super::ll_vec_alloc_and_set_nonnull_r_word as *const () as usize as i64;
+        let i_word = super::ll_vec_alloc_and_set_nonnull_i_word as *const () as usize as i64;
+        let f_word = super::ll_vec_alloc_and_set_nonnull_f_word as *const () as usize as i64;
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+            r_word,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+            r_word,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+            i_word,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+            f_word,
+        );
+        assert!(!is_abi_unsound_argument_residual(r_word as usize));
+        assert!(!is_abi_unsound_argument_residual(i_word as usize));
+        assert!(!is_abi_unsound_argument_residual(f_word as usize));
+        let call_non_fn =
+            crate::call::call_non_function_callable_with_mode_jit_abi as *const () as usize as i64;
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::call::call_non_function_callable_with_mode",
+            call_non_fn,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::call_non_function_callable_with_mode",
+            call_non_fn,
+        );
+        assert!(!is_abi_unsound_argument_residual(call_non_fn as usize));
+        let entries_get_trampoline =
+            super::module_dict_entries_get_str as *const () as usize as i64;
+        let entries_get_raw =
+            pyre_object::celldict::module_dict_entries_get as *const () as usize as i64;
+        assert_occupied_binding(
+            &bindings,
+            "pyre_object::celldict::module_dict_entries_get",
+            entries_get_trampoline,
+        );
+        assert_ne!(
+            entries_get_trampoline, entries_get_raw,
+            "must not publish the fat-&str item"
+        );
+        let build_tuple_trampoline = super::opcode_build_tuple_pyframe as *const () as usize as i64;
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::shared_opcode::opcode_build_tuple",
+            build_tuple_trampoline,
+        );
+        let getdictvalue_trampoline =
+            super::instance_node_getdictvalue_checked_str as *const () as usize as i64;
+        let getdictvalue_raw = crate::objspace::std::mapdict::instance_node_getdictvalue_checked
+            as *const () as usize as i64;
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
+            getdictvalue_trampoline,
+        );
+        assert_ne!(
+            getdictvalue_trampoline, getdictvalue_raw,
+            "must not publish the fat-&Wtf8 item"
+        );
         assert!(!is_abi_unsound_argument_residual(
             bindings["pyre_object::dictmultiobject::w_dict_len"] as usize
         ));
@@ -7946,6 +8306,31 @@ mod tests {
             );
         }
         assert!(!is_abi_unsound_argument_residual(0));
+    }
+
+    /// Residual trampoline of `look_inside_iff` declined
+    /// `ll_vec_alloc_and_set_nonnull_r` (`rlist.py _ll_alloc_and_set_nonnull`)
+    /// returns a raw header at `majit_ir::rvec` word indices, not a rustc
+    /// `Vec` by value.
+    #[test]
+    fn ll_vec_alloc_and_set_nonnull_r_word_returns_raw_header() {
+        let item = 0x11usize as majit_gc::GCREF;
+        let header = super::ll_vec_alloc_and_set_nonnull_r_word(3, item as usize as i64);
+        assert_ne!(header, 0);
+        let header = header as usize;
+        unsafe {
+            let p = header as *const usize;
+            assert_eq!(*p.add(majit_ir::rvec::VEC_LEN_WORD), 3);
+            assert!(*p.add(majit_ir::rvec::VEC_CAP_WORD) >= 3);
+            let items = *p.add(majit_ir::rvec::VEC_PTR_WORD) as *const usize;
+            assert_eq!(*items, 0x11);
+            assert_eq!(*items.add(1), 0x11);
+            assert_eq!(*items.add(2), 0x11);
+            let cap = *p.add(majit_ir::rvec::VEC_CAP_WORD);
+            let len = *p.add(majit_ir::rvec::VEC_LEN_WORD);
+            let _ = Vec::from_raw_parts(items as *mut majit_gc::GCREF, len, cap);
+            majit_rlib::lltypesystem::rffi::raw_free(header);
+        }
     }
 
     /// `#[getfunctionptr]` publishes the word-ABI trampoline, not the raw
@@ -8344,8 +8729,12 @@ mod tests {
                 "majit_gc::shadow_stack::try_pop_to",
                 shadow_stack_try_pop_to_word as *const () as usize as i64,
             ),
+            (
+                "majit_gc::shadow_stack::slot_from_cached",
+                slot_from_cached_word as *const () as usize as i64,
+            ),
         ] {
-            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert_occupied_binding(&bindings, path, expected);
         }
     }
 
@@ -8366,6 +8755,8 @@ mod tests {
             unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::get")) };
         let try_pop_to: extern "C" fn(i64) =
             unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::try_pop_to")) };
+        let slot_from_cached: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::slot_from_cached")) };
 
         // A word that is not a live object: these three only move it between
         // the stack and the caller.
@@ -8375,6 +8766,11 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+
+        // Zero falls back to the TLS cell; a cached word is that same pointer.
+        let resolved = slot_from_cached(0);
+        assert_ne!(resolved, 0, "TLS slot is never a zero word");
+        assert_eq!(slot_from_cached(resolved), resolved);
     }
 
     #[test]
@@ -8844,6 +9240,10 @@ mod tests {
                 finditem_str_named_word as *const () as usize as i64,
             ),
             (
+                "pyre_interpreter::baseobjspace::call_method_add",
+                crate::opcode_ops::jit_baseobjspace_call_method_add as *const () as usize as i64,
+            ),
+            (
                 "pyre_interpreter::builtins::try_hash_value",
                 crate::opcode_ops::jit_builtins_try_hash_value as *const () as usize as i64,
             ),
@@ -8857,6 +9257,7 @@ mod tests {
             crate::executioncontext::call_trace_jit_abi as *const () as usize as i64;
         let run_trace_func_shim =
             crate::executioncontext::run_trace_func_jit_abi as *const () as usize as i64;
+        let leave_shim = crate::executioncontext::leave_jit_abi as *const () as usize as i64;
         let bytecode_only_trace_raw: fn(
             &mut crate::executioncontext::ExecutionContext,
             *mut crate::PyFrame,
@@ -8870,9 +9271,17 @@ mod tests {
             &mut crate::executioncontext::ExecutionContext,
             *mut crate::PyFrame,
         ) -> Result<(), crate::PyError> = crate::executioncontext::ExecutionContext::run_trace_func;
+        let leave_raw: fn(
+            &mut crate::executioncontext::ExecutionContext,
+            *mut crate::PyFrame,
+            pyre_object::PyObjectRef,
+            bool,
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> =
+            crate::executioncontext::ExecutionContext::leave;
         let bytecode_only_trace_raw = bytecode_only_trace_raw as *const () as usize as i64;
         let call_trace_raw = call_trace_raw as *const () as usize as i64;
         let run_trace_func_raw = run_trace_func_raw as *const () as usize as i64;
+        let leave_raw = leave_raw as *const () as usize as i64;
         for (path, expected, raw) in [
             (
                 "executioncontext::ExecutionContext::bytecode_only_trace",
@@ -8919,6 +9328,21 @@ mod tests {
                 run_trace_func_shim,
                 run_trace_func_raw,
             ),
+            (
+                "executioncontext::ExecutionContext::leave",
+                leave_shim,
+                leave_raw,
+            ),
+            (
+                "pyre_interpreter::executioncontext::ExecutionContext::leave",
+                leave_shim,
+                leave_raw,
+            ),
+            (
+                "pyre_interpreter::ExecutionContext::leave",
+                leave_shim,
+                leave_raw,
+            ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
             assert_ne!(
@@ -8926,6 +9350,25 @@ mod tests {
                 Some(raw),
                 "{path} must not publish the raw Result method"
             );
+        }
+    }
+
+    #[test]
+    fn enter_recursive_frame_residual_is_the_native_function() {
+        let bindings: std::collections::HashMap<&'static str, i64> =
+            jit_trace_fnaddrs().into_iter().collect();
+        let enter = crate::call::enter_recursive_frame as *const () as usize as i64;
+        let native = crate::call::enter_native_dispatch as *const () as usize as i64;
+        let release = crate::call::release_recursive_frame as *const () as usize as i64;
+        for (path, fallback) in [
+            ("call::enter_recursive_frame", enter),
+            ("pyre_interpreter::call::enter_recursive_frame", enter),
+            ("call::enter_native_dispatch", native),
+            ("pyre_interpreter::call::enter_native_dispatch", native),
+            ("call::release_recursive_frame", release),
+            ("pyre_interpreter::call::release_recursive_frame", release),
+        ] {
+            assert_occupied_binding(&bindings, path, fallback);
         }
     }
 
@@ -9650,6 +10093,32 @@ mod tests {
         );
     }
 
+    /// Every `BUILTIN_FASTFUNC_2_DESCRIPTORS` member must carry the
+    /// `__majit_fastfunc_2_` leaf.  That prefix is how
+    /// `CallControl::compute_builtin_fastfunc_2_indirect_graphs` populates the
+    /// `BuiltinCode.fastfunc_2` PBC family.
+    #[test]
+    fn every_builtin_fastfunc_2_descriptor_carries_the_family_prefix() {
+        let mut stray: Vec<&str> = Vec::new();
+        crate::gateway::for_each_builtin_fastfunc_2_descriptor(|descr| {
+            stray.push(descr.path);
+        });
+        let stray: Vec<&str> = stray
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf.starts_with("__majit_fastfunc_2_"))
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "these fastfunc_2 descriptors cannot join the BuiltinCode.fastfunc_2 PBC \
+             family, so they get no jitcode: {stray:?}",
+        );
+    }
+
     #[test]
     fn jit_trace_fnaddrs_covers_w_code_get_w_globals() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
@@ -9955,6 +10424,22 @@ mod tests {
             clear_references
         );
 
+        let load_fast_failed: fn(&crate::pyframe::PyFrame, usize) -> crate::PyError =
+            crate::pyframe::PyFrame::_load_fast_failed;
+        let load_fast_failed = load_fast_failed as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyframe::PyFrame::_load_fast_failed"],
+            load_fast_failed
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyframe::PyFrame::_load_fast_failed"],
+            load_fast_failed
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::PyFrame::_load_fast_failed"],
+            load_fast_failed
+        );
+
         let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
         let get_exc = occupied_published_addr(
             "pyre_interpreter::eval::get_current_exception",
@@ -10143,6 +10628,36 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
+    }
+
+    /// `vref_referent` is opaque so the tracer does not residualize
+    /// `ptr_is_virtual_ref`. Every spelling the codewriter hashes must bind
+    /// the word-ABI bridge, not a symbolic path hash.
+    #[test]
+    fn jit_trace_fnaddrs_covers_vref_referent() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let fallback = crate::executioncontext::vref_referent_jit_abi as *const () as usize as i64;
+        for path in [
+            "pyre_interpreter::executioncontext::vref_referent",
+            "pyre_interpreter::vref_referent",
+            "executioncontext::vref_referent",
+        ] {
+            assert_occupied_binding(&bindings, path, fallback);
+        }
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_pin_frame_across_topframeref_barrier() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let fallback = crate::executioncontext::pin_frame_across_topframeref_barrier_jit_abi
+            as *const () as usize as i64;
+        for path in [
+            "pyre_interpreter::executioncontext::pin_frame_across_topframeref_barrier",
+            "pyre_interpreter::pin_frame_across_topframeref_barrier",
+            "executioncontext::pin_frame_across_topframeref_barrier",
+        ] {
+            assert_occupied_binding(&bindings, path, fallback);
+        }
     }
 
     /// `w_float_gc_alloc` is `dont_look_inside`; a typo in either spelling
