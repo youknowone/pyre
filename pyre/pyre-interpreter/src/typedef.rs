@@ -16714,7 +16714,7 @@ pub fn __majit_wrap_type_descr_set_name(
             "can only assign string to ",
             unsafe { pyre_object::w_type_get_name(w_type) },
             ".__name__, not '",
-            type_name_of(w_value),
+            crate::error::type_name_str(w_value),
             "'"
         )));
     }

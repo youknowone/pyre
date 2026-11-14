@@ -1551,7 +1551,7 @@ impl PyError {
                 message.push_str(&fmt[start..i]);
                 match c {
                     b'T' => {
-                        message.push_str(&type_name_of(x0 as PyObjectRef));
+                        message.push_str(type_name_str(x0 as PyObjectRef));
                         count += 1;
                     }
                     b's' => {
@@ -6287,22 +6287,27 @@ fn format_obj_name(obj: PyObjectRef) -> Wtf8Buf {
     }
 }
 
-/// `space.type(w_obj).getname(space)` — the `%T` spelling.
+/// `space.type(w_obj).name` — the `%T` spelling (`error.py`). rstr; no copy.
 ///
 /// The Python-visible type, which is `w_class`; `ob_type` names the storage a
 /// value is laid out as, and a class deriving from a builtin shares its
 /// storage while presenting its own name.
-pub fn type_name_of(w_obj: PyObjectRef) -> String {
+pub fn type_name_str(w_obj: PyObjectRef) -> &'static str {
     // A tagged int immediate is an exact builtin int; skip the ob_type deref.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
-        return "int".to_string();
+        return "int";
     }
     unsafe {
         match crate::typedef::r#type(w_obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*w_obj).ob_type).name.to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()),
+            None => (*(*w_obj).ob_type).name,
         }
     }
+}
+
+/// Owned copy of [`type_name_str`] for callers that format into a `String`.
+pub fn type_name_of(w_obj: PyObjectRef) -> String {
+    type_name_str(w_obj).to_string()
 }
 
 /// `oefmt(space.w_<kind>, valuefmt)` with no argument, for the builtin class
@@ -6487,7 +6492,7 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -
             ('T', FmtArg::Obj(_)) => {
                 let obj = _roots.get(next_obj_slot);
                 next_obj_slot += 1;
-                message.push_str(&type_name_of(obj));
+                message.push_str(type_name_str(obj));
             }
             ('N', FmtArg::Obj(_)) => {
                 let obj = _roots.get(next_obj_slot);
