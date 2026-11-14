@@ -3795,6 +3795,8 @@ impl<M: Clone> MetaInterp<M> {
         ) {
             let mut attrs = tt.attrs();
             if let Some(virtual_state) = attrs.virtual_state.as_mut() {
+                // Node intern is `NotVirtualStateInfo.constbox`. The retained
+                // list is short-preamble intern the node does not hold.
                 virtual_state.walk_const_ptr_refs_mut(visitor);
                 virtual_state.trace_const_ptr_indexes(visitor);
             }
@@ -31819,9 +31821,7 @@ mod tests {
         let dead = GcRef(0x90_0000_D001);
         let live = GcRef(0x90_0000_D002);
         let (_const_ref, index, _restore) = intern_const_ptr(dead);
-        let mut vs =
-            VirtualState::new(vec![VirtualStateInfo::Constant(majit_ir::Value::Ref(dead))]);
-        vs.retain_const_ptr_indexes(&[index]);
+        let vs = VirtualState::new(vec![VirtualStateInfo::Constant(majit_ir::Value::Ref(dead))]);
 
         let pred_tt = crate::history::TargetToken::new_loop(13);
         pred_tt.attrs().virtual_state = Some(vs);
