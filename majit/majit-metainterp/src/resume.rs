@@ -5366,7 +5366,7 @@ mod tests {
             None,
             None, // all_virtuals
             &NullAllocator,
-            None,
+            Some(&rd_numb),
         );
 
         assert_eq!(virtualizable_ptr, 0);
@@ -5410,6 +5410,7 @@ mod tests {
             None,
             &NullAllocator,
         );
+        reader.resumecodereader.bind_numbering(&rd_numb);
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
     }
 
@@ -5465,7 +5466,7 @@ mod tests {
                 None,
                 all_virtuals,
                 &NullAllocator,
-                None,
+                Some(&rd_numb),
             )
         };
 
@@ -5534,7 +5535,7 @@ mod tests {
             None, // ginfo
             None, // all_virtuals
             &NullAllocator,
-            None,
+            Some(&rd_numb),
         );
         (virtualizable_ptr, bh.registers_r[0])
     }

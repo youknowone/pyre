@@ -1935,10 +1935,8 @@ impl BlackholeInterpreter {
         let mut regs_i = self.registers_i.as_mut_ptr();
         let mut regs_r = self.registers_r.as_mut_ptr();
         loop {
-            // `dispatch_loop` is `while True:` over `ord(code[position])`:
-            // a jitcode leaves through a `*_return` handler or an exception,
-            // and reading past its last byte is an error.
-            assert!(
+            // `dispatch_loop` is `while True:` over `ord(code[position])`.
+            debug_assert!(
                 position < code.len(),
                 "dispatch_loop: position {position} is past the end of jitcode {:?} index {:?}",
                 self.jitcode.name,
@@ -1953,7 +1951,10 @@ impl BlackholeInterpreter {
                     self.jitcode.try_index(),
                 );
             }
-            // SAFETY: `position < code.len()` just held.
+            // SAFETY: a well-formed jitcode ends in a `*_return`/raise/jump
+            // opcode (`assembler.py` `Assembler.assemble`), so `position`
+            // never runs past `code.len()`; `debug_assert!` checks it in
+            // debug builds.
             let opcode = unsafe { *code.get_unchecked(position) };
             let pos_before = position;
             position += 1;

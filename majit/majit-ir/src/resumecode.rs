@@ -359,9 +359,20 @@ impl<'a> Reader<'a> {
     }
 
     /// `numb_next_item` after `bind_numbering` / `from_numbering`.
+    /// An empty numbering never reaches this path.
     #[inline(always)]
     pub fn next_item_bound(&mut self) -> i32 {
-        self.next_item()
+        let addr = self.code.0;
+        debug_assert!(self.bound && addr != 0);
+        // SAFETY: `bind_numbering` stored a live `NUMBERING` payload;
+        // `resumecode.py` `numb_next_item` indexes `numb.code` from that
+        // pointer. An empty numbering never reaches this path.
+        let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
+        #[cfg(debug_assertions)]
+        let len = unsafe { *(addr as *const usize) };
+        #[cfg(not(debug_assertions))]
+        let len = 0usize;
+        self.take_item(ptr, len)
     }
 
     /// resumecode.py: peek
