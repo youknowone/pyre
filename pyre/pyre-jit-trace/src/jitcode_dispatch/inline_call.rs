@@ -5532,10 +5532,37 @@ unsafe fn fbw_reorder_call_kw_args(
     if kwnames.is_null() || !unsafe { pyre_object::is_tuple(kwnames) } {
         return None;
     }
+    // `w_tuple_getitem` on a specialised tuple allocates. Pin kwnames,
+    // the callee code, the receiver, and the remaining arg Refs before
+    // those reads (`gctransform/shadowstack.py` `push_roots`).
+    let kw_roots = pyre_object::gc_roots::push_roots();
+    let mut pin_vals = vec![kwnames, w_code as pyre_object::PyObjectRef];
+    let recv_pin = if let Some((_, ConcreteValue::Ref(r))) = receiver {
+        pin_vals.push(r);
+        Some(pin_vals.len() - 1)
+    } else {
+        None
+    };
+    let mut arg_pins: Vec<Option<usize>> = vec![None; arg_concretes.len()];
+    for (i, c) in arg_concretes.iter().enumerate() {
+        if let ConcreteValue::Ref(obj) = *c {
+            pin_vals.push(obj);
+            arg_pins[i] = Some(pin_vals.len() - 1);
+        }
+    }
+    let kw_base = kw_roots.pin_roots(&pin_vals);
+    let live_ref = |off: usize| kw_roots.get(kw_base + off);
+    let kwnames = live_ref(0);
+    let w_code = live_ref(1) as *const ();
+    let receiver = match (receiver, recv_pin) {
+        (Some((op, ConcreteValue::Ref(_))), Some(off)) => {
+            Some((op, ConcreteValue::Ref(live_ref(off))))
+        }
+        (other, _) => other,
+    };
     let args = &r_args[3..];
-    let arg_conc = &arg_concretes[3..];
     let nargs = args.len();
-    if arg_conc.len() != nargs {
+    if arg_concretes.len().saturating_sub(3) != nargs {
         return None;
     }
     let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
@@ -5574,16 +5601,23 @@ unsafe fn fbw_reorder_call_kw_args(
     let extras = Vec::new();
     let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
     let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
+    let mut slot_pin: Vec<Option<usize>> = vec![None; nparams];
     if let Some((receiver_arg, receiver_concrete)) = receiver {
         slot_args[0] = Some(receiver_arg);
         slot_conc[0] = Some(receiver_concrete);
+        slot_pin[0] = recv_pin;
     }
     for k in 0..n_pos {
         let pi = receiver_count + k;
         slot_args[pi] = Some(args[k]);
-        slot_conc[pi] = Some(arg_conc[k]);
+        slot_conc[pi] = Some(match (arg_concretes[3 + k], arg_pins[3 + k]) {
+            (ConcreteValue::Ref(_), Some(off)) => ConcreteValue::Ref(live_ref(off)),
+            (other, _) => other,
+        });
+        slot_pin[pi] = arg_pins[3 + k];
     }
     for j in 0..nkw {
+        let kwnames = live_ref(0);
         let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
         if !unsafe { pyre_object::is_str(name_obj) } {
             return None;
@@ -5591,12 +5625,17 @@ unsafe fn fbw_reorder_call_kw_args(
         let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
             .as_str()
             .ok()?;
+        let w_code = live_ref(1) as *const ();
+        let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+        if raw.is_null() {
+            return None;
+        }
         let posonly = unsafe { (*raw).posonlyarg_count } as usize;
         // A keyword naming no parameter — or, under PEP 570, naming a
         // positional-only one — goes to the `**kwargs` mapping when the callee
         // has one (`_match_signature`); without it the call is a TypeError the
         // interpreter reports.
-        let pi = varnames[..nparams]
+        let pi = unsafe { &(*raw).varnames }[..nparams]
             .iter()
             .position(|v| v.as_str() == name)
             .filter(|&pi| pi >= posonly);
@@ -5615,13 +5654,22 @@ unsafe fn fbw_reorder_call_kw_args(
             return None;
         }
         slot_args[pi] = Some(args[n_pos + j]);
-        slot_conc[pi] = Some(arg_conc[n_pos + j]);
+        let arg_i = 3 + n_pos + j;
+        slot_conc[pi] = Some(match (arg_concretes[arg_i], arg_pins[arg_i]) {
+            (ConcreteValue::Ref(_), Some(off)) => ConcreteValue::Ref(live_ref(off)),
+            (other, _) => other,
+        });
+        slot_pin[pi] = arg_pins[arg_i];
     }
     let mut out_args = Vec::with_capacity(nparams);
     let mut out_conc = Vec::with_capacity(nparams);
     for k in 0..nparams {
         out_args.push(slot_args[k].unwrap_or(OpRef::NONE));
-        out_conc.push(slot_conc[k].unwrap_or(ConcreteValue::Null));
+        let conc = match slot_pin[k] {
+            Some(off) => ConcreteValue::Ref(live_ref(off)),
+            None => slot_conc[k].unwrap_or(ConcreteValue::Null),
+        };
+        out_conc.push(conc);
     }
     Some((out_args, out_conc, extras))
 }
@@ -6518,7 +6566,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             }
         }
     }
-    let ConcreteValue::Ref(callable) = arg_concretes[0] else {
+    let ConcreteValue::Ref(mut callable) = arg_concretes[0] else {
         decline!("callable slot carries no concrete ref");
     };
     if callable.is_null() || (callable as usize) % std::mem::align_of::<usize>() != 0 {
@@ -6538,7 +6586,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // module aliases in random.py) arrive as `[Method, PY_NULL, args...]`, so
     // recover its immutable function/receiver fields and feed the same
     // method-form callee shape used by LOAD_METHOD.
-    let bound_method = if !method_form && unsafe { pyre_object::is_method(callable) } {
+    let mut bound_method = if !method_form && unsafe { pyre_object::is_method(callable) } {
         let function = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable) };
         if function.is_null() || receiver.is_null() {
@@ -6590,12 +6638,58 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         }
     };
     // `w_tuple_getitem` on a specialised tuple (CALL_FUNCTION_EX) and on
-    // `kwnames` (CALL_KW) allocates. Pin the callee and its nursery-born
-    // `W_Code` before those reads (`gctransform/shadowstack.py` `push_roots`).
+    // `kwnames` (CALL_KW) allocates. Pin the callee, its nursery-born
+    // `W_Code`, every Ref argument, and the bound-method receiver before
+    // those reads (`gctransform/shadowstack.py` `push_roots`).
+    let mut pin_vals = vec![resolved_callable, w_code as pyre_object::PyObjectRef];
+    let mut arg_pin_off = Vec::with_capacity(arg_concretes.len());
+    for c in &arg_concretes {
+        if let ConcreteValue::Ref(obj) = *c {
+            arg_pin_off.push(Some(pin_vals.len()));
+            pin_vals.push(obj);
+        } else {
+            arg_pin_off.push(None);
+        }
+    }
+    let bound_recv_off = bound_method.map(|bound| {
+        let off = pin_vals.len();
+        pin_vals.push(bound.receiver);
+        off
+    });
     let callee_roots = pyre_object::gc_roots::push_roots();
-    let callee_base =
-        callee_roots.pin_roots(&[resolved_callable, w_code as pyre_object::PyObjectRef]);
+    let callee_base = callee_roots.pin_roots(&pin_vals);
+    // After a collecting call, reload arg Refs, the bound-method
+    // function/receiver, and the CALL callable (`instance_call_pin`).
+    let reload_pinned_call_refs =
+        |arg_concretes: &mut [ConcreteValue],
+         bound_method: &mut Option<BoundMethodInline>,
+         instance_call_pin: &mut Option<ExceptionInlineReceiverGuard>,
+         callable: &mut pyre_object::PyObjectRef| {
+            for (c, off) in arg_concretes.iter_mut().zip(arg_pin_off.iter()) {
+                if let Some(off) = *off {
+                    *c = ConcreteValue::Ref(callee_roots.get(callee_base + off));
+                }
+            }
+            if let Some(bound) = bound_method.as_mut() {
+                bound.function = callee_roots.get(callee_base);
+                if let Some(off) = bound_recv_off {
+                    bound.receiver = callee_roots.get(callee_base + off);
+                }
+            }
+            if let ConcreteValue::Ref(r) = arg_concretes[0] {
+                *callable = r;
+            }
+            if let Some((_, inst_callable, ..)) = instance_call_pin {
+                *inst_callable = *callable;
+            }
+        };
     w_code = callee_roots.get(callee_base + 1) as *const ();
+    reload_pinned_call_refs(
+        &mut arg_concretes,
+        &mut bound_method,
+        &mut instance_call_pin,
+        &mut callable,
+    );
     if fbw_inline_diag_enabled() {
         // Name the callee: a pc alone does not say which function a decline
         // cost, and one trace reaches several.
@@ -6615,6 +6709,12 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let mut star_args = None;
     let mut star_kwargs = None;
     let mut varkw_extra = Vec::new();
+    reload_pinned_call_refs(
+        &mut arg_concretes,
+        &mut bound_method,
+        &mut instance_call_pin,
+        &mut callable,
+    );
     let (callee_args, callee_arg_concretes) = if is_call_kw {
         // A keyword call folds its `kwnames`->parameter permutation at trace
         // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
@@ -6700,6 +6800,12 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     };
     resolved_callable = callee_roots.get(callee_base);
     w_code = callee_roots.get(callee_base + 1) as *const ();
+    reload_pinned_call_refs(
+        &mut arg_concretes,
+        &mut bound_method,
+        &mut instance_call_pin,
+        &mut callable,
+    );
     try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
@@ -17760,13 +17866,22 @@ fn descend_generatorentry<Sym: WalkSym>(
     let mut live = pin.live_clone(&typed_key);
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
+        let mut warm = driver
+            .meta_interp_mut()
+            .warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX);
         pin.reload(&mut live);
-        crate::genentry_state::genentry_resolved_cell_key(
-            &driver
-                .meta_interp_mut()
-                .warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX),
+        match crate::genentry_state::genentry_resolved_cell_key(
+            &warm,
             pin.get() as pyre_object::PyObjectRef,
-        )
+        ) {
+            Some(key) => key,
+            None => {
+                // `warmstate.py get_assembler_token` /
+                // `ensure_jit_cell_at_key`: a miss creates the cell.
+                pin.reload(&mut live);
+                warm.ensure_cell_key(&pin, &mut live)
+            }
+        }
     };
     let (driver, _) = crate::driver::driver_pair();
     pin.reload(&mut live);
@@ -18967,8 +19082,9 @@ fn walk_generator_resume<Sym: WalkSym>(
     };
     // This walk frame's own pycode (`MIFrame.setup(jitcode)`). Nested
     // helper / Python-callee frames do not inherit it: they pass 0 or
-    // store their own code on their `WalkFrameStateData`.
-    let inline_w_code = resume.w_pycode;
+    // store their own code on their `WalkFrameStateData`. Read the live
+    // address from `code_root` at subwalk setup, after register-bank
+    // allocation and the collecting intern/hash below.
     ctx.fbw_mode.generator_resume = Some(resume);
     let ec_box = ctx
         .trace_ctx
@@ -19153,7 +19269,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 &[],
                 &[],
                 &extra_ref_seeds,
-                inline_w_code,
+                pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
                 SubwalkFrameKind::PythonPortal(portal_site),
             );
             // `opimpl_jit_merge_point` (`portal_call_depth != 0`):
@@ -19297,6 +19413,10 @@ fn walk_generator_resume<Sym: WalkSym>(
                     super::portal_assembler_token(pin.save(), target_pc, is_being_profiled)
                 }
             };
+            // `portal_assembler_token` / `get_uhash` can collect. Reload
+            // `code_root` before the recorder publishes it
+            // (`gctransform/shadowstack.py`).
+            let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
             // `do_recursive_call` records CALL_ASSEMBLER in `_send_ex`,
             // after `finishframe` popped only the portal. Pass the generator
             // so GUARD_NOT_FORCED / GUARD_NO_EXCEPTION capture that tail

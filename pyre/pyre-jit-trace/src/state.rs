@@ -3829,7 +3829,10 @@ pub(crate) fn note_root_trace_too_long(
                 .disable_noninlinable_function_for_key(&pin, &mut live);
             // pyjitpl.py, read by `aborted_tracing`'s `on_trace_abort`.
             meta.aborted_tracing_jitdriver = Some(jd_no);
-            meta.aborted_tracing_greenkey = Some(huge_key);
+            // pyjitpl.py `self.aborted_tracing_greenkey = greenkey_of_huge_function`
+            // holds the greenkey boxes the GC traces. Store the pin-reloaded
+            // key; `disable_noninlinable_function_for_key` may have moved it.
+            meta.aborted_tracing_greenkey = Some((huge_key.0, live));
             // pyjitpl.py `blackhole_if_trace_too_long`:
             // `warmrunnerstate = self.jitdriver_sd.warmstate` then
             // `JitCell.trace_next_iteration` on the outermost merge key.

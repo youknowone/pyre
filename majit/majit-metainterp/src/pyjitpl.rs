@@ -5404,12 +5404,12 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(key) = closed {
             let pin = crate::warmstate::GreenRefPin::pin(&key);
             let mut live = pin.live_clone(&key);
-            return self.cell_key_for_typed_or_installed(
-                compiling_jd,
-                outer_green_key,
-                &pin,
-                &mut live,
-            );
+            // `compile.py` `compile_loop` files `original_boxes[:num_green_args]`
+            // of the closing merge. Resolve B's greens for B
+            // (`cell_key_for_typed`); the `installed` shortcut is
+            // `bound_reached`'s cell for the greens being resolved, not a
+            // bridge that started at A and closed at B.
+            return self.cell_key_for_typed(compiling_jd, &pin, &mut live);
         }
         if let Some(inner) = cut_inner_green_key {
             let pin = crate::warmstate::GreenRefPin::pin(inner);
@@ -7717,17 +7717,6 @@ impl<M: Clone> MetaInterp<M> {
             let pin = crate::warmstate::GreenRefPin::pin_slices(green_values, &spec);
             let mut live = majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone());
             pin.reload(&mut live);
-            let greenboxes: Vec<Value> = live
-                .values
-                .iter()
-                .zip(live.types.iter())
-                .map(|(&value, kind)| match majit_ir::green_type_to_ir(*kind) {
-                    Type::Int => Value::Int(value),
-                    Type::Ref => Value::Ref(GcRef(value as usize)),
-                    Type::Float => Value::Float(f64::from_bits(value as u64)),
-                    Type::Void => Value::Void,
-                })
-                .collect();
             let red_arg_types = jd.red_arg_types_as_ir_types();
             let mut state = runtime_state.borrow_mut();
             let backend: &mut BackendImpl = &mut *state;
@@ -7742,9 +7731,29 @@ impl<M: Clone> MetaInterp<M> {
             }
             warm_state.ensure_cell_for_key(&pin, &mut live);
             pin.reload(&mut live);
-            let cell_key = warm_state
-                .cell_key_for(&pin, &mut live)
-                .unwrap_or_else(|| live.get_uhash());
+            let cell_key = match warm_state.cell_key_for(&pin, &mut live) {
+                Some(key) => key,
+                None => {
+                    let hash = live.get_uhash();
+                    pin.reload(&mut live);
+                    hash
+                }
+            };
+            // `compile.py` `compile_tmp_callback` embeds these as
+            // `ConstPtr` call arguments. Rebuild from the pin after the
+            // last collecting call (`get_uhash` / `ensure_cell_for_key`).
+            pin.reload(&mut live);
+            let greenboxes: Vec<Value> = live
+                .values
+                .iter()
+                .zip(live.types.iter())
+                .map(|(&value, kind)| match majit_ir::green_type_to_ir(*kind) {
+                    Type::Int => Value::Int(value),
+                    Type::Ref => Value::Ref(GcRef(value as usize)),
+                    Type::Float => Value::Float(f64::from_bits(value as u64)),
+                    Type::Void => Value::Void,
+                })
+                .collect();
             match warm_state.get_assembler_token(cell_key, |memmgr| {
                 compile::compile_tmp_callback(
                     backend,
@@ -8724,7 +8733,10 @@ impl<M: Clone> MetaInterp<M> {
             // stashed so `aborted_tracing(reason)` can fire `on_trace_too_long`
             // when the hook is ported.
             self.aborted_tracing_jitdriver = Some(huge_fn_jd_no);
-            self.aborted_tracing_greenkey = Some(huge_fn_key);
+            // pyjitpl.py `self.aborted_tracing_greenkey = greenkey_of_huge_function`
+            // holds the greenkey boxes the GC traces. Store the pin-reloaded
+            // key; `disable_noninlinable_function_for_key` may have moved it.
+            self.aborted_tracing_greenkey = Some((huge_fn_key.0, live));
             // pyjitpl.py:2801-2804: only boost retrace for the outermost
             // loop (when `current_merge_points` is non-empty).  Bridge
             // and function-entry overflow must NOT trigger trace_next_iteration.
@@ -17463,13 +17475,24 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Begin inlining a function call during tracing.
     ///
-    /// Pushes an inline frame so tracing can continue through the callee body.
+    /// Pushes an integer-index inline frame so tracing can continue through
+    /// the callee body. A Ref code key uses [`Self::enter_inline_frame_ref`].
     /// We intentionally avoid recording ENTER_PORTAL_FRAME markers for inline
     /// calls: unlike a real portal transition, they do not carry runtime
     /// semantics and only bloat the trace.
     ///
     /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
     pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
+        self.push_tracing_inline_frame(callee_raw, false)
+    }
+
+    /// Push a live Ref code key onto `inline_frames`. `callee_raw.0` is a
+    /// live wrapper (pin / owner-root), retained on the entry.
+    pub fn enter_inline_frame_ref(&mut self, callee_raw: (usize, usize)) -> bool {
+        self.push_tracing_inline_frame(callee_raw, true)
+    }
+
+    fn push_tracing_inline_frame(&mut self, callee_raw: (usize, usize), as_ref: bool) -> bool {
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return false,
@@ -17477,9 +17500,12 @@ impl<M: Clone> MetaInterp<M> {
         if ctx.inline_depth() >= MAX_INLINE_DEPTH {
             return false;
         }
-
-        ctx.push_inline_frame(callee_raw, MAX_INLINE_DEPTH as u32);
-        true
+        let max_depth = MAX_INLINE_DEPTH as u32;
+        if as_ref {
+            ctx.push_inline_frame_ref(callee_raw, max_depth)
+        } else {
+            ctx.push_inline_frame(callee_raw, max_depth)
+        }
     }
 
     /// Leave an inlined function call during tracing.
@@ -19167,6 +19193,18 @@ impl<M: Clone> MetaInterp<M> {
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
         greenkey: Option<PortalGreenKey>,
     ) -> usize {
+        let code_pin = greenkey.as_ref().and_then(|gk| {
+            crate::warmstate::code_ref_index(&gk.1.types).map(|idx| {
+                let code = gk.1.values.get(idx).copied().unwrap_or(0) as usize;
+                crate::warmstate::GreenRefPin::pin_one(code)
+            })
+        });
+        let mut greenkey = greenkey;
+        let reload_code = |gk: &mut Option<PortalGreenKey>| {
+            if let (Some(gk), Some(pin)) = (gk.as_mut(), code_pin.as_ref()) {
+                pin.reload(&mut gk.1);
+            }
+        };
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
         if let Some(jd_no) = jitcode.jitdriver_sd() {
             self.portal_call_depth += 1;
@@ -19180,6 +19218,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
         }
+        reload_code(&mut greenkey);
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
@@ -19200,15 +19239,21 @@ impl<M: Clone> MetaInterp<M> {
                 positions.push((jd_no, Some(gk.clone()), pos));
             }
         }
+        reload_code(&mut greenkey);
         // pyjitpl.py `_opimpl_recursive_call` walks `framestack` and
         // skips `greenkey is None` (the root from
         // `initialize_state_from_start`). Only an inlined portal
         // enters `inline_frames`; pushing the root as `(0, 0)` made
         // `recursive_depth` count a frame upstream never sees.
-        if let Some(gk) = greenkey.as_ref() {
+        // A Ref code key is retained on the entry (`push_inline_frame_ref`);
+        // integer-only test keys keep the uhash projection.
+        if let Some(pin) = code_pin.as_ref() {
+            let _ = self.enter_inline_frame_ref((pin.get(), 0));
+        } else if let Some(gk) = greenkey.as_ref() {
             let raw = (gk.0 as usize, 0);
             let _ = self.enter_inline_frame(raw);
         }
+        reload_code(&mut greenkey);
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
         let frame = if let Some(mut frame) = self.free_frames_list.pop() {
             frame.setup_reused(jitcode, 0, greenkey, self.tracing.as_deref_mut());

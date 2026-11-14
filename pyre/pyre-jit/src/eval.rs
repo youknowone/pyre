@@ -8408,11 +8408,14 @@ fn drive_portal_metatrace(
     let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
         (*canonical).clone(),
     ));
-    let live_frame = FrameView::reload(frame);
-    let pycode_root = PortalPycodeRoot::pin(unsafe { (*live_frame).pycode });
-    let profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
+    // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
+    // in its own slot before `PortalPycodeRoot` pushes `W_Code` above it,
+    // and read the frame through that slot (`can_enter_jit`).
+    let mut frame_root = FrameRoot::new(unsafe { &mut *frame });
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    let profiled = i64::from(frame_root.frame().get_is_being_profiled());
     let ec = pyre_interpreter::call::getexecutioncontext();
-    let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
     // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
@@ -8430,7 +8433,7 @@ fn drive_portal_metatrace(
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
     let meta = driver.meta_interp_mut();
-    let live_frame = FrameView::reload(frame);
+    let live_frame = frame_root.frame() as *mut PyFrame;
     let pycode = pycode_root.get() as i64;
     let args = {
         let ctx = meta.trace_ctx().unwrap();
@@ -8507,7 +8510,7 @@ fn drive_portal_metatrace(
             // The blackhole already performed the remaining frame mutations;
             // only the carried green next_instr becomes the native loop PC.
             let resumed = args.red_ref[0] as *mut PyFrame;
-            assert_eq!(resumed, FrameView::reload(frame));
+            assert_eq!(resumed, frame_root.frame() as *mut PyFrame);
             if let Some(pc) = green_pc_position(args.green_int[0]) {
                 unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
             }
@@ -8688,23 +8691,39 @@ fn genentry_merge_point_jit(
     // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
     // distinguishes yields.
     let pycode = pin.get() as pyre_object::PyObjectRef;
-    let green_key = genentry_resolved_cell_key(pycode);
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A live session on another key or driver may still
-    // `bound_reached` a nested MetaInterp.
-    {
-        let (driver, _) = driver_pair();
-        let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
-        if driver.cell_is_tracing_on_driver(jd_no, green_key) {
-            return None;
+    let green_key = match genentry_resolved_cell_key(pycode) {
+        Some(key) => {
+            // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING`
+            // is read only when a cell was found.
+            let (driver, _) = driver_pair();
+            let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+            if driver.cell_is_tracing_on_driver(jd_no, key) {
+                return None;
+            }
+            key
         }
-    }
+        None => {
+            // warmstate.py maybe_compile_and_run: a miss ticks
+            // `JitCell.get_uhash(*greenargs)` and does not create a cell.
+            // A tokenless cell (`BaseJitCell::new_for_driver_with_greens`,
+            // flags empty) would take `cleanup_chain` and never go hot.
+            let mut live = pyre_jit_trace::genentry_state::genentry_green_key(
+                pin.get() as pyre_object::PyObjectRef
+            );
+            let hash = live.get_uhash();
+            pin.reload(&mut live);
+            hash
+        }
+    };
+    // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
+    // `_find_shadow`). Re-read every pycode/w_gen/w_arg from the pins.
+    let _pycode = pin.get() as pyre_object::PyObjectRef;
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
     // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
     // counting, and the tick is on the one runner `jitcounter`.
-    let w_gen = roots.get(base + 1);
-    let w_arg = roots.get(base + 2);
     let hot = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
@@ -8742,8 +8761,9 @@ fn genentry_merge_point_jit(
 }
 
 /// Cell key for `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. Resolved on that
-/// driver's `WarmEnterState` (`warmstate.py JitCell`).
-fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
+/// driver's `WarmEnterState` (`warmstate.py JitCell.get_jitcell`,
+/// `create=False`). `None` is a miss.
+fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> Option<u64> {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
         &driver

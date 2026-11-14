@@ -8884,9 +8884,19 @@ impl<S: JitState> JitDriver<S> {
         // (`disable_noninlinable_on_a_typed_key_flags_its_one_cell`).
         // The empty-chain door never reaches here; it ticked already.
         let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
+        // `live_after_hash` inside the decision can move a nursery Ref green.
+        // Keep one pin for both arms and publish the reloaded key into
+        // `bound_reached`; never re-pin the pre-decision `greenargs` copy
+        // (`gctransform/shadowstack.py` `push_roots`).
+        let had_caller_pin = pin_live.is_some();
+        let had_greenargs = greenargs.is_some();
         let owned_decision_pin;
-        let decision_slot = match pin_live {
-            Some((pin, _)) => pin.save(),
+        let mut owned_live;
+        let (decision_pin, decision_live): (
+            &crate::warmstate::GreenRefPin,
+            &mut majit_ir::GreenKey,
+        ) = match pin_live {
+            Some((pin, live)) => (pin, live),
             None => {
                 owned_decision_pin = match greenargs {
                     Some((values, types)) => {
@@ -8894,9 +8904,15 @@ impl<S: JitState> JitDriver<S> {
                     }
                     None => crate::warmstate::GreenRefPin::pin_one(0),
                 };
-                owned_decision_pin.save()
+                owned_live = match greenargs {
+                    Some((values, types)) => GreenKey::from_greenargs(values, types),
+                    None => GreenKey::from_greenargs(&[], &[]),
+                };
+                owned_decision_pin.reload(&mut owned_live);
+                (&owned_decision_pin, &mut owned_live)
             }
         };
+        let decision_slot = decision_pin.save();
         match self.meta.on_back_edge_typed_decision_on_driver(
             self.index().unwrap_or(0),
             green_key,
@@ -8909,18 +8925,18 @@ impl<S: JitState> JitDriver<S> {
                 // drivers have no `NestedTraceGuard`; `bound_reached` refuses
                 // the start so the outer attempt is not clobbered. The tick
                 // already ran in `on_back_edge_typed_decision`.
-                match pin_live {
-                    Some((pin, live)) => self.commit_start_tracing(
+                decision_pin.reload(decision_live);
+                if had_caller_pin || had_greenargs {
+                    self.commit_start_tracing(
                         green_key,
                         None,
-                        Some((pin, live)),
+                        Some((decision_pin, decision_live)),
                         target_pc,
                         state,
                         env,
-                    ),
-                    None => {
-                        self.commit_start_tracing(green_key, greenargs, None, target_pc, state, env)
-                    }
+                    )
+                } else {
+                    self.commit_start_tracing(green_key, None, None, target_pc, state, env)
                 }
             }
             _ => false,
