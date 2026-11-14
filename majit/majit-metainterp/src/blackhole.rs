@@ -2722,9 +2722,10 @@ impl Default for BlackholeInterpBuilder {
 /// `BlackholeInterpreter.__init__` copies `cpu`, `dispatch_loop`, `descrs`,
 /// `op_catch_exception`, `op_rvmprof_code` (and pyre's `op_live` /
 /// `jitdrivers_sd` snapshot) off the builder, so `resume_mainloop` does not
-/// borrow it. The pool lock on `MetaInterpStaticData.blackholeinterpbuilder`
-/// therefore covers only these operations — a nested resume on the same
-/// thread pops another interpreter off the same builder.
+/// borrow it. Each `RefCell::borrow_mut` on
+/// `MetaInterpStaticData.blackholeinterpbuilder` therefore covers only these
+/// operations — a nested resume on the same thread pops another interpreter
+/// off the same builder (`blackhole.py` `BlackholeInterpBuilder.acquire_interp`).
 pub trait BlackholeInterpPool {
     fn with_builder<R>(&mut self, f: impl FnOnce(&mut BlackholeInterpBuilder) -> R) -> R;
 

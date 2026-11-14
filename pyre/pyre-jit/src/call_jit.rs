@@ -3263,13 +3263,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     use majit_metainterp::resume;
 
     // `blackhole.py` `resume_in_blackhole` uses
-    // `metainterp_sd.blackholeinterpbuilder`. Lock only for acquire/release
-    // and chain construction; `bh.run()` drops it so a nested resume pops
-    // another interpreter off the same builder.
+    // `metainterp_sd.blackholeinterpbuilder`. `borrow_mut` only for
+    // acquire/release and chain construction; `bh.run()` drops it so a
+    // nested resume pops another interpreter off the same builder.
     let (driver, driver_vinfo) = crate::eval::driver_pair();
     let staticdata = std::sync::Arc::clone(&driver.meta_interp().staticdata);
     let release_bh_rd = |bh: Box<majit_metainterp::blackhole::BlackholeInterpreter>| {
-        staticdata.blackholeinterpbuilder.lock().release_interp(bh);
+        staticdata
+            .blackholeinterpbuilder
+            .borrow_mut()
+            .release_interp(bh);
     };
 
     // `resume.py` `blackhole_from_resumedata` indexes `jitcodes[jitcode_pos]`,
@@ -3356,10 +3359,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // per-driver pick is needed. Snapshot once per call so the slice outlives
     // ResumeDataDirectReader.
     let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-    // Lock only for `blackhole_from_resumedata` chain construction;
+    // `borrow_mut` only for `blackhole_from_resumedata` chain construction;
     // `bh.run()` below must not hold it.
     let bh = {
-        let mut builder = staticdata.blackholeinterpbuilder.lock();
+        let mut builder = staticdata.blackholeinterpbuilder.borrow_mut();
         builder.debug_assert_cpu(driver.meta_interp().blackhole_cpu());
         resume::blackhole_from_resumedata_with(
             &mut builder,
