@@ -1063,6 +1063,7 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
             &then_value,
             suffix,
             &site.result_payload0_ty,
+            &mut [],
         )?;
     }
 

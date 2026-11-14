@@ -724,9 +724,7 @@ fn call_ops_with_leaf<'a>(
 /// the pointer-to-ObjectKey trampolines.
 #[test]
 fn w_set_add_checked_is_set_strategy_add_indirect_call() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let graph = lower_function(llbc, "w_set_add_checked").expect("lower w_set_add_checked");
     let dump = graph.dump();
     assert!(
@@ -874,9 +872,7 @@ fn family_covers_impl(family: &[majit_translate::CallPath], impl_leaf: &str) -> 
 /// `int_guard_value` plus `IndirectCallTargets` (`guess_call_kind` Regular).
 #[test]
 fn set_strategy_add_family_has_six_impls_and_regular_ict() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     let mut graph = lower_function(llbc, "w_set_add_checked").expect("lower w_set_add_checked");
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),

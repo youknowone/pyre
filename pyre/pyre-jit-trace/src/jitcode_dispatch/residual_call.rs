@@ -6148,8 +6148,9 @@ pub(crate) enum AssemblerContinuationEscape {
 
 /// After this residual in a numbered helper, `capture_resumedata` would
 /// resume at the trailing `-live-` and `handle_exception_in_frame` would
-/// run the remaining CFG. Refuse when that continuation, or any outer
-/// helper's CALL `next_pc` (`paused_parent_resume_pc`), reaches a blocker.
+/// run the remaining CFG. Refuse when that continuation, or any
+/// transparent-helper ancestor's CALL `next_pc` (`paused_parent_resume_pc`),
+/// reaches a blocker — including helpers below an inlined Python level.
 /// A numbered parent with no resume coordinate cannot be resumed
 /// (`MetaInterp.capture_resumedata` captures every frame at its pc).
 pub(crate) fn numbered_may_force_continuation_blocked<Sym: WalkSym>(
@@ -6169,12 +6170,11 @@ pub(crate) fn numbered_may_force_continuation_blocked<Sym: WalkSym>(
         return true;
     }
     let session = ctx.session.borrow();
-    for frame in session
-        .framestack
-        .iter()
-        .rev()
-        .take_while(|frame| frame.is_helper_level())
-    {
+    // `capture_resumedata` numbers every frame; `_resume_mainloop` runs
+    // every recorded frame. Transparent-helper ancestors below an inlined
+    // Python level are not in the trailing helper-level prefix
+    // (`numbered_helper_guard_resume`).
+    for frame in session.framestack.iter().rev() {
         for parent in &frame.parents {
             if !crate::state::jitcode_is_transparent_helper(parent.jitcode_index as i32) {
                 continue;
