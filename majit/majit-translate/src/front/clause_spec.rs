@@ -707,8 +707,19 @@ fn provided_trait_default_generics(
     for ty in &mut types {
         substitute_type_vars(ty, llbc, &subst_types, &subst_consts);
     }
+    // concrete_type_args walks this list as Space::Const: const_var_index_at
+    // matches [{"Var": ...}, ty] only in that space.
     for cg in &mut const_generics {
-        substitute_type_vars(cg, llbc, &subst_types, &subst_consts);
+        subst_vars(
+            cg,
+            llbc,
+            &subst_types,
+            &subst_consts,
+            Space::Const,
+            None,
+            0,
+            0,
+        );
     }
     let clause_n = fd.generics.as_ref().map_or(0, |g| g.trait_clauses.len());
     let mut trait_refs = vec![resolved.clone()];

@@ -591,12 +591,19 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
                 ")"
             )));
         }
-        unsafe {
-            pyre_object::w_set_add(
+        // pyopcode.py MATCH_KEYS: space.call_method(w_seen, "add", w_key)
+        let status = unsafe {
+            pyre_object::setobject::w_set_add_checked(
                 pyre_object::gc_roots::shadow_stack_get(seen_slot),
                 pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
             )
         };
+        if status != pyre_object::setobject::SET_ADD_OK {
+            return Err(crate::baseobjspace::map_set_add_status(
+                pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
+                status,
+            ));
+        }
         let w_sentinel = pyre_object::gc_roots::shadow_stack_get(sentinel_slot);
         let w_value = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(subject_slot),
