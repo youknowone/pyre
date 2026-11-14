@@ -640,11 +640,11 @@ impl W_UCD {
 
     #[getter]
     fn unidata_version(&self) -> PyObjectRef {
-        if self.legacy {
-            w_str_new("3.2.0")
+        w_str_new(if self.legacy {
+            ucd_core::UNICODE_VERSION_LEGACY
         } else {
-            w_str_new(&ucd_core::unicode_version())
-        }
+            ucd_core::UNICODE_VERSION
+        })
     }
 }
 
