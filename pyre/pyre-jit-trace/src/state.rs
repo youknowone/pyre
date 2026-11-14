@@ -12279,51 +12279,19 @@ impl JitState for PyreJitState {
                     bridge_array_len,
                     &vable_array_values,
                 );
-                // resume.py `rebuild_from_resumedata` fills the live MIFrame
-                // register banks with `consume_boxes`; operand-stack boxes are the
-                // authoritative values at an after-residual guard.  The separately
-                // decoded virtualizable array can still contain the pre-call operand
-                // because the residual result has not passed through a frame-array
-                // write.  Locals and cells keep the vable-image authority established
-                // above: a register color at an interior resume point can hold a dead
-                // or stale local value.  Kept-stack branch guards retain their existing
-                // post-overlay path: their deeper pcdep stack is not the resumed
-                // virtualizable depth.
+                // `resume.py rebuild_from_resumedata`: `consume_vable_info` fills
+                // `virtualizable_boxes` and `consume_boxes` fills the MIFrame
+                // registers, independently. Stack `getarrayitem_vable` reads the
+                // vable section; a register color (including a dead Const left in a
+                // reused color) is not copied into it. An after-residual call
+                // result stays in its register until the resumed jitcode's
+                // `setarrayitem_vable` stores it.
                 let mut bridge_array_items = vable_array_items.clone();
                 let mut bridge_array_values = live_array_values.clone();
                 bridge_array_values.resize(
                     bridge_array_len,
                     majit_ir::Value::Ref(majit_ir::GcRef::NULL),
                 );
-                if !seed_deferred_to_overlay {
-                    let semantic_array_len = sym.registers_r.len().min(bridge_array_len);
-                    if bridge_array_items.len() < semantic_array_len {
-                        let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-                        bridge_array_items.resize(semantic_array_len, null_ref);
-                    }
-                    for (slot, opref) in sym
-                        .registers_r
-                        .iter()
-                        .take(semantic_array_len)
-                        .enumerate()
-                        .skip(nlocals)
-                    {
-                        if opref.is_none() {
-                            continue;
-                        }
-                        bridge_array_items[slot] = opref;
-                        if let Some(value) = ctx.box_value(opref) {
-                            if !matches!(value, majit_ir::Value::Void) {
-                                bridge_array_values[slot] = value;
-                                store_live_frame_array_slot(
-                                    resume_decoded_vable_addr(boxes),
-                                    slot,
-                                    value,
-                                );
-                            }
-                        }
-                    }
-                }
                 sym.concrete_locals = (0..nlocals)
                     .map(|i| {
                         bridge_array_values
@@ -15716,11 +15684,13 @@ mod tests {
                 majit_ir::Value::Ref(majit_ir::GcRef(live_cell as usize)),
             )),
         );
+        // The array item comes from the vable section (`resume.py consume_vable_info`); the after-call result stays in the
+        // register (`registers_r[2]`) until the resumed jitcode stores it.
         assert_eq!(
             ctx.virtualizable_entry_at(array_base + 2),
             Some((
-                OpRef::input_arg_ref(8),
-                majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize)),
+                OpRef::input_arg_ref(6),
+                majit_ir::Value::Ref(majit_ir::GcRef(local0 as usize)),
             )),
         );
         assert_eq!(
