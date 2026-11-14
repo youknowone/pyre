@@ -5552,6 +5552,22 @@ fn describe_v_inst_from_base(
     }
 }
 
+/// Minted (flag, offset, size) for `field`, same Parent-then-Layout walk
+/// `fielddescrof` uses (`bh_field_lookup`). `None` when that walk has no
+/// leaf. A non-`FLAG_STRUCT` leaf is an ordinary one-word field
+/// (`descr.py get_type_flag`); `jtransform.py rewrite_op_getsubstruct`
+/// is only for an inline Struct.
+pub(crate) fn minted_field_layout(
+    cc: &CallControl,
+    field: &crate::model::FieldDescriptor,
+) -> Option<(majit_ir::descr::ArrayFlag, usize, usize)> {
+    match bh_field_lookup(cc, field) {
+        BhFieldLookup::Parent(spec) => Some((spec.field_flag, spec.offset, spec.field_size)),
+        BhFieldLookup::Layout(row) => Some((row.flag, row.offset, row.size)),
+        BhFieldLookup::Missing => None,
+    }
+}
+
 /// Offset and size of a by-value substructure that has no flattened field
 /// descriptor of its own.
 ///
@@ -6137,13 +6153,14 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // blackhole must reconstruct the same inherited tag slot or the payload
     // takes slot 0 here while living at byte 8 there.  `None` carries no
     // payload row, so it needs no reconstruction.
-    let result_variant = is_explicit_shell_variant_owner(template_owner)
-        && cc.struct_layout_for(owner).is_none_or(|layout| {
-            layout
-                .fields
-                .iter()
-                .any(|field| field.name == "__discriminant")
-        });
+    //
+    // Reconstruction is the spelling, not a `__discriminant` intern row.
+    // The shell's payload seats are one word each (`descr.py get_type_flag`).
+    // A concrete `Result<T>::Ok` intern can be payload-only FLAG_STRUCT 16
+    // with the tag on the enum base; skipping reconstruction then lets
+    // `heaptracker.py all_fielddescrs` recurse into T's leaves and name a
+    // pointer past the 16-byte parent instead of the seat the writer stores.
+    let result_variant = is_explicit_shell_variant_owner(template_owner);
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -9383,6 +9400,130 @@ mod tests {
         assert!(is_explicit_shell_variant_owner(
             "core::option::Option::Some"
         ));
+    }
+
+    /// A concrete shelled variant whose intern rows are payload-only:
+    /// FLAG_STRUCT 16 `__pos_0` and no `__discriminant` (the tag lives on
+    /// the enum base / template). Reconstruction still mints the shell:
+    /// tag @0 and a one-word POINTER seat at +8 (`descr.py get_type_flag`).
+    /// `heaptracker.py all_fielddescrs` must list that seat, not recurse
+    /// into `__pos_0.hash` / `__pos_0.obj` past the 16-byte parent.
+    #[test]
+    fn concrete_shell_variant_without_tag_row_mints_one_word_payload_seat() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let template = "core::result::Result::Ok";
+        let owner = "core::result::Result<payload_seat::Key, payload_seat::Err>::Ok";
+        let key = "payload_seat::Key";
+        let template_id = majit_ir::descr::StructId::from_canonical(template);
+        let owner_id = template_id.instantiate("<payload_seat::Key, payload_seat::Err>");
+        let key_id = majit_ir::descr::StructId::from_canonical(key);
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(key.to_string(), Some(key_id));
+        let _registry = register_struct_ids_serialized(ids);
+
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), key.to_string())],
+        );
+        struct_fields.fields.insert(
+            key.to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".into(),
+                    offset: 8,
+                    size: 16,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            key_id,
+            StructLayout {
+                size: 16,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "hash".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "obj".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let intern = cc.struct_layout_for(owner).expect("intern layout");
+        assert!(
+            intern
+                .fields
+                .iter()
+                .all(|field| field.name != "__discriminant"),
+            "subject is intern without a tag row"
+        );
+        assert_eq!(intern.fields[0].name, "__pos_0");
+        assert_eq!(intern.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(intern.fields[0].size, 16);
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("concrete shelled variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(
+            spec.all_fielddescrs[0].field_flag,
+            majit_ir::descr::ArrayFlag::Signed
+        );
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+        assert_eq!(spec.all_fielddescrs[1].field_size, 8);
+        assert_eq!(
+            spec.all_fielddescrs[1].field_flag,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
+        let keys: Vec<&str> = spec
+            .all_fielddescrs
+            .iter()
+            .map(|field| field.field_key())
+            .collect();
+        assert!(
+            !keys.iter().any(|key| key.contains('.')),
+            "shell seat is not intern FLAG_STRUCT leaves; got {keys:?}"
+        );
     }
 
     #[test]

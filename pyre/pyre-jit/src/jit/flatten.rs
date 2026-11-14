@@ -144,6 +144,10 @@ pub struct SSARepr {
     /// Synthetic ops (`offset < 0`) start no run: they belong to whichever PC
     /// was last anchored, which is what leaving the run open expresses.
     pub pc_run_insn_pos: Vec<(usize, i64)>,
+    /// `(insns index, record index)` for every `-live-` graph op that
+    /// carries a Signed constant arg. The constant is the index of the
+    /// matching `after_pops_force_alive` record.
+    pub after_pops_live_insn_pos: Vec<(usize, usize)>,
     /// Pyre-only side-table: `(label name, block)` for every `Label` the
     /// flattener emits — the block a `Label(block)` opens, or the target
     /// block of a `Label(link)`.  The codewriter's block-entry `-live-`
@@ -174,6 +178,7 @@ impl SSARepr {
             pc_first_insn_pos: Vec::new(),
             abort_permanent_insn_pos: Vec::new(),
             pc_run_insn_pos: Vec::new(),
+            after_pops_live_insn_pos: Vec::new(),
             label_blocks: Vec::new(),
             next_var_idx: [0; 3],
         }
@@ -190,6 +195,7 @@ impl SSARepr {
             .map(|(_, pos)| pos)
             .chain(self.abort_permanent_insn_pos.iter_mut().map(|(pos, _)| pos))
             .chain(self.pc_run_insn_pos.iter_mut().map(|(pos, _)| pos))
+            .chain(self.after_pops_live_insn_pos.iter_mut().map(|(pos, _)| pos))
     }
 
     /// Allocate a fresh `(kind, index)` Variable for this SSARepr.
@@ -1416,6 +1422,24 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
+        // Record `(insns index, Signed constant as record index)` for every
+        // `-live-` graph op that carries a Signed constant arg, before the
+        // args are stripped below.
+        let after_pop_record_idx: Option<usize> = if op.opname == OPNAME_LIVE {
+            let mut rec_idx = None;
+            for a in &op.args {
+                for c in a.constants() {
+                    if let ConstantValue::Signed(n) = c.value {
+                        if n >= 0 {
+                            rec_idx = Some(n as usize);
+                        }
+                    }
+                }
+            }
+            rec_idx
+        } else {
+            None
+        };
         // Forced-alive `-live-` args (`liveness.py`) are graph-side
         // information: `make_dependencies` reads them off the graph op to
         // keep co-live frame slots interfering (and so on distinct colors).
@@ -1493,6 +1517,11 @@ impl<'a> GraphFlattener<'a> {
         // so the residual gate is `calldescr_canraise`
         // (`insn_needs_trailing_live`).
         let trailing_live = insn_needs_trailing_live(&insn);
+        if let Some(rec_idx) = after_pop_record_idx {
+            self.ssarepr
+                .after_pops_live_insn_pos
+                .push((self.ssarepr.insns.len(), rec_idx));
+        }
         self.emitline(insn);
         if trailing_live {
             self.emitline(Insn::live(Vec::new()));
@@ -1873,7 +1902,20 @@ impl<'a> GraphFlattener<'a> {
             // `last_exc_value` emission, mirroring the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
             // make_exception_link` layout (flatten.py).
+            //
+            // `flatten.py insert_exits`: after walking back over trailing
+            // `-live-`, `index == -1` means the last instruction is not
+            // actually a `-live-`; the block cannot raise.
             if block.borrow().canraise() {
+                let ends_in_live = block
+                    .borrow()
+                    .operations
+                    .last()
+                    .is_some_and(|op| op.opname == OPNAME_LIVE);
+                if !self.include_all_exc_links && !ends_in_live {
+                    self.make_link(link, handling_ovf, work);
+                    return;
+                }
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
                 let handler_label = self.label_for_link(link);
@@ -2774,6 +2816,8 @@ pub(super) fn insn_needs_trailing_live(insn: &Insn) -> bool {
 ///   (`MayForce`/`Plain` → can raise, `PlainCannotRaise*` → cannot).
 ///   `newlist`/`newtuple` classify as their post-
 ///   `lower_frontend_collection_ops` `*_from_array` residual.
+/// * `raise` — a caught `raise` carries the same `[raising_op, -live-]`
+///   tail `insert_exits` uses to emit `catch_exception`.
 /// * everything else (vable mirrors, `ptr_*` tests, copies, markers,
 ///   elidable HLOps) — cannot raise.
 pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
@@ -2862,6 +2906,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "set_display_new"
             | "build_set_from_array"
             | "build_string_from_array"
+            | "raise"
     )
 }
 

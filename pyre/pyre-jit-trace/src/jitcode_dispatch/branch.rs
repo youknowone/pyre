@@ -220,7 +220,7 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
         for s in 0..depth {
             let slot = (stack_base + s) as u16;
             // Live Variable slot: inspect its concrete register value.
-            if let Some(color) = pcdep.and_then(|e| {
+            if let Some(color) = pcdep.as_ref().and_then(|e| {
                 e.iter()
                     .find_map(|&(b, c, sl)| (b == 1 && sl == slot).then_some(c))
             }) {

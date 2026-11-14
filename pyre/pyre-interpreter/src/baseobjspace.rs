@@ -315,6 +315,10 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 ///
 /// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
 /// is fetched first, matching [`take_pending_dict_key_error`].
+///
+/// Residual (`get_jitcode_calldescr` `getfunctionptr`). The word-ABI
+/// trampoline returns the error as one GC-ref word (`ErrorCarrierWord`).
+#[majit_macros::getfunctionptr]
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
         return crate::runtime_ops::fetch_memory_error();
@@ -18217,25 +18221,33 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let w_type = crate::typedef::r#type(obj)
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
-    let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
-        return Ok(w_result);
-    }
+    let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
     {
-        let tp = crate::type_methods::arg_type_name(w_result);
-        pyre_object::with_roots!(w_result => crate::warn::warn_deprecation(&format!(
-            "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
-        )))?;
-        // descroperation.py `space.index` — return a base int,
-        // never the strict subclass supplied by `__index__`.
-        return Ok(unsafe { int_as_base(w_result) });
+        // `W_LongObject` shares the `int` class, so this is `type(w_result) is int`
+        // for either payload layout (`descroperation.py` `index`).
+        if unsafe { pyre_object::is_exact_type(w_result, &pyre_object::INT_TYPE) } {
+            return Ok(w_result);
+        }
+        return index_result_strict_int_subclass(w_result);
     }
     Err(PyError::type_error(format!(
         "__index__ returned non-int (type {})",
         object_functionstr_type_name(w_result),
     )))
+}
+
+/// `__index__` returned a strict int subclass (or bool): emit the
+/// DeprecationWarning and return the base int.
+#[majit_macros::getfunctionptr]
+pub fn index_result_strict_int_subclass(mut w_result: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let tp = crate::type_methods::arg_type_name(w_result);
+    pyre_object::with_roots!(w_result => crate::warn::warn_deprecation(&format!(
+        "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
+    )))?;
+    // descroperation.py `space.index` — return a base int,
+    // never the strict subclass supplied by `__index__`.
+    Ok(unsafe { int_as_base(w_result) })
 }
 
 /// baseobjspace.py `float_w` — the `space.float` coercion

@@ -451,7 +451,7 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
             return OpRef::NONE;
         };
         let pjc = &frame.0;
-        let pcdep = pjc.pcdep_for_jitcode_pc(jit_pc).unwrap_or(&[]);
+        let pcdep = pjc.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default();
         if pcdep.is_empty() {
             return OpRef::NONE;
         }
@@ -463,7 +463,7 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
             crate::state::callee_layout_for_call_assembler(code).0
         };
         let slot = stack_base + stack_slot;
-        let Some(color) = crate::state::semantic_slot_color_for_ref_slot(pcdep, slot) else {
+        let Some(color) = crate::state::semantic_slot_color_for_ref_slot(&pcdep, slot) else {
             return OpRef::NONE;
         };
         return ctx.registers_r.get(color).unwrap_or(OpRef::NONE);

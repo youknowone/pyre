@@ -172,7 +172,21 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     argboxes_f: &[OpRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sym_ptr = sym as *mut Sym;
-    let entry_py_pc = EntryPyPc::Py(orgpc as u32);
+    // pyjitpl.py setup_resume_at_op / resume.py rebuild_from_resumedata:
+    // the MIFrame sits at the encoded jitcode pc. Carrier walks already use
+    // EntryPyPc::Jit(root_pc); a single-frame bridge must too, or FOR_ITER
+    // treats EntryPyPc::Py(orgpc) as opcode-entry and re-inlines `__next__`.
+    let walked_jitcode_index = if sym.jitcode().is_null() {
+        0u32
+    } else {
+        unsafe { (*sym.jitcode()).index as u32 }
+    };
+    let is_bridge_trace = trace_ctx.is_bridge_trace;
+    let entry_py_pc = if is_bridge_trace {
+        EntryPyPc::Jit(position)
+    } else {
+        EntryPyPc::Py(orgpc as u32)
+    };
     if is_top_level {
         let mut walk_session = session.borrow_mut();
         walk_session.recording_frame_ptr = sym.live_vable_frame_addr();
@@ -459,16 +473,12 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             is_top_level,
             sub_jitcode_lookup,
             entry_py_pc,
-            outer_resume_marker_jit_pc: None,
-            outer_jitcode_index: 0,
+            outer_resume_marker_jit_pc: is_bridge_trace.then_some(position),
+            outer_jitcode_index: walked_jitcode_index,
 
-            // This entry (test/fixture) hard-codes
-            // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
-            // rather than seeding them from `sym.jitcode` /
-            // `collect_outer_active_boxes` like the retired per-opcode
-            // arm entry did.  A guard captured via
-            // `walker_capture_snapshot_for_last_guard` would attach
-            // resume data pointing at the wrong frame.
+            // `outer_active_boxes` stays empty here; production FBW collects
+            // them per guard. `outer_jitcode_index` is the walked body's
+            // index so `EntryPyPc::Jit` maps through that body.
             pending_guard_snapshot_error: None,
 
             vstack_depth: 0,
@@ -1354,6 +1364,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(recorded.result),
+                        result_concrete: super::concrete_from_recorded_opref(ctx, recorded.result),
                     },
                     cont_pc,
                 ))
@@ -1671,7 +1682,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     concrete_callee_frame: usize,
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
-    child_result: Option<OpRef>,
+    child_result: Option<(OpRef, ConcreteValue)>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     // Enter this reconstructed frame on an exception edge.  `None` is the
     // ordinary resume-at-CALL / `make_result_of_lastop` path.
@@ -1801,7 +1812,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }
         regs_f[i] = box_ref;
     }
-    if let Some(result) = child_result {
+    if let Some((result, result_concrete)) = child_result {
         // `_setup_return_value_*` (`blackhole.py`): the callee's result
         // lands in `code[position - 1]` of the call it paused in.
         match super::call_result_register_in(jc.code.as_slice(), entry) {
@@ -1815,9 +1826,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_r.set(call_dst_reg, result);
-                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
-                    concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
-                }
+                concrete_r[call_dst_reg] = result_concrete;
             }
             super::CallResultRegister::Reg('i', call_dst_reg) => {
                 if call_dst_reg >= regs_i.len() {
@@ -1828,9 +1837,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_i[call_dst_reg] = result;
-                if let Some(majit_ir::Value::Int(v)) = ctx.box_value(result) {
-                    concrete_i[call_dst_reg] = ConcreteValue::Int(v);
-                }
+                concrete_i[call_dst_reg] = result_concrete;
             }
             super::CallResultRegister::Reg('f', call_dst_reg) => {
                 if call_dst_reg >= regs_f.len() {
@@ -1841,6 +1848,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     }));
                 }
                 regs_f[call_dst_reg] = result;
+                if let ConcreteValue::Float(value) = result_concrete {
+                    ctx.set_opref_concrete(result, majit_ir::Value::Float(value));
+                }
             }
             super::CallResultRegister::Reg(..) | super::CallResultRegister::Unknown => {
                 return None;
@@ -2590,7 +2600,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
-    child_result: OpRef,
+    child_result: (OpRef, ConcreteValue),
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
         ctx,

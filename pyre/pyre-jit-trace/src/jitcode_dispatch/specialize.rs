@@ -7056,8 +7056,10 @@ fn descend_named_cell_helper<Sym: WalkSym>(
     };
     let result =
         match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
-            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            DispatchOutcome::SubReturn { result, .. } => {
+                finish_inline_callee_return(ctx, result)
+                    .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?
+            }
             raised @ DispatchOutcome::SubRaise { .. } => {
                 let _ = raised;
                 return Ok(None);
@@ -7381,6 +7383,8 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     rb: i64,
     lhs_obj: pyre_object::PyObjectRef,
     rhs_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     use pyre_interpreter::objspace::descroperation as desc;
@@ -7457,9 +7461,6 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         .unwrap_or(raw_concrete as usize);
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete)));
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
     let boxed = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
@@ -7474,8 +7475,18 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_obj as usize)),
     );
+    // `make_result_of_lastop` (`pyjitpl.py execute_varargs`): the caller's
+    // dst is this fold's later `SubReturn` box. Write it before
+    // `GUARD_NO_EXCEPTION` so `get_list_of_active_boxes` at the trailing
+    // `-live-` sees the product. Capture stays at `op_pc` (the CALL);
+    // `walker_emit_guard_with_snapshot` does not set `live_after_jit_pc`.
+    make_result_of_lastop(ctx, op_pc, dst, dst_bank, boxed)?;
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -7592,7 +7603,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
                 .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
                 .unwrap_or(rhs_obj);
             return emit_int_ovf_to_long(
-                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
+                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj, dst, dst_bank,
             );
         }
         if !raw.is_constant() {
@@ -7621,6 +7632,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     let _ = (dst, dst_bank);
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -7774,6 +7786,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         Ok((
             DispatchOutcome::SubReturn {
                 result: Some(boxed),
+                ..
             },
             _,
         )) => Ok(Some(boxed)),
@@ -7845,6 +7858,7 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     };
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
+        result_concrete: super::concrete_from_recorded_opref(ctx, boxed),
     }))
 }
 
@@ -8117,11 +8131,11 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             return Err(error);
         }
     };
-    let result =
+    let (result, result_concrete) =
         match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             // Void helpers (`opimpl_residual_call_*_v`) have no dst
             // register; `write_residual_call_result_to_dst` no-ops `'v'`.
-            DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+            DispatchOutcome::SubReturn { result: None, .. } if dst_bank == 'v' => {
                 let _ = finish_inline_callee_return(ctx, None);
                 // Callers that pass `boxed_out` check after the result is
                 // delivered (`finishframe` / `make_result_of_lastop`, then
@@ -8138,8 +8152,14 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
                 }
                 return Ok(Some(DispatchOutcome::Continue));
             }
-            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            DispatchOutcome::SubReturn {
+                result,
+                result_concrete,
+            } => (
+                finish_inline_callee_return(ctx, result)
+                    .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+                result_concrete,
+            ),
             // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
             // `PyError` aggregate from supported literal-message raise paths and
             // materialises the interpreter's `W_BaseException` through one opaque
@@ -8150,15 +8170,23 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     if boxed_out.is_some() {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        super::residual_call::write_call_result_to_dst_with_concrete(
+            ctx,
+            op_pc,
+            dst,
+            dst_bank,
+            result,
+            result_concrete,
+        )?;
     } else {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             result,
+            result_concrete,
         )?;
     }
     if let Some(slot) = boxed_out {
@@ -9995,6 +10023,11 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
 /// `getindex_w`) for an exact `str` and an exact `int` index.
 /// A missing jitcode declines to the generic residual.
 ///
+/// `descr_getitem` returns `_getitem_result`, so the helper return is
+/// the subscript. `HelperReturn::CallResult` numbers that `MIFrame`
+/// (`capture_resumedata` / `_setup_return_value_*`) and keeps
+/// start/end/utf8/strlen in the guard failargs.
+///
 /// The boxed index is not frozen: a loop over `s[i]` must keep the
 /// live key so the generated length test stays in the body.
 /// Specialised-tuple descent freezes because that reader is a
@@ -10050,7 +10083,8 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
 
@@ -10102,18 +10136,25 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10223,18 +10264,25 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10352,19 +10400,26 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before),
     };
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         result,
+        result_concrete,
     )?;
     Ok(Some(()))
 }
@@ -10486,7 +10541,7 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         Err(error) => return Err(error),
     };
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             let _ = finish_inline_callee_return(ctx, result);
         }
         DispatchOutcome::Continue => {}
@@ -10540,7 +10595,9 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    // The helper's return is the ForIterNext dest, so the paused caller resumes past the call (`_setup_return_value_r`).
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
 
@@ -10592,9 +10649,15 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     // The walked `setfield_gc` moved the cursor as it was recorded; the
@@ -10605,14 +10668,18 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     let index_after = unsafe { pyre_object::w_list_iter_index(iter_now) };
     let seq_after = unsafe { pyre_object::w_list_iter_seq(iter_now) };
     let cursor_unchanged = seq_after == seq_before && index_after == index_before;
-    let item = walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null());
+    let item = match result_concrete {
+        ConcreteValue::Ref(item) if !item.is_null() => Some(item),
+        _ => walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null()),
+    };
     // Exhaustion (`list_iter_stop`, index >= 0).  A negative `__setstate__`
     // cursor stays attached; that arm returns null without the store.
     let exhausted = item.is_none()
-        && matches!(
-            ctx.trace_ctx.concrete_of_opref(result),
-            Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
-        );
+        && (matches!(result_concrete, ConcreteValue::Ref(item) if item.is_null())
+            || matches!(
+                ctx.trace_ctx.concrete_of_opref(result),
+                Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+            ));
     // The store the body recorded, for a walk that could not execute it.
     let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
     // A kept store has no undo entry.  A bridge walk snapshots the pre-walk
@@ -11467,7 +11534,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     if !(3..=5).contains(&r_args.len()) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let mut arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
     else {
@@ -11481,26 +11548,33 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // The bounds are pinned from the moment they are read because the fold
+    // records guards before it runs the constructor, and a minor collection
+    // in any of them moves the bound; an RPython trace keeps each argument
+    // in a GC-visible box (`history.py` `FrontendOp.value`, `pyjitpl.py`
+    // `MIFrame.registers_r`), so the value the constructor sees is the
+    // forwarded one.
+    let arg_pins = residual_call::owner_roots_for_concretes(&arg_concretes);
+
     let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     enum BoundPlan {
-        Exact {
-            op: OpRef,
-            concrete: pyre_object::PyObjectRef,
-        },
-        UserIndex(IndexInlineCandidate),
+        Exact { op: OpRef, arg_index: usize },
+        UserIndex { arg_index: usize },
     }
     let mut plans = Vec::with_capacity(r_args.len() - 2);
-    for (&arg_op, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
-        let ConcreteValue::Ref(arg_obj) = *concrete else {
+    for i in 2..r_args.len().min(arg_concretes.len()) {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let ConcreteValue::Ref(arg_obj) = arg_concretes[i] else {
             return Ok(None);
         };
+        let arg_op = r_args[i];
         if walker_is_exact_machine_int_concrete(arg_obj) {
             plans.push(BoundPlan::Exact {
                 op: arg_op,
-                concrete: arg_obj,
+                arg_index: i,
             });
-        } else if let Some(candidate) = prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-            plans.push(BoundPlan::UserIndex(candidate));
+        } else if prepare_walker_inline_index(ctx, arg_op, arg_obj).is_some() {
+            plans.push(BoundPlan::UserIndex { arg_index: i });
         } else {
             return Ok(None);
         }
@@ -11515,29 +11589,37 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let mut concrete_args = Vec::with_capacity(plans.len());
-    let mut arg_pins = Vec::with_capacity(plans.len());
+    let mut exact_indices = Vec::with_capacity(plans.len());
+    let mut user_pins = Vec::with_capacity(plans.len());
     let mut concrete_values = Vec::with_capacity(plans.len());
     let mut raw_args = Vec::with_capacity(plans.len());
     for plan in plans {
-        let (arg_op, arg_obj) = match plan {
-            BoundPlan::Exact { op, concrete } => (op, concrete),
-            BoundPlan::UserIndex(candidate) => {
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let (arg_op, exact_index, user_pin, arg_obj) = match plan {
+            BoundPlan::Exact { op, arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold Exact bound is a Ref");
+                };
+                (op, Some(arg_index), None, arg_obj)
+            }
+            BoundPlan::UserIndex { arg_index } => {
+                let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                    unreachable!("range fold UserIndex bound is a Ref");
+                };
+                let Some(candidate) = prepare_walker_inline_index(ctx, r_args[arg_index], arg_obj)
+                else {
+                    return walker_range_decline(ctx, pre_emit_pos);
+                };
                 let Some((result, ConcreteValue::Ref(concrete))) =
                     try_walker_inline_index(ctx, op, code, dst, candidate)?
                 else {
                     return walker_range_decline(ctx, pre_emit_pos);
                 };
-                (result, concrete)
+                let user_pin = residual_call::owner_root_if_gc(concrete as usize);
+                let arg_obj = pinned_obj(&user_pin, concrete);
+                (result, None, user_pin, arg_obj)
             }
         };
-        // `walker_guard_class` / `opimpl_getfield_gc_i` append to
-        // `opencoder.py Trace._ops`. Pin the bound so
-        // `call_function_impl_result` receives the forwarded object.
-        let arg_pin = residual_call::owner_root_if_gc(arg_obj as usize);
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
         // A trace-constant bound carries its class in the constant itself, so
         // record the class as known without proving it: `walker_guard_class`
         // would emit a `GuardClass` that can never fail plus the tagged-operand
@@ -11550,10 +11632,15 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
             walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
         }
         walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
+        residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+        let arg_obj = if let Some(arg_index) = exact_index {
+            let ConcreteValue::Ref(arg_obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            arg_obj
+        } else {
+            pinned_obj(&user_pin, arg_obj)
+        };
         let concrete_value = unsafe { pyre_object::w_int_get_value(arg_obj) };
         let raw = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
@@ -11563,13 +11650,24 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
         concrete_args.push(arg_obj);
-        arg_pins.push(arg_pin);
+        exact_indices.push(exact_index);
+        user_pins.push(user_pin);
         concrete_values.push(concrete_value);
         raw_args.push(raw);
     }
-    for (arg, pin) in concrete_args.iter_mut().zip(arg_pins.iter()) {
-        if let Some(pin) = pin {
-            *arg = pin.get().0 as pyre_object::PyObjectRef;
+    residual_call::refresh_pinned_concretes(&mut arg_concretes, &arg_pins);
+    for ((arg, exact_index), user_pin) in concrete_args
+        .iter_mut()
+        .zip(exact_indices.iter())
+        .zip(user_pins.iter())
+    {
+        if let Some(arg_index) = *exact_index {
+            let ConcreteValue::Ref(obj) = arg_concretes[arg_index] else {
+                unreachable!("range fold Exact bound is a Ref");
+            };
+            *arg = obj;
+        } else {
+            *arg = pinned_obj(user_pin, *arg);
         }
     }
 
@@ -15884,7 +15982,7 @@ fn finish_recorded_list_append<Sym: WalkSym>(
     len_before: usize,
 ) -> Result<(), DispatchError> {
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             if finish_inline_callee_return(ctx, result).is_some() {
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op_pc });
             }
@@ -16097,246 +16195,11 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
 /// force/exception guards, the heapcache invalidation and the result
 /// writeback all stay where they are.
 ///
-/// Two arms produce one: [`try_walker_specialize_set_add_method`] and
-/// [`try_walker_specialize_bare_super_call`].
+/// [`try_walker_specialize_bare_super_call`] produces one.
 pub(crate) struct DirectResidualSubst {
     pub(crate) funcptr: OpRef,
     pub(crate) descr: DescrRef,
     pub(crate) allboxes: Vec<OpRef>,
-}
-
-/// What [`try_walker_specialize_set_add_method`] recorded.
-pub(crate) enum SetAddMethodSpec {
-    /// MayForce [`pyre_interpreter::runtime_ops::jit_set_add_method`]. The
-    /// generic tail still executes it.
-    Subst(DirectResidualSubst),
-    /// The traced element is already in an integer-strategy set. Either the
-    /// intval, `set_id`, and `content_gen` guards stand in for the insert, or
-    /// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`]
-    /// does, and the generic tail does not run.
-    Elided,
-}
-
-/// Pin `op` to `expected` unless the trace already folded it to that
-/// constant. `GUARD_VALUE` of a constant the optimizer has proved is
-/// `InvalidLoop` (`optimize_GUARD_VALUE`). A constant that is some other
-/// int is not guarded and not treated as pinned: the caller keeps the
-/// contains helper instead of the field guards.
-fn pin_int_guard_value<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op: OpRef,
-    expected: i64,
-) -> Result<bool, DispatchError> {
-    if op.is_constant() {
-        let pinned = matches!(
-            ctx.trace_ctx.box_value(op),
-            Some(majit_ir::Value::Int(n)) if n == expected
-        );
-        return Ok(pinned);
-    }
-    let expected_op = ctx.trace_ctx.const_int(expected);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[op, expected_op])?;
-    Ok(true)
-}
-
-/// `s.add(x)`: record the direct `set_add` residual the SET_ADD accumulator
-/// opcode records, in place of the generic `bh_call_fn` dispatch the
-/// bound-method spelling otherwise leaves behind.
-///
-/// `pyopcode.py SET_ADD` is `space.call_method(w_set, 'add', w_value)`, so the
-/// two spellings name one operation.  The codewriter lowers the opcode to a
-/// `set_add` residual (`bh_set_add_fn`), while the method call reaches the
-/// same store through `bh_call_fn`, which re-reads the bound method's
-/// function, rejects keywords and rebuilds the argument vector on every
-/// iteration.  This arm pins the callable to the `set.add` builtin and the
-/// receiver to an exact `set`, then hands `(receiver, value)` to
-/// [`pyre_interpreter::runtime_ops::jit_set_add_method`] — the same
-/// `set_add_value` store, entered directly.  Measured on a 3M-iteration
-/// `s.add(i & 3)` loop, that is the whole difference between the method-call
-/// form and the comprehension: 0.220s -> 0.130s against `list.append`'s
-/// 0.040s.
-///
-/// A miss stays a MayForce residual, and deliberately so: `set_add_value`
-/// hashes the element, which can run a user `__hash__`.  That is the other
-/// half of the gap against `list.append` (`GuardNotForced`, which even the
-/// dispatch-free comprehension carries), and this arm does not claim it.
-///
-/// A hit does not hash.  When the traced value is an exact `int`
-/// [`pyre_object::plain_int_already_in_int_set`] already finds in an
-/// [`pyre_object::setobject::IntegerSetStrategy`] set, and that set's
-/// [`pyre_object::setobject::W_SetObject::len_relaxed`] is 1, the arm guards
-/// the unboxed intval, [`pyre_object::setobject::W_SetObject::set_id`], and
-/// [`pyre_object::setobject::W_SetObject::content_gen`], then writes `None`.
-/// No helper runs.  The single element is the traced int, so a different
-/// int is a miss: the intval guard side-exits and the interpreter performs
-/// the real add.  A membership change fails the `content_gen` guard the
-/// same way.
-///
-/// A hit in a set that already holds more than one int keeps
-/// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`] and
-/// `GuardTrue`.  Those keys share one trace (`i & 15`); pinning the traced
-/// sample side-exits on every other present key.  The helper does not
-/// insert.  A fitting `W_LongObject` is stored unboxed too, but it is not a
-/// `W_IntObject`, so it takes the helper rather than the intval guard.  A
-/// concrete miss stays the MayForce substitution below.
-///
-/// Recognition declines before emitting IR. It admits an exact `set`
-/// (`ob_type == &SET_TYPE`). A subclass instance carries `SET_USER_TYPE`
-/// (`typedef.py` `_getusercls`) and does not match the `GuardClass` below.
-/// A subclass that overrides `add` is excluded by the `GuardValue` pinning
-/// the bound function, and a frozenset receiver by the layout guard, which
-/// matters because
-/// [`pyre_interpreter::opcode_ops::set_add_value`] itself accepts
-/// `is_set_or_frozenset` and would mutate one.  Anything else falls through to
-/// the generic residual, which still runs the builtin's receiver and arity
-/// checks.
-pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<SetAddMethodSpec>, DispatchError> {
-    let Some((callable, [value, _])) = plain_builtin_call_concretes(ctx, code, op, r_args, 1)
-    else {
-        return Ok(None);
-    };
-
-    // Recognition: the callable must be the bound builtin `set.add`, over an
-    // exact `set`. `py_type_check(..., &SET_TYPE)` is the layout the
-    // `GuardClass` below pins, so a `SET_USER_TYPE` receiver is not
-    // substituted. It excludes a frozenset, which `set_add_value` would
-    // otherwise mutate.
-    let (inner_func, inner_self) = unsafe {
-        if !pyre_object::function::is_method(callable) {
-            return Ok(None);
-        }
-        let inner_func = pyre_object::function::w_method_get_func(callable);
-        let inner_self = pyre_object::function::w_method_get_self(callable);
-        if inner_func.is_null()
-            || !pyre_object::py_type_check(inner_self, &pyre_object::setobject::SET_TYPE)
-        {
-            return Ok(None);
-        }
-        let set_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-        if pyre_interpreter::lookup_in_type(set_type, "add") != Some(inner_func) {
-            return Ok(None);
-        }
-        (inner_func, inner_self)
-    };
-    // Before any IR. A concrete miss keeps today's MayForce substitution;
-    // guarding a contains check that just returned 0 would side-exit forever.
-    let already = pyre_object::plain_int_already_in_int_set(inner_self, value);
-
-    // ── tentative commit ──
-    // Pin the callable to `set.add`: guard_class METHOD + guard_value on the
-    // stable function slot, both resuming at the call site so a deopt
-    // re-executes the call generically.
-    let self_ref = walker_guard_bound_method(ctx, op.pc, r_args[0], inner_func)?;
-    let set_type_addr = &pyre_object::setobject::SET_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op.pc, self_ref, set_type_addr)?;
-
-    // `is_plain_int1` also accepts a fitting long. `walker_unbox_int` reads
-    // `W_IntObject.intval`, so only an exact int is pinned here, and only
-    // when it is the set's sole element. Any other present int shares this
-    // trace; a GuardValue of the sample fails on the next key.
-    if already && unsafe { pyre_object::is_int(value) } {
-        let (traced_int, traced_id, traced_gen, sole) = unsafe {
-            let n = pyre_object::w_int_get_value(value);
-            let set = &*(inner_self as *const pyre_object::setobject::W_SetObject);
-            (
-                n,
-                set.set_id as i64,
-                set.content_gen_relaxed() as i64,
-                set.len_relaxed() == 1,
-            )
-        };
-        if sole {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let raw = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
-            if pin_int_guard_value(ctx, op.pc, raw, traced_int)? {
-                let id_op = crate::state::opimpl_getfield_gc_i(
-                    ctx.trace_ctx,
-                    self_ref,
-                    crate::descr::set_id_descr(),
-                );
-                if pin_int_guard_value(ctx, op.pc, id_op, traced_id)? {
-                    let gen_op = crate::state::opimpl_getfield_gc_i(
-                        ctx.trace_ctx,
-                        self_ref,
-                        crate::descr::set_content_gen_descr(),
-                    );
-                    if pin_int_guard_value(ctx, op.pc, gen_op, traced_gen)? {
-                        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-                        return Ok(Some(SetAddMethodSpec::Elided));
-                    }
-                }
-            }
-        }
-    }
-
-    if already {
-        let mut effect = majit_metainterp::cannot_raise_effect_info();
-        effect.can_collect = false;
-        let present = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallI,
-            pyre_interpreter::residual_word_addr!(
-                2,
-                pyre_interpreter::runtime_ops::jit_int_set_add_already_present,
-            ),
-            &[self_ref, r_args[2]],
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::Type::Int,
-            effect,
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(present, majit_ir::Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[present])?;
-        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-        return Ok(Some(SetAddMethodSpec::Elided));
-    }
-
-    let funcptr = ctx
-        .trace_ctx
-        .const_int(pyre_interpreter::residual_word_addr!(
-            2,
-            pyre_interpreter::runtime_ops::jit_set_add_method,
-        ) as i64);
-    Ok(Some(SetAddMethodSpec::Subst(DirectResidualSubst {
-        funcptr,
-        descr: set_add_method_descr(),
-        allboxes: vec![funcptr, self_ref, r_args[2]],
-    })))
-}
-
-/// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
-/// `MOST_GENERAL`, tagged [`majit_ir::RuntimeHelperKind::SetAddMethod`].
-///
-/// The EI `bind(..., CallFlavor::MayForce)` gives the SET_ADD residual this one
-/// stands in for: `EffectInfo::MOST_GENERAL`, not the analyzer-empty forcing
-/// shape.  Hashing the element runs arbitrary Python, so no write set was ever
-/// computed for it and an empty one would assert something false
-/// (`effect_info_for_call_flavor`).
-///
-/// `SetAddMethod` on top of it: the call inserts into the live set and returns
-/// `None`, so the `Void`-result write proxy in `writes_live_heap` misses it and
-/// the helper tag is all that discriminator has left to read.  The generic
-/// `bh_call_fn` this stands in for was counted through its own `CallFn` tag;
-/// dropping to an untagged descr would take a completed insert out of the
-/// executed-effect odometer, which is what a nested abort consults before
-/// rewinding.  Built here rather than inline so that invariant is testable.
-pub(crate) fn set_add_method_descr() -> DescrRef {
-    majit_metainterp::make_call_descr_with_effect(
-        &[Type::Ref, Type::Ref],
-        Type::Ref,
-        majit_ir::EffectInfo {
-            runtime_helper: majit_ir::RuntimeHelperKind::SetAddMethod,
-            ..default_effect_info()
-        },
-    )
 }
 
 /// Shared recognition for the list-append descent: the receiver must be a
@@ -16533,16 +16396,53 @@ pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker
 /// Parent resume coordinate for a guard recorded inside a collapsed helper
 /// or inlined callee.
 ///
-/// The parent re-executes the Python opcode from this `-live-`. On a
-/// loop-header opcode that is the op2 `-live-` after `jit_merge_point`
-/// (`jtransform.py handle_jit_marker__jit_merge_point`).
+/// The parent re-executes the collapsed call, so it resumes at the last
+/// `-live-` the call's own opcode passed before the call op.
+/// `pyjitpl.py get_list_of_active_boxes` reads liveness at that preceding
+/// `-live-`; `blackhole.py setposition` restores those colors. On a
+/// loop-header opcode the walk starts at the op2 `-live-` after
+/// `jit_merge_point` (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn collapsed_parent_resume_marker(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
-    payload
-        .resume_marker_for_jitcode_pc(jit_pc)
-        .map(|m| loop_header_guard_resume_marker(payload, m))
+    let start =
+        loop_header_guard_resume_marker(payload, payload.resume_marker_for_jitcode_pc(jit_pc)?);
+    let jitcode = payload.jitcode.as_ref();
+    let code = jitcode.code.as_slice();
+    let op_live = crate::state::op_live();
+    let mut remembered: Option<usize> = None;
+    let mut decode_failed = false;
+    match crate::jitcode_runtime::decode_op_at(code, start) {
+        None => decode_failed = true,
+        Some(start_op) => {
+            let mut pc = start_op.next_pc;
+            while pc < jit_pc {
+                match crate::jitcode_runtime::decode_op_at(code, pc) {
+                    None => {
+                        decode_failed = true;
+                        break;
+                    }
+                    Some(op) => {
+                        if op.opname == "live" && jitcode.can_decode_live_vars(pc, op_live) {
+                            remembered = Some(pc);
+                        }
+                        if op.opname == "goto"
+                            || op.opname.starts_with("goto_if")
+                            || op.opname == "switch"
+                        {
+                            remembered = None;
+                        }
+                        pc = op.next_pc;
+                    }
+                }
+            }
+        }
+    }
+    if decode_failed {
+        remembered = None;
+    }
+    Some(remembered.unwrap_or(start))
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -17314,9 +17214,15 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         &[],
     )?;
 
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
+    let (result, result_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
     };
     // The Integer arm commits `ll_list_int_set_len` before it boxes, so a guard
@@ -17346,7 +17252,14 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
             symbolic: 0,
         });
     }
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    super::residual_call::write_call_result_to_dst_with_concrete(
+        ctx,
+        op.pc,
+        dst,
+        'r',
+        result,
+        result_concrete,
+    )?;
 
     let w_item = match popped {
         PoppedTail::Int(raw_item) => pyre_object::w_int_new(raw_item),
@@ -19351,7 +19264,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         }
     };
     match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn { result, .. } => {
             // `w_list_setitem_inner` returns bool; the opcode discards it.
             let _ = result;
         }
@@ -19808,7 +19721,9 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    // The helper's return is the ForIterNext dest, so the paused caller resumes past the call (`_setup_return_value_r`).
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -19861,9 +19776,15 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     let Some(iter_obj) = iter_now else {
         return Ok(None);
     };
-    let item = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+    let (item, mut item_concrete) = match walk_outcome {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => (
+            finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            result_concrete,
+        ),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     // The walked body records the compare, the store and the box, and its
@@ -19880,27 +19801,30 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
             }
             ctx.trace_ctx
                 .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+            item_concrete = ConcreteValue::Ref(concrete_item);
         }
     }
     let Some(concrete_item_ptr) = walker_concrete_ref_object(ctx, item) else {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             item,
+            item_concrete,
         )?;
         return Ok(Some(item));
     };
     if !concrete_continues {
-        write_no_driver_finishframe_dest(
+        write_no_driver_finishframe_dest_with_concrete(
             ctx,
             op_pc,
             no_driver_finishframe_latch(ctx, op_pc),
             dst,
             dst_bank,
             item,
+            item_concrete,
         )?;
         return Ok(Some(item));
     }
@@ -19922,13 +19846,14 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
-    write_no_driver_finishframe_dest(
+    write_no_driver_finishframe_dest_with_concrete(
         ctx,
         op_pc,
         no_driver_finishframe_latch(ctx, op_pc),
         dst,
         dst_bank,
         item,
+        item_concrete,
     )?;
     Ok(Some(item))
 }

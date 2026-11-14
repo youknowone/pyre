@@ -1238,7 +1238,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
-    concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    // resume.py rebuild_from_resumedata already wrote last_instr from the
+    // snapshot boxes. pyjitpl.py handle_guard_failure / setup_resume_at_op
+    // starts at the encoded jitcode pc and does not plant a Python pc over
+    // that field.
+    if carrier.is_some() || sym.bridge_walk_entry_pc().is_none() {
+        concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    }
     let w_code = concrete_frame.pycode;
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
@@ -1644,6 +1650,43 @@ fn inject_root_call_result<Sym: WalkSym>(
             else {
                 return false;
             };
+            if op.opname.starts_with("inline_call_") {
+                // `MIFrame.make_result_of_lastop` and blackhole
+                // `_setup_return_value_i` / `_setup_return_value_r` /
+                // `_setup_return_value_f` write only the dest register.
+                // `Transformer.handle_regular_call` is always
+                // `[inline_call, -live-]`; no Python operand-stack depth is
+                // touched for an inline call's return.
+                return match dest {
+                    crate::jitcode_dispatch::CallResultRegister::Void => true,
+                    crate::jitcode_dispatch::CallResultRegister::Reg('r', result_reg) => {
+                        if let Some(bridge_regs) = sym.bridge_registers_r_mut().as_mut() {
+                            if bridge_regs.len() <= result_reg {
+                                bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+                            }
+                            bridge_regs.set(result_reg, result);
+                        }
+                        true
+                    }
+                    crate::jitcode_dispatch::CallResultRegister::Reg(
+                        bank @ ('i' | 'f'),
+                        result_reg,
+                    ) => {
+                        let regs = if bank == 'i' {
+                            sym.registers_i_mut()
+                        } else {
+                            sym.registers_f_mut()
+                        };
+                        if regs.len() <= result_reg {
+                            regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
+                        }
+                        regs[result_reg] = result;
+                        true
+                    }
+                    crate::jitcode_dispatch::CallResultRegister::Reg(..)
+                    | crate::jitcode_dispatch::CallResultRegister::Unknown => false,
+                };
+            }
             match dest {
                 crate::jitcode_dispatch::CallResultRegister::Void => {
                     // `_setup_return_value_v`: a void helper (list setitem) has no
@@ -2202,13 +2245,17 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // continuation form one bridge body).
     // Other shapes / outcomes log + abort (trace discarded).
     let subwalk_result = match &walk {
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
-            Some(*r)
-        }
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _)))
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                result: Some(r),
+                result_concrete,
+            },
+            _,
+        ))) => Some((*r, *result_concrete)),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _)))
             if crate::state::jitcode_is_transparent_helper(recipe.jitcode_index) =>
         {
-            Some(majit_ir::OpRef::NONE)
+            Some((majit_ir::OpRef::NONE, crate::state::ConcreteValue::Null))
         }
         _ => None,
     };
@@ -2500,7 +2547,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     root_frame_box: majit_ir::OpRef,
     carrier: &majit_metainterp::BridgeInlineCarrier,
     middles: &[majit_metainterp::ReconstructRecipe],
-    mut result: majit_ir::OpRef,
+    mut result: (majit_ir::OpRef, crate::state::ConcreteValue),
 ) -> Option<TraceAction> {
     finishframe_clear_last_exc(session, sym);
     for i in (0..middles.len()).rev() {
@@ -2546,7 +2593,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
         root_pc,
         cf_addr,
         carrier,
-        result,
+        result.0,
     )
 }
 
@@ -2819,6 +2866,8 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     Some(action)
 }
 
+type ThreadedBridgeValue = (majit_ir::OpRef, crate::state::ConcreteValue);
+
 /// Reconstruct `middle` and walk it from its `catch_exception` target, the
 /// `ChangeFrame` half of `finishframe_exception`. `Ok` is `finishframe`
 /// (`SubReturn`); `Err` is a handler that raised again; `None` is a
@@ -2836,7 +2885,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     exc: majit_ir::OpRef,
     exc_concrete: crate::state::ConcreteValue,
     catch_target: usize,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let is_being_profiled =
         crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
@@ -2932,9 +2981,10 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -2964,8 +3014,8 @@ fn walk_len_operator_tail<Sym: WalkSym>(
     root_pc: usize,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
         middle.jitcode_index,
@@ -2998,9 +3048,10 @@ fn walk_len_operator_tail<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -3026,8 +3077,8 @@ fn walk_transparent_helper_middle<Sym: WalkSym>(
     root_pc: usize,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle = ctx.reconstruct_recipe_with_current_refs(middle);
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
@@ -3061,11 +3112,15 @@ fn walk_transparent_helper_middle<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
-            Some(Ok(majit_ir::OpRef::NONE))
+        ))) => Some(Ok((mid_result, result_concrete))),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
+            Some(Ok((
+                majit_ir::OpRef::NONE,
+                crate::state::ConcreteValue::Null,
+            )))
         }
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
@@ -3094,7 +3149,7 @@ fn walk_transparent_helper_middle_from_handler<Sym: WalkSym>(
     exc: majit_ir::OpRef,
     exc_concrete: crate::state::ConcreteValue,
     catch_target: usize,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let middle = ctx.reconstruct_recipe_with_current_refs(middle);
     let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
     let middle_entry = select_recipe_entry(
@@ -3130,11 +3185,15 @@ fn walk_transparent_helper_middle_from_handler<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
-            Some(Ok(majit_ir::OpRef::NONE))
+        ))) => Some(Ok((mid_result, result_concrete))),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
+            Some(Ok((
+                majit_ir::OpRef::NONE,
+                crate::state::ConcreteValue::Null,
+            )))
         }
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
@@ -3177,8 +3236,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     root_ec_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
-    child_result: majit_ir::OpRef,
-) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    child_result: ThreadedBridgeValue,
+) -> Option<Result<ThreadedBridgeValue, ThreadedBridgeValue>> {
     let is_being_profiled =
         crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     if middle.len_tail {
@@ -3300,9 +3359,10 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
                 result: Some(mid_result),
+                result_concrete,
             },
             _,
-        ))) => Some(Ok(mid_result)),
+        ))) => Some(Ok((mid_result, result_concrete))),
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise {
                 exc: raised,
@@ -3310,7 +3370,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
             },
             _,
         ))) => Some(Err((raised, raised_concrete))),
-        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None, .. }, _))) => {
             crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveVoid");
             None
         }
@@ -3813,30 +3873,6 @@ fn cash_multi_frame_blackhole(
             })
             .collect::<Vec<_>>(),
     );
-    // This closure does not run `return_trace` / `ExecutionContext.leave`.
-    // Adopted Python levels finish through `bhimpl_jit_merge_point`'s
-    // recursive arm; `ll_portal_runner_shim`'s bracket already ran
-    // `pyframe.py execute_frame`'s inner and outer `finally` hooks
-    // (`portal_activation_bracketed`, `PortalLeaveOwner::CompiledTrace`).
-    // The bracket skips the chain half of `leave`, which this supplies.
-    // Convert's `bh_portal_runner_c` levels instead take
-    // `finish_per_code_blackhole_level` (`call_jit.rs`).
-    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
-        // Only no-handler exception leave stores the bit (`handle_operation_error`); a return executed its own flags store.
-        crate::state::finish_blackhole_level_frame(
-            frame_ptr,
-            matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
-        );
-        if frame_ptr != 0 {
-            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
-            // before the caller's residuals run.
-            unsafe {
-                (*ec).set_topframeref((*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref);
-            }
-            level_recursion.borrow_mut().pop();
-        }
-        None
-    };
     if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
         crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3861,6 +3897,18 @@ fn cash_multi_frame_blackhole(
     for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
         slot.0 = ptr;
     }
+    // Adopted inner levels now finish through `bh_portal_runner_c`
+    // (`portal_ptr`, no second `enter`/`call_trace`) and their
+    // `execute_frame` finally (`return_trace`, `leave`) runs here, as in
+    // convert.
+    let portal_frame = per_frame.first().map(|&(p, _)| p).unwrap_or(0);
+    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        let replaced = crate::state::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
+        if frame_ptr != 0 {
+            level_recursion.borrow_mut().pop();
+        }
+        replaced
+    };
     let virtualizable_info = std::sync::Arc::as_ptr(&staged.virtualizable_info);
     let drive_vable = cf_addr.unwrap_or(live_root_addr) as i64;
     WALK_HANDED_TO_BLACKHOLE.with(|c| c.set(true));
@@ -3886,7 +3934,9 @@ fn cash_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64, majit_metainterp::blackhole::LevelExit) -> Option<i64>),
-        None,
+        Some(crate::state::python_portal_bh_jitdrivers_sd(
+            staged.metainterp_sd.as_ref(),
+        )),
         Some(staged.banks.as_mut_slice()),
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
@@ -8730,6 +8780,32 @@ mod tests {
             sym.bridge_stack_oprefs.is_none(),
             "an int dest is a typed register, not an operand-stack slot"
         );
+    }
+
+    #[test]
+    fn inject_root_call_result_inline_call_writes_only_the_register() {
+        let dest = 3_u8;
+        let byte = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("inline_call_r_i/dR>i")
+            .expect("inline_call_r_i/dR>i must be in the insns table");
+        // d(2) + empty R varlist (len byte) + dest.
+        let code = vec![byte, 0, 0, 0, dest];
+        let root_pc = code.len();
+        let (_wrapper, mut sym) = inject_root_fixture(code);
+        let valuestackdepth_before = sym.valuestackdepth;
+        let stack_before = sym.bridge_stack_oprefs.to_vec();
+        let result = majit_ir::OpRef::const_int(1);
+        assert!(
+            super::inject_root_call_result(&mut sym, root_pc, result),
+            "inline-call result at root_pc must resolve like make_result_of_lastop"
+        );
+        assert_eq!(
+            sym.registers_i.get(dest as usize).copied(),
+            Some(result),
+            "inline_call 'i' dest lands in registers_i[color]"
+        );
+        assert_eq!(sym.valuestackdepth, valuestackdepth_before);
+        assert_eq!(sym.bridge_stack_oprefs.to_vec(), stack_before);
     }
 
     #[test]

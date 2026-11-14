@@ -6724,7 +6724,7 @@ pub(crate) fn dict_store_checked(
     }
 }
 
-/// Hash `item` with it rooted, then look it up with `probe`.
+/// Hash `item` with it rooted, then look it up: remove it when `discard`, test membership otherwise.
 ///
 /// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
 /// pointer, so hashing inside the key build (`object_key_for_checked`) captures
@@ -6735,14 +6735,12 @@ pub(crate) fn dict_store_checked(
 /// The set is rooted too: `CONTAINS_OP` pops the container off the operand
 /// stack before dispatching here, so on `x in {...}` the hash below runs with
 /// nothing else referring to the set at all.  The body relocates, so the
-/// probe reloads it after `__hash__`.
+/// lookup reloads it after `__hash__`.
+#[majit_macros::getfunctionptr]
 unsafe fn set_lookup_checked(
     set: PyObjectRef,
     item: PyObjectRef,
-    probe: unsafe fn(
-        PyObjectRef,
-        pyre_object::dictmultiobject::ObjectKey,
-    ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
+    discard: bool,
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::pin_roots(&[item, set]);
@@ -6757,8 +6755,13 @@ unsafe fn set_lookup_checked(
         pyre_object::gc_roots::shadow_stack_get(sp),
         hash,
     );
-    probe(pyre_object::gc_roots::shadow_stack_get(sp + 1), key)
-        .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    let set = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    let found = if discard {
+        pyre_object::setobject::w_set_discard_key_checked(set, key)
+    } else {
+        pyre_object::setobject::w_set_contains_key_checked(set, key)
+    };
+    found.map_err(|_| crate::baseobjspace::take_pending_hash_error())
 }
 
 /// Remove an element from a set, hashing it through the protocol.
@@ -6766,10 +6769,11 @@ pub(crate) fn set_discard_checked(
     set: PyObjectRef,
     item: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    unsafe { set_lookup_checked(set, item, pyre_object::setobject::w_set_discard_key_checked) }
+    unsafe { set_lookup_checked(set, item, true) }
 }
 
 /// Test membership in a set, hashing the element through the protocol.
+#[majit_macros::getfunctionptr]
 pub(crate) fn set_contains_checked(
     set: PyObjectRef,
     item: PyObjectRef,
@@ -6788,11 +6792,7 @@ pub(crate) fn set_contains_checked(
                 return Ok(found != 0);
             }
         }
-        set_lookup_checked(
-            set,
-            item,
-            pyre_object::setobject::w_set_contains_key_checked,
-        )
+        set_lookup_checked(set, item, false)
     }
 }
 

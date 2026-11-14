@@ -1676,11 +1676,42 @@ fn descent_decline(
     summary.blocker_after_effect.map(DescentDecline::Helper)
 }
 
+/// Callee answer for a blackhole `inline_call_*`: a callable `fnaddr` runs
+/// natively (`bhimpl_inline_call_*`) and contributes only its effect;
+/// otherwise the callee is interpreted. `recursive` is the in-progress
+/// blackhole scan's `seen` / `cycle_hits`; without it the callee starts a
+/// fresh memoized summary.
+fn blackhole_inline_callee_summary(
+    payload_descrs: Option<&[DescrRef]>,
+    descr_index: usize,
+    recursive: Option<(&mut Vec<usize>, &mut u64)>,
+) -> Option<DescentBlockerSummary> {
+    helper_resume_descr_at(payload_descrs, descr_index)
+        .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+        .map(|callee_index| {
+            // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does not
+            // interpret this body; the native call can still allocate, raise
+            // or write the heap.
+            let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
+                .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
+            if calls_native {
+                DescentBlockerSummary {
+                    may_execute_effect: true,
+                    ..DescentBlockerSummary::default()
+                }
+            } else if let Some((seen, cycle_hits)) = recursive {
+                summarize_blackhole_blockers_cached(callee_index, seen, cycle_hits)
+            } else {
+                blackhole_blocker_summary(callee_index)
+            }
+        })
+}
+
 /// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
 /// can reach a residual or conditional call whose funcbox may be a symbolic
 /// placeholder (`is_symbolic_fnaddr`), an `abort` opcode (`bhimpl_abort`),
 /// an `inline_call_*` callee the blackhole would interpret
-/// (`interpret_unresolved_inline_call`) whose whole-body summary can reach
+/// (`interpret_unresolved_inline_call`) whose blackhole summary can reach
 /// an `abort`, or a region the scan cannot read.
 ///
 /// `reject_unresolved_call` bails at a symbolic placeholder. A runtime
@@ -1692,8 +1723,9 @@ fn descent_decline(
 /// scan proves there (`entry_array_len`, the length of a gateway's argument
 /// array), so an arm those facts exclude on every path to `pc` is not
 /// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary. An inline callee with a callable `fnaddr` contributes
+/// blackhole summary. An inline callee with a callable `fnaddr` contributes
 /// no body blockers: the blackhole calls it natively (`bhimpl_inline_call_*`).
+/// A nested callee with a callable `fnaddr` contributes only its effect.
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1727,23 +1759,7 @@ pub(crate) fn helper_resume_reaches_blocker(
             jitcode.num_regs_i(),
             jitcode.constants_i.as_slice(),
             |descr_index, _caller_effect, _entry_lens| {
-                helper_resume_descr_at(payload_descrs, descr_index)
-                    .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    .map(|callee_index| {
-                        // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
-                        // not interpret this body; the native call can still
-                        // allocate, raise or write the heap.
-                        let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
-                            .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
-                        if calls_native {
-                            DescentBlockerSummary {
-                                may_execute_effect: true,
-                                ..DescentBlockerSummary::default()
-                            }
-                        } else {
-                            descent_blocker_summary(callee_index)
-                        }
-                    })
+                blackhole_inline_callee_summary(payload_descrs, descr_index, None)
             },
             &mut |_blocker, _effect| true,
             &mut call_effect_free,
@@ -2089,6 +2105,82 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
         return body_not_walked();
     };
     jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
+}
+
+/// Whole-body summary under blackhole execution: an `inline_call_*` callee
+/// with a callable fnaddr runs natively (`bhimpl_inline_call_*`) and
+/// contributes only its effect.
+pub(crate) fn blackhole_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return body_not_walked();
+    };
+    jitcode.blackhole_blocker_summary(|| {
+        let mut cycle_hits = 0;
+        summarize_blackhole_blockers_inner(jitcode_index, &mut Vec::new(), &mut cycle_hits)
+    })
+}
+
+/// [`summarize_blackhole_blockers_inner`] for a callee, memoized on the
+/// callee's body when the answer belongs to that body.
+///
+/// Cycle-safe the same way [`summarize_descent_blockers_cached`] is: a body
+/// already on the stack answers "executes an effect, names no blocker" for
+/// the occurrence that opened the cycle, and that answer is not stored.
+fn summarize_blackhole_blockers_cached(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    cycle_hits: &mut u64,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        return summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    };
+    if let Some(cached) = jitcode.blackhole_blocker_summary_if_computed() {
+        return cached;
+    }
+    let cycles_before = *cycle_hits;
+    let summary = summarize_blackhole_blockers_inner(jitcode_index, seen, cycle_hits);
+    if *cycle_hits == cycles_before {
+        jitcode.blackhole_blocker_summary(|| summary);
+    }
+    summary
+}
+
+fn summarize_blackhole_blockers_inner(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    cycle_hits: &mut u64,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        *cycle_hits += 1;
+        return DescentBlockerSummary {
+            may_execute_effect: true,
+            ..DescentBlockerSummary::default()
+        };
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return body_not_walked();
+    };
+    seen.push(jitcode_index);
+    let summary = summarize_body_blockers_from(
+        None,
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index, _caller_effect, _entry_lens| {
+            blackhole_inline_callee_summary(None, descr_index, Some((&mut *seen, &mut *cycle_hits)))
+        },
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
+        &[],
+        &mut jitcode_fnaddr_for_descr,
+        descr_refs_for_jitcode_index(jitcode_index),
+    );
+    seen.pop();
+    summary
 }
 
 /// One reachable point of [`summarize_descent_blockers`]'s dataflow.
@@ -8330,6 +8422,84 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// `pyjitpl.py` `MetaInterp.execute_new_array_clear` and
+/// `execute_setarrayitem_gc` execute the allocation/stores as they record.
+/// As in `MetaInterp.execute_and_record_varargs`, execution supplies the
+/// concrete value before recording its result box.
+/// Keep the gateway's argument GcArray concrete too, so a residual inside
+/// the wrapper can read the same array as its recorded box.
+fn record_builtin_wrapper_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    items: &[OpRef],
+    item_concretes: &[ConcreteValue],
+) -> (OpRef, Option<majit_gc::shadow_stack::OwnerRootGuard>) {
+    let mut concretes: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(i, &item)| {
+            let concrete = item_concretes
+                .get(i)
+                .copied()
+                .unwrap_or(ConcreteValue::Null);
+            live_box_concrete(ctx.trace_ctx, item, concrete)
+        })
+        .collect();
+    let mut item_pins = residual_call::PinnedConcretes::new(&concretes);
+    // An unknown item must not make a partially populated array executable.
+    let array_root = concretes
+        .iter()
+        .all(|value| matches!(value, ConcreteValue::Ref(_)))
+        .then(|| execute_new_ref_array_clear(items.len()))
+        .flatten();
+    item_pins.refresh(&mut concretes);
+    for (&item, &concrete) in items.iter().zip(&concretes) {
+        if let ConcreteValue::Ref(value) = concrete
+            && !value.is_null()
+        {
+            ctx.trace_ctx.try_set_opref_concrete(
+                item,
+                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+            );
+        }
+    }
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    for (index, &item) in items.iter().enumerate() {
+        if let Some(root) = array_root.as_ref() {
+            item_pins.refresh(&mut concretes);
+            let ConcreteValue::Ref(value) = concretes[index] else {
+                unreachable!("only concrete Ref arguments materialize a gateway array")
+            };
+            unsafe {
+                pyre_object::object_array::items_block_set_ref(
+                    root.get().0 as *mut pyre_object::object_array::ItemsBlock,
+                    index,
+                    value,
+                );
+            }
+        }
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+    }
+    if let Some(root) = array_root.as_ref() {
+        ctx.trace_ctx
+            .try_set_opref_concrete(args_array, majit_ir::Value::Ref(root.get()));
+    }
+    (args_array, array_root)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8365,42 +8535,9 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     let tp_init_pin = type_call_init
         .as_ref()
         .and_then(|init| residual_call::owner_root_if_gc(init.tp_init as usize));
-    for (&item, concrete) in wrapper_items.iter().zip(wrapper_item_concretes) {
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            // Box.value is the recording-time shadow, not a compile-time
-            // constant.  The generated wrapper's getarrayitem returns this
-            // same live box; seeding it lets py_type_check choose its observed
-            // arm and emit the corresponding guards while retaining `self`
-            // as a red input.
-            ctx.trace_ctx.try_set_opref_concrete(
-                item,
-                majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
-            );
-        }
-    }
+    let (args_array, args_array_root) =
+        record_builtin_wrapper_args(ctx, wrapper_items, wrapper_item_concretes);
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -8480,7 +8617,11 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_root
+            .as_ref()
+            .map_or(ConcreteValue::Null, |root| {
+                ConcreteValue::Ref(root.get().0 as pyre_object::PyObjectRef)
+            })],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -8596,9 +8737,12 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // descent entry points live even under `all`; the residual `spec_gate`
     // still covers leftover `jit_str_startswith` / `jit_str_endswith`.
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
-                let concrete = match concrete_from_recorded_opref(ctx, value) {
+                let concrete = match result_concrete {
                     ConcreteValue::Ref(p) if !p.is_null() => ConcreteValue::Ref(p),
                     other => walker_concrete_ref_object(ctx, value)
                         .map(ConcreteValue::Ref)
@@ -8908,38 +9052,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     if let Some(level) = nested_helper_entry.as_mut() {
         level.entry_array_len = Some(wrapper_items.len());
     }
-    for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            // The box's own value is forwarded by the collector; the copy
-            // predates the snapshot capture above.
-            let value = walker_concrete_ref_object(ctx, item).unwrap_or(*value);
-            ctx.trace_ctx.try_set_opref_concrete(
-                item,
-                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
-            );
-        }
-    }
+    let (args_array, args_array_root) =
+        record_builtin_wrapper_args(ctx, &wrapper_items, &wrapper_item_concretes);
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
@@ -8977,7 +9092,11 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_root
+            .as_ref()
+            .map_or(ConcreteValue::Null, |root| {
+                ConcreteValue::Ref(root.get().0 as pyre_object::PyObjectRef)
+            })],
         &[],
     );
     drop(helper_frame);
@@ -9002,7 +9121,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         Err(error) => return Err(error),
     };
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
-        DispatchOutcome::SubReturn { result: _ } => {
+        DispatchOutcome::SubReturn { result: _, .. } => {
             // `descr_call` discards `__init__`'s None and returns the instance.
             write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
             Ok(Some(super::continue_after_no_driver_finishframe(
@@ -12336,7 +12455,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -12571,9 +12690,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         fbw_foriter_inflight_popframe(owner);
     }
     match outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                let concrete_for_shadow = result_concrete;
                 if require_str_result
                     && !matches!(
                         concrete_for_shadow,
@@ -14293,7 +14415,6 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             );
             match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
                 Ok(live_norm) => {
-                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
                     ctx.trace_ctx
                         .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
                     (raw, live_norm)
@@ -14325,7 +14446,13 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         let live_ptr = pyre_object::w_int_new(live_norm) as i64;
         ctx.trace_ctx
             .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+        // `make_result_of_lastop` before `GUARD_NO_EXCEPTION` on the residual
+        // normalize path (`pyjitpl.py execute_varargs`). Capture stays at
+        // `op.pc`; this site does not set `live_after_jit_pc`.
+        make_result_of_lastop(ctx, op.pc, dst, 'r', boxed)?;
+        if !inline_unbox {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+        }
     }
     Ok(Some(inlined))
 }
@@ -18529,7 +18656,7 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
         &[gen_concrete, frame],
         &[],
     )? {
-        DispatchOutcome::SubReturn { result: None } => {}
+        DispatchOutcome::SubReturn { result: None, .. } => {}
         _ => return Err(DispatchError::callee_inline_unsupported(op.pc)),
     }
     let null_box = ctx.trace_ctx.const_null();
@@ -19152,7 +19279,9 @@ fn walk_generator_resume<Sym: WalkSym>(
         drop(inline_concrete.take());
     }
     let (item, residualize_if_unstamped) = match walk_result {
-        DispatchOutcome::SubReturn { result: Some(item) } => (item, true),
+        DispatchOutcome::SubReturn {
+            result: Some(item), ..
+        } => (item, true),
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // `do_recursive_call(..., assembler_call=True)`: reds are
             // `[frame, ec]` (`PyPyJitDriver.reds`). The CALL_ASSEMBLER
@@ -20923,7 +21052,11 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
     pc: usize,
     exc_before: Option<OpRef>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let DispatchOutcome::SubReturn { result: Some(op) } = outcome else {
+    let DispatchOutcome::SubReturn {
+        result: Some(op),
+        result_concrete,
+    } = outcome
+    else {
         return Ok(outcome);
     };
     // A void return (`None`) or a real box must not be treated as a raise
@@ -20934,7 +21067,10 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
         Some(majit_ir::Value::Ref(r)) if r.0 == 0
     );
     if !published_null {
-        return Ok(DispatchOutcome::SubReturn { result: Some(op) });
+        return Ok(DispatchOutcome::SubReturn {
+            result: Some(op),
+            result_concrete,
+        });
     }
     match ctx.last_exc_value().filter(|&exc| Some(exc) != exc_before) {
         Some(_) => {
@@ -20953,7 +21089,10 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
                 exc_concrete: ctx.last_exc_value_concrete(),
             })
         }
-        None => Ok(DispatchOutcome::SubReturn { result: Some(op) }),
+        None => Ok(DispatchOutcome::SubReturn {
+            result: Some(op),
+            result_concrete,
+        }),
     }
 }
 
@@ -21557,6 +21696,11 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     }
     Ok(InlineCallOutcome::residual(DispatchOutcome::SubReturn {
         result: (dst_bank != 'v').then_some(recorded),
+        result_concrete: if dst_bank == 'v' {
+            ConcreteValue::Null
+        } else {
+            concrete_from_recorded_opref(ctx, recorded)
+        },
     }))
 }
 
@@ -21716,6 +21860,7 @@ struct PendingSubReturn {
     dst: usize,
     caller_pc: usize,
     result: Option<OpRef>,
+    result_concrete: ConcreteValue,
     /// `SubWalkFrame::caller_exc_before` of the callee that produced `result`.
     exc_before: Option<OpRef>,
 }
@@ -21781,6 +21926,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                     &mut walk_ctx,
                     DispatchOutcome::SubReturn {
                         result: pending.result,
+                        result_concrete: pending.result_concrete,
                     },
                     pending.caller_pc,
                     pending.exc_before,
@@ -21790,12 +21936,13 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 None
             } else {
                 let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
-                    Some(value) => super::residual_call::write_residual_call_result_to_dst(
+                    Some(value) => super::residual_call::write_call_result_to_dst_with_concrete(
                         &mut walk_ctx,
                         pending.caller_pc,
                         pending.dst,
                         pending.dst_bank,
                         value,
+                        pending.result_concrete,
                     )
                     .is_ok(),
                     None => pending.dst_bank == 'v',
@@ -22147,7 +22294,10 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     let Some(parent) = self.frames.last_mut() else {
                         return result.map(|outcome| (outcome, class_state));
                     };
-                    if let Ok(DispatchOutcome::SubReturn { result: ret }) = &result
+                    if let Ok(DispatchOutcome::SubReturn {
+                        result: ret,
+                        result_concrete,
+                    }) = &result
                         && let Some((dst_bank, dst, next_pc)) =
                             inline_call_subreturn_dst(parent.body.code, caller_pc)
                     {
@@ -22157,6 +22307,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             dst,
                             caller_pc,
                             result: *ret,
+                            result_concrete: *result_concrete,
                             exc_before: caller_exc_before,
                         });
                         parent.pc = next_pc;
@@ -23789,10 +23940,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             super::specialize::binary_op_tag_for_helper_index(ctx.raw_descrs, sub_index, &[])
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-        let write_boxed = |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef| {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)
-        };
+        let write_boxed =
+            |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef, concrete: ConcreteValue| {
+                write_ref_reg(ctx, op.pc, dst, boxed, concrete)
+            };
         let is_subscr = matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
             Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -23815,11 +23966,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         if is_subscr
             && let Some(DispatchOutcome::SubReturn {
                 result: Some(boxed),
+                result_concrete,
             }) = spec_gate(SpecFold::Subscr, || {
                 super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
             })?
         {
-            write_boxed(ctx, boxed)?;
+            write_boxed(ctx, boxed, result_concrete)?;
             return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
         // Named `add`/`mul`/… helpers arrive as `dR>r`, not
@@ -23874,7 +24026,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR`
@@ -23884,20 +24039,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
                 let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-                // inline_call_* dst writeback — `value` is the callee's
-                // SubReturn OpRef.  The callee's matching concrete shadow
-                // was dropped at sub-walk exit; `concrete_of_opref` still
-                // sees through to `constants.get_value` for callees that
-                // return a constant (e.g. `LoadConst` tail), so route via
-                // the unified shadow channel.  Non-constant returns surface
-                // as the sentinel `GcRef(usize::MAX)` → Null fallback.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
@@ -24133,11 +24280,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
+            result_concrete,
         }) = spec_gate(SpecFold::Subscr, || {
             super::specialize::try_emit_list_int_getitem(ctx, op.pc, &ref_args, dst, dst_bank)
         })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            write_ref_reg(ctx, op.pc, dst, boxed, result_concrete)?;
             return continue_after_no_driver_finishframe(ctx, op.next_pc, op.pc);
         }
     }
@@ -24252,13 +24399,13 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // `int_add_ovf` instead of aborting the bridge.
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
+            result_concrete,
         }) = spec_gate(SpecFold::BinaryOpDescent, || {
             super::specialize::try_emit_exact_int_binop(
                 ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
             )
         })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            write_ref_reg(ctx, op.pc, dst, boxed, result_concrete)?;
             // `pyjitpl.py finishframe` clears `last_exc_value` before popframe
             // on a non-exceptional return. This emit replaces that inline
             // call, so the following `opimpl_catch_exception` sees a clear
@@ -24349,7 +24496,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     };
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
@@ -24357,16 +24507,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // dst register byte sits after descr (2B) + I-list (int_width)
                 // + R-list (ref_width) bytes.
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
-                // See dispatch_inline_call_dr_kind: route the SubReturn
-                // OpRef through the unified shadow channel so constant
-                // return values propagate.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
@@ -24594,22 +24740,21 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         promote_published_null_return_since(ctx, callee_result.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 if dst_bank == 'v' {
                     return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
-                // See dispatch_inline_call_dr_kind: route the SubReturn
-                // OpRef through the unified shadow channel so constant
-                // return values propagate.
-                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'i' => {
-                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_int_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'r' => {
-                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                        write_ref_reg(ctx, op.pc, dst, value, result_concrete)?;
                     }
                     'f' => {
                         let len = ctx.registers_f.len();
@@ -24623,6 +24768,10 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                                     bank: "f",
                                 })?;
                         ctx.registers_f.set(dst, value);
+                        if let ConcreteValue::Float(float_value) = result_concrete {
+                            ctx.trace_ctx
+                                .set_opref_concrete(value, majit_ir::Value::Float(float_value));
+                        }
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"

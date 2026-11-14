@@ -222,6 +222,17 @@ pub trait ResidualError {
     fn publish_residual(self);
 }
 
+/// The error carrier returned as a value is one GC-ref word.
+///
+/// Distinct from [`ResidualError::publish_residual`], which raises.
+/// `CallControl.guess_call_kind` residualizes a graphless call to a real
+/// low-level function pointer (`Transformer.handle_residual_call`); that
+/// pointer's result is this word. The caller converts it and raises
+/// explicitly.
+pub trait ErrorCarrierWord {
+    fn into_return_word(self) -> i64;
+}
+
 /// Visit every registered trampoline, whichever population the target carries.
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]

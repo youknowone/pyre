@@ -2247,31 +2247,6 @@ fn a_new_opref_is_allocated_after_the_helper_entry_index() {
     assert!(!opref_allocated_after(OpRef::NONE, 0));
 }
 
-/// The `s.add(x)` substitution replaces a residual the executed-effect odometer
-/// counts (`CallFn`) with one it judges by descr shape alone.  A `Ref` result
-/// clears the `Void` write proxy, so the helper tag is the only thing left
-/// saying an insert happened — and the element's `__hash__` cannot stand in for
-/// it, since a cpyext `tp_hash` runs native code and moves no frame-entry
-/// odometer.  Drop the tag and a nested abort rewinds past a completed insert.
-#[test]
-fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
-    let descr = super::specialize::set_add_method_descr();
-    let call_descr = descr
-        .as_call_descr()
-        .expect("the substitution installs a call descr");
-    assert_eq!(
-        call_descr.result_type(),
-        Type::Ref,
-        "`set.add` returns None, so the Void write proxy cannot see this store"
-    );
-    assert!(
-        super::residual_call::helper_kind_writes_live_heap(
-            call_descr.get_extra_info().runtime_helper
-        ),
-        "an untagged descr takes the insert out of the executed-effect odometer"
-    );
-}
-
 /// The zero-argument `super()` substitution has the same two obligations, and
 /// for it they are load-bearing on a shape the corpus runs: the leaf reaches
 /// `_super_check`'s `__class__` lookup, which a property answers with arbitrary
@@ -2441,6 +2416,34 @@ fn async_force_result_slot_skips_only_guard_not_forced_ref_residual() {
         slot(Some(OpCode::GuardNotForced), true, ref_argcode, 31, 4),
         Some(31),
         "the FOR_ITER iterator at nlocals+0 is below the result TOS"
+    );
+}
+
+#[test]
+fn after_residual_guard_uses_adjacent_trailing_live() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let live = crate::state::op_live();
+    let catch_exception = *insns_opname_to_byte()
+        .get("catch_exception/L")
+        .expect("catch_exception/L must be in the insns table");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_residual_adjacent_live_test");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        // residual_call (int_add stand-in) at 0, trailing `-live-` at 4,
+        // catch_exception/L at 7 (1 + LABEL_OPERAND_SIZE=3).
+        code: vec![int_add, 0, 1, 2, live, 0, 0, catch_exception, 0, 0, 0],
+        startpoints: Some([0_usize, 4, 7].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.after_residual_call_resume_pred_by_jit_pc = vec![(0, Some(0))];
+
+    assert_eq!(
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, 0, Some(0)),
+        Some(4),
+        "jtransform.py handle_residual_call trailing -live- is the byte after the call",
     );
 }
 
@@ -5247,7 +5250,10 @@ fn trace_too_long_snapshot_waits_for_frame_transition_outcomes() {
         0,
     ));
     assert!(!trace_too_long_abort_safe(
-        &DispatchOutcome::SubReturn { result: None },
+        &DispatchOutcome::SubReturn {
+            result: None,
+            result_concrete: ConcreteValue::Null,
+        },
         false,
         0,
     ));
@@ -11462,8 +11468,9 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     );
     dump(&descr_str.code, "descr_str");
     // `ll_int2dec` is the one residual that returns the STR; `len(res)` is
-    // `LLHelpers.ll_strlen`, a field read off that STR, and the result is
-    // wrapped by the inlined newutf8 body.
+    // `LLHelpers.ll_strlen` (`len(s.chars)`), which
+    // `jtransform.py rewrite_op_getinteriorarraysize` rewrites to `strlen`,
+    // and the result is wrapped by the inlined newutf8 body.
     assert_eq!(
         descr_str_ops
             .iter()
@@ -11474,9 +11481,9 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     );
     let strlen_at = descr_str_ops
         .iter()
-        .position(|op| *op == "getfield_gc_i")
+        .position(|op| *op == "strlen")
         .unwrap_or_else(|| {
-            panic!("descr_str must read the STR length field; ops={descr_str_ops:?}")
+            panic!("descr_str must read the STR length with strlen; ops={descr_str_ops:?}")
         });
     let int2dec_at = descr_str_ops
         .iter()
@@ -11535,8 +11542,8 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
     );
     assert_eq!(jc.calldescr().result_type, 'r', "ops={ops:?}");
     assert!(
-        ops.iter().any(|op| *op == "getfield_gc_i"),
-        "the STR length is a field read; ops={ops:?}"
+        ops.iter().any(|op| *op == "strlen"),
+        "the STR length is strlen; ops={ops:?}"
     );
     assert!(
         ops.iter()
@@ -12255,8 +12262,12 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         0x05, // ref_return r5
     ];
     let mut tc = fresh_trace_ctx();
-    let regs_r = distinct_const_refs(&mut tc, 8);
+    const LIVE: usize = 0xC2_AB07_FEED_0202;
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    regs_r[2] = OpRef::input_arg_ref(0);
     let arg_value = regs_r[2];
+    let mut concrete_regs_r = vec![ConcreteValue::Null; regs_r.len()];
+    concrete_regs_r[2] = ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef);
     done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -12272,7 +12283,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
+            concrete_registers_r: concrete_regs_r,
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),
             vstack_last_ref: OpRef::NONE,
@@ -12324,6 +12335,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         "normal inline return must clear the caller's concrete exception shadow",
     );
     let regs_r = wc.registers_r.to_vec();
+    let returned_concrete = wc.frame_state.borrow().concrete_registers_r[5];
     drop(wc);
     // dst register r5 must equal the arg the caller passed (since
     // callee's `ref_return r0` returns its registers_r[0] which
@@ -12331,6 +12343,11 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     assert_eq!(
         regs_r[5], arg_value,
         "inline_call_r_r dst writeback must propagate callee's SubReturn",
+    );
+    assert_eq!(
+        returned_concrete,
+        ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef),
+        "inline_call_r_r dst writeback must propagate the callee's concrete shadow",
     );
     // The outermost finish payload carries the same value (callee's
     // ref_return surfaced as SubReturn and recorded nothing; the
@@ -13755,6 +13772,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         outcome,
         DispatchOutcome::SubReturn {
             result: Some(expected),
+            result_concrete: ConcreteValue::Int(0xCAFE_0001),
         },
         "sub-walk int_return must surface SubReturn{{Some(value)}}",
     );
@@ -13900,7 +13918,13 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     };
     let ops_before = wc.trace_ctx.num_ops();
     let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
-    assert_eq!(outcome, DispatchOutcome::SubReturn { result: None });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SubReturn {
+            result: None,
+            result_concrete: ConcreteValue::Null,
+        }
+    );
     drop(wc);
     assert_eq!(
         tc.num_ops(),
@@ -21081,6 +21105,99 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
 }
 
 #[test]
+fn int_mul_overflow_writes_dst_before_guard_no_exception() {
+    // `emit_int_ovf_to_long` records `CallR` then `GUARD_NO_EXCEPTION`.
+    // `make_result_of_lastop` (`pyjitpl.py execute_varargs`) must write the
+    // boxed product into dst before that guard's snapshot, so a later
+    // `ResumeGuardCopiedDescr` sharer restores the product rather than the
+    // pre-call local.
+    let lhs_obj = pyre_object::w_int_new(1i64 << 32);
+    let rhs_obj = pyre_object::w_int_new(1i64 << 32);
+    let _lhs_pin = super::residual_call::owner_root_if_gc(lhs_obj as usize);
+    let _rhs_pin = super::residual_call::owner_root_if_gc(rhs_obj as usize);
+    let _ = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    // Non-const boxes so `record_int_ovf` records `INT_MUL_OVF` and
+    // `emit_int_ovf_to_long` records `CallR` rather than a ConstInt fold.
+    let lhs = OpRef::input_arg_ref(0);
+    let rhs = OpRef::input_arg_ref(1);
+    tc.set_opref_concrete(lhs, majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)));
+    tc.set_opref_concrete(rhs, majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)));
+    let dst_pre = dummy_ptr_eq_box(&mut tc);
+    let regs_r = vec![lhs, rhs, dst_pre];
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let mul_tag = 2; // `runtime_ops.rs` BinaryOperator::Multiply
+    let outcome =
+        super::specialize::try_emit_exact_int_binop(&mut wc, 0, mul_tag, &[lhs, rhs], 2, 'r')
+            .expect("overflow int mul must dispatch")
+            .expect("overflow int mul must emit");
+    let regs_r = wc.registers_r.to_vec();
+    drop(wc);
+    let ops: Vec<_> = tc.ops().iter().skip(ops_before).collect();
+    let opcodes: Vec<_> = ops.iter().map(|o| o.opcode).collect();
+    // `call_typed_with_effect_pure_can_raise` records CALL then patches
+    // it to CALL_PURE (`pyjitpl.py record_result_of_call_pure`).
+    let call_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::CallR || op == OpCode::CallPureR)
+        .unwrap_or_else(|| {
+            panic!("CallR/CallPureR (bigint mul) must be recorded, got {opcodes:?}")
+        });
+    let boxed_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::NewWithVtable)
+        .unwrap_or_else(|| panic!("boxed W_Long must be recorded, got {opcodes:?}"));
+    let guard_idx = opcodes
+        .iter()
+        .position(|&op| op == OpCode::GuardNoException)
+        .unwrap_or_else(|| {
+            panic!("GuardNoException must follow the residual mul, got {opcodes:?}")
+        });
+    assert!(
+        call_idx < boxed_idx && boxed_idx < guard_idx,
+        "CallR/CallPureR then box then GuardNoException, got {opcodes:?}"
+    );
+    let boxed_pos = ops[boxed_idx].pos().get();
+    assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
+    assert_eq!(
+        regs_r[2], boxed_pos,
+        "registers_r[dst] must hold the boxed product when GuardNoException is recorded"
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::SubReturn { result: Some(r), .. } if r == boxed_pos),
+        "SubReturn must keep the boxed product, got {outcome:?}"
+    );
+}
+
+#[test]
 fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
     // Dst register OOR — the call was already recorded at this
     // point (RPython parity: `do_residual_or_indirect_call` records
@@ -22394,7 +22511,10 @@ fn helper_ordinary_steps_that_cross_the_limit_still_finishframe() {
     };
     let result = walk(&code, 0, &mut wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "ordinary helper steps that cross the limit still finishframe: {result:?}"
     );
     assert!(
@@ -23523,7 +23643,10 @@ fn helper_ordinary_residual_does_not_check_the_limit_at_that_call() {
     let result = walk(&code, 0, &mut wc);
     drop(wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "a non-descending residual must not take the helper ChangeFrame check: {result:?}"
     );
     fbw_store_journal_reset();
@@ -24186,7 +24309,10 @@ fn helper_residualized_inline_call_does_not_check_the_limit() {
     let result = walk(&code, 0, &mut wc);
     drop(wc);
     assert!(
-        matches!(result, Ok((DispatchOutcome::SubReturn { result: None }, _))),
+        matches!(
+            result,
+            Ok((DispatchOutcome::SubReturn { result: None, .. }, _))
+        ),
         "a non-descending inline_call must not take the helper ChangeFrame check: {result:?}"
     );
     fbw_store_journal_reset();

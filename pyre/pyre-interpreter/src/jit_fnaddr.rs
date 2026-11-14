@@ -490,6 +490,15 @@ pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
     pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
 }
 
+/// Word-ABI residual for `w_bytes_from_bytes`. Rebuilds the `&[u8]` from the
+/// pointer and length words a residual call passes, then calls the slice entry.
+#[inline(never)]
+pub(crate) extern "C" fn w_bytes_from_bytes_word(ptr: i64, len: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::w_bytes_from_bytes_word");
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
+    pyre_object::bytesobject::w_bytes_from_bytes(bytes) as usize as i64
+}
+
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
     entries: &mut pyre_object::ObjectDictStorage,
@@ -3050,6 +3059,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::bytesobject::jit_w_bytes_from_u8x4",
         "pyre_object::jit_w_bytes_from_u8x4",
         pyre_object::bytesobject::jit_w_bytes_from_u8x4,
+    );
+    // slice entry; residual calls pass the pointer/length words.
+    cpa2!(
+        &mut entries,
+        "pyre_object::bytesobject::w_bytes_from_bytes",
+        "pyre_object::w_bytes_from_bytes",
+        w_bytes_from_bytes_word,
     );
     pa1!(
         &mut entries,
@@ -6372,11 +6388,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // residual-call ABI.
 
     // `PyError::to_exc_object` — residual exception materialization emitted by
-    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses
-    // the same impl-method CallPath shape as `type_error`, resolving to
-    // `["PyError", "to_exc_object"]` after the crate segment is stripped.
-    p1!(
+    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  Bind both
+    // spellings (`error::PyError::to_exc_object` after the crate segment is
+    // stripped, and the crate-root alias) because the blackhole calls
+    // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
+    pa1!(
         &mut entries,
+        "pyre_interpreter::error::PyError::to_exc_object",
         "pyre_interpreter::PyError::to_exc_object",
         crate::PyError::to_exc_object,
     );
@@ -7836,10 +7854,10 @@ mod tests {
         pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
         shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        w_bytes_from_bytes_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
+        w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7978,6 +7996,47 @@ mod tests {
         assert_ne!(
             call_impl, raw_call,
             "must not publish the raw slice/Result item"
+        );
+
+        assert!(
+            bindings.contains_key("pyre_interpreter::type_methods::set_lookup_checked"),
+            "missing pyre_interpreter::type_methods::set_lookup_checked"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::type_methods::set_contains_checked"),
+            "missing pyre_interpreter::type_methods::set_contains_checked"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::typedef::set_type_error_matched"),
+            "missing pyre_interpreter::typedef::set_type_error_matched"
+        );
+
+        let index_strict: extern "C" fn(i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_index_result_strict_int_subclass;
+        let index_strict = index_strict as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::index_result_strict_int_subclass"],
+            index_strict
+        );
+        let raw_index_strict =
+            crate::baseobjspace::index_result_strict_int_subclass as *const () as usize as i64;
+        assert_ne!(
+            index_strict, raw_index_strict,
+            "must not publish the raw Result item"
+        );
+
+        let take_pending: extern "C" fn(i64, i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_take_pending_mapping_key_error;
+        let take_pending = take_pending as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::take_pending_mapping_key_error"],
+            take_pending
+        );
+        let raw_take_pending =
+            crate::baseobjspace::take_pending_mapping_key_error as *const () as usize as i64;
+        assert_ne!(
+            take_pending, raw_take_pending,
+            "must not publish the raw PyError item"
         );
     }
 
@@ -9937,6 +9996,23 @@ mod tests {
     }
 
     #[test]
+    fn jit_trace_fnaddrs_covers_to_exc_object_both_spellings() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let to_exc: fn(&mut crate::PyError) -> pyre_object::PyObjectRef =
+            crate::PyError::to_exc_object;
+        let to_exc = occupied_published_addr(
+            "pyre_interpreter::error::PyError::to_exc_object",
+            to_exc as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::error::PyError::to_exc_object"],
+            to_exc
+        );
+        assert_eq!(bindings["pyre_interpreter::PyError::to_exc_object"], to_exc);
+    }
+
+    #[test]
     fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 
@@ -10184,6 +10260,23 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_object::jit_w_bytes_from_u8"], expected);
+    }
+
+    /// `w_bytes_from_bytes` is a slice entry; residual calls pass the
+    /// pointer/length words.
+    #[test]
+    fn jit_trace_fnaddrs_covers_w_bytes_from_bytes_word() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = w_bytes_from_bytes_word as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::bytesobject::w_bytes_from_bytes"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::w_bytes_from_bytes"], expected);
+        let obj = w_bytes_from_bytes_word(1, 0) as usize as pyre_object::PyObjectRef;
+        unsafe {
+            assert_eq!(pyre_object::bytesobject::w_bytes_len(obj), 0);
+        }
     }
 
     /// `rgc.py` keeps `FinalizerQueue.register_finalizer` opaque with

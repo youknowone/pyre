@@ -1,10 +1,11 @@
-# pyre-check: max-pypy-ratio=20.5
+# pyre-check: max-pypy-ratio=11.8
 #
-# Floor is 20.5 / 4 = 5.125x. CI measured cranelift 12.8x (ubuntu) and
-# 11.8x (macOS arm64), dynasm 7.1x (macOS arm64); local macOS arm64 dynasm
-# 5.7x-5.9x. Ceiling = 1.6 x the largest. Before the recursive call folded
-# to CALL_ASSEMBLER here, the same workload ran about 8x slower than now,
-# past this ceiling.
+# Floor is 11.8 / 4 = 2.95x. CI (native legs, runs 41939478616 and
+# 41964689814) measured cranelift 6.8x-7.4x (ubuntu) and 5.3x-5.6x
+# (macOS arm64), dynasm 4.5x-6.4x (ubuntu, windows) and 4.4x-4.7x (macOS
+# arm64); local macOS arm64 dynasm 4.0x-4.1x. Ceiling = 1.6 x the largest.
+# Before the recursive call folded to CALL_ASSEMBLER here, the same
+# workload ran about 8x slower than that.
 #
 # A self-recursive function defined and driven in code executed with a
 # plain `{}` as globals.  Its `LOAD_GLOBAL` cannot fold to a constant, so

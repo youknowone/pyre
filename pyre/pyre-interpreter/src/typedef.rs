@@ -32126,6 +32126,7 @@ fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
 
 /// `W_BaseSetObject.descr_contains` / `_discard_from_set`:
 /// `e.match(space, space.w_TypeError)`.
+#[majit_macros::getfunctionptr]
 fn set_type_error_matched(err: &mut crate::PyError) -> bool {
     if let Some(w_type_error) = crate::baseobjspace::cached_type_error() {
         err.match_(pyre_object::PY_NULL, w_type_error)

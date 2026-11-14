@@ -395,6 +395,13 @@ impl majit_ir::helper_fnaddr::ResidualError for PyError {
     }
 }
 
+impl majit_ir::helper_fnaddr::ErrorCarrierWord for PyError {
+    #[inline]
+    fn into_return_word(self) -> i64 {
+        self.0.as_ptr() as usize as i64
+    }
+}
+
 /// Widest `jit_call_known_builtin_N` published by [`known_builtin_call_helper`],
 /// plus the leading code slot.
 const MAX_KNOWN_BUILTIN_ARGS: usize = 9;
@@ -2376,35 +2383,6 @@ pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
     }
     jit_publish_exception(exc_obj);
     PY_NULL
-}
-
-/// `s.add(value)` written as a bound-method call, for the walker arm that
-/// recognises it (`try_walker_specialize_set_add_method`).
-///
-/// The arm pins the callable to the `set.add` builtin and guards the receiver
-/// in the same spelling `require_set_receiver` uses, so the two checks the
-/// builtin opens with — its receiver predicate and one positional argument —
-/// are answered by those guards, and what remains is the store
-/// [`crate::opcode_ops::set_add_value`] already performs for `SET_ADD`. The
-/// element `__hash__` can run Python, so this is a MayForce residual like the
-/// accumulator it shares its body with.
-///
-/// Returns `None`. A raising `__hash__` publishes through both exception
-/// channels and answers PY_NULL, the residual-call ABI [`jit_next`] documents.
-pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
-    match crate::opcode_ops::set_add_value(set, value) {
-        Ok(()) => pyre_object::w_none(),
-        Err(err) => jit_publish_residual_error_ref(err),
-    }
-}
-
-/// `1` when [`pyre_object::plain_int_already_in_int_set`] is true.
-///
-/// Recorded as a cannot-collect call when the traced `set.add` is that hit.
-/// It does not insert, so a user `__hash__` never runs here. `0` fails the
-/// guard and the interpreter performs the real add.
-pub extern "C" fn jit_int_set_add_already_present(set: PyObjectRef, value: PyObjectRef) -> i64 {
-    pyre_object::plain_int_already_in_int_set(set, value) as i64
 }
 
 /// `pyopcode.py` FOR_ITER exception discrimination:

@@ -176,6 +176,18 @@ pub struct PyJitCodeMetadata {
     /// equality holds by construction. Sorted ascending by offset; empty for
     /// skeleton / fixture.
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
+    /// Exact-match color→slot rows at after-pop `-live-` markers (Call,
+    /// CallKw, CallFunctionEx, BinaryOp, CompareOp, LoadAttr, StoreAttr,
+    /// LoadSpecial). Keyed by the marker's assembled JitCode byte offset.
+    /// Each entry is `(offset, base_rows, popped_rows)`: `base_rows` are
+    /// locals plus remaining stack, `popped_rows` the `$popped` operand
+    /// slots. `get_list_of_active_boxes` (`pyjitpl.py`) reads the `-live-`
+    /// that governs the resume pc, so popped rows apply at the after-pop
+    /// marker and at ops up to the next `-live-`; from the next `-live-`
+    /// on (the trailing marker `flatten.rs insn_needs_trailing_live` emits
+    /// after the residual, and everything after it in the opcode) only
+    /// base rows apply. Empty for skeleton / fixture.
+    pub pcdep_after_pops_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>, Vec<(u8, u16, u16)>)>,
     /// Predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
     /// built alongside `pcdep_by_jit_pc` with the same `containing_py_pc_for_jitcode_pc`
     /// resolution (marker precedence + op-start predecessor). Predecessor-covers
@@ -1018,18 +1030,99 @@ impl PyJitCode {
         }
     }
 
+    /// Rows of `pcdep_after_pops_by_jit_pc` valid at `jit_pc`.
+    ///
+    /// An exact marker offset returns base ++ popped (sorted). A
+    /// same-opcode fallback (the `py_exact` test below) walks from the
+    /// after-pop marker to `jit_pc`: popped rows apply at the after-pop
+    /// marker and at ops up to the next `-live-`; from the next `-live-`
+    /// on (the trailing marker and everything after it in the opcode)
+    /// only base rows apply. Decode failure, or a query that is not an
+    /// op start, returns base only. `get_list_of_active_boxes`
+    /// (`pyjitpl.py`) reads the liveness of the `-live-` that governs
+    /// the resume pc, so the popped rows apply only while the after-pop
+    /// marker is the last `-live-` at or before `jit_pc`.
+    fn after_pops_rows_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+        let after = &self.metadata.pcdep_after_pops_by_jit_pc;
+        if after.is_empty() {
+            return None;
+        }
+        let combine = |base: &[(u8, u16, u16)], popped: &[(u8, u16, u16)], include_popped: bool| {
+            let mut rows = base.to_vec();
+            if include_popped {
+                rows.extend_from_slice(popped);
+                rows.sort_unstable();
+            }
+            rows
+        };
+        match after.binary_search_by_key(&jit_pc, |&(off, _, _)| off) {
+            Ok(i) => {
+                let (_, ref base, ref popped) = after[i];
+                Some(combine(base, popped, true))
+            }
+            Err(0) => None,
+            Err(i) => {
+                let pred_off = after[i - 1].0;
+                let query_py =
+                    exact_py_pc_for_jitcode_pc(&self.metadata.py_exact_by_jit_pc, jit_pc);
+                let pred_py =
+                    exact_py_pc_for_jitcode_pc(&self.metadata.py_exact_by_jit_pc, pred_off);
+                if query_py.is_some() && query_py == pred_py {
+                    let (_, ref base, ref popped) = after[i - 1];
+                    let include_popped = {
+                        let code = self.jitcode.code.as_slice();
+                        let mut pc = pred_off;
+                        let mut last_live_pc = None;
+                        let mut landed = false;
+                        while pc <= jit_pc {
+                            match crate::jitcode_runtime::decode_op_at(code, pc) {
+                                Some(op) => {
+                                    if op.opname == "live" {
+                                        last_live_pc = Some(pc);
+                                    }
+                                    if pc == jit_pc {
+                                        landed = true;
+                                        break;
+                                    }
+                                    if op.next_pc <= pc {
+                                        break;
+                                    }
+                                    pc = op.next_pc;
+                                }
+                                None => break,
+                            }
+                        }
+                        landed && last_live_pc == Some(pred_off)
+                    };
+                    Some(combine(base, popped, include_popped))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// The pcdep color→slot list keyed directly by a JitCode byte
-    /// offset via the `pcdep_by_jit_pc` predecessor twin. Equals
-    /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
-    /// a carried resume coordinate; `None` when the twin is empty (skeleton /
-    /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
-    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
+    /// offset. An exact or same-opcode hit in
+    /// `pcdep_after_pops_by_jit_pc` wins —
+    /// `after_pops_rows_for_jitcode_pc` returns the rows valid at that
+    /// coordinate (`get_list_of_active_boxes` in `pyjitpl.py` encodes
+    /// `registers_r[index]` for every color live at the `-live-` at
+    /// the resume pc). Otherwise the `pcdep_by_jit_pc` predecessor twin,
+    /// which equals
+    /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by
+    /// construction for a carried resume coordinate. `None` when both
+    /// tables are empty (skeleton / fixture).
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+        if let Some(rows) = self.after_pops_rows_for_jitcode_pc(jit_pc) {
+            return Some(rows);
+        }
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
+        Self::predecessor_index(search).map(|i| table[i].1.clone())
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
@@ -1122,19 +1215,25 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
-    /// Trivia-aware pcdep color→slot list keyed by a JitCode byte offset,
-    /// resolved with exact-marker precedence and an op-start predecessor scan.
-    pub fn pcdep_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
+    /// Trivia-aware pcdep color→slot list keyed by a JitCode byte offset.
+    /// An exact or same-opcode hit in `pcdep_after_pops_by_jit_pc` wins
+    /// (`after_pops_rows_for_jitcode_pc`, matching
+    /// `get_list_of_active_boxes` in `pyjitpl.py`); otherwise
+    /// exact-marker precedence and an op-start predecessor scan.
+    pub fn pcdep_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+        if let Some(rows) = self.after_pops_rows_for_jitcode_pc(jit_pc) {
+            return Some(rows);
+        }
         let marker = &self.metadata.pcdep_trivia_marker_by_jit_pc;
         let pred = &self.metadata.pcdep_trivia_pred_by_jit_pc;
         if marker.is_empty() && pred.is_empty() {
             return None;
         }
         if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
-            return Some(&marker[i].1);
+            return Some(marker[i].1.clone());
         }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
+        Self::predecessor_index(search).map(|i| pred[i].1.clone())
     }
 
     /// Trivia-aware const Ref slot list keyed by a JitCode byte offset,
@@ -1510,6 +1609,7 @@ impl PyJitCodeMetadata {
             dispatch_switch_pc: None,
             dispatch_head_by_jit_pc: Vec::new(),
             pcdep_by_jit_pc: Vec::new(),
+            pcdep_after_pops_by_jit_pc: Vec::new(),
             depth_pred_by_jit_pc: Vec::new(),
             depth_trivia_marker_by_jit_pc: Vec::new(),
             depth_trivia_pred_by_jit_pc: Vec::new(),

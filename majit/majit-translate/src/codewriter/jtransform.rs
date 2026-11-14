@@ -2834,11 +2834,20 @@ fn getsubstruct_offset_for_access(
 /// `taken_by_address` is not required: a place projection
 /// `(*raw).inline.field` reads the aggregate as the next base, and the
 /// rtyper still emits `getsubstruct` for it. `getfield_raw_r` is refused.
+///
+/// The intern `struct_layout_for` row can still say `FLAG_STRUCT` for a
+/// by-value struct type seated as one pointer word. `fielddescrof` /
+/// `bh_field_lookup` mint that seat as POINTER / SIGNED / FLOAT
+/// (`descr.py get_type_flag`); a minted non-STRUCT leaf is an ordinary
+/// getfield, not `rewrite_op_getsubstruct`.
 fn inline_aggregate_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
 ) -> Option<Result<usize, ()>> {
     if field.vec_part.is_some() {
+        return None;
+    }
+    if minted_field_is_non_struct_leaf(field, cc) {
         return None;
     }
     let owner = field.owner_root.as_deref()?;
@@ -2872,11 +2881,16 @@ fn inline_aggregate_offset(
 ///
 /// A later field read through this result needs the interior address.
 /// A by-value copy of the same one-word struct stays an ordinary load.
+/// A minted non-STRUCT leaf is that ordinary load even when intern
+/// `struct_layout_for` still carries `FLAG_STRUCT`.
 fn inline_struct_field_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
 ) -> Option<usize> {
     if field.vec_part.is_some() {
+        return None;
+    }
+    if minted_field_is_non_struct_leaf(field, cc) {
         return None;
     }
     let owner = field.owner_root.as_deref()?;
@@ -2886,6 +2900,17 @@ fn inline_struct_field_offset(
         return None;
     }
     Some(row.offset)
+}
+
+/// `fielddescrof` / `bh_field_lookup` minted a non-STRUCT leaf
+/// (POINTER / SIGNED / FLOAT). That field is an ordinary getfield
+/// (`descr.py get_type_flag`), not `jtransform.py rewrite_op_getsubstruct`.
+fn minted_field_is_non_struct_leaf(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> bool {
+    cc.and_then(|cc| crate::assembler::minted_field_layout(cc, field))
+        .is_some_and(|(flag, _, _)| flag != majit_ir::descr::ArrayFlag::Struct)
 }
 
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
@@ -9913,6 +9938,35 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `jtransform.py rewrite_op_getinteriorarraysize`: `Ptr(rstr.STR)`
+        // is `strlen` (`len(s.chars)` / `LLHelpers.ll_strlen`). Pyre's STR
+        // layout stores that word as `Utf8Str.length`; a FieldRead of it is
+        // the same query. STRLEN is an always-pure opcode (vstring
+        // `_optimize_STRLEN` / unroll extra-arg), so the compact
+        // `_length == strlen` guard can stay in the peel. A GETFIELD of
+        // the same slot — even `IR_IMMUTABLE` / `getfield_*_pure` — is
+        // reloaded after the body label.
+        if field.name == "length"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_rstr_str_layout_declaration)
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(STR.length) → strlen".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: "strlen".into(),
+                    args: vec![base.clone().into()],
+                },
+            }]);
+        }
         // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
         // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
         // lowers that word to `arraylen_gc`. A struct `getfield` of the same
@@ -20599,6 +20653,145 @@ mod tests {
             "liveness must assign the kind FieldRead base a register; base={kind_base:?}"
         );
         let _ = crate::flatten::flatten_graph(&graph, &mut regallocs);
+    }
+
+    /// An explicit-shell payload seat whose intern row is FLAG_STRUCT 16
+    /// while `fielddescrof` / `bh_field_lookup` mint a POINTER word. The
+    /// by-value FieldRead is getfield (kind r), not
+    /// `jtransform.py rewrite_op_getsubstruct` (`cast_ptr_to_int` +
+    /// `int_add` of the slot address).
+    #[test]
+    fn enum_payload_pointer_seat_reads_with_getfield_not_substruct() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let template = "core::result::Result::Ok";
+        let owner = "core::result::Result<payload_seat::Key, payload_seat::Err>::Ok";
+        let template_id = majit_ir::descr::StructId::from_canonical(template);
+        let owner_id = template_id.instantiate("<payload_seat::Key, payload_seat::Err>");
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "payload_seat::Key".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "__discriminant".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0".into(),
+                        offset: word,
+                        size: 2 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let field = FieldDescriptor::new("__pos_0", Some(owner.into()));
+        let intern = cc
+            .struct_layout_for(owner)
+            .expect("intern layout")
+            .fields
+            .iter()
+            .find(|row| row.name == "__pos_0")
+            .cloned()
+            .expect("intern __pos_0");
+        assert_eq!(intern.flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(intern.size, 2 * word);
+        let minted = crate::assembler::minted_field_layout(&cc, &field).expect("minted leaf");
+        assert_eq!(minted.0, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(minted.1, word);
+        assert_eq!(minted.2, word);
+        assert_eq!(inline_aggregate_offset(&field, Some(&cc)), None);
+
+        let mut graph = FunctionGraph::new("read_payload_seat");
+        let result_box = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "result".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, result_box.clone());
+        let payload = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: result_box,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let read = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+            )
+        });
+        let read = read.expect("payload seat stays a getfield");
+        assert_eq!(
+            read.result.as_ref(),
+            Some(&payload),
+            "getfield keeps the FieldRead result; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&payload),
+            ConcreteType::Unknown,
+            "getfield kind r (Unknown defaults to r); ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "pointer seat is not rewrite_op_getsubstruct; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "pointer seat is not int_add of the slot address; ops={ops:?}"
+        );
     }
 
     /// `(*p).inner.x` on a raw `&mut S`. `rewrite_op_getsubstruct` is
@@ -41482,6 +41675,95 @@ mod tests {
                     .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
             }),
             "typeptr getfield of a parameter must become guard_class"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorarraysize` / `test_str_getinteriorarraysize`:
+    /// `Ptr(rstr.STR)` length is `strlen`. Pyre's STR length word is a
+    /// FieldRead of `Utf8Str.length` (and the other STR-layout overlays).
+    #[test]
+    fn rewrite_op_getfield_str_length_is_strlen() {
+        for owner in [
+            "unicodeobject::Utf8Str",
+            "unicodeobject::UnicodeValueStorage",
+            "bytesobject::BytesBlock",
+            "lowlevel_string::LowlevelStringHeader",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+        ] {
+            let mut graph = FunctionGraph::new("ll_strlen");
+            let bb = graph.startblock;
+            let base =
+                graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+            graph.block_mut(bb).inputargs.push(base.clone());
+            graph
+                .push_op_var(
+                    bb,
+                    OpKind::FieldRead {
+                        base: base.clone(),
+                        field: crate::model::FieldDescriptor::new("length", Some(owner.into())),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(bb, Some(base));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops: Vec<&OpKind> = transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter().map(|op| &op.kind))
+                .collect();
+            assert!(
+                ops.iter().any(|kind| matches!(
+                    kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "strlen" && args.len() == 1
+                )),
+                "{owner} length must become strlen, got {ops:?}",
+            );
+            assert!(
+                ops.iter()
+                    .all(|kind| !matches!(kind, OpKind::FieldRead { .. })),
+                "{owner} length must not stay a getfield, got {ops:?}",
+            );
+        }
+        let mut graph = FunctionGraph::new("other_utf8str_length");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "length",
+                        Some("other::Utf8Str".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(base));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "length"
+                                && field.owner_root.as_deref() == Some("other::Utf8Str")
+                    )
+                })
+            }),
+            "an unrelated Utf8Str owner is not ll_strlen"
         );
     }
 

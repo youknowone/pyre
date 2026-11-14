@@ -1,39 +1,23 @@
-# pyre-check: spec-folds=set_add_method
-# `spec-folds` gates the arm directly: a residual produces the same result, so
-# output parity alone cannot tell whether the method-call substitution ran.
+# `s.add(x)` descends `W_BaseSetObject.descr_add` -> `W_BaseSetObject.add` ->
+# strategy `add`.
 #
 # `s.add(x)` and a set comprehension name one operation -- `pyopcode.py SET_ADD`
-# is `space.call_method(w_set, 'add', w_value)` -- but they recorded two
-# different residuals. The comprehension's SET_ADD lowers to the direct
-# `set_add` store; the method call arrived as a generic `bh_call_fn`, which
-# re-reads the bound method's function, rejects keywords and rebuilds the
-# argument vector on every iteration. `try_walker_specialize_set_add_method`
-# pins the callable to the `set.add` builtin and guards the receiver, then
-# substitutes the direct store. `hot_add` is what that buys, and
-# `hot_add_comprehension` is the spelling it is brought level with; a
+# is `space.call_method(w_set, 'add', w_value)`. `hot_add` is the method-call
+# spelling, and `hot_add_comprehension` is the SET_ADD spelling; a
 # regression separates the two legs.
 #
-# The substitution is not a fold: a miss stays a MayForce residual because
-# hashing the element can run a user `__hash__`. A plain int already stored in
-# an integer-strategy set records a cannot-collect contains check. A set whose
-# only element is that int guards the unboxed intval, set_id and content_gen
-# instead. `hot_add` saturates past one element and takes the contains check.
-# `hot_add_user_hash` stays on the
+# Hashing the element can run a user `__hash__`. `hot_add` saturates past one
+# element. `hot_add_user_hash` stays on the
 # MayForce residual -- the element's `__hash__` and `__eq__` are Python, so the
 # call really does force -- and `hot_add_raising_hash` walks the exception
-# channel out of the substituted residual, which has to reach the `except` in
+# channel out of the call, which has to reach the `except` in
 # the loop body
 # exactly as the generic call did.
 #
-# The three remaining legs pin what the arm may and may not swallow, and are
-# here because a wrong answer there is silently wrong code rather than a slow
-# loop. `hot_add_subclass` MUST be substituted: the receiver guard is the
-# builtin's own `require_set_receiver` predicate, an `ob_type` layout test that
-# a `set` subclass shares, and an inherited `add` runs the identical body.
-# `hot_add_override` MUST NOT be, and is the leg that says so -- its `add`
-# stores a different value, so bypassing it changes `len`. `hot_add_unbound`
-# calls the descriptor with an explicit receiver, which is one argument more
-# than the arm accepts.
+# The three remaining legs pin receiver and callable shape.
+# `hot_add_subclass` inherits `add` and runs the identical body.
+# `hot_add_override` stores a different value, so bypassing it changes `len`.
+# `hot_add_unbound` calls the descriptor with an explicit receiver.
 
 try:
     import pypyjit

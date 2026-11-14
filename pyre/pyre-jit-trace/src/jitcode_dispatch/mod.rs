@@ -2995,15 +2995,24 @@ pub enum DispatchOutcome {
         portal_finish_too_long: bool,
     },
     /// Sub-walk frame returned with a result OpRef (Some) or void
-    /// (None — no `>X` slot in the callee's `*_return` op). Surfaced
-    /// only when `WalkContext::is_top_level == false`. The caller's
+    /// (None — no `>X` slot in the callee's `*_return` op). The concrete
+    /// shadow travels with the result instead of being reconstructed from
+    /// the recorder after the callee frame has gone away.
+    ///
+    /// RPython parity: `pyjitpl.py` `MIFrame.make_result_of_lastop` receives
+    /// the same result box from `MetaInterp.finishframe`; `resume.py`
+    /// `rebuild_from_resumedata` restores each frame's typed register banks.
+    /// Surfaced only when `WalkContext::is_top_level == false`. The caller's
     /// `inline_call_r_r/dR>r` handler consumes this to write the dst
     /// register and continue stepping its own jitcode.
     ///
     /// RPython parity: `metainterp.popframe()` after an `opimpl_*_return`
     /// (`pyjitpl.py`) — the callee frame ends, control returns
     /// to the caller's metainterp loop with the resbox in hand.
-    SubReturn { result: Option<OpRef> },
+    SubReturn {
+        result: Option<OpRef>,
+        result_concrete: ConcreteValue,
+    },
     /// Sub-walk frame raised. RPython
     /// `metainterp.popframe() + finishframe_exception()` walks up the
     /// framestack scanning each parent's exceptiontable; pyre's walker
@@ -3279,7 +3288,16 @@ impl PartialEq for DispatchOutcome {
                     portal_finish_too_long: b_too_long,
                 },
             ) => a_arg == b_arg && a_ty == b_ty && a_too_long == b_too_long,
-            (Self::SubReturn { result: a }, Self::SubReturn { result: b }) => a == b,
+            (
+                Self::SubReturn {
+                    result: a,
+                    result_concrete: a_concrete,
+                },
+                Self::SubReturn {
+                    result: b,
+                    result_concrete: b_concrete,
+                },
+            ) => a == b && a_concrete == b_concrete,
             (
                 Self::SubRaise {
                     exc: a_exc,
@@ -4932,6 +4950,19 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let allboxes = recursive_call_allboxes(
         funcbox, call_descr, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
+    // `gettrace()` / `profilefunc` in front of `CALL_ASSEMBLER`, at this
+    // recursive-call's pc — the inlined `execute_frame` read upstream
+    // places here.  This opcode is already inside `dispatch` of a frame
+    // whose `call_trace` ran; a hook already set records nothing
+    // (`record_call_trace_guards_before_assembler`) and the assembler call
+    // proceeds.
+    // interp_jit.py reds = ['frame', 'ec']: the callee PyFrame is the first ref red.
+    let frame_box = reds_r[0];
+    let concrete_frame = match ctx.trace_ctx.concrete_of_opref(frame_box) {
+        Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *mut pyre_interpreter::PyFrame,
+        _ => std::ptr::null_mut(),
+    };
+    record_call_trace_guards_before_assembler(ctx, op.pc, frame_box, concrete_frame)?;
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // Concrete portal runner first (`do_recursive_call` /
     // `execute_varargs`). `direct_assembler_call` then records
@@ -5136,9 +5167,19 @@ fn finish_recursive_inline<Sym: WalkSym>(
     walked: DispatchOutcome,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     match walked {
-        DispatchOutcome::SubReturn { result } => {
+        DispatchOutcome::SubReturn {
+            result,
+            result_concrete,
+        } => {
             if let Some(result) = result {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
+                residual_call::write_call_result_to_dst_with_concrete(
+                    ctx,
+                    op.pc,
+                    dst,
+                    dst_bank,
+                    result,
+                    result_concrete,
+                )?;
             }
             helper_blackhole_after_no_driver_finishframe(ctx, op.next_pc, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
@@ -5616,6 +5657,28 @@ pub(crate) fn write_no_driver_finishframe_dest<Sym: WalkSym>(
     result: OpRef,
 ) -> Result<(), DispatchError> {
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    helper_blackhole_after_no_driver_finishframe(ctx, latch_pc, op_pc)
+}
+
+/// [`write_no_driver_finishframe_dest`] for a result whose concrete shadow
+/// came directly from the callee's `SubReturn`.
+pub(crate) fn write_no_driver_finishframe_dest_with_concrete<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    latch_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    result: OpRef,
+    result_concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    residual_call::write_call_result_to_dst_with_concrete(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        result,
+        result_concrete,
+    )?;
     helper_blackhole_after_no_driver_finishframe(ctx, latch_pc, op_pc)
 }
 
@@ -6876,7 +6939,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or(&[]);
+        .unwrap_or_default();
     if pcdep.is_empty() {
         return;
     }
@@ -6888,7 +6951,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in pcdep {
+    for &(bank, color, slot) in &pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -8458,27 +8521,29 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+    let entry_pcdep_entries: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
             .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         // Defensive default for a genuinely absent entry coordinate
         // (marker miss); 0-fire across the corpus.
-        _ => &[],
+        _ => Vec::new(),
     };
     let (carried_pcdep_entries, carried_stack_only) = match jc {
-        None => (&[] as &[(u8, u16, u16)], 0usize),
+        None => (Vec::new(), 0usize),
         Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
+                jc.payload
+                    .pcdep_for_jitcode_pc(cjc as usize)
+                    .unwrap_or_default()
             } else {
-                &[] as &[(u8, u16, u16)]
+                Vec::new()
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -8507,9 +8572,9 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
         valid_stack_only
     };
     let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
-        carried_pcdep_entries
+        &carried_pcdep_entries
     } else {
-        entry_pcdep_entries
+        &entry_pcdep_entries
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
@@ -8585,7 +8650,7 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
             let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 carried_stack_only,
-                carried_pcdep_entries,
+                &carried_pcdep_entries,
                 color,
             );
             if let Some(mirror) = vstack_mirror {
@@ -8815,8 +8880,17 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                     // residual call and the stack push — is live here and its
                     // inputarg is the only source. Only a NONE register (a color
                     // dead at this pc under a shared marker) becomes `CONST_NULL`.
-                    // Under the walker (gate-off) each PC owns a depth-narrowed
-                    // marker, so this arm never fires.
+                    //
+                    // After-pop CALL/attr `-live-` is the depth-narrowed exception:
+                    // the op still reads the popped operand colors
+                    // (`get_list_of_active_boxes` `registers_r[index]`) while
+                    // pcdep/depth at the marker are post-pop, so this arm *does*
+                    // fire. Residual-call entry plants those boxes into the
+                    // walker bank from the valuestack mirror (positional zip with
+                    // the R-list, not a pcdep invert — a reused color's opcode-start
+                    // slot is a different value). A bridge walk seeds the same
+                    // colors from failargs. Encode that register; CONST_NULL only
+                    // when it is genuinely empty.
                     None => match regs_r.get_box(color) {
                         Some(v) if v != OpRef::NONE => v,
                         _ => OpRef::const_ptr(majit_ir::GcRef(0)),
@@ -15359,14 +15433,15 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
         &[],
     )?;
     match walk_outcome {
-        DispatchOutcome::SubReturn { result: None } => {
+        DispatchOutcome::SubReturn { result: None, .. } => {
             let _ = inline_call::finish_inline_callee_return(ctx, None);
             helper_blackhole_after_no_driver_finishframe(ctx, op_pc, op_pc)?;
             Ok(())
         }
-        DispatchOutcome::SubRaise { .. } | DispatchOutcome::SubReturn { result: Some(_) } => {
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })
-        }
+        DispatchOutcome::SubRaise { .. }
+        | DispatchOutcome::SubReturn {
+            result: Some(_), ..
+        } => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         // `walk` consumes `Continue` as next-pc (`mod.rs` Continue arm);
         // a finished helper's `void_return/` is `SubReturn { None }`.
         DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
@@ -15401,6 +15476,26 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
         ec as *mut pyre_interpreter::PyExecutionContext,
         concrete_frame,
     )
+}
+
+/// Walk the generated `call_trace` JitCode (`call_trace_jit_abi(ec, frame)`).
+///
+/// The caller of a fresh recursive portal `CALL_ASSEMBLER` records
+/// `pyframe.py execute_frame`'s `ec.call_trace(frame)` here: that portal
+/// starts at `dispatch`'s `jit_merge_point` (`interp_jit.py`), past the
+/// prologue. Resume stays at the CALLER's CALL (`op_pc`). A hook already
+/// set is declined here (`ec_hook_installed`); the walker debug-asserts
+/// no hook is installed.
+pub(crate) fn record_call_trace_guards_before_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_box: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+) -> Result<(), DispatchError> {
+    if ec_hook_installed() {
+        return Ok(());
+    }
+    walker_call_trace_hook_reads(ctx, op_pc, frame_box, concrete_frame)
 }
 
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
@@ -15746,6 +15841,17 @@ fn walk_jit_force_quasi_immutable<Sym: WalkSym>(
     }
     walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[mutatebox])?;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Execute the Ref-array allocation shared by the opcode and builtin gateways.
+/// `pyjitpl.py` `MIFrame.opimpl_new_array_clear` delegates to
+/// `MetaInterp.execute_new_array_clear`; its concrete array stays live while
+/// `execute_and_record` appends the allocation to the trace.
+fn execute_new_ref_array_clear(cap: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    let block = unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap) }?;
+    Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+        majit_ir::GcRef(block as usize),
+    ))
 }
 
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
@@ -17389,11 +17495,11 @@ fn handle<Sym: WalkSym>(
                     // cannot represent leaves the result unbound (decline
                     // the concrete step) rather than allocating a wrong
                     // integer block. Zero length is a valid empty array.
+                    let ref_array_root = is_ref_array
+                        .then(|| execute_new_ref_array_clear(cap))
+                        .flatten();
                     let block: Option<*mut u8> = if is_ref_array {
-                        unsafe {
-                            pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap)
-                                .map(|p| p as *mut u8)
-                        }
+                        ref_array_root.as_ref().map(|root| root.get().0 as *mut u8)
                     } else if let Some(ad) = descr.as_array_descr() {
                         if ad.is_array_of_structs() || ad.item_size() != std::mem::size_of::<u64>()
                         {
@@ -17664,16 +17770,16 @@ fn handle<Sym: WalkSym>(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
+            let result_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             publish_inline_return_last_instr(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary:
             // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
-            // carries the live PyObject pointer; mirror it onto the
-            // OpRef-keyed `opref_concrete` channel so the caller's
-            // `concrete_from_recorded_opref` (in `dispatch_inline_call_*_kind`)
-            // sees the stamped Box.value.  Skips constants — `TraceCtx::constants
-            // .get_value` is the authoritative shadow for those.
+            // carries the live PyObject pointer. `SubReturn` carries that
+            // shadow directly to `MIFrame.make_result_of_lastop`; retain the
+            // OpRef-keyed stamp for non-frame consumers too. Skips constants —
+            // `TraceCtx::constants.get_value` is authoritative for those.
             if !result.is_constant() {
-                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                if let ConcreteValue::Ref(ptr) = result_concrete {
                     if !ptr.is_null() {
                         ctx.trace_ctx.set_opref_concrete(
                             result,
@@ -17694,7 +17800,7 @@ fn handle<Sym: WalkSym>(
                 // of re-running the compiled trace against the already
                 // side-effected heap (the walk consumed it).  A null /
                 // unknown concrete leaves the cell `None` → degrade.
-                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                if let ConcreteValue::Ref(ptr) = result_concrete {
                     if !ptr.is_null() {
                         fbw_finish_concrete_set(ConcreteValue::Ref(ptr));
                     }
@@ -17712,6 +17818,7 @@ fn handle<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(result),
+                        result_concrete,
                     },
                     op.next_pc,
                 ))
@@ -17726,11 +17833,12 @@ fn handle<Sym: WalkSym>(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
+            let result_concrete = read_int_reg_concrete(code, op, 0, ctx);
             publish_inline_return_last_instr(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary —
             // see `ref_return/r` comment above for rationale.
             if !result.is_constant() {
-                if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                if let ConcreteValue::Int(v) = result_concrete {
                     ctx.trace_ctx
                         .set_opref_concrete(result, majit_ir::Value::Int(v));
                 }
@@ -17743,7 +17851,7 @@ fn handle<Sym: WalkSym>(
                 // No-replay portal exit: stash the concrete int so
                 // `eval.rs` returns the walk's result directly (re-boxed
                 // via `ConcreteValue::to_pyobj`).
-                if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                if let ConcreteValue::Int(v) = result_concrete {
                     fbw_finish_concrete_set(ConcreteValue::Int(v));
                 }
                 let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
@@ -17759,6 +17867,7 @@ fn handle<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(result),
+                        result_concrete,
                     },
                     op.next_pc,
                 ))
@@ -17789,6 +17898,7 @@ fn handle<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(result),
+                        result_concrete: ConcreteValue::Int(value),
                     },
                     op.next_pc,
                 ))
@@ -17804,6 +17914,7 @@ fn handle<Sym: WalkSym>(
             // which bank to write into.
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
+            let result_concrete = read_float_reg_concrete(code, op, 0, ctx);
             publish_inline_return_last_instr(ctx, op.pc);
             if ctx.is_top_level {
                 // Slice b: portal-exit FINISH carries Type::Ref;
@@ -17825,6 +17936,7 @@ fn handle<Sym: WalkSym>(
                 Ok((
                     DispatchOutcome::SubReturn {
                         result: Some(result),
+                        result_concrete,
                     },
                     op.next_pc,
                 ))
@@ -17870,7 +17982,13 @@ fn handle<Sym: WalkSym>(
                     op.next_pc,
                 ))
             } else {
-                Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubReturn {
+                        result: None,
+                        result_concrete: ConcreteValue::Null,
+                    },
+                    op.next_pc,
+                ))
             }
         }
         "raise/r" => {
