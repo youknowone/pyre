@@ -185,13 +185,14 @@ pub(crate) fn build_ll_wtf8_nth_graph() -> FunctionGraph {
 /// Dest `Option<T>` payload the nth diamond stores in `Some.__pos_0`.
 ///
 /// `ClassDef.generalize_attr` / `unionof` keep one annotation per
-/// attribute. A `Ref` payload is the named instance intern publishes
-/// (`intern_opaque_payload_spelling` / `intern_adt_type_decl_identity`
-/// for an Opaque TypeDecl, `emit_aggregate_ctor` for a Struct). The
-/// ctor name is that identity so `intern_class_by_qualname` shares the
-/// FORCE `__pos_0` class (`getuniqueclassdef`). A scalar / pointer
-/// payload is the helper word. Never a silent word store into a struct
-/// payload.
+/// attribute. A `Ref` payload whose TypeDecl is a Struct is the named
+/// instance `emit_aggregate_ctor` publishes, with the helper word
+/// written to the unique non-ZST field. The ctor name is that identity
+/// so `intern_class_by_qualname` shares the FORCE `__pos_0` class
+/// (`getuniqueclassdef`). A scalar / pointer payload is the helper
+/// word. An Opaque TypeDecl (or Alias of Opaque) cannot carry the code
+/// point; `nth_payload_shape` declines. Never a silent word store into
+/// a struct payload.
 #[derive(Clone, Debug)]
 pub(crate) enum NthPayload {
     Word,
