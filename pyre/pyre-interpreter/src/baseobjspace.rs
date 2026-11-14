@@ -14235,13 +14235,14 @@ pub unsafe fn isinstance_miss_class_lookup_is_pure(w_type: PyObjectRef) -> bool 
 /// typeobject.py `setattr_if_not_from_object` — the `__setattr__`
 /// companion of [`getattribute_if_not_from_object`].
 ///
-/// [3.15-spec] `W_TypeObject.typedef` has no `__setattr__`, so this
-/// predicate answers `None` for `type` and every class that inherits
-/// `object.__setattr__`. pyre keeps a distinct `type.__setattr__` for
-/// the Carlo Verre check (`test_carloverre`); that slot is a thin
-/// forward to `object_setattr`, so it counts as the object default
-/// here and `space.setattr` / `STORE_ATTR` take the inlined
-/// `descr__setattr__` path (`objspace.py setattr`).
+/// [3.15-spec] distinct type.__setattr__ (hackcheck, test_carloverre) <->
+/// typeobject.py W_TypeObject.typedef has no __setattr__ —
+/// `object.__setattr__(str, "foo", 42)` raises TypeError; evidence:
+/// lib-python/3/test/test_descr.py test_carloverre, Objects/typeobject.c
+/// hackcheck.
+/// The slot forwards to `object_setattr`, so the predicate treats it as the
+/// object default, and `space.setattr` takes the inlined `descr__setattr__`
+/// path the way `setattr_if_not_from_object` answers `None` upstream.
 pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
         if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {

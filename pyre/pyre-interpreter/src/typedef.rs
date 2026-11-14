@@ -16644,27 +16644,29 @@ fn check_set_special_type_attr(
     w_value: PyObjectRef,
     name: &str,
 ) -> Result<(), crate::PyError> {
-    if w_value.is_null() {
-        let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
-        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            "cannot delete '",
-            name,
-            "' attribute of type '",
-            type_name,
-            "'"
-        )));
-    }
-    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-        let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
-        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            "cannot set '",
-            name,
-            "' attribute of immutable type '",
-            type_name,
-            "'"
-        )));
-    }
-    Ok(())
+    let valuefmt: &'static str = if w_value.is_null() {
+        "cannot delete '%s' attribute of type '%s'"
+    } else if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
+        // [3.15-spec] check_set_special_type_attr IMMUTABLETYPE <->
+        // typeobject.py descr_set__name__ is_heaptype — freeze of a heap
+        // type refuses `__name__`; evidence: Objects/typeobject.c
+        // check_set_special_type_attr / type_set_name.
+        "cannot set '%s' attribute of immutable type '%s'"
+    } else {
+        return Ok(());
+    };
+    let w_te = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::TypeError,
+    );
+    let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
+    Err(crate::error::oefmt(
+        w_te,
+        valuefmt,
+        &[
+            crate::error::FmtArg::Text(name),
+            crate::error::FmtArg::Text(type_name),
+        ],
+    ))
 }
 
 /// The `fdel` half of the special type getsets: deletion is never allowed,
@@ -16688,25 +16690,7 @@ pub fn __majit_wrap_type_descr_set_name(
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_type = args[1];
     let w_value = args[2];
-    if w_value.is_null() {
-        check_set_special_type_attr(w_type, w_value, "__name__")?;
-    }
-    // [3.15-spec] `typeobject.c check_set_special_type_attr` IMMUTABLETYPE
-    // <-> PyPy `descr_set__name__` `is_heaptype`. Observable: freeze of a
-    // heap type refuses `__name__`. evidence: Objects/typeobject.c
-    // `check_set_special_type_attr` / `type_set_name`.
-    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-        let w_te = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
-            pyre_object::interp_exceptions::ExcKind::TypeError,
-        );
-        return Err(crate::error::oefmt(
-            w_te,
-            "cannot set '__name__' attribute of immutable type '%s'",
-            &[crate::error::FmtArg::Text(unsafe {
-                pyre_object::w_type_get_name(w_type)
-            })],
-        ));
-    }
+    check_set_special_type_attr(w_type, w_value, "__name__")?;
     // typeobject.py descr_set__name__ `space.isinstance_w(w_value, space.w_text)`
     // accepts str and any str subclass, not only the exact type.
     if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {

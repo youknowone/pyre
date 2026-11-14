@@ -1472,21 +1472,12 @@ impl PyError {
     /// Wrap the existing message rstr; do not copy the payload.
     fn wrap_display_message_str(&self) -> PyObjectRef {
         let storage = self.message as *mut pyre_object::unicodeobject::UnicodeValueStorage;
-        if storage.is_null() {
-            return pyre_object::unicodeobject::w_str_from_storage_and_length(
-                std::ptr::null_mut(),
-                0,
-            );
-        }
-        let _roots = pyre_object::gc_roots::push_roots();
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(storage as PyObjectRef);
-        let storage = pyre_object::gc_roots::shadow_stack_get(slot)
-            as *mut pyre_object::unicodeobject::UnicodeValueStorage;
-        let wtf8 = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(storage) };
-        let lgt = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, wtf8.len());
-        let storage = pyre_object::gc_roots::shadow_stack_get(slot)
-            as *mut pyre_object::unicodeobject::UnicodeValueStorage;
+        let lgt = if storage.is_null() {
+            0
+        } else {
+            let wtf8 = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(storage) };
+            pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, wtf8.len())
+        };
         pyre_object::unicodeobject::w_str_from_storage_and_length(storage, lgt)
     }
 
