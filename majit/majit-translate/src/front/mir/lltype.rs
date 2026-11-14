@@ -13785,18 +13785,6 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     if tyref_rust_vec_item_kind(ty, llbc).is_some() {
         return "isize".to_string();
     }
-    // A named struct that is not an inlined `lltype.Struct` is a
-    // `Ptr` field (`backendopt/malloc.py` / `descr.py` `get_type_flag`).
-    if let Some(ptr) = malloc_ptr_field_spelling(
-        ty,
-        &tyref_to_ast_string(ty, llbc),
-        llbc,
-        no_tombstoned_leaves(),
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    ) {
-        return ptr;
-    }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in
     // the containing struct's descriptor instead of treating it as a Ref.

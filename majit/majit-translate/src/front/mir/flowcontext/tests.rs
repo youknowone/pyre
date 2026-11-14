@@ -16713,3 +16713,33 @@ fn harvested_w_dict_delitem_index_of_keeps_object_key_pointer() {
         );
     }
 }
+
+/// `W_ListObject.int_items` is the inlined `IntArray` STRUCT (`rlist.py`
+/// LIST length / items). `malloc_ptr_field_spelling` is the Result-payload
+/// path (`register_ref_enum_instantiation_rows`); a nested field still
+/// inlines so `fielddescrof` can `getattr` `int_items.len`.
+#[test]
+fn harvested_w_list_int_items_is_inlined_int_array() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program =
+        crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+            std::slice::from_ref(llbc),
+            crate::HostStaticAddrs::default(),
+            &["listobject", "int_array"],
+        )
+        .expect("harvest W_ListObject / IntArray");
+    let ty = ["listobject::W_ListObject", "W_ListObject"]
+        .into_iter()
+        .find_map(|owner| program.struct_fields.field_type(owner, "int_items"))
+        .expect("W_ListObject.int_items is harvested");
+    assert!(
+        !ty.starts_with('*') && !ty.starts_with('&'),
+        "int_items is an inlined IntArray, not a malloc Ptr; ty={ty}"
+    );
+    let leaf = ty.rsplit("::").next().unwrap_or(ty);
+    assert_eq!(
+        leaf, "IntArray",
+        "int_items field type is IntArray, got {ty}"
+    );
+}

@@ -8899,6 +8899,99 @@ mod tests {
         );
     }
 
+    /// `flatten_list_storage_field` names `int_items.len` on the list
+    /// owner. `heaptracker.all_fielddescrs` recurses the nested
+    /// `IntArray` STRUCT (`rlist.py` LIST length); the owner layout lists
+    /// `int_items` itself, not the dotted leaf.
+    #[test]
+    fn fielddescrof_resolves_list_storage_dotted_leaf() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let list = "list_storage_fd::W_ListObject";
+        let inner = "list_storage_fd::IntArray";
+        let list_id = majit_ir::descr::StructId::from_canonical(list);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (list.to_string(), Some(list_id)),
+            (inner.to_string(), Some(inner_id)),
+        ]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            list.to_string(),
+            vec![("int_items".to_string(), inner.to_string())],
+        );
+        struct_fields.fields.insert(
+            inner.to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([inner.to_string()].into_iter().collect());
+        cc.set_struct_layout(
+            inner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "block".to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "len".to_string(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            list_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![StructFieldLayout {
+                    name: "int_items".to_string(),
+                    offset: 0,
+                    size: 16,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let crate::jitcode::BhDescr::Field { offset, .. } = fielddescrof(
+            &FieldDescriptor::new("int_items.len", Some(list.to_string())),
+            &crate::model::ValueType::Unsigned,
+            Some(&cc),
+            true,
+        ) else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 8);
+    }
+
     /// `get_field_descr` raises when `getattr(STRUCT, fieldname)` misses.
     #[test]
     #[should_panic(expected = "getattr(s2_unresolved::Owner, missing)")]
