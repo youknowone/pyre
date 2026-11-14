@@ -20,7 +20,6 @@
 use crate::gc_hook::GCREF;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and_weakref(
@@ -206,19 +205,13 @@ pub enum SetUpdateError {
 /// `exceptiontransform.py` `exc_data`. rustc `Result<(), SetUpdateError>` is
 /// a 1-byte enum, so a residual CALL of the vtable slot cannot return the
 /// interned Result shell jitcode GETFIELDs. These Signed codes are that
-/// word instead.
+/// return word instead. After descent the Integer path is constant
+/// [`SET_ADD_OK`].
 pub const SET_ADD_OK: i64 = 0;
 pub const SET_ADD_KEY: i64 = -1;
 pub const SET_ADD_CHANGED_SIZE: i64 = -2;
 pub const SET_ADD_MEMORY: i64 = -3;
 pub const SET_ADD_HASH: i64 = -4;
-
-thread_local! {
-    // Presence token like `dict_eq_hook` `HASH_W_ERROR`: the concrete
-    // exception rides the interpreter pending slot; this cell is the
-    // Signed kind residual CALL returns.
-    static PARKED_SET_UPDATE: Cell<i8> = const { Cell::new(0) };
-}
 
 fn set_update_status(err: SetUpdateError) -> i64 {
     match err {
@@ -229,7 +222,14 @@ fn set_update_status(err: SetUpdateError) -> i64 {
     }
 }
 
-/// Reconstruct the parked kind. `0` is success.
+fn set_add_status(result: Result<(), SetUpdateError>) -> i64 {
+    match result {
+        Ok(()) => SET_ADD_OK,
+        Err(err) => set_update_status(err),
+    }
+}
+
+/// Reconstruct the status word. `0` is success.
 pub fn set_update_error_from_status(status: i64) -> Option<SetUpdateError> {
     match status {
         SET_ADD_OK => None,
@@ -238,26 +238,6 @@ pub fn set_update_error_from_status(status: i64) -> Option<SetUpdateError> {
         SET_ADD_MEMORY => Some(SetUpdateError::Memory),
         SET_ADD_HASH => Some(SetUpdateError::Hash(crate::dictmultiobject::DictKeyError)),
         _ => Some(SetUpdateError::Key(crate::dictmultiobject::DictKeyError)),
-    }
-}
-
-#[majit_macros::dont_look_inside]
-fn park_set_update_error(err: SetUpdateError) {
-    let status = set_update_status(err) as i8;
-    PARKED_SET_UPDATE.with(|cell| cell.set(status));
-}
-
-#[majit_macros::dont_look_inside]
-fn take_set_update_status() -> i64 {
-    PARKED_SET_UPDATE.with(|cell| cell.replace(0) as i64)
-}
-
-/// Park only on `Err`, like `dict_eq_hook::signal_hash_error`. Success
-/// leaves the cell at 0 so the hot `IntegerSetStrategy.add` path does
-/// not residualize a TLS write (`SetStrategy.add` returns None).
-fn finish_set_add(result: Result<(), SetUpdateError>) {
-    if let Err(err) = result {
-        park_set_update_error(err);
     }
 }
 
@@ -283,12 +263,12 @@ pub trait SetStrategy {
 
     /// `SetStrategy.add`. `w_key` is the wrapped element
     /// (`setobject.py SetStrategy.add` / `W_BaseSetObject.add`).
-    /// No return value: a failure parks [`SetUpdateError`] for
-    /// [`w_set_add_checked`] to read as a Signed word.
+    /// Returns [`SET_ADD_OK`] or a negative [`SetUpdateError`] code: the
+    /// Signed word a residual CALL of this slot can return.
     ///
     /// # Safety
     /// `w_set` must point at a valid `W_SetObject`. Caller holds `w_set_lock`.
-    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef);
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64;
 
     /// `SetStrategy.remove`. A removal that empties the live set calls
     /// `W_BaseSetObject.switch_to_empty_strategy` (`W_SetObject._discard_from_set`).
@@ -1408,10 +1388,10 @@ where
     }
     unwrapped_switch_to_object(strategy, roots.get(base)).map_err(SetUpdateError::Key)?;
     let w_set = roots.get(base);
-    (*(w_set as *const W_SetObject))
+    let status = (*(w_set as *const W_SetObject))
         .strategy
         .add(w_set, roots.get(base + 1));
-    match set_update_error_from_status(take_set_update_status()) {
+    match set_update_error_from_status(status) {
         None => Ok(()),
         Some(err) => Err(err),
     }
@@ -2264,8 +2244,8 @@ macro_rules! impl_unwrapped_set_strategy {
                 unsafe { (*(w_set as *const W_SetObject)).len_relaxed() }
             }
 
-            unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) {
-                finish_set_add(unwrapped_add(self, w_set, w_key));
+            unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
+                set_add_status(unwrapped_add(self, w_set, w_key))
             }
 
             unsafe fn remove(
@@ -3012,8 +2992,7 @@ pub unsafe fn w_set_add_checked(obj: PyObjectRef, item: PyObjectRef) -> i64 {
     let obj = roots.get(base);
     (*(obj as *const W_SetObject))
         .strategy
-        .add(obj, roots.get(base + 1));
-    take_set_update_status()
+        .add(obj, roots.get(base + 1))
 }
 
 /// Insert an element keyed on a `space.hash_w` digest the caller already
@@ -4223,7 +4202,7 @@ impl SetStrategy for EmptySetStrategy {
         0
     }
 
-    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) {
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
         // `EmptySetStrategy.add`: select storage, then `w_set.add`.
         let roots = crate::gc_roots::push_roots();
         let base = roots.base();
@@ -4233,7 +4212,7 @@ impl SetStrategy for EmptySetStrategy {
         let w_set = roots.get(base);
         (*(w_set as *const W_SetObject))
             .strategy
-            .add(w_set, roots.get(base + 1));
+            .add(w_set, roots.get(base + 1))
     }
 
     /// `EmptySetStrategy.remove` returns False. The caller already hashed.
@@ -4348,7 +4327,7 @@ impl SetStrategy for ObjectSetStrategy {
         (*(w_set as *const W_SetObject)).len_relaxed()
     }
 
-    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) {
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
         // `setobject.py AbstractUnwrappedSetStrategy.add` captures `d` before
         // hashing; measured 3.15.0t hash-clears-set add retains the incoming
         // element, so retry the live strategy with the already computed digest.
@@ -4366,7 +4345,7 @@ impl SetStrategy for ObjectSetStrategy {
             ),
             Err(err) => Err(SetUpdateError::Hash(err)),
         };
-        finish_set_add(result);
+        set_add_status(result)
     }
 
     unsafe fn remove(
