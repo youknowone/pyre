@@ -11283,9 +11283,7 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
 #[test]
 fn range_list_length_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "range_list_length")
         .expect("lower range_list_length");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -11301,9 +11299,7 @@ fn range_list_length_decomposes_core_try_from() {
 #[test]
 fn u32_as_usize_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "u32_as_usize").expect("lower u32_as_usize");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -11321,9 +11317,7 @@ fn u32_as_usize_decomposes_core_try_from() {
 #[test]
 fn execute_opcode_step_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "execute_opcode_step")
         .expect("lower execute_opcode_step");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -11339,9 +11333,7 @@ fn execute_opcode_step_decomposes_core_try_from() {
 #[test]
 fn eval_loop_jit_decomposes_core_try_from() {
     let path = crate::runtime_names::artifacts::JIT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "eval_loop_jit").expect("lower eval_loop_jit");
     let leftovers = leftover_core_try_from_paths(&caller);
@@ -11367,9 +11359,7 @@ fn extracted_try_from_callers_decompose_core_try_from() {
         ),
         ("jit", crate::runtime_names::artifacts::JIT_ULLBC),
     ] {
-        let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-            continue;
-        };
+        let llbc = crate::test_support::load_ullbc(path);
         crate::test_support::with_lowering(llbc, |ctx| {
             for fd in llbc.iter_fun_decls() {
                 if !fd.has_unstructured_body() {
@@ -11411,9 +11401,7 @@ fn extracted_try_from_callers_decompose_core_try_from() {
 #[test]
 fn harvested_execute_load_attr_aliases_arg_get() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11474,9 +11462,7 @@ fn harvested_execute_load_attr_aliases_arg_get() {
 #[test]
 fn eval_load_attr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr")
         .expect("lower eval::<Impl>::load_attr");
     let leftovers = leftover_push_roots_paths(&caller);
@@ -11492,9 +11478,7 @@ fn eval_load_attr_erases_push_roots() {
 #[test]
 fn harvested_load_attr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11535,9 +11519,7 @@ fn harvested_load_attr_erases_push_roots() {
 #[test]
 fn eval_getattr_str_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "pyre_interpreter::baseobjspace::getattr_str")
             .expect("lower getattr_str");
@@ -11555,9 +11537,7 @@ fn eval_getattr_str_erases_push_roots() {
 #[test]
 fn harvested_getattr_str_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11601,9 +11581,7 @@ fn harvested_getattr_str_erases_push_roots() {
 #[test]
 fn eval_getattr_str_impl_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(
         llbc,
         "pyre_interpreter::baseobjspace::getattr_str_impl",
@@ -11622,9 +11600,7 @@ fn eval_getattr_str_impl_erases_push_roots() {
 #[test]
 fn harvested_getattr_str_impl_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11662,9 +11638,7 @@ fn harvested_getattr_str_impl_erases_push_roots() {
 
 fn assert_baseobjspace_fn_erases_push_roots(leaf: &str) {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let full = format!("pyre_interpreter::baseobjspace::{leaf}");
     let caller =
         crate::test_support::lower_function(llbc, &full).unwrap_or_else(|_| panic!("lower {full}"));
@@ -11705,9 +11679,7 @@ fn eval_getattr_str_instance_like_override_erases_push_roots() {
 #[test]
 fn eval_get_and_call_attribute_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(
         llbc,
         "pyre_interpreter::baseobjspace::get_and_call_attribute",
@@ -11729,9 +11701,7 @@ fn eval_get_and_call_attribute_erases_push_roots() {
 #[test]
 fn harvested_get_and_call_attribute_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11816,9 +11786,7 @@ fn load_attr_cached_frame_anchor_leftovers(graph: &crate::model::FunctionGraph) 
 #[test]
 fn eval_to_bool_jitted_has_no_frame_anchor() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::to_bool")
         .expect("lower eval::<Impl>::to_bool");
     let calls = leftover_call_summaries(&caller);
@@ -11832,9 +11800,7 @@ fn eval_to_bool_jitted_has_no_frame_anchor() {
 #[test]
 fn harvested_to_bool_jitted_has_no_frame_anchor() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11874,9 +11840,7 @@ fn harvested_to_bool_jitted_has_no_frame_anchor() {
 #[test]
 fn eval_load_attr_cached_jitted_uses_wrapped_getattr() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller = crate::test_support::lower_function(llbc, "eval::<Impl>::load_attr_cached")
         .expect("lower eval::<Impl>::load_attr_cached");
     let leftovers = leftover_push_roots_paths(&caller);
@@ -11909,9 +11873,7 @@ fn eval_load_attr_cached_jitted_uses_wrapped_getattr() {
 #[test]
 fn eval_load_attr_getattr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let caller =
         crate::test_support::lower_function(llbc, "pyre_interpreter::eval::load_attr_getattr")
             .unwrap_or_else(|err| panic!("lower load_attr_getattr: {err}"));
@@ -11943,9 +11905,7 @@ fn eval_load_attr_getattr_erases_push_roots() {
 #[test]
 fn harvested_getattr_erases_push_roots() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -11987,9 +11947,7 @@ fn harvested_getattr_erases_push_roots() {
 #[test]
 fn harvested_load_attr_cached_jitted_uses_wrapped_getattr() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -12070,9 +12028,7 @@ fn local_fun_paths_ending(llbc: &Llbc, suffix: &str) -> Vec<String> {
 #[test]
 fn eval_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let paths = local_fun_paths_ending(llbc, "::getcode");
     assert!(!paths.is_empty(), "no local FunDecl ending ::getcode");
     let mut hits: Vec<String> = Vec::new();
@@ -12108,9 +12064,7 @@ fn eval_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
 #[test]
 fn eval_co_flags_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let paths = local_fun_paths_ending(llbc, "::co_flags");
     assert!(!paths.is_empty(), "no local FunDecl ending ::co_flags");
     let mut hits: Vec<String> = Vec::new();
@@ -12148,9 +12102,7 @@ fn eval_co_flags_cast_int_to_ptr_of_codeobject_is_int_identity() {
 #[test]
 fn harvested_getcode_cast_int_to_ptr_of_codeobject_is_int_identity() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -12223,15 +12175,9 @@ fn harvested_new_malloc_typed_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12305,15 +12251,9 @@ fn harvested_enter_recursive_frame_is_dont_look_inside() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12381,15 +12321,9 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12647,15 +12581,9 @@ fn harvested_funccall_flat_looks_inside_eval_frame_with_resume() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12815,15 +12743,9 @@ fn harvested_enter_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12873,15 +12795,9 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -12979,9 +12895,7 @@ fn cached_root_raw_has_no_cast_ptr_to_int() {
 #[test]
 fn harvested_getdictvalue_no_unwrapping_pure_leftover_is_entries_get() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13038,9 +12952,7 @@ fn harvested_getdictvalue_no_unwrapping_pure_leftover_is_entries_get() {
 fn harvested_load_global_value_uses_getname_w() {
     use crate::model::{CallFuncPtr, CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
@@ -13246,15 +13158,9 @@ fn harvested_set_topframeref_has_no_frame_anchor() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -13379,15 +13285,9 @@ fn harvested_eval_frame_with_resume_has_no_frame_anchor() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -13536,15 +13436,9 @@ fn harvested_frame_dispatch_passes_the_frame_ref_to_next_instr() {
     let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(rlib) = crate::test_support::load_ullbc_if_present(rlib) else {
-        return;
-    };
-    let Some(object) = crate::test_support::load_ullbc_if_present(object) else {
-        return;
-    };
-    let Some(interpreter) = crate::test_support::load_ullbc_if_present(interpreter) else {
-        return;
-    };
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[rlib, object, interpreter],
         crate::HostStaticAddrs::default(),
@@ -16727,9 +16621,7 @@ fn harvested_call_target_is_index_of(target: &CallTarget) -> bool {
 #[test]
 fn harvested_w_dict_delitem_index_of_keeps_object_key_pointer() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
+    let llbc = crate::test_support::load_ullbc(path);
     let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
