@@ -63,6 +63,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_memfd_create)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_unshare)");
     println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_qrtr)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_alg)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -90,10 +91,10 @@ fn main() {
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
     }
-    let have_sockaddr_qrtr = if target_is_unix_or_windows() {
+    let (have_sockaddr_qrtr, have_sockaddr_alg) = if target_is_unix_or_windows() {
         write_rsocket_cconfig()
     } else {
-        false
+        (false, false)
     };
     majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
@@ -118,6 +119,10 @@ fn main() {
     println!(
         "cargo::metadata=HAVE_SOCKADDR_QRTR={}",
         have_sockaddr_qrtr as u8
+    );
+    println!(
+        "cargo::metadata=HAVE_SOCKADDR_ALG={}",
+        have_sockaddr_alg as u8
     );
 }
 
@@ -2366,8 +2371,8 @@ fn rsocket_intmask(name: &str, value: i128) -> i64 {
 }
 
 /// `_rsocket_rffi.py` `CConfig` / `configure(CConfig)`, then `constants`.
-/// Returns whether `cConfig.sockaddr_qrtr` is a struct (`HAVE_SOCKADDR_QRTR`).
-fn write_rsocket_cconfig() -> bool {
+/// Returns whether `cConfig.sockaddr_qrtr` / `cConfig.sockaddr_alg` are structs.
+fn write_rsocket_cconfig() -> (bool, bool) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
     let has_af_packet = target_os == "linux" || target_os == "android";
@@ -2401,6 +2406,27 @@ fn write_rsocket_cconfig() -> bool {
             CConfigEntry::DefinedConstantInteger((*name).into()),
         ));
     }
+    // `_rsocket_rffi.py` `CConfig.sockaddr_alg`
+    entries.push((
+        "sockaddr_alg".into(),
+        CConfigEntry::struct_type(
+            "struct sockaddr_alg",
+            vec![
+                ("salg_family".into(), FieldType::int()),
+                (
+                    "salg_type".into(),
+                    FieldType::fixed_array(FieldType::uchar(), 14),
+                ),
+                ("salg_feat".into(), FieldType::short()),
+                ("salg_mask".into(), FieldType::short()),
+                (
+                    "salg_name".into(),
+                    FieldType::fixed_array(FieldType::uchar(), 64),
+                ),
+            ],
+            Some("AF_ALG".into()),
+        ),
+    ));
     // `_rsocket_rffi.py` `CConfig.sockaddr_qrtr`
     entries.push((
         "sockaddr_qrtr".into(),
@@ -2458,6 +2484,15 @@ fn write_rsocket_cconfig() -> bool {
     }
     text.push_str("];\n");
 
+    let have_sockaddr_alg = match cconfig_lookup(&results, "sockaddr_alg") {
+        ConfigValue::Struct(layout) => {
+            text.push_str(&layout.rust_struct_source("sockaddr_alg", &[]));
+            println!("cargo:rustc-cfg=rsocket_have_sockaddr_alg");
+            true
+        }
+        ConfigValue::None => false,
+        other => panic!("sockaddr_alg: {other:?}"),
+    };
     let have_sockaddr_qrtr = match cconfig_lookup(&results, "sockaddr_qrtr") {
         ConfigValue::Struct(layout) => {
             text.push_str(&layout.rust_struct_source("sockaddr_qrtr", &[]));
@@ -2471,7 +2506,7 @@ fn write_rsocket_cconfig() -> bool {
     let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("rsocket_cconfig.rs");
     std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-    have_sockaddr_qrtr
+    (have_sockaddr_qrtr, have_sockaddr_alg)
 }
 
 /// Emit `&[(&str, i32)]` of keys whose `DefinedConstantInteger` is not None.

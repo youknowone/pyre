@@ -2887,6 +2887,212 @@ fn get_cmsg_space(length: usize) -> Option<usize> {
     Some(tmp)
 }
 
+/// `interp_socket.py` `_pack_uint32`. Host-endian four bytes.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn pack_uint32(v: i64) -> [u8; 4] {
+    (v as u32).to_ne_bytes()
+}
+
+/// `RSocket.sendmsg` / `W_Socket.sendmsg_w` after the buffers are copied.
+#[cfg(unix)]
+fn unix_sendmsg(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+    data_buffers: &mut [Vec<u8>],
+    cmsgs: &[(libc::c_int, libc::c_int, Vec<u8>)],
+    flags: libc::c_int,
+    addr: Option<(*const libc::c_void, rffi::SockLen)>,
+) -> Result<isize, pyre_interpreter::PyError> {
+    let mut iovs: Vec<libc::iovec> = data_buffers
+        .iter_mut()
+        .map(|s| libc::iovec {
+            iov_base: s.as_mut_ptr() as *mut libc::c_void,
+            iov_len: s.len(),
+        })
+        .collect();
+    let mut control = {
+        let mut controllen = 0usize;
+        let mut controllen_last = 0usize;
+        for (_, _, data) in cmsgs {
+            let Some(space) = get_cmsg_space(data.len()) else {
+                return Err(pyre_interpreter::PyError::os_error(
+                    "ancillary data item too large",
+                ));
+            };
+            controllen += space;
+            if controllen > SOCKLEN_T_LIMIT || controllen < controllen_last {
+                return Err(pyre_interpreter::PyError::os_error(
+                    "too much ancillary data",
+                ));
+            }
+            controllen_last = controllen;
+        }
+        let mut control = vec![0u8; controllen];
+        if controllen > 0 {
+            let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            packing_msg.msg_controllen = controllen as _;
+            let mut cur = unsafe { libc::CMSG_FIRSTHDR(&packing_msg) };
+            for (level, ty, data) in cmsgs {
+                if cur.is_null() {
+                    break;
+                }
+                let cmsg_len = unsafe { libc::CMSG_LEN(data.len() as libc::c_uint) };
+                unsafe {
+                    (*cur).cmsg_level = *level;
+                    (*cur).cmsg_type = *ty;
+                    (*cur).cmsg_len = cmsg_len as _;
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cur), data.len());
+                    cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                }
+            }
+        }
+        control
+    };
+    let total_control = control.len();
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iovs.as_mut_ptr();
+    msg.msg_iovlen = iovs.len() as _;
+    if let Some((name, namelen)) = addr {
+        msg.msg_name = name as *mut libc::c_void;
+        msg.msg_namelen = namelen;
+    }
+    if total_control > 0 {
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = total_control as _;
+    }
+
+    socket_wait_writable(obj, fd)?;
+    loop {
+        let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
+            libc::sendmsg(fd, &msg, flags)
+        });
+        if r >= 0 {
+            return Ok(r);
+        }
+        if !rffi::error_is_interrupted(errno) {
+            return Err(socket_io_err_for_operation(
+                obj,
+                std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+    }
+}
+
+/// `rsocket.py` `constants` lookup used by `sendmsg_afalg_w`.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn rsocket_constant(name: &'static str) -> i64 {
+    majit_rlib::rsocket::constants()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("{name}"))
+}
+
+/// `interp_socket.py` `W_Socket.sendmsg_afalg_w`.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_w(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let msg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let op_obj = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let iv = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+    let assoclen_obj = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
+    let flags_obj = args.get(5).copied().unwrap_or(pyre_object::PY_NULL);
+
+    let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"));
+    if family != majit_rlib::rsocket::af_alg() {
+        return Err(pyre_interpreter::PyError::os_error(
+            "algset is only supported for AF_ALG",
+        ));
+    }
+    // `unwrap_spec(op=int)` then `op < 0`. Default `-1` is the missing-op
+    // sentinel (`sendmsg_afalg_w`).
+    let op = pyre_interpreter::baseobjspace::int_w(op_obj)?;
+    if op < 0 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "Invalid or missing argument 'op'",
+        ));
+    }
+    let mut assoclen: i64 = -1;
+    if !assoclen_obj.is_null() && !unsafe { pyre_object::is_none(assoclen_obj) } {
+        assoclen = pyre_interpreter::baseobjspace::int_w(assoclen_obj)?;
+        if assoclen < 0 {
+            return Err(pyre_interpreter::PyError::type_error(
+                "assoclen must be positive",
+            ));
+        }
+    }
+    let flags =
+        libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(flags_obj)?).map_err(|_| {
+            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+        })?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, msg, iv]);
+    let fd = socket_fd(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+
+    let mut data_buffers: Vec<Vec<u8>> = Vec::new();
+    let msg = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
+    if !msg.is_null() && !unsafe { pyre_object::is_none(msg) } {
+        let data_items = pyre_interpreter::baseobjspace::unpackiterable(msg, -1)?;
+        let items_base = pyre_object::gc_roots::pin_roots(&data_items);
+        for i in 0..data_items.len() {
+            let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
+            let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(item)? else {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "sendmsg: data items must be bytes-like",
+                ));
+            };
+            data_buffers.push(buffer.as_bytes().to_vec());
+            buffer.release();
+        }
+    }
+
+    let sol_alg = rsocket_constant("SOL_ALG") as libc::c_int;
+    let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+    cmsgs.push((
+        sol_alg,
+        rsocket_constant("ALG_SET_OP") as libc::c_int,
+        pack_uint32(op).to_vec(),
+    ));
+    let iv = pyre_object::gc_roots::shadow_stack_get(obj_slot + 2);
+    if !iv.is_null() && !unsafe { pyre_object::is_none(iv) } {
+        let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(iv)? else {
+            return Err(pyre_interpreter::PyError::type_error(
+                "a bytes-like object is required",
+            ));
+        };
+        let iv_bytes = buffer.as_bytes().to_vec();
+        buffer.release();
+        let mut payload = pack_uint32(iv_bytes.len() as i64).to_vec();
+        payload.extend_from_slice(&iv_bytes);
+        cmsgs.push((
+            sol_alg,
+            rsocket_constant("ALG_SET_IV") as libc::c_int,
+            payload,
+        ));
+    }
+    if assoclen >= 0 {
+        cmsgs.push((
+            sol_alg,
+            rsocket_constant("ALG_SET_AEAD_ASSOCLEN") as libc::c_int,
+            pack_uint32(assoclen).to_vec(),
+        ));
+    }
+
+    let sent = unix_sendmsg(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        fd,
+        &mut data_buffers,
+        &cmsgs,
+        flags,
+        None,
+    )?;
+    Ok(pyre_object::w_int_new(sent as i64))
+}
+
 /// Release the interpreter around a WinSock call and return the code
 /// `last_error_code` reported. WinSock does not write the C runtime's `errno`.
 /// `recvmsg` and `sendmsg` stay on `call_external_function`.
@@ -4216,6 +4422,65 @@ fn pack_inet_addr(
         return Ok((storage, addrlen));
     }
 
+    // `interp_socket.py` `addr_from_object` `AF_ALG` / `AlgAddress`.
+    #[cfg(rsocket_have_sockaddr_alg)]
+    if family as i64 == majit_rlib::rsocket::af_alg() {
+        let pieces = pyre_interpreter::baseobjspace::unpackiterable(addr, -1)?;
+        if !(2..=4).contains(&pieces.len()) {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "AF_ALG address must be a tuple of length 2 to 4 not {}",
+                pieces.len()
+            )));
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::pin_roots(&pieces);
+        let algtype = pyre_interpreter::baseobjspace::text_w(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        )?;
+        let algname = pyre_interpreter::baseobjspace::text_w(
+            pyre_object::gc_roots::shadow_stack_get(slot + 1),
+        )?;
+        if algtype.len() > 13 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "AF_ALG type too long.",
+            ));
+        }
+        if algname.len() > 63 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "AF_ALG name too long.",
+            ));
+        }
+        let salg_feat = if pieces.len() > 2 {
+            pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+                slot + 2,
+            ))?
+        } else {
+            0
+        };
+        let salg_mask = if pieces.len() > 3 {
+            pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+                slot + 3,
+            ))?
+        } else {
+            0
+        };
+        let alg = majit_rlib::rsocket::AlgAddress::new(
+            algtype.as_bytes(),
+            algname.as_bytes(),
+            salg_feat,
+            salg_mask,
+        );
+        let src = alg.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (&raw mut storage).cast::<u8>(),
+                src.len(),
+            );
+        }
+        return Ok((storage, src.len() as rffi::SockLen));
+    }
+
     // `interp_socket.py` `addr_from_object` `AF_QIPCRTR` / `QrtrAddress`.
     #[cfg(rsocket_have_sockaddr_qrtr)]
     if family as i64 == majit_rlib::rsocket::af_qipcrtr() {
@@ -4415,9 +4680,10 @@ fn storage_from_rsocket(bytes: &[u8], slen: i32) -> (rffi::sockaddr_storage, rff
 fn accept_socket(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
+    family: libc::c_int,
 ) -> Result<(rffi::Socket, rffi::sockaddr_storage, rffi::SockLen), pyre_interpreter::PyError> {
     loop {
-        match majit_rlib::rsocket::accept(fd) {
+        match majit_rlib::rsocket::accept(fd, family as majit_rlib::rffi::SIGNED) {
             Ok((cfd, bytes, addrlen)) => {
                 let (storage, slen) = storage_from_rsocket(&bytes, addrlen);
                 return Ok((cfd, storage, slen));
@@ -4533,6 +4799,10 @@ fn unpack_inet_addr(
             fields.push(pyre_object::w_int_new(node));
             fields.push(pyre_object::w_int_new(port));
             return pyre_object::w_tuple_new(fields.take());
+        }
+        #[cfg(rsocket_have_sockaddr_alg)]
+        if family as i64 == majit_rlib::rsocket::af_alg() {
+            return pyre_object::w_none();
         }
         pyre_object::w_tuple_new(vec![])
     }
@@ -5510,7 +5780,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto"))
                     as libc::c_int;
                 #[cfg(unix)]
-                let (cfd, storage, slen) = accept_socket(obj, fd)?;
+                let (cfd, storage, slen) = accept_socket(obj, fd, family)?;
                 #[cfg(windows)]
                 let (cfd, storage, slen) = {
                     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -5563,8 +5833,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
                 pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"))
+                    as libc::c_int;
                 #[cfg(unix)]
-                let (cfd, storage, slen) = accept_socket(obj, fd)?;
+                let (cfd, storage, slen) = accept_socket(obj, fd, family)?;
                 #[cfg(windows)]
                 let (cfd, storage, slen) = {
                     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -6675,13 +6947,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     data_buffers.push(buffer.as_bytes().to_vec());
                     buffer.release();
                 }
-                let mut iovs: Vec<libc::iovec> = data_buffers
-                    .iter()
-                    .map(|s| libc::iovec {
-                        iov_base: s.as_ptr() as *mut libc::c_void,
-                        iov_len: s.len(),
-                    })
-                    .collect();
 
                 // Build ancillary control buffer from args[2] (optional).
                 let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
@@ -6779,86 +7044,69 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     (None, 0)
                 };
 
-                // Lay out cmsgs into a single control buffer.
-                // `sendmsg_implementation` sums `CMSG_SPACE` per item with a
-                // wrap check against `SOCKLEN_T_LIMIT`.
-                let mut control = {
-                    let mut controllen = 0usize;
-                    let mut controllen_last = 0usize;
-                    for (_, _, data) in &cmsgs {
-                        let Some(space) = get_cmsg_space(data.len()) else {
-                            return Err(pyre_interpreter::PyError::os_error(
-                                "ancillary data item too large",
-                            ));
-                        };
-                        controllen += space;
-                        if controllen > SOCKLEN_T_LIMIT || controllen < controllen_last {
-                            return Err(pyre_interpreter::PyError::os_error(
-                                "too much ancillary data",
-                            ));
-                        }
-                        controllen_last = controllen;
-                    }
-                    let mut control = vec![0u8; controllen];
-                    if controllen > 0 {
-                        let mut packing_msg: libc::msghdr = std::mem::zeroed();
-                        packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                        packing_msg.msg_controllen = controllen as _;
-                        let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
-                        for (level, ty, data) in &cmsgs {
-                            if cur.is_null() {
-                                break;
-                            }
-                            let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
-                            (*cur).cmsg_level = *level;
-                            (*cur).cmsg_type = *ty;
-                            (*cur).cmsg_len = cmsg_len as _;
-                            std::ptr::copy_nonoverlapping(
-                                data.as_ptr(),
-                                libc::CMSG_DATA(cur),
-                                data.len(),
-                            );
-                            cur = libc::CMSG_NXTHDR(&packing_msg, cur);
-                        }
-                    }
-                    control
-                };
-                let total_control = control.len();
-                let mut msg: libc::msghdr = { std::mem::zeroed() };
-                msg.msg_iov = iovs.as_mut_ptr();
-                msg.msg_iovlen = iovs.len() as _;
-                if let Some(ref s) = addr_storage {
-                    msg.msg_name = s as *const _ as *mut libc::c_void;
-                    msg.msg_namelen = addr_len;
-                }
-                if total_control > 0 {
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = total_control as _;
-                }
-
-                socket_wait_writable(pyre_object::gc_roots::shadow_stack_get(obj_slot), fd)?;
-                let sent = loop {
-                    let (r, errno) =
-                        pyre_interpreter::module::thread::call_external_function(|| {
-                            libc::sendmsg(fd, &msg, flags)
-                        });
-                    if r >= 0 {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                };
+                let addr = addr_storage
+                    .as_ref()
+                    .map(|s| (s as *const _ as *const libc::c_void, addr_len));
+                let sent = unix_sendmsg(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    fd,
+                    &mut data_buffers,
+                    &cmsgs,
+                    flags,
+                    addr,
+                )?;
                 Ok(pyre_object::w_int_new(sent as i64))
             })
         )
     };
+
+    // `interp_socket.py` `socketmethodnames` appends `sendmsg_afalg` when
+    // `HAS_AF_ALG`.
+    #[cfg(rsocket_have_sockaddr_alg)]
+    {
+        let mut builder = pyre_interpreter::gateway::SignatureBuilder::default();
+        builder.append("self");
+        builder.marker_posonly();
+        builder.append("msg");
+        builder.marker_kwonly();
+        builder.append("op");
+        builder.append("iv");
+        builder.append("assoclen");
+        builder.append("flags");
+        let function = pyre_interpreter::gateway::make_builtin_function_with_text_signature_and_sig(
+            "sendmsg_afalg",
+            sendmsg_afalg_w,
+            "($self, msg=None, *, op=-1, iv=None, assoclen=None, flags=0)",
+            Some(builder.signature()),
+        );
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_interpreter::gateway::function_set_positional_defaults(
+            function,
+            &[pyre_object::w_none()],
+        ));
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "op",
+            pyre_object::w_int_new(-1),
+        );
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "iv",
+            pyre_object::w_none(),
+        );
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "assoclen",
+            pyre_object::w_none(),
+        );
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "flags",
+            pyre_object::w_int_new(0),
+        );
+        pyre_interpreter::__pyre_put_new!(ns_slot, "sendmsg_afalg", roots.get(fn_slot));
+    }
 
     pyre_interpreter::__pyre_put_new!(
         ns_slot,

@@ -19,6 +19,9 @@ pub mod cConfig {
 /// `_rsocket_rffi.py` `constants`.
 #[cfg(any(unix, windows))]
 pub use cConfig::CONSTANTS;
+/// `_rsocket_rffi.py` `if cConfig.sockaddr_alg is not None: sockaddr_alg = cConfig.sockaddr_alg`.
+#[cfg(rsocket_have_sockaddr_alg)]
+pub use cConfig::sockaddr_alg;
 /// `_rsocket_rffi.py` `if cConfig.sockaddr_qrtr is not None: sockaddr_qrtr = cConfig.sockaddr_qrtr`.
 #[cfg(rsocket_have_sockaddr_qrtr)]
 pub use cConfig::sockaddr_qrtr;
