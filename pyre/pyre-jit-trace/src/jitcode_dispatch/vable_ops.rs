@@ -725,7 +725,7 @@ fn durable_resume_frame<Sym: WalkSym>(
     // to the generator: journal and write the live object, matching
     // `cpu.bh_setarrayitem_gc_r` / `write_box_at` on the forwarded GCREF.
     if let Some(resume) = ctx.fbw_mode.generator_resume {
-        let live = pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize;
+        let live = live_generator_resume_frame(resume);
         if live != 0 && generator_resume_frame_copy(frame, live, resume) {
             return Some(live);
         }
@@ -735,6 +735,23 @@ fn durable_resume_frame<Sym: WalkSym>(
         return Some(frame);
     }
     None
+}
+
+/// Live generator `PyFrame` this resume walk executes.
+///
+/// Nested under an already-active driver the shadow-stack pin
+/// `resume.frame_root` belongs to `walk_generator_resume` and drops on
+/// `SubWalkSuspended`. `InlineConcreteFrameGuard` is the
+/// `OwnerRootGuard` `push_frame` publishes (`gc_restore_root` after a
+/// collecting call). The shadow-stack slot remains the root-path pin
+/// while that guard is not yet installed.
+fn live_generator_resume_frame(resume: super::GeneratorResumeSubwalk) -> usize {
+    let inline = current_inline_concrete_frame();
+    if inline != 0 {
+        inline
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize
+    }
 }
 
 /// A heap pointer that is the live generator or a pre-move copy of it.
@@ -1054,7 +1071,7 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
     vable: OpRef,
 ) -> Option<usize> {
     if let Some(resume) = ctx.fbw_mode.generator_resume {
-        let live = pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize;
+        let live = live_generator_resume_frame(resume);
         if live != 0 {
             // This walk's virtualizable is the generator frame
             // (`walk_generator_resume` / `_opimpl_setarrayitem_vable`).

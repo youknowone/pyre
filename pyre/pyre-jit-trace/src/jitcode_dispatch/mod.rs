@@ -866,6 +866,10 @@ pub struct WalkSession {
     /// driver is active so `walk_session_roots` forwards its parent
     /// concretes until `push_frame` publishes it (`MetaInterp.newframe`).
     pub(crate) pending_helper_level: Option<HelperLevel>,
+    /// Python-portal level a nested generator resume computed, held while
+    /// the explicit driver is active so `walk_session_roots` forwards it
+    /// until `push_frame` publishes the `MIFrame` (`MetaInterp.newframe`).
+    pub(crate) pending_portal_level: Option<PendingPortalLevel>,
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
@@ -1037,6 +1041,7 @@ impl Default for WalkSession {
             helper_live: Vec::new(),
             framestack: Vec::new(),
             pending_helper_level: None,
+            pending_portal_level: None,
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -9507,6 +9512,21 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         };
         for parent in level.parents.iter_mut().chain(call_entry) {
             walk_inline_parent_frame(parent, visitor);
+        }
+    }
+    if let Some(level) = session.pending_portal_level.as_mut() {
+        for parent in level.parents.iter_mut() {
+            walk_inline_parent_frame(parent, visitor);
+        }
+        if level.w_code != 0 {
+            let mut root = majit_ir::GcRef(level.w_code);
+            visitor(&mut root);
+            level.w_code = root.0;
+        }
+        if level.concrete_frame != 0 {
+            let mut root = majit_ir::GcRef(level.concrete_frame);
+            visitor(&mut root);
+            level.concrete_frame = root.0;
         }
     }
 }

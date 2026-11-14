@@ -3227,6 +3227,23 @@ pub(crate) struct HelperLevel {
     pub(crate) entry_trace_index: u32,
 }
 
+/// Python-portal level a nested generator resume computed, held while the
+/// explicit driver is active so `walk_session_roots` forwards `w_code` /
+/// `concrete_frame` / parents until `push_frame` publishes the same
+/// `MIFrame` (`MetaInterp.newframe` / `perform_call`).
+pub(crate) struct PendingPortalLevel {
+    pub(crate) w_code: usize,
+    pub(crate) is_being_profiled: bool,
+    pub(crate) recursion_greenkey: bool,
+    pub(crate) parents: Vec<InlineParentFrame>,
+    pub(crate) entry_trace_index: u32,
+    /// Generator `PyFrame` this portal executes. Re-read through
+    /// `walk_session_roots` across a collection between stash and
+    /// `push_frame`; `InlineConcreteFrameGuard` then holds the
+    /// `OwnerRootGuard`.
+    pub(crate) concrete_frame: usize,
+}
+
 impl HelperLevel {
     fn section(caller: InlineParentFrame, call_entry: HelperCallEntry) -> Self {
         HelperLevel {

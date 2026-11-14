@@ -8213,6 +8213,13 @@ fn inline_callee_shadow_states<Sym: WalkSym>(
             }
         }
     }
+    if let Some(level) = session.pending_portal_level.as_ref() {
+        for parent in &level.parents {
+            if let Some(state) = parent.frame_state.as_ref() {
+                push_unique_frame_state(&mut out, state);
+            }
+        }
+    }
     for live in &session.helper_live {
         push_unique_frame_state(&mut out, live.frame_state());
     }
