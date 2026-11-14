@@ -9608,9 +9608,8 @@ pub fn cranelift_resumedata_deopt(
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
     // Keep the `NumberingRef`. The payload slice is taken immediately
-    // before the reader is built: a minor in between would leave the
-    // header decoded from from-space while `bind_numbering` reloads
-    // `numb.code` per item (`resumecode.py` `numb_next_item`).
+    // before the reader is built so the header and `Reader.code` name
+    // the same `NUMBERING` (`resumecode.py` `numb_next_item`).
     let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };
@@ -9654,11 +9653,11 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
-    let mut reader = reader.bind_deadframe_root();
-    // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
-    // collection. `prepare_resume_heap_with_roots` materializes virtuals
-    // and can minor-collect. Same bind as `blackhole_from_resumedata`.
+    // `resumecode.py` `Reader.__init__` stores `storage.rd_numb` before
+    // `_prepare`. `bind_deadframe_root` then traces `Reader.code` so
+    // `prepare_resume_heap_with_roots` can collect.
     reader.resumecodereader.bind_numbering(numb);
+    let mut reader = reader.bind_deadframe_root();
 
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame
