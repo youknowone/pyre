@@ -2989,50 +2989,204 @@ fn rsocket_constant(name: &'static str) -> i64 {
         .unwrap_or_else(|| panic!("{name}"))
 }
 
-/// `interp_socket.py` `W_Socket.sendmsg_afalg_w`.
+/// [3.15-spec] `sock_sendmsg_afalg` checks the family before parsing, tells
+/// an omitted `iv`/`assoclen` apart from an explicit `None` (`O!`/`y*`), and
+/// rejects the None.  PyPy `W_Socket.sendmsg_afalg_w` takes
+/// `unwrap_spec(op=int, flags=int, w_iv=WrappedDefault(None),
+/// w_assoclen=WrappedDefault(None))`, so an omitted argument equals `None`.
+/// The `__args__` passthrough follows `functional.py` `min_max`'s way of
+/// reading keywords.
 #[cfg(all(unix, rsocket_have_sockaddr_alg))]
 fn sendmsg_afalg_w(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let msg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let op_obj = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-    let iv = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-    let assoclen_obj = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
-    let flags_obj = args.get(5).copied().unwrap_or(pyre_object::PY_NULL);
-
     let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::pin_roots(&[obj, msg, op_obj, iv, assoclen_obj, flags_obj]);
+    let slot = pyre_object::gc_roots::pin_roots(&[
+        self_,
+        msg,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    ]);
+    sendmsg_afalg_check_family(slot)?;
+    if args.len() > 2 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() takes at most 1 positional argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    sendmsg_afalg_body(slot)
+}
 
-    // `unwrap_spec(op=int, flags=int)`: the gateway converts op, then flags,
-    // before the body runs. Default op `-1` is the missing-op sentinel.
-    let op = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
-        slot + 2,
-    ))?;
-    let flags = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(
-        pyre_object::gc_roots::shadow_stack_get(slot + 5),
-    )?)
-    .map_err(|_| {
-        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
-    })?;
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_args(
+    self_: pyre_object::PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_]);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    let npos = pos.len();
+    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
+    let pos_base = pyre_object::gc_roots::publish_roots(&pos);
+    let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
+    pyre_object::gc_roots::normalize_roots(pos_base, npos + 1);
+    sendmsg_afalg_check_family(self_slot)?;
+    if npos > 1 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() takes at most 1 positional argument ({npos} given)"
+        )));
+    }
+    let kwargs = sendmsg_afalg_kwargs(kwargs_slot);
+    pyre_interpreter::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["msg", "op", "iv", "assoclen", "flags"],
+        "sendmsg_afalg",
+    )?;
+    let kwargs = sendmsg_afalg_kwargs(kwargs_slot);
+    let msg_kw = pyre_interpreter::builtins::kwarg_get(kwargs, "msg");
+    if npos >= 1 && msg_kw.is_some() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "argument for sendmsg_afalg() given by name ('msg') and position (1)",
+        ));
+    }
+    let msg = if npos >= 1 {
+        pyre_object::gc_roots::shadow_stack_get(pos_base)
+    } else {
+        msg_kw.unwrap_or(pyre_object::PY_NULL)
+    };
+    let op = pyre_interpreter::builtins::kwarg_get(kwargs, "op").unwrap_or(pyre_object::PY_NULL);
+    let iv = pyre_interpreter::builtins::kwarg_get(kwargs, "iv").unwrap_or(pyre_object::PY_NULL);
+    let assoclen =
+        pyre_interpreter::builtins::kwarg_get(kwargs, "assoclen").unwrap_or(pyre_object::PY_NULL);
+    let flags =
+        pyre_interpreter::builtins::kwarg_get(kwargs, "flags").unwrap_or(pyre_object::PY_NULL);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let slot = pyre_object::gc_roots::pin_roots(&[self_, msg, op, iv, assoclen, flags]);
+    sendmsg_afalg_body(slot)
+}
 
-    let family = socket_get_attr_i64(pyre_object::gc_roots::shadow_stack_get(slot), "_family");
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_kwargs(kwargs_slot: usize) -> Option<pyre_object::PyObjectRef> {
+    let dict = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
+    if dict.is_null() {
+        None
+    } else {
+        Some(dict)
+    }
+}
+
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_check_family(obj_slot: usize) -> Result<(), pyre_interpreter::PyError> {
+    let family = socket_get_attr_i64(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "_family",
+    );
     if family != majit_rlib::rsocket::af_alg() {
         return Err(pyre_interpreter::PyError::os_error(
             "algset is only supported for AF_ALG",
         ));
     }
+    Ok(())
+}
+
+/// `converterr`: None prints as `"None"`, otherwise the type's name.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_arg_type(obj: pyre_object::PyObjectRef) -> String {
+    if unsafe { pyre_object::is_none(obj) } {
+        "None".to_string()
+    } else {
+        pyre_interpreter::type_methods::arg_type_name(obj)
+    }
+}
+
+/// Conversions and send after the family check. Six consecutive shadow-stack
+/// slots, pinned by the caller: `slot` is self, then msg, op, iv, assoclen,
+/// flags; `PY_NULL` means omitted.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_body(
+    slot: usize,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let op_obj = pyre_object::gc_roots::shadow_stack_get(slot + 2);
+    if !op_obj.is_null() && !unsafe { pyre_interpreter::baseobjspace::isinstance_int_w(op_obj) } {
+        let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 2));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() argument 'op' must be int, not {t}"
+        )));
+    }
+
+    let mut iv_bytes: Option<Vec<u8>> = None;
+    if !pyre_object::gc_roots::shadow_stack_get(slot + 3).is_null() {
+        match pyre_interpreter::baseobjspace::simple_buffer_bytes(
+            pyre_object::gc_roots::shadow_stack_get(slot + 3),
+        )? {
+            Some(buffer) => {
+                let bytes = buffer.as_bytes().to_vec();
+                buffer.release();
+                iv_bytes = Some(bytes);
+            }
+            None => {
+                let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 3));
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "sendmsg_afalg() argument 'iv' must be bytes-like object, not {t}"
+                )));
+            }
+        }
+    }
+
+    let assoclen_obj = pyre_object::gc_roots::shadow_stack_get(slot + 4);
+    if !assoclen_obj.is_null()
+        && !unsafe { pyre_interpreter::baseobjspace::isinstance_int_w(assoclen_obj) }
+    {
+        let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 4));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() argument 'assoclen' must be int, not {t}"
+        )));
+    }
+
+    let flags = if pyre_object::gc_roots::shadow_stack_get(slot + 5).is_null() {
+        0
+    } else {
+        let value = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 5,
+        ))?;
+        libc::c_int::try_from(value).map_err(|_| {
+            pyre_interpreter::PyError::overflow_error(if value > i64::from(libc::c_int::MAX) {
+                "signed integer is greater than maximum"
+            } else {
+                "signed integer is less than minimum"
+            })
+        })?
+    };
+
+    let op = if pyre_object::gc_roots::shadow_stack_get(slot + 2).is_null() {
+        -1
+    } else {
+        pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(slot + 2))
+            .ok()
+            .and_then(|v| libc::c_int::try_from(v).ok())
+            .map_or(-1, i64::from)
+    };
     if op < 0 {
         return Err(pyre_interpreter::PyError::type_error(
             "Invalid or missing argument 'op'",
         ));
     }
+
     let mut assoclen: i64 = -1;
-    let assoclen_obj = pyre_object::gc_roots::shadow_stack_get(slot + 4);
-    if !assoclen_obj.is_null() && !unsafe { pyre_object::is_none(assoclen_obj) } {
+    if !pyre_object::gc_roots::shadow_stack_get(slot + 4).is_null() {
         assoclen = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
             slot + 4,
-        ))?;
+        ))
+        .ok()
+        .and_then(|v| libc::c_int::try_from(v).ok())
+        .map(i64::from)
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+        })?;
         if assoclen < 0 {
             return Err(pyre_interpreter::PyError::type_error(
                 "assoclen must be positive",
@@ -3044,7 +3198,7 @@ fn sendmsg_afalg_w(
 
     let mut data_buffers: Vec<Vec<u8>> = Vec::new();
     let msg = pyre_object::gc_roots::shadow_stack_get(slot + 1);
-    if !msg.is_null() && !unsafe { pyre_object::is_none(msg) } {
+    if !msg.is_null() {
         let data_items = pyre_interpreter::baseobjspace::unpackiterable(msg, -1)?;
         let items_base = pyre_object::gc_roots::pin_roots(&data_items);
         for i in 0..data_items.len() {
@@ -3066,15 +3220,7 @@ fn sendmsg_afalg_w(
         rsocket_constant("ALG_SET_OP") as libc::c_int,
         pack_uint32(op).to_vec(),
     ));
-    let iv = pyre_object::gc_roots::shadow_stack_get(slot + 3);
-    if !iv.is_null() && !unsafe { pyre_object::is_none(iv) } {
-        let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(iv)? else {
-            return Err(pyre_interpreter::PyError::type_error(
-                "a bytes-like object is required",
-            ));
-        };
-        let iv_bytes = buffer.as_bytes().to_vec();
-        buffer.release();
+    if let Some(iv_bytes) = iv_bytes {
         let mut payload = pack_uint32(iv_bytes.len() as i64).to_vec();
         payload.extend_from_slice(&iv_bytes);
         cmsgs.push((
@@ -7061,46 +7207,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `HAS_AF_ALG`.
     #[cfg(rsocket_have_sockaddr_alg)]
     {
-        let mut builder = pyre_interpreter::gateway::SignatureBuilder::default();
-        builder.append("self");
-        builder.marker_posonly();
-        builder.append("msg");
-        builder.marker_kwonly();
-        builder.append("op");
-        builder.append("iv");
-        builder.append("assoclen");
-        builder.append("flags");
-        let function = pyre_interpreter::gateway::make_builtin_function_with_text_signature_and_sig(
-            "sendmsg_afalg",
-            sendmsg_afalg_w,
-            "($self, msg=None, *, op=-1, iv=None, assoclen=None, flags=0)",
-            Some(builder.signature()),
-        );
+        const DOC: &str = "sendmsg_afalg([msg], *, op[, iv[, assoclen[, flags=MSG_MORE]]])\n\nSet operation mode, IV and length of associated data for an AF_ALG\noperation socket.";
         let roots = pyre_object::gc_roots::push_roots();
         let fn_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_interpreter::gateway::function_set_positional_defaults(
-            function,
-            &[pyre_object::w_none()],
-        ));
-        pyre_interpreter::gateway::function_set_kwonly_default_pair(
-            fn_slot,
-            "op",
-            pyre_object::w_int_new(-1),
-        );
-        pyre_interpreter::gateway::function_set_kwonly_default_pair(
-            fn_slot,
-            "iv",
-            pyre_object::w_none(),
-        );
-        pyre_interpreter::gateway::function_set_kwonly_default_pair(
-            fn_slot,
-            "assoclen",
-            pyre_object::w_none(),
-        );
-        pyre_interpreter::gateway::function_set_kwonly_default_pair(
-            fn_slot,
-            "flags",
-            pyre_object::w_int_new(0),
+        let _ = roots.pin_root(
+            pyre_interpreter::gateway::make_method_descriptor_passthrough1_with_doc(
+                "sendmsg_afalg",
+                sendmsg_afalg_w,
+                sendmsg_afalg_args,
+                DOC,
+            ),
         );
         pyre_interpreter::__pyre_put_new!(ns_slot, "sendmsg_afalg", roots.get(fn_slot));
     }
