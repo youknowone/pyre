@@ -18155,9 +18155,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
         .max(ec_reg as usize + 1)
         .max(recipe.registers_r_color.len());
     let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
-    // `consume_boxes` refills every live register; the color bank carries
-    // the live temporaries that have no slot. Reds and slots are written
-    // after it, so they keep their current precedence.
+    // `consume_boxes` (`resume.py rebuild_from_resumedata`) refills every
+    // live register from the numbering stream. The color bank is that
+    // stream; a slot image does not replace a box the numbering stream put
+    // in that color. It still replaces a frame/ec red seed whose color the
+    // register allocator reused for this stack slot. The vable array is
+    // not the source of a live numbered register.
     for (color, &b) in recipe.registers_r_color.iter().enumerate() {
         if !b.is_none() {
             argboxes_r[color] = b;
@@ -18175,8 +18178,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // value at the color the dispatcher will touch. Placing it at the raw slot
     // index (the old identity assumption) lands it under the wrong register and
     // leaves the true color still holding the portal-red seed (frame/ec) whose
-    // color the register allocator reused for this stack slot. Runs AFTER the
-    // frame/ec seeding so a reused color resolves to the live stack value.
+    // color the register allocator reused for this stack slot. A slot image
+    // does not replace a box the numbering stream put in that color; it still
+    // replaces a frame/ec red seed whose color the register allocator reused
+    // for this stack slot.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     //
@@ -18218,7 +18223,16 @@ pub(crate) fn setup_reconstructed_callee_frame(
         if color >= argboxes_r.len() {
             argboxes_r.resize(color + 1, OpRef::NONE);
         }
-        argboxes_r[color] = opref;
+        // `consume_boxes`: a live numbered box already occupies this color.
+        let numbered = color != frame_reg as usize
+            && color != ec_reg as usize
+            && recipe
+                .registers_r_color
+                .get(color)
+                .is_some_and(|b| !b.is_none());
+        if !numbered {
+            argboxes_r[color] = opref;
+        }
         // `box.value` parity at the frame boundary (mirror `ref_return/r`):
         // thread the reconstructed slot's concrete onto the OpRef-keyed shadow
         // so the re-executed callee's speculation gates
