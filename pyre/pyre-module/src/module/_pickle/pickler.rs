@@ -1844,6 +1844,7 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
             let bytes_type_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_bytes);
             let w_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
+            let w_bytes = pyre_object::gc_roots::shadow_stack_get(bytes_type_slot);
             return save_reduce(
                 ctx,
                 buf,
@@ -2334,6 +2335,7 @@ fn save_bytearray(
                 bytes_slot,
             )])
         };
+        let w_bytearray_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         return save_reduce(
             ctx,
             buf,

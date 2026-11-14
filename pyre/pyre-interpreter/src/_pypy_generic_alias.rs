@@ -991,6 +991,7 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(pair),
         pyre_object::gc_roots::shadow_stack_get(pair + 1),
     ]);
+    let ga_type = pyre_object::gc_roots::shadow_stack_get(ga_type_slot);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args);
     Ok(w_tuple_new(vec![

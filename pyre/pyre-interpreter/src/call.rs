@@ -3840,6 +3840,7 @@ fn call_passthrough_maybe_profile(
         let arguments = make_args();
         return body(&arguments);
     }
+    let _roots = pyre_object::gc_roots::push_roots();
     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
     let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
     let arguments = make_args();
@@ -3866,7 +3867,6 @@ fn call_passthrough_maybe_profile(
             Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
         }
         Err(err) => {
-            let _roots = pyre_object::gc_roots::push_roots();
             let mut err = err;
             let err_slot = err.pin(&_roots);
             if !ec.is_null() {
@@ -5965,17 +5965,14 @@ fn call_metaclass_with_kwargs(
     // nursery-born, and a heap type is born nursery
     // (`try_gc_alloc_collecting_rooted` / `malloc_fixedsize`); `pin_root`'s return is the pre-collect
     // word, so every consumer after a collecting call reloads from its slot.
+    // All five are published in one run, so no pin's normalization can move
+    // one that is not yet published.
     let _roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_namespace_dict);
-    let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(kwargs);
-    let meta_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_metaclass);
-    let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(name);
-    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(bases);
+    let ns_slot = _roots.pin_roots(&[w_namespace_dict, kwargs, w_metaclass, name, bases]);
+    let kwargs_slot = ns_slot + 1;
+    let meta_slot = ns_slot + 2;
+    let name_slot = ns_slot + 3;
+    let bases_slot = ns_slot + 4;
     let w_namespace_dict = || pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let kwargs = || pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
     let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
@@ -6007,16 +6004,25 @@ fn call_metaclass_with_kwargs(
         }
         return crate::call_function(w_metaclass(), &[name(), bases(), w_namespace_dict()]);
     }
-    let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) } {
-        unsafe {
-            pyre_object::w_dict_items(kwargs())
-                .into_iter()
-                .filter(|(k, _)| pyre_object::is_str(*k))
-                .collect()
-        }
-    } else {
-        Vec::new()
+    let kw_base = pyre_object::gc_roots::shadow_stack_len();
+    let n_kw = {
+        let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) }
+        {
+            unsafe {
+                pyre_object::w_dict_items(kwargs())
+                    .into_iter()
+                    .filter(|(k, _)| pyre_object::is_str(*k))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let flat: Vec<PyObjectRef> = kw_items.iter().flat_map(|&(k, v)| [k, v]).collect();
+        let _ = _roots.pin_roots(&flat);
+        kw_items.len()
     };
+    let kw_key = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i);
+    let kw_value = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i + 1);
     // Find the metaclass __new__ method
     let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass(), "__new__") };
 
@@ -6033,21 +6039,20 @@ fn call_metaclass_with_kwargs(
             // kwargs as keywords; resolve_kwargs matches them against the
             // __new__ signature, filling keyword-only params and packing
             // the remainder into a `**kwds` parameter when present.
-            let mut call_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            let mut names = Vec::new();
-            for (k, v) in &kw_items {
-                call_args.push(*v);
-                names.push(*k);
-            }
-            // `resolve_kwargs` reaches `store_collected_keyword`. The slot
-            // is the live word; this pin's argument is not read again.
+            // `resolve_kwargs` reaches `store_collected_keyword`. The slots
+            // are the live words; these pins' arguments are not read again.
             let new_fn_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(new_fn);
-            let kwarg_names = pyre_object::w_tuple_new(names);
+            let names_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
+                (0..n_kw).map(kw_key).collect(),
+            ));
+            let mut call_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
+            call_args.extend((0..n_kw).map(kw_value));
             match resolve_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
                 &call_args,
-                kwarg_names,
+                pyre_object::gc_roots::shadow_stack_get(names_slot),
                 false,
             ) {
                 Ok(resolved) => call_user_function_resolved_frameless(
@@ -6063,14 +6068,14 @@ fn call_metaclass_with_kwargs(
             // Builtin type.__new__: the same Arguments shape as
             // `space.call_obj_args(w_newfunc, self, __args__)`.
             let mut new_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            let result = if kw_items.is_empty() {
+            let result = if n_kw == 0 {
                 call_function_impl_result(new_fn, &new_args)
             } else {
-                let mut names = Vec::with_capacity(kw_items.len());
-                let mut values = Vec::with_capacity(kw_items.len());
-                for &(k, v) in &kw_items {
-                    names.push(k);
-                    values.push(v);
+                let mut names = Vec::with_capacity(n_kw);
+                let mut values = Vec::with_capacity(n_kw);
+                for i in 0..n_kw {
+                    names.push(kw_key(i));
+                    values.push(kw_value(i));
                 }
                 call_with_kwargs_in_ctx_impl(
                     take_last_exec_ctx(),
@@ -6114,28 +6119,27 @@ fn call_metaclass_with_kwargs(
             && unsafe {
                 !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
             };
-        if is_user_fn && !kw_items.is_empty() {
+        if is_user_fn && n_kw != 0 {
             // The metaclass `__new__` ran between the pin and here.
+            // Same slot discipline as `__new__`: `init_fn` is not read again
+            // after the pin.
+            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(init_fn);
+            let names_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
+                (0..n_kw).map(kw_key).collect(),
+            ));
             let mut call_args = vec![
                 pyre_object::gc_roots::shadow_stack_get(instance_slot),
                 name(),
                 bases(),
                 pyre_object::gc_roots::shadow_stack_get(ns_slot),
             ];
-            let mut names = Vec::with_capacity(kw_items.len());
-            for (k, v) in &kw_items {
-                call_args.push(*v);
-                names.push(*k);
-            }
-            // Same slot discipline as `__new__`: `init_fn` is not read again
-            // after the pin.
-            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(init_fn);
-            let kwarg_names = pyre_object::w_tuple_new(names);
+            call_args.extend((0..n_kw).map(kw_value));
             match resolve_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
                 &call_args,
-                kwarg_names,
+                pyre_object::gc_roots::shadow_stack_get(names_slot),
                 false,
             ) {
                 Ok(resolved) => {
