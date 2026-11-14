@@ -20655,7 +20655,6 @@ mod tests {
         let _ = crate::flatten::flatten_graph(&graph, &mut regallocs);
     }
 
-
     /// An explicit-shell payload seat whose intern row is FLAG_STRUCT 16
     /// while `fielddescrof` / `bh_field_lookup` mint a POINTER word. The
     /// by-value FieldRead is getfield (kind r), not
