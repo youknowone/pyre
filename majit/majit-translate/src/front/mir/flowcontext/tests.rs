@@ -8382,18 +8382,13 @@ fn closure_capturing_fieldless_enum_annotates() {
         .expect("Discriminant of a borrowed fieldless-enum tag annotates");
 }
 
-/// A rustc closure env that captures `&TransparentWrapper` of a scalar
-/// (`eval::FrameAnchor` / `_trace` closure `__pos_5`) must annotate: the
-/// stored word is Integer and the env field must be that same Integer
-/// (`rclass.py` field reprs; `annotator/model.py` `unionof`).
-#[test]
-fn closure_capturing_borrowed_transparent_scalar_annotates() {
-    use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::{SomeInteger, SomeValue};
-    use crate::translator::rtyper::call_registry::CallRegistry;
-    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
-    use std::rc::Rc;
-
+/// rustc closure env that captures `&TransparentWrapper` of a scalar.
+/// `wrapper` is the last Ident of `eval::<wrapper>` (`DepthWord` for
+/// the generic inner-word rule, `FrameAnchor` for the frame GCREF).
+/// `fun` names the capturing function; its `<fun>::closure` key goes
+/// into the process-global struct-field registry, so each test passes
+/// its own.
+fn llbc_closure_capturing_borrowed_wrapper(wrapper: &str, fun: &str) -> (Llbc, TyRef) {
     let span = serde_json::json!({"data": {
         "file_id": 0,
         "beg": {"line": 1, "col": 0},
@@ -8409,6 +8404,8 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
     let closure_adt = serde_json::json!({"Adt": {"id": 3, "generics": generics}});
     let place =
         |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let source_text =
+        format!("pub struct {wrapper} {{ depth: usize, _not_send: PhantomData<*const ()> }}");
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -8437,9 +8434,9 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
                 {
                     "def_id": 2,
                     "item_meta": {
-                        "name": [{"Ident": ["eval", 0]}, {"Ident": ["FrameAnchor", 0]}],
+                        "name": [{"Ident": ["eval", 0]}, {"Ident": [wrapper, 0]}],
                         "span": span,
-                        "source_text": "pub struct FrameAnchor { depth: usize, _not_send: PhantomData<*const ()> }",
+                        "source_text": source_text,
                         "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                         "is_local": true
                     },
@@ -8469,7 +8466,7 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
                     "item_meta": {
                         "name": [
                             {"Ident": ["fixture", 0]},
-                            {"Ident": ["capture_anchor", 0]},
+                            {"Ident": [fun, 0]},
                             {"Ident": ["closure", 0]}
                         ],
                         "span": span, "source_text": null,
@@ -8495,7 +8492,7 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
             "fun_decls": [{
                 "def_id": 0,
                 "item_meta": {
-                    "name": [{"Ident": ["fixture", 0]}, {"Ident": ["capture_anchor", 0]}],
+                    "name": [{"Ident": ["fixture", 0]}, {"Ident": [fun, 0]}],
                     "span": span, "source_text": null,
                     "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                     "is_local": true
@@ -8534,8 +8531,25 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let borrowed_ty = serde_json::from_value::<super::TyRef>(borrowed_anchor.clone())
-        .expect("borrowed wrapper TyRef parses");
+    let borrowed_ty =
+        serde_json::from_value::<TyRef>(borrowed_anchor).expect("borrowed wrapper TyRef parses");
+    (llbc, borrowed_ty)
+}
+
+/// A rustc closure env that captures `&TransparentWrapper` of a scalar
+/// (`eval::DepthWord`) must annotate: the stored word is Integer and the
+/// env field must be that same Integer (`rclass.py` field reprs;
+/// `annotator/model.py` `unionof`).
+#[test]
+fn closure_capturing_borrowed_transparent_scalar_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeInteger, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+    use std::rc::Rc;
+
+    let (llbc, borrowed_ty) =
+        llbc_closure_capturing_borrowed_wrapper("DepthWord", "capture_anchor");
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let env = llbc.type_by_id(3).expect("closure env");
 
@@ -8630,6 +8644,125 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
     ann.addpendingblock(&lifted.graph, &start, &cells);
     ann.complete_pending_blocks()
         .expect("a closure capturing a borrowed transparent scalar annotates");
+}
+
+/// A rustc closure env that captures `&FrameAnchor` (`_trace` /
+/// `wrap_trace_frame(frame_anchor.live())`) must annotate: the stored
+/// word is the frame GCREF and the env field is that same GCREF
+/// (`rclass.py` `InstanceRepr._setup_repr`; `llmemory.py` `GCREF`;
+/// `annotator/model.py` `unionof`).
+#[test]
+fn closure_capturing_borrowed_frame_anchor_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::bookkeeper::gcref_ptr_annotation;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+    use std::rc::Rc;
+
+    let (llbc, borrowed_ty) =
+        llbc_closure_capturing_borrowed_wrapper("FrameAnchor", "capture_frame_anchor");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let env = llbc.type_by_id(3).expect("closure env");
+    // `tyref_is_frame_anchor` / `frame_class_root`: fixture has no PyFrame
+    // decl, so FORCE is `Ref(None)` and the layout row is `GCREF`.
+    let gcref = tyref_to_attr_value_type(&borrowed_ty, &llbc);
+    assert!(
+        matches!(gcref, ValueType::Ref(_)),
+        "FORCE must seed the frame GCREF for a captured &FrameAnchor, got {gcref:?}"
+    );
+    assert_ne!(
+        gcref,
+        ValueType::Unsigned,
+        "FrameAnchor capture FORCE is the frame Ref, got {gcref:?}"
+    );
+
+    assert_eq!(
+        super::tyref_to_field_layout_string(
+            &borrowed_ty,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        "GCREF",
+        "a borrow of FrameAnchor is the frame GCREF layout row"
+    );
+    assert_eq!(
+        tyref_to_attr_value_type_for_struct_field(
+            &borrowed_ty,
+            env,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        gcref,
+        "closure-env FORCE rows match the GCREF capture"
+    );
+
+    let graph = crate::test_support::lower_function(&llbc, "capture_frame_anchor")
+        .expect("lower capture_frame_anchor");
+    let cast_roots: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        !cast_roots.iter().any(|root| root.contains("FrameAnchor")),
+        "FrameAnchor capture must not CAST onto a FrameAnchor ClassDef; roots={cast_roots:?}"
+    );
+
+    let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
+        &llbc,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    let closure_key = "fixture::capture_frame_anchor::closure";
+    let attr_rows = attrs
+        .get("capture_frame_anchor::closure")
+        .or_else(|| attrs.get(closure_key))
+        .expect("closure FORCE rows");
+    let layout_rows = fields
+        .fields
+        .get(closure_key)
+        .or_else(|| fields.fields.get("capture_frame_anchor::closure"))
+        .cloned()
+        .expect("closure layout rows");
+    let layout_pairs: Vec<(String, String)> = layout_rows
+        .iter()
+        .map(|row| (row.name.clone(), row.ty.clone()))
+        .collect();
+    assert_eq!(
+        layout_pairs[0].1, "GCREF",
+        "published closure-env capture layout is the frame GCREF; got {layout_pairs:?}"
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout(
+        closure_key,
+        attr_rows,
+        Some(layout_pairs.as_slice()),
+    );
+    crate::annotator::classdesc::register_struct_fields_with_layout(
+        "capture_frame_anchor::closure",
+        attr_rows,
+        Some(layout_pairs.as_slice()),
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let bk = &ann.bookkeeper;
+    bk.set_struct_fields(Rc::new(fields));
+    let registry = CallRegistry::new(bk.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift capture_frame_anchor");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs)
+        .map(|_| Some(gcref_ptr_annotation()))
+        .collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("a closure capturing a borrowed FrameAnchor annotates");
 }
 
 /// Each receiver that reaches a `Vec` — an inline field, a `&mut Vec`
