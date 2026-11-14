@@ -242,11 +242,6 @@ pub fn set_update_error_from_status(status: i64) -> Option<SetUpdateError> {
 }
 
 #[majit_macros::dont_look_inside]
-fn clear_parked_set_update() {
-    PARKED_SET_UPDATE.with(|cell| cell.set(0));
-}
-
-#[majit_macros::dont_look_inside]
 fn park_set_update_error(err: SetUpdateError) {
     let status = set_update_status(err) as i8;
     PARKED_SET_UPDATE.with(|cell| cell.set(status));
@@ -257,10 +252,12 @@ fn take_set_update_status() -> i64 {
     PARKED_SET_UPDATE.with(|cell| cell.replace(0) as i64)
 }
 
+/// Park only on `Err`, like `dict_eq_hook::signal_hash_error`. Success
+/// leaves the cell at 0 so the hot `IntegerSetStrategy.add` path does
+/// not residualize a TLS write (`SetStrategy.add` returns None).
 fn finish_set_add(result: Result<(), SetUpdateError>) {
-    match result {
-        Ok(()) => clear_parked_set_update(),
-        Err(err) => park_set_update_error(err),
+    if let Err(err) = result {
+        park_set_update_error(err);
     }
 }
 
@@ -3013,7 +3010,6 @@ pub unsafe fn w_set_add_checked(obj: PyObjectRef, item: PyObjectRef) -> i64 {
     let _ = roots.pin_root(item);
     let _set_guard = w_set_lock(roots.get(base));
     let obj = roots.get(base);
-    clear_parked_set_update();
     (*(obj as *const W_SetObject))
         .strategy
         .add(obj, roots.get(base + 1));
