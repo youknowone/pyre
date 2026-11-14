@@ -8890,13 +8890,18 @@ pub(crate) struct GuardCaptureScope {
     /// matching the operator-tail path.
     pub constructor_assembler: Option<(OpRef, OpRef, Option<InlineParentFrame>)>,
 
-    /// Generator-resume `CALL_ASSEMBLER`: the iterator and the portal result.
+    /// Generator-resume `CALL_ASSEMBLER`: the iterator, the portal result, and
+    /// the FOR_ITER caller taken before `finishframe` popped the portal.
     /// Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture `_send_ex`'s
-    /// tail (`send_ex_continuation` assembler resume) above the FOR_ITER
-    /// caller, so a force still runs `bh_send_ex_tail`'s
-    /// `frame_finished_execution` check (`generator.py` `_send_ex` after
-    /// `_invoke_execute_frame`). The pending slot is the portal return.
-    pub send_ex_assembler: Option<(OpRef, OpRef)>,
+    /// tail (`send_ex_continuation` assembler resume) above that caller, so a
+    /// force still runs `bh_send_ex_tail`'s `frame_finished_execution` check
+    /// (`generator.py` `_send_ex` after `_invoke_execute_frame`). The pending
+    /// slot is the portal return. The caller is the same rooted
+    /// `InlineParentFrame` the constructor path passes
+    /// (`constructor_assembler`): `opimpl_jit_merge_point` `finishframe` pops
+    /// the recursive portal, then `do_recursive_call` records from
+    /// `framestack[-1]`.
+    pub send_ex_assembler: Option<(OpRef, OpRef, Option<InlineParentFrame>)>,
 
     /// Operator-tail residual after the inlined dunder has returned: snapshot
     /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` at the tail's after-call

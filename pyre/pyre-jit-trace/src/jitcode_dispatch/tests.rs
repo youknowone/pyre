@@ -3102,6 +3102,7 @@ fn portal_may_force_records_the_callee_execution_context() {
         None,
         None,
         None,
+        None,
     )
     .expect("portal may-force residual")
     .expect("portal runner is wired");
@@ -3276,6 +3277,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         None,
         None,
         None,
+        None,
     );
     assert!(
         wc.trace_ctx
@@ -3426,6 +3428,7 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         false,
         None,
         Some(generator),
+        None,
         None,
     )
     .expect("portal assembler residual")
@@ -4503,6 +4506,7 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
         Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
         None,
         None,
+        None,
     );
     assert_ne!(
         recorded.as_ref().err(),
@@ -4701,6 +4705,7 @@ fn loop_callee_portal_none_init_records_the_none_check() {
         Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
         None,
         None,
+        None,
     );
     assert_ne!(
         recorded.as_ref().err(),
@@ -4890,6 +4895,7 @@ fn constructor_call_assembler_guard_snapshot_keeps_the_immediate_caller() {
         Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
         None,
         Some(caller),
+        None,
     );
     assert_ne!(
         recorded.as_ref().err(),

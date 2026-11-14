@@ -1324,6 +1324,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     ) {
         Ok(Some(recorded)) => {
             // `opimpl_jit_merge_point`: `finishframe(None, leave_portal_frame=False)`

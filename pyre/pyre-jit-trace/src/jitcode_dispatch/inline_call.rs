@@ -4876,6 +4876,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     send_ex_generator: Option<OpRef>,
     constructor_assembler_caller: Option<InlineParentFrame>,
+    send_ex_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
     let Some(recorded) = record_walker_loop_callee_portal_call(
@@ -4893,6 +4894,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         constructor_result,
         send_ex_generator,
         constructor_assembler_caller,
+        send_ex_assembler_caller,
     )?
     else {
         // Recorder preflight missed after the prologue ran. The sub-walk
@@ -4973,6 +4975,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     send_ex_generator: Option<OpRef>,
     constructor_assembler_caller: Option<InlineParentFrame>,
+    send_ex_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // Nursery-born `W_Code` must sit on the extra-area before
@@ -5412,7 +5415,8 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         constructor_assembler: constructor_result
             .as_ref()
             .map(|(instance, _)| (*instance, ca_result, constructor_assembler_caller)),
-        send_ex_assembler: send_ex_generator.map(|generator| (generator, ca_result)),
+        send_ex_assembler: send_ex_generator
+            .map(|generator| (generator, ca_result, send_ex_assembler_caller)),
         ..Default::default()
     };
 
@@ -13626,6 +13630,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 constructor_result,
                 None,
                 constructor_assembler_caller,
+                None,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             emitted
@@ -18874,26 +18879,19 @@ pub(crate) fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
         Some(pending) => *pending = item,
         None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    let mut parent_frames = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect::<Vec<_>>()
-    };
-    parent_frames.push(caller_parent);
-    parent_frames.push(send_ex_tail);
-
+    // `finishframe` already popped the generator portal (`pyjitpl.py`
+    // `opimpl_jit_merge_point` / `ref_return`). Number `_send_ex` above the
+    // FOR_ITER caller the same way assembler `GUARD_NOT_FORCED` does
+    // (`walker_capture_send_ex_assembler_guard`). Flattening the portal's
+    // own `.parents` then appending that caller again duplicated the chain
+    // and made `last_inline` treat the generator as the FOR_ITER caller.
     let saved_helper = ctx.fbw_mode.transparent_helper_subwalk;
     ctx.fbw_mode.transparent_helper_subwalk = true;
-    let captured = walker_capture_multi_frame_inline_snapshot(
+    let captured = super::resume_snapshot::walker_capture_assembler_continuation_guard(
         ctx,
         op_pc,
-        false,
-        parent_frames,
-        GuardCaptureScope::default(),
-        GuardStampTarget::LastOp,
+        send_ex_tail,
+        Some(caller_parent),
     );
     ctx.fbw_mode.transparent_helper_subwalk = saved_helper;
     captured?;
@@ -19469,11 +19467,12 @@ fn walk_generator_resume<Sym: WalkSym>(
     // this generator frame, re-read from its pin.
     let gen_frame = live_generator_frame(frame_root);
     let is_being_profiled = crate::driver::frame_is_being_profiled(gen_frame as usize);
-    // Held through a SubReturn dest bind; dropped before CALL_ASSEMBLER
-    // (`finishframe` already ended the inlined portal). Nested under an
-    // already-active driver this is `None`: `enter_portal_level` stashes
-    // the same level so `push_frame` publishes it (`MetaInterp.newframe`).
-    let mut portal_guards = enter_portal_level(
+    // Nested under an already-active driver this is `None`:
+    // `enter_portal_level` stashes the same level so `push_frame` publishes
+    // it (`MetaInterp.newframe`). The root resume drops it after the body
+    // walk: `finishframe` pops the portal before the caller records
+    // CALL_ASSEMBLER or binds the yield (`make_result_of_lastop`).
+    let portal_guards = enter_portal_level(
         ctx,
         pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
         is_being_profiled,
@@ -19629,12 +19628,6 @@ fn walk_generator_resume<Sym: WalkSym>(
         // of driving — the same ChangeFrame, not a FOR_ITER decline.
         Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         Err(error) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[gen-resume] walk err pc={} resume_marker={} err={error:?}",
-                    op.pc, resume_marker,
-                );
-            }
             // Same split as `residualize_generator_resume_foriter` and as
             // `TraceTooLong` above: an effectful abort is
             // `run_blackhole_interp_to_cancel_tracing`, which drives the
@@ -19649,27 +19642,13 @@ fn walk_generator_resume<Sym: WalkSym>(
             return Ok(None);
         }
     };
-    if gen_census_enabled() {
-        match &walk_result {
-            DispatchOutcome::SubReturn { .. } => {
-                eprintln!("[gen-resume] walk outcome SubReturn");
-            }
-            DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. } => {
-                eprintln!("[gen-resume] walk outcome CA target_pc={target_pc}");
-            }
-            other => {
-                eprintln!("[gen-resume] walk outcome {other:?}");
-            }
-        }
-    }
-    if matches!(
-        walk_result,
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. }
-    ) {
-        if let Some(guards) = portal_guards.as_mut() {
-            guards.drop_concrete();
-        }
-    }
+    // `finishframe(None, leave_portal_frame=False)` (`pyjitpl.py`
+    // `opimpl_jit_merge_point` / `ref_return`): pop the inlined portal
+    // before the caller records CALL_ASSEMBLER or binds the yield.
+    // `InlineFrameGuard::enter` leaves `is_portal` false, so
+    // `last_inline` would otherwise treat this generator as the FOR_ITER
+    // caller (`compute_inline_caller_frame`).
+    drop(portal_guards);
     let (item, residualize_if_unstamped) = match walk_result {
         DispatchOutcome::SubReturn { result: Some(item) } => (item, true),
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
@@ -19725,12 +19704,15 @@ fn walk_generator_resume<Sym: WalkSym>(
                 None,
                 Some(iter_op),
                 None,
+                Some(caller_parent.clone()),
             );
             record_deferred_portal_leave(deferred_portal_leave);
             match emitted? {
                 Some((DispatchOutcome::Continue, _)) => {}
                 Some(other) => return Ok(Some(other)),
-                None => return Err(DispatchError::callee_inline_unsupported(op.pc)),
+                None => {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                }
             }
             let Some(item) = ctx.registers_r.get(dst) else {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -22936,13 +22918,7 @@ pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
 /// stack when this resume is the driver's root.
 struct PortalLevelGuards<'sess> {
     _inline_frame: InlineFrameGuard<'sess>,
-    inline_concrete: Option<InlineConcreteFrameGuard>,
-}
-
-impl PortalLevelGuards<'_> {
-    fn drop_concrete(&mut self) {
-        self.inline_concrete.take();
-    }
+    _inline_concrete: Option<InlineConcreteFrameGuard>,
 }
 
 fn clear_pending_inline_levels(session: &std::cell::RefCell<WalkSession>) {
@@ -22995,7 +22971,7 @@ fn enter_portal_level<'sess, Sym: WalkSym>(
                 parents,
                 entry_trace_index,
             ),
-            inline_concrete: Some(InlineConcreteFrameGuard::enter(concrete_frame)),
+            _inline_concrete: Some(InlineConcreteFrameGuard::enter(concrete_frame)),
         })
     }
 }

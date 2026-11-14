@@ -613,8 +613,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             caller,
         );
     }
-    if let Some((generator, pending)) = scope.send_ex_assembler {
-        return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
+    if let Some((generator, pending, caller)) = scope.send_ex_assembler {
+        return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending, caller);
     }
     if let Some((tail, caller)) = scope.operator_tail_after_call {
         return walker_capture_operator_tail_after_call_guard(ctx, op_pc, tail, caller);
@@ -3745,6 +3745,7 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
     op_pc: usize,
     generator: OpRef,
     pending: OpRef,
+    caller: Option<InlineParentFrame>,
 ) -> Result<(), DispatchError> {
     let Some(mut tail) = super::send_ex_continuation_parent_frame(generator) else {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
@@ -3753,14 +3754,14 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
         Some(slot) => *slot = pending,
         None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, None)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, caller)
 }
 
 /// Paused callers, then a synthesised assembler-resume tail as the innermost
 /// parent. Constructor and send_ex `CALL_ASSEMBLER` share this capture:
 /// `do_recursive_call` records the call in the frame that `finishframe`
 /// left on top (`pyjitpl.py` `opimpl_jit_merge_point`).
-fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
+pub(crate) fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     tail: InlineParentFrame,
