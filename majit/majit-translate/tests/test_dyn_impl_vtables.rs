@@ -210,9 +210,7 @@ fn registered_dyn_impl_keys_equal_charon_name_path_of_their_type() {
 
 #[test]
 fn w_set_add_checked_is_present() {
-    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
-        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-    });
+    let object = load_llbc(OBJECT_LLBC);
     assert!(
         object.local_fn("w_set_add_checked").is_some(),
         "w_set_add_checked missing from pyre-object LLBC"
