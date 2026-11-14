@@ -3150,7 +3150,8 @@ fn sendmsg_afalg_body(
     let flags = if pyre_object::gc_roots::shadow_stack_get(slot + 5).is_null() {
         0
     } else {
-        let value = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+        // The `i` format unit converts through `__index__`, not `__int__`.
+        let value = pyre_interpreter::baseobjspace::index_int_w(pyre_object::gc_roots::shadow_stack_get(
             slot + 5,
         ))?;
         libc::c_int::try_from(value).map_err(|_| {
