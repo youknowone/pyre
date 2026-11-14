@@ -1303,7 +1303,6 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
-    let w_exc = _roots.get(base);
     let w_code = _roots.get(base + 1);
     let w_globals = _roots.get(base + 2);
     // `record_application_traceback` requires the traceback's own frame
@@ -1326,6 +1325,9 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    // `createframe_obj` allocates the frame and can collect; re-read the
+    // exception from its root slot (`shadowstack.py` `pop_roots`).
+    let w_exc = _roots.get(base);
     let recorded = unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
