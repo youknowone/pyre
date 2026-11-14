@@ -332,13 +332,20 @@ impl<'a> QuasiImmutField<'a> {
     }
 
     /// The native half of `jit_force_quasi_immutable` ahead of a store to this field
-    /// (`warmspot.py rewrite_force_quasi_immutable` → `quasiimmut.py make_invalidation_function`):
-    /// take the field lock, then unlink and sweep the watchers. The returned guard holds
-    /// the field lock until the caller's store is done, so a recorder cannot install a
-    /// watcher against the old value between the sweep and the store (the GIL made that
-    /// pair indivisible upstream). Dropping the guard — normally, on unwind, or on
-    /// early exit — releases the lock. Use [`quasi_immut_store!`](crate::quasi_immut_store),
-    /// never directly.
+    /// (`warmspot.py rewrite_force_quasi_immutable` → `quasiimmut.py make_invalidation_function`).
+    ///
+    /// When another mutator may run (`objlock::stripes_taken`: `gil_ready` and
+    /// this thread does not hold the GIL), take the field lock, then unlink and
+    /// sweep. The returned guard holds that lock until the caller's store is
+    /// done, so a recorder cannot install a watcher against the old value
+    /// between the sweep and the store (the GIL made that pair indivisible
+    /// upstream). Dropping the guard — normally, on unwind, or on early exit —
+    /// releases the lock.
+    ///
+    /// When the GIL already serialises the store with recording, this is
+    /// `make_invalidation_function.invalidation`: `if getattr(p, mutatefieldname):
+    /// _invalidate_now(p)`, with no field lock. Use
+    /// [`quasi_immut_store!`](crate::quasi_immut_store), never directly.
     ///
     /// # Safety
     ///
@@ -347,10 +354,17 @@ impl<'a> QuasiImmutField<'a> {
     /// the guard is dropped at the end of the store block, while the caller
     /// still holds the owner.
     #[doc(hidden)]
-    pub unsafe fn begin_store(&self) -> parking_lot::MutexGuard<'static, ()> {
-        let guard = self.lock();
-        unlink_and_invalidate!(self);
-        guard
+    pub unsafe fn begin_store(&self) -> Option<parking_lot::MutexGuard<'static, ()>> {
+        if crate::objlock::stripes_taken() {
+            let guard = self.lock();
+            unlink_and_invalidate!(self);
+            Some(guard)
+        } else {
+            if self.is_installed() {
+                unlink_and_invalidate!(self);
+            }
+            None
+        }
     }
 
     /// Publish `value` at `slot` only when it still holds `expected`.
@@ -436,8 +450,11 @@ impl<'a> QuasiImmutField<'a> {
 /// (`rclass.py InstanceRepr.hook_setfield`, via `warmspot.py
 /// rewrite_force_quasi_immutable` / `quasiimmut.py make_invalidation_function`)
 /// puts `jit_force_quasi_immutable` before each `FieldWrite`. The interpreter
-/// branch holds the [`QuasiImmutField::begin_store`] guard across the stores, so
-/// dropping it — normally, on unwind, or on early exit — releases the field lock.
+/// branch runs [`QuasiImmutField::begin_store`] across the stores: the field
+/// lock when `objlock::stripes_taken`, otherwise
+/// `make_invalidation_function.invalidation` (a pointer check, then a sweep
+/// only if a watcher is installed). Dropping the guard — normally, on unwind,
+/// or on early exit — releases the lock when one was taken.
 #[macro_export]
 macro_rules! quasi_immut_store {
     ($mutate:expr => $($store:stmt;)+) => {{
@@ -668,8 +685,9 @@ mod tests {
         assert!(!field.is_installed());
     }
 
-    /// After [`quasi_immut_store!`] returns, the field lock is free so the
-    /// same thread can take it again.
+    /// After [`quasi_immut_store!`] returns, a later [`QuasiImmutField::lock`]
+    /// on the same thread succeeds. Unit tests run with `gil_ready` unset, so
+    /// `begin_store` takes the GIL path and does not allocate the lock box.
     #[test]
     fn quasi_immut_store_releases_the_field_lock() {
         let owned = TestField::new();
@@ -677,20 +695,15 @@ mod tests {
         crate::quasi_immut_store!(field =>
             let _ = ();
         );
-        let mutex = field.lock.load(Ordering::Acquire);
         assert!(
-            !mutex.is_null(),
-            "begin_store allocates the lock box on first use"
-        );
-        assert!(
-            unsafe { (*mutex).0.try_lock() }.is_some(),
-            "the field lock must be free after quasi_immut_store! returns",
+            field.lock.load(Ordering::Acquire).is_null(),
+            "GIL-path begin_store does not allocate the lock box"
         );
         let _guard = field.lock();
     }
 
     /// A panic inside the store statements drops the [`QuasiImmutField::begin_store`]
-    /// guard, so the field lock is free afterwards.
+    /// guard. The GIL path never took the lock, so a later `lock()` still succeeds.
     #[test]
     fn quasi_immut_store_releases_the_field_lock_on_panic() {
         let owned = TestField::new();
@@ -701,21 +714,16 @@ mod tests {
             );
         }));
         assert!(panicked.is_err());
-        let mutex = field.lock.load(Ordering::Acquire);
         assert!(
-            !mutex.is_null(),
-            "begin_store allocates the lock box on first use"
-        );
-        assert!(
-            unsafe { (*mutex).0.try_lock() }.is_some(),
-            "the field lock must be free after the store body panics",
+            field.lock.load(Ordering::Acquire).is_null(),
+            "GIL-path begin_store does not allocate the lock box"
         );
         let _guard = unsafe { field.begin_store() };
     }
 
     /// An early `return` from a closure that runs the store statements drops
-    /// the [`QuasiImmutField::begin_store`] guard, so the field lock is free
-    /// afterwards.
+    /// the [`QuasiImmutField::begin_store`] guard. The GIL path never took the
+    /// lock, so a later `lock()` still succeeds.
     #[test]
     fn quasi_immut_store_releases_the_field_lock_on_early_return() {
         let owned = TestField::new();
@@ -725,14 +733,9 @@ mod tests {
                 return;
             );
         })();
-        let mutex = field.lock.load(Ordering::Acquire);
         assert!(
-            !mutex.is_null(),
-            "begin_store allocates the lock box on first use"
-        );
-        assert!(
-            unsafe { (*mutex).0.try_lock() }.is_some(),
-            "the field lock must be free after an early return from the store body",
+            field.lock.load(Ordering::Acquire).is_null(),
+            "GIL-path begin_store does not allocate the lock box"
         );
         let _guard = field.lock();
     }
