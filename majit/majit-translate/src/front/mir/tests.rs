@@ -32489,6 +32489,101 @@ fn wtf8_code_points_nth_opaque_payload_declines() {
     );
 }
 
+/// Unsigned unique field is `rarithmetic.py` `r_uint` of the signed helper
+/// word (`signedness_retype_op`); a signed field stores the helper as-is.
+#[test]
+fn emit_nth_payload_retypes_unsigned_field_and_skips_signed() {
+    use crate::front::wtf8_nth::{NthPayload, emit_nth_payload};
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+
+    fn payload_ops(
+        field_ty: ValueType,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("nth_payload");
+        let block = graph.startblock;
+        let helper = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(helper.clone()),
+            kind: OpKind::ConstInt(65),
+        });
+        emit_nth_payload(
+            &mut graph,
+            block,
+            helper.clone(),
+            &NthPayload::Instance {
+                owner: "Holder".to_string(),
+                field: Some(("n".to_string(), field_ty)),
+            },
+        );
+        (graph.block(block).operations.clone(), helper)
+    }
+
+    let (unsigned_ops, unsigned_helper) = payload_ops(ValueType::Unsigned);
+    let mut r_uint_result = None;
+    let mut unsigned_write = None;
+    for (i, op) in unsigned_ops.iter().enumerate() {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty,
+            } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "r_uint"] => {
+                assert_eq!(*result_ty, ValueType::Unsigned);
+                assert_eq!(
+                    args.first().and_then(LinkArg::as_variable),
+                    Some(&unsigned_helper)
+                );
+                r_uint_result = Some((i, op.result.clone().expect("r_uint result")));
+            }
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ty,
+                ..
+            } if field.name == "n" => {
+                unsigned_write = Some((i, v.clone(), ty.clone()));
+            }
+            _ => {}
+        }
+    }
+    let (r_uint_idx, retyped) = r_uint_result.expect("Unsigned field emits r_uint");
+    let (write_idx, written, written_ty) = unsigned_write.expect("Unsigned field FieldWrite n");
+    assert!(
+        r_uint_idx < write_idx,
+        "r_uint must sit between the helper and FieldWrite: r_uint={r_uint_idx} write={write_idx}"
+    );
+    assert_eq!(written, retyped);
+    assert_eq!(written_ty, ValueType::Unsigned);
+    assert_ne!(written, unsigned_helper);
+
+    let (signed_ops, signed_helper) = payload_ops(ValueType::Int);
+    assert!(
+        signed_ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "r_uint"]
+                    || segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        }),
+        "Signed field must not retype the helper word: {signed_ops:#?}"
+    );
+    let signed_write = signed_ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(v),
+            ty,
+            ..
+        } if field.name == "n" => Some((v.clone(), ty.clone())),
+        _ => None,
+    });
+    let (written, written_ty) = signed_write.expect("Signed field FieldWrite n");
+    assert_eq!(written, signed_helper);
+    assert_eq!(written_ty, ValueType::Int);
+}
+
 fn assert_nth_struct_payload_writes_value(graph: &crate::model::FunctionGraph, helper: &str) {
     use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
     let identity = super::class_identity_spelling(
@@ -32597,14 +32692,47 @@ fn assert_nth_struct_payload_writes_value(graph: &crate::model::FunctionGraph, h
         "Struct dest payload must be a struct instance ctor; identity={identity} new_owners={new_owners:?} value_writes={value_writes:?} pos0={pos0:?}"
     );
     // `close_call_diamond` threads the helper word as a Some-arm
-    // inputarg (`true_extras` → mapped[0]); the FieldWrite uses that
-    // alias, not the call-block result.
+    // inputarg (`true_extras` → mapped[0]). The field is Unsigned, so
+    // `signedness_retype_op` / `rarithmetic.py` `r_uint` retypes that
+    // alias before the FieldWrite.
     let helper_words = diamond_threaded_words(graph, &nth_results);
+    let mut r_uint_of_helper = Vec::new();
+    for op in &ops {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != ["rpython", "rlib", "rarithmetic", "r_uint"] {
+            continue;
+        }
+        let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+            continue;
+        };
+        if helper_words.iter().any(|h| h == arg)
+            && let Some(result) = op.result.as_ref()
+        {
+            r_uint_of_helper.push(result.clone());
+        }
+    }
+    assert!(
+        !r_uint_of_helper.is_empty(),
+        "Unsigned field must r_uint the helper word: helper_words={helper_words:#?} ops={ops:#?}"
+    );
     assert!(
         value_writes.iter().any(|(v, ty)| {
-            helper_words.iter().any(|nth| nth == v) && matches!(ty, ValueType::Unsigned)
+            r_uint_of_helper.iter().any(|retyped| retyped == v) && matches!(ty, ValueType::Unsigned)
         }),
-        "Struct payload must FieldWrite value from the helper word: value_writes={value_writes:#?} helper_words={helper_words:#?}"
+        "Struct payload must FieldWrite value from r_uint(helper): value_writes={value_writes:#?} r_uint_of_helper={r_uint_of_helper:#?}"
+    );
+    assert!(
+        value_writes
+            .iter()
+            .all(|(v, _)| helper_words.iter().all(|nth| nth != v)),
+        "Unsigned field must not store the signed helper word: value_writes={value_writes:#?} helper_words={helper_words:#?}"
     );
     assert!(
         pos0.iter().any(|(v, ty)| {

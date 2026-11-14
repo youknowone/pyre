@@ -9296,6 +9296,7 @@ use self::framestate::*;
 use self::gcroot::*;
 pub(in crate::front::mir) use self::lltype::*;
 use self::malloc::*;
+pub(crate) use self::operation::signedness_retype_op;
 use self::operation::*;
 use self::removeassert::*;
 use self::simplify::*;

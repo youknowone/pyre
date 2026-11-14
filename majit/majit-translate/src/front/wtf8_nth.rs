@@ -187,8 +187,10 @@ pub(crate) fn build_ll_wtf8_nth_graph() -> FunctionGraph {
 /// `ClassDef.generalize_attr` / `unionof` keep one annotation per
 /// attribute. A `Ref` payload whose TypeDecl is a Struct is the named
 /// instance `emit_aggregate_ctor` publishes, with the helper word
-/// written to the unique non-ZST field. The ctor name is that identity
-/// so `intern_class_by_qualname` shares the FORCE `__pos_0` class
+/// written to the unique non-ZST field — retyped to the field's integer
+/// kind (`signedness_retype_op` / `rarithmetic.py` `r_uint`) when that
+/// kind is Unsigned. The ctor name is that identity so
+/// `intern_class_by_qualname` shares the FORCE `__pos_0` class
 /// (`getuniqueclassdef`). A scalar / pointer payload is the helper
 /// word. An Opaque TypeDecl (or Alias of Opaque) cannot carry the code
 /// point; `nth_payload_shape` declines. Never a silent word store into
@@ -227,18 +229,42 @@ pub(crate) fn emit_nth_payload(
         },
     });
     if let Some((field_name, field_ty)) = field {
+        let stored = nth_word_for_field(graph, block, value, field_ty);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base: shell.clone(),
                 field: FieldDescriptor::new(field_name.clone(), Some(owner.clone()))
                     .with_base_is_deref(false),
-                value: LinkArg::Value(value),
+                value: LinkArg::Value(stored),
                 ty: field_ty.clone(),
             },
         });
     }
     shell
+}
+
+/// `ll_wtf8_nth` returns a signed `SomeInteger`. Store the field's integer
+/// kind: `ClassDef.generalize_attr` / `unionof` reject `int ∪ r_uint`.
+/// `signedness_retype_op` (`rarithmetic.py` `r_uint`) when the field is
+/// Unsigned. A signed field already matches the helper word.
+fn nth_word_for_field(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    value: Variable,
+    field_ty: &ValueType,
+) -> Variable {
+    // Helper word is signed (`ll_wtf8_nth` / `ValueType::Int`). A signed
+    // field matches that kind; only Unsigned differs (`r_uint`).
+    if !matches!(field_ty, ValueType::Unsigned) {
+        return value;
+    }
+    let (kind, result) = crate::front::mir::signedness_retype_op(graph, value, false);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind,
+    });
+    result
 }
 
 fn push_call(

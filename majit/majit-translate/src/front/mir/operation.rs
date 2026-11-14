@@ -12288,7 +12288,7 @@ pub(in crate::front::mir) fn rarithmetic_mask(
 
 /// `rarithmetic.intmask` (`result_ty: Int`) or `r_uint` (`result_ty: Unsigned`).
 /// `rarithmetic.py` `intmask` / `r_uint`; `rffi.cast` annotates from the target.
-pub(in crate::front::mir) fn signedness_retype_op(
+pub(crate) fn signedness_retype_op(
     graph: &mut FunctionGraph,
     arg: Variable,
     dest_signed: bool,
