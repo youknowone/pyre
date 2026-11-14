@@ -16661,3 +16661,163 @@ fn merge_phi_concretetype_requires_predecessor_agreement() {
         phi.concretetype()
     );
 }
+
+fn harvested_value_type_kind(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => 'i',
+        ValueType::Float => 'f',
+        ValueType::Void => 'v',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+        ValueType::Unknown | ValueType::State => '?',
+    }
+}
+
+fn harvested_var_kind(graph: &FunctionGraph, var: &Variable) -> char {
+    match FunctionGraph::concretetype_of(var) {
+        crate::codewriter::type_state::ConcreteType::Signed => return 'i',
+        crate::codewriter::type_state::ConcreteType::GcRef => return 'r',
+        crate::codewriter::type_state::ConcreteType::Float => return 'f',
+        crate::codewriter::type_state::ConcreteType::Void => return 'v',
+        crate::codewriter::type_state::ConcreteType::Unknown => {}
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Input { ty, .. }
+                | OpKind::Call { result_ty: ty, .. }
+                | OpKind::FieldRead { ty, .. } => harvested_value_type_kind(ty),
+                OpKind::New { .. } => 'r',
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => 'i',
+                OpKind::ConstFloat(_) => 'f',
+                _ => '?',
+            };
+        }
+    }
+    '?'
+}
+
+fn harvested_link_arg_kind(graph: &FunctionGraph, arg: &LinkArg) -> char {
+    match arg {
+        LinkArg::Value(var) => harvested_var_kind(graph, var),
+        LinkArg::Const(_) => '?',
+    }
+}
+
+fn harvested_call_target_is_index_of(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.iter().any(|seg| seg.contains("index_of"))
+        }
+        CallTarget::Method { name, .. } => name.contains("index_of"),
+        _ => false,
+    }
+}
+
+/// `w_dict_delitem_object_strategy_checked` leftover `index_of` keeps the
+/// `ObjectKey` pointer (`backendopt/malloc.py`: a malloc whose pointer is
+/// a call argument is not removed). Callee inputargs are entries + key.
+#[test]
+fn harvested_w_dict_delitem_index_of_keeps_object_key_pointer() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        crate::HostStaticAddrs::default(),
+        &["dictmultiobject"],
+        &[
+            "w_dict_delitem_object_strategy_checked",
+            "index_of",
+            "object_key_for_checked",
+        ],
+    )
+    .expect("harvest w_dict_delitem_object_strategy_checked");
+    let mut callee_kinds: Option<Vec<char>> = None;
+    let mut caller_calls: Vec<(String, Vec<char>)> = Vec::new();
+    for f in &program.functions {
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf.contains("index_of") {
+            let kinds: Vec<char> = graph
+                .blocks
+                .first()
+                .map(|block| {
+                    block
+                        .inputargs
+                        .iter()
+                        .map(|arg| harvested_var_kind(graph, arg))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if graph.name.contains("ObjectKey") || callee_kinds.is_none() {
+                callee_kinds = Some(kinds);
+            }
+        }
+        if leaf.contains("object_key_for_checked") {
+            let mut news_object_key = false;
+            for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+                match &op.kind {
+                    OpKind::New { owner } if owner.ends_with("ObjectKey") => {
+                        news_object_key = true;
+                    }
+                    OpKind::FieldWrite { field, .. } => {
+                        assert!(
+                            !field.name.contains("__pos_0.hash")
+                                && !field.name.contains("__pos_0.obj"),
+                            "{} must not inline ObjectKey into Result (`lltype.GcStruct` / `backendopt/malloc.py`); field={}",
+                            f.name,
+                            field.name
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                news_object_key,
+                "{} must materialize ObjectKey (`backendopt/malloc.py`)",
+                f.name
+            );
+        }
+        if !leaf.contains("w_dict_delitem_object_strategy_checked") {
+            continue;
+        }
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !harvested_call_target_is_index_of(target) {
+                continue;
+            }
+            let kinds: Vec<char> = args
+                .iter()
+                .map(|arg| harvested_link_arg_kind(graph, arg))
+                .collect();
+            caller_calls.push((f.name.clone(), kinds));
+        }
+    }
+    let callee_kinds = callee_kinds.expect("harvested index_of inputargs");
+    assert!(
+        !caller_calls.is_empty(),
+        "harvested index_of call in w_dict_delitem_object_strategy_checked, functions={}",
+        program.functions.len()
+    );
+    for (name, kinds) in &caller_calls {
+        assert_eq!(
+            kinds, &callee_kinds,
+            "{name} index_of args {kinds:?} must match callee inputargs {callee_kinds:?}"
+        );
+    }
+}

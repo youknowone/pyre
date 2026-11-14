@@ -6798,7 +6798,7 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// identity); `all_fielddescrs` does not recurse, so
 /// `PyreDecodeContext.pos_delta` is one
 /// `getfield(PyreDecodeContext, "pos_delta")`.
-pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
+fn tyref_named_struct_for_inline_walk<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -6889,6 +6889,83 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         return None;
     }
     Some(td)
+}
+
+/// A by-value named struct is an inlined `lltype.Struct`.
+///
+/// A `lltype.GcStruct` (`gc_struct_ids`) still inlines as the first field
+/// of another GcStruct (`rclass` `super`). A struct that is not declared
+/// GC but whose leaves include a GC pointer is not inlined:
+/// `backendopt/malloc.py` materializes it when the pointer is a call
+/// argument.
+pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
+    ty: &TyRef,
+    llbc: &'l Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<&'l TypeDecl> {
+    let td = tyref_named_struct_for_inline_walk(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )?;
+    if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+        return Some(td);
+    }
+    if struct_decl_has_gc_pointer_leaf(
+        td,
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return None;
+    }
+    Some(td)
+}
+
+/// Field spelling of a named struct that is not an inlined `lltype.Struct`.
+///
+/// `backendopt/malloc.py` materializes it (`New` + `setfield`); the
+/// containing struct holds a `Ptr` (`descr.py` `get_type_flag` of a Ptr).
+/// A declared `lltype.GcStruct` still inlines as `rclass` `super`.
+pub(in crate::front::mir) fn malloc_ptr_field_spelling(
+    ty: &TyRef,
+    by_value_spelling: &str,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let spelling = by_value_spelling.trim();
+    if spelling.is_empty() || spelling.starts_with('*') || spelling.starts_with('&') {
+        return None;
+    }
+    let td = tyref_named_struct_for_inline_walk(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )?;
+    if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+        return None;
+    }
+    if !struct_decl_has_gc_pointer_leaf(
+        td,
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return None;
+    }
+    Some(format!("*mut {spelling}"))
 }
 
 /// By-value ADT after leaving `Ref` and `RawPtr` in place.
@@ -7387,6 +7464,91 @@ pub(in crate::front::mir) struct InlineVariantField {
     pub payload_ty: TyRef,
 }
 
+/// A physical leaf that is a GC pointer (`lltype.GcStruct` field,
+/// `rstr` `STR`, or `STRINGBUILDERPTR`). `heaptracker.all_fielddescrs`
+/// does not recurse into Ptr; inlining such a leaf into another STRUCT
+/// drops the pointer `backendopt/malloc.py` keeps when the aggregate
+/// is passed to a call that is not inlined.
+fn inline_leaf_holds_gc_pointer(
+    leaf: &crate::model::InlineLeaf,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    match &leaf.ty {
+        ValueType::Str | ValueType::StringBuilder | ValueType::Ref(Some(_)) => true,
+        _ => gc_ref_pointer(
+            &leaf.source_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            0,
+            raw_alloc_flavor_structs,
+        ),
+    }
+}
+
+fn struct_decl_has_gc_pointer_leaf(
+    nested: &TypeDecl,
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    collect_by_value_struct_leaves(
+        nested,
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .iter()
+    .any(|leaf| {
+        inline_leaf_holds_gc_pointer(
+            leaf,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    })
+}
+
+/// Whether a named struct carries a GC-pointer leaf.
+///
+/// That struct is not an inlined STRUCT: `backendopt/malloc.py`
+/// materializes it (`New` + `setfield`) when the pointer is a call
+/// argument. A declared `lltype.GcStruct` still inlines as `rclass`
+/// `super`.
+pub(in crate::front::mir) fn by_value_struct_has_gc_pointer_leaf(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(nested) = tyref_named_struct_for_inline_walk(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) else {
+        return false;
+    };
+    struct_decl_has_gc_pointer_leaf(
+        nested,
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+}
+
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
 ///
 /// `None` keeps the existing one-word copy.  `Some` is whether `field` sits
@@ -7399,7 +7561,8 @@ pub(in crate::front::mir) struct InlineVariantField {
 /// Variant payloads are an exact `InlineVariantField` lookup first
 /// (`tyref_by_value_struct_decl`); a miss falls through to the owner's
 /// TypeDecl field. `heaptracker.all_fielddescrs` emits the leaves, never
-/// the containing Struct field.
+/// the containing Struct field. A nested struct whose leaves include a
+/// GC pointer is not expanded (`lltype.GcStruct` / `backendopt/malloc.py`).
 pub(in crate::front::mir) fn expand_inline_field(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -7420,8 +7583,21 @@ pub(in crate::front::mir) fn expand_inline_field(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         )?;
-        // A GcStruct inlines only as the first field of another GcStruct (`lltype.GcStruct` / `rclass` `super`).
-        if spec.payload_offset != 0 && gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+        // A declared GcStruct inlines only as the first field of another
+        // GcStruct (`lltype.GcStruct` / `rclass` `super`). A struct whose
+        // leaves include a GC pointer is not inlined (`backendopt/malloc.py`).
+        if gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+            if !(spec.owner_is_gc && spec.payload_offset == 0) {
+                return None;
+            }
+        } else if struct_decl_has_gc_pointer_leaf(
+            nested,
+            &spec.payload_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ) {
             return None;
         }
         let (size, align) = type_decl_size_align(nested, llbc)?;
@@ -7463,6 +7639,20 @@ pub(in crate::front::mir) fn expand_inline_field(
     let owner_id = struct_id_for_type_decl(td);
     let owner_is_gc = struct_id_is_declared_gc(gc_struct_ids, owner_id, owner);
     let offset = type_decl_struct_field_offset(td, llbc, field_idx)?;
+    if gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+        if !(owner_is_gc && offset == 0) {
+            return None;
+        }
+    } else if struct_decl_has_gc_pointer_leaf(
+        nested,
+        &field.ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return None;
+    }
     let (size, align) = type_decl_size_align(nested, llbc)?;
     let leaves = collect_by_value_struct_leaves(
         nested,
@@ -13594,6 +13784,18 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // size disagrees with the Int publish.
     if tyref_rust_vec_item_kind(ty, llbc).is_some() {
         return "isize".to_string();
+    }
+    // A named struct that is not an inlined `lltype.Struct` is a
+    // `Ptr` field (`backendopt/malloc.py` / `descr.py` `get_type_flag`).
+    if let Some(ptr) = malloc_ptr_field_spelling(
+        ty,
+        &tyref_to_ast_string(ty, llbc),
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return ptr;
     }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in

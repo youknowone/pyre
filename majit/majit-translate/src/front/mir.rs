@@ -1573,7 +1573,10 @@ fn register_ref_enum_instantiation_rows(
                 tyref_node(&inst.instantiated, llbc).and_then(|node| strip_ty_wrappers(node, llbc));
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
-                let concrete = intern_payload_registry_spelling(
+                let payload_ty = instantiated_node
+                    .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
+                    .unwrap_or_else(|| clone_tyref(&f.ty));
+                let mut concrete = intern_payload_registry_spelling(
                     llbc,
                     &substitute_field_type(
                         &f.ty,
@@ -1584,9 +1587,16 @@ fn register_ref_enum_instantiation_rows(
                     ),
                     struct_fields,
                 );
-                let payload_ty = instantiated_node
-                    .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
-                    .unwrap_or_else(|| clone_tyref(&f.ty));
+                if let Some(ptr) = lltype::malloc_ptr_field_spelling(
+                    &payload_ty,
+                    &concrete,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ) {
+                    concrete = ptr;
+                }
                 if let Some(nested) = tyref_by_value_struct_decl(
                     &payload_ty,
                     llbc,
@@ -1594,8 +1604,21 @@ fn register_ref_enum_instantiation_rows(
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
                 ) {
-                    // The variant payload sits past the discriminant word, and a GcStruct inlines only as the first field (`lltype.GcStruct` / `rclass` `super`).
-                    if !gc_struct_ids.contains(&struct_id_for_type_decl(nested)) {
+                    // The variant payload sits past the discriminant word.
+                    // A GcStruct inlines only as the first field
+                    // (`lltype.GcStruct` / `rclass` `super`). A by-value
+                    // struct whose leaves include a GC pointer is that
+                    // GcStruct: `backendopt/malloc.py` materializes it
+                    // when the pointer is a call argument.
+                    if !gc_struct_ids.contains(&struct_id_for_type_decl(nested))
+                        && !lltype::by_value_struct_has_gc_pointer_leaf(
+                            &payload_ty,
+                            llbc,
+                            tombstoned,
+                            gc_struct_ids,
+                            raw_alloc_flavor_structs,
+                        )
+                    {
                         // `heaptracker.all_fielddescrs` emits the payload's
                         // non-Struct leaves. The logical `fname` row stays in
                         // `struct_fields` without an ExactLayout offset

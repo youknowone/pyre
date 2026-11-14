@@ -23365,6 +23365,59 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             callee_num_regs_f: sub_body.num_regs_f,
         });
     }
+    // `MIFrame.setup_call` writes every argbox into the callee registers.
+    // A list shorter than `JitCode.calldescr.arg_classes` of that kind, or a
+    // supplied Ref that is `OpRef::NONE`, leaves a hole the callee then
+    // reads (`pyjitpl.py` setup_call). Empty `arg_classes` is unset, not
+    // nullary (`assembler.py` `check_inline_call_arg_classes`).
+    let declared = sub_body.jitcode_index.and_then(|idx| {
+        let jc = crate::jitcode_runtime::get_jitcode_ref_by_index(idx)?;
+        let classes = jc.calldescr().arg_classes.as_str();
+        if classes.is_empty() {
+            return None;
+        }
+        Some((
+            classes.chars().filter(|&c| c == 'i').count(),
+            classes.chars().filter(|&c| c == 'r').count(),
+            classes.chars().filter(|&c| c == 'f').count(),
+        ))
+    });
+    if let Some((need_i, need_r, need_f)) = declared {
+        if int_args.len() < need_i {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallIntArityMismatch {
+                pc,
+                provided: int_args.len(),
+                callee_num_regs_i: need_i,
+            });
+        }
+        if ref_args.len() < need_r {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallArityMismatch {
+                pc,
+                provided: ref_args.len(),
+                callee_num_regs_r: need_r,
+            });
+        }
+        if float_args.len() < need_f {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallFloatArityMismatch {
+                pc,
+                provided: float_args.len(),
+                callee_num_regs_f: need_f,
+            });
+        }
+    }
+    if ref_args.iter().any(|arg| *arg == OpRef::NONE) {
+        ctx.session.borrow_mut().pending_helper_level = None;
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: declared
+                .map(|(_, need_r, _)| need_r)
+                .unwrap_or(sub_body.num_regs_r),
+        });
+    }
     for (i, arg) in int_args.iter().enumerate() {
         callee_regs_i[i] = *arg;
     }
