@@ -2348,6 +2348,11 @@ pub fn handle_exception_with_context(
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
         *next_instr = (target_bytes / 2) as usize;
+        // The handler pc goes on the live frame here, where the anchor still
+        // names it (`pyopcode.py` `dispatch_bytecode` sets `last_instr` on the
+        // reloaded `self`); a caller's pre-call frame pointer is stale after
+        // the collecting calls above.
+        frame.set_last_instr_from_next_instr(*next_instr);
         return true;
     }
 
@@ -2463,7 +2468,6 @@ pub fn prepare_frame_resume_for_dispatch(
             ) {
                 return Err(err);
             }
-            frame.last_instr = next_instr as isize - 1;
             Ok(None)
         }
         FrameResume::Dispatch(None) => Ok(None),
