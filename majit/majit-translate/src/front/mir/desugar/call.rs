@@ -1209,6 +1209,24 @@ impl<'a> Lowering<'a> {
                         .expect("a materialized GC root stays a Variable")
                         .clone();
                 }
+                // `FrameAnchor` is a GC-local keepalive (`gc_push_roots` of
+                // `frame`), not a residual shadow-stack push/get/pop.
+                // Charon names inherent methods `eval::<Impl>::live`;
+                // `frame_anchor_callee_name` prefers the registered
+                // `eval::FrameAnchor::live` path (`CallPath::for_impl_method`).
+                if let Some(name) = frame_anchor_callee_name(&reg, self.llbc)
+                    && self.try_lower_frame_anchor_call(
+                        mir_bb,
+                        &name,
+                        &args,
+                        dest_local,
+                        target,
+                        first_arg_ty.as_ref(),
+                        Some(&call.dest.ty),
+                    )?
+                {
+                    return Ok(());
+                }
                 // `rarithmetic.r_uint`: the unique graph's `usize` input is
                 // Unsigned. `cast_ptr_to_int` callers otherwise merge
                 // `r_uint ∪ int` (`annrpython.py` `mergeinputargs`).

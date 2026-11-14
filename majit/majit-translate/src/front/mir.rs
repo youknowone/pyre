@@ -3776,8 +3776,8 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        // `FrameAnchor` is the frame GCREF (`tyref_is_frame_anchor`); the
-        // signature word is `usize` but the CFG return is `r`. Leave
+        // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`);
+        // the signature word is `usize` but the CFG return is `r`. Leave
         // FUNC.RESULT unstamped so `func_result_kind` follows the CFG.
         let frame_anchor_result = tyref_is_frame_anchor(&signature.output, llbc);
         let return_type = if stamp_return_token && !frame_anchor_result {

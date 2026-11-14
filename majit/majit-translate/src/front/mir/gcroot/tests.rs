@@ -5,7 +5,8 @@ use crate::model::FunctionGraph;
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    fixture_llbc, graph_call_leaves, llbc_with_types, llbc_with_types_impls,
+    fixture_item_meta, fixture_llbc, graph_call_leaves, ident_path, llbc_with_types,
+    llbc_with_types_impls, struct_decl, usize_ty,
 };
 
 impl<'b> crate::front::mir::MovedOutLocals<'b> {
@@ -582,6 +583,87 @@ fn root_scope_drop_is_classified_and_live() {
     assert!(super::is_shadow_stack_bracket_close(&release));
     assert!(!super::is_root_scope_drop_glue_call(&release));
 
+    use super::FrameAnchorLowering::*;
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::<Impl>::from_raw"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::new"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::FrameAnchor::<Impl>::live"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::<Impl>::live"),
+        None,
+        "Charon inherent spelling has no FrameAnchor segment"
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::FrameAnchor::<Impl>::drop"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::frame_anchor_push"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_push_jit_abi"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_new_jit_abi"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live_jit_abi"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live_method_jit_abi"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_release"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_release_jit_abi"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("alloc::layout::Layout::new"),
+        None
+    );
+    assert_eq!(super::frame_anchor_lowering("core::ptr::from_raw"), None);
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_object::gc_roots::pin_root"),
+        None
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"),
+        None
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("unrelated::frame_anchor_release"),
+        None
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("unrelated::FrameAnchor::new"),
+        None
+    );
+    assert_eq!(super::frame_anchor_lowering("frame_anchor_release"), None);
+
     // `_1` is written in bb0 and read only by bb1's Drop.
     let span = || {
         serde_json::json!({
@@ -641,6 +723,264 @@ fn root_scope_drop_is_classified_and_live() {
     assert!(
         lowered[1].contains(1),
         "a drop lowered as its glue call reads the guard, so it is live-in at bb1"
+    );
+}
+
+/// `&FrameAnchor` / `&mut FrameAnchor` are the frame GCREF word, not
+/// the transparent `usize` the wrapper peels to. Inputarg kind is `r`.
+#[test]
+fn frame_anchor_borrow_value_type_is_gcref() {
+    use crate::model::{OpKind, ValueType};
+    let depth = serde_json::json!([{
+        "name": "depth",
+        "ty": usize_ty(),
+        "attr_info": null
+    }]);
+    let llbc = llbc_with_types(
+        "pyre_interpreter",
+        vec![struct_decl(
+            0,
+            ident_path(&["pyre_interpreter", "eval", "FrameAnchor"]),
+            depth,
+            true,
+        )],
+        vec![],
+    );
+    let adt = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+    let by_value = TyRef::Other(adt.clone());
+    let shared = TyRef::Other(serde_json::json!({"Ref": ["Erased", adt.clone(), "Shared"]}));
+    let mut_ref = TyRef::Other(serde_json::json!({"Ref": ["Erased", adt, "Mut"]}));
+    assert!(super::tyref_is_frame_anchor(&by_value, &llbc));
+    assert!(super::tyref_is_frame_anchor(&shared, &llbc));
+    assert!(super::tyref_is_frame_anchor(&mut_ref, &llbc));
+    let is_gcref = |ty: &TyRef| {
+        matches!(
+            crate::front::mir::tyref_to_value_type(ty, &llbc),
+            ValueType::Ref(_)
+        )
+    };
+    assert!(
+        is_gcref(&by_value),
+        "by-value FrameAnchor is the frame GCREF, got {:?}",
+        crate::front::mir::tyref_to_value_type(&by_value, &llbc)
+    );
+    assert!(
+        is_gcref(&shared),
+        "&FrameAnchor is the same GCREF word, got {:?}",
+        crate::front::mir::tyref_to_value_type(&shared, &llbc)
+    );
+    assert!(
+        is_gcref(&mut_ref),
+        "&mut FrameAnchor is the same GCREF word, got {:?}",
+        crate::front::mir::tyref_to_value_type(&mut_ref, &llbc)
+    );
+
+    let span = crate::front::mir::tests::fixture_span();
+    let anchor_ref = serde_json::json!({"Ref": ["Erased", {"Adt": {"id": 0, "generics": {"types": []}}}, "Shared"]});
+    let local = |i: u64, name: Option<&str>| serde_json::json!({"index": i, "name": name, "span": span, "ty": anchor_ref.clone()});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["eval", "live_handler"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [anchor_ref.clone()],
+            "output": anchor_ref.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [local(0, None), local(1, Some("anchor"))]},
+            "body": [{
+                "statements": [{
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": anchor_ref.clone()},
+                        {"Use": [{"Move": {"kind": {"Local": 1}, "ty": anchor_ref.clone()}}, "No"]}
+                    ]},
+                    "comments_before": [],
+                    "span": span
+                }],
+                "kind": "Regular",
+                "terminator": {"kind": "Return", "span": span}
+            }]
+        }}
+    });
+    let llbc = llbc_with_types(
+        "pyre_interpreter",
+        vec![struct_decl(
+            0,
+            ident_path(&["pyre_interpreter", "eval", "FrameAnchor"]),
+            serde_json::json!([{
+                "name": "depth",
+                "ty": usize_ty(),
+                "attr_info": null
+            }]),
+            true,
+        )],
+        vec![fun],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "eval::live_handler")
+        .expect("lower by-ref FrameAnchor identity");
+    let input_tys: Vec<ValueType> = graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { ty, .. } => Some(ty.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        input_tys.iter().any(|ty| matches!(ty, ValueType::Ref(_))),
+        "by-ref FrameAnchor inputarg kind is r, got {input_tys:?}"
+    );
+    assert!(
+        input_tys
+            .iter()
+            .all(|ty| !matches!(ty, ValueType::Int | ValueType::Unsigned)),
+        "by-ref FrameAnchor must not peel to the transparent usize, got {input_tys:?}"
+    );
+}
+
+/// Charon names `FrameAnchor::live` `eval::<Impl>::live` (no
+/// `FrameAnchor` segment). The registered path is
+/// `eval::FrameAnchor::live`; IdentityLive aliases dest to the GCREF
+/// receiver (`classify_frame_anchor`, `CallPath::for_impl_method`).
+#[test]
+fn charon_inherent_live_is_identity_gcref() {
+    use crate::model::{OpKind, ValueType};
+    let span = crate::front::mir::tests::fixture_span();
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let adt = serde_json::json!({"Adt": {"id": 0, "generics": generics.clone()}});
+    let owner_ty = serde_json::json!({"Value": [0, adt.clone()]});
+    let anchor_ref = serde_json::json!({"Ref": ["Erased", adt.clone(), "Shared"]});
+    let inherent_impl = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": owner_ty,
+        "kind": "InherentImplBlock"
+    }}});
+    let live_name = serde_json::json!([
+        {"Ident": ["pyre_interpreter", 0]},
+        {"Ident": ["eval", 0]},
+        inherent_impl,
+        {"Ident": ["live", 0]}
+    ]);
+    let local = |i: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": i, "name": name, "span": span, "ty": ty.clone()});
+    let live = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(live_name),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [anchor_ref.clone()],
+            "output": anchor_ref.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                local(0, None, &anchor_ref),
+                local(1, Some("self"), &anchor_ref)
+            ]},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"kind": "Return", "span": span}
+            }]
+        }}
+    });
+    let handler = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["eval", "live_handler"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [anchor_ref.clone()],
+            "output": anchor_ref.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                local(0, None, &anchor_ref),
+                local(1, Some("anchor"), &anchor_ref)
+            ]},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": generics
+                        }},
+                        "args": [{"Move": {"kind": {"Local": 1}, "ty": anchor_ref.clone()}}]
+                    },
+                    "dest": {"kind": {"Local": 0}, "ty": anchor_ref.clone()},
+                    "target": 1,
+                    "on_unwind": 1
+                }}, "span": span}
+            }, {
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"kind": "Return", "span": span}
+            }]
+        }}
+    });
+    let llbc = llbc_with_types(
+        "pyre_interpreter",
+        vec![struct_decl(
+            0,
+            ident_path(&["pyre_interpreter", "eval", "FrameAnchor"]),
+            serde_json::json!([{
+                "name": "depth",
+                "ty": usize_ty(),
+                "attr_info": null
+            }]),
+            true,
+        )],
+        vec![handler, live],
+    );
+    let live_fd = llbc.fn_by_id(1).expect("live FunDecl");
+    let charon_path = live_fd.item_meta.name_path();
+    assert!(
+        super::frame_anchor_lowering(&charon_path).is_none(),
+        "Charon inherent path has no FrameAnchor segment, got {charon_path}"
+    );
+    assert_eq!(
+        super::frame_anchor_lowering_of_call(
+            &charon_path,
+            live_fd.signature.inputs.first(),
+            Some(&live_fd.signature.output),
+            &llbc
+        ),
+        Some(super::FrameAnchorLowering::IdentityLive),
+        "receiver type supplies the FrameAnchor owner, path {charon_path}"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "eval::live_handler")
+        .expect("lower Charon inherent FrameAnchor::live");
+    let has_call = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Call { .. }))
+    });
+    assert!(!has_call, "IdentityLive must not residualize live");
+    let start = graph.block(graph.startblock);
+    let input_gcref = start.operations.iter().find_map(|op| match &op.kind {
+        OpKind::Input { ty, .. } if matches!(ty, ValueType::Ref(_)) => {
+            op.result.as_ref().map(|r| r.id())
+        }
+        _ => None,
+    });
+    let returned = graph.blocks.iter().find_map(|block| {
+        block.exits.iter().find_map(|exit| {
+            (exit.target == graph.returnblock).then(|| {
+                exit.args.iter().find_map(|arg| match arg {
+                    crate::model::LinkArg::Value(var) => Some(var.id()),
+                    _ => None,
+                })
+            })?
+        })
+    });
+    assert_eq!(
+        returned, input_gcref,
+        "the link into returnblock carries the FrameAnchor GCREF"
     );
 }
 

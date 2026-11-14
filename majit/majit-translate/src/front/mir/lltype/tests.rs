@@ -11738,7 +11738,7 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
 /// `#[repr(transparent)] struct Anchor { depth: usize, _not_send: PhantomData }`
 /// plus a rustc closure env that captures `&Anchor`. Mirrors
 /// `eval::FrameAnchor` / `_trace::{closure#2}.__pos_5`.
-fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
+fn llbc_with_transparent_anchor_closure_env(path: &[&str]) -> (Llbc, TyRef, TyRef) {
     let generics = serde_json::json!({
         "regions": [], "types": [], "const_generics": [], "trait_refs": []
     });
@@ -11768,7 +11768,7 @@ fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
                 },
                 {
                     "def_id": 1,
-                    "item_meta": type_decl_meta(&["eval", "FrameAnchor"]),
+                    "item_meta": type_decl_meta(path),
                     "kind": {"Struct": [
                         {
                             "name": "depth",
@@ -11836,7 +11836,8 @@ fn llbc_with_transparent_anchor_closure_env() -> (Llbc, TyRef, TyRef) {
 /// (`annotator/model.py` `unionof`).
 #[test]
 fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
-    let (llbc, borrowed, by_value) = llbc_with_transparent_anchor_closure_env();
+    let (llbc, borrowed, by_value) =
+        llbc_with_transparent_anchor_closure_env(&["eval", "DepthWord"]);
     let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let raw = std::collections::HashSet::<String>::new();
     let tomb = no_tombstoned_leaves();
@@ -11858,7 +11859,7 @@ fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
     assert_eq!(
         super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
         "usize",
-        "a captured &Wrapper layout is the inner scalar, not &eval::FrameAnchor"
+        "a captured &Wrapper layout is the inner scalar, not &eval::DepthWord"
     );
     let ordinary = llbc.type_by_id(2).expect("ordinary holder");
     let env = llbc.type_by_id(3).expect("closure env");
@@ -11875,6 +11876,75 @@ fn closure_env_capture_of_borrowed_transparent_scalar_is_the_inner_word() {
         ),
         ValueType::Unsigned,
         "closure-env getfield of a captured &Wrapper is the inner word"
+    );
+}
+
+/// `FrameAnchor` has the same `repr(transparent)` `depth` shape, but the
+/// lowering makes it the frame GCREF (`try_lower_frame_anchor_call`). The
+/// by-value anchor and a borrow of it are that one Ref word, so the
+/// borrowed-scalar rule above does not claim it.
+#[test]
+fn borrowed_frame_anchor_is_not_a_transparent_scalar() {
+    let (llbc, borrowed, by_value) =
+        llbc_with_transparent_anchor_closure_env(&["eval", "FrameAnchor"]);
+    let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        tyref_to_value_type(&by_value, &llbc),
+        crate::front::mir::gcroot::frame_anchor_value_type(),
+        "by-value FrameAnchor is the frame GCREF"
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed, &llbc),
+        crate::front::mir::gcroot::frame_anchor_value_type(),
+        "a borrow of FrameAnchor is the same word"
+    );
+    assert!(
+        !super::tyref_is_borrowed_transparent_scalar(
+            &borrowed,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_ids,
+            &raw
+        ),
+        "&FrameAnchor is not a borrowed transparent scalar"
+    );
+    let gcref = crate::front::mir::gcroot::frame_anchor_value_type();
+    assert_eq!(
+        super::tyref_to_field_layout_string(&by_value, &llbc, &gc_ids, &raw),
+        "GCREF",
+        "by-value FrameAnchor field layout is the frame GCREF"
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&borrowed, &llbc, &gc_ids, &raw),
+        "GCREF",
+        "a captured &FrameAnchor layout is the frame GCREF, not &eval::FrameAnchor"
+    );
+    assert_eq!(
+        tyref_to_attr_value_type(&borrowed, &llbc),
+        gcref.clone(),
+        "FORCE of &FrameAnchor is the frame GCREF"
+    );
+    let env = llbc.type_by_id(3).expect("closure env");
+    assert_eq!(
+        tyref_to_attr_value_type_for_struct_field(&borrowed, env, &llbc, &gc_ids, &raw),
+        gcref.clone(),
+        "closure-env FORCE of a captured &FrameAnchor is the frame GCREF"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &borrowed,
+            &borrowed,
+            false,
+            true,
+            None,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_ids,
+            &raw
+        ),
+        gcref,
+        "closure-env getfield of a captured &FrameAnchor is the frame GCREF"
     );
 }
 

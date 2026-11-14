@@ -8664,8 +8664,8 @@ fn closure_capturing_borrowed_frame_anchor_annotates() {
         llbc_closure_capturing_borrowed_wrapper("FrameAnchor", "capture_frame_anchor");
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let env = llbc.type_by_id(3).expect("closure env");
-    // `tyref_is_frame_anchor` / `frame_class_root`: fixture has no PyFrame
-    // decl, so FORCE is `Ref(None)` and the layout row is `GCREF`.
+    // `tyref_is_frame_anchor` / `frame_anchor_value_type`: fixture has no
+    // PyFrame decl, so FORCE is `Ref(GCREF)` and the layout row is `GCREF`.
     let gcref = tyref_to_attr_value_type(&borrowed_ty, &llbc);
     assert!(
         matches!(gcref, ValueType::Ref(_)),
