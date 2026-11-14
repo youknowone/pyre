@@ -6910,6 +6910,7 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
+                let profilefunc_graphs = profilefunc_graphs_for_call(self.llbc, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -6968,10 +6969,11 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         }
                     }
-                } else if let Some(graphs) = eval_hook_graphs {
-                    // `register_eval_override`'s function and the `FnDef`
-                    // cast to that parameter's type are one prebuilt
-                    // constant set. `FunctionsPBCRepr` /
+                } else if let Some(graphs) = eval_hook_graphs.or(profilefunc_graphs) {
+                    // `register_eval_override`'s function, `_trace`'s
+                    // `profilefunc` trampolines, and the `FnDef` values
+                    // stored into those slots are one prebuilt constant
+                    // set each. `FunctionsPBCRepr` /
                     // `SmallFunctionSetPBCRepr` (`rpbc.py`) lower it to
                     // `indirect_call(funcptr, *args, c_graphs)`.
                     // `guess_call_kind` answers `recursive` only when the

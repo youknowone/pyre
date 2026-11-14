@@ -193,6 +193,18 @@ fn profilefunc_spellings_of(llbc: &Llbc) -> Vec<String> {
     discover_profilefunc_spellings(llbc)
 }
 
+fn profilefunc_graphs_of(llbc: &Llbc) -> Vec<String> {
+    let published = llbc.profilefunc_graphs();
+    if !published.is_empty() {
+        return published;
+    }
+    let tls = crate::profilefunc_family::profilefunc_graphs();
+    if !tls.is_empty() {
+        return tls;
+    }
+    discover_profilefunc_graphs(llbc)
+}
+
 fn tyref_matches_profilefunc_spellings(ty: &TyRef, llbc: &Llbc, spellings: &[String]) -> bool {
     let rendered = tyref_to_ast_string(ty, llbc);
     if spelling_matches_profilefunc(&rendered, spellings) {
@@ -585,6 +597,37 @@ pub(in crate::front::mir) fn operand_bound_fundef(
         return None;
     };
     bound.get(index as usize).copied().flatten()
+}
+
+/// `_trace`'s `self.profilefunc(...)`: the prebuilt family published on `llbc`.
+///
+/// `FunctionsPBCRepr.call` (`rpbc.py`) lowers a PBC of those trampolines
+/// (`app_profile_call` / `lsprof_call`) to
+/// `indirect_call(funcptr, *args, c_graphs)`. Without `c_graphs`,
+/// `find_all_graphs` leaves the members out of `candidate_graphs`; Phase A
+/// then mints `cachedgraph((AccessDirect, None))` copies that
+/// `warmspot.py check_access_directly_sanity` rejects.
+pub(in crate::front::mir) fn profilefunc_graphs_for_call(
+    llbc: &Llbc,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let ty = match operand {
+        Operand::Copy(place) | Operand::Move(place) => &place.ty,
+        Operand::Const(_) => return None,
+    };
+    if !tyref_is_profilefunc_family(ty, llbc) {
+        return None;
+    }
+    let paths = profilefunc_graphs_of(llbc);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(
+        paths
+            .iter()
+            .map(|path| crate::parse::CallPath::from_segments(path.split("::")))
+            .collect(),
+    )
 }
 
 /// `get_eval_fn`'s result, or any other value of `register_eval_override`'s

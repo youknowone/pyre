@@ -1,6 +1,7 @@
-use super::{FnPtrFamily, fn_ptr_family_for};
+use super::{FnPtrFamily, fn_ptr_family_for, profilefunc_graphs_for_call};
 
 use majit_charon_reader::Llbc;
+use majit_charon_reader::ullbc::Operand;
 
 use serde_json::json;
 
@@ -1059,6 +1060,33 @@ fn discover_profilefunc_graphs_keys_on_type_not_member_names() {
     assert!(
         spellings.iter().any(|s| s.contains("fn(")),
         "expanded fn(...) after alias peel must be published, got {spellings:?}"
+    );
+}
+
+#[test]
+fn profilefunc_graphs_for_call_attaches_the_pbc_family() {
+    let llbc = profilefunc_family_llbc();
+    let operand: Operand = serde_json::from_value(move_op(place_of(0, &adt_node(1))))
+        .expect("ProfileFunc local deserializes");
+    let graphs = profilefunc_graphs_for_call(&llbc, &operand)
+        .expect("FunctionsPBCRepr.call attaches c_graphs for ProfileFunc");
+    assert!(
+        graphs.iter().any(|path| {
+            path.last_segment() == Some("hook_a") || path.display_name().ends_with("::hook_a")
+        }),
+        "hook_a must be in the attached family, got {graphs:?}"
+    );
+    assert!(
+        graphs.iter().any(|path| {
+            path.last_segment() == Some("hook_b") || path.display_name().ends_with("::hook_b")
+        }),
+        "hook_b must be in the attached family, got {graphs:?}"
+    );
+    let other: Operand = serde_json::from_value(move_op(place_of(0, &unit_fn_ptr())))
+        .expect("unrelated fn local deserializes");
+    assert!(
+        profilefunc_graphs_for_call(&llbc, &other).is_none(),
+        "a non-ProfileFunc fn pointer must not claim the family"
     );
 }
 
