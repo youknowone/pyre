@@ -2896,7 +2896,7 @@ fn pack_uint32(v: i64) -> [u8; 4] {
 /// `RSocket.sendmsg` / `W_Socket.sendmsg_w` after the buffers are copied.
 #[cfg(unix)]
 fn unix_sendmsg(
-    obj: pyre_object::PyObjectRef,
+    obj_slot: usize,
     fd: rffi::Socket,
     data_buffers: &mut [Vec<u8>],
     cmsgs: &[(libc::c_int, libc::c_int, Vec<u8>)],
@@ -2962,7 +2962,7 @@ fn unix_sendmsg(
         msg.msg_controllen = total_control as _;
     }
 
-    socket_wait_writable(obj, fd)?;
+    socket_wait_writable(pyre_object::gc_roots::shadow_stack_get(obj_slot), fd)?;
     loop {
         let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
             libc::sendmsg(fd, &msg, flags)
@@ -2972,7 +2972,7 @@ fn unix_sendmsg(
         }
         if !rffi::error_is_interrupted(errno) {
             return Err(socket_io_err_for_operation(
-                obj,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 std::io::Error::from_raw_os_error(errno),
             ));
         }
@@ -2994,14 +2994,17 @@ fn rsocket_constant(name: &'static str) -> i64 {
 fn sendmsg_afalg_w(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let msg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let op_obj = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
     let iv = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
     let assoclen_obj = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
     let flags_obj = args.get(5).copied().unwrap_or(pyre_object::PY_NULL);
 
-    let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[obj, msg, op_obj, iv, assoclen_obj, flags_obj]);
+
+    let family = socket_get_attr_i64(pyre_object::gc_roots::shadow_stack_get(slot), "_family");
     if family != majit_rlib::rsocket::af_alg() {
         return Err(pyre_interpreter::PyError::os_error(
             "algset is only supported for AF_ALG",
@@ -3009,32 +3012,37 @@ fn sendmsg_afalg_w(
     }
     // `unwrap_spec(op=int)` then `op < 0`. Default `-1` is the missing-op
     // sentinel (`sendmsg_afalg_w`).
-    let op = pyre_interpreter::baseobjspace::int_w(op_obj)?;
+    let op = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+        slot + 2,
+    ))?;
     if op < 0 {
         return Err(pyre_interpreter::PyError::type_error(
             "Invalid or missing argument 'op'",
         ));
     }
     let mut assoclen: i64 = -1;
+    let assoclen_obj = pyre_object::gc_roots::shadow_stack_get(slot + 4);
     if !assoclen_obj.is_null() && !unsafe { pyre_object::is_none(assoclen_obj) } {
-        assoclen = pyre_interpreter::baseobjspace::int_w(assoclen_obj)?;
+        assoclen = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 4,
+        ))?;
         if assoclen < 0 {
             return Err(pyre_interpreter::PyError::type_error(
                 "assoclen must be positive",
             ));
         }
     }
-    let flags =
-        libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(flags_obj)?).map_err(|_| {
-            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
-        })?;
+    let flags = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(
+        pyre_object::gc_roots::shadow_stack_get(slot + 5),
+    )?)
+    .map_err(|_| {
+        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+    })?;
 
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, msg, iv]);
-    let fd = socket_fd(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let fd = socket_fd(pyre_object::gc_roots::shadow_stack_get(slot))?;
 
     let mut data_buffers: Vec<Vec<u8>> = Vec::new();
-    let msg = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
+    let msg = pyre_object::gc_roots::shadow_stack_get(slot + 1);
     if !msg.is_null() && !unsafe { pyre_object::is_none(msg) } {
         let data_items = pyre_interpreter::baseobjspace::unpackiterable(msg, -1)?;
         let items_base = pyre_object::gc_roots::pin_roots(&data_items);
@@ -3057,7 +3065,7 @@ fn sendmsg_afalg_w(
         rsocket_constant("ALG_SET_OP") as libc::c_int,
         pack_uint32(op).to_vec(),
     ));
-    let iv = pyre_object::gc_roots::shadow_stack_get(obj_slot + 2);
+    let iv = pyre_object::gc_roots::shadow_stack_get(slot + 3);
     if !iv.is_null() && !unsafe { pyre_object::is_none(iv) } {
         let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(iv)? else {
             return Err(pyre_interpreter::PyError::type_error(
@@ -3082,14 +3090,7 @@ fn sendmsg_afalg_w(
         ));
     }
 
-    let sent = unix_sendmsg(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        fd,
-        &mut data_buffers,
-        &cmsgs,
-        flags,
-        None,
-    )?;
+    let sent = unix_sendmsg(slot, fd, &mut data_buffers, &cmsgs, flags, None)?;
     Ok(pyre_object::w_int_new(sent as i64))
 }
 
@@ -4436,10 +4437,12 @@ fn pack_inet_addr(
         let slot = pyre_object::gc_roots::pin_roots(&pieces);
         let algtype = pyre_interpreter::baseobjspace::text_w(
             pyre_object::gc_roots::shadow_stack_get(slot),
-        )?;
+        )?
+        .to_owned();
         let algname = pyre_interpreter::baseobjspace::text_w(
             pyre_object::gc_roots::shadow_stack_get(slot + 1),
-        )?;
+        )?
+        .to_owned();
         if algtype.len() > 13 {
             return Err(pyre_interpreter::PyError::value_error(
                 "AF_ALG type too long.",
@@ -7047,14 +7050,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let addr = addr_storage
                     .as_ref()
                     .map(|s| (s as *const _ as *const libc::c_void, addr_len));
-                let sent = unix_sendmsg(
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    fd,
-                    &mut data_buffers,
-                    &cmsgs,
-                    flags,
-                    addr,
-                )?;
+                let sent = unix_sendmsg(obj_slot, fd, &mut data_buffers, &cmsgs, flags, addr)?;
                 Ok(pyre_object::w_int_new(sent as i64))
             })
         )
