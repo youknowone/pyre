@@ -71,17 +71,19 @@ pub fn genentry_green_hash(pycode: PyObjectRef) -> u64 {
     majit_metainterp::green_key_hash_typed(&[pycode as i64], &[GreenType::Ref])
 }
 
-/// `warmstate.py JitCell.get_jitcell`: resolve once and carry the cell key.
-/// `make_key` runs only when the bucket holds more than one cell.
+/// `warmstate.py JitCell.get_jitcell` / `_get_jitcell(create=False)`:
+/// resolve once and carry the cell key. `None` is a miss: this key owns
+/// no cell and its raw bucket hash belongs to a different cell. Readers
+/// treat that as a miss; writers call `ensure_cell_key`
+/// (`_ensure_jit_cell_at_key` / `jit_cell_at_key`).
 pub fn genentry_resolved_cell_key(
     warm: &majit_metainterp::warmstate::WarmEnterState,
     pycode: PyObjectRef,
-) -> u64 {
+) -> Option<u64> {
     let pin = majit_metainterp::GreenRefPin::pin_one(pycode as usize);
     let mut live = genentry_green_key(pin.live() as PyObjectRef);
-    let hash = live.get_uhash();
     pin.reload(&mut live);
-    warm.cell_key_for(&pin, &live).unwrap_or(hash)
+    warm.cell_key_for(&pin, &live)
 }
 
 /// Reds in merge-point bank order (red R: `gen`, `w_arg`).
@@ -197,13 +199,24 @@ mod tests {
         );
         assert_eq!(
             genentry_resolved_cell_key(&jd2, pycode),
-            minted,
+            Some(minted),
             "jd2 comparekey walks to the typed cell"
         );
         assert_eq!(
             genentry_resolved_cell_key(&portal, pycode),
-            hash,
+            Some(hash),
             "portal slot 0 has no genentry cell for these greens"
+        );
+        let mut collision_only = WarmEnterState::new(1039);
+        {
+            let pin = majit_metainterp::GreenRefPin::pin(&squatter);
+            let mut live = pin.live_clone(&squatter);
+            collision_only.disable_noninlinable_function_for_key(&pin, &mut live);
+        }
+        assert_eq!(
+            genentry_resolved_cell_key(&collision_only, pycode),
+            None,
+            "a colliding occupant without this key's cell is a miss"
         );
     }
 

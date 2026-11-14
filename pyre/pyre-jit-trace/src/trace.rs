@@ -1248,7 +1248,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
             meta,
             &flush_committed,
             sym,
-            pyre_object::gc_roots::shadow_stack_get(trace_code_slot) as *const (),
+            trace_code_slot,
             start_pc,
             cf_addr,
             carrier,
@@ -1752,14 +1752,24 @@ fn record_carrier_crossed_frame_traceback(
     if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
         return true;
     }
+    let tb_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = tb_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
     let w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe);
     if w_globals.is_null() {
         return false;
     }
+    // The recording hook and `const_ref` can collect. Pin the Ref operands
+    // before the first call (`gctransform/shadowstack.py` `push_roots`), and
+    // reload them from the pinned slots afterward.
+    let tb_base = tb_roots.pin_roots(&[
+        exc_ptr as pyre_object::PyObjectRef,
+        tb_roots.get(code_slot),
+        w_globals,
+    ]);
     majit_metainterp::record_inline_application_traceback_for_recording(
-        exc_ptr as usize as i64,
-        w_code as usize as i64,
-        w_globals as usize as i64,
+        tb_roots.get(tb_base) as usize as i64,
+        tb_roots.get(tb_base + 1) as i64,
+        tb_roots.get(tb_base + 2) as i64,
         recipe.jitcode_index,
         recipe.jitcode_pc,
     );
@@ -1767,12 +1777,8 @@ fn record_carrier_crossed_frame_traceback(
     if hook.is_null() || exc.is_none() {
         return true;
     }
-    // `const_ref` interns and can collect. Pin both Ref operands before
-    // the first intern (`gctransform/shadowstack.py` `push_roots`).
-    let tb_roots = pyre_object::gc_roots::push_roots();
-    let tb_base = tb_roots.pin_roots(&[w_code as pyre_object::PyObjectRef, w_globals]);
-    let w_code_op = ctx.const_ref(tb_roots.get(tb_base) as i64);
-    let w_globals_op = ctx.const_ref(tb_roots.get(tb_base + 1) as i64);
+    let w_code_op = ctx.const_ref(tb_roots.get(tb_base + 1) as i64);
+    let w_globals_op = ctx.const_ref(tb_roots.get(tb_base + 2) as i64);
     let jitcode_op = ctx.const_int(i64::from(recipe.jitcode_index));
     let opcode_op = ctx.const_int(i64::from(recipe.jitcode_pc));
     ctx.call_void_typed_with_effect(
@@ -1908,7 +1914,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     meta: &mut MetaInterp<PyreMeta>,
     flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
@@ -2202,7 +2208,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             flush_committed,
             &session,
             sym,
-            w_code,
+            code_slot,
             root_pc,
             root_ec,
             root_ec_box,
@@ -2239,7 +2245,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             flush_committed,
             &session,
             sym,
-            w_code,
+            code_slot,
             root_pc,
             root_ec,
             root_ec_box,
@@ -2460,7 +2466,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
@@ -2490,7 +2496,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
                     flush_committed,
                     session,
                     sym,
-                    w_code,
+                    code_slot,
                     root_pc,
                     root_ec,
                     root_ec_box,
@@ -2504,7 +2510,15 @@ fn drive_middles_finishframe<Sym: WalkSym>(
             None => return None,
         }
     }
-    compile_root_from_carrier_result(meta, flush_committed, sym, w_code, root_pc, carrier, result)
+    compile_root_from_carrier_result(
+        meta,
+        flush_committed,
+        sym,
+        code_slot,
+        root_pc,
+        carrier,
+        result,
+    )
 }
 
 /// `pyjitpl.py finishframe_exception` over `middles` (a prefix of the
@@ -2521,7 +2535,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
@@ -2630,7 +2644,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                             flush_committed,
                             session,
                             sym,
-                            w_code,
+                            code_slot,
                             root_pc,
                             root_ec,
                             root_ec_box,
@@ -2680,7 +2694,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                         flush_committed,
                         session,
                         sym,
-                        w_code,
+                        code_slot,
                         root_pc,
                         root_ec,
                         root_ec_box,
@@ -2730,7 +2744,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
         meta,
         flush_committed,
         sym,
-        w_code,
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
         root_py_pc,
         cf_addr,
         WalkJournals::Keep,
@@ -2748,7 +2762,7 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     meta: &mut MetaInterp<PyreMeta>,
     flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
-    w_code: *const (),
+    code_slot: usize,
     root_pc: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
     result: majit_ir::OpRef,
@@ -2768,7 +2782,7 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
         meta,
         flush_committed,
         sym,
-        w_code,
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
         root_py_pc,
         cf_addr,
         WalkJournals::Keep,
