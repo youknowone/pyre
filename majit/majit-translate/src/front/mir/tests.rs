@@ -31204,6 +31204,89 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
     );
 }
 
+/// `Wtf8CodePoints::nth(s, n)` is `rutf8.py` `next_codepoint_pos` /
+/// `codepoint_at_pos` via the minted `ll_wtf8_nth` helper, not a residual
+/// 2-segment FunctionPath.
+#[test]
+fn wtf8_code_points_nth_lowers_to_minted_helper() {
+    use crate::front::wtf8_nth::LL_WTF8_NTH;
+    use crate::model::{CallTarget, OpKind};
+    let s_ty = interior_adt(1);
+    let n_ty = interior_usize();
+    let cp_ty = interior_adt(1);
+    let opt_ty = option_adt_node(0, cp_ty);
+    let wtf8 = interior_struct(
+        1,
+        &["rustpython_wtf8", "CodePoint"],
+        &[("value", interior_u32())],
+        4,
+        &[0],
+        false,
+    );
+    let nth = interior_opaque(
+        1,
+        &["rustpython_wtf8", "Wtf8CodePoints", "nth"],
+        vec![s_ty.clone(), n_ty.clone()],
+        opt_ty.clone(),
+    );
+    let caller = interior_caller(
+        "nth_site",
+        2,
+        vec![s_ty.clone(), n_ty.clone()],
+        opt_ty.clone(),
+        vec![
+            interior_local(0, None, &opt_ty),
+            interior_local(1, Some("s"), &s_ty),
+            interior_local(2, Some("n"), &n_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &s_ty)),
+                        interior_copy(interior_place(2, &n_ty)),
+                    ],
+                    interior_place(0, &opt_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), wtf8], vec![caller, nth]);
+    let graph = lower_interior(&llbc, "nth_site");
+    let paths: Vec<Vec<&str>> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.iter().map(String::as_str).collect()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|segments| segments.as_slice() == ["Wtf8CodePoints", "nth"]
+                || segments.last() == Some(&"nth")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))),
+        "nth must not survive as a FunctionPath: {paths:#?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
+        "call site calls the minted helper: {paths:#?}"
+    );
+}
+
 /// `PyError(ptr)` is the payload pointer. Construction peels to that
 /// word; `retag_error_carrier` recasts once to the handle class
 /// (`error::PyError`). No FieldWrite / synthetic ctor.

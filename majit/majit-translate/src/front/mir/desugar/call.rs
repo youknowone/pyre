@@ -6468,6 +6468,26 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Wtf8CodePoints::nth(s, n)` — receiver already aliased to
+                // the string by the `code_points` arm. `unicodeobject.py`
+                // `_index_to_byte` without index storage: the minted
+                // helper steps with `rutf8.py` `next_codepoint_pos` then
+                // `codepoint_at_pos`. Dest `Option` is the same tagged
+                // construction `slice_first` / `str.find` mint from
+                // `resolve_option_dest_owners`.
+                if args.len() == 2
+                    && segments.last().is_some_and(|leaf| leaf == "nth")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))
+                    && self.try_lower_wtf8_code_points_nth(
+                        mir_bb,
+                        &args,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
                 // `&a == &b` / `&a != &b` on two string-family references
                 // (`&Wtf8`, `&str`, `&String`) resolves to the blanket
                 // `impl PartialEq<&B> for &A` (`core::cmp::impls`), whose body
@@ -10590,6 +10610,118 @@ fn passes_attr_as_rust_heap(formal: Option<&TyRef>, place: Option<&TyRef>, llbc:
 }
 
 impl Lowering<'_> {
+    /// `Wtf8CodePoints::nth(s, n)` → look-inside `ll_wtf8_nth` then dest
+    /// `Option` (`unicodeobject.py` `_index_to_byte`, `rutf8.py`
+    /// `next_codepoint_pos` / `codepoint_at_pos`). `None` when `n` is at
+    /// or past the code-point count. Declines when dest is not a
+    /// resolvable `Option` (residual `nth` stays).
+    fn try_lower_wtf8_code_points_nth(
+        &mut self,
+        mir_bb: usize,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some((option_owner, some_owner, payload_ty)) = self.resolve_option_dest_owners(dest_ty)
+        else {
+            return Ok(false);
+        };
+        let payload_struct = self.nth_payload_struct(dest_ty);
+        let bb_id = self.emit_bb(mir_bb);
+        let cp = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(cp.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([crate::front::wtf8_nth::LL_WTF8_NTH]),
+                args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        let neg1 = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(neg1.clone()),
+            kind: OpKind::ConstInt(-1),
+        });
+        let found = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(found.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: cp.clone(),
+                rhs: neg1,
+                result_ty: ValueType::Bool,
+            },
+        });
+        let option_owner_some = option_owner.clone();
+        let some_owner_some = some_owner.clone();
+        let payload_ty_some = payload_ty.clone();
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            found,
+            false,
+            false,
+            std::slice::from_ref(&cp),
+            &[],
+            move |this, some_bb, mapped| {
+                let payload = crate::front::wtf8_nth::emit_nth_payload(
+                    &mut this.graph,
+                    some_bb,
+                    mapped[0].clone(),
+                    &payload_ty_some,
+                    payload_struct.as_ref().map(|(owner, _)| owner.as_str()),
+                    payload_struct.as_ref().map(|(_, field)| field.as_str()),
+                );
+                crate::front::option_variant::emit_option_variant(
+                    &mut this.graph,
+                    some_bb,
+                    &option_owner_some,
+                    1,
+                    Some((some_owner_some.as_str(), payload, payload_ty_some.clone())),
+                )
+            },
+            move |this, none_bb, _| {
+                crate::front::option_variant::emit_option_variant(
+                    &mut this.graph,
+                    none_bb,
+                    &option_owner,
+                    0,
+                    None,
+                )
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Unique sized field of dest `Option<T>` when `T` is a one-field
+    /// integer struct (`CodePoint.value`). `None` for a scalar payload.
+    fn nth_payload_struct(&self, dest_ty: &TyRef) -> Option<(String, String)> {
+        let body = match dest_ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        let inner = type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+            .get("types")?
+            .get(0)?;
+        let inner_ty = TyRef::Other(inner.clone());
+        let def_id = self.tyref_adt_def_id(&inner_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let (_, field) = unique_nonzst_field(td, self.llbc)?;
+        let owner = strip_crate_prefix(&td.item_meta.name_path_str());
+        if owner.is_empty() {
+            return None;
+        }
+        Some((owner, field))
+    }
+
     /// `vec![e0, …, eN-1]` → `ll_vec_newlist_{kind}(N)` +
     /// `ll_vec_setitem_fast_{kind}` per item (`rlist.py` `rtype_newlist`).
     /// The leftover `new_uninit` box and Array ctor are swept by
