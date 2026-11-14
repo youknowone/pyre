@@ -1,10 +1,10 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use majit_ir::operand::Operand;
-use majit_ir::{InputArg, OpCode, OpRc, OpRef, Type};
 #[cfg(test)]
-use majit_ir::{OPCODE_COUNT, Value};
+use majit_ir::OPCODE_COUNT;
+use majit_ir::operand::Operand;
+use majit_ir::{InputArg, OpCode, OpRc, OpRef, Type, Value};
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU32, Ordering};
 
