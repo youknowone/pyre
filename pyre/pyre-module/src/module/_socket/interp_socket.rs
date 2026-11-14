@@ -3004,17 +3004,24 @@ fn sendmsg_afalg_w(
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::pin_roots(&[obj, msg, op_obj, iv, assoclen_obj, flags_obj]);
 
+    // `unwrap_spec(op=int, flags=int)`: the gateway converts op, then flags,
+    // before the body runs. Default op `-1` is the missing-op sentinel.
+    let op = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+        slot + 2,
+    ))?;
+    let flags = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(
+        pyre_object::gc_roots::shadow_stack_get(slot + 5),
+    )?)
+    .map_err(|_| {
+        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+    })?;
+
     let family = socket_get_attr_i64(pyre_object::gc_roots::shadow_stack_get(slot), "_family");
     if family != majit_rlib::rsocket::af_alg() {
         return Err(pyre_interpreter::PyError::os_error(
             "algset is only supported for AF_ALG",
         ));
     }
-    // `unwrap_spec(op=int)` then `op < 0`. Default `-1` is the missing-op
-    // sentinel (`sendmsg_afalg_w`).
-    let op = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
-        slot + 2,
-    ))?;
     if op < 0 {
         return Err(pyre_interpreter::PyError::type_error(
             "Invalid or missing argument 'op'",
@@ -3032,12 +3039,6 @@ fn sendmsg_afalg_w(
             ));
         }
     }
-    let flags = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(
-        pyre_object::gc_roots::shadow_stack_get(slot + 5),
-    )?)
-    .map_err(|_| {
-        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
-    })?;
 
     let fd = socket_fd(pyre_object::gc_roots::shadow_stack_get(slot))?;
 
