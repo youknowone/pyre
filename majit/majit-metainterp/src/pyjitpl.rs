@@ -9606,7 +9606,7 @@ impl<M: Clone> MetaInterp<M> {
         // `_forwarded`. Cut: `cut_trace_from` remaps ops into a fresh
         // namespace, so no seed can resolve cut-op lookups anyway; an explicit
         // empty seed states that (producer lookup runs off new_operations /
-        // phase1_emit_ops / resop_refs).
+        // phase1_emit_ops).
         // Only the peeling arm below reads this seed. When the jitdriver's
         // `enable_opts` omits `unroll`, the optimize call is `InvalidLoop`
         // before it looks at any of `unroll_opt`, and the retry builds its own
