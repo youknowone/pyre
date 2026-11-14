@@ -530,15 +530,16 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
     pub(in crate::front::mir) result_exc_call_results: Vec<crate::front::result_exc::ResultExcCall>,
-    /// Result `Variable`s of `RBigInt::toint` / `i64::try_from(&RBigInt)`
-    /// intercepts retargeted to `jit_bigint_toint`. The OverflowError rewrite
-    /// (`front::result_exc`) stamps `LastException` after the body lowers.
-    /// Sibling of [`Self::result_exc_call_results`]; `RBigIntError` is not
-    /// an [`crate::ErrorCarrierSpec`].
-    pub(in crate::front::mir) toint_call_results: Vec<(Variable, Option<String>, ValueType)>,
-    /// `Result<T, RBigIntError>::unwrap_or` sites fused onto the toint call's
-    /// OverflowError catch (`CarrierCatchKind::JoinDefault`).
-    pub(in crate::front::mir) toint_combinator_sites:
+    /// Fallible rbigint residual sites (`jit_bigint_toint` OverflowError,
+    /// division ZeroDivisionError). The rewrite (`front::result_exc`) stamps
+    /// `LastException` after the body lowers. Sibling of
+    /// [`Self::result_exc_call_results`]; `RBigIntError` is not an
+    /// [`crate::ErrorCarrierSpec`].
+    pub(in crate::front::mir) fallible_rbigint_sites:
+        Vec<crate::front::result_exc::FallibleRbigintSite>,
+    /// `Result<T, RBigIntError>::unwrap_or` sites fused onto the recorded
+    /// rbigint residual's typed catch (`CarrierCatchKind::JoinDefault`).
+    pub(in crate::front::mir) rbigint_combinator_sites:
         Vec<crate::front::result_exc::CarrierCombinatorSite>,
     /// Foreign `Option::ok_or_else(opt, closure)` results consumed immediately
     /// by `?`, recorded for the combined value-or-exception rewrite in
@@ -2199,8 +2200,8 @@ impl<'a> Lowering<'a> {
             string_array_view_locals: Vec::new(),
             numeric_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
-            toint_call_results: Vec::new(),
-            toint_combinator_sites: Vec::new(),
+            fallible_rbigint_sites: Vec::new(),
+            rbigint_combinator_sites: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
             carrier_combinator_sites: Vec::new(),
             result_map_err_sites: Vec::new(),

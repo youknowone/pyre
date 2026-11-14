@@ -384,7 +384,6 @@ spec_folds! {
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
-    SetAddMethod         => ("set_add_method",           "residual_call", "-"),
     StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),
     LoadAttr             => ("load_attr",                "residual_call", "-"),
     LoadAttrPureRead     => ("load_attr_pure_read",      "specialize",    "load_attr"),

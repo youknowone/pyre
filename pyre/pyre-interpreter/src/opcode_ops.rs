@@ -591,12 +591,19 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
                 ")"
             )));
         }
-        unsafe {
-            pyre_object::w_set_add(
+        // pyopcode.py MATCH_KEYS: space.call_method(w_seen, "add", w_key)
+        let status = unsafe {
+            pyre_object::setobject::w_set_add_checked(
                 pyre_object::gc_roots::shadow_stack_get(seen_slot),
                 pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
             )
         };
+        if status != pyre_object::setobject::SET_ADD_OK {
+            return Err(crate::baseobjspace::map_set_add_status(
+                pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
+                status,
+            ));
+        }
         let w_sentinel = pyre_object::gc_roots::shadow_stack_get(sentinel_slot);
         let w_value = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(subject_slot),
@@ -914,54 +921,30 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_exact_type(set, &pyre_object::setobject::SET_TYPE) {
-            // `IntegerSetStrategy.add` with `is_correct_type(w_key)`:
-            // `d[self.unwrap(w_key)] = None`. A plain int is stored unwrapped
-            // and needs no `try_hash_value` first. The helper reads the
-            // strategy under the set's stripe lock and answers -1 for any
-            // other.
-            if pyre_object::listobject::is_plain_int1(value) {
-                let status = pyre_object::setobject::jit_int_set_add(
-                    set,
-                    pyre_object::listobject::plain_int_w(value),
-                );
-                if status >= 0 {
-                    return Ok(());
-                }
-                if status == pyre_object::setobject::JIT_INT_SET_ADD_MEMORY {
-                    return Err(crate::runtime_ops::fetch_memory_error());
-                }
-            }
-            // `try_hash_value` may run a user `__hash__` that allocates and
-            // triggers a moving minor collection; `set`/`value` must be
-            // shadow-stack roots across it, then reloaded, or the store
-            // below can write through a relocated (stale) pointer.  Its
-            // digest keys the store, so the element is hashed once.  The
-            // slots are read back as `base + <literal>` through the scope,
-            // and the error arm is a `match`, not a closure, so the
-            // codewriter erases the bracket and the JIT inlines the body.
+            // `W_BaseSetObject.add` → `self.strategy.add(self, w_key)`.
+            // Root both operands before the collecting add; map errors from
+            // the reloaded element slot, not the pre-call local.
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
             let _ = roots.pin_root(set);
             let _ = roots.pin_root(value);
-            let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    return Err(crate::baseobjspace::wrap_set_element_hash_error(
-                        roots.get(base + 1),
-                        err,
-                    ));
-                }
-            };
-            pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
-                .map_err(crate::baseobjspace::map_set_update_error)?;
+            let status =
+                pyre_object::setobject::w_set_add_checked(roots.get(base), roots.get(base + 1));
+            if status == pyre_object::setobject::SET_ADD_OK {
+                Ok(())
+            } else {
+                Err(crate::baseobjspace::map_set_add_status(
+                    roots.get(base + 1),
+                    status,
+                ))
+            }
         } else {
-            return Err(PyError::type_error(format!(
+            Err(PyError::type_error(format!(
                 "'{}' object is not a set",
                 crate::display::type_fully_qualified_name_of(set),
-            )));
+            )))
         }
     }
-    Ok(())
 }
 
 /// SET_UPDATE — `set.update(iterable)` (or `list.extend` for the
@@ -1823,6 +1806,7 @@ mod tests {
 
     #[test]
     fn test_accumulator_helpers_reject_unhashable_values_without_inserting() {
+        crate::typedef::init_typeobjects();
         install_hash_hook();
 
         let key = pyre_object::w_list_new(vec![]);
@@ -1832,12 +1816,73 @@ mod tests {
         assert_eq!(map_err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(unsafe { w_dict_len(dict) }, 0);
 
+        let expected = "cannot use 'list' as a set element (unhashable type: 'list')";
         let value = pyre_object::w_list_new(vec![]);
         let set = pyre_object::w_set_new();
         let set_err =
             set_add_value(set, value).expect_err("SET_ADD should reject an unhashable element");
         assert_eq!(set_err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(set_err.message_text(), expected);
         assert_eq!(unsafe { w_set_len(set) }, 0);
+
+        let gateway_set = pyre_object::w_set_new();
+        let gateway_value = pyre_object::w_list_new(vec![]);
+        let gateway_err = crate::typedef::__majit_wrap_set_descr_add(&[gateway_set, gateway_value])
+            .expect_err("set.add should reject an unhashable element");
+        assert_eq!(gateway_err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(gateway_err.message_text(), expected);
+        assert_eq!(unsafe { w_set_len(gateway_set) }, 0);
+
+        let subclass = pyre_object::w_set_user_new_empty(
+            pyre_object::get_instantiate(&pyre_object::setobject::SET_TYPE),
+            false,
+        );
+        let subclass_value = pyre_object::w_list_new(vec![]);
+        let subclass_err = crate::typedef::__majit_wrap_set_descr_add(&[subclass, subclass_value])
+            .expect_err("subclass set.add should reject an unhashable element");
+        assert_eq!(subclass_err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(subclass_err.message_text(), expected);
+        assert_eq!(unsafe { w_set_len(subclass) }, 0);
+
+        use pyre_object::dictmultiobject::DictKeyError;
+        use pyre_object::setobject::SetUpdateError;
+        let item = pyre_object::w_list_new(vec![]);
+        crate::baseobjspace::set_pending_hash_error(crate::PyError::type_error("eq boom"));
+        let eq_mapped =
+            crate::baseobjspace::map_set_add_error(item, SetUpdateError::Key(DictKeyError));
+        assert_eq!(eq_mapped.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(eq_mapped.message_text(), "eq boom");
+
+        crate::baseobjspace::set_pending_dict_hash_error(crate::PyError::type_error("hash boom"));
+        let hash_mapped =
+            crate::baseobjspace::map_set_add_error(item, SetUpdateError::Hash(DictKeyError));
+        assert_eq!(hash_mapped.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            hash_mapped.message_text(),
+            "cannot use 'list' as a set element (hash boom)"
+        );
+
+        crate::baseobjspace::set_pending_dict_hash_error(crate::PyError::value_error("hash boom"));
+        let value_mapped =
+            crate::baseobjspace::map_set_add_error(item, SetUpdateError::Hash(DictKeyError));
+        assert_eq!(value_mapped.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(value_mapped.message_text(), "hash boom");
+
+        let mut subclass_type_error = crate::PyError::type_error("hash boom");
+        subclass_type_error.set_exc_object(pyre_object::w_list_new(vec![]));
+        crate::baseobjspace::set_pending_dict_hash_error(subclass_type_error);
+        let subclass_mapped =
+            crate::baseobjspace::map_set_add_error(item, SetUpdateError::Hash(DictKeyError));
+        assert_eq!(subclass_mapped.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(subclass_mapped.message_text(), "hash boom");
+
+        let leftover =
+            crate::baseobjspace::map_set_add_error(item, SetUpdateError::Key(DictKeyError));
+        assert_eq!(leftover.message_text(), "unhashable type");
+
+        let ok = pyre_object::w_set_new();
+        set_add_value(ok, w_int_new(1)).expect("successful add after mapped errors");
+        assert_eq!(unsafe { w_set_len(ok) }, 1);
     }
 
     /// SET_UPDATE (`set.update(iterable)`) rejects an unhashable element

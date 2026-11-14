@@ -180,6 +180,34 @@ pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyEr
             PyError::runtime_error("Set changed size during iteration")
         }
         pyre_object::setobject::SetUpdateError::Memory => crate::runtime_ops::fetch_memory_error(),
+        pyre_object::setobject::SetUpdateError::Hash(_) => take_pending_hash_error(),
+    }
+}
+
+/// Ordinary add's error mapper: wrap only an incoming-element hash failure.
+/// Equality's exact TypeError passes through [`map_set_update_error`] unwrapped.
+pub fn map_set_add_error(
+    item: PyObjectRef,
+    err: pyre_object::setobject::SetUpdateError,
+) -> PyError {
+    match err {
+        pyre_object::setobject::SetUpdateError::Hash(_) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.base();
+            let _ = roots.pin_root(item);
+            let err = take_pending_hash_error();
+            wrap_set_element_hash_error(roots.get(base), err)
+        }
+        err => map_set_update_error(err),
+    }
+}
+
+/// [`w_set_add_checked`](pyre_object::setobject::w_set_add_checked) word
+/// status into the Python exception [`map_set_add_error`] would produce.
+pub fn map_set_add_status(item: PyObjectRef, status: i64) -> PyError {
+    match pyre_object::setobject::set_update_error_from_status(status) {
+        Some(err) => map_set_add_error(item, err),
+        None => PyError::runtime_error("set add status 0"),
     }
 }
 
@@ -10884,9 +10912,30 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
     let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    // baseobjspace.py — an exact int returns directly.
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
+    // baseobjspace.py `W_Root.int` — an exact int returns directly
+    // (`space.is_w(space.type(w_result), space.w_int)`). `StdObjSpace.type`
+    // is `promote(__class__); getclass`. Both `INT_TYPE` and `LONG_TYPE`
+    // instantiate `space.w_int`; `INT_TYPE` has `_getusercls` (`INT_USER_TYPE`),
+    // so the typeptr test is that identity. A helper (`typedef::type` /
+    // `is_exact_type`) is its own RandomEffects jitcode and cannot residualize
+    // after `get_and_call_function` in a numbered helper.
+    // `get_and_call_function` returned a live object: a null check here
+    // becomes `goto_if_not_ptr_iszero` and a GuardNonnull the numbered helper
+    // cannot snapshot after that residual.
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::INT_TYPE),
+        )
+    } {
+        return Ok(w_result);
+    }
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::LONG_TYPE),
+        )
+    } {
         return Ok(w_result);
     }
     // baseobjspace.py — a strict int subclass is accepted for now,
@@ -18218,8 +18267,30 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
     let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
+    // descroperation.py `_index`: `space.is_w(space.type(w_result),
+    // space.w_int)`. `StdObjSpace.type` is `promote(__class__); getclass`.
+    // Both `INT_TYPE` and `LONG_TYPE` instantiate `space.w_int`; `INT_TYPE`
+    // has `_getusercls` (`INT_USER_TYPE`), so the typeptr test is that
+    // identity. A helper (`typedef::type` / `is_exact_type`) is its own
+    // RandomEffects jitcode and cannot residualize after
+    // `get_and_call_function` in a numbered helper.
+    // `get_and_call_function` returned a live object: a null check here
+    // becomes `goto_if_not_ptr_iszero` and a GuardNonnull the numbered helper
+    // cannot snapshot after that residual.
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::INT_TYPE),
+        )
+    } {
+        return Ok(w_result);
+    }
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::LONG_TYPE),
+        )
+    } {
         return Ok(w_result);
     }
     if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }

@@ -33865,37 +33865,27 @@ fn set_op_inplace_xor(
 /// as a generic `bh_call_fn` residual, while the `SET_ADD` opcode the same
 /// operation reaches from a set comprehension lowers to the direct `set_add`
 /// helper. Publishing the descriptor below gives the source translator the
-/// candidate graph and lets the call descend to `w_set_add_hashed_checked`,
-/// the way upstream's tracer descends through `descr_add` into
-/// `W_BaseSetObject.add`.
+/// candidate graph and lets the call descend to `w_set_add_checked` /
+/// `SetStrategy.add(w_key)`, the way upstream's tracer descends through
+/// `descr_add` into `W_BaseSetObject.add`.
 pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_set_receiver(args, "add", true)?;
     crate::type_methods::arity_exact(args, "add", 1)?;
-    // `try_hash_value` may run a user `__hash__` that allocates and triggers
-    // a moving minor collection; root `self` and the element across it, then
-    // reload. Its digest keys the store, so the element is hashed once. The
-    // slots are read back as `base + <literal>` through the scope and the
-    // error arm is a `match`, not a closure, so the codewriter erases the
-    // bracket (as in `set_add_value`).
-    unsafe {
-        let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.base();
-        let (w_set, w_elem) = (args[0], args[1]);
-        let _ = roots.pin_root(w_set);
-        let _ = roots.pin_root(w_elem);
-        let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
-            Ok(hash) => hash,
-            Err(err) => {
-                return Err(crate::baseobjspace::wrap_set_element_hash_error(
-                    roots.get(base + 1),
-                    err,
-                ));
-            }
-        };
-        pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
-            .map_err(crate::baseobjspace::map_set_update_error)?;
+    let (w_set, w_elem) = (args[0], args[1]);
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(w_set);
+    let _ = roots.pin_root(w_elem);
+    let status =
+        unsafe { pyre_object::setobject::w_set_add_checked(roots.get(base), roots.get(base + 1)) };
+    if status == pyre_object::setobject::SET_ADD_OK {
+        Ok(pyre_object::w_none())
+    } else {
+        Err(crate::baseobjspace::map_set_add_status(
+            roots.get(base + 1),
+            status,
+        ))
     }
-    Ok(pyre_object::w_none())
 }
 
 crate::builtin_wrapper_descriptor!(

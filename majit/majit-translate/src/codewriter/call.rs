@@ -10126,12 +10126,19 @@ impl CallControl {
             .map(|s| s.to_string())
             .unwrap_or_else(|| declared.clone());
         let kind = return_type_string_to_value_type(Some(&effective));
+        // `history.py getkind`: the register bank follows the pointee's gckind.
+        // An rstr result stays ref even when its Rust newtype wrapper has a raw
+        // nominal layout (`translator::rtyper::cutover::declared_return_annotation`
+        // gives string-result metadata the same precedence).
+        let returns_str =
+            graph.return_is_str || effective == crate::translator::rtyper::cutover::STR_RETURN_TYPE;
         // Use the same declared repr as the annotator. A headerless native
         // layout alone does not make a nominal instance a raw-word owner.
         // Intern of `*mut T` whose projector is `SomePtr` is int
         // (`history.getkind`); a classed T stays Ref. The frontend token
         // stays `"ref"`.
         if kind == Type::Ref
+            && !returns_str
             && graph.return_class_root.as_deref().is_some_and(|root| {
                 crate::annotator::bookkeeper::raw_struct_ptr_from_layout(
                     &self.struct_fields,
@@ -24686,6 +24693,58 @@ mod tests {
             FunctionGraph::concretetype_of(&result),
             crate::model::ConcreteType::Signed
         );
+
+        // (b) The explicit string-result token stays ref even with the Raw
+        // class root still set and `return_is_str` false.
+        let path_str = CallPath::from_segments(["raw_str_key_new"]);
+        let target_str = CallTarget::function_path(["raw_str_key_new"]);
+        let mut graph_str = simple_graph("raw_str_key_new")
+            .with_return_type(crate::translator::rtyper::cutover::STR_RETURN_TYPE);
+        graph_str.return_class_root = Some(owner.to_string());
+        graph_str.return_is_str = false;
+        graph_str.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path_str.clone(), graph_str);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target_str),
+            Some(Type::Ref)
+        );
+        assert_eq!(cc.declared_return_kind(&path_str), Some('r'));
+        assert_eq!(cc.declared_result_argclass(&path_str), Some('r'));
+        let descr_str = cc.getcalldescr(
+            &direct_call_op(target_str),
+            vec![],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr_str.result_ir_type(), Type::Ref);
+
+        // (c) `return_is_str` keeps a declared `ref` in the ref bank.
+        let path_rstr = CallPath::from_segments(["raw_rstr_new"]);
+        let target_rstr = CallTarget::function_path(["raw_rstr_new"]);
+        let mut graph_rstr = simple_graph("raw_rstr_new").with_return_type("ref");
+        graph_rstr.return_class_root = Some(owner.to_string());
+        graph_rstr.return_is_str = true;
+        graph_rstr.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path_rstr.clone(), graph_rstr);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target_rstr),
+            Some(Type::Ref)
+        );
+        assert_eq!(cc.declared_return_kind(&path_rstr), Some('r'));
+        assert_eq!(cc.declared_result_argclass(&path_rstr), Some('r'));
+        let descr_rstr = cc.getcalldescr(
+            &direct_call_op(target_rstr),
+            vec![],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr_rstr.result_ir_type(), Type::Ref);
     }
 
     #[test]

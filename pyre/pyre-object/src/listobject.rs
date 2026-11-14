@@ -414,7 +414,7 @@ impl W_ListObject {
         match self.strategy {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
-            ListStrategy::Object => self.length_relaxed(),
+            ListStrategy::Object => ll_list_obj_length(self),
             // rlist.py `ll_length` is the `list.int_len` / `list.float_len` /
             // `list.bytes_len` / `list.ascii_len` oopspec leaf.  Keep that call
             // boundary: jtransform lowers the nested `<strategy>_items.len` path
@@ -3265,6 +3265,11 @@ pub unsafe fn w_list_getslice(
 // `ll_getitem_fast`/`ll_setitem_fast` in rlist.py.
 
 /// `ll_length` for the Integer strategy (rlist.py `'list.len(l)'`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_i(int_items.len)`. rustc otherwise
+/// inlines the load as `FieldRead(len)` on the nested `IntArray`.
+#[inline(never)]
 #[majit_macros::oopspec("list.int_len(l)")]
 pub fn ll_list_int_length(l: &W_ListObject) -> usize {
     l.int_items.len()
@@ -3485,6 +3490,10 @@ pub unsafe fn ll_list_int_resize_le(obj: PyObjectRef, newsize: usize, empty_clea
 // `GetfieldGcI(float_items.len)` (see float_array.rs).
 
 /// `ll_length` for the Float strategy (rlist.py `'list.len(l)'`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_i(float_items.len)`.
+#[inline(never)]
 #[majit_macros::oopspec("list.float_len(l)")]
 pub fn ll_list_float_length(l: &W_ListObject) -> usize {
     l.float_items.len()
@@ -3698,6 +3707,10 @@ pub unsafe fn ll_list_float_resize_le(obj: PyObjectRef, newsize: usize, empty_cl
 
 /// `ll_length` for the Object strategy: the live `length` header
 /// (rlist.py:116 `l.length`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_i(length)`.
+#[inline(never)]
 #[majit_macros::oopspec("list.obj_len(l)")]
 pub fn ll_list_obj_length(l: &W_ListObject) -> usize {
     l.length_relaxed()
@@ -3719,6 +3732,10 @@ pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
 
 /// `ll_length` for BytesListStrategy. The length word sits at the same
 /// offset as `bytes_items`; the oopspec reads that word.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_i(bytes_items.len)`.
+#[inline(never)]
 #[majit_macros::oopspec("list.bytes_len(l)")]
 pub fn ll_list_bytes_length(l: &W_ListObject) -> usize {
     l.bytes_items.len()
@@ -3783,6 +3800,10 @@ pub fn ll_list_bytes_set_len(l: &mut W_ListObject, n: usize) {
 
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_i(ascii_items.len)`.
+#[inline(never)]
 #[majit_macros::oopspec("list.ascii_len(l)")]
 pub fn ll_list_ascii_length(l: &W_ListObject) -> usize {
     l.ascii_items.len()
@@ -4546,7 +4567,12 @@ pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) ->
 unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     let count = count as usize;
     if count == 0 {
-        return std::ptr::null_mut();
+        // rlist.py `_ll_prebuilt_empty_array`: `ll_newlist(0)` mallocs a
+        // length-0 items array, never a null. A null dest made the slice
+        // helper's `dest.is_null()` a GuardNonNull after `ll_arraycopy`,
+        // and numbering that guard after the applied residual aborted
+        // BINARY_SLICE (`ll_listslice_startstop` has no such test).
+        return crate::object_array::ll_prebuilt_empty_int_items_block();
     }
     typed_ll_newlist(count, gc_int_array_gc_type_id())
 }
@@ -4574,7 +4600,7 @@ unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
 unsafe fn float_ll_newlist(count: i64) -> *mut FloatItemsBlock {
     let count = count as usize;
     if count == 0 {
-        return std::ptr::null_mut();
+        return crate::object_array::ll_prebuilt_empty_float_items_block() as *mut FloatItemsBlock;
     }
     typed_ll_newlist(count, gc_float_array_gc_type_id()) as *mut FloatItemsBlock
 }
@@ -4648,30 +4674,25 @@ pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize
     let _obj = crate::gc_roots::pin_root(obj);
     let dest = int_ll_newlist(n as i64);
     let dest_slot = crate::gc_roots::shadow_stack_len();
-    // Pin even a null dest so both CFG arms share one shadow-stack
-    // depth; `shadow_stack_erase` refuses a merge that disagrees.
     let _ = crate::gc_roots::pin_root(dest as PyObjectRef);
     if n > 0 && crate::gc_hook::gc_alloc_failed_pending() && dest.is_null() {
         return crate::PY_NULL;
     }
-    if n > 0 {
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.
-        let src = ll_list_int_items(&*(obj as *const W_ListObject));
-        let dest_now = crate::gc_roots::shadow_stack_get(dest_slot);
-        crate::object_array::ll_arraycopy_int_items_block(
-            src,
-            dest_now as *mut TypedItemsBlock,
-            start as i64,
-            0,
-            n as i64,
-        );
-    }
-    let dest_now = if dest.is_null() {
-        std::ptr::null_mut()
-    } else {
-        crate::gc_roots::shadow_stack_get(dest_slot) as *mut TypedItemsBlock
-    };
+    // rlist.py `ll_listslice_startstop`: always `ll_newlist` then
+    // `ll_arraycopy`, including length 0 (`rgc.ll_arraycopy` is a no-op
+    // then). A `dest.is_null()` / `n > 0` split after those residuals
+    // recorded GuardNonNull the numbered helper could not resume.
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let src = ll_list_int_items(&*(obj as *const W_ListObject));
+    let dest_now = crate::gc_roots::shadow_stack_get(dest_slot);
+    crate::object_array::ll_arraycopy_int_items_block(
+        src,
+        dest_now as *mut TypedItemsBlock,
+        start as i64,
+        0,
+        n as i64,
+    );
+    let dest_now = crate::gc_roots::shadow_stack_get(dest_slot) as *mut TypedItemsBlock;
     w_list_adopt_int_items(dest_now, n)
 }
 

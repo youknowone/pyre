@@ -11,7 +11,9 @@
 //! and `ObjectSetStrategy` otherwise. `ObjectSetStrategy` stores `ObjectKey`
 //! in an [`rordereddict`] and reuses the dict object strategy's hashing and
 //! equality. `IdentitySetStrategy` stores the object itself
-//! ([`IdentitySetKey`]), plus the `hash_w` digest from insertion.
+//! ([`IdentitySetKey`]), plus insertion metadata: ordinary add uses
+//! `typedef.py default_identity_hash` (`identity ^ (identity >> 4)`);
+//! a digest-owning insert keeps the supplied hash.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -191,6 +193,52 @@ pub enum SetUpdateError {
     /// Collector allocation failed during `ll_dict_setitem` growth or
     /// `ll_dict_copy`. The pending exception is still in the shared channel.
     Memory,
+    /// Failure hashing the incoming wrapped element during ordinary add.
+    /// Probe/equality failure and hashing a previously stored key during a
+    /// strategy switch stay [`Self::Key`].
+    Hash(crate::dictmultiobject::DictKeyError),
+}
+
+/// Word status of [`SetStrategy::add`] / [`w_set_add_checked`].
+///
+/// `setobject.py SetStrategy.add` returns `None`; a raise is
+/// `exceptiontransform.py` `exc_data`. rustc `Result<(), SetUpdateError>` is
+/// a 1-byte enum, so a residual CALL of the vtable slot cannot return the
+/// interned Result shell jitcode GETFIELDs. These Signed codes are that
+/// return word instead. After descent the Integer path is constant
+/// [`SET_ADD_OK`].
+pub const SET_ADD_OK: i64 = 0;
+pub const SET_ADD_KEY: i64 = -1;
+pub const SET_ADD_CHANGED_SIZE: i64 = -2;
+pub const SET_ADD_MEMORY: i64 = -3;
+pub const SET_ADD_HASH: i64 = -4;
+
+fn set_update_status(err: SetUpdateError) -> i64 {
+    match err {
+        SetUpdateError::Key(_) => SET_ADD_KEY,
+        SetUpdateError::ChangedSize => SET_ADD_CHANGED_SIZE,
+        SetUpdateError::Memory => SET_ADD_MEMORY,
+        SetUpdateError::Hash(_) => SET_ADD_HASH,
+    }
+}
+
+fn set_add_status(result: Result<(), SetUpdateError>) -> i64 {
+    match result {
+        Ok(()) => SET_ADD_OK,
+        Err(err) => set_update_status(err),
+    }
+}
+
+/// Reconstruct the status word. `0` is success.
+pub fn set_update_error_from_status(status: i64) -> Option<SetUpdateError> {
+    match status {
+        SET_ADD_OK => None,
+        SET_ADD_KEY => Some(SetUpdateError::Key(crate::dictmultiobject::DictKeyError)),
+        SET_ADD_CHANGED_SIZE => Some(SetUpdateError::ChangedSize),
+        SET_ADD_MEMORY => Some(SetUpdateError::Memory),
+        SET_ADD_HASH => Some(SetUpdateError::Hash(crate::dictmultiobject::DictKeyError)),
+        _ => Some(SetUpdateError::Key(crate::dictmultiobject::DictKeyError)),
+    }
 }
 
 /// `setobject.py SetStrategy`. `EmptySetStrategy`, `BytesSetStrategy`,
@@ -213,15 +261,14 @@ pub trait SetStrategy {
     /// `w_set` must point at a valid `W_SetObject`.
     unsafe fn length(&self, w_set: PyObjectRef) -> usize;
 
-    /// `SetStrategy.add`. `key` already carries `space.hash_w`.
+    /// `SetStrategy.add`. `w_key` is the wrapped element
+    /// (`setobject.py SetStrategy.add` / `W_BaseSetObject.add`).
+    /// Returns [`SET_ADD_OK`] or a negative [`SetUpdateError`] code: the
+    /// Signed word a residual CALL of this slot can return.
     ///
     /// # Safety
     /// `w_set` must point at a valid `W_SetObject`. Caller holds `w_set_lock`.
-    unsafe fn add(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<(), SetUpdateError>;
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64;
 
     /// `SetStrategy.remove`. A removal that empties the live set calls
     /// `W_BaseSetObject.switch_to_empty_strategy` (`W_SetObject._discard_from_set`).
@@ -534,10 +581,9 @@ define_prebuilt_set_strategy_ref!(
 
 /// Python set object.
 ///
-/// Layout: `[ob_header | sstorage | strategy | len | hash | set_id | content_gen | lifeline]`,
+/// Layout: `[ob_header | sstorage | strategy | len | hash | lifeline]`,
 /// the `W_BaseSetObject` slots `sstorage` and `strategy` (`setobject.py`) plus
-/// the atomic count, the frozenset hash cache, and the two words the integer
-/// `add` hit guard reads. `sstorage` is the erased box;
+/// the atomic count and the frozenset hash cache. `sstorage` is the erased box;
 /// [`SetItemsStorage`] (`ObjectSetStrategy.unerase`), [`IntSetStorage`]
 /// (`IntegerSetStrategy.unerase`), [`BytesSetStorage`]
 /// (`BytesSetStrategy.unerase`), [`AsciiSetStorage`]
@@ -572,14 +618,6 @@ pub struct W_SetObject {
     pub len: AtomicUsize,
     /// setobject.py `W_FrozensetObject.hash = DEFAULT_HASH`.
     pub hash: i64,
-    /// Identity assigned once by [`fresh_set_id`]. A nursery collection
-    /// moves the object address; this word does not.
-    pub set_id: usize,
-    /// Bumped by [`W_SetObject::set_len_relaxed`] and [`set_write_barrier`]
-    /// when membership or storage changes. A plain-int `add` that finds the
-    /// key already stored does not reach either, so the word stays put.
-    /// Relaxed, same as `len`.
-    pub content_gen: AtomicUsize,
     /// `setobject.py W_BaseSetObject` `_lifeline_` methods. Exact `set` and
     /// `frozenset` instances store the lifeline here; a `_getusercls` subclass
     /// keeps this null and uses `MapdictWeakrefSupport`.
@@ -593,29 +631,10 @@ impl W_SetObject {
         self.len.load(Ordering::Relaxed)
     }
 
-    /// `FT_ATOMIC_STORE_SSIZE_RELAXED(so->used, n)`. Also bumps
-    /// [`Self::content_gen`]: every length publish is a membership change.
+    /// `FT_ATOMIC_STORE_SSIZE_RELAXED(so->used, n)`.
     #[inline]
     pub fn set_len_relaxed(&self, n: usize) {
         self.len.store(n, Ordering::Relaxed);
-        self.bump_content_gen();
-    }
-
-    /// Relaxed load of [`Self::content_gen`].
-    #[inline]
-    pub fn content_gen_relaxed(&self) -> usize {
-        self.content_gen.load(Ordering::Relaxed)
-    }
-
-    /// Advance [`Self::content_gen`] by one. Load then store, not
-    /// `fetch_add`: `len` already rtypes those two atomics. Under the stripe
-    /// lock the pair is race-free for this set. Two racers that both store
-    /// the same successor still move the word off the value a hit guard
-    /// traced, so the guard fails closed.
-    #[inline]
-    fn bump_content_gen(&self) {
-        let n = self.content_gen.load(Ordering::Relaxed);
-        self.content_gen.store(n.wrapping_add(1), Ordering::Relaxed);
     }
 }
 
@@ -747,9 +766,11 @@ impl crate::rordereddict::GcEntriesType for (crate::celldict::StrKey, ()) {
 }
 
 /// Identity-set key. Equality and the table hash are the object pointer,
-/// the same contract as [`crate::identitydict::IdentityKey`]. `hash` is the
-/// `hash_w` digest captured at insertion, the word [`crate::dictmultiobject::ObjectKey`]
-/// already keeps, so [`SetStrategy::stored_hashes`] does not call `hash_w` again.
+/// the same contract as [`crate::identitydict::IdentityKey`]. `hash` is
+/// insertion metadata used by stored_hashes / iterkeys_with_hash and merge:
+/// ordinary add fills `typedef.py default_identity_hash`; a digest-owning
+/// insert keeps the supplied word. [`SetStrategy::stored_hashes`] does not
+/// call `hash_w` again.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IdentitySetKey {
@@ -891,6 +912,11 @@ pub trait AbstractUnwrappedSetStrategy: Sized {
     unsafe fn is_correct_type(&self, w_key: PyObjectRef) -> bool;
     /// `unwrap`.
     unsafe fn unwrap(&self, w_key: PyObjectRef) -> Self::Key;
+    /// Ordinary add's unwrap. Identity overrides this to fill insertion
+    /// metadata; int/bytes/ascii keep [`Self::unwrap`].
+    unsafe fn unwrap_for_add(&self, w_key: PyObjectRef) -> Self::Key {
+        unsafe { self.unwrap(w_key) }
+    }
     /// `unwrap`, keeping `hash` when the key stores an insertion digest.
     /// Int, bytes, and ascii ignore `hash`.
     unsafe fn unwrap_with_hash(&self, w_key: PyObjectRef, hash: i64) -> Self::Key {
@@ -1185,6 +1211,8 @@ where
 }
 
 /// `W_BaseSetObject.switch_to_object_strategy` for an unwrapped set.
+/// The set is pinned in this function's own bracket, so the caller passes
+/// the object, not a slot index.
 ///
 /// `getdict_w` wraps each live key and `result[wrap(key)] = None` runs
 /// `hash_w` before `switch_to_object_strategy` assigns the object
@@ -1199,12 +1227,15 @@ where
 /// change, so the frozenset hash cache is left alone.
 unsafe fn unwrapped_switch_to_object<S>(
     strategy: &S,
-    set_slot: usize,
+    w_set: PyObjectRef,
 ) -> Result<(), crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
 {
+    let roots = crate::gc_roots::push_roots();
+    let set_slot = roots.base();
+    let _ = roots.pin_root(w_set);
     let snap = snap_entries(strategy, set_slot);
     let n = snap.live.len();
     let index_len = snap.index_len;
@@ -1265,34 +1296,38 @@ where
 }
 
 /// `AbstractUnwrappedSetStrategy.add`'s correct-type arm,
-/// `d[self.unwrap(w_key)] = None`, on the set pinned at `obj_slot`. The table
-/// insert may allocate (`ll_dict_setitem`), so the set is read back from its
-/// slot. A collector failure leaves the length unpublished.
+/// `d[self.unwrap(w_key)] = None`, on `w_set`, pinned in this function's own
+/// bracket. The table insert may allocate (`ll_dict_setitem`), so the set is
+/// read back from that bracket. A collector failure leaves the length
+/// unpublished.
 unsafe fn unwrapped_store<S>(
     strategy: &S,
-    obj_slot: usize,
+    w_set: PyObjectRef,
     unwrapped: S::Key,
 ) -> Result<(), SetUpdateError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
 {
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(w_set);
     let inserted = {
-        let set =
-            unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
+        let set = unsafe { &mut *(roots.get(base) as *mut W_SetObject) };
         unsafe { (*strategy.storage_ptr(set)).insert(unwrapped, ()).is_none() }
     };
     if crate::gc_hook::gc_alloc_failed_pending() {
         return Err(SetUpdateError::Memory);
     }
     if inserted {
-        publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(obj_slot));
+        publish_unwrapped_len(strategy, roots.get(base));
     }
     Ok(())
 }
 
-/// `AbstractUnwrappedSetStrategy.add`.
-unsafe fn unwrapped_add<S>(
+/// Digest-owning `AbstractUnwrappedSetStrategy.add`. Caller already holds
+/// the set lock and the `space.hash_w` digest.
+unsafe fn unwrapped_add_hashed<S>(
     strategy: &S,
     w_set: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
@@ -1309,18 +1344,57 @@ where
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
         let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, key.hash) };
-        unsafe { unwrapped_store(strategy, obj_slot, unwrapped)? };
+        unsafe {
+            unwrapped_store(
+                strategy,
+                crate::gc_roots::shadow_stack_get(obj_slot),
+                unwrapped,
+            )?
+        };
         return Ok(());
     }
-    // Wrong type: `switch_to_object_strategy`, then `w_set.add`.
+    // Wrong type: `switch_to_object_strategy`, then digest insertion.
     // `getdict_w` raises before the strategy word is published.
-    unwrapped_switch_to_object(strategy, obj_slot).map_err(SetUpdateError::Key)?;
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let key = crate::dictmultiobject::ObjectKey {
-        hash: key.hash,
-        obj: crate::gc_roots::shadow_stack_get(key_slot),
-    };
-    unsafe { (*(obj as *const W_SetObject)).strategy.add(obj, key) }
+    unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(obj_slot))
+        .map_err(SetUpdateError::Key)?;
+    set_insert_key_with_hash_unlocked(
+        crate::gc_roots::shadow_stack_get(obj_slot),
+        crate::dictmultiobject::ObjectKey {
+            hash: key.hash,
+            obj: crate::gc_roots::shadow_stack_get(key_slot),
+        },
+    )
+}
+
+/// `AbstractUnwrappedSetStrategy.add`. Correct-type unwrap/store before
+/// any generic hash (`setobject.py AbstractUnwrappedSetStrategy.add`).
+unsafe fn unwrapped_add<S>(
+    strategy: &S,
+    w_set: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Result<(), SetUpdateError>
+where
+    S: AbstractUnwrappedSetStrategy,
+    (S::Key, ()): crate::rordereddict::GcEntriesType,
+{
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(w_set);
+    let _ = roots.pin_root(w_key);
+    if strategy.is_correct_type(roots.get(base + 1)) {
+        let key = strategy.unwrap_for_add(roots.get(base + 1));
+        unwrapped_store(strategy, roots.get(base), key)?;
+        return Ok(());
+    }
+    unwrapped_switch_to_object(strategy, roots.get(base)).map_err(SetUpdateError::Key)?;
+    let w_set = roots.get(base);
+    let status = (*(w_set as *const W_SetObject))
+        .strategy
+        .add(w_set, roots.get(base + 1));
+    match set_update_error_from_status(status) {
+        None => Ok(()),
+        Some(err) => Err(err),
+    }
 }
 
 /// `AbstractUnwrappedSetStrategy.has_key`.
@@ -1344,7 +1418,7 @@ where
         let set = unsafe { &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject) };
         return Ok(unsafe { (*strategy.storage_ptr(set)).contains_key(&unwrapped) });
     }
-    unwrapped_switch_to_object(strategy, obj_slot)?;
+    unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(obj_slot))?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1404,7 +1478,7 @@ where
             true,
         ));
     }
-    unwrapped_switch_to_object(strategy, obj_slot)?;
+    unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(obj_slot))?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1433,7 +1507,7 @@ where
             (*strategy.storage_ptr(set)).contains_key(&unwrapped)
         }))
     } else {
-        unwrapped_switch_to_object(strategy, set_slot)?;
+        unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(set_slot))?;
         Ok(None)
     }
 }
@@ -1452,7 +1526,7 @@ where
         unwrapped_delete(strategy, obj, key.obj, false);
         Ok(Some(()))
     } else {
-        unwrapped_switch_to_object(strategy, set_slot)?;
+        unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(set_slot))?;
         Ok(None)
     }
 }
@@ -1785,7 +1859,8 @@ where
     }
     // A different strategy switches to object and retries. The kind is read
     // again because `switch_to_object_strategy` can run user code.
-    unwrapped_switch_to_object(strategy, dst_slot).map_err(SetUpdateError::Key)?;
+    unwrapped_switch_to_object(strategy, crate::gc_roots::shadow_stack_get(dst_slot))
+        .map_err(SetUpdateError::Key)?;
     update_object_from_other(dst_slot, src_slot)
 }
 
@@ -2075,11 +2150,22 @@ impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
         crate::dictmultiobject::key_compares_by_identity(w_key)
     }
     /// `IdentitySetStrategy.unwrap` — the object itself. Lookup keys do not
-    /// carry a digest; [`Self::unwrap_with_hash`] is what `add` stores.
+    /// carry a digest; [`Self::unwrap_for_add`] is ordinary add, and
+    /// [`Self::unwrap_with_hash`] keeps a supplied digest.
     unsafe fn unwrap(&self, w_key: PyObjectRef) -> Self::Key {
         IdentitySetKey {
             obj: w_key,
             hash: 0,
+        }
+    }
+    unsafe fn unwrap_for_add(&self, w_key: PyObjectRef) -> Self::Key {
+        let roots = crate::gc_roots::push_roots();
+        let base = roots.base();
+        let _ = roots.pin_root(w_key);
+        let identity = crate::gc_hook::gc_identity_hash(roots.get(base) as usize) as i64;
+        IdentitySetKey {
+            obj: roots.get(base),
+            hash: identity ^ (identity >> 4),
         }
     }
     unsafe fn unwrap_with_hash(&self, w_key: PyObjectRef, hash: i64) -> Self::Key {
@@ -2139,120 +2225,129 @@ crate::register_dyn_impl_vtable!(
     IdentitySetStrategy,
     SetStrategy
 );
-impl<S> SetStrategy for S
-where
-    S: AbstractUnwrappedSetStrategy,
-    (S::Key, ()): crate::rordereddict::GcEntriesType,
-{
-    fn strategy_kind(&self) -> SetStrategyKind {
-        self.kind()
-    }
+// `setobject.py` gives each concrete `AbstractUnwrappedSetStrategy` class
+// its own inherited method copies. Expand the shared body into one concrete
+// `SetStrategy` impl per strategy so each method is a distinct PBC family
+// member (`rpbc.py MethodsPBCRepr`).
+macro_rules! impl_unwrapped_set_strategy {
+    ($strategy:ty) => {
+        impl SetStrategy for $strategy {
+            fn strategy_kind(&self) -> SetStrategyKind {
+                self.kind()
+            }
 
-    fn get_empty_storage(&self) -> GCREF {
-        AbstractUnwrappedSetStrategy::get_empty_storage(self)
-    }
+            fn get_empty_storage(&self) -> GCREF {
+                AbstractUnwrappedSetStrategy::get_empty_storage(self)
+            }
 
-    unsafe fn length(&self, w_set: PyObjectRef) -> usize {
-        unsafe { (*(w_set as *const W_SetObject)).len_relaxed() }
-    }
+            unsafe fn length(&self, w_set: PyObjectRef) -> usize {
+                unsafe { (*(w_set as *const W_SetObject)).len_relaxed() }
+            }
 
-    unsafe fn add(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<(), SetUpdateError> {
-        unwrapped_add(self, w_set, key)
-    }
+            unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
+                set_add_status(unwrapped_add(self, w_set, w_key))
+            }
 
-    unsafe fn remove(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-        unwrapped_remove(self, w_set, key)
-    }
+            unsafe fn remove(
+                &self,
+                w_set: PyObjectRef,
+                key: crate::dictmultiobject::ObjectKey,
+            ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+                unwrapped_remove(self, w_set, key)
+            }
 
-    unsafe fn has_key(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
-        unwrapped_has_key(self, w_set, key)
-    }
+            unsafe fn has_key(
+                &self,
+                w_set: PyObjectRef,
+                key: crate::dictmultiobject::ObjectKey,
+            ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+                unwrapped_has_key(self, w_set, key)
+            }
 
-    unsafe fn clear(&self, w_set: PyObjectRef) {
-        // `AbstractUnwrappedSetStrategy.clear` → `switch_to_empty_strategy`.
-        unsafe { switch_to_empty_strategy(w_set) };
-    }
+            unsafe fn clear(&self, w_set: PyObjectRef) {
+                // `AbstractUnwrappedSetStrategy.clear` → `switch_to_empty_strategy`.
+                unsafe { switch_to_empty_strategy(w_set) };
+            }
 
-    unsafe fn popitem(&self, w_set: PyObjectRef) -> Option<PyObjectRef> {
-        unwrapped_popitem(self, w_set)
-    }
+            unsafe fn popitem(&self, w_set: PyObjectRef) -> Option<PyObjectRef> {
+                unwrapped_popitem(self, w_set)
+            }
 
-    unsafe fn get_storage_copy(&self, src: PyObjectRef, dst: PyObjectRef) {
-        unwrapped_copy_storage(self, src, dst);
-    }
+            unsafe fn get_storage_copy(&self, src: PyObjectRef, dst: PyObjectRef) {
+                unwrapped_copy_storage(self, src, dst);
+            }
 
-    unsafe fn getkeys(&self, w_set: PyObjectRef) -> Vec<PyObjectRef> {
-        unwrapped_getkeys(self, w_set)
-    }
+            unsafe fn getkeys(&self, w_set: PyObjectRef) -> Vec<PyObjectRef> {
+                unwrapped_getkeys(self, w_set)
+            }
 
-    unsafe fn next_slot(&self, w_set: PyObjectRef, from: usize) -> Option<usize> {
-        let set = unsafe { &*(w_set as *const W_SetObject) };
-        unsafe { (*self.storage_ptr(set)).next_valid_slot(from) }
-    }
+            unsafe fn next_slot(&self, w_set: PyObjectRef, from: usize) -> Option<usize> {
+                let set = unsafe { &*(w_set as *const W_SetObject) };
+                unsafe { (*self.storage_ptr(set)).next_valid_slot(from) }
+            }
 
-    unsafe fn key_at(
-        &self,
-        w_set: PyObjectRef,
-        slot: usize,
-    ) -> Option<crate::dictmultiobject::ObjectKey> {
-        unwrapped_key_object(self, w_set, slot)
-    }
+            unsafe fn key_at(
+                &self,
+                w_set: PyObjectRef,
+                slot: usize,
+            ) -> Option<crate::dictmultiobject::ObjectKey> {
+                unwrapped_key_object(self, w_set, slot)
+            }
 
-    unsafe fn num_ever_used_items(&self, w_set: PyObjectRef) -> usize {
-        let set = unsafe { &*(w_set as *const W_SetObject) };
-        unsafe { (*self.storage_ptr(set)).entry_slots() }
-    }
+            unsafe fn num_ever_used_items(&self, w_set: PyObjectRef) -> usize {
+                let set = unsafe { &*(w_set as *const W_SetObject) };
+                unsafe { (*self.storage_ptr(set)).entry_slots() }
+            }
 
-    unsafe fn iterkey_at(&self, w_set: PyObjectRef, index: usize) -> *mut PyObject {
-        match unwrapped_key_object(self, w_set, index) {
-            Some(key) => key.obj,
-            None => std::ptr::null_mut(),
+            unsafe fn iterkey_at(&self, w_set: PyObjectRef, index: usize) -> *mut PyObject {
+                match unwrapped_key_object(self, w_set, index) {
+                    Some(key) => key.obj,
+                    None => std::ptr::null_mut(),
+                }
+            }
+
+            unsafe fn iterkey_hash_at(&self, w_set: PyObjectRef, index: usize) -> i64 {
+                match unwrapped_key_object(self, w_set, index) {
+                    Some(key) => key.hash,
+                    None => 0,
+                }
+            }
+
+            unsafe fn stored_hashes(&self, w_set: PyObjectRef) -> Vec<i64> {
+                unwrapped_stored_hashes(self, w_set)
+            }
+
+            unsafe fn update(
+                &self,
+                w_set: PyObjectRef,
+                w_other: PyObjectRef,
+            ) -> Result<(), SetUpdateError> {
+                unwrapped_update(self, w_set, w_other)
+            }
+
+            unsafe fn difference_update(
+                &self,
+                w_set: PyObjectRef,
+                w_other: PyObjectRef,
+            ) -> Result<(), SetUpdateError> {
+                unwrapped_difference_update(self, w_set, w_other)
+            }
+
+            unsafe fn walk_gc_refs(
+                &self,
+                w_set: PyObjectRef,
+                visitor: &mut dyn FnMut(*mut PyObjectRef),
+            ) {
+                unwrapped_walk_gc_refs(self, w_set, visitor);
+            }
         }
-    }
-
-    unsafe fn iterkey_hash_at(&self, w_set: PyObjectRef, index: usize) -> i64 {
-        match unwrapped_key_object(self, w_set, index) {
-            Some(key) => key.hash,
-            None => 0,
-        }
-    }
-
-    unsafe fn stored_hashes(&self, w_set: PyObjectRef) -> Vec<i64> {
-        unwrapped_stored_hashes(self, w_set)
-    }
-
-    unsafe fn update(
-        &self,
-        w_set: PyObjectRef,
-        w_other: PyObjectRef,
-    ) -> Result<(), SetUpdateError> {
-        unwrapped_update(self, w_set, w_other)
-    }
-
-    unsafe fn difference_update(
-        &self,
-        w_set: PyObjectRef,
-        w_other: PyObjectRef,
-    ) -> Result<(), SetUpdateError> {
-        unwrapped_difference_update(self, w_set, w_other)
-    }
-
-    unsafe fn walk_gc_refs(&self, w_set: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
-        unwrapped_walk_gc_refs(self, w_set, visitor);
-    }
+    };
 }
+
+impl_unwrapped_set_strategy!(IntegerSetStrategy);
+impl_unwrapped_set_strategy!(BytesSetStrategy);
+impl_unwrapped_set_strategy!(AsciiSetStrategy);
+impl_unwrapped_set_strategy!(IdentitySetStrategy);
 
 /// Remove the entry occupying `slot` in O(1).
 ///
@@ -2364,37 +2459,6 @@ fn try_w_set_lock(obj: PyObjectRef) -> Option<SetGuard> {
         .map(|lock| unsafe { crate::objlock::ObjectLockGuard::from_word(lock) })
 }
 
-/// Whether `value` is a plain int [`IntegerSetStrategy`] already stores.
-///
-/// [`AbstractUnwrappedSetStrategy::add`] inserts when the key is the wrong
-/// type or absent. This answers the other half: `is_plain_int1` holds and
-/// `contains_key` finds the unwrapped int. It does not hash, pin, allocate,
-/// or wait on the stripe. A contended lock, a non-int, or any other strategy
-/// answers false so the caller runs the real add.
-#[majit_macros::dont_look_inside]
-pub fn plain_int_already_in_int_set(set: PyObjectRef, value: PyObjectRef) -> bool {
-    if set.is_null() || value.is_null() {
-        return false;
-    }
-    unsafe {
-        if !is_set(set) || !crate::listobject::is_plain_int1(value) {
-            return false;
-        }
-        let n = crate::listobject::plain_int_w(value);
-        let Some(_guard) = try_w_set_lock(set) else {
-            return false;
-        };
-        let (kind, storage) = {
-            let set_obj = &*(set as *const W_SetObject);
-            (set_obj.strategy.kind, set_obj.sstorage)
-        };
-        if kind != SetStrategyKind::Int || storage.is_null() {
-            return false;
-        }
-        (*(storage as *const IntSetStorage)).contains_key(&n)
-    }
-}
-
 /// `IntegerSetStrategy.has_key` for a key that `is_correct_type`:
 /// `self.unwrap(w_key) in self.unerase(w_set.sstorage)`. The int-keyed lookup
 /// runs no `__hash__` or `__eq__`, so this cannot raise or force.
@@ -2413,52 +2477,6 @@ pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
             return -1;
         }
         i64::from((*(set_obj.sstorage as *const IntSetStorage)).contains_key(&key))
-    }
-}
-
-/// `ll_dict_setitem` allocation failure from [`jit_int_set_add`]. `0` stores
-/// the key (including a duplicate); `-1` falls back to `strategy.add`.
-pub const JIT_INT_SET_ADD_MEMORY: i64 = -3;
-
-/// `IntegerSetStrategy.add` for a key that `is_correct_type`:
-/// `self.unerase(w_set.sstorage)[self.unwrap(w_key)] = None`. On an empty set
-/// this is `EmptySetStrategy.add`'s `is_plain_int1` arm first: the set
-/// switches to `IntegerSetStrategy` with its empty storage, then `w_set.add`
-/// takes the same store. The int-keyed store runs no `__hash__` or `__eq__`.
-///
-/// Answers `0` once the key is stored. `-1` means the set holds neither
-/// `EmptySetStrategy` nor `IntegerSetStrategy`, or its stripe is contended;
-/// the caller then takes `strategy.add` with the wrapped key.
-/// [`JIT_INT_SET_ADD_MEMORY`] is table allocation failure.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
-    unsafe {
-        let Some(_guard) = try_w_set_lock(set) else {
-            return -1;
-        };
-        let (kind, storage) = {
-            let set_obj = &*(set as *const W_SetObject);
-            (set_obj.strategy.kind, set_obj.sstorage)
-        };
-        match kind {
-            SetStrategyKind::Empty => {}
-            SetStrategyKind::Int if !storage.is_null() => {}
-            _ => return -1,
-        }
-        let _roots = crate::gc_roots::push_roots();
-        let obj_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(set);
-        if kind == SetStrategyKind::Empty {
-            switch_empty_to(
-                &INTEGER_SET_STRATEGY,
-                crate::gc_roots::shadow_stack_get(obj_slot),
-            );
-        }
-        match unwrapped_store(&INTEGER_SET_STRATEGY, obj_slot, key) {
-            Ok(()) => 0,
-            Err(SetUpdateError::Memory) => JIT_INT_SET_ADD_MEMORY,
-            Err(_) => -1,
-        }
     }
 }
 
@@ -2643,9 +2661,6 @@ fn set_write_barrier(obj: PyObjectRef) {
         return;
     }
     let set = unsafe { &*(obj as *const W_SetObject) };
-    // Storage replacement is a membership change for every strategy,
-    // including an integer set whose kind returns below.
-    set.bump_content_gen();
     // `EmptySetStrategy.get_empty_storage` is null. Kind and storage are
     // read together; an empty set has nothing to remember.
     if set.strategy.kind != SetStrategyKind::Object {
@@ -2675,12 +2690,49 @@ unsafe fn switch_to_empty_strategy(obj: PyObjectRef) {
     set_write_barrier(obj);
 }
 
-/// `setobject.py EmptySetStrategy.add` — install `ObjectSetStrategy` and
-/// its empty storage, then the caller performs the add. A plain int,
-/// an exact `bytes`, an exact ASCII `str`, and a key whose type
+/// `setobject.py EmptySetStrategy.add` — select storage/strategy for `w_key`.
+/// A plain int, an exact `bytes`, an exact ASCII `str`, and a key whose type
 /// `W_TypeObject.compares_by_identity` holds take [`switch_empty_to`]
 /// with `IntegerSetStrategy`, `BytesSetStrategy`, `AsciiSetStrategy`, or
-/// `IdentitySetStrategy`.
+/// `IdentitySetStrategy`; else [`switch_empty_to_object_strategy`].
+///
+/// # Safety
+/// `w_set` must point at a valid `W_SetObject` whose strategy is
+/// `EmptySetStrategy`. Caller holds `w_set_lock`.
+unsafe fn switch_empty_for_key(w_set: PyObjectRef, w_key: PyObjectRef) {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_set);
+    let key_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_key);
+    let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
+    if crate::listobject::is_plain_int1(key_obj) {
+        switch_empty_to(
+            &INTEGER_SET_STRATEGY,
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        );
+    } else if is_exact_bytes_object(key_obj) {
+        switch_empty_to(
+            &BYTES_SET_STRATEGY,
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        );
+    } else if is_exact_ascii_str(key_obj) {
+        switch_empty_to(
+            &ASCII_SET_STRATEGY,
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        );
+    } else if IDENTITY_SET_STRATEGY.is_correct_type(key_obj) {
+        switch_empty_to(
+            &IDENTITY_SET_STRATEGY,
+            crate::gc_roots::shadow_stack_get(obj_slot),
+        );
+    } else {
+        switch_empty_to_object_strategy(crate::gc_roots::shadow_stack_get(obj_slot));
+    }
+}
+
+/// `setobject.py EmptySetStrategy.add` — install `ObjectSetStrategy` and
+/// its empty storage, then the caller performs the add.
 ///
 /// Storage is published before the kind, so the word is never
 /// `ObjectSetStrategy` over null. `try_gc_alloc_stable_raw` does not collect;
@@ -2760,16 +2812,6 @@ fn set_items_write_barrier(items: *mut SetItemsStorage) {
     crate::gc_hook::try_gc_write_barrier(items as crate::gc_hook::GCREF);
 }
 
-/// Process-wide source of [`W_SetObject::set_id`].
-///
-/// A `static` atomic has no llop, so the bump stays residual and the id is
-/// not a traced constant.
-#[majit_macros::dont_look_inside]
-pub fn fresh_set_id() -> usize {
-    static NEXT_SET_ID: AtomicUsize = AtomicUsize::new(1);
-    NEXT_SET_ID.fetch_add(1, Ordering::Relaxed)
-}
-
 /// Allocate an empty `set`: `objspace.py newset` →
 /// `W_SetObject(space, None)` → `set_strategy_and_setdata(space, w_set,
 /// None)`, the [`crate::dictmultiobject::newdict_empty`] twin.
@@ -2791,8 +2833,6 @@ pub fn w_set_new() -> PyObjectRef {
         strategy: empty_set_strategy_ref(),
         len: crate::object_array::length_cell(0),
         hash: -1,
-        set_id: fresh_set_id(),
-        content_gen: crate::object_array::length_cell(0),
         lifeline: PY_NULL,
     }) as PyObjectRef
 }
@@ -2827,8 +2867,6 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
         strategy: empty_set_strategy_ref(),
         len: crate::object_array::length_cell(0),
         hash: -1,
-        set_id: fresh_set_id(),
-        content_gen: crate::object_array::length_cell(0),
         lifeline: PY_NULL,
     };
     if !raw.is_null() {
@@ -2875,8 +2913,6 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
             strategy: empty_set_strategy_ref(),
             len: crate::object_array::length_cell(0),
             hash: -1,
-            set_id: fresh_set_id(),
-            content_gen: crate::object_array::length_cell(0),
             lifeline: PY_NULL,
         },
         map: 0,
@@ -2900,8 +2936,8 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
 /// Allocate a populated set-like from a slice of elements (deduped).
 ///
 /// A `&[PyObjectRef]` is not a root area, so the caller's words go stale at
-/// the first insert: `w_set_add` hashes with `space.hash_w`, a collection
-/// point that may run a user `__hash__`, and the set's own table can grow.
+/// the first insert: ordinary add may hash an object-strategy element, switch
+/// storage, or grow the table.
 /// The whole slice is therefore published as one livevar set before the
 /// constructor allocates, and both the set and each element are read back
 /// out of their slots per insert.
@@ -2929,18 +2965,34 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
 
 /// Insert an element. No-op when already present.
 ///
+/// Legacy infallible API: errors from hashing or equality are ignored.
+/// Python-exposed checked add paths call [`w_set_add_checked`].
+///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::pin_roots(&[obj, item]);
-    let item_slot = obj_slot + 1;
-    let key = crate::dictmultiobject::object_key_for(crate::gc_roots::shadow_stack_get(item_slot));
-    let key = crate::dictmultiobject::object_key_hashed(
-        crate::gc_roots::shadow_stack_get(item_slot),
-        key.hash,
-    );
-    let _ = w_set_insert_key_checked(crate::gc_roots::shadow_stack_get(obj_slot), key);
+    let _ = w_set_add_checked(obj, item);
+}
+
+/// Ordinary checked add: `W_BaseSetObject.add` → `self.strategy.add(self, w_key)`.
+///
+/// Roots before [`w_set_lock`]: contended acquisition parks at a GC safepoint.
+/// The strategy is read only after acquire and reload. Caller-visible hash
+/// of the incoming element happens only inside `ObjectSetStrategy.add`.
+/// Returns [`SET_ADD_OK`] or a negative [`SetUpdateError`] code.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_add_checked(obj: PyObjectRef, item: PyObjectRef) -> i64 {
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(item);
+    let _set_guard = w_set_lock(roots.get(base));
+    let obj = roots.get(base);
+    (*(obj as *const W_SetObject))
+        .strategy
+        .add(obj, roots.get(base + 1))
 }
 
 /// Insert an element keyed on a `space.hash_w` digest the caller already
@@ -3080,18 +3132,67 @@ pub unsafe fn w_set_insert_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
-    let _set_guard = w_set_lock(obj);
-    // `W_BaseSetObject.add` → `self.strategy.add(self, w_key)`.
-    (*(obj as *const W_SetObject)).strategy.add(obj, key)
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(key.obj);
+    let _set_guard = w_set_lock(roots.get(base));
+    set_insert_key_with_hash_unlocked(
+        roots.get(base),
+        crate::dictmultiobject::ObjectKey {
+            hash: key.hash,
+            obj: roots.get(base + 1),
+        },
+    )
+}
+
+/// Storage insert for a caller that already owns the digest. Caller holds
+/// the set lock.
+unsafe fn set_insert_key_with_hash_unlocked(
+    obj: PyObjectRef,
+    key: crate::dictmultiobject::ObjectKey,
+) -> Result<(), SetUpdateError> {
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(key.obj);
+    let obj = roots.get(base);
+    let kind = (*(obj as *const W_SetObject)).strategy.kind;
+    match kind {
+        SetStrategyKind::Empty => {
+            switch_empty_for_key(roots.get(base), roots.get(base + 1));
+            set_insert_key_with_hash_unlocked(
+                roots.get(base),
+                crate::dictmultiobject::ObjectKey {
+                    hash: key.hash,
+                    obj: roots.get(base + 1),
+                },
+            )
+        }
+        SetStrategyKind::Object => w_set_insert_key_reentrant(
+            roots.get(base),
+            crate::dictmultiobject::ObjectKey {
+                hash: key.hash,
+                obj: roots.get(base + 1),
+            },
+        ),
+        _ => on_unwrapped!(kind, strategy => unwrapped_add_hashed(
+            strategy,
+            roots.get(base),
+            crate::dictmultiobject::ObjectKey {
+                hash: key.hash,
+                obj: roots.get(base + 1),
+            },
+        )),
+    }
 }
 
 /// Explicit `Result` shell the trace field-reads. `__discriminant` is an
 /// `i64` at byte 0 (`0` = `Ok`, `1` = `Err`) and `__pos_0` is one word at
 /// byte 8.
 ///
-/// `Ok(())` and `Ok(false)` share the zero payload. `Ok(true)` stores 1.
-/// `Err(DictKeyError)` stores the address of one static unit. `SetUpdateError`
-/// is its `u8` tag (`Key` = 0, `ChangedSize` = 1, `Memory` = 2).
+/// `Ok(false)` stores a zero payload. `Ok(true)` stores 1.
+/// `Err(DictKeyError)` stores the address of one static unit.
 #[repr(C)]
 struct StrategyResultShell {
     discriminant: i64,
@@ -3129,31 +3230,9 @@ static STRATEGY_RESULT_ERR_DICT_KEY: DictKeyResultShell = DictKeyResultShell {
     discriminant: 1,
     payload: &DICT_KEY_ERROR_UNIT,
 };
-static STRATEGY_RESULT_ERR_KEY: StrategyResultShell = StrategyResultShell {
-    discriminant: 1,
-    payload: 0,
-};
-static STRATEGY_RESULT_ERR_CHANGED_SIZE: StrategyResultShell = StrategyResultShell {
-    discriminant: 1,
-    payload: 1,
-};
-static STRATEGY_RESULT_ERR_MEMORY: StrategyResultShell = StrategyResultShell {
-    discriminant: 1,
-    payload: 2,
-};
 
 fn strategy_result_ptr<T>(shell: &'static T) -> crate::gc_hook::GCREF {
     std::ptr::from_ref(shell) as crate::gc_hook::GCREF
-}
-
-fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> crate::gc_hook::GCREF {
-    let shell = match result {
-        Ok(()) => &STRATEGY_RESULT_OK_ZERO,
-        Err(SetUpdateError::Key(_)) => &STRATEGY_RESULT_ERR_KEY,
-        Err(SetUpdateError::ChangedSize) => &STRATEGY_RESULT_ERR_CHANGED_SIZE,
-        Err(SetUpdateError::Memory) => &STRATEGY_RESULT_ERR_MEMORY,
-    };
-    strategy_result_ptr(shell)
 }
 
 fn set_strategy_bool_shell(
@@ -3166,28 +3245,8 @@ fn set_strategy_bool_shell(
     }
 }
 
-/// Residual word ABI for `SetStrategy::add`.
-///
-/// The traced call passes `(w_set, &ObjectKey)`. `&self` on the ZST strategy
-/// is void in the flow graph, and `ObjectKey` stays one pointer. The vtable
-/// method is `fn(&self, PyObjectRef, ObjectKey)` — hash and obj in registers —
-/// so calling that pointer with the two residual words reads the key pointer
-/// as the set. This trampoline is the operation the trace recorded.
-///
-/// The method returns a `Result` ADT (`setobject.py SetStrategy.add`); the
-/// interned shell is that residual word, `llmemory.GCREF`.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn set_strategy_add_key_ptr(
-    w_set: PyObjectRef,
-    key: *const crate::dictmultiobject::ObjectKey,
-) -> crate::gc_hook::GCREF {
-    let key = unsafe { std::ptr::read(key) };
-    let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
-    set_strategy_add_shell(result)
-}
-
-/// Residual word ABI for `SetStrategy::remove`. Same argument words as
-/// [`set_strategy_add_key_ptr`].
+/// Residual word ABI for `SetStrategy::remove`. The traced call passes
+/// `(w_set, &ObjectKey)`.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_remove_key_ptr(
     w_set: PyObjectRef,
@@ -3198,8 +3257,8 @@ pub extern "C" fn set_strategy_remove_key_ptr(
     set_strategy_bool_shell(result)
 }
 
-/// Residual word ABI for `SetStrategy::has_key`. Same argument words as
-/// [`set_strategy_add_key_ptr`].
+/// Residual word ABI for `SetStrategy::has_key`. The traced call passes
+/// `(w_set, &ObjectKey)`.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_has_key_ptr(
     w_set: PyObjectRef,
@@ -4079,6 +4138,7 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
         Err(SetUpdateError::Key(_)) => -1,
         Err(SetUpdateError::ChangedSize) => -2,
         Err(SetUpdateError::Memory) => -3,
+        Err(SetUpdateError::Hash(_)) => -1,
     }
 }
 
@@ -4142,51 +4202,17 @@ impl SetStrategy for EmptySetStrategy {
         0
     }
 
-    unsafe fn add(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<(), SetUpdateError> {
-        // `EmptySetStrategy.add`: `is_plain_int1` → `IntegerSetStrategy`;
-        // `type is W_BytesObject` → `BytesSetStrategy`; exact `W_UnicodeObject`
-        // and `is_ascii` → `AsciiSetStrategy`;
-        // `W_TypeObject.compares_by_identity` → `IdentitySetStrategy`;
-        // else `ObjectSetStrategy`. Then `w_set.add`.
-        let _roots = crate::gc_roots::push_roots();
-        let obj_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(w_set);
-        let key_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(key.obj);
-        let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
-        if crate::listobject::is_plain_int1(key_obj) {
-            switch_empty_to(
-                &INTEGER_SET_STRATEGY,
-                crate::gc_roots::shadow_stack_get(obj_slot),
-            );
-        } else if is_exact_bytes_object(key_obj) {
-            switch_empty_to(
-                &BYTES_SET_STRATEGY,
-                crate::gc_roots::shadow_stack_get(obj_slot),
-            );
-        } else if is_exact_ascii_str(key_obj) {
-            switch_empty_to(
-                &ASCII_SET_STRATEGY,
-                crate::gc_roots::shadow_stack_get(obj_slot),
-            );
-        } else if IDENTITY_SET_STRATEGY.is_correct_type(key_obj) {
-            switch_empty_to(
-                &IDENTITY_SET_STRATEGY,
-                crate::gc_roots::shadow_stack_get(obj_slot),
-            );
-        } else {
-            switch_empty_to_object_strategy(crate::gc_roots::shadow_stack_get(obj_slot));
-        }
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let key = crate::dictmultiobject::ObjectKey {
-            hash: key.hash,
-            obj: crate::gc_roots::shadow_stack_get(key_slot),
-        };
-        (*(obj as *const W_SetObject)).strategy.add(obj, key)
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
+        // `EmptySetStrategy.add`: select storage, then `w_set.add`.
+        let roots = crate::gc_roots::push_roots();
+        let base = roots.base();
+        let _ = roots.pin_root(w_set);
+        let _ = roots.pin_root(w_key);
+        switch_empty_for_key(roots.get(base), roots.get(base + 1));
+        let w_set = roots.get(base);
+        (*(w_set as *const W_SetObject))
+            .strategy
+            .add(w_set, roots.get(base + 1))
     }
 
     /// `EmptySetStrategy.remove` returns False. The caller already hashed.
@@ -4301,14 +4327,25 @@ impl SetStrategy for ObjectSetStrategy {
         (*(w_set as *const W_SetObject)).len_relaxed()
     }
 
-    unsafe fn add(
-        &self,
-        w_set: PyObjectRef,
-        key: crate::dictmultiobject::ObjectKey,
-    ) -> Result<(), SetUpdateError> {
-        // `ObjectSetStrategy` `is_correct_type` is always true, so `add`
-        // stores into the captured box (`AbstractUnwrappedSetStrategy.add`).
-        w_set_insert_key_reentrant(w_set, key)
+    unsafe fn add(&self, w_set: PyObjectRef, w_key: PyObjectRef) -> i64 {
+        // `setobject.py AbstractUnwrappedSetStrategy.add` captures `d` before
+        // hashing; measured 3.15.0t hash-clears-set add retains the incoming
+        // element, so retry the live strategy with the already computed digest.
+        let roots = crate::gc_roots::push_roots();
+        let base = roots.base();
+        let _ = roots.pin_root(w_set);
+        let _ = roots.pin_root(w_key);
+        let result = match crate::dictmultiobject::object_key_for_checked(roots.get(base + 1)) {
+            Ok(key) => set_insert_key_with_hash_unlocked(
+                roots.get(base),
+                crate::dictmultiobject::ObjectKey {
+                    hash: key.hash,
+                    obj: roots.get(base + 1),
+                },
+            ),
+            Err(err) => Err(SetUpdateError::Hash(err)),
+        };
+        set_add_status(result)
     }
 
     unsafe fn remove(
@@ -5049,28 +5086,15 @@ mod tests {
 
     #[test]
     fn set_strategy_result_shells_keep_payload_words() {
-        let ok_unit = super::set_strategy_add_shell(Ok(()));
         let ok_false = super::set_strategy_bool_shell(Ok(false));
         let ok_true = super::set_strategy_bool_shell(Ok(true));
-        let err_key = super::set_strategy_add_shell(Err(SetUpdateError::Key(DictKeyError)));
-        let err_size = super::set_strategy_add_shell(Err(SetUpdateError::ChangedSize));
-        let err_memory = super::set_strategy_add_shell(Err(SetUpdateError::Memory));
         let err_dict = super::set_strategy_bool_shell(Err(DictKeyError));
 
-        assert_eq!(ok_unit, ok_false);
         assert_ne!(ok_true, ok_false);
-        assert_ne!(err_key, ok_unit);
-        assert_ne!(err_size, err_key);
-        assert_ne!(err_memory, err_key);
-        assert_ne!(err_memory, err_size);
-        assert_ne!(err_dict, err_key);
         assert_ne!(err_dict, ok_true);
 
-        assert_eq!(shell_words(ok_unit), (0, 0));
+        assert_eq!(shell_words(ok_false), (0, 0));
         assert_eq!(shell_words(ok_true), (0, 1));
-        assert_eq!(shell_words(err_key), (1, 0));
-        assert_eq!(shell_words(err_size), (1, 1));
-        assert_eq!(shell_words(err_memory), (1, 2));
         let (discriminant, payload) = shell_words(err_dict);
         assert_eq!(discriminant, 1);
         assert_eq!(
@@ -5119,21 +5143,33 @@ mod tests {
 
     #[test]
     fn add_dedupes() {
-        install_test_hash_hook();
+        unsafe fn always_raise_hash(obj: PyObjectRef) -> i64 {
+            crate::dict_eq_hook::signal_hash_error(obj);
+            0
+        }
+        unsafe fn hash_str(_ptr: *const u8, _len: usize) -> i64 {
+            0
+        }
+        crate::dict_eq_hook::register_hash_w_hook(always_raise_hash);
+        crate::dict_eq_hook::register_hash_str_hook(hash_str);
         let s = w_set_new();
         unsafe {
             assert_eq!(
                 (*(s as *const W_SetObject)).strategy.kind,
                 SetStrategyKind::Empty
             );
-            w_set_add(s, w_int_new(1));
-            w_set_add(s, w_int_new(1));
-            w_set_add(s, w_int_new(2));
+            assert_eq!(w_set_add_checked(s, w_int_new(1)), SET_ADD_OK);
+            assert_eq!(w_set_add_checked(s, w_int_new(1)), SET_ADD_OK);
+            assert_eq!(w_set_add_checked(s, w_int_new(2)), SET_ADD_OK);
             assert_eq!(
                 (*(s as *const W_SetObject)).strategy.kind,
                 SetStrategyKind::Int
             );
             assert_eq!(w_set_len(s), 2);
+            assert!(!crate::dict_eq_hook::take_hash_error());
+        }
+        install_test_hash_hook();
+        unsafe {
             assert!(w_set_contains(s, w_int_new(1)));
             assert!(w_set_contains(s, w_int_new(2)));
             assert!(!w_set_contains(s, w_int_new(3)));
@@ -5145,23 +5181,21 @@ mod tests {
         install_test_hash_hook();
         let s = w_set_new();
         let one = w_int_new(1);
-        assert!(!plain_int_already_in_int_set(std::ptr::null_mut(), one));
-        assert!(!plain_int_already_in_int_set(s, std::ptr::null_mut()));
-        assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
-        assert_eq!(jit_int_set_add(s, 1), 0);
+        unsafe {
+            assert_eq!(w_set_add_checked(s, one), SET_ADD_OK);
+        }
         assert_eq!(
             unsafe { (*(s as *const W_SetObject)).strategy.kind },
             SetStrategyKind::Int
         );
-        assert!(plain_int_already_in_int_set(s, one));
-        assert!(!plain_int_already_in_int_set(s, w_int_new(2)));
-        assert!(!plain_int_already_in_int_set(s, crate::w_bool_from(true)));
         assert_eq!(jit_int_set_has_key(s, 1), 1);
         assert_eq!(jit_int_set_has_key(s, 2), 0);
         assert_eq!(unsafe { w_set_len(s) }, 1);
-        assert_eq!(jit_int_set_add(s, 2), 0);
-        assert_eq!(jit_int_set_add(s, 2), 0);
+        unsafe {
+            assert_eq!(w_set_add_checked(s, w_int_new(2)), SET_ADD_OK);
+            assert_eq!(w_set_add_checked(s, w_int_new(2)), SET_ADD_OK);
+        }
         assert_eq!(jit_int_set_has_key(s, 2), 1);
         assert_eq!(unsafe { w_set_len(s) }, 2);
         unsafe { w_set_add(s, crate::w_bool_from(true)) };
@@ -5169,59 +5203,106 @@ mod tests {
             unsafe { (*(s as *const W_SetObject)).strategy.kind },
             SetStrategyKind::Object
         );
-        assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
-        assert_eq!(jit_int_set_add(s, 3), -1);
         assert_eq!(unsafe { w_set_len(s) }, 2);
     }
 
     #[test]
-    fn content_gen_is_stable_across_a_hit_add() {
-        install_test_hash_hook();
-        let a = w_set_new();
-        let b = w_set_new();
-        unsafe {
-            let a_obj = &*(a as *const W_SetObject);
-            let b_obj = &*(b as *const W_SetObject);
-            assert_ne!(a_obj.set_id, 0);
-            assert_ne!(a_obj.set_id, b_obj.set_id);
-            let id = a_obj.set_id;
-            let gen_empty = a_obj.content_gen_relaxed();
-
-            w_set_add(a, w_int_new(1));
-            let gen_inserted = (*(a as *const W_SetObject)).content_gen_relaxed();
-            assert_ne!(gen_inserted, gen_empty);
-            assert_eq!((*(a as *const W_SetObject)).set_id, id);
-
-            w_set_add(a, w_int_new(1));
-            assert_eq!(
-                (*(a as *const W_SetObject)).content_gen_relaxed(),
-                gen_inserted
-            );
-            assert!(plain_int_already_in_int_set(a, w_int_new(1)));
-
-            w_set_discard(a, w_int_new(1));
-            let gen_removed = (*(a as *const W_SetObject)).content_gen_relaxed();
-            assert_ne!(gen_removed, gen_inserted);
-
-            w_set_add(a, w_int_new(2));
-            let gen_readded = (*(a as *const W_SetObject)).content_gen_relaxed();
-            w_set_clear(a);
-            assert_ne!(
-                (*(a as *const W_SetObject)).content_gen_relaxed(),
-                gen_readded
-            );
-            assert_eq!((*(a as *const W_SetObject)).set_id, id);
-
-            w_set_add(a, crate::w_str_new("a"));
-            let gen_str = (*(a as *const W_SetObject)).content_gen_relaxed();
-            w_set_add(a, crate::w_str_new("a"));
-            assert_eq!((*(a as *const W_SetObject)).content_gen_relaxed(), gen_str);
-            assert_eq!(
-                (*(a as *const W_SetObject)).strategy.kind,
-                SetStrategyKind::Ascii
-            );
+    fn ordinary_add_tags_hash_and_eq_failures() {
+        let _ident = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_NO));
+        unsafe fn raising_hash(obj: PyObjectRef) -> i64 {
+            crate::dict_eq_hook::signal_hash_error(obj);
+            0
         }
+        unsafe fn hash_str(_ptr: *const u8, _len: usize) -> i64 {
+            0
+        }
+        crate::dict_eq_hook::register_hash_w_hook(raising_hash);
+        crate::dict_eq_hook::register_hash_str_hook(hash_str);
+        unsafe {
+            let inst = crate::w_instance_new(w_type);
+            let s = w_set_new();
+            let err = w_set_add_checked(s, inst);
+            assert_eq!(err, SET_ADD_HASH);
+            assert_eq!(w_set_len(s), 0);
+            assert!(!crate::dict_eq_hook::take_hash_error());
+        }
+
+        unsafe fn constant_hash(_obj: PyObjectRef) -> i64 {
+            42
+        }
+        unsafe fn raising_eq(a: PyObjectRef, _b: PyObjectRef) -> bool {
+            crate::dict_eq_hook::signal_eq_error(a);
+            false
+        }
+        crate::dict_eq_hook::register_hash_w_hook(constant_hash);
+        crate::dict_eq_hook::register_eq_w_hook(raising_eq);
+        unsafe {
+            let a = crate::w_instance_new(w_type);
+            let b = crate::w_instance_new(w_type);
+            let s = w_set_new();
+            assert_eq!(w_set_add_checked(s, a), SET_ADD_OK);
+            assert_eq!(w_set_len(s), 1);
+            let err = w_set_add_checked(s, b);
+            assert_eq!(err, SET_ADD_KEY);
+            assert_eq!(w_set_len(s), 1);
+            assert!(!crate::dict_eq_hook::take_eq_error());
+            assert!(!crate::dict_eq_hook::take_hash_error());
+        }
+        crate::dict_eq_hook::clear_eq_w_hook();
+        install_test_hash_hook();
+    }
+
+    #[test]
+    fn digest_insert_does_not_call_hash_hook() {
+        unsafe fn always_raise(obj: PyObjectRef) -> i64 {
+            crate::dict_eq_hook::signal_hash_error(obj);
+            0
+        }
+        unsafe fn hash_str(_ptr: *const u8, _len: usize) -> i64 {
+            0
+        }
+        crate::dict_eq_hook::register_hash_w_hook(always_raise);
+        crate::dict_eq_hook::register_hash_str_hook(hash_str);
+        unsafe {
+            let s = w_set_new();
+            assert!(w_set_add_hashed_checked(s, w_int_new(1), 1).is_ok());
+            assert_eq!(
+                (*(s as *const W_SetObject)).strategy.kind,
+                SetStrategyKind::Int
+            );
+            assert_eq!(w_set_len(s), 1);
+            assert!(!crate::dict_eq_hook::take_hash_error());
+        }
+
+        let _ident = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_NO));
+        unsafe fn raise_non_int(obj: PyObjectRef) -> i64 {
+            if crate::is_bool(obj) {
+                crate::dict_eq_hook::signal_hash_error(obj);
+                return 0;
+            }
+            if crate::py_type_check(obj, &crate::INT_TYPE) {
+                return crate::w_int_get_value(obj);
+            }
+            crate::dict_eq_hook::signal_hash_error(obj);
+            0
+        }
+        crate::dict_eq_hook::register_hash_w_hook(raise_non_int);
+        unsafe {
+            let s = w_set_new();
+            assert!(w_set_add_hashed_checked(s, w_int_new(1), 1).is_ok());
+            let inst = crate::w_instance_new(w_type);
+            assert!(w_set_add_hashed_checked(s, inst, 99).is_ok());
+            assert_eq!(
+                (*(s as *const W_SetObject)).strategy.kind,
+                SetStrategyKind::Object
+            );
+            assert_eq!(w_set_len(s), 2);
+            assert!(!crate::dict_eq_hook::take_hash_error());
+        }
+        install_test_hash_hook();
     }
 
     #[test]
@@ -6008,6 +6089,11 @@ mod tests {
         crate::dict_eq_hook::register_hash_str_hook(identity_test_hash_str);
     }
 
+    fn identity_insertion_hash(obj: PyObjectRef) -> i64 {
+        let identity = crate::gc_hook::gc_identity_hash(obj as usize) as i64;
+        identity ^ (identity >> 4)
+    }
+
     #[test]
     fn identity_set_keeps_insertion_hash_after_hook_changes() {
         install_identity_hash_hook();
@@ -6015,33 +6101,35 @@ mod tests {
         let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
         let inst = crate::w_instance_new(w_type);
         let extra = crate::w_instance_new(w_type);
+        let inst_hash = identity_insertion_hash(inst);
+        let extra_hash = identity_insertion_hash(extra);
         unsafe {
             let s = w_set_new();
             w_set_add(s, inst);
             assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
             let slot = w_set_next_slot(s, 0).unwrap();
-            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
-            assert_eq!(w_set_stored_hashes(s), vec![11]);
+            assert_eq!(w_set_key_at(s, slot).unwrap().hash, inst_hash);
+            assert_eq!(w_set_stored_hashes(s), vec![inst_hash]);
 
             INSTANCE_HASH.with(|cell| cell.set(99));
-            assert_eq!(w_set_stored_hashes(s), vec![11]);
-            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
-            assert_eq!(w_set_iterkey_hash_at(s, slot), 11);
+            assert_eq!(w_set_stored_hashes(s), vec![inst_hash]);
+            assert_eq!(w_set_key_at(s, slot).unwrap().hash, inst_hash);
+            assert_eq!(w_set_iterkey_hash_at(s, slot), inst_hash);
             assert!(w_set_contains(s, inst));
 
             let copied = w_set_new();
             w_set_copy_storage_from(copied, s);
             assert_eq!(strategy_kind(copied), SetStrategyKind::Identity);
-            assert_eq!(w_set_stored_hashes(copied), vec![11]);
+            assert_eq!(w_set_stored_hashes(copied), vec![inst_hash]);
 
             let right = w_set_new();
             w_set_add(right, extra);
-            assert_eq!(w_set_stored_hashes(right), vec![99]);
+            assert_eq!(w_set_stored_hashes(right), vec![extra_hash]);
             assert!(w_set_update_from_set(s, right).is_ok());
             assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
             assert_eq!(w_set_len(s), 2);
             let hashes = w_set_stored_hashes(s);
-            assert_eq!(hashes, vec![11, 99]);
+            assert_eq!(hashes, vec![inst_hash, extra_hash]);
 
             let other = w_set_new();
             w_set_add(other, w_int_new(1));
@@ -6050,13 +6138,20 @@ mod tests {
             INSTANCE_HASH.with(|cell| cell.set(11));
             let kept = w_set_new();
             w_set_add(kept, inst);
-            assert_eq!(w_set_stored_hashes(kept), vec![11]);
+            assert_eq!(w_set_stored_hashes(kept), vec![inst_hash]);
             INSTANCE_HASH.with(|cell| cell.set(99));
             assert!(w_set_difference_update_from_set(kept, other).is_ok());
             assert_eq!(strategy_kind(kept), SetStrategyKind::Identity);
             assert_eq!(w_set_len(kept), 1);
-            assert_eq!(w_set_stored_hashes(kept), vec![11]);
+            assert_eq!(w_set_stored_hashes(kept), vec![inst_hash]);
             assert!(w_set_contains(kept, inst));
+
+            let hashed_inst = crate::w_instance_new(w_type);
+            let prehashed = w_set_new();
+            const SENTINEL: i64 = 0x1234_5678;
+            assert!(w_set_add_hashed_checked(prehashed, hashed_inst, SENTINEL).is_ok());
+            assert_eq!(strategy_kind(prehashed), SetStrategyKind::Identity);
+            assert_eq!(w_set_stored_hashes(prehashed), vec![SENTINEL]);
         }
     }
 
@@ -6140,6 +6235,7 @@ mod tests {
             w_set_add(s, inst);
             assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
             assert_eq!(w_set_len(s), 1);
+            let initial = identity_insertion_hash(inst);
             let item = w_int_new(1);
             let hash = identity_test_hash(item);
             RAISE_INSTANCE_HASH.with(|cell| cell.set(true));
@@ -6147,7 +6243,7 @@ mod tests {
             assert!(err.is_err());
             assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
             assert_eq!(w_set_len(s), 1);
-            assert_eq!(w_set_stored_hashes(s), vec![11]);
+            assert_eq!(w_set_stored_hashes(s), vec![initial]);
             assert!(w_set_contains(s, inst));
         }
     }

@@ -4115,17 +4115,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder",
         crate::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder,
     );
-    // Floored `divmod` projections used by the zero-checked interpreter seams.
-    cp2!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
-        crate::objspace::descroperation::jit_bigint_div_floor,
-    );
-    cp2!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
-        crate::objspace::descroperation::jit_bigint_mod_floor,
-    );
     // Machine-int-divisor legs of the same seams (`_int_floordiv` / `_int_mod`).
     cp2!(
         &mut entries,
@@ -4843,12 +4832,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::setobject::jit_int_set_has_key",
         "pyre_object::jit_int_set_has_key",
         pyre_object::setobject::jit_int_set_has_key,
-    );
-    cpa2!(
-        &mut entries,
-        "pyre_object::setobject::jit_int_set_add",
-        "pyre_object::jit_int_set_add",
-        pyre_object::setobject::jit_int_set_add,
     );
     cpa1!(
         &mut entries,
@@ -5590,16 +5573,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
         "pyre_object::w_dict_unicode_key_hash",
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash,
-    );
-    // A runtime-mutable global counter, not a build-time constant: bind the
-    // read seam by address so the JIT calls it instead of folding whatever
-    // serial the build process saw. Same shape for the `W_SetObject.set_id`
-    // counter the `w_set_new` body calls.
-    pa0!(
-        &mut entries,
-        "pyre_object::setobject::fresh_set_id",
-        "pyre_object::fresh_set_id",
-        pyre_object::setobject::fresh_set_id,
     );
     // `quasiimmut.py _invalidate_now`, shared by both `?` fields.
     upa1!(
@@ -9761,15 +9734,6 @@ mod tests {
             set_int
         );
         assert_eq!(bindings["pyre_object::jit_int_set_has_key"], set_int);
-        let set_add_int = occupied_published_addr(
-            "pyre_object::setobject::jit_int_set_add",
-            pyre_object::setobject::jit_int_set_add as *const () as usize as i64,
-        );
-        assert_eq!(
-            bindings["pyre_object::setobject::jit_int_set_add"],
-            set_add_int
-        );
-        assert_eq!(bindings["pyre_object::jit_int_set_add"], set_add_int);
     }
 
     #[test]

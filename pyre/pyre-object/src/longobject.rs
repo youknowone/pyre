@@ -139,6 +139,15 @@ pub fn alloc_bigint_pair_nursery_collecting(
     majit_rlib::rbigint::alloc_rbigint_pair_nursery_collecting(item0, item1)
 }
 
+/// Allocate the `tuple2` while keeping an already-allocated item1 payload.
+#[inline]
+pub fn alloc_bigint_pair_item1_alias_nursery_collecting(
+    item0: BigInt,
+    item1: *mut BigInt,
+) -> *mut majit_rlib::rbigint::RBigIntPair {
+    majit_rlib::rbigint::alloc_rbigint_pair_item1_alias_nursery_collecting(item0, item1)
+}
+
 // GC type id for the raw `rbigint` payload is published at JitDriver init by
 // `set_bigint_gc_type_id`. It remains 0 until then, in which case the alloc
 // helpers fall back to leaked raw allocations in bare tests/pre-init bootstrap.

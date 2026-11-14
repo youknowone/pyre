@@ -20351,6 +20351,10 @@ fn popvalue_py_null_narrows_to_nullable_instance() {
 /// `call_method`'s `Result<Option<PyObjectRef>, PyError>::Ok.__pos_0`
 /// is the niche pointer. The read must narrow to nullable `PyObject`
 /// before it merges with the `PY_NULL` arm.
+///
+/// `long_mod`'s `Result<*mut RBigInt, RBigIntError>::Ok.__pos_0` is a
+/// registered GC payload of a different class: the narrow is `RBigInt`,
+/// never `PyObject` (`LowLevelOpList.convertvar`).
 #[test]
 #[ignore]
 fn call_method_ok_payload_narrows_to_the_instance_class() {
@@ -20379,6 +20383,43 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
     assert!(
         narrowed,
         "call_method Ok payload read must be followed by a PyObject narrow"
+    );
+
+    let long_mod = crate::test_support::lower_function(
+        llbc,
+        "pyre_interpreter::objspace::descroperation::long_mod",
+    )
+    .expect("lower long_mod");
+    let mut rbigint_ok_casts = Vec::new();
+    for block in &long_mod.blocks {
+        for ops in block.operations.windows(2) {
+            let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                continue;
+            };
+            if field.name != "__pos_0" {
+                continue;
+            }
+            let Some(owner) = field.owner_root.as_deref() else {
+                continue;
+            };
+            if !(owner.contains("Result") && owner.contains("RBigInt")) {
+                continue;
+            }
+            let root = crate::model::cast_instance_root(&ops[1].kind);
+            assert_ne!(
+                root,
+                Some(super::W_ROOT_CLASS_ROOT),
+                "Result<*mut RBigInt, _>::Ok.__pos_0 must not narrow to PyObject; owner={owner}"
+            );
+            rbigint_ok_casts.push(root.map(str::to_string));
+        }
+    }
+    assert!(
+        rbigint_ok_casts.iter().any(|root| {
+            root.as_deref()
+                .is_some_and(|root| root.contains("RBigInt") && !root.contains("Error"))
+        }),
+        "long_mod Ok payload read must be followed by an RBigInt narrow; casts={rbigint_ok_casts:?}"
     );
 }
 
@@ -30943,8 +30984,8 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
 }
 
 /// `PyError(ptr)` is the payload pointer. Construction peels to that
-/// word; `retag_error_carrier` recasts once to the handle class
-/// (`error::PyError`). No FieldWrite / synthetic ctor.
+/// word; `retag_error_carrier` recasts once to the carrier's inner
+/// class (`PyErrorObject`). No FieldWrite / synthetic ctor.
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
     let py_ptr = interior_raw_mut(interior_adt(0));
@@ -31036,8 +31077,8 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
         .collect();
     assert_eq!(
         roots,
-        ["error::PyError"],
-        "PyError(ptr) recasts the payload to the handle class; graph={}",
+        ["PyErrorObject"],
+        "PyError(ptr) recasts the payload to the inner class; graph={}",
         graph.dump()
     );
     assert!(
@@ -39557,6 +39598,7 @@ fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
 
 /// Object-list length stays `rlist.py` `ll_length` (the LIST.length
 /// field), not `ll_strlen` of a str-family payload.
+/// The Object arm reaches the list.obj_len oopspec leaf (rlist.py ll_length / jtransform.py do_resizable_list_len).
 #[test]
 fn object_list_len_reads_list_length_field() {
     use crate::model::OpKind;
@@ -39583,8 +39625,11 @@ fn object_list_len_reads_list_length_field() {
         _ => false,
     });
     assert!(
-        has_list_length || calls_leaf(&graph, "__len") || has_live_len,
-        "w_list_len must read LIST.length / __len / live_len; graph={}",
+        has_list_length
+            || calls_leaf(&graph, "__len")
+            || calls_leaf(&graph, "ll_list_obj_length")
+            || has_live_len,
+        "w_list_len must read LIST.length / __len / live_len / the ll_list_obj_length oopspec leaf; graph={}",
         graph.dump()
     );
     assert!(
