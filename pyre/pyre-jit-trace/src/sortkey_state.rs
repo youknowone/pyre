@@ -9,7 +9,7 @@ use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
-use pyre_object::{PY_NULL, PyObjectRef};
+use pyre_object::PyObjectRef;
 
 pub const SORTKEY_PORTAL_KEY: &str = "builtins::sortkey_portal";
 pub const SORTKEY_JD_INDEX: usize = 3;
@@ -178,6 +178,5 @@ mod tests {
             banks.red_r
         );
         assert_eq!(banks.red_f.len(), 0);
-        let _ = PY_NULL;
     }
 }
