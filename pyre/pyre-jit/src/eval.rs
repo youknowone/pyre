@@ -7938,15 +7938,22 @@ fn stack_almost_full() -> bool {
 /// This is the main entry point for pyre-jit.
 pub fn eval_with_jit(
     frame: &mut PyFrame,
-    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+    mut resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
 ) -> PyResult {
     // pypy/interpreter/pyframe.py marks execute_frame as a stack-check
     // entry.  The portal runner is pyre's JIT-aware execution entry for the
     // same frame and must perform the interpreter-side check before compiled
     // code exists; compiled callees additionally carry the backend prologue.
+    let pins = match resume.as_mut() {
+        Some(resume) => pyre_interpreter::pin_resume_args!(resume),
+        None => None,
+    };
+    let anchor = pyre_interpreter::eval::FrameAnchor::new(frame);
     pyre_interpreter::stack_check::drain_jit_pending_exception()?;
+    pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
     pyre_interpreter::stack_check::stack_check()?;
-    eval_with_jit_inner(frame, resume)
+    pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
+    eval_with_jit_inner(unsafe { &mut *anchor.live() }, resume)
 }
 
 /// Hook target for `pyre_interpreter::call::set_jit_param`. Routes
@@ -10481,6 +10488,8 @@ fn eval_with_jit_inner(
         Some(resume) => pyre_interpreter::pin_resume_args!(resume),
         None => None,
     };
+    // Before `FrameRoot::new`: the guard pushes the displaced claim onto the
+    // shadow stack, and `FrameView::reload` reads the frame from the top slot.
     // The JIT-side frame-activation seam: a frame that runs entirely as
     // compiled code returns from `try_function_entry_jit` without reaching an
     // eval loop, so the recursion budget is spent here, where every JIT route

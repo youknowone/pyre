@@ -1788,10 +1788,10 @@ impl FrameBox {
     ///
     /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
     /// GC object whose lifetime is its reachability.  When the GC hook is
-    /// installed this allocates a non-moving YOUNG `PYFRAME_GC_TYPE_ID`
-    /// block (`external_malloc(..., alloc_young=True)`, through
-    /// `try_gc_alloc_young_nonmoving_raw`); the collector reclaims the frame
-    /// and its GC-managed locals and debug data once no root
+    /// installed this allocates a nursery `PYFRAME_GC_TYPE_ID` block
+    /// (`malloc_fixedsize`, through `try_gc_alloc_collecting_rooted`); the
+    /// collector reclaims the frame and its GC-managed locals and debug data
+    /// once no root
     /// (the handle's own owner root while it lives, then `walk_pyframe_roots`
     /// over the `CURRENT_FRAME` / `f_backref` chain or a traced edge such as
     /// a traceback's `tb_frame`) reaches it, so `Drop` performs no manual
@@ -1806,21 +1806,24 @@ impl FrameBox {
     /// 92-99.7% of the nursery surviving each minor on a module-level loop
     /// calling a compiled function that raises, against 15% with the JIT off.
     ///
-    /// The non-moving part is pyre's, not upstream's: `pyframe.py class
-    /// PyFrame(W_Root)` declares no placement hint and a minor collection
-    /// relocates it, rewriting every referring slot
-    /// (`rpython/memory/gc/incminimark.py` / `:2252`) because the
-    /// translator delivers roots as slot addresses and rewrites live GCREF
-    /// locals in them (`rpython/memory/gctransform/shadowstack.py:43-46`).
-    /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
-    /// across its own allocations, so this allocation standing still is what
-    /// takes the place of that rewrite.  It is not a rule about every frame —
-    /// a compiled trace's inlined-callee frame is a nursery allocation
-    /// (`emit_new_pyframe_inline_with_params` -> `NewWithVtable`), so the
-    /// crossing into raw-pointer territory is guarded at the seams instead,
-    /// by `crate::eval::FrameAnchor` and the JIT layer's `FrameRoot`.
+    /// The frame moves like upstream's (`pyframe.py class PyFrame(W_Root)`
+    /// declares no placement hint, and a minor collection relocates it,
+    /// rewriting every referring slot). The translator delivers roots as
+    /// slot addresses and rewrites live GCREF locals in them
+    /// (`shadowstack.py` `push_roots` / `pop_roots`); Rust has no such pass,
+    /// so a caller that keeps a frame address across an allocation holds it
+    /// in a shadow-stack slot and reads it back: this function's own
+    /// `owner_root`, `crate::eval::FrameAnchor` in the dispatch loop and the
+    /// opcode handlers, and the JIT layer's `FrameRoot`.
     ///
-    /// Making it uniform is one line —
+    /// A young-nonmoving frame (`external_malloc(alloc_young=True)`) was the
+    /// earlier stand-in for that rewrite, and it was not free: once a
+    /// bounded heap is at its limit `threshold_reached` stays true, and every
+    /// `external_malloc` runs a minor collection plus a major step sized
+    /// `totalsize + nursery_size/2`, so each Python call after a
+    /// `MemoryError` drove the collector toward the fatal second arrival.
+    ///
+    /// Making every frame old-gen is one line —
     /// `PYFRAME_DESCR_GROUP.size_descr.set_non_moving(true)` sends
     /// `NewWithVtable` down `gen_malloc_fixedsize` to the old generation —
     /// and it costs 3.6x on `bench/fib_recursive.py`: 0.39s against 1.43s,
@@ -1839,7 +1842,18 @@ impl FrameBox {
     /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
     /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
     /// distinguishes them with `try_gc_owns_object`.
-    pub fn new(mut frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+    pub fn new(frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+        Self::new_placed(frame, false)
+    }
+
+    /// [`FrameBox::new`] for a frame whose address must not change: a
+    /// young-nonmoving block (`external_malloc(..., alloc_young=True)`), for
+    /// [`PyFrame::snapshot_for_tracing`] only.
+    pub fn new_nonmoving(frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+        Self::new_placed(frame, true)
+    }
+
+    fn new_placed(mut frame: PyFrame, nonmoving: bool) -> Result<FrameBox, crate::PyError> {
         // `frame` is an RPython aggregate local whose GCREF fields are all
         // translated livevars across the frame allocation. Publish every field
         // before it, the way `gct_fv_gc_malloc` brackets a malloc with the
@@ -1904,10 +1918,30 @@ impl FrameBox {
         };
         let inputs = frame_root.publish(published);
         frame_root.normalize(inputs, published.len());
-        let raw = pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
-            PYFRAME_GC_TYPE_ID,
-            std::mem::size_of::<PyFrame>(),
-        );
+        let mut needs_write_barrier = true;
+        let raw = if nonmoving {
+            pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
+                PYFRAME_GC_TYPE_ID,
+                std::mem::size_of::<PyFrame>(),
+            )
+        } else {
+            // `malloc_fixedsize` (`incminimark.py`): a nursery bump that runs
+            // `collect_and_reserve` only when the nursery is full. Every input
+            // is already on `frame_root`; the hook's own slot carries the
+            // locals array, and the read-back below goes through `frame_root`
+            // like the other fields.
+            let mut allocation_root = frame_root.get(inputs + 2) as pyre_object::gc_hook::GCREF;
+            pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
+                pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+                    PYFRAME_GC_TYPE_ID,
+                    std::mem::size_of::<PyFrame>(),
+                    &mut allocation_root,
+                    &mut needs_write_barrier,
+                )
+            })
+            .allocated_or_raise()
+            .unwrap_or(std::ptr::null_mut())
+        };
         if !raw.is_null() {
             // RPython allocation results stay live in the translated shadow
             // stack while the caller initializes their fields.  Free-threaded
@@ -1944,13 +1978,14 @@ impl FrameBox {
             unsafe {
                 std::ptr::write(ptr, frame);
             }
-            // A young frame needs no barrier for the young argument / locals
-            // objects it names, and the barrier's TRACK_YOUNG_PTRS test
-            // answers so.  A refused young birth is old-gen, and that frame
-            // must be remembered for the next minor tracer, exactly as
-            // `generator.rs`'s `w_generator_or_coroutine_new` does for a
-            // stable generator wrapping young frame contents.
-            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+            // A nursery frame needs no barrier for the young objects it names,
+            // and the barrier's TRACK_YOUNG_PTRS test answers so. A frame the
+            // collecting malloc placed old (`needs_write_barrier`) must be
+            // remembered for the next minor tracer, as `generator.rs`'s
+            // `w_generator_or_coroutine_new` does for a stable generator.
+            if needs_write_barrier {
+                pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+            }
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
@@ -1981,9 +2016,8 @@ impl FrameBox {
     ///
     /// The sole caller is [`Self::new`]'s fallback for the window before the
     /// GC hook is installed (bootstrap, unit tests).  Nothing is collected in
-    /// that window, so a frame allocated here is never swept and never moves,
-    /// which is what lets the rest of the interpreter treat every frame
-    /// address as stable.
+    /// that window, so a frame allocated here is never swept and never
+    /// moves.
     fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
@@ -4946,8 +4980,12 @@ impl PyFrame {
         // skip its frame edge and `TraceCtx::virtualizable_heap_ptr` has no
         // slot to read back.  Same allocation shape as
         // `snapshot_for_generator` below, for the same reason.
-        let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
+        // The snapshot is pyre's own stand-in for the `MIFrame` stack and its
+        // address is the walk's `cf_addr` identity, so it is young-nonmoving
+        // rather than a moving nursery frame.
+        let mut frame = FrameBox::new_nonmoving(
+            self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?,
+        )?;
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -5025,8 +5063,8 @@ impl PyFrame {
     /// frame), and the generator's custom trace greys the frame block.
     pub fn snapshot_for_generator(&self) -> Result<FrameBox, crate::PyError> {
         // `build_snapshot_frame` finishes its allocations before returning.
-        // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
-        // and write-barriers the frame before this returns.
+        // `FrameBox::new` then allocates a nursery frame, which moves like any
+        // generator frame (`generator.py` holds it through a traced field).
         let mut frame =
             FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
         frame.fix_array_ptrs();

@@ -2753,10 +2753,10 @@ pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
     eval_loop(frame, ec, /* relink */ true)
 }
 
-/// The frame passed here is a `FrameBox` frame that a minor collection does
-/// not move. After every collecting call the loop still re-reads it from its
-/// `FrameAnchor` slot (`shadowstack.py` `pop_roots`), matching
-/// `eval_loop_jit`. A JIT nursery frame is resumed through `eval_loop_jit`.
+/// The frame passed here is a `FrameBox` frame that a minor collection can
+/// move, so the loop re-reads it from its `FrameAnchor` slot after every
+/// collecting call (`shadowstack.py` `pop_roots`), matching `eval_loop_jit`.
+/// A JIT nursery frame is resumed through `eval_loop_jit`.
 fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
@@ -2768,7 +2768,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
     // nested activation (depth 2); a callback entered from a depth-1 opcode
     // handler runs at depth 2 with that handler suspended. Operands stay on
     // the frame value stack or are pinned (`with_roots!`), the interpreter
-    // frame is a `FrameBox` (young-nonmoving), and the result push goes
+    // frame is a `FrameBox`, and the result push goes
     // through `FrameAnchor`. This loop reloads the frame from its
     // `FrameAnchor` slot after each collecting call (`framework.py`
     // `gct_direct_call`, `shadowstack.py` `push_roots` / `pop_roots`).

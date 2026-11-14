@@ -24818,13 +24818,15 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
     // send GeneratorExit (or the error that close raised) into this frame.
     // Doing the delegate close here, not only inside JIT resume, keeps
     // `os.fwalk().close()` from depending on whether the portal compiled.
-    let err = if generator_get_delegate(gen_obj).is_null() {
-        PyError::new(PyErrorKind::GeneratorExit, String::new())
-    } else {
-        pyre_object::with_roots!(gen_obj => generator_close_iter(gen_obj))
-            .err()
-            .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
-    };
+    let err = pyre_object::with_roots!(gen_obj => {
+        if generator_get_delegate(gen_obj).is_null() {
+            PyError::new(PyErrorKind::GeneratorExit, String::new())
+        } else {
+            generator_close_iter(gen_obj)
+                .err()
+                .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
+        }
+    });
     let sent = pyre_object::with_roots!(gen_obj => {
         generator_send_error(gen_obj, err, None)
     });
