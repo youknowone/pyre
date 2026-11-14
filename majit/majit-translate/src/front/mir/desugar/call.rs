@@ -10627,7 +10627,9 @@ impl Lowering<'_> {
         else {
             return Ok(false);
         };
-        let payload_struct = self.nth_payload_struct(dest_ty);
+        let Some(nth_payload) = self.nth_payload_shape(dest_ty, &payload_ty) else {
+            return Ok(false);
+        };
         let bb_id = self.emit_bb(mir_bb);
         let cp = self
             .graph
@@ -10662,6 +10664,7 @@ impl Lowering<'_> {
         let option_owner_some = option_owner.clone();
         let some_owner_some = some_owner.clone();
         let payload_ty_some = payload_ty.clone();
+        let nth_payload_some = nth_payload;
         self.close_call_diamond(
             mir_bb,
             target,
@@ -10676,16 +10679,20 @@ impl Lowering<'_> {
                     &mut this.graph,
                     some_bb,
                     mapped[0].clone(),
-                    &payload_ty_some,
-                    payload_struct.as_ref().map(|(owner, _)| owner.as_str()),
-                    payload_struct.as_ref().map(|(_, field)| field.as_str()),
+                    &nth_payload_some,
                 );
+                let stored_ty = match &nth_payload_some {
+                    crate::front::wtf8_nth::NthPayload::Instance { owner, .. } => {
+                        ValueType::Ref(Some(owner.clone()))
+                    }
+                    crate::front::wtf8_nth::NthPayload::Word => payload_ty_some.clone(),
+                };
                 crate::front::option_variant::emit_option_variant(
                     &mut this.graph,
                     some_bb,
                     &option_owner_some,
                     1,
-                    Some((some_owner_some.as_str(), payload, payload_ty_some.clone())),
+                    Some((some_owner_some.as_str(), payload, stored_ty)),
                 )
             },
             move |this, none_bb, _| {
@@ -10701,25 +10708,68 @@ impl Lowering<'_> {
         Ok(true)
     }
 
-    /// Unique sized field of dest `Option<T>` when `T` is a one-field
-    /// integer struct (`CodePoint.value`). `None` for a scalar payload.
-    fn nth_payload_struct(&self, dest_ty: &TyRef) -> Option<(String, String)> {
-        let body = match dest_ty {
-            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
-            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
-        };
-        let inner = type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
-            .get("types")?
-            .get(0)?;
-        let inner_ty = TyRef::Other(inner.clone());
-        let def_id = self.tyref_adt_def_id(&inner_ty)?;
+    /// Dest `Option<T>` payload shape. Inner `T` is [`Self::tyref_adt_type_arg`]
+    /// (serde through [`TyRef`], so a `Deduplicated` generic peels the same
+    /// way [`Self::tyref_option_payload_value_type`] already does).
+    /// `None` declines: a `Ref` payload whose TypeDecl cannot be resolved
+    /// must not store the helper word (`ClassDef.generalize_attr` /
+    /// `unionof`).
+    fn nth_payload_shape(
+        &self,
+        dest_ty: &TyRef,
+        payload_ty: &ValueType,
+    ) -> Option<crate::front::wtf8_nth::NthPayload> {
+        if !matches!(payload_ty, ValueType::Ref(_)) {
+            return Some(crate::front::wtf8_nth::NthPayload::Word);
+        }
+        let inner = self.tyref_adt_type_arg(dest_ty, 0)?;
+        let node =
+            tyref_node(&inner, self.llbc).and_then(|n| strip_ty_indirections(n, self.llbc))?;
+        if node.as_object().is_some_and(|obj| {
+            obj.contains_key("Scalar") || obj.contains_key("Ref") || obj.contains_key("RawPtr")
+        }) {
+            return Some(crate::front::wtf8_nth::NthPayload::Word);
+        }
+        let def_id = adt_node_def_id(node)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let (_, field) = unique_nonzst_field(td, self.llbc)?;
-        let owner = strip_crate_prefix(&td.item_meta.name_path_str());
+        let name_path = td.item_meta.name_path_str();
+        let owner = class_identity_spelling(name_path, self.tombstoned_leaves);
         if owner.is_empty() {
             return None;
         }
-        Some((owner, field))
+        if let Some(fields) = type_decl_struct_fields(td, self.llbc) {
+            let mut found = None;
+            for (index, field) in fields.iter().enumerate() {
+                if field_is_zst(&field.ty, self.llbc) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                let name = field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+                found = Some((name, self.value_type_of(&field.ty)));
+            }
+            return Some(crate::front::wtf8_nth::NthPayload::Instance {
+                owner,
+                field: found,
+            });
+        }
+        match &td.kind {
+            TypeDeclKind::Opaque => {
+                Some(crate::front::wtf8_nth::NthPayload::Instance { owner, field: None })
+            }
+            TypeDeclKind::Alias(body) => {
+                let node = body.get("aliased_ty").unwrap_or(body);
+                let peeled = type_node_peel_aliases(node, self.llbc).unwrap_or(node);
+                let inner = self.llbc.type_by_id(adt_node_def_id(peeled)?)?;
+                matches!(inner.kind, TypeDeclKind::Opaque)
+                    .then_some(crate::front::wtf8_nth::NthPayload::Instance { owner, field: None })
+            }
+            _ => None,
+        }
     }
 
     /// `vec![e0, …, eN-1]` → `ll_vec_newlist_{kind}(N)` +

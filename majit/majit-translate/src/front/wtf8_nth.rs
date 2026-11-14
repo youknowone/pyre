@@ -182,41 +182,61 @@ pub(crate) fn build_ll_wtf8_nth_graph() -> FunctionGraph {
     graph
 }
 
-/// Wrap a signed code point as the dest Option payload when that payload
-/// is a one-field integer struct (`CodePoint.value`). Integer / unsigned
-/// payloads are the word itself.
+/// Dest `Option<T>` payload the nth diamond stores in `Some.__pos_0`.
+///
+/// `ClassDef.generalize_attr` / `unionof` keep one annotation per
+/// attribute. A `Ref` payload is the named instance intern publishes
+/// (`intern_opaque_payload_spelling` / `intern_adt_type_decl_identity`
+/// for an Opaque TypeDecl, `emit_aggregate_ctor` for a Struct). The
+/// ctor name is that identity so `intern_class_by_qualname` shares the
+/// FORCE `__pos_0` class (`getuniqueclassdef`). A scalar / pointer
+/// payload is the helper word. Never a silent word store into a struct
+/// payload.
+#[derive(Clone, Debug)]
+pub(crate) enum NthPayload {
+    Word,
+    Instance {
+        owner: String,
+        field: Option<(String, ValueType)>,
+    },
+}
+
+/// Wrap the helper word as [`NthPayload::Instance`], else return it.
 pub(crate) fn emit_nth_payload(
     graph: &mut FunctionGraph,
     block: BlockId,
     value: Variable,
-    payload_ty: &ValueType,
-    struct_owner: Option<&str>,
-    field_name: Option<&str>,
+    payload: &NthPayload,
 ) -> Variable {
-    let (ValueType::Ref(_), Some(owner), Some(field)) = (payload_ty, struct_owner, field_name)
-    else {
+    let NthPayload::Instance { owner, field } = payload else {
         return value;
     };
-    let leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let owner_path = crate::model::split_qualified_path(owner);
     let shell = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(shell.clone()),
         kind: OpKind::Call {
-            target: CallTarget::synthetic_transparent_struct_ctor(owner_path, leaf),
+            // Empty `owner_path`: intern under `owner`
+            // (`intern_adt_type_decl_identity` / `class_identity_spelling`).
+            // A crate-prefixed path mints a second ClassDef
+            // (`intern_class_by_qualname` of the dotted TypeDecl path)
+            // that `unionof` cannot join with the FORCE payload row.
+            target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), owner.clone()),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(owner.to_string())),
+            result_ty: ValueType::Ref(Some(owner.clone())),
         },
     });
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: None,
-        kind: OpKind::FieldWrite {
-            base: shell.clone(),
-            field: FieldDescriptor::new(field, Some(owner.to_string())).with_base_is_deref(false),
-            value: LinkArg::Value(value),
-            ty: ValueType::Unsigned,
-        },
-    });
+    if let Some((field_name, field_ty)) = field {
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new(field_name.clone(), Some(owner.clone()))
+                    .with_base_is_deref(false),
+                value: LinkArg::Value(value),
+                ty: field_ty.clone(),
+            },
+        });
+    }
     shell
 }
 
