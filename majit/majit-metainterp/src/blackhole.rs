@@ -796,24 +796,23 @@ impl BlackholeInterpreter {
     }
 
     fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
-        // One `body()` so a same-helper reseat does not pay nine
-        // `OnceLock` walks (`num_regs_*` / `num_regs_and_consts_*` /
-        // `constants_*` each Deref through the body).
-        let body = jitcode.body();
+        // `blackhole.py` `BlackholeInterpreter.setposition` reads
+        // `jitcode.num_regs_*` / `jitcode.constants_*` as fields
+        // (`JitCode.setup`). `Arc<JitCode>` on `self.jitcode` pins them.
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
-            body.c_num_regs_i as usize,
-            &body.constants_i,
+            jitcode.num_regs_i(),
+            &jitcode.constants_i,
         );
         Self::init_register_file_from_const_slots_r(
             &mut self.registers_r,
-            body.c_num_regs_r as usize,
-            &body.constants_r,
+            jitcode.num_regs_r(),
+            &jitcode.constants_r,
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
-            body.c_num_regs_f as usize,
-            &body.constants_f,
+            jitcode.num_regs_f(),
+            &jitcode.constants_f,
         );
     }
 
