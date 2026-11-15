@@ -655,6 +655,7 @@ impl AppExecCache {
 pub enum SpaceCacheClass {
     ClassDictStrategy,
     SysState,
+    AppReCache,
 }
 
 /// A `fromcache` value plus the IsolatedStrong that keeps an isolated
@@ -706,6 +707,7 @@ impl<T> std::ops::Deref for RetainedSpaceCache<T> {
 pub enum SpaceCacheInstance {
     ClassDictStrategy(RetainedSpaceCache<crate::objspace::std::classdict::ClassDictStrategy>),
     SysState(RetainedSpaceCache<crate::module::sys::state::SysState>),
+    AppReCache(RetainedSpaceCache<crate::module::_sre::interp_sre::AppReCache>),
 }
 
 impl SpaceCacheInstance {
@@ -715,6 +717,7 @@ impl SpaceCacheInstance {
         match self {
             Self::ClassDictStrategy(cache) => Self::ClassDictStrategy(cache.retain_owner()),
             Self::SysState(cache) => Self::SysState(cache.retain_owner()),
+            Self::AppReCache(cache) => Self::AppReCache(cache.retain_owner()),
         }
     }
 }
@@ -796,12 +799,18 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
                 space.clone(),
                 std::sync::Arc::new(crate::module::sys::state::SysState::new()),
             )),
+            Self::AppReCache => SpaceCacheInstance::AppReCache(RetainedSpaceCache::stored(
+                space.clone(),
+                std::sync::Arc::new(crate::module::_sre::interp_sre::AppReCache::new(
+                    space.clone(),
+                )),
+            )),
         })
     }
 }
 
-/// One `space.w_*` attribute of an object space: written while the space
-/// initializes, then rewritten only by the collector through
+/// One space-owned `W_Root` slot: written at initialization or when a space
+/// cache first publishes it, then rewritten only by the collector through
 /// [`ObjSpace::walk_cache_roots`].
 pub struct SpaceAttr(std::cell::UnsafeCell<PyObjectRef>);
 
@@ -822,12 +831,12 @@ impl SpaceAttr {
 
     /// `setattr(space, 'w_' + name, w_obj)`. The space is prebuilt, so the
     /// store is a prebuilt-family store (`remember_young_pointer`).
-    fn set(&self, w_obj: PyObjectRef) {
+    pub(crate) fn set(&self, w_obj: PyObjectRef) {
         unsafe { *self.0.get() = w_obj };
         pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     }
 
-    fn walk(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    pub(crate) fn walk(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
         let slot = unsafe { &mut *self.0.get() };
         if !slot.is_null() {
             forward(slot);
@@ -914,6 +923,11 @@ impl ObjSpace {
 
     pub fn type_cache(&self) -> &crate::objspace::std::typeobject::TypeCache {
         &self.type_cache
+    }
+
+    /// `space.builtin`; null before `make_builtins` sets it.
+    pub fn builtin(&self) -> PyObjectRef {
+        self.builtin.get()
     }
 
     /// `space.w_object`; null before `init_typeobjects` sets it.
@@ -1007,6 +1021,7 @@ impl ObjSpace {
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
+            SpaceCacheInstance::AppReCache(cache) => cache.walk_roots(forward),
         });
     }
 
