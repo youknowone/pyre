@@ -1773,10 +1773,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
+                    // `_PyArg_CheckPositional("pidfd_send_signal", nargs, 2, 4)`.
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "pidfd_send_signal() requires at least 2 arguments",
-                        ));
+                        return Err(crate::PyError::type_error(format!(
+                            "pidfd_send_signal expected at least 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    if args.len() > 4 {
+                        return Err(crate::PyError::type_error(format!(
+                            "pidfd_send_signal expected at most 4 arguments, got {}",
+                            args.len()
+                        )));
                     }
                     // The syscall's `siginfo` argument is not exposed, so the
                     // only value that can be honoured is None.  Ignoring
