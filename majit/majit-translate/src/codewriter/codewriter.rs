@@ -103,6 +103,21 @@ impl majit_jitcode::codewriter::codewriter::CodeWriterSetup for CodeWriterWithCa
     }
 }
 
+/// The `remove_obvious_noops` step of `warmspot.py prejit_optimizations` /
+/// `all.py backend_optimizations`. Runs per graph on Spine B's input because
+/// Spine A still reads the shared rtyped graph by op index; at cut-over it
+/// becomes one `backend_optimizations(graphs=…)` call with the remaining
+/// sub-passes (constfold, remove_asserts, merge_if_blocks) in upstream order.
+fn prejit_remove_obvious_noops(
+    graph: &crate::flowspace::model::FunctionGraph,
+    translator: &crate::translator::translator::TranslationContext,
+) {
+    crate::translator::backendopt::removenoops::remove_same_as(graph);
+    crate::translator::simplify::eliminate_empty_blocks(graph);
+    crate::translator::simplify::transform_dead_op_vars(graph, Some(translator));
+    crate::translator::backendopt::removenoops::remove_duplicate_casts(graph, translator);
+}
+
 impl CodeWriter {
     /// Pair this codewriter with the `CallControl` it drove, for
     /// `MetaInterpStaticData.finish_setup(codewriter)`.
@@ -1157,6 +1172,19 @@ impl CodeWriter {
         verbose: bool,
         index: usize,
     ) {
+        // `warmspot.py WarmRunnerDesc.__init__` → `prejit_optimizations` →
+        // `all.py backend_optimizations` `remove_obvious_noops` before
+        // jtransform sees the graph. No dual-gate session (unit fixtures)
+        // skips the pass. Drop the registry before the rest of Spine B.
+        {
+            let translator = self
+                .dual_gate_registry(callcontrol)
+                .session_if_started()
+                .map(|(ann, _rt)| std::rc::Rc::clone(&ann.translator));
+            if let Some(translator) = translator {
+                prejit_remove_obvious_noops(flow_graph, &translator);
+            }
+        }
         // jtransform.py transform_graph starts with
         // constant_fold_ll_issubclass(graph, cpu) on the flowspace
         // graph. Spine B is the remaining entry that still holds
@@ -1946,5 +1974,250 @@ mod exception_class_hierarchy_tests {
                 .expect("cached base"),
             &base
         ));
+    }
+}
+
+#[cfg(test)]
+mod opname_spine_prejit_tests {
+    use super::prejit_remove_obvious_noops;
+    use crate::codewriter::call::CallControl;
+    use crate::codewriter::codewriter::CodeWriter;
+    use crate::codewriter::jtransform::GraphTransformConfig;
+    use crate::flowspace::model::{
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
+        Variable,
+    };
+    use crate::model::OpKind;
+    use crate::parse::CallPath;
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        FuncType, LowLevelType, Ptr, PtrTarget, functionptr,
+    };
+    use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+    use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+    use crate::translator::translator::TranslationContext;
+
+    fn graph_opnames(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn has_getfield_named(graph: &FunctionGraph, field: &str) -> bool {
+        graph.iterblocks().into_iter().any(|block| {
+            block.borrow().operations.iter().any(|op| {
+                op.opname == "getfield"
+                    && op.args.get(1).is_some_and(|arg| match arg {
+                        Hlvalue::Constant(c) => c.value.as_byte_str() == Some(field.as_bytes()),
+                        _ => false,
+                    })
+            })
+        })
+    }
+
+    fn field_name_const(name: &str) -> Hlvalue {
+        constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
+    }
+
+    fn method_fnptr_type() -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![OBJECTPTR.clone()],
+                result: LowLevelType::Signed,
+            }),
+        }))
+    }
+
+    fn close_return(
+        start: &crate::flowspace::model::BlockRef,
+        graph: &FunctionGraph,
+        value: Variable,
+    ) {
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    /// `MethodsPBCRepr.redispatch_call` for a single-function family:
+    /// `getfield(v, typeptr)` → `cast_pointer` → Void `getfield(cls_m)`
+    /// → unused, plus `direct_call(c_fn, v)`.
+    fn dead_method_class_lookup_graph() -> FunctionGraph {
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let vtable = variable_with_lltype("vtable", CLASSTYPE.clone());
+        let v_func = variable_with_lltype("v_func", LowLevelType::Void);
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "w_bytearray_len",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let ft = FuncType {
+            args: vec![OBJECTPTR.clone()],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr(ft, "c_fn", None, Some("c_fn".to_string()));
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(v.clone()), field_name_const("typeptr")],
+                Hlvalue::Variable(cls.clone()),
+            ),
+            SpaceOperation::new(
+                "cast_pointer",
+                vec![Hlvalue::Variable(cls)],
+                Hlvalue::Variable(vtable.clone()),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(vtable), field_name_const("cls_m")],
+                Hlvalue::Variable(v_func),
+            ),
+            SpaceOperation::new(
+                "direct_call",
+                vec![c_fn, Hlvalue::Variable(v)],
+                Hlvalue::Variable(result.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, result);
+        graph
+    }
+
+    /// Same class-lookup chain, but `cls_m` is a live funcptr consumed by
+    /// `indirect_call`.
+    fn live_method_class_lookup_graph() -> FunctionGraph {
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let vtable = variable_with_lltype("vtable", CLASSTYPE.clone());
+        let v_func = variable_with_lltype("v_func", method_fnptr_type());
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "method_indirect",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(v.clone()), field_name_const("typeptr")],
+                Hlvalue::Variable(cls.clone()),
+            ),
+            SpaceOperation::new(
+                "cast_pointer",
+                vec![Hlvalue::Variable(cls)],
+                Hlvalue::Variable(vtable.clone()),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(vtable), field_name_const("cls_m")],
+                Hlvalue::Variable(v_func.clone()),
+            ),
+            SpaceOperation::new(
+                "indirect_call",
+                vec![
+                    Hlvalue::Variable(v_func),
+                    Hlvalue::Variable(v),
+                    Hlvalue::Constant(Constant::new(ConstValue::None)),
+                ],
+                Hlvalue::Variable(result.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, result);
+        graph
+    }
+
+    #[test]
+    fn opname_spine_drops_dead_method_class_lookup() {
+        let graph = dead_method_class_lookup_graph();
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        let opnames = graph_opnames(&graph);
+        assert!(
+            !opnames
+                .iter()
+                .any(|name| name == "getfield" || name == "cast_pointer"),
+            "dead typeptr/cls_m lookup must drop; ops={opnames:?}"
+        );
+        assert_eq!(opnames, vec!["direct_call"]);
+
+        let lowered = crate::codewriter::jtransform_opname::lower_graph(&graph);
+        let saw_guard = lowered.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
+        });
+        assert!(!saw_guard, "lowered graph must not emit guard_class");
+
+        let path = CallPath::from_segments(["w_bytearray_len"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            !dump.contains("guard_class"),
+            "assembled jitcode must not contain guard_class; dump:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn opname_spine_keeps_class_lookup_feeding_indirect_call() {
+        let graph = live_method_class_lookup_graph();
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        assert!(
+            has_getfield_named(&graph, "typeptr"),
+            "typeptr getfield feeding indirect_call must survive; ops={:?}",
+            graph_opnames(&graph)
+        );
+    }
+
+    #[test]
+    fn opname_spine_prejit_removes_same_as() {
+        let x = Variable::named("x");
+        let y = Variable::named("y");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let graph = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![Hlvalue::Variable(x.clone())],
+            Hlvalue::Variable(y.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(y)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        assert!(
+            start.borrow().operations.is_empty(),
+            "same_as must be removed"
+        );
+        let link_arg = start.borrow().exits[0].borrow().args[0]
+            .clone()
+            .expect("link arg");
+        assert_eq!(link_arg, Hlvalue::Variable(x));
     }
 }
