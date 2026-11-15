@@ -1,4 +1,4 @@
-//! Expansion of `llexternal` and `external_compilation_info`.
+//! Expansion of `llexternal`, `cextern_variable`, and `external_compilation_info`.
 //!
 //! `llexternal` (`rffi.py`) builds the funcptr, then `call_external_function`,
 //! then the forwarding wrapper. The derivations below follow that function's
@@ -18,6 +18,60 @@ use syn::{
 pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
     let parsed: LlexternalInput = syn::parse2(input)?;
     Ok(parsed.expand())
+}
+
+pub fn expand_cextern_variable(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::CExternVariableHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let getter_vis = &head.getter.0;
+    let getter = &head.getter.1;
+    let getter_c = format!("get_{}", head.name);
+    let ty = &head.ty;
+    let eci = &head.compilation_info;
+    let sandboxsafe = head
+        .sandboxsafe
+        .as_ref()
+        .map(|expr| quote! { , sandboxsafe = #expr });
+    let nowrapper = head
+        .nowrapper
+        .as_ref()
+        .map(|expr| quote! { , _nowrapper = #expr });
+    let getter_item = quote! {
+        #(#attrs)*
+        ::majit_rlib::rffi::llexternal!(
+            #getter_vis #getter = #getter_c,
+            [],
+            #ty,
+            compilation_info = #eci
+            #sandboxsafe
+            #nowrapper
+        );
+    };
+    if head.getter_only {
+        return Ok(getter_item);
+    }
+    let (setter_vis, setter) = head.setter.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            getter.span(),
+            "cextern_variable with two names needs a setter",
+        )
+    })?;
+    let setter_c = format!("set_{}", head.name);
+    let setter_item = quote! {
+        #(#attrs)*
+        ::majit_rlib::rffi::llexternal!(
+            #setter_vis #setter = #setter_c,
+            [#ty],
+            (),
+            compilation_info = #eci
+            #sandboxsafe
+            #nowrapper
+        );
+    };
+    Ok(quote! {
+        #getter_item
+        #setter_item
+    })
 }
 
 pub fn expand_external_compilation_info(input: TokenStream) -> syn::Result<TokenStream> {

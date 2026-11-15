@@ -110,16 +110,37 @@ pub use cConfig::{
 #[cfg(unix)]
 const _: () = assert!(OFF_T_SIZE == core::mem::size_of::<i64>());
 
-/// `rposix._get_errno`.
-pub fn _get_errno() -> i32 {
+// Windows wrap_write/wrap_read sources are not part of this ECI here.
+#[cfg(any(unix, windows))]
+crate::rffi::external_compilation_info! { const ERRNO_ECI = { includes: ["errno.h", "stdio.h"] }; }
+// Direct getters/setters, don't use directly!
+#[cfg(any(unix, windows))]
+crate::rffi::cextern_variable!(pub _get_errno, pub _set_errno = "errno", crate::rffi::INT, compilation_info = ERRNO_ECI, sandboxsafe = true, _nowrapper = true, c_type = "int", declare_as_extern = false);
+
+// No C `errno` on this target, the thread-local slot stands in for it.
+#[cfg(not(any(unix, windows)))]
+pub unsafe fn _get_errno() -> i32 {
     unsafe { *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) }
 }
 
-/// `rposix._set_errno`.
-pub fn _set_errno(errno: i32) {
+#[cfg(not(any(unix, windows)))]
+pub unsafe fn _set_errno(errno: i32) {
     unsafe {
         *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) = errno
     };
+}
+
+#[cfg(all(test, unix))]
+mod cextern_variable_errno_tests {
+    use super::*;
+
+    #[test]
+    fn cextern_variable_errno_round_trip() {
+        unsafe {
+            _set_errno(42);
+            assert_eq!(_get_errno(), 42);
+        }
+    }
 }
 
 /// `rposix.get_saved_errno`.
@@ -213,16 +234,22 @@ pub fn restore_closed_standard_fds() {}
 pub fn _errno_before(save_err: i64) {
     if save_err & RFFI_READSAVED_ERRNO != 0 {
         if save_err & RFFI_ALT_ERRNO != 0 {
-            _set_errno(
-                rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32,
-            );
+            unsafe {
+                _set_errno(
+                    rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32,
+                );
+            }
         } else {
-            _set_errno(
-                rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32,
-            );
+            unsafe {
+                _set_errno(
+                    rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32,
+                );
+            }
         }
     } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
-        _set_errno(0);
+        unsafe {
+            _set_errno(0);
+        }
     }
     #[cfg(target_os = "windows")]
     if save_err & RFFI_READSAVED_LASTERROR != 0 {
@@ -264,7 +291,7 @@ pub fn _errno_after(save_err: i64) {
     #[cfg(not(target_os = "windows"))]
     let _ = (RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR);
     if save_err & RFFI_SAVE_ERRNO != 0 {
-        let value = _get_errno() as i64;
+        let value = unsafe { _get_errno() } as i64;
         if save_err & RFFI_ALT_ERRNO != 0 {
             rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_ERRNO_OFS, value);
         } else {
@@ -3565,8 +3592,8 @@ mod tests {
     fn alt_errno_round_trips_through_the_real_errno() {
         set_saved_alterrno(42);
         _errno_before(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
-        assert_eq!(_get_errno(), 42);
-        _set_errno(7);
+        assert_eq!(unsafe { _get_errno() }, 42);
+        unsafe { _set_errno(7) };
         _errno_after(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
         assert_eq!(get_saved_alterrno(), 7);
         assert_eq!(get_saved_errno(), 0);
@@ -3681,9 +3708,9 @@ mod tests {
 
     #[test]
     fn zero_errno_before_clears_the_real_errno() {
-        _set_errno(5);
+        unsafe { _set_errno(5) };
         _errno_before(RFFI_ZERO_ERRNO_BEFORE);
-        assert_eq!(_get_errno(), 0);
+        assert_eq!(unsafe { _get_errno() }, 0);
     }
 
     #[cfg(unix)]

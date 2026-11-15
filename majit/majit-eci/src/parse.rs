@@ -1,5 +1,5 @@
-//! `external_compilation_info!` input grammar and the `llexternal!` head
-//! `compile_crate_ecis` reads for `macro` wrappers.
+//! `external_compilation_info!` input grammar and the `llexternal!` /
+//! `cextern_variable!` heads `compile_crate_ecis` reads.
 
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -138,6 +138,103 @@ impl Parse for LlexternalHead {
             result,
             macro_,
             compilation_info,
+        })
+    }
+}
+
+/// The `cextern_variable!` tokens `compile_crate_ecis` and the proc macro
+/// share: outer attributes, getter, optional setter, C name, type, then
+/// `key = expr` pairs (`rffi.CExternVariable`).
+pub struct CExternVariableHead {
+    pub attrs: Vec<Attribute>,
+    pub getter: (Visibility, Ident),
+    pub setter: Option<(Visibility, Ident)>,
+    pub name: String,
+    pub ty: Type,
+    pub compilation_info: Expr,
+    pub sandboxsafe: Option<Expr>,
+    pub nowrapper: Option<Expr>,
+    pub c_type: Option<String>,
+    pub getter_only: bool,
+    pub declare_as_extern: Option<bool>,
+}
+
+impl Parse for CExternVariableHead {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        let getter_vis: Visibility = input.parse()?;
+        let getter: Ident = input.parse()?;
+        let setter = if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            let setter_vis: Visibility = input.parse()?;
+            let setter: Ident = input.parse()?;
+            Some((setter_vis, setter))
+        } else {
+            None
+        };
+        input.parse::<Token![=]>()?;
+        let name: LitStr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let ty: Type = input.parse()?;
+
+        let mut compilation_info = None;
+        let mut sandboxsafe = None;
+        let mut nowrapper = None;
+        let mut c_type = None;
+        let mut getter_only = false;
+        let mut declare_as_extern = None;
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key = Ident::parse_any(input)?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "compilation_info" => compilation_info = Some(input.parse()?),
+                "sandboxsafe" => sandboxsafe = Some(input.parse()?),
+                "_nowrapper" => nowrapper = Some(input.parse()?),
+                "c_type" => c_type = Some(input.parse::<LitStr>()?.value()),
+                "getter_only" => getter_only = input.parse::<LitBool>()?.value(),
+                "declare_as_extern" => declare_as_extern = Some(input.parse::<LitBool>()?.value()),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown cextern_variable kwarg `{other}`"),
+                    ));
+                }
+            }
+        }
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after cextern_variable arguments"));
+        }
+        let compilation_info = compilation_info.ok_or_else(|| {
+            syn::Error::new(getter.span(), "cextern_variable requires compilation_info")
+        })?;
+        if setter.is_some() && getter_only {
+            return Err(syn::Error::new(
+                getter.span(),
+                "cextern_variable with two names cannot set getter_only = true",
+            ));
+        }
+        if setter.is_none() && !getter_only {
+            return Err(syn::Error::new(
+                getter.span(),
+                "cextern_variable with one name requires getter_only = true",
+            ));
+        }
+        Ok(CExternVariableHead {
+            attrs,
+            getter: (getter_vis, getter),
+            setter,
+            name: name.value(),
+            ty,
+            compilation_info,
+            sandboxsafe,
+            nowrapper,
+            c_type,
+            getter_only,
+            declare_as_extern,
         })
     }
 }

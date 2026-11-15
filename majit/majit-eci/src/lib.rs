@@ -45,6 +45,42 @@ pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result:
     }
 }
 
+/// `rffi.CExternVariable`'s generated getter/setter source and prototypes.
+pub fn generate_cextern_variable(
+    name: &str,
+    c_type: &str,
+    getter_only: bool,
+    declare_as_extern: bool,
+    includes: &[String],
+) -> ExternalCompilationInfo {
+    let getter_name = format!("get_{name}");
+    let setter_name = format!("set_{name}");
+    let getter_prototype = format!("RPY_EXTERN {c_type} {getter_name} (void);");
+    let setter_prototype = format!("RPY_EXTERN void {setter_name} ({c_type} v);");
+    let c_getter = format!("{c_type} {getter_name} () {{ return {name}; }}");
+    let c_setter = format!("void {setter_name} ({c_type} v) {{ {name} = v; }}");
+    let mut lines: Vec<String> = includes
+        .iter()
+        .map(|include| format!("#include <{include}>"))
+        .collect();
+    if declare_as_extern {
+        lines.push(format!("extern {c_type} {name};"));
+    }
+    lines.push(c_getter);
+    if !getter_only {
+        lines.push(c_setter);
+    }
+    let mut prototypes = vec![getter_prototype];
+    if !getter_only {
+        prototypes.push(setter_prototype);
+    }
+    ExternalCompilationInfo {
+        separate_module_sources: vec![lines.join("\n")],
+        post_include_bits: prototypes,
+        ..ExternalCompilationInfo::default()
+    }
+}
+
 /// `cbuild.py` `from_pkg_config` / `from_config_tool` `ImportError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportError {
@@ -1103,5 +1139,80 @@ mod tests {
         assert_eq!(value.1, &["stdio.h".to_string()][..]);
         assert!(value.13);
         assert_eq!(value.14, Some("host"));
+    }
+
+    #[test]
+    fn cextern_variable_errno_source_and_prototypes() {
+        let eci = generate_cextern_variable(
+            "errno",
+            "int",
+            false,
+            false,
+            &["errno.h".into(), "stdio.h".into()],
+        );
+        assert_eq!(
+            eci.separate_module_sources,
+            [
+                "#include <errno.h>\n#include <stdio.h>\nint get_errno () { return errno; }\nvoid set_errno (int v) { errno = v; }"
+            ]
+        );
+        assert_eq!(
+            eci.post_include_bits,
+            [
+                "RPY_EXTERN int get_errno (void);".to_string(),
+                "RPY_EXTERN void set_errno (int v);".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cextern_variable_getter_only_declare_as_extern() {
+        let eci = generate_cextern_variable("stdin", "FILE*", true, true, &["stdio.h".into()]);
+        assert_eq!(eci.separate_module_sources.len(), 1);
+        let source = &eci.separate_module_sources[0];
+        assert!(source.contains("extern FILE* stdin;"), "{source}");
+        assert!(
+            source.contains("FILE* get_stdin () { return stdin; }"),
+            "{source}"
+        );
+        assert!(!source.contains("set_stdin"), "{source}");
+        assert_eq!(
+            eci.post_include_bits,
+            ["RPY_EXTERN FILE* get_stdin (void);".to_string()]
+        );
+    }
+
+    #[test]
+    fn cextern_variable_head_parses_getter_and_setter() {
+        let head: crate::parse::CExternVariableHead = syn::parse_str(
+            r#"pub _get_errno, pub _set_errno = "errno", crate::rffi::INT, compilation_info = ERRNO_ECI, sandboxsafe = true, _nowrapper = true, c_type = "int", declare_as_extern = false"#,
+        )
+        .unwrap();
+        assert_eq!(head.getter.1.to_string(), "_get_errno");
+        assert_eq!(
+            head.setter
+                .as_ref()
+                .map(|(_, name)| name.to_string())
+                .as_deref(),
+            Some("_set_errno")
+        );
+        assert_eq!(head.name, "errno");
+        assert!(!head.getter_only);
+        assert_eq!(head.c_type.as_deref(), Some("int"));
+        assert_eq!(head.declare_as_extern, Some(false));
+    }
+
+    #[test]
+    fn cextern_variable_head_parses_getter_only() {
+        let head: crate::parse::CExternVariableHead = syn::parse_str(
+            r#"pub c_stdin = "stdin", FILEP, compilation_info = ECI, c_type = "FILE*", getter_only = true, declare_as_extern = false"#,
+        )
+        .unwrap();
+        assert_eq!(head.getter.1.to_string(), "c_stdin");
+        assert!(head.setter.is_none());
+        assert_eq!(head.name, "stdin");
+        assert!(head.getter_only);
+        assert_eq!(head.c_type.as_deref(), Some("FILE*"));
+        assert_eq!(head.declare_as_extern, Some(false));
     }
 }

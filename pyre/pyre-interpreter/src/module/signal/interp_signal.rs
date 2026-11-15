@@ -1148,9 +1148,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if err == 0 {
                             Ok(())
                         } else {
-                            Err(std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::_get_errno(),
-                            ))
+                            Err(std::io::Error::from_raw_os_error(unsafe {
+                                majit_rlib::rposix::_get_errno()
+                            }))
                         }
                     };
                     // No kernel to hand the number to.  The delivery this

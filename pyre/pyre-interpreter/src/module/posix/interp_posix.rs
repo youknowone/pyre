@@ -9512,9 +9512,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // copies it before `gc_thread_after_fork`.
                         let pid = unsafe { majit_rlib::rposix::c_fork() };
                         if pid < 0 {
-                            Err(std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::_get_errno(),
-                            ))
+                            Err(std::io::Error::from_raw_os_error(unsafe {
+                                majit_rlib::rposix::_get_errno()
+                            }))
                         } else {
                             Ok(pid)
                         }
@@ -9585,9 +9585,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             )
                         };
                         if pid < 0 {
-                            Err(std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::_get_errno(),
-                            ))
+                            Err(std::io::Error::from_raw_os_error(unsafe {
+                                majit_rlib::rposix::_get_errno()
+                            }))
                         } else {
                             Ok((pid, master))
                         }
@@ -12555,11 +12555,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             fn spawn_sigset(signals: &[i32]) -> Result<libc::sigset_t, i32> {
                 let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                 if unsafe { majit_rlib::rsignal::c_sigemptyset(&mut set) } != 0 {
-                    return Err(majit_rlib::rposix::_get_errno());
+                    return Err(unsafe { majit_rlib::rposix::_get_errno() });
                 }
                 for &sig in signals {
                     if unsafe { majit_rlib::rsignal::c_sigaddset(&mut set, sig) } != 0 {
-                        return Err(majit_rlib::rposix::_get_errno());
+                        return Err(unsafe { majit_rlib::rposix::_get_errno() });
                     }
                 }
                 Ok(set)

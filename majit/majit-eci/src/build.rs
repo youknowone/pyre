@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token, Type, UseTree};
 
 use crate::ExternalCompilationInfo;
-use crate::parse::{EciInput, LlexternalHead};
+use crate::parse::{CExternVariableHead, EciInput, LlexternalHead};
 
 /// `rffi.py` `TYPES` on POSIX, minus the machine-word names `cdecl` spells
 /// without asking (`size_t`, `ssize_t`, `intptr_t`, `uintptr_t`).
@@ -237,6 +237,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected, extra);
+    merge_cextern_variables(&mut collected);
 
     for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
@@ -265,6 +266,12 @@ struct CollectedLlexternal {
     file_path: PathBuf,
     module_path: Vec<String>,
     head: LlexternalHead,
+}
+
+struct CollectedCExternVariable {
+    file_path: PathBuf,
+    module_path: Vec<String>,
+    head: CExternVariableHead,
 }
 
 struct CollectedUse {
@@ -296,6 +303,7 @@ struct CrateItems {
     ecis: Vec<CollectedEci>,
     aliases: Vec<CollectedAlias>,
     llexternals: Vec<CollectedLlexternal>,
+    cextern_variables: Vec<CollectedCExternVariable>,
     uses: Vec<CollectedUse>,
     modules: Vec<Vec<String>>,
     structs: Vec<CollectedStruct>,
@@ -333,47 +341,14 @@ fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationI
         let source = {
             let resolve =
                 |path: &syn::Path, module_path: &[String]| -> Option<crate::cdecl::Resolved> {
-                    match resolve_path(collected, path, module_path) {
-                        Some(Target::Local(m, n)) => {
-                            if let Some(alias) = collected
-                                .aliases
-                                .iter()
-                                .find(|a| a.module_path == m && a.name == n)
-                            {
-                                Some(crate::cdecl::Resolved::Alias(alias.ty.clone(), m))
-                            } else if let Some(st) = collected
-                                .structs
-                                .iter()
-                                .find(|s| s.module_path == m && s.name == n)
-                            {
-                                Some(crate::cdecl::Resolved::LocalStruct {
-                                    name: n,
-                                    c_name: st.c_name.clone(),
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        Some(Target::Extern(p)) => {
-                            if p.len() == 2 && p[0] == "libc" {
-                                let n = &p[1];
-                                if SIMPLE_TYPES.iter().any(|(name, _)| name == n) {
-                                    if let Some((_, t)) = measured_simple
-                                        .iter()
-                                        .find(|((idx, name), _)| *idx == eci_idx && name == n)
-                                    {
-                                        return Some(crate::cdecl::Resolved::Int(*t));
-                                    }
-                                } else if let Some((_, t)) =
-                                    measured_rffi.iter().find(|(name, _)| name == n)
-                                {
-                                    return Some(crate::cdecl::Resolved::Int(*t));
-                                }
-                            }
-                            Some(crate::cdecl::Resolved::Extern(p))
-                        }
-                        None => None,
-                    }
+                    resolve_macro_type(
+                        collected,
+                        &measured_rffi,
+                        &measured_simple,
+                        eci_idx,
+                        path,
+                        module_path,
+                    )
                 };
             let args: Vec<String> = item
                 .head
@@ -410,62 +385,155 @@ fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationI
     }
 }
 
+/// `rffi.CExternVariable`: merge each declaration's getter/setter C into
+/// its named ECI (`eci.merge` of `separate_module_sources` and
+/// `post_include_bits`).
+fn merge_cextern_variables(collected: &mut CrateItems) {
+    let items = std::mem::take(&mut collected.cextern_variables);
+    let mut eci_idxs: Vec<usize> = Vec::new();
+    for item in &items {
+        eci_idxs.push(compilation_info_eci_idx(
+            collected,
+            &item.file_path,
+            "cextern_variable",
+            &item.head.name,
+            &item.module_path,
+            &item.head.compilation_info,
+        ));
+    }
+    let measured_rffi: Vec<(String, crate::rffi_platform::IntType)> = Vec::new();
+    let measured_simple: Vec<((usize, String), crate::rffi_platform::IntType)> = Vec::new();
+    for (item, eci_idx) in items.iter().zip(&eci_idxs) {
+        let eci_idx = *eci_idx;
+        let resolve =
+            |path: &syn::Path, module_path: &[String]| -> Option<crate::cdecl::Resolved> {
+                resolve_macro_type(
+                    collected,
+                    &measured_rffi,
+                    &measured_simple,
+                    eci_idx,
+                    path,
+                    module_path,
+                )
+            };
+        let c_type = cextern_c_type(item, &resolve);
+        let declare_as_extern = item
+            .head
+            .declare_as_extern
+            .unwrap_or_else(|| std::env::var("CARGO_CFG_WINDOWS").is_err());
+        let includes = collected.ecis[eci_idx].eci.includes.clone();
+        let generated = crate::generate_cextern_variable(
+            &item.head.name,
+            &c_type,
+            item.head.getter_only,
+            declare_as_extern,
+            &includes,
+        );
+        collected.ecis[eci_idx].eci = collected.ecis[eci_idx].eci.merge(&[&generated]);
+    }
+}
+
+fn cextern_c_type(
+    item: &CollectedCExternVariable,
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<crate::cdecl::Resolved>,
+) -> String {
+    if let Some(c_type) = &item.head.c_type {
+        return c_type.clone();
+    }
+    match type_path_last_ident(&item.head.ty).as_deref() {
+        Some("CCHARPP") => "char **".into(),
+        Some("CCHARP") => "char *".into(),
+        Some("INT") | Some("LONG") => panic!(
+            "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
+            item.file_path.display(),
+            item.head.name
+        ),
+        _ => {
+            let template = crate::cdecl::gettype(&item.head.ty, &item.module_path, resolve)
+                .unwrap_or_else(|msg| {
+                    panic!(
+                        "{}: cextern_variable `{}`: {msg}",
+                        item.file_path.display(),
+                        item.head.name
+                    )
+                });
+            crate::cdecl::cdecl(&template, "")
+        }
+    }
+}
+
+fn type_path_last_ident(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            type_path.path.segments.last().map(|s| s.ident.to_string())
+        }
+        Type::Paren(paren) => type_path_last_ident(&paren.elem),
+        Type::Group(group) => type_path_last_ident(&group.elem),
+        _ => None,
+    }
+}
+
+fn resolve_macro_type(
+    collected: &CrateItems,
+    measured_rffi: &[(String, crate::rffi_platform::IntType)],
+    measured_simple: &[((usize, String), crate::rffi_platform::IntType)],
+    eci_idx: usize,
+    path: &syn::Path,
+    module_path: &[String],
+) -> Option<crate::cdecl::Resolved> {
+    match resolve_path(collected, path, module_path) {
+        Some(Target::Local(m, n)) => {
+            if let Some(alias) = collected
+                .aliases
+                .iter()
+                .find(|a| a.module_path == m && a.name == n)
+            {
+                Some(crate::cdecl::Resolved::Alias(alias.ty.clone(), m))
+            } else if let Some(st) = collected
+                .structs
+                .iter()
+                .find(|s| s.module_path == m && s.name == n)
+            {
+                Some(crate::cdecl::Resolved::LocalStruct {
+                    name: n,
+                    c_name: st.c_name.clone(),
+                })
+            } else {
+                None
+            }
+        }
+        Some(Target::Extern(p)) => {
+            if p.len() == 2 && p[0] == "libc" {
+                let n = &p[1];
+                if SIMPLE_TYPES.iter().any(|(name, _)| name == n) {
+                    if let Some((_, t)) = measured_simple
+                        .iter()
+                        .find(|((idx, name), _)| *idx == eci_idx && name == n)
+                    {
+                        return Some(crate::cdecl::Resolved::Int(*t));
+                    }
+                } else if let Some((_, t)) = measured_rffi.iter().find(|(name, _)| name == n) {
+                    return Some(crate::cdecl::Resolved::Int(*t));
+                }
+            }
+            Some(crate::cdecl::Resolved::Extern(p))
+        }
+        None => None,
+    }
+}
+
 /// The ECI index `llexternal` `compilation_info` resolves to, the same
 /// lookup `merge_macro_wrappers` used to attach the wrapper source.
 fn llexternal_eci_idx(collected: &mut CrateItems, item: &CollectedLlexternal) -> usize {
     match &item.head.compilation_info {
-        Some(expr) => {
-            let Some(path) = expr_as_path(expr) else {
-                panic!(
-                    "{}: llexternal `{}`: compilation_info is not a path",
-                    item.file_path.display(),
-                    item.head.name
-                );
-            };
-            match resolve_path(collected, path, &item.module_path) {
-                Some(Target::Local(m, n)) => {
-                    match collected
-                        .ecis
-                        .iter()
-                        .position(|eci| eci.module_path == m && eci.name == n)
-                    {
-                        Some(idx) => idx,
-                        None => {
-                            let eci_name = path
-                                .segments
-                                .last()
-                                .map(|seg| seg.ident.to_string())
-                                .unwrap_or_default();
-                            panic!(
-                                "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
-                                item.file_path.display(),
-                                item.head.name
-                            )
-                        }
-                    }
-                }
-                Some(Target::Extern(_)) => {
-                    panic!(
-                        "{}: llexternal `{}`: compilation_info `{}` is outside this crate",
-                        item.file_path.display(),
-                        item.head.name,
-                        path_text(path)
-                    )
-                }
-                None => {
-                    let eci_name = path
-                        .segments
-                        .last()
-                        .map(|seg| seg.ident.to_string())
-                        .unwrap_or_default();
-                    panic!(
-                        "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
-                        item.file_path.display(),
-                        item.head.name
-                    )
-                }
-            }
-        }
+        Some(expr) => compilation_info_eci_idx(
+            collected,
+            &item.file_path,
+            "llexternal",
+            &item.head.name.to_string(),
+            &item.module_path,
+            expr,
+        ),
         None => {
             collected.ecis.push(CollectedEci {
                 module_path: item.module_path.clone(),
@@ -473,6 +541,62 @@ fn llexternal_eci_idx(collected: &mut CrateItems, item: &CollectedLlexternal) ->
                 eci: ExternalCompilationInfo::default(),
             });
             collected.ecis.len() - 1
+        }
+    }
+}
+
+fn compilation_info_eci_idx(
+    collected: &CrateItems,
+    file_path: &Path,
+    kind: &str,
+    item_name: &str,
+    module_path: &[String],
+    expr: &Expr,
+) -> usize {
+    let Some(path) = expr_as_path(expr) else {
+        panic!(
+            "{}: {kind} `{item_name}`: compilation_info is not a path",
+            file_path.display(),
+        );
+    };
+    match resolve_path(collected, path, module_path) {
+        Some(Target::Local(m, n)) => {
+            match collected
+                .ecis
+                .iter()
+                .position(|eci| eci.module_path == m && eci.name == n)
+            {
+                Some(idx) => idx,
+                None => {
+                    let eci_name = path
+                        .segments
+                        .last()
+                        .map(|seg| seg.ident.to_string())
+                        .unwrap_or_default();
+                    panic!(
+                        "{}: {kind} `{item_name}`: compilation_info `{eci_name}` not found",
+                        file_path.display(),
+                    )
+                }
+            }
+        }
+        Some(Target::Extern(_)) => {
+            panic!(
+                "{}: {kind} `{item_name}`: compilation_info `{}` is outside this crate",
+                file_path.display(),
+                path_text(path)
+            )
+        }
+        None => {
+            let eci_name = path
+                .segments
+                .last()
+                .map(|seg| seg.ident.to_string())
+                .unwrap_or_default();
+            panic!(
+                "{}: {kind} `{item_name}`: compilation_info `{eci_name}` not found",
+                file_path.display(),
+            )
         }
     }
 }
@@ -1269,6 +1393,19 @@ fn walk_items(
                             });
                         if attrs_cfgs_hold(&parsed.attrs, file_path) && parsed.macro_.is_some() {
                             out.llexternals.push(CollectedLlexternal {
+                                file_path: file_path.to_path_buf(),
+                                module_path: mod_path.to_vec(),
+                                head: parsed,
+                            });
+                        }
+                    }
+                    Some("cextern_variable") => {
+                        let parsed: CExternVariableHead = syn::parse2(mac.mac.tokens.clone())
+                            .unwrap_or_else(|err| {
+                                panic!("{}: {err}", file_path.display());
+                            });
+                        if attrs_cfgs_hold(&parsed.attrs, file_path) {
+                            out.cextern_variables.push(CollectedCExternVariable {
                                 file_path: file_path.to_path_buf(),
                                 module_path: mod_path.to_vec(),
                                 head: parsed,

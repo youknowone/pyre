@@ -11,7 +11,8 @@ pub use majit_jitcode::rffi::{
     RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
 };
 pub use majit_macros::{
-    call_aroundstate_target, external_compilation_info, jit_close_stack, llexternal,
+    call_aroundstate_target, cextern_variable, external_compilation_info, jit_close_stack,
+    llexternal,
 };
 
 /// `rffi.CHAR` (`lltype.Char`, 0..=255; `size_and_sign` reports it unsigned).
