@@ -27,7 +27,6 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
@@ -133,7 +132,6 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
@@ -817,7 +815,6 @@ fn dummy_foriter_caller_parent() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0xF0_11_E5,
         call_jitcode_pc: Some(4),
-        call_pc: Some(4),
         resume_pc: Some(8),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -1048,7 +1045,6 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -1074,7 +1070,6 @@ fn constructor_assembler_caller_frame(jitcode_index: u32) -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -1118,11 +1113,6 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1245,11 +1235,6 @@ fn abort_latch_image_after_a_pop_publishes_the_vable_depth() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: nlocals + 2,
-        vstack_cur_pypc: 6,
-        vstack_valid: true,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -1308,11 +1293,6 @@ fn operator_tail_known_class_result_records_no_guard_class() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -2647,30 +2627,16 @@ fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
 }
 
 #[test]
-fn vstack_permuted_for_iter_entry_uses_block_head_target() {
-    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
-    pyjit.metadata.n_py_instrs = 19;
-    pyjit.metadata.block_head_py_by_jit_pc = vec![(110, 18)];
-    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (100, 17), (120, 18)];
-
-    assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 110), 17);
-    assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, true), 18);
-    assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, false), 17);
-    assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 18), 18);
-    assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 17), 17);
-    // Entering this marker from another block must not apply the containing
-    // predecessor opcode (17); the first real target op advances to 18.
-    assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 12), 12);
-    assert_eq!(vstack_step_py_pc(&pyjit.metadata, 120, 18), 18);
-}
-
-#[test]
 fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (10, 11), (20, 21)];
     pyjit.metadata.py_exact_by_jit_pc = vec![(0, 0), (10, 11), (20, 21), (30, 11)];
 
-    assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 35), 21);
+    assert_eq!(
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&pyjit.metadata.py_floor_by_jit_pc, 35)
+            .map(|(_, py)| py),
+        Some(21),
+    );
     assert_eq!(
         crate::pyjitcode::exact_py_pc_for_jitcode_pc(&pyjit.metadata.py_exact_by_jit_pc, 35),
         Some(11),
@@ -2723,33 +2689,6 @@ fn forward_py_pc_covers_dispatch_loop_head_before_first_opcode_run() {
         "dispatch-head live before the first case must floor to the entry green",
     );
     assert_eq!(pyjit.resume_position_for_jitcode_pc(68), Some((68, 0)));
-}
-
-#[test]
-fn exact_vstack_step_uses_depth_of_its_own_python_opcode() {
-    let code = pyre_interpreter::compile_exec("answer = f(1)").unwrap();
-    let code = Box::into_raw(Box::new(code));
-    let live = crate::liveness::liveness_for(code);
-    let depths = live.depth_at_py_pc();
-    let (floor_pc, &floor_depth) = depths.iter().enumerate().find(|(_, d)| **d > 0).unwrap();
-    let (exact_pc, &exact_depth) = depths.iter().enumerate().find(|(_, d)| **d == 0).unwrap();
-    let mut pyjit = crate::PyJitCode::skeleton(code);
-    pyjit.metadata.py_floor_by_jit_pc = vec![(0, floor_pc as u32)];
-    pyjit.metadata.depth_containing_by_jit_pc = vec![(0, floor_depth)];
-    pyjit.metadata.py_exact_by_jit_pc = vec![(0, exact_pc as u32)];
-    assert_eq!(
-        vstack_step_depth(&pyjit, 0, exact_pc as u32),
-        exact_depth as usize
-    );
-    assert_eq!(
-        vstack_step_depth(&pyjit, 0, floor_pc as u32),
-        floor_depth as usize
-    );
-    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit));
-    let (pc, _, depth) = frame
-        .vstack_step_coordinate_for_jitcode_pc(0, u32::MAX)
-        .unwrap();
-    assert_eq!((pc, depth), (exact_pc as u32, exact_depth as usize));
 }
 
 /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
@@ -2840,9 +2779,6 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
             callee_shadow: None,
             concrete_registers_r: (concrete_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -2865,13 +2801,6 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3039,7 +2968,6 @@ fn portal_may_force_records_the_callee_execution_context() {
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
-            call_pc: None,
             resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3078,11 +3006,6 @@ fn portal_may_force_records_the_callee_execution_context() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3245,11 +3168,6 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3365,7 +3283,6 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
-            call_pc: None,
             resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3405,11 +3322,6 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3675,11 +3587,6 @@ fn with_unarmed_call_trace_walk<R>(
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: outer_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -3931,7 +3838,6 @@ fn enter_inline_converted_call_trace_caller<'a>(
         vec![InlineParentFrame {
             jitcode_index,
             call_jitcode_pc: None,
-            call_pc: Some(0),
             resume_pc: Some(0),
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -4161,11 +4067,6 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -4478,11 +4379,6 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4677,11 +4573,6 @@ fn loop_callee_portal_none_init_records_the_none_check() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -4871,11 +4762,6 @@ fn constructor_call_assembler_guard_snapshot_keeps_the_immediate_caller() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: caller_jitcode,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5499,9 +5385,6 @@ fn over_limit_portal_subraise_must_not_compile_finish() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -5521,11 +5404,6 @@ fn over_limit_portal_subraise_must_not_compile_finish() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5563,9 +5441,6 @@ fn over_limit_portal_subraise_must_not_compile_finish() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -5585,11 +5460,6 @@ fn over_limit_portal_subraise_must_not_compile_finish() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5622,9 +5492,6 @@ fn portal_finish_seam_judges_plain_length() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -5644,11 +5511,6 @@ fn portal_finish_seam_judges_plain_length() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -5715,9 +5577,6 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             callee_shadow: None,
             concrete_registers_r: (concrete).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -5740,13 +5599,6 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6016,9 +5868,6 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6041,13 +5890,6 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6079,9 +5921,6 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6104,13 +5943,6 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6160,9 +5992,6 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
                 callee_shadow: None,
                 concrete_registers_r: ([]).to_vec(),
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -6185,13 +6014,6 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
 
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -6263,9 +6085,6 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
                 callee_shadow: None,
                 concrete_registers_r: ([]).to_vec(),
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -6288,13 +6107,6 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
 
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -6402,9 +6214,6 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
                 callee_shadow: None,
                 concrete_registers_r: ([]).to_vec(),
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -6427,13 +6236,6 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
 
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -6578,9 +6380,6 @@ fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
             callee_shadow: shadow,
             concrete_registers_r: vec![ConcreteValue::Null; 3],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6600,11 +6399,6 @@ fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6711,9 +6505,6 @@ fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6733,11 +6524,6 @@ fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6846,9 +6632,6 @@ fn setfield_vable_i_standard_refuses_unreconstructable_before_store() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6868,11 +6651,6 @@ fn setfield_vable_i_standard_refuses_unreconstructable_before_store() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -6921,9 +6699,6 @@ fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -6943,11 +6718,6 @@ fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7165,9 +6935,6 @@ fn read_retired_callee_local(
             callee_shadow: Some(shadow),
             concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -7187,11 +6954,6 @@ fn read_retired_callee_local(
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7517,9 +7279,6 @@ fn drive_int_add_jump_if_ovf(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -7542,13 +7301,6 @@ fn drive_int_add_jump_if_ovf(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7718,9 +7470,6 @@ fn drive_alloc_with_descr(
             callee_shadow: None,
             concrete_registers_r: (concrete_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -7743,13 +7492,6 @@ fn drive_alloc_with_descr(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -7984,9 +7726,6 @@ fn with_hint_walk_context<R>(
             callee_shadow: None,
             concrete_registers_r: concrete_r.to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -8009,13 +7748,6 @@ fn with_hint_walk_context<R>(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8044,9 +7776,6 @@ fn with_authoritative_hint_walk<R>(
             callee_shadow: None,
             concrete_registers_r: concrete_r.to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -8066,11 +7795,6 @@ fn with_authoritative_hint_walk<R>(
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -8150,7 +7874,6 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
                 parents: vec![InlineParentFrame {
                     jitcode_index,
                     call_jitcode_pc: None,
-                    call_pc: Some(0),
                     resume_pc: Some(0),
                     call_stack_overrides: Vec::new(),
                     blackhole: None,
@@ -9437,9 +9160,6 @@ fn switch_id_jumps_to_target_or_falls_through() {
                 callee_shadow: None,
                 concrete_registers_r: ([]).to_vec(),
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -9462,13 +9182,6 @@ fn switch_id_jumps_to_target_or_falls_through() {
 
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -9502,9 +9215,6 @@ fn switch_id_requires_concrete_int_value() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -9527,13 +9237,6 @@ fn switch_id_requires_concrete_int_value() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9575,9 +9278,6 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -9600,13 +9300,6 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9640,9 +9333,6 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -9665,13 +9355,6 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -9704,9 +9387,6 @@ fn goto_if_not_requires_concrete_int_value() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -9729,13 +9409,6 @@ fn goto_if_not_requires_concrete_int_value() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13323,9 +12996,6 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -13348,13 +13018,6 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13451,9 +13114,6 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -13476,13 +13136,6 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13612,9 +13265,6 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -13637,13 +13287,6 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13738,9 +13381,6 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -13763,13 +13403,6 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13855,9 +13488,6 @@ fn compare_tag_inline_call_records_no_binary_exception_guard() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -13880,13 +13510,6 @@ fn compare_tag_inline_call_records_no_binary_exception_guard() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -13984,9 +13607,6 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14009,13 +13629,6 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14093,9 +13706,6 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14118,13 +13728,6 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14197,9 +13800,6 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14222,13 +13822,6 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14280,9 +13873,6 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14305,13 +13895,6 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14344,9 +13927,6 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14369,13 +13949,6 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14404,9 +13977,6 @@ fn step_through_live_opcode_advances_by_offset_size() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14429,13 +13999,6 @@ fn step_through_live_opcode_advances_by_offset_size() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14473,9 +14036,6 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14498,13 +14058,6 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14540,9 +14093,6 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14565,13 +14115,6 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14608,9 +14151,6 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
             callee_shadow: None,
             concrete_registers_r: (concrete_registers_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14633,13 +14173,6 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14677,9 +14210,6 @@ fn step_through_int_return_records_finish_with_int_descr() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14702,13 +14232,6 @@ fn step_through_int_return_records_finish_with_int_descr() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14763,9 +14286,6 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14788,13 +14308,6 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14837,9 +14350,6 @@ fn step_through_void_return_stashes_void_finish_payload() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14862,13 +14372,6 @@ fn step_through_void_return_stashes_void_finish_payload() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14912,9 +14415,6 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -14937,13 +14437,6 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -14975,9 +14468,6 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15000,13 +14490,6 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15041,9 +14524,6 @@ fn step_through_goto_jumps_to_label_target() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15066,13 +14546,6 @@ fn step_through_goto_jumps_to_label_target() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15107,9 +14580,6 @@ fn step_through_goto_handles_high_byte_of_label() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15132,13 +14602,6 @@ fn step_through_goto_handles_high_byte_of_label() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15227,9 +14690,6 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15252,13 +14712,6 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15288,9 +14741,6 @@ fn step_through_catch_exception_advances_past_label_operand() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15313,13 +14763,6 @@ fn step_through_catch_exception_advances_past_label_operand() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15363,9 +14806,6 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15388,13 +14828,6 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15448,9 +14881,6 @@ fn top_level_raise_settles_the_vable_token() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15473,13 +14903,6 @@ fn top_level_raise_settles_the_vable_token() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15587,9 +15010,6 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
             callee_shadow: None,
             concrete_registers_r: (concrete).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15612,13 +15032,6 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15700,9 +15113,6 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15725,13 +15135,6 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15784,9 +15187,6 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15809,13 +15209,6 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15845,9 +15238,6 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15870,13 +15260,6 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -15972,9 +15355,6 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -15997,13 +15377,6 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16100,9 +15473,6 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16126,13 +15496,6 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16177,9 +15540,6 @@ fn step_through_int_copy_advances_past_operand_bytes() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16202,13 +15562,6 @@ fn step_through_int_copy_advances_past_operand_bytes() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16250,9 +15603,6 @@ fn int_copy_writes_src_value_into_dst_register() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16275,13 +15625,6 @@ fn int_copy_writes_src_value_into_dst_register() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16316,9 +15659,6 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16341,13 +15681,6 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16379,9 +15712,6 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16404,13 +15734,6 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16462,9 +15785,6 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16487,13 +15807,6 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16533,9 +15846,6 @@ fn ref_copy_writes_src_value_into_dst_register() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: regs_r[7],
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16558,13 +15868,6 @@ fn ref_copy_writes_src_value_into_dst_register() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16579,76 +15882,6 @@ fn ref_copy_writes_src_value_into_dst_register() {
         wc.registers_r.get(2).expect("ref register in range"),
         src_val_pre,
         "src register must remain unchanged",
-    );
-    assert_eq!(
-        wc.frame_state.borrow().vstack_last_ref,
-        regs_r[7],
-        "a link renaming is not the opcode's result, so ref_copy must leave \
-             the operand-stack TOS candidate alone",
-    );
-}
-
-#[test]
-fn ref_copy_keeps_operand_stack_tos_candidate() {
-    // `output = ''; for b in input:` flattens to GET_ITER's
-    // `setarrayitem_vable_r(stack_base, iter)` followed by the block-exit
-    // renaming `ref_copy('' -> r_output)`.  The renaming must not replace the
-    // iterator as the TOS box `reconcile_vstack_at_boundary` lands for
-    // GET_ITER.
-    let ref_copy_byte = *insns_opname_to_byte()
-        .get("ref_copy/r>r")
-        .expect("`ref_copy/r>r` must be in insns table");
-    let code = [ref_copy_byte, 0x02, 0x05]; // src=2, dst=5
-    let mut tc = fresh_trace_ctx();
-    let regs_r = distinct_const_refs(&mut tc, 8);
-    let pushed = regs_r[7];
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let mut wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
-            outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: pushed,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
-        inline_callee_consts: None,
-        fbw_mode: test_fbw_mode(),
-        session: &session,
-        registers_r: &RegisterBank::new(regs_r.iter().copied()),
-        registers_i: &RegisterBank::default(),
-        registers_f: &RegisterBank::default(),
-
-        concrete_registers_i: &mut [],
-        descr_refs: &[],
-        raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: true,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
-
-        pending_guard_snapshot_error: None,
-
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
-    let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
-    assert_eq!(wc.registers_r.get(5), Some(regs_r[2]));
-    assert_eq!(
-        wc.frame_state.borrow().vstack_last_ref,
-        pushed,
-        "a renaming copy must leave the operand-stack TOS candidate alone",
     );
 }
 
@@ -16667,9 +15900,6 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16692,13 +15922,6 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16728,9 +15951,6 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16753,13 +15973,6 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16800,9 +16013,6 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16825,13 +16035,6 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -16967,9 +16170,6 @@ fn drive_int_between(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -16992,13 +16192,6 @@ fn drive_int_between(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17111,9 +16304,6 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17136,13 +16326,6 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17210,9 +16393,6 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17235,13 +16415,6 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17297,9 +16470,6 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17322,13 +16492,6 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17428,9 +16591,6 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17453,13 +16613,6 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17608,9 +16761,6 @@ fn run_float_step(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17633,13 +16783,6 @@ fn run_float_step(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17812,9 +16955,6 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17837,13 +16977,6 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17874,9 +17007,6 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17899,13 +17029,6 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -17938,9 +17061,6 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17963,13 +17083,6 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18019,9 +17132,6 @@ fn unsupported_opname_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18044,13 +17154,6 @@ fn unsupported_opname_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18078,9 +17181,6 @@ fn new_array_id_records_new_array() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Null],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18100,11 +17200,6 @@ fn new_array_id_records_new_array() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18489,9 +17584,6 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
             callee_shadow: None,
             concrete_registers_r: (concrete_registers_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18514,13 +17606,6 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18570,9 +17655,6 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18595,13 +17677,6 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18828,9 +17903,6 @@ fn abort_result_r_stops_the_walk() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18853,13 +17925,6 @@ fn abort_result_r_stops_the_walk() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18902,9 +17967,6 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
             callee_shadow: None,
             concrete_registers_r: (concrete_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -18927,13 +17989,6 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -18986,9 +18041,6 @@ fn walker_implement_guard_value_mints_const_ref_for_a_ref_box() {
             callee_shadow: None,
             concrete_registers_r: Vec::new(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19008,11 +18060,6 @@ fn walker_implement_guard_value_mints_const_ref_for_a_ref_box() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19053,9 +18100,6 @@ fn walker_implement_guard_value_mints_const_ref_for_a_null_ref_box() {
             callee_shadow: None,
             concrete_registers_r: Vec::new(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19075,11 +18119,6 @@ fn walker_implement_guard_value_mints_const_ref_for_a_null_ref_box() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19122,9 +18161,6 @@ fn ref_guard_value_records_guardvalue_for_a_null_ref() {
             callee_shadow: None,
             concrete_registers_r: (concrete_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19147,13 +18183,6 @@ fn ref_guard_value_records_guardvalue_for_a_null_ref() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19213,9 +18242,6 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19238,13 +18264,6 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19305,9 +18324,6 @@ fn ref_guard_value_on_const_records_nothing() {
             callee_shadow: None,
             concrete_registers_r: (concrete_r).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19330,13 +18346,6 @@ fn ref_guard_value_on_const_records_nothing() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19410,9 +18419,6 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19435,13 +18441,6 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19598,9 +18597,6 @@ fn run_symbolic_box_str_dispatch(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19626,13 +18622,6 @@ fn run_symbolic_box_str_dispatch(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19770,9 +18759,6 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19795,13 +18781,6 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -19957,9 +18936,6 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -19982,13 +18958,6 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20045,9 +19014,6 @@ fn run_elidable_can_raise_residual(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20070,13 +19036,6 @@ fn run_elidable_can_raise_residual(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20167,9 +19126,6 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20192,13 +19148,6 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20228,9 +19177,6 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20253,13 +19199,6 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20308,9 +19247,6 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20333,13 +19269,6 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20424,9 +19353,6 @@ fn may_force_with_active_vable_executes_and_clears_token() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20449,13 +19375,6 @@ fn may_force_with_active_vable_executes_and_clears_token() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20525,9 +19444,6 @@ fn may_force_vable_escape_surfaces_typed_abort() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20550,13 +19466,6 @@ fn may_force_vable_escape_surfaces_typed_abort() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20612,15 +19521,11 @@ fn release_gil_forcing_stores_precede_call() {
         callee_shadow: Some(shadow),
         concrete_registers_r: Vec::new(),
         outer_active_boxes: Vec::new(),
-        vstack_boxes: Vec::new(),
-        vstack_last_ref: OpRef::NONE,
-        vstack_reorder_saved: None,
         ..Default::default()
     });
     let parent = InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -20658,9 +19563,6 @@ fn release_gil_forcing_stores_precede_call() {
             callee_shadow: None,
             concrete_registers_r: Vec::new(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20680,11 +19582,6 @@ fn release_gil_forcing_stores_precede_call() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20777,9 +19674,6 @@ fn drive_residual_call_ir_i(
             callee_shadow: None,
             concrete_registers_r: Vec::new(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20799,11 +19693,6 @@ fn drive_residual_call_ir_i(
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -20920,9 +19809,6 @@ fn with_call_pure_walk<R>(
             callee_shadow: None,
             concrete_registers_r: Vec::new(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -20942,11 +19828,6 @@ fn with_call_pure_walk<R>(
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21131,9 +20012,6 @@ fn run_not_in_trace(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21156,13 +20034,6 @@ fn run_not_in_trace(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21267,9 +20138,6 @@ fn jit_force_virtual_without_vinfo_falls_through() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21289,11 +20157,6 @@ fn jit_force_virtual_without_vinfo_falls_through() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21332,9 +20195,6 @@ fn jit_force_virtual_identity_returns_standard_box() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21354,11 +20214,6 @@ fn jit_force_virtual_identity_returns_standard_box() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21392,9 +20247,6 @@ fn jit_force_virtual_wrong_arity_fails_loud() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21414,11 +20266,6 @@ fn jit_force_virtual_wrong_arity_fails_loud() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21471,9 +20318,6 @@ fn jit_force_virtual_missing_standard_box_fails_loud() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21493,11 +20337,6 @@ fn jit_force_virtual_missing_standard_box_fails_loud() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21558,9 +20397,6 @@ fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21580,11 +20416,6 @@ fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21625,9 +20456,6 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21650,13 +20478,6 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21819,9 +20640,6 @@ fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() 
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21844,13 +20662,6 @@ fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() 
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21896,9 +20707,6 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21921,13 +20729,6 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21981,9 +20782,6 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22006,13 +20804,6 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22069,9 +20860,6 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22094,13 +20882,6 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22156,9 +20937,6 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22181,13 +20959,6 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22222,9 +20993,6 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22247,13 +21015,6 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22326,9 +21087,6 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22351,13 +21109,6 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22429,9 +21180,6 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22454,13 +21202,6 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22540,9 +21281,6 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22565,13 +21303,6 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22683,9 +21414,6 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22708,13 +21436,6 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22762,9 +21483,6 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22787,13 +21505,6 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22827,9 +21538,6 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22852,13 +21560,6 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -22916,9 +21617,6 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -22941,13 +21639,6 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23035,9 +21726,6 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23060,13 +21748,6 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23163,9 +21844,6 @@ fn helper_descent_runs_the_limit_check_at_frame_entry() {
                 callee_shadow: None,
                 concrete_registers_r: ([]).to_vec(),
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -23191,13 +21869,6 @@ fn helper_descent_runs_the_limit_check_at_frame_entry() {
 
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -23312,9 +21983,6 @@ fn helper_void_return_already_over_budget_aborts_at_frame_entry() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23334,11 +22002,6 @@ fn helper_void_return_already_over_budget_aborts_at_frame_entry() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23408,9 +22071,6 @@ fn helper_ordinary_steps_that_cross_the_limit_still_finishframe() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23433,11 +22093,6 @@ fn helper_ordinary_steps_that_cross_the_limit_still_finishframe() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23505,9 +22160,6 @@ fn helper_that_crosses_trace_limit_with_effects_does_not_abort_without_a_latch()
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23533,13 +22185,6 @@ fn helper_that_crosses_trace_limit_with_effects_does_not_abort_without_a_latch()
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23597,9 +22242,6 @@ fn authoritative_crossing_helper_without_a_latch_keeps_recording() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23626,13 +22268,6 @@ fn authoritative_crossing_helper_without_a_latch_keeps_recording() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23721,9 +22356,6 @@ fn crossed_helper_still_executes_a_nested_helper_after_the_limit() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23747,11 +22379,6 @@ fn crossed_helper_still_executes_a_nested_helper_after_the_limit() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23816,9 +22443,6 @@ fn authoritative_crossing_helper_with_enclosing_effects_keeps_recording() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23845,13 +22469,6 @@ fn authoritative_crossing_helper_with_enclosing_effects_keeps_recording() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -23937,9 +22554,6 @@ fn python_walk_notes_root_when_a_helper_crosses_the_limit() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -23959,11 +22573,6 @@ fn python_walk_notes_root_when_a_helper_crosses_the_limit() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24079,9 +22688,6 @@ fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24105,11 +22711,6 @@ fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24233,9 +22834,6 @@ fn helper_dest_write_delivers_the_result_before_the_limit_check() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24255,11 +22853,6 @@ fn helper_dest_write_delivers_the_result_before_the_limit_check() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24417,9 +23010,6 @@ fn helper_caught_subraise_checks_the_limit_at_handler_entry() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24439,11 +23029,6 @@ fn helper_caught_subraise_checks_the_limit_at_handler_entry() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24536,9 +23121,6 @@ fn helper_ordinary_residual_does_not_check_the_limit_at_that_call() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24561,11 +23143,6 @@ fn helper_ordinary_residual_does_not_check_the_limit_at_that_call() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24660,9 +23237,6 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24686,11 +23260,6 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24789,9 +23358,6 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Null; 4],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24815,11 +23381,6 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -24943,9 +23504,6 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Null; 4],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -24965,11 +23523,6 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25077,9 +23630,6 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Null; 4],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25099,11 +23649,6 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25199,9 +23744,6 @@ fn helper_residualized_inline_call_does_not_check_the_limit() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25224,11 +23766,6 @@ fn helper_residualized_inline_call_does_not_check_the_limit() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25371,9 +23908,6 @@ fn helper_residual_replay_checks_the_limit_after_the_child_returns() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25393,11 +23927,6 @@ fn helper_residual_replay_checks_the_limit_after_the_child_returns() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25604,9 +24133,6 @@ fn probe_nested_helper_later_abort(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25630,11 +24156,6 @@ fn probe_nested_helper_later_abort(
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25840,9 +24361,6 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25866,11 +24384,6 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -25905,9 +24418,6 @@ fn abort_fill_hands_off_raw_ref_words_without_interning() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef)],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -25927,11 +24437,6 @@ fn abort_fill_hands_off_raw_ref_words_without_interning() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -26037,9 +24542,6 @@ fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -26064,11 +24566,6 @@ fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -26207,9 +24704,6 @@ fn effectful_helper_abort_does_not_latch_enclosing_call_start() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -26232,11 +24726,6 @@ fn effectful_helper_abort_does_not_latch_enclosing_call_start() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -26339,9 +24828,6 @@ fn residual_call_refused_up_front_probe(
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -26365,11 +24851,6 @@ fn residual_call_refused_up_front_probe(
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -26478,7 +24959,6 @@ fn paused_helper_parent_for_activation(
     InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_pc),
-        call_pc: Some(call_pc),
         resume_pc: Some(call_pc + 1),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -26783,9 +25263,6 @@ fn with_carrier_abort_ctx<R>(
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             current_op_pc,
             ..Default::default()
         }),
@@ -26812,11 +25289,6 @@ fn with_carrier_abort_ctx<R>(
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -26942,9 +25414,6 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -26968,11 +25437,6 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27312,9 +25776,6 @@ fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27338,11 +25799,6 @@ fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27395,9 +25851,6 @@ fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27417,11 +25870,6 @@ fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27488,9 +25936,6 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27513,11 +25958,6 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27547,7 +25987,7 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
 /// hole only for a stored live NULL (CALL `self_or_null`). Otherwise
 /// `bhimpl_raise` sees a null ref.
 #[test]
-fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
+fn snapshot_stack_box_does_not_clobber_last_exc_with_const_null() {
     let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
     let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
     assert_eq!(
@@ -27609,9 +26049,6 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27634,13 +26071,6 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27721,9 +26151,6 @@ fn inline_call_r_v_accepts_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27746,13 +26173,6 @@ fn inline_call_r_v_accepts_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27812,9 +26232,6 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27837,13 +26254,6 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27904,9 +26314,6 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -27929,13 +26336,6 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -27994,9 +26394,6 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28019,13 +26416,6 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28089,9 +26479,6 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28114,13 +26501,6 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28182,9 +26562,6 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28207,13 +26584,6 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28263,9 +26633,6 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28288,13 +26655,6 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28365,9 +26725,6 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28390,13 +26747,6 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28445,9 +26795,6 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28470,13 +26817,6 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28513,9 +26853,6 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28538,13 +26875,6 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28593,9 +26923,6 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28618,13 +26945,6 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28693,9 +27013,6 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28718,13 +27035,6 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28783,9 +27093,6 @@ fn setfield_gc_i_redundant_write_skips_recording() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28808,13 +27115,6 @@ fn setfield_gc_i_redundant_write_skips_recording() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28851,9 +27151,6 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28876,13 +27173,6 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -28945,9 +27235,6 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -28970,13 +27257,6 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29022,9 +27302,6 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29047,13 +27324,6 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29175,9 +27445,6 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29200,13 +27467,6 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29265,9 +27525,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29287,11 +27544,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29330,9 +27582,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29352,11 +27601,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29397,9 +27641,6 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29422,13 +27663,6 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29473,9 +27707,6 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29498,13 +27729,6 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29800,9 +28024,6 @@ fn walk_undecodable_byte_surfaces_typed_error() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29825,13 +28046,6 @@ fn walk_undecodable_byte_surfaces_typed_error() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -29898,9 +28112,6 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -29923,13 +28134,6 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30002,9 +28206,6 @@ fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30024,11 +28225,6 @@ fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30111,9 +28307,6 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30133,11 +28326,6 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30192,9 +28380,6 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30217,13 +28402,6 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30366,7 +28544,6 @@ fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
         &mut regs_f,
         &descr_pool,
         |wc| {
-            wc.vstack_valid = false;
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
             let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
@@ -30443,7 +28620,6 @@ fn snapshot_stack_slot_keeps_stored_live_null() {
         &mut regs_f,
         &descr_pool,
         |wc| {
-            wc.vstack_valid = false;
             let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
             let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
                 wc,
@@ -30519,9 +28695,6 @@ fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30544,13 +28717,6 @@ fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30608,9 +28774,6 @@ fn jit_merge_point_nested_helper_stamped_surfaces_call_assembler() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30630,11 +28793,6 @@ fn jit_merge_point_nested_helper_stamped_surfaces_call_assembler() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -30970,9 +29128,6 @@ fn loop_header_stamps_seen_flag() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -30995,13 +29150,6 @@ fn loop_header_stamps_seen_flag() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31112,9 +29260,6 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -31134,11 +29279,6 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31228,9 +29368,6 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -31253,13 +29390,6 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31310,9 +29440,6 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -31335,13 +29462,6 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31775,9 +29895,6 @@ fn publish_callee_locals_region_accepts_an_alias_register_of_the_same_frame() {
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -31797,11 +29914,6 @@ fn publish_callee_locals_region_accepts_an_alias_register_of_the_same_frame() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31887,11 +29999,6 @@ fn residual_preflight_declines_when_callee_locals_cannot_publish() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -31931,9 +30038,6 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -31956,13 +30060,6 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -32136,9 +30233,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -32161,13 +30255,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -32462,9 +30549,6 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -32487,13 +30571,6 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -32799,11 +30876,6 @@ fn bridge_resume_vsd_survives_first_live_step() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -32998,7 +31070,6 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
     let parent = InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(CALL_JIT_PC),
-        call_pc: Some(CALL_JIT_PC),
         resume_pc: Some(LIVE_PC),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -33057,11 +31128,6 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
         outer_resume_marker_jit_pc: Some(LIVE_PC),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: LIVE_PC,
     };
@@ -33313,11 +31379,6 @@ fn after_residual_pcdep_does_not_publish_stack_slot_at_or_above_valuestackdepth(
         outer_resume_marker_jit_pc: Some(LIVE_PC),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: LIVE_PC,
     };
@@ -33534,11 +31595,7 @@ fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdept
     let regs_i = vec![i0];
     let regs_f = vec![f0];
     let mut concrete_i = Vec::new();
-    let mut frame_data = WalkFrameStateData::default();
-    // Operand index `s` such that `nlocals + s == DEAD_SLOT` (>= BOX_VSD).
-    let dead_operand = DEAD_SLOT as usize - NLOCALS;
-    frame_data.vstack_boxes = vec![OpRef::NONE; dead_operand + 1];
-    frame_data.vstack_boxes[dead_operand] = overlay;
+    let frame_data = WalkFrameStateData::default();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(frame_data),
         inline_callee_consts: None,
@@ -33558,11 +31615,6 @@ fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdept
         outer_resume_marker_jit_pc: Some(LIVE_PC),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: FALLTHROUGH_OPERAND_DEPTH as usize,
-        vstack_cur_pypc: CALL_PY_PC as u32,
-        vstack_valid: true,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: LIVE_PC,
     };
@@ -33600,12 +31652,12 @@ fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdept
         dead_ref,
         opref_gcref(sentinel),
         "overlay must leave locals_cells_stack_w[vsd] as the existing vable box; \
-         a live vstack operand at that index is above valuestackdepth"
+         a live operand at that index is above valuestackdepth"
     );
     assert_ne!(
         dead_ref,
         opref_gcref(overlay),
-        "a vstack box at index >= valuestackdepth must not replace the vable slot"
+        "a box at index >= valuestackdepth must not replace the vable slot"
     );
     std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
 }
@@ -33778,11 +31830,6 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         outer_resume_marker_jit_pc: Some(LIVE_PC),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: LIVE_PC,
     };
@@ -34011,11 +32058,6 @@ fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         outer_resume_marker_jit_pc: Some(LIVE_PC),
         outer_jitcode_index: jitcode_index,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: LIVE_PC,
     };
@@ -34381,9 +32423,6 @@ fn setarrayitem_vable_standard_writes_heap_ptr_once() {
             callee_shadow: None,
             concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -34403,11 +32442,6 @@ fn setarrayitem_vable_standard_writes_heap_ptr_once() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -34667,9 +32701,6 @@ fn push_exc_info_prev_save_without_an_anchor_binds_the_getfield() {
             callee_shadow: None,
             concrete_registers_r: vec![ConcreteValue::Null],
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -34689,11 +32720,6 @@ fn push_exc_info_prev_save_without_an_anchor_binds_the_getfield() {
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -34840,9 +32866,6 @@ fn setfield_vable_i_imm_fold_frame_updates_vsd_box() {
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -34862,11 +32885,6 @@ fn setfield_vable_i_imm_fold_frame_updates_vsd_box() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -34941,9 +32959,6 @@ fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
             }),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -34963,11 +32978,6 @@ fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };

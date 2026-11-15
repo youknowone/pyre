@@ -624,7 +624,7 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
     };
     let result = ctx.trace_ctx.const_ref(const_ptr as i64);
     let dst = code[op.pc + 4] as usize;
-    write_vable_field_ref_reg(
+    write_ref_reg(
         ctx,
         op.pc,
         dst,
@@ -1199,16 +1199,6 @@ mod seeded_frame_op_tests {
             argcodes,
             pc: 0,
             next_pc,
-        }
-    }
-
-    fn decoded(opname: &'static str) -> DecodedOp {
-        DecodedOp {
-            key: "",
-            opname,
-            argcodes: "",
-            pc: 0,
-            next_pc: 1,
         }
     }
 
@@ -3733,7 +3723,7 @@ fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
 }
 
 /// Operand-stack depth at `jit_pc` from the containing-opcode table, then
-/// `LiveVars.stack_depth_at`. Not `WalkContext.vstack_depth`.
+/// `LiveVars.stack_depth_at`.
 fn table_operand_depth_at_jit_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jit_pc: usize,
@@ -3778,8 +3768,7 @@ fn vable_stack_box_at<Sym: WalkSym>(
 /// frame is not the owner, so its slots are the `registers_r` colors the
 /// pcdep map names at this jitcode pc (`get_list_of_active_boxes`). Depth is
 /// the containing opcode's static table at this jitcode pc
-/// (`depth_containing_for_jitcode_pc` / `LiveVars.stack_depth_at`), not
-/// `vstack_depth`.
+/// (`depth_containing_for_jitcode_pc` / `LiveVars.stack_depth_at`).
 fn vable_loop_carried_below_call_declines<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jit_pc: usize,
@@ -4002,7 +3991,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         _assembler_code_roots.pin_roots(&[callable, w_code as pyre_object::PyObjectRef]);
     let callable_slot = assembler_base;
     let assembler_code_slot = assembler_base + 1;
-    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     // `_opimpl_recursive_call` residualizes with `assembler_call = False`
     // when `warmrunnerstate.inlining` is off. With inlining on, a callee
@@ -4031,7 +4019,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX);
         warm_state.inlining() && !warm_state.can_inline_callable_for_key(&pin, &callee_green_key)
     };
-    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     if !assembler_call {
         return Ok(None);
@@ -4186,7 +4173,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let code_pin = majit_metainterp::GreenRefPin::pin_one(pyre_object::gc_roots::shadow_stack_get(
         assembler_code_slot,
     ) as usize);
-    let w_code = code_pin.get() as *const ();
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     // The callee's globals OBJECT (`function.w_func_globals_obj`). A
     // `frame_stores_global` mismatch is stored on the inline frame as
@@ -4552,89 +4538,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.live_after_jit_pc = op.next_pc;
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
-
-    // The CALL_ASSEMBLER fold records both post-call guards before the walk
-    // reaches the next Python-opcode boundary, so advance the caller's stack
-    // mirror here.  Keep any operands below the call, discard the callable,
-    // NULL marker, and arguments, then put the assembler result on the new
-    // TOS.  The register writeback above already carries the same result, but
-    // guard snapshotting sources operand-stack slots from this mirror.
-    if ctx.vstack_valid {
-        let caller_jitcode = unsafe { &*sym.jitcode() };
-        let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
-        // #73 Slice 4: forward after-residual fallthrough coordinate; the
-        // containing lookup survives only for the empty-twin class and as the
-        // audit oracle.
-        let legacy_resume_py_pc = || {
-            let call_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(
-                &caller_jitcode.payload.metadata,
-                op.pc,
-            ) as usize;
-            crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32
-        };
-        let resume_py_pc = match caller_jitcode
-            .payload
-            .after_residual_fallthrough_py_pc_populated()
-            .then(|| {
-                caller_jitcode
-                    .payload
-                    .after_residual_fallthrough_py_pc_for_jitcode_pc(op.pc)
-            })
-            .flatten()
-        {
-            Some(ft) => {
-                if pcmap_afterresidual_audit_enabled() {
-                    assert_eq!(
-                        ft,
-                        legacy_resume_py_pc(),
-                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: self-recursive CA vstack fallthrough-py twin diverged at jit_pc {}",
-                        op.pc
-                    );
-                }
-                ft
-            }
-            None => legacy_resume_py_pc(),
-        };
-        let raw_depth = || {
-            crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
-                .depth_at_py_pc()
-                .get(resume_py_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize
-        };
-        let resume_depth = if caller_jitcode.payload.depth_after_residual_populated() {
-            let depth = caller_jitcode
-                .payload
-                .depth_after_residual_for_jitcode_pc(op.pc)
-                .unwrap_or(0) as usize;
-            if pcmap_afterresidual_audit_enabled() {
-                assert_eq!(
-                    depth,
-                    raw_depth(),
-                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: self-recursive CA vstack depth twin diverged at jit_pc {} (py {resume_py_pc})",
-                    op.pc
-                );
-            }
-            depth
-        } else {
-            raw_depth()
-        };
-        ctx.frame_state
-            .borrow_mut()
-            .vstack_boxes
-            .truncate(resume_depth);
-        ctx.frame_state
-            .borrow_mut()
-            .vstack_boxes
-            .resize(resume_depth, OpRef::NONE);
-        if resume_depth > 0 {
-            ctx.frame_state.borrow_mut().vstack_boxes[resume_depth - 1] = ca_result;
-        }
-        ctx.vstack_cur_pypc = resume_py_pc;
-        ctx.vstack_depth = resume_depth;
-        ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
-        super::vstack_mirror::disarm_vstack_reorder_region(ctx);
-    }
 
     // pyjitpl.py: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).  The
@@ -12148,13 +12051,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             is_authoritative_executor: ctx.is_authoritative_executor,
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
@@ -12214,11 +12110,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
-        if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
-            if frame.body_matches(&body) {
-                seed_callee_vstack_mirror(&mut sub_wc, &frame, 0);
-            }
-        }
         // Seed the callee's per-slot concrete-locals shadow from the param
         // boxes.  Two distinct consumers, gated differently:
         //
@@ -17472,14 +17363,12 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
             }
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            ctx.frame_state.borrow_mut().vstack_last_ref = result_op;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
-    ctx.frame_state.borrow_mut().vstack_last_ref = obj_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
@@ -17643,16 +17532,15 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         body_coord,
         false,
     );
-    ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Write one static field of the suspended generator frame.
 ///
 /// The generator is not the trace's standard virtualizable — that stays the
-/// caller's frame — so this is a SETFIELD_GC on the generator object plus the
-/// matching live-frame store, not a `mirror_vable_static_to_boxes` into the
-/// caller's shadow.
+/// caller's frame — so this is the nonstandard arm of `_opimpl_setfield_vable`
+/// (`_nonstandard_virtualizable`): a SETFIELD_GC on the generator object plus
+/// the matching live-frame store.
 fn publish_generator_suspension<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame: usize,
@@ -18174,7 +18062,6 @@ fn descend_generatorentry<Sym: WalkSym>(
         none_op,
         majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
     );
-    let pycode = pin.get() as pyre_object::PyObjectRef;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
 
     // `space.next` dispatches on the iterator's type, and `send_ex` reads
@@ -18542,7 +18429,6 @@ pub(crate) fn send_ex_continuation_parent_frame(generator: OpRef) -> Option<Inli
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -18573,7 +18459,6 @@ pub(crate) fn send_ex_finished_after_teardown_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(after_teardown),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -19025,7 +18910,6 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     }
     let null_box = ctx.trace_ctx.const_null();
     write_ref_reg(ctx, op.pc, dst, null_box, ConcreteValue::Null)?;
-    ctx.frame_state.borrow_mut().vstack_last_ref = null_box;
     Ok(Some(super::continue_after_no_driver_finishframe(
         ctx, op.next_pc, op.pc,
     )?))
@@ -19052,7 +18936,6 @@ pub(crate) fn publish_generator_resume_foriter_item<Sym: WalkSym>(
         body_coord,
         false,
     );
-    ctx.frame_state.borrow_mut().vstack_last_ref = item;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
@@ -22181,7 +22064,6 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     caller_exc_before: Option<OpRef>,
     pc: usize,
     body: SubJitCodeBody,
-    seed_from_active_resume: bool,
     registers_r: RegisterBank,
     registers_i: RegisterBank,
     registers_f: RegisterBank,
@@ -22202,13 +22084,6 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
 
     pending_guard_snapshot_error: Option<DispatchError>,
 
-    vstack_depth: usize,
-    vstack_cur_pypc: u32,
-    vstack_valid: bool,
-
-    vstack_reorder_ceiling: u32,
-
-    vstack_handler_landing_py: Option<u32>,
     live_before_jit_pc: usize,
     live_after_jit_pc: usize,
     /// `pyjitpl.py finishframe` + `make_result_of_lastop`: dest write for an
@@ -22276,28 +22151,12 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
 
             pending_guard_snapshot_error: self.pending_guard_snapshot_error.take(),
 
-            vstack_depth: self.vstack_depth,
-            vstack_cur_pypc: self.vstack_cur_pypc,
-            vstack_valid: self.vstack_valid,
-
-            vstack_reorder_ceiling: self.vstack_reorder_ceiling,
-
-            vstack_handler_landing_py: self.vstack_handler_landing_py,
             live_before_jit_pc: self.live_before_jit_pc,
             live_after_jit_pc: self.live_after_jit_pc,
         };
-        if self.seed_from_active_resume {
-            self.seed_from_active_resume = false;
-            if let Some(frame) =
-                ActiveResumeFrame::current(walk_ctx.session, walk_ctx.fbw_mode.snapshot_sym)
-                && frame.body_matches(&self.body)
-            {
-                seed_callee_vstack_mirror(&mut walk_ctx, &frame, self.pc);
-            }
-        }
         // ChangeFrame: dest-write from the finished callee, then walk at
-        // the opcode after the CALL.  The first CALL step already ran
-        // vstack/live bookkeeping before it suspended.
+        // the opcode after the CALL.  The first CALL step already ran live
+        // bookkeeping before it suspended.
         let mut published_raise = None;
         let mut finishframe_error_pc = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
@@ -22372,13 +22231,6 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
 
         self.pending_guard_snapshot_error = walk_ctx.pending_guard_snapshot_error.take();
 
-        self.vstack_depth = walk_ctx.vstack_depth;
-        self.vstack_cur_pypc = walk_ctx.vstack_cur_pypc;
-        self.vstack_valid = walk_ctx.vstack_valid;
-
-        self.vstack_reorder_ceiling = walk_ctx.vstack_reorder_ceiling;
-
-        self.vstack_handler_landing_py = walk_ctx.vstack_handler_landing_py;
         self.live_before_jit_pc = walk_ctx.live_before_jit_pc;
         self.live_after_jit_pc = walk_ctx.live_after_jit_pc;
         result
@@ -23218,11 +23070,6 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
             outer_resume_marker_jit_pc: child.outer_resume_marker_jit_pc,
             outer_jitcode_index: child.outer_jitcode_index,
             pending_guard_snapshot_error: child.pending_guard_snapshot_error.clone(),
-            vstack_depth: child.vstack_depth,
-            vstack_cur_pypc: child.vstack_cur_pypc,
-            vstack_valid: child.vstack_valid,
-            vstack_reorder_ceiling: child.vstack_reorder_ceiling,
-            vstack_handler_landing_py: child.vstack_handler_landing_py,
             live_before_jit_pc: child.live_before_jit_pc,
             live_after_jit_pc: child.live_after_jit_pc,
         };
@@ -24183,9 +24030,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
         outer_active_boxes,
-        vstack_boxes: Vec::new(),
-        vstack_last_ref: OpRef::NONE,
-        vstack_reorder_saved: None,
         inline_w_code,
         ..Default::default()
     });
@@ -24311,7 +24155,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         caller_exc_before: ctx.last_exc_value(),
         pc: start_pc,
         body: sub_body.clone(),
-        seed_from_active_resume: is_python_portal || start_pc == 0,
         registers_r: callee_regs_r,
         registers_i,
         registers_f,
@@ -24334,13 +24177,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 
         pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
         pending_subreturn: None,

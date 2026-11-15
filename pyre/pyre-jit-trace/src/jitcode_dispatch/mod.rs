@@ -241,8 +241,6 @@ pub use fbw_state::*;
 mod resume_snapshot;
 pub(crate) use resume_snapshot::jit_merge_point_pc_in_containing_floor;
 pub(crate) use resume_snapshot::*;
-mod vstack_mirror;
-pub(crate) use vstack_mirror::*;
 mod vable_ops;
 
 mod frame_state;
@@ -2623,46 +2621,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// recorded without a resume snapshot aborts the walk instead of
     /// compiling.
     pub pending_guard_snapshot_error: Option<DispatchError>,
-
-    /// #73: the absolute operand-stack depth `vstack_boxes` currently
-    /// reflects — the depth ON ENTRY to the Python opcode at
-    /// `vstack_cur_pypc` (i.e. AFTER the previous opcode's stack effect
-    /// was reconciled).
-    pub vstack_depth: usize,
-    /// #73: the Python pc of the opcode currently being walked.  A change
-    /// in `containing_py_pc_for_jitcode_pc(jit_pc)` from this value marks a
-    /// Python-opcode boundary, where the previous opcode's stack effect is
-    /// reconciled into `vstack_boxes` (see [`reconcile_vstack_at_boundary`]).
-    pub vstack_cur_pypc: u32,
-    /// #73: whether `vstack_boxes` is a trustworthy mirror of the live
-    /// operand stack.  Set `false` at walk entry until seeded, and latched
-    /// `false` permanently on the first unmodeled stack effect so later
-    /// consumers skip those slots.
-    pub vstack_valid: bool,
-
-    /// #389(b): the py_pc the walk backed off FROM when it entered the
-    /// codewriter's out-of-order FOR_ITER-entry permutation lowering
-    /// (`SWAP`/`BUILD_LIST`/`SWAP` before a `FOR_ITER`, lowered non-monotonically
-    /// in jitcode).  `u32::MAX` when not inside such a region.  While set, the
-    /// per-op reconcile is invalid (the walk re-visits already-passed py_pcs out
-    /// of order), so `reconcile_vstack_at_boundary` reseeds the whole mirror from
-    /// the virtualizable shadow instead of replaying stack effects.  Cleared once
-    /// the walk advances past this ceiling (py-pc order is monotonic again).
-    pub vstack_reorder_ceiling: u32,
-
-    /// The py_pc the walk's floor lookup reports while it is inside an
-    /// out-of-line exception LANDING block — the unwind bookkeeping the
-    /// codewriter emits per catch site, after the whole body, which then jumps
-    /// to the handler proper.  `None` when the catch target is in line with its
-    /// handler (nothing to skip).
-    ///
-    /// Those bytes lower no Python opcode, but they are laid out inside some
-    /// other opcode's floor segment, so the walk reports that opcode as a
-    /// boundary and the mirror would replay a stack effect from a block it
-    /// never ran — and, py order having gone backwards, arm the reorder region
-    /// over the whole handler body.  Hold the handler-entry coordinate until
-    /// the walk leaves those bytes instead.
-    pub vstack_handler_landing_py: Option<u32>,
     /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py`, normal guard resume reads at
@@ -3164,11 +3122,6 @@ fn create_segmented_trace<Sym: WalkSym>(
     // Before the guard: a refusal must leave no always-fails guard and no
     // FINISH behind, and the latch records nothing into the trace.
     //
-    // `step_vstack_mirror` leaves a block-head marker on the opcode that
-    // entered it.  A JUMP_BACKWARD cut then publishes that STORE's entry
-    // value, and `bhimpl_jit_merge_point`'s ContinueRunningNormally resumes
-    // the loop header one slot deeper than `depth_at_py_pc` there.  Same
-    // post-step reconcile as `blackhole_if_trace_too_long`.
     // The portal merge-point cut resumes at op2 `-live-` after the marker
     // (`pyjitpl.py generate_guard` `after_residual_call=True`); a synthesized
     // per-opcode DMP stays at `mp_opcode_pc` unless that floor contains a
@@ -3178,7 +3131,6 @@ fn create_segmented_trace<Sym: WalkSym>(
     } else {
         segmented_merge_point_resume_pc(ctx, mp_opcode_pc)
     };
-    reconcile_vstack_to_resume_pc(ctx, latch_pc);
     if !latch_abort_blackhole(ctx, latch_pc, "segment-cut") {
         census_record("SegmentTrace::LatchRefused");
         return Ok(None);
@@ -5392,15 +5344,6 @@ pub fn step<Sym: WalkSym>(
     if op.opname == "live" {
         ctx.live_before_jit_pc = op.pc;
     }
-    // #73: maintain the walk-level operand-stack box
-    // mirror.  Detects a Python-opcode boundary at this jitcode pc and
-    // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
-    // BEFORE this op runs.  Writes ONLY the new `vstack_*` fields — never
-    // the existing registers / snapshot / control flow — so the mirror is
-    // pure side-data until a later slice makes the read authoritative.  No-op
-    // unless the full-body walk owns the virtualizable shadow and the
-    // mirror is still valid.
-    step_vstack_mirror(ctx, pc);
     let effects_before = fbw_executed_effect_count();
     let result = handle(&op, code, ctx);
     if matches!(
@@ -5547,7 +5490,6 @@ pub(crate) fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
     if !ctx.fbw_mode.transparent_helper_subwalk || !ctx.trace_ctx.is_too_long() {
         return Ok(());
     }
-    reconcile_vstack_to_resume_pc(ctx, latch_pc);
     let mut blackhole_latched = latch_abort_blackhole(ctx, latch_pc, "run_one_step");
     if blackhole_latched {
         let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
@@ -5963,13 +5905,6 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            // Reconcile the operand-stack mirror to the post-step resume
-            // coordinate before latching.  A block-head merge point is
-            // otherwise left on the completed opcode's on-entry stack
-            // (`reconcile_vstack_to_resume_pc`).
-            if snapshot_safe {
-                reconcile_vstack_to_resume_pc(ctx, pc);
-            }
             // A translated helper is an ordinary `MIFrame` on
             // `metainterp.framestack`. `_interpret` /
             // `blackhole_if_trace_too_long` (`pyjitpl.py`) latches it at
@@ -6186,13 +6121,6 @@ node,
                     // Mirrors `blackhole.rs route_to_catch`'s `BH_LAST_EXC_VALUE
                     // = 0` on handler entry.
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                    // #370: re-seed the operand-stack mirror at the handler
-                    // entry.  The unwind boundary is otherwise unmodeled, so
-                    // without this the mirror latches invalid.  `vstack_enter_exception_handler`
-                    // falls back safely (per-slot NONE hole /
-                    // `vstack_valid = false`) for the coordinates it cannot
-                    // reconstruct.
-                    vstack_enter_exception_handler(ctx, target, exc);
                     // `finishframe_exception` sets the handler pc and raises
                     // ChangeFrame; `_interpret` checks before the handler's
                     // first instruction. Latch at the handler, error at the
@@ -6996,59 +6924,6 @@ fn write_ref_reg<Sym: WalkSym>(
     {
         *c_slot = sanitized;
     }
-    // #73: record the box just written as the candidate
-    // operand-stack TOS for the current Python opcode.  A value-producing
-    // opcode (LOAD_*, BINARY_OP, COPY, …) lands its result on the stack
-    // TOS; this is the last Ref it writes, so capturing it here lets
-    // `reconcile_vstack_at_boundary` reconstruct the new TOS without a
-    // per-opcode hook.  Cheap unconditional write to a new side-field;
-    // only consumed when the mirror is valid (never alters existing state).
-    ctx.frame_state.borrow_mut().vstack_last_ref = value;
-    Ok(())
-}
-
-/// Write a Ref register for a link renaming (`flatten.py insert_renamings`:
-/// `ref_copy` / `ref_pop`) without stamping operand TOS.
-///
-/// A renaming moves a value that is already live into the target block's
-/// register; it is not the result of the Python opcode it happens to be
-/// flattened into.  The opcode's own push stamped `vstack_last_ref` at its
-/// `setarrayitem_vable_r` or residual result, and a following renaming of an
-/// unrelated local (a loop-carried constant, say) must not replace it.
-fn write_renaming_ref_reg<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    dst: usize,
-    value: OpRef,
-    concrete: ConcreteValue,
-) -> Result<(), DispatchError> {
-    let saved = ctx.frame_state.borrow().vstack_last_ref;
-    write_ref_reg(ctx, pc, dst, value, concrete)?;
-    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
-    Ok(())
-}
-
-/// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
-///
-/// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)` and `debugdata(3)` (`virtualizable_gen.rs`,
-/// `NUM_VABLE_SCALARS = 4`). They are frame
-/// bookkeeping; the Python operand stack lives in the separate
-/// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
-/// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
-/// grounds the same scalar-vs-array split, and `pyjitpl.py
-/// get_list_of_active_boxes` sources liveness-indexed register boxes, not
-/// scalar virtualizable fields.
-fn write_vable_field_ref_reg<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    dst: usize,
-    value: OpRef,
-    concrete: ConcreteValue,
-) -> Result<(), DispatchError> {
-    let saved = ctx.frame_state.borrow().vstack_last_ref;
-    write_ref_reg(ctx, pc, dst, value, concrete)?;
-    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
     Ok(())
 }
 
@@ -8955,13 +8830,8 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
-    /// `Some` re-executes that call. A bridge root leaves this unset; the
-    /// call position is `call_pc`.
+    /// `Some` re-executes that call. A bridge root leaves this unset.
     call_jitcode_pc: Option<usize>,
-    /// Jitcode pc of the CALL this frame is paused in. The handler records
-    /// that position, then sets `MIFrame.pc` to the first byte after the
-    /// opcode before the callee runs. Not the Rewind coordinate above.
-    call_pc: Option<usize>,
     /// Post-call resume pc. `MIFrame.pc` while the callee runs, and the pc
     /// half of `AbstractResumeDataReader.read_jitcode_pos_pc` restored by
     /// `MIFrame.setup_resume_at_op`. Includes a trailing `-live-`.
@@ -9196,19 +9066,6 @@ struct InlineParentBlackhole {
     float_values: Vec<(usize, OpRef)>,
 }
 
-/// The instruction whose next byte is `resume_pc`.
-///
-/// The handler sets `MIFrame.pc` to the first byte after the opcode before
-/// the callee runs. `AbstractResumeDataReader.read_jitcode_pos_pc` restores
-/// that word through `MIFrame.setup_resume_at_op`. The CALL's jitcode pc is
-/// the opcode that ends at that word; the opcode name is not consulted.
-fn jitcode_op_ending_at(
-    code: &[u8],
-    resume_pc: usize,
-) -> Option<crate::jitcode_runtime::DecodedOp> {
-    crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
-}
-
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
@@ -9239,7 +9096,6 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -9276,7 +9132,6 @@ pub(crate) fn ctor_continuation_assembler_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -9326,7 +9181,6 @@ pub(crate) fn operator_continuation_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -9986,23 +9840,6 @@ thread_local! {
     /// (`cffi_lib_attr_cell`).
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-
-    /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
-    /// opcode it is currently inside, as `(py_pc, odometer)`.
-    ///
-    /// A leg that resumes the interpreter at a Python opcode re-executes that
-    /// whole opcode — `flush_walk_end_state_to_frame` sets `last_instr = pc - 1`
-    /// — so it owes a proof that the opcode has applied nothing yet.  This is
-    /// that proof's sample point, and it must be the OPCODE boundary: a
-    /// per-`-live-` or per-jitcode-op sample would read zero for an opcode whose
-    /// earlier ops already ran effects.
-    ///
-    /// Recorded only on the top-level walk (`reconcile_vstack_at_boundary`, the
-    /// boundary detector).  A callee sub-walk's `py_pc` names a different code
-    /// object, so leaving the sample absent there makes the gate decline rather
-    /// than compare coordinates from two universes.
-    static FBW_OPCODE_ENTRY_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
-        const { std::cell::Cell::new(None) };
 
     /// Effect-count delta of the exact JitCode opcode that most recently
     /// returned `LoopBearingCalleeInlineUnsupported`.  The structural
@@ -10756,98 +10593,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     fbw_state::walk_parked_walk_tls_stack(area.parked_stack, visitor);
 }
 
-/// #73: classification of a Python opcode's effect on the walk-level
-/// symbolic operand stack ([`WalkFrameStateData::vstack_boxes`]), used by
-/// [`reconcile_vstack_at_boundary`] to update `vstack_boxes` at an
-/// opcode boundary.  The depth delta is already known from
-/// `depth_at_py_pc`; this only decides WHERE the new boxes come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VstackOpClass {
-    /// A single net-result lands on the new TOS, and its box is the last
-    /// Ref written via [`write_ref_reg`] during this opcode
-    /// (`vstack_last_ref`).  Truncate to the new depth, then overwrite the
-    /// new TOS with `vstack_last_ref`.  Covers value producers whose
-    /// result is the topmost stack slot: LOAD_FAST / LOAD_CONST /
-    /// LOAD_GLOBAL(result) / LOAD_NAME / LOAD_ATTR / BINARY_OP /
-    /// BINARY_SUBSCR / COMPARE_OP / unary ops / CALL /
-    /// IS_OP / CONTAINS_OP / single-result BUILD_*.
-    ResultToTos,
-    /// Pyre's method-form `LOAD_GLOBAL` pushes the callable and then a NULL
-    /// `self_or_null` sentinel.  The callable is recovered from the
-    /// virtualizable shadow; the top slot is an explicit Ref constant so a
-    /// guard inside the following CALL can snapshot the live NULL instead of
-    /// inheriting an older value from that frame slot.
-    LoadGlobalMethod,
-    /// The opcode only pops (and/or stores to a local/global/attr/subscr,
-    /// or is an unconditional control transfer).  Truncate to the new
-    /// depth WITHOUT touching the surviving TOS — the box already in that
-    /// slot is the live value.  Covers POP_TOP / POP_JUMP_IF_* /
-    /// STORE_FAST / STORE_GLOBAL / STORE_NAME / STORE_ATTR /
-    /// STORE_SUBSCR / STORE_SLICE / JUMP_* / RETURN_* / DELETE_*.
-    PopOnlyOrSideStore,
-    /// `SWAP(i)` permutes the operand stack: it exchanges the TOS box with
-    /// the box `i` positions below it (the `localsplus[depth-1]` /
-    /// `localsplus[depth-i]` exchange in `swap_values`).  Net depth is
-    /// unchanged; the carried `usize` is the decoded `i`.  Reconcile applies
-    /// the same exchange to `vstack_boxes`, so a value kept across a SWAP
-    /// (e.g. `a + ((i & 1) or 5)` reorders its operands with SWAP before the
-    /// short-circuit guard) lands on the right slot instead of latching the
-    /// mirror invalid.
-    Swap(usize),
-    /// `COPY(i)` duplicates the box `i` positions from the top onto the new
-    /// TOS (`opcode_copy_value` = `push(peek_at(i-1))`).  Net depth +1; the
-    /// new TOS box is `vstack_boxes[depth-1-i]` (the COPIED slot), NOT the
-    /// last Ref written — only `COPY 1` (dup of TOS, the and/or/condexpr and
-    /// chained-comparison truthiness dup) coincides with `vstack_last_ref`.
-    /// Reconcile sources the duplicated slot directly so `COPY i>1`
-    /// (duplicating a deeper operand) is faithful.  The carried `usize` is
-    /// the decoded `i`.
-    Copy(usize),
-    /// An exception-machinery opcode (PUSH_EXC_INFO / CHECK_EXC_MATCH /
-    /// RERAISE / WITH_EXCEPT_START / RAISE_VARARGS) reached INSIDE an
-    /// exception handler.  Its operand-stack effect is not a simple
-    /// producer/pop — the unwinder and the exc-info machinery rewrite the
-    /// stack — but the lowering writes every resulting operand slot through
-    /// `setarrayitem_vable_r`, so the virtualizable shadow holds the correct
-    /// post-opcode operand stack.  Reconcile truncates to the new depth and
-    /// reseeds the slots from the shadow (`reseed_vstack_from_shadow`); a
-    /// slot the shadow cannot source (a genuine NULL exc-info slot, an
-    /// Int/Float temp) stays a NONE hole.  Reached with a valid mirror only
-    /// via [`vstack_enter_exception_handler`]; without that handler-entry
-    /// reseed the mirror is already invalid at the unwind boundary, so this
-    /// arm is inert on the non-exception path.
-    ShadowReseed,
-    /// `UNPACK_SEQUENCE` / `UNPACK_EX`: pop one sequence and push its
-    /// elements (net push > 1), each written through `setarrayitem_vable_r`.
-    /// A single `vstack_last_ref` write cannot reconstruct the whole pushed
-    /// group, but every pushed element IS in the virtualizable shadow, so
-    /// reconcile clears the affected range `[pop_point .. new_depth)` (from
-    /// the popped sequence slot upward) to NONE holes and the general
-    /// hole-fill sources them from the shadow.  Slots BELOW the popped
-    /// sequence keep their mirror-tracked boxes (the hole-fill never
-    /// overwrites a non-NONE slot).  Never latches the mirror invalid.
-    MultiResultFromShadow,
-    /// `LOAD_SPECIAL` (`__enter__` / `__exit__`): pop the context manager and
-    /// push the resolved special method followed by the call's `self_or_null`
-    /// slot.  Same pop-then-push-a-group shape as
-    /// [`VstackOpClass::MultiResultFromShadow`], except that the top slot is a
-    /// live NULL the shadow cannot return — its source is a dense array where
-    /// an absent slot and a written NULL are the same word — so reconcile
-    /// stamps the NULL constant there instead, as [`Self::LoadGlobalMethod`]
-    /// does for the other callable/NULL pair.
-    LoadSpecialMethod,
-    /// Method-form `LOAD_SUPER_ATTR` pops `global_super`, `__class__`
-    /// and `self` and pushes `func` then `self`; both pushed slots are cleared
-    /// and sourced from the virtualizable shadow.
-    LoadSuperAttrMethod,
-    /// Anything that does not fit the shapes above — FOR_ITER or any opcode
-    /// this classifier does not recognise.  Latches `vstack_valid = false`
-    /// so later consumers skip those slots.
-    Unmodeled,
-}
-
-/// The frame whose JitCode byte offsets the vstack-mirror coordinate
-/// readers resolve through.  Holds the
+/// The frame whose JitCode the walk is currently inside. Holds the
 /// frame's `PyJitCode` payload — its `metadata` (the tables for the
 /// jitcode-pc → Python-pc inversion) and `code_ptr` (the liveness key).
 ///
@@ -10859,8 +10605,9 @@ enum VstackOpClass {
 ///   sub-walked (framestack top), or the portal frame when no
 ///   sub-walk is active.  Mirrors the callee derivation in
 ///   `walker_capture_multi_frame_inline_snapshot` (the framestack
-///   → `ensure_jitcode_index` → `pyjitcode_for_jitcode_index` chain) so the
-///   mirror and the snapshot encoder consult one consistent active frame.
+///   → `ensure_jitcode_index` → `pyjitcode_for_jitcode_index` chain) so
+///   debug merge points and the snapshot encoder consult one consistent
+///   active frame.
 struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
 
 impl ActiveResumeFrame {
@@ -10896,63 +10643,6 @@ impl ActiveResumeFrame {
             }
             None => Self::outer(snapshot_sym),
         }
-    }
-
-    fn vstack_coordinate_for_jitcode_pc(
-        &self,
-        jit_pc: usize,
-    ) -> Option<(u32, *const pyre_interpreter::CodeObject, usize)> {
-        let pjc = &self.0;
-        if pjc.code_ptr.is_null() {
-            return None;
-        }
-        let py_pc = vstack_containing_py_pc(&pjc.metadata, jit_pc);
-        // Raw py_pc-keyed static-liveness read: the unpopulated-twin fallback
-        // (skeleton / fixture) and the audit oracle.
-        let raw_depth = || {
-            crate::liveness::liveness_for(pjc.code_ptr)
-                .depth_at_py_pc()
-                .get(py_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize
-        };
-        let depth = if pjc.depth_containing_populated() {
-            let depth = pjc.depth_containing_for_jitcode_pc(jit_pc).unwrap_or(0) as usize;
-            if pcmap_containing_audit_enabled() {
-                assert_eq!(
-                    depth,
-                    raw_depth(),
-                    "PYRE_PCMAP_CONTAINING_AUDIT: resume-frame containing-depth twin diverged at jit_pc {jit_pc} (py {py_pc})"
-                );
-            }
-            depth
-        } else {
-            raw_depth()
-        };
-        Some((py_pc, pjc.code_ptr, depth))
-    }
-
-    /// Coordinate used while stepping an already-seeded operand-stack
-    /// mirror.  A block-head metadata entry is JitCode control-flow trivia,
-    /// not a Python opcode boundary: defer reconciliation until the first
-    /// real operation in that block, whose containing coordinate is exact.
-    fn vstack_step_coordinate_for_jitcode_pc(
-        &self,
-        jit_pc: usize,
-        current_py_pc: u32,
-    ) -> Option<(u32, *const pyre_interpreter::CodeObject, usize)> {
-        let code_ptr = self.0.code_ptr;
-        if code_ptr.is_null() {
-            return None;
-        }
-        let py_pc = vstack_step_py_pc(&self.0.metadata, jit_pc, current_py_pc);
-        let depth = vstack_step_depth(&self.0, jit_pc, py_pc);
-        Some((py_pc, code_ptr, depth))
-    }
-
-    fn body_matches(&self, sub_body: &SubJitCodeBody) -> bool {
-        let code = self.0.jitcode.code.as_slice();
-        code.len() == sub_body.code.len() && code.as_ptr() == sub_body.code.as_ptr()
     }
 }
 
@@ -12288,10 +11978,9 @@ fn walker_unbox_int_exact<Sym: WalkSym>(
 ///     from the guard-fail resume stream, not the converted portal frame;
 ///   * a non-InputArg (op result / const / temp).
 ///
-/// Reads the active portal sym via `fbw_mode.snapshot_sym` (the same
-/// source `reseed_vstack_from_shadow` uses for `nlocals`); `false` when the
-/// pointer is null (no materialized portal, as in tests), which
-/// keeps the guard (correct-but-conservative).
+/// Reads the active portal sym via `fbw_mode.snapshot_sym` for `nlocals`;
+/// `false` when the pointer is null (no materialized portal, as in tests),
+/// which keeps the guard (correct-but-conservative).
 fn walker_inputarg_is_converted_local<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     obj: OpRef,
@@ -14317,9 +14006,8 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
 ///
 /// The caller has already proven `stored` foldable and non-null AND pinned the
 /// namespace version — that marker is what revokes the constant this emits.
-/// Writing a destination is deliberately left out: `write_ref_reg` also stamps
-/// `ctx.vstack_last_ref`, so a caller that is not standing in for a residual
-/// must not be made to go through it.
+/// Writing a destination is deliberately left out: the caller is not standing
+/// in for a residual and has no jitcode dest register.
 fn emit_namespace_cell_value<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -17253,7 +16941,7 @@ fn handle<Sym: WalkSym>(
                 (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
-            write_renaming_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_push/i" => {
@@ -17336,10 +17024,8 @@ fn handle<Sym: WalkSym>(
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
             // A copy is a link renaming (`flatten.py insert_renamings`,
-            // `same_as`). Restoring TOS after the write is what keeps
-            // GET_ITER's iterator from being replaced by a later
-            // `output = ''` block-exit copy.
-            write_renaming_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            // `same_as`).
+            write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {

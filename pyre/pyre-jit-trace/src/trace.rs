@@ -6976,7 +6976,7 @@ fn fbw_loopbody_scan_full_enabled() -> bool {
 /// than an oversight.  Narrowing it to the PCs reachable from the loop's own
 /// handler is unsound: a walk that leaves the loop concretely executes the
 /// post-loop tail, and a raise there is delivered by
-/// `vstack_enter_exception_handler` into the TAIL's handler, which the loop's
+/// the TAIL's handler, which the loop's
 /// own reachability set does not contain.  The walk then records that handler
 /// inline and keeps going, so a marker in it is reached after non-journaled
 /// effects have already run — the case the paragraph above describes.  A sound

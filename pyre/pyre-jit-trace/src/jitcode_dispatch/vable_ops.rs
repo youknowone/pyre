@@ -208,8 +208,6 @@ mod frame_replacement_tests {
                     ..Default::default()
                 }),
                 outer_active_boxes: vec![old],
-                vstack_boxes: vec![old],
-                vstack_last_ref: old,
                 ..Default::default()
             })
         };
@@ -233,7 +231,6 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
-                call_pc: Some(0),
                 resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
@@ -262,15 +259,15 @@ mod frame_replacement_tests {
         assert_eq!(suspended_regs.get(0), Some(standard));
         // The active frame is rewritten directly, never on a later replay
         // where the trace could have reused one of these operation ids.
-        assert_eq!(active_state.borrow().vstack_boxes, [old]);
+        assert_eq!(active_state.borrow().outer_active_boxes, [old]);
         // Guard capture in the child already sees the rewritten caller.
         assert_eq!(
             session.borrow().framestack.last().unwrap().parents[0].boxes,
             vec![standard]
         );
         // Both frames have already changed before either continuation runs.
-        assert_eq!(parent_state.borrow().vstack_boxes, [standard]);
-        assert_eq!(suspended_state.borrow().vstack_boxes, [standard]);
+        assert_eq!(parent_state.borrow().outer_active_boxes, [standard]);
+        assert_eq!(suspended_state.borrow().outer_active_boxes, [standard]);
         for (regs, state) in [
             (parent_regs, parent_state),
             (suspended_regs, suspended_state),
@@ -301,19 +298,11 @@ mod frame_replacement_tests {
 
                 pending_guard_snapshot_error: None,
 
-                vstack_depth: 1,
-                vstack_cur_pypc: 0,
-                vstack_valid: true,
-
-                vstack_reorder_ceiling: u32::MAX,
-
-                vstack_handler_landing_py: None,
                 live_before_jit_pc: usize::MAX,
                 live_after_jit_pc: usize::MAX,
             };
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
             assert_eq!(ctx.frame_state.borrow().outer_active_boxes, vec![standard]);
-            assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
             assert_eq!(
                 ctx.frame_state
                     .borrow()
@@ -330,14 +319,13 @@ mod frame_replacement_tests {
             // Explicit guard promotions use the same full-frame operation as
             // nonstandard virtualizable promotion, not just this Ref bank.
             walker_replace_box(&mut ctx, standard, middle);
-            assert_eq!(ctx.frame_state.borrow().vstack_boxes, [middle]);
+            assert_eq!(ctx.frame_state.borrow().outer_active_boxes, [middle]);
             assert_eq!(
                 session.borrow().framestack.last().unwrap().parents[0].boxes,
                 [middle]
             );
             walker_replace_box(&mut ctx, middle, standard);
             ctx.registers_r.set(0, old);
-            ctx.frame_state.borrow_mut().vstack_boxes[0] = old;
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let initial = ctx.trace_ctx.const_int(0);
             let pointer = Value::Ref(majit_ir::GcRef(0x1000));
@@ -374,7 +362,7 @@ mod frame_replacement_tests {
             .unwrap();
             assert!(ctx.trace_ctx.num_guards() > guards_before);
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
-            assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
+            assert_eq!(ctx.frame_state.borrow().outer_active_boxes, vec![standard]);
         }
     }
 
@@ -385,8 +373,7 @@ mod frame_replacement_tests {
         let session = std::cell::RefCell::new(WalkSession::default());
         let parent_regs = RegisterBank::new([old]);
         let parent_state = WalkFrameState::new(WalkFrameStateData {
-            vstack_boxes: vec![old],
-            vstack_last_ref: old,
+            outer_active_boxes: vec![old],
             ..Default::default()
         });
         session.borrow_mut().framestack.push(InlineFrame {
@@ -399,7 +386,6 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
-                call_pc: Some(0),
                 resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
@@ -424,8 +410,7 @@ mod frame_replacement_tests {
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(parent_regs.get(0), Some(new));
-        assert_eq!(parent_state.borrow().vstack_boxes, [new]);
-        assert_eq!(parent_state.borrow().vstack_last_ref, new);
+        assert_eq!(parent_state.borrow().outer_active_boxes, [new]);
         assert_eq!(
             session.borrow().framestack.last().unwrap().parents[0].boxes,
             vec![new]
@@ -439,7 +424,7 @@ mod frame_replacement_tests {
         let session = std::cell::RefCell::new(WalkSession::default());
         let regs = RegisterBank::new([old]);
         let state = WalkFrameState::new(WalkFrameStateData {
-            vstack_boxes: vec![old],
+            outer_active_boxes: vec![old],
             ..Default::default()
         });
         bind_paused_caller_regs(
@@ -454,7 +439,7 @@ mod frame_replacement_tests {
         assert!(session.borrow().framestack[0].live.is_some());
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(regs.get(0), Some(new));
-        assert_eq!(state.borrow().vstack_boxes, [new]);
+        assert_eq!(state.borrow().outer_active_boxes, [new]);
     }
 
     #[test]
@@ -487,7 +472,7 @@ mod frame_replacement_tests {
         let session = std::cell::RefCell::new(WalkSession::default());
         let regs = RegisterBank::new([old]);
         let state = WalkFrameState::new(WalkFrameStateData {
-            vstack_boxes: vec![old],
+            outer_active_boxes: vec![old],
             ..Default::default()
         });
         push_helper_live(
@@ -500,7 +485,7 @@ mod frame_replacement_tests {
         assert_eq!(session.borrow().helper_live.len(), 1);
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(regs.get(0), Some(new));
-        assert_eq!(state.borrow().vstack_boxes, [new]);
+        assert_eq!(state.borrow().outer_active_boxes, [new]);
         pop_helper_live(&session);
         assert!(session.borrow().helper_live.is_empty());
     }
@@ -989,7 +974,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            write_vable_field_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1965,67 +1950,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     }
     let _ = _write;
-    // A Ref stored to the operand-stack region of the vable array is an
-    // operand-stack push (`pyframe.pushvalue` lowers to
-    // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). Retain the
-    // last-write TOS candidate for ordinary single-result opcodes. Method-form
-    // LOAD_ATTR is the one two-result shape that also needs its exact lower
-    // slot mirrored: it writes `[method, self]`, and retaining only `self`
-    // made boundary reconciliation refill the method hole from the stale
-    // pre-LOAD_ATTR receiver. A later guard then resumed CALL with that
-    // receiver as its callee. Scope the positional write to that opcode; the
-    // general boundary model remains authoritative for other push/pop shapes.
-    // Local/cell stores remain excluded by the `index >= nlocals` gate.
-    if value_bank == 'r' && ctx.vstack_valid {
-        if let Some(nlocals) = active_frame_nlocals(ctx)
-            && index_value >= nlocals
-        {
-            // `vstack_cur_pypc` is a pc in the frame the op names, so it must
-            // be decoded against that frame's own bytecode.
-            let method_load = active_frame_code(ctx).is_some_and(|code| {
-                pyre_interpreter::decode_instruction_at(code, ctx.vstack_cur_pypc as usize)
-                    .is_some_and(|(instr, op_arg)| match instr {
-                        pyre_interpreter::Instruction::LoadAttr { namei } => {
-                            namei.get(op_arg).is_method()
-                        }
-                        _ => false,
-                    })
-            });
-            let stack_slot = (index_value - nlocals) as usize;
-            if method_load {
-                if ctx.frame_state.borrow().vstack_boxes.len() <= stack_slot {
-                    ctx.frame_state
-                        .borrow_mut()
-                        .vstack_boxes
-                        .resize(stack_slot + 1, OpRef::NONE);
-                }
-                ctx.frame_state.borrow_mut().vstack_boxes[stack_slot] = value;
-            }
-            // Mark the slot as execution-derived while an out-of-order region
-            // is armed, so the boundary restore does not put its pc-derived
-            // snapshot back over it.  Outside a region the mask does not exist
-            // and this costs one `Option` test.
-            //
-            // This is a property of the STORE, not of the opcode that issued
-            // it: the mask records which slot the walk demonstrably wrote, and
-            // that is the same fact whatever the surrounding opcode is.  Only
-            // the positional mirror write above is method-form specific, and
-            // for the reason its own comment gives.  Scoping the mask to that
-            // opcode too left every other push shape unprotected, so a window
-            // whose only executed store came from, say, `LOAD_NAME` or
-            // `BINARY_OP` reported an empty mask and the restore reinstated the
-            // pre-window mirror wholesale over it.
-            if let Some((_, _, _, mask)) =
-                ctx.frame_state.borrow_mut().vstack_reorder_saved.as_mut()
-            {
-                if mask.len() <= stack_slot {
-                    mask.resize(stack_slot + 1, false);
-                }
-                mask[stack_slot] = true;
-            }
-            ctx.frame_state.borrow_mut().vstack_last_ref = value;
-        }
-    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2118,9 +2042,6 @@ mod callee_ref_owner_tests {
                 callee_shadow: shadow,
                 concrete_registers_r: concrete_r,
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -2140,11 +2061,6 @@ mod callee_ref_owner_tests {
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };

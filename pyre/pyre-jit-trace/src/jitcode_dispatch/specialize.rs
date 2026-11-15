@@ -19693,7 +19693,6 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
     if unsafe { !range_obj.is_null() && std::ptr::eq((*range_obj).ob_type, zip_type) } {
         walker_guard_exact_instance(ctx, op_pc, range_op, zip_type as i64, zip_class)?;
-        ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
         return Ok(Some(range_op));
     }
 
@@ -19904,7 +19903,6 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         new,
         majit_ir::Value::Ref(majit_ir::GcRef(real_iter as usize)),
     );
-    ctx.frame_state.borrow_mut().vstack_last_ref = new;
 
     Ok(Some(new))
 }
@@ -20117,7 +20115,6 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         body,
         true,
     );
-    ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     write_no_driver_finishframe_dest(
         ctx,
@@ -20313,10 +20310,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         body,
         true,
     );
-    // Range iteration stays at the C level, so the operand-stack mirror
-    // remains valid and must receive the item produced by FOR_ITER.  Its
-    // virtual state is captured by subsequent body-guard snapshots.
-    ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     Ok(Some(item))
 }

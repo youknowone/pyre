@@ -174,7 +174,7 @@ fn const_ptr_is_null(value: OpRef) -> bool {
 }
 
 /// A pcdep `ConstPtr(NULL)` fills a hole only for a stored live NULL.
-/// Any other NULL is a dead color (`vstack_last_ref`).
+/// Any other NULL is a dead color.
 pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef> {
     if opref_is_null_const_ptr(value) {
         live_null.then_some(value)
@@ -195,7 +195,7 @@ pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef>
 /// as `ConstPtr(NULL)`. Register liveness never blanks that item. A
 /// pcdep `ConstPtr(NULL)` fills a hole only when
 /// `virtualizable_slot_stored_live_null` (`PUSH_NULL` / resume `NULLREF`)
-/// and does not replace a real vable box (`vstack_last_ref` dead color).
+/// and does not replace a real vable box (a dead color).
 /// A real `ConstPtr(NULL)` stays; `MetaInterp.capture_resumedata` /
 /// `Trace.capture_resumedata` encode the boxes that already exist and
 /// never record. A missing declared box is an invariant failure.
@@ -248,8 +248,8 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
         }
         if value.is_none() && slot >= nlocals {
             // A pcdep Ref register may fill a hole. A ConstPtr(NULL) fills
-            // only a stored live NULL (`PUSH_NULL`); a dead color
-            // (`vstack_last_ref`) must not.
+            // only a stored live NULL (`PUSH_NULL`); a color the `-live-`
+            // bitmap marks dead (`get_list_of_active_boxes`) must not.
             for &(bank, color, mapped) in pcdep_entries {
                 if bank == 1
                     && mapped as usize == slot
@@ -578,17 +578,49 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     complete
 }
 
+/// `pyopcode.py dispatch_bytecode`: `self.last_instr = intmask(next_instr)`
+/// opens every dispatch. Bytes of the shared `interp_jit.py PyFrame.dispatch`
+/// head (`PyJitCodeMetadata.dispatch_head_by_jit_pc`) run for whichever
+/// instruction the `next_instr` green names; their static floor names an
+/// unrelated opcode (the `bytecode_only_trace` arm lays out after the last
+/// opcode body). The green is the first Int green of the head's
+/// `jit_merge_point` and stays in that register across the whole head.
+/// Trivia-normalized like the executing coordinate the per-opcode
+/// `last_instr` store names. `None` outside the head or when the register
+/// holds no concrete value.
+pub(crate) fn dispatch_head_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    jit_pc: usize,
+) -> Option<u32> {
+    if !pjc.metadata.dispatch_head_contains(jit_pc) {
+        return None;
+    }
+    // SAFETY: `code_ptr` is the CodeObject this jitcode was built from; it
+    // outlives the published jitcode.
+    let code = unsafe { pjc.code_ptr.as_ref() }?;
+    let merge_pc = *pjc.loop_scan().merge_points.first()?;
+    let green_regs =
+        crate::trace::merge_point_int_green_regs(pjc.jitcode.code.as_slice(), merge_pc)?;
+    let color = usize::from(*green_regs.first()?);
+    let next_instr = match ctx.concrete_registers_i.get(color) {
+        Some(ConcreteValue::Int(value)) => *value,
+        _ => match ctx
+            .registers_i
+            .get(color)
+            .and_then(|op| ctx.trace_ctx.concrete_of_opref(op))
+        {
+            Some(Value::Int(value)) => value,
+            _ => return None,
+        },
+    };
+    let next_instr = usize::try_from(next_instr).ok()?;
+    Some(skip_python_trivia_forward(code, next_instr) as u32)
+}
+
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
-/// the MIFrame registers as they stand after the residual call.  The
-/// capture below advances the operand-stack mirror to that same post-call
-/// boundary so the guard's virtualizable image sees the residual result;
-/// that is the transition the following walk step would make.  The walk
-/// may still emit `-live-` markers owned by the retired opcode; those
-/// report the earlier py_pc and would look like a backward layout switch.
-/// `step_vstack_mirror` ignores that marker for GET_ITER / LOAD_SPECIAL
-/// while their two pushed slots are still empty in the shadow, so the
-/// residual result stays in the live mirror. After those pushes fill the
-/// shadow, the same marker reseeds from it. Other retired opcodes reseed.
+/// the MIFrame registers and `virtualizable_boxes` as they stand after
+/// the residual call (`write_box_at`).
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -811,8 +843,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // opcode this head is running (`pyopcode.py dispatch_bytecode`).
                 // A transparent helper sub-walk's registers are the helper's.
                 if !ctx.fbw_mode.transparent_helper_subwalk
-                    && let Some(head_py) =
-                        super::vstack_mirror::dispatch_head_py_pc(ctx, &jc.payload, op_pc)
+                    && let Some(head_py) = dispatch_head_py_pc(ctx, &jc.payload, op_pc)
                 {
                     py = head_py;
                 }
@@ -905,8 +936,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else {
                 py_pc
             };
-            // The two resume-depth consumers below (vstack reconcile and
-            // vable stack sync) share one JitCode-PC twin. Plain guards key
+            // The resume-depth consumer below (vable stack sync) shares one
+            // JitCode-PC twin. Plain guards key
             // their trivia twin at `op_pc`; after-residual guards key the
             // same family at their post-call marker. A loop-close overshoot
             // falls back to entry_py_pc and has no corresponding
@@ -937,43 +968,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     jc.payload.depth_trivia_for_jitcode_pc(op_pc)
                 }
             };
-            // `capture_resumedata(after_residual_call=True)` snapshots the
-            // trailing `-live-`, after the residual result has replaced the
-            // Python opcode's consumed operands (pyjitpl.py,
-            // opencoder.py).  The walk-level stack mirror normally
-            // applies that replacement only when `step_vstack_mirror` reaches
-            // the next Python opcode.  A guard emitted by the residual itself
-            // captures before that step, so advance the mirror here to the
-            // same post-call boundary before it supplies the vable snapshot.
-            // This is the same transition the following walk step would make;
-            // it merely makes the guard's resume image observe it at the
-            // required point.  The live walk keeps that post-call mirror so a
-            // later FOR_ITER snapshot still sees GET_ITER's iterator.
-            //
-            // `py_pc == vstack_cur_pypc` is not that transition: the walk has
-            // not left the opcode the mirror already holds, so the following
-            // step makes no boundary at all — `step_vstack_mirror` returns on
-            // the same equality. Reconciling anyway replays that opcode's
-            // stack effect a second time, and the permutation classes are not
-            // idempotent: a `SWAP` applied twice is the identity, so the two
-            // slots it exchanged keep their pre-swap order for the rest of the
-            // walk and every later guard snapshot publishes them crossed.
-            if after_residual_call && ctx.vstack_valid && py_pc != ctx.vstack_cur_pypc {
-                let jc = &walked_owned;
-                let code_ptr = jc.payload.code_ptr;
-                if !code_ptr.is_null() {
-                    let resume_depth = match resume_depth_twin {
-                        Some(depth) => depth as usize,
-                        None => crate::liveness::liveness_for(code_ptr)
-                            .depth_at_py_pc()
-                            .get(py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize,
-                    };
-                    let code = unsafe { &*code_ptr };
-                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true, op_pc);
-                }
-            }
             // Snapshot `last_instr` / `valuestackdepth` as they stand: the
             // last `_opimpl_setfield_vable` boxes (`pyjitpl.py
             // capture_resumedata`, `virtualizable.py write_box_at`). The
@@ -2705,7 +2699,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides,
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -2940,7 +2933,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -3015,7 +3007,6 @@ pub(crate) fn paused_helper_caller_frame_from_banks(
         InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: Some(call_jit_pc),
-            call_pc: Some(call_jit_pc),
             resume_pc: Some(resume_marker_jit_pc),
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3191,7 +3182,6 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc: Some(call_jit_pc),
         resume_pc: Some(resume_marker_jit_pc),
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -3638,7 +3628,6 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(helper_jitcode_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
