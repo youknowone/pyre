@@ -17755,20 +17755,20 @@ fn generator_unpack_into(
             // the frame rests on `POP_TOP` after the wrap-time prologue,
             // and that pop consumes the None.  Later resumes after
             // `YIELD_VALUE` use the same push so `x = yield` sees it.
-            //
-            // The generator body can collect and move the frame, so the
-            // frame is re-read from the pinned generator (`generator.py`
-            // `unpack_into` `frame = self.frame`; `shadowstack.py`
-            // `pop_roots`).
             let frame = &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
             w_generator_set_started(gen_obj());
             let result = generator_invoke_execute_frame(gen_obj(), frame, pyre_object::w_none());
-            let frame = &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
             match result {
                 // `_invoke_execute_frame` has already applied PEP 479 and
                 // finalized the frame for any escaping error.
                 Err(e) => return Err(e),
                 Ok(w_result) => {
+                    // The generator body can collect and move the frame, so the
+                    // frame is re-read from the pinned generator (`generator.py`
+                    // `unpack_into` `frame = self.frame`; `shadowstack.py`
+                    // `pop_roots`).
+                    let frame =
+                        &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {

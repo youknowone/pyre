@@ -2396,7 +2396,23 @@ pub(crate) fn eval_frame_plain(
 
 enum FrameResume {
     Yielded(PyObjectRef),
-    Dispatch(Option<PyError>),
+    Dispatch,
+}
+
+/// The resumption payload is an error: hand it to this frame's own
+/// exception table (`pyframe.py` `resume_execute_frame` →
+/// `handle_operation_error`). `Err` means no handler caught it.
+fn dispatch_resume_error(frame: &mut PyFrame, mut err: PyError) -> Result<(), PyError> {
+    let mut next_instr = frame.next_instr();
+    if !handle_exception_with_context(
+        frame,
+        &mut err,
+        &mut next_instr,
+        ContextSource::ResumedFrameOnly,
+    ) {
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// pyframe.py `resume_execute_frame`.  A suspended `yield from` is
@@ -2425,22 +2441,27 @@ fn prepare_frame_resume(
             // `resume_execute_frame` continues after `next_yield_from`.
             Ok(None) => {
                 crate::baseobjspace::position_after_send(unsafe { &mut *anchor.live() })?;
-                return Ok(FrameResume::Dispatch(None));
+                return Ok(FrameResume::Dispatch);
             }
-            // The delegate's error is thrown into this frame's own dispatch;
-            // the sent value was the delegate's and is not resumed here.
-            Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
+            Err(err) => {
+                // The delegate can collect, so the error goes to the frame
+                // re-read off the anchor.
+                dispatch_resume_error(unsafe { &mut *anchor.live() }, err)?;
+                return Ok(FrameResume::Dispatch);
+            }
         }
     }
     if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
-        return Ok(FrameResume::Dispatch(Some(
+        dispatch_resume_error(
+            frame,
             crate::pyopcode::s_application_exception_operr(w_arg_or_err),
-        )));
+        )?;
+        return Ok(FrameResume::Dispatch);
     }
     if !w_arg_or_err.is_null() {
         let _ = frame.resume_execute_frame(w_arg_or_err)?;
     }
-    Ok(FrameResume::Dispatch(None))
+    Ok(FrameResume::Dispatch)
 }
 
 /// Seed a suspended frame with its resumption payload, leaving it positioned to
@@ -2458,19 +2479,7 @@ pub fn prepare_frame_resume_for_dispatch(
 ) -> Result<Option<PyObjectRef>, PyError> {
     match prepare_frame_resume(frame, resume.w_arg_or_err)? {
         FrameResume::Yielded(value) => Ok(Some(value)),
-        FrameResume::Dispatch(Some(mut err)) => {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception_with_context(
-                frame,
-                &mut err,
-                &mut next_instr,
-                ContextSource::ResumedFrameOnly,
-            ) {
-                return Err(err);
-            }
-            Ok(None)
-        }
-        FrameResume::Dispatch(None) => Ok(None),
+        FrameResume::Dispatch => Ok(None),
     }
 }
 

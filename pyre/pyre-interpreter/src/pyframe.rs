@@ -5893,6 +5893,7 @@ impl PyFrame {
         repr.push_str(&lineno.to_string());
         repr.push_str(", code ");
         repr.push_wtf8(&name);
+        repr.push_str(">");
         repr
     }
 
