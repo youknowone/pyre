@@ -9706,6 +9706,21 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
     Some(leaf)
 }
 
+/// Declaration path of `DICTENTRY` (`get_ll_dict`).
+pub(crate) fn entry_family_is_entry_path(name_path: &str) -> bool {
+    name_path.ends_with("::rordereddict_entries::Entry")
+}
+
+/// Declaration path of `DICTENTRYARRAY` (`get_ll_dict`).
+fn entry_family_is_gc_entries_path(name_path: &str) -> bool {
+    name_path.ends_with("::rordereddict_entries::GcEntries")
+}
+
+/// `DICTENTRY` or `DICTENTRYARRAY` (`get_ll_dict`).
+pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
+    entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
+}
+
 /// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
 /// serves every monomorphization; the bare `Entry` class would union `key`.
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
@@ -9714,7 +9729,7 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if !name_path.ends_with("::rordereddict_entries::Entry") {
+    if !entry_family_is_entry_path(name_path) {
         return None;
     }
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
@@ -9729,7 +9744,7 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if !name_path.ends_with("::rordereddict_entries::GcEntries") {
+    if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
@@ -9820,6 +9835,95 @@ pub(in crate::front::mir) fn foreign_body_generic_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
 }
 
+/// `<…>` suffix for a struct whose template field type names the split
+/// entry family (`DICTENTRY` / `DICTENTRYARRAY`) parametrized by that
+/// struct's own type variables.
+///
+/// `get_ll_dict` builds one `DICT` per key/value, and that struct holds
+/// `("entries", Ptr(DICTENTRYARRAY))`. `bookkeeper.py` `getuniqueclassdef`
+/// is one class object per such struct. The predicate is those template
+/// field types, not the struct's name.
+pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let _ = name_path;
+    let td = llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    if !fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
+    {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+}
+
+/// Pointer / `Box` / `NonNull` / by-value field whose pointee ADT is the
+/// entry family and whose type arguments mention a type variable.
+/// Arrays and slices stay out: `DICTENTRYARRAY` is the array of
+/// `DICTENTRY`, not another struct that holds one.
+fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    for _ in 0..8 {
+        let Some(stripped) = strip_ty_indirections(node, llbc) else {
+            return false;
+        };
+        let Some(peeled) = type_node_peel_aliases(stripped, llbc) else {
+            return false;
+        };
+        if type_node_is_array_or_slice(peeled) {
+            return false;
+        }
+        if let Some(pointee) = one_level_pointer_pointee(peeled, llbc) {
+            node = pointee;
+            continue;
+        }
+        // `one_level_pointer_pointee` peels a thin `Box` only. A `Box`
+        // whose pointee has no recorded layout is still `Box<T>`.
+        if let Some(pointee) = type_node_box_pointee(peeled, llbc) {
+            node = pointee;
+            continue;
+        }
+        return adt_node_is_entry_family_of_typevar(peeled, llbc);
+    }
+    false
+}
+
+fn type_node_is_array_or_slice(node: &serde_json::Value) -> bool {
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Array") || obj.contains_key("Slice") {
+        return true;
+    }
+    matches!(
+        obj.get("Adt").and_then(type_decl_ref_builtin),
+        Some("Array" | "Slice")
+    )
+}
+
+fn adt_node_is_entry_family_of_typevar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    if !entry_family_name_path(td.item_meta.name_path_str()) {
+        return false;
+    }
+    adt_node_type_subst(node, llbc)
+        .iter()
+        .any(|arg| super::json_mentions_typevar(arg, llbc, 0))
+}
+
 pub(in crate::front::mir) fn struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -9832,6 +9936,9 @@ pub(in crate::front::mir) fn struct_instantiation_suffix(
         .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc, tombstoned))
         .or_else(|| {
             foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc, tombstoned)
+        })
+        .or_else(|| {
+            entry_family_holder_struct_instantiation_suffix(name_path, adt, llbc, tombstoned)
         })
 }
 

@@ -13595,6 +13595,182 @@ fn gc_entries_instantiation_splits_key_class() {
 }
 
 #[test]
+fn entry_family_holder_instantiation_splits_key_class() {
+    // `get_ll_dict` builds one `DICT` per key/value holding
+    // `Ptr(DICTENTRYARRAY)`. A struct whose template field names that
+    // family with its own type variables splits the same way
+    // (`bookkeeper.py` `getuniqueclassdef`). A generic struct without
+    // such a field stays one class.
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let family = || named_adt(0, vec![tvar(0), tvar(1)]);
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let box_ty = |ty: serde_json::Value| {
+        serde_json::json!({
+            "Adt": {
+                "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let count = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "GcEntries"],
+                vec![],
+            ),
+            type_decl_struct(1, &["core", "ptr", "non_null", "NonNull"], vec![]),
+            type_decl_struct(
+                2,
+                &["fixture", "Table"],
+                vec![
+                    named_copy_field("entries", raw_mut(family())),
+                    named_copy_field("n", count.clone()),
+                ],
+            ),
+            type_decl_struct(
+                3,
+                &["fixture", "Pair"],
+                vec![
+                    named_copy_field("a", tvar(0)),
+                    named_copy_field("b", tvar(1)),
+                ],
+            ),
+            type_decl_struct(
+                4,
+                &["fixture", "Fixed"],
+                vec![
+                    named_copy_field(
+                        "entries",
+                        raw_mut(named_adt(0, vec![u64_ty.clone(), i64_ty.clone()])),
+                    ),
+                    named_copy_field("n", count.clone()),
+                ],
+            ),
+            type_decl_struct(
+                5,
+                &["fixture", "ViaNonNull"],
+                vec![
+                    named_copy_field("entries", named_adt(1, vec![family()])),
+                    named_copy_field("n", count.clone()),
+                ],
+            ),
+            type_decl_struct(
+                6,
+                &["fixture", "ViaBox"],
+                vec![
+                    named_copy_field("entries", box_ty(family())),
+                    named_copy_field("n", count.clone()),
+                ],
+            ),
+            type_decl_struct(
+                7,
+                &["fixture", "ViaValue"],
+                vec![
+                    named_copy_field("entries", family()),
+                    named_copy_field("n", count.clone()),
+                ],
+            ),
+            type_decl_struct(
+                8,
+                &["fixture", "ViaArray"],
+                vec![
+                    named_copy_field("entries", serde_json::json!({"Array": [family(), 0, null]})),
+                    named_copy_field("n", count),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let tomb = std::collections::HashSet::new();
+    fn adt_of(node: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        node.get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .expect("Adt")
+    }
+    let assert_split = |id: u64, leaf: &str| {
+        let a_node = named_adt(id, vec![u64_ty.clone(), i64_ty.clone()]);
+        let b_node = named_adt(id, vec![i64_ty.clone(), i64_ty.clone()]);
+        let a = super::adt_node_class_root_with(&a_node, &llbc, &tomb);
+        let b = super::adt_node_class_root_with(&b_node, &llbc, &tomb);
+        assert_ne!(a, b, "{leaf} instantiations must not share one class");
+        let spelling = a.as_deref().unwrap_or("");
+        assert!(
+            spelling.contains(leaf) && spelling.contains('<'),
+            "{leaf} got {a:?}"
+        );
+        assert_eq!(
+            super::entry_family_holder_struct_instantiation_suffix(
+                &format!("fixture::{leaf}"),
+                adt_of(&a_node),
+                &llbc,
+                &tomb,
+            )
+            .as_deref(),
+            Some("<u64,i64>")
+        );
+        assert_eq!(
+            super::struct_instantiation_suffix(
+                &format!("fixture::{leaf}"),
+                adt_of(&a_node),
+                &llbc,
+                &tomb,
+            )
+            .as_deref(),
+            Some("<u64,i64>")
+        );
+    };
+    let assert_shared = |id: u64, leaf: &str| {
+        let a_node = named_adt(id, vec![u64_ty.clone(), i64_ty.clone()]);
+        let b_node = named_adt(id, vec![i64_ty.clone(), i64_ty.clone()]);
+        let a = super::adt_node_class_root_with(&a_node, &llbc, &tomb);
+        let b = super::adt_node_class_root_with(&b_node, &llbc, &tomb);
+        assert_eq!(a, b, "{leaf} must stay one class");
+        let spelling = a.expect(leaf);
+        assert!(
+            spelling.contains(leaf) && !spelling.contains('<'),
+            "{leaf} got {spelling}"
+        );
+        assert_eq!(
+            super::entry_family_holder_struct_instantiation_suffix(
+                &format!("fixture::{leaf}"),
+                adt_of(&a_node),
+                &llbc,
+                &tomb,
+            ),
+            None
+        );
+    };
+    assert_split(2, "Table");
+    assert_split(5, "ViaNonNull");
+    assert_split(6, "ViaBox");
+    assert_split(7, "ViaValue");
+    assert_shared(3, "Pair");
+    assert_shared(4, "Fixed");
+    assert_shared(8, "ViaArray");
+    let open = named_adt(2, vec![tvar(0), tvar(1)]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Table",
+            adt_of(&open),
+            &llbc,
+            &tomb,
+        ),
+        None,
+        "an unsubstituted holder is not an instantiation"
+    );
+}
+
+#[test]
 fn tyref_enum_instantiation_suffix_unwraps_value_wrapper() {
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let wrapped = TyRef::Other(
