@@ -1776,31 +1776,28 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         &[true, false, false, false, false],
         "__lazy_import__",
     )?;
-    let mut name = scope[0];
-    let mut globals = scope[1];
-    let mut locals = scope[2];
+    // Every argument is live across the empty-tuple allocation and the
+    // level conversion; publish all five in one run and read them back.
     let _roots = pyre_object::gc_roots::push_roots();
-    let scope_base = pyre_object::gc_roots::pin_roots(&[name, globals, locals]);
-    let mut fromlist = if scope[3].is_null() {
-        pyre_object::with_roots!(name, globals, locals => w_tuple_new(Vec::new()))
+    let scope_base =
+        pyre_object::gc_roots::pin_roots(&[scope[0], scope[1], scope[2], scope[4], scope[3]]);
+    let fromlist_slot = if pyre_object::gc_roots::shadow_stack_get(scope_base + 4).is_null() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(Vec::new()));
+        slot
     } else {
-        scope[3]
+        scope_base + 4
     };
-    let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(fromlist);
-    let level = if scope[4].is_null() {
+    let level_obj = pyre_object::gc_roots::shadow_stack_get(scope_base + 3);
+    let level = if level_obj.is_null() {
         0
     } else {
-        name = pyre_object::gc_roots::shadow_stack_get(scope_base);
-        globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
-        locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
-        fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
-        level_from_obj(scope[4])?
+        level_from_obj(level_obj)?
     };
-    name = pyre_object::gc_roots::shadow_stack_get(scope_base);
-    globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
-    locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
-    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    let mut name = pyre_object::gc_roots::shadow_stack_get(scope_base);
+    let mut globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
+    let mut locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
+    let mut fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
     if globals.is_null() {
         let frame = current_frame();
         if frame.is_null() {

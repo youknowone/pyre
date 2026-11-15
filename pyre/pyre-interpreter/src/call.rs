@@ -7028,17 +7028,21 @@ fn update_bases(
     // `w_orig_bases` is the tuple every `__mro_entries__` in the walk is handed,
     // and it is nursery-allocated: the caller's pin keeps it alive and forwards
     // its slot, but this parameter copy is the pre-move word from the first
-    // `getattr_str` onwards.  Re-publish it here and read the slot at each call.
+    // `getattr_str` onwards.  The tuple and the originals are published
+    // together in one run; read the slot at each call.
     let _entry_roots = pyre_object::gc_roots::push_roots();
-    let orig_bases_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_orig_bases);
+    let mut live = Vec::with_capacity(1 + base_args.len());
+    live.push(w_orig_bases);
+    live.extend_from_slice(base_args);
+    let orig_bases_slot = pyre_object::gc_roots::pin_roots(&live);
     // The originals go on the shadow stack for the same reason `w_orig_bases`
     // does: `getattr_str` and the `__mro_entries__` call both run Python, so a
     // base the walk has not reached yet is a pre-move word by the time it is
-    // read.  The accumulation is a list of slot indices rather than of words,
+    // read.  The tuple and the originals are published together in one run.
+    // The accumulation is a list of slot indices rather than of words,
     // so an entry already appended is re-read at the end instead of being
     // frozen at the address it had when it was appended.
-    let args_base = pyre_object::gc_roots::pin_roots(base_args);
+    let args_base = orig_bases_slot + 1;
     let mut new_slots: Option<Vec<usize>> = None;
     for i in 0..base_args.len() {
         let w_base = pyre_object::gc_roots::shadow_stack_get(args_base + i);
