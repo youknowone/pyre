@@ -8320,6 +8320,18 @@ x = 7
         payload as pyre_object::gc_hook::GCREF
     }
 
+    /// `GcAllocCollectingRootedHookFn` fake: a headered nursery block that
+    /// never collects, so `root` stays as given and no barrier is needed.
+    unsafe fn headered_young_alloc_rooted(
+        type_id: u32,
+        payload_size: usize,
+        _root: *mut pyre_object::gc_hook::GCREF,
+        needs_write_barrier: *mut bool,
+    ) -> pyre_object::gc_hook::GCREF {
+        unsafe { *needs_write_barrier = false };
+        headered_young_alloc(type_id, payload_size)
+    }
+
     fn young_frame_alloc_is_owned(addr: usize) -> bool {
         YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow().contains(&addr))
     }
@@ -8328,6 +8340,7 @@ x = 7
     impl Drop for ClearYoungFrameHooks {
         fn drop(&mut self) {
             pyre_object::gc_hook::clear_gc_alloc_young_nonmoving_hook();
+            pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
             pyre_object::gc_hook::clear_gc_owns_object_hook();
             YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().clear());
         }
@@ -8377,6 +8390,7 @@ x = 7
                 .push(snapshot.locals_cells_stack_w as usize)
         });
         pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(headered_young_alloc);
+        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(headered_young_alloc_rooted);
         pyre_object::gc_hook::register_gc_owns_object_hook(young_frame_alloc_is_owned);
         let boxed = super::FrameBox::new(snapshot).expect("frame allocation");
         assert!(
