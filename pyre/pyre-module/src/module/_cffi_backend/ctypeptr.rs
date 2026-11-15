@@ -8,7 +8,7 @@
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::collections::HashSet;
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_int};
 use std::sync::{Mutex, OnceLock};
 
 use super::cdataobj::{self, W_CData};
@@ -772,18 +772,34 @@ unsafe fn prepare_pointer_call_argument(
 
 // ── the C `FILE` a stream is cast to ────────────────────────────────────
 
-unsafe extern "C" {
+// `ctypeptr.FILEP` is `rffi.COpaquePtr("FILE")`.
+majit_rlib::rffi::copaque_ptr!(pub FILEP = "FILE");
+
+majit_rlib::rffi::llexternal!(
     #[cfg_attr(windows, link_name = "_fdopen")]
-    #[cfg_attr(not(windows), link_name = "fdopen")]
-    fn rffi_fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
+    pub rffi_fdopen = "fdopen",
+    [majit_rlib::rffi::INT, majit_rlib::rffi::CCHARP],
+    FILEP,
+    save_err = majit_rlib::rffi::RFFI_SAVE_ERRNO
+);
+majit_rlib::rffi::llexternal!(
+    pub rffi_setbuf = "setbuf",
+    [FILEP, majit_rlib::rffi::CCHARP],
+    ()
+);
+majit_rlib::rffi::llexternal!(
+    pub rffi_fclose = "fclose",
+    [FILEP],
+    majit_rlib::rffi::INT
+);
+
+unsafe extern "C" {
     #[cfg_attr(windows, link_name = "_dup")]
     #[cfg_attr(not(windows), link_name = "dup")]
     fn rffi_dup(fd: c_int) -> c_int;
     #[cfg_attr(windows, link_name = "_close")]
     #[cfg_attr(not(windows), link_name = "close")]
     fn rffi_close(fd: c_int) -> c_int;
-    fn setbuf(stream: *mut c_void, buf: *mut c_char);
-    fn fclose(stream: *mut c_void) -> c_int;
 }
 
 /// The slot `W_IOBase.cffi_fileobj` is here: the address `fdopen` returned,
@@ -816,7 +832,7 @@ fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
 
 /// `W_CTypePointer.prepare_file` — a stream answers with the C `FILE` over
 /// it, and anything else with a null pointer.
-fn prepare_file(mut w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
+fn prepare_file(mut w_ob: PyObjectRef) -> Result<FILEP, PyError> {
     if !pyre_object::with_roots!(w_ob => pyre_interpreter::baseobjspace::isinstance(
         w_ob,
         pyre_interpreter::module::_io::io_base_type(),
@@ -827,13 +843,13 @@ fn prepare_file(mut w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
 }
 
 /// `ctypeptr.py prepare_file_argument`.
-fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError> {
+fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<FILEP, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let file_slot = roots.base();
     let _ = roots.pin_root(w_fileobj);
     pyre_interpreter::baseobjspace::call_method_result(roots.get(file_slot), "flush", &[])?;
     if let Some(held) = held_file(roots.get(file_slot)) {
-        return Ok(held as *mut c_void);
+        return Ok(held as FILEP);
     }
 
     let w_fd =
@@ -857,13 +873,13 @@ fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError>
     if fd < 0 {
         return Err(PyError::os_error_with_errno(errno(), "dup failed"));
     }
-    let llf = unsafe { rffi_fdopen(fd, mode.as_ptr()) };
+    let llf = unsafe { rffi_fdopen(fd, mode.as_ptr() as majit_rlib::rffi::CCHARP) };
     if llf.is_null() {
-        let saved = errno();
+        let saved = majit_rlib::rposix::get_saved_errno();
         unsafe { rffi_close(fd) };
         return Err(PyError::os_error_with_errno(saved, "fdopen failed"));
     }
-    unsafe { setbuf(llf, std::ptr::null_mut()) };
+    unsafe { rffi_setbuf(llf, std::ptr::null_mut()) };
 
     let address = llf as usize;
     lock_open_files().insert(address);
@@ -888,7 +904,7 @@ pub fn close_cffi_fileobj(mut w_fileobj: PyObjectRef) {
         CFFI_FILEOBJ_SLOT,
         pyre_object::w_none(),
     );
-    unsafe { fclose(address as *mut c_void) };
+    unsafe { rffi_fclose(address as FILEP) };
 }
 
 /// `rposix.get_saved_errno()`.
