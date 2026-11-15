@@ -18939,6 +18939,157 @@ pub(crate) fn publish_generator_resume_foriter_item<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
+/// Nested generator-resume `SubReturn` parked on the parent CALL so
+/// [`walk_generator_resume`] can run `_send_ex` (`bind_generator_resume_foriter_item`)
+/// instead of dest-binding the portal result.
+struct ParkedGeneratorResumeSubReturn {
+    item: Option<OpRef>,
+    generator_resume: GeneratorResumeSubwalk,
+    frame_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// FOR_ITER caller captured before the body (`compute_inline_caller_frame`).
+    /// `_interpret` keeps that `MIFrame`; replay must not recapture it.
+    caller_parent: Option<InlineParentFrame>,
+}
+
+/// Pre-body `_send_ex` bind inputs for a nested generator resume.
+///
+/// Captured at first entry, before `SubWalkSuspended`. The driver binds at
+/// pop and skips CALL replay so the GETFIELD preamble stays (`_interpret`
+/// continues from the executed call; it does not re-enter it).
+struct ParkedSendExCaller {
+    caller_parent: InlineParentFrame,
+    iter_op: OpRef,
+    dst: usize,
+}
+
+/// `_send_ex` tail for a nested resume whose body already ran.
+///
+/// The child `PyFrame` is the pin taken before `pop_frame`: after RETURN
+/// `gen.frame` may be None, and `InlineConcreteFrameGuard` drops on pop.
+fn finish_parked_generator_resume_subreturn<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    iter_op: OpRef,
+    parked: ParkedGeneratorResumeSubReturn,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let ParkedGeneratorResumeSubReturn {
+        item,
+        generator_resume,
+        frame_pin,
+        caller_parent,
+    } = parked;
+    let Some(item) = item else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let Some(caller_parent) = caller_parent else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let live = frame_pin.as_ref().map(|pin| pin.get().0).unwrap_or(0);
+    if live == 0 {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(live as pyre_object::PyObjectRef);
+    ctx.trace_ctx.set_opref_concrete(
+        generator_resume.frame_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(live)),
+    );
+    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    // The child already ran. A bind failure cannot residualize `jit_next`
+    // (`convert_and_run_from_pyjitpl` continues the live frame).
+    bind_generator_resume_foriter_item(
+        ctx,
+        op,
+        dst,
+        item,
+        body_coord,
+        generator_resume.frame_box,
+        frame_root,
+        iter_op,
+        caller_parent,
+    )
+}
+
+/// `_send_ex` bind at dest-write timing: the child already ran, the GETFIELD
+/// preamble is in the trace, and the parent CALL must not replay.
+fn bind_nested_generator_resume_at_parent<'a, Sym: WalkSym>(
+    parent: &mut SubWalkFrame<'a, Sym>,
+    trace_ctx: &mut TraceCtx,
+    item: OpRef,
+    generator_resume: GeneratorResumeSubwalk,
+    frame_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    caller_pc: usize,
+) -> Result<usize, DispatchError> {
+    let Some(parked) = parent.send_ex_caller.take() else {
+        return Err(DispatchError::callee_inline_unsupported(caller_pc));
+    };
+    let Some(op) = crate::jitcode_runtime::decode_op_at(parent.body.code, caller_pc) else {
+        return Err(DispatchError::callee_inline_unsupported(caller_pc));
+    };
+    let live = frame_pin.as_ref().map(|pin| pin.get().0).unwrap_or(0);
+    if live == 0 {
+        return Err(DispatchError::callee_inline_unsupported(caller_pc));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(live as pyre_object::PyObjectRef);
+    let mut walk_ctx = WalkContext {
+        frame_state: parent.frame_state.clone(),
+        inline_callee_consts: parent.inline_callee_consts,
+        fbw_mode: parent.fbw_mode.clone(),
+        session: parent.session,
+        registers_r: &parent.registers_r,
+        registers_i: &parent.registers_i,
+        registers_f: &parent.registers_f,
+        concrete_registers_i: &mut parent.concrete_registers_i,
+        descr_refs: parent.descr_refs,
+        raw_descrs: parent.raw_descrs,
+        is_authoritative_executor: parent.is_authoritative_executor,
+        trace_ctx,
+        is_top_level: false,
+        sub_jitcode_lookup: parent.sub_jitcode_lookup,
+        entry_py_pc: parent.entry_py_pc,
+        outer_resume_marker_jit_pc: parent.outer_resume_marker_jit_pc,
+        outer_jitcode_index: parent.outer_jitcode_index,
+        pending_guard_snapshot_error: parent.pending_guard_snapshot_error.take(),
+        live_before_jit_pc: parent.live_before_jit_pc,
+        live_after_jit_pc: parent.live_after_jit_pc,
+    };
+    walk_ctx.trace_ctx.set_opref_concrete(
+        generator_resume.frame_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(live)),
+    );
+    let body_coord = fbw_foriter_body_from_op_pc(&walk_ctx, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(walk_ctx.entry_py_pc() as usize + 1));
+    let bind_result = bind_generator_resume_foriter_item(
+        &mut walk_ctx,
+        &op,
+        parked.dst,
+        item,
+        body_coord,
+        generator_resume.frame_box,
+        frame_root,
+        parked.iter_op,
+        parked.caller_parent,
+    );
+    parent.inline_callee_consts = walk_ctx.inline_callee_consts;
+    parent.fbw_mode = walk_ctx.fbw_mode;
+    parent.entry_py_pc = walk_ctx.entry_py_pc;
+    parent.outer_resume_marker_jit_pc = walk_ctx.outer_resume_marker_jit_pc;
+    parent.outer_jitcode_index = walk_ctx.outer_jitcode_index;
+    parent.pending_guard_snapshot_error = walk_ctx.pending_guard_snapshot_error.take();
+    parent.live_before_jit_pc = walk_ctx.live_before_jit_pc;
+    parent.live_after_jit_pc = walk_ctx.live_after_jit_pc;
+    match bind_result {
+        Ok(Some((DispatchOutcome::Continue, next_pc))) => Ok(next_pc),
+        Ok(_) => Err(DispatchError::callee_inline_unsupported(caller_pc)),
+        Err(error) => Err(error),
+    }
+}
+
 /// Walk the already-installed portal-shaped body of a suspended generator
 /// from `resume_execute_frame` to its next `yield`.
 fn walk_generator_resume<Sym: WalkSym>(
@@ -18950,6 +19101,13 @@ fn walk_generator_resume<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // Nested `SubWalkSuspended` returns here before the `_send_ex` tail.
+    // A finished generator is no longer resumable (`generator_resume_fast_path`),
+    // so the parked `SubReturn` is consumed first and bound through
+    // `bind_generator_resume_foriter_item` (`GeneratorOrCoroutine._send_ex`).
+    if let Some(parked) = take_completed_generator_resume_subreturn(ctx, op.pc) {
+        return finish_parked_generator_resume_subreturn(ctx, op, dst, iter_op, parked);
+    }
     let Some(shape) =
         (unsafe { pyre_interpreter::baseobjspace::generator_resume_fast_path(iter_obj) })
     else {
@@ -19509,7 +19667,17 @@ fn walk_generator_resume<Sym: WalkSym>(
         // over `framestack`. Nested under a sub-walk driver,
         // `run_sub_jitcode_walk_from` returns `SubWalkSuspended` instead
         // of driving — the same ChangeFrame, not a FOR_ITER decline.
-        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
+        // Park the pre-body FOR_ITER caller (`compute_inline_caller_frame`)
+        // so replay binds through `_send_ex` with that image, not a recapture
+        // after the child ran (`MetaInterp._interpret` / `make_result_of_lastop`).
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => {
+            park_send_ex_caller::<Sym>(ParkedSendExCaller {
+                caller_parent,
+                iter_op,
+                dst,
+            });
+            return Err(error);
+        }
         Err(error) => {
             // Same split as `residualize_generator_resume_foriter` and as
             // `TraceTooLong` above: an effectful abort is
@@ -22045,6 +22213,53 @@ impl Drop for HelperLiveGuard<'_> {
     }
 }
 
+/// Pre-call list/range iterator cursor, parked with the nested helper
+/// result so replay does not re-sample after the child advanced
+/// (`MetaInterp._interpret` / `make_result_of_lastop`).
+pub(crate) struct CallEntryIterCheckpoint {
+    pub kind: CallEntryIterKind,
+    pub journal_mark: FbwEffectJournalMark,
+    seq_before: usize,
+    seq_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CallEntryIterKind {
+    List { index_before: isize },
+    Range { current: i64, remaining: i64 },
+}
+
+impl CallEntryIterCheckpoint {
+    pub(crate) fn list(
+        index_before: isize,
+        seq_before: pyre_object::PyObjectRef,
+        journal_mark: FbwEffectJournalMark,
+    ) -> Self {
+        Self {
+            kind: CallEntryIterKind::List { index_before },
+            journal_mark,
+            seq_before: seq_before as usize,
+            seq_pin: residual_call::owner_root_if_gc(seq_before as usize),
+        }
+    }
+
+    pub(crate) fn range(current: i64, remaining: i64, journal_mark: FbwEffectJournalMark) -> Self {
+        Self {
+            kind: CallEntryIterKind::Range { current, remaining },
+            journal_mark,
+            seq_before: 0,
+            seq_pin: None,
+        }
+    }
+
+    pub(crate) fn seq_before(&self) -> pyre_object::PyObjectRef {
+        self.seq_pin
+            .as_ref()
+            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+            .unwrap_or(self.seq_before as pyre_object::PyObjectRef)
+    }
+}
+
 struct SubWalkFrame<'a, Sym: WalkSym> {
     _helper_live: HelperLiveGuard<'a>,
     /// Helper or Python-portal level published by
@@ -22109,6 +22324,13 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// [`fbw_heap_writing_effect_count`] at that same CALL
     /// (`InlineFrame::entry_heap_writing_effects`).
     heap_writing_at_call: Option<usize>,
+    /// List/range cursor sampled at this CALL, before the nested helper ran.
+    /// Copied onto [`CompletedSubWalk`] so replay does not re-sample
+    /// (`MetaInterp._interpret` / `make_result_of_lastop`).
+    iter_checkpoint_at_call: Option<CallEntryIterCheckpoint>,
+    /// FOR_ITER caller and residual dest captured before a nested generator
+    /// body. The driver binds at pop (`_send_ex`) and skips CALL replay.
+    send_ex_caller: Option<ParkedSendExCaller>,
 }
 
 struct PendingSubReturn {
@@ -22264,6 +22486,18 @@ struct CompletedSubWalk {
     caller_pc: usize,
     result: Result<DispatchOutcome, DispatchError>,
     class_of_last_exc_is_const: bool,
+    /// Set when the popped child was a generator-resume portal. The parent
+    /// CALL replays into [`walk_generator_resume`], which binds through
+    /// [`bind_generator_resume_foriter_item`] (`_send_ex`).
+    generator_resume: Option<GeneratorResumeSubwalk>,
+    /// Pin of the child's `PyFrame` taken before `pop_frame`. After RETURN
+    /// `gen.frame` may be None; `InlineConcreteFrameGuard` drops on pop.
+    frame_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// Pre-call list/range iterator cursor, if this CALL sampled one.
+    iter_checkpoint: Option<CallEntryIterCheckpoint>,
+    /// Pre-body FOR_ITER caller for a generator-resume child, if this CALL
+    /// captured one.
+    send_ex_caller_parent: Option<InlineParentFrame>,
 }
 
 /// The only state nested `walk()` activations exchange with the outer driver.
@@ -22298,6 +22532,12 @@ struct SubWalkExchange<'a, Sym: WalkSym> {
     ancestor_frames: *const SubWalkFrame<'a, Sym>,
     ancestor_len: usize,
     active_caller_pc: usize,
+    /// List/range cursor sampled at the current CALL, before the nested
+    /// helper ran. Copied onto the paused parent at `SubWalkSuspended`.
+    step_iter_checkpoint: Option<CallEntryIterCheckpoint>,
+    /// FOR_ITER caller captured before a nested generator body. Copied onto
+    /// the paused parent at `SubWalkSuspended`.
+    step_send_ex_caller: Option<ParkedSendExCaller>,
 }
 
 struct SubWalkDriver<'a, Sym: WalkSym> {
@@ -22330,6 +22570,8 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 ancestor_frames: std::ptr::null(),
                 ancestor_len: 0,
                 active_caller_pc: 0,
+                step_iter_checkpoint: None,
+                step_send_ex_caller: None,
             },
         };
         driver.push_frame(root);
@@ -22513,6 +22755,13 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         // refuse replay after an effect this step applied.
                         frame.effects_at_call = Some(self.exchange.step_effect_count);
                         frame.heap_writing_at_call = Some(self.exchange.step_heap_writing);
+                        if frame.iter_checkpoint_at_call.is_none() {
+                            frame.iter_checkpoint_at_call =
+                                self.exchange.step_iter_checkpoint.take();
+                        }
+                        if frame.send_ex_caller.is_none() {
+                            frame.send_ex_caller = self.exchange.step_send_ex_caller.take();
+                        }
                         // Keep the results this pass consumed; the callee that
                         // just suspended appends its own when it finishes.
                         let mut replay_log = std::mem::take(&mut self.exchange.completed);
@@ -22551,27 +22800,64 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         }
                         return result.map(|(outcome, _)| (outcome, false));
                     }
+                    // Pin the generator frame before `pop_frame`:
+                    // `InlineConcreteFrameGuard` drops on pop, and after
+                    // RETURN `gen.frame` may be None (`_send_ex`).
+                    let generator_resume = self
+                        .frames
+                        .last()
+                        .and_then(|frame| frame.fbw_mode.generator_resume);
+                    let frame_pin = if generator_resume.is_some()
+                        && matches!(&result, Ok((DispatchOutcome::SubReturn { .. }, _)))
+                    {
+                        residual_call::owner_root_if_gc(
+                            residual_call::current_inline_concrete_frame(),
+                        )
+                    } else {
+                        None
+                    };
                     let frame = self.pop_frame();
                     let class_state = frame.fbw_mode.class_of_last_exc_is_const;
-                    let portal_resume = frame.fbw_mode.generator_resume.is_some();
                     let caller_pc = frame.caller_pc;
                     let caller_exc_before = frame.caller_exc_before;
                     let result = result.map(|(outcome, _)| outcome);
                     let Some(parent) = self.frames.last_mut() else {
                         return result.map(|outcome| (outcome, class_state));
                     };
+                    if let Some(resume) = generator_resume
+                        && let Ok(DispatchOutcome::SubReturn { result: item }) = &result
+                    {
+                        // Bind through `_send_ex` at dest-write timing and
+                        // skip CALL replay so the first-entry GETFIELD
+                        // preamble stays (`MetaInterp._interpret`).
+                        let Some(item) = *item else {
+                            self.exchange.completed.clear();
+                            while !self.frames.is_empty() {
+                                let _ = self.pop_frame();
+                            }
+                            return Err(DispatchError::callee_inline_unsupported(caller_pc));
+                        };
+                        match bind_nested_generator_resume_at_parent(
+                            parent, trace_ctx, item, resume, frame_pin, caller_pc,
+                        ) {
+                            Ok(next_pc) => {
+                                parent.fbw_mode.class_of_last_exc_is_const = class_state;
+                                parent.pc = next_pc;
+                                continue;
+                            }
+                            Err(error) => {
+                                self.exchange.completed.clear();
+                                while !self.frames.is_empty() {
+                                    let _ = self.pop_frame();
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
                     if let Ok(DispatchOutcome::SubReturn { result: ret }) = &result {
                         // `inline_call_*` dest-write is `finishframe` /
-                        // `make_result_of_lastop`. Generator resume is a
-                        // residual `jit_next` whose dest is the FOR_ITER
-                        // item; replay would cut the GETFIELD preamble the
-                        // child walk already named (`perform_call`).
-                        let dst =
-                            inline_call_subreturn_dst(parent.body.code, caller_pc).or_else(|| {
-                                portal_resume
-                                    .then(|| call_opcode_result_dst(parent.body.code, caller_pc))
-                                    .flatten()
-                            });
+                        // `make_result_of_lastop`.
+                        let dst = inline_call_subreturn_dst(parent.body.code, caller_pc);
                         if let Some((dst_bank, dst, next_pc)) = dst {
                             parent.fbw_mode.class_of_last_exc_is_const = class_state;
                             parent.pending_subreturn = Some(PendingSubReturn {
@@ -22632,11 +22918,20 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             .all(|entry| entry.caller_pc == caller_pc),
                         "a replay log spans two CALL steps"
                     );
+                    let iter_checkpoint = parent.iter_checkpoint_at_call.take();
+                    let send_ex_caller_parent = parent
+                        .send_ex_caller
+                        .take()
+                        .map(|parked| parked.caller_parent);
                     parent.replay_log.push(CompletedSubWalk {
                         parent_id: parent.id,
                         caller_pc,
                         result,
                         class_of_last_exc_is_const: class_state,
+                        generator_resume,
+                        frame_pin,
+                        iter_checkpoint,
+                        send_ex_caller_parent,
                     });
                 }
             }
@@ -22685,6 +22980,8 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         // A replay of the CALL step starts consuming its log from the first
         // entry; any other step means that CALL finished and its log is spent.
         exchange.completed_cursor = 0;
+        exchange.step_iter_checkpoint = None;
+        exchange.step_send_ex_caller = None;
         if exchange
             .completed
             .first()
@@ -23336,12 +23633,52 @@ pub(crate) fn keep_residual_recordings_across_suspend<Sym: WalkSym>() {
     });
 }
 
+/// Park the list/range cursor sampled before the nested helper runs.
+pub(crate) fn set_call_entry_iter_checkpoint<Sym: WalkSym>(checkpoint: CallEntryIterCheckpoint) {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        exchange.step_iter_checkpoint = Some(checkpoint);
+    });
+}
+
+/// Park the FOR_ITER caller captured before a nested generator body.
+fn park_send_ex_caller<Sym: WalkSym>(parked: ParkedSendExCaller) {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        if exchange.step_send_ex_caller.is_none() {
+            exchange.step_send_ex_caller = Some(parked);
+        }
+    });
+}
+
 /// Consume the completed nested helper for `pc`, if this residual opcode is
 /// replaying it. Mirrors the completed-result arm of `run_sub_jitcode_walk_from`.
 pub(crate) fn take_completed_nested_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Option<Result<DispatchOutcome, DispatchError>> {
+    take_completed_nested_subwalk_ex(ctx, pc).map(|(result, _)| result)
+}
+
+/// Same as [`take_completed_nested_subwalk`], carrying the pre-call iterator
+/// checkpoint parked with that helper.
+pub(crate) fn take_completed_nested_subwalk_ex<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Option<(
+    Result<DispatchOutcome, DispatchError>,
+    Option<CallEntryIterCheckpoint>,
+)> {
     SUBWALK_DRIVER.with(|slot| {
         let pointer = slot.get();
         if pointer.is_null() {
@@ -23349,17 +23686,56 @@ pub(crate) fn take_completed_nested_subwalk<Sym: WalkSym>(
         }
         // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
         let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
-        let completed = exchange.completed.get(exchange.completed_cursor)?;
+        let completed = exchange.completed.get_mut(exchange.completed_cursor)?;
         if completed.parent_id != exchange.active_frame_id || completed.caller_pc != pc {
             return None;
         }
         let class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
         let result = completed.result.clone();
+        let iter_checkpoint = completed.iter_checkpoint.take();
         exchange.completed_cursor += 1;
         if result.is_ok() {
             ctx.fbw_mode.class_of_last_exc_is_const = class_of_last_exc_is_const;
         }
-        Some(result)
+        Some((result, iter_checkpoint))
+    })
+}
+
+/// Consume a parked generator-resume `SubReturn` for `pc`.
+///
+/// CALL_ASSEMBLER results stay for [`run_sub_jitcode_walk_from`]. A
+/// non-generator `SubReturn` stays on the `inline_call_*` dest-write path.
+fn take_completed_generator_resume_subreturn<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Option<ParkedGeneratorResumeSubReturn> {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: same scoped driver pointer as `take_completed_nested_subwalk`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        let completed = exchange.completed.get_mut(exchange.completed_cursor)?;
+        if completed.parent_id != exchange.active_frame_id || completed.caller_pc != pc {
+            return None;
+        }
+        let generator_resume = completed.generator_resume?;
+        let Ok(DispatchOutcome::SubReturn { result: item }) = &completed.result else {
+            return None;
+        };
+        let item = *item;
+        let frame_pin = completed.frame_pin.take();
+        let send_ex_caller_parent = completed.send_ex_caller_parent.take();
+        let class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
+        exchange.completed_cursor += 1;
+        ctx.fbw_mode.class_of_last_exc_is_const = class_of_last_exc_is_const;
+        Some(ParkedGeneratorResumeSubReturn {
+            item,
+            generator_resume,
+            frame_pin,
+            caller_parent: send_ex_caller_parent,
+        })
     })
 }
 
@@ -23420,6 +23796,8 @@ mod subwalk_checkpoint_tests {
             ancestor_frames: std::ptr::null(),
             ancestor_len: 0,
             active_caller_pc: 0,
+            step_iter_checkpoint: None,
+            step_send_ex_caller: None,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -23469,6 +23847,10 @@ mod subwalk_checkpoint_tests {
             caller_pc,
             result: Err(DispatchError::UndecodableOpcode { pc: leaf_pc }),
             class_of_last_exc_is_const: false,
+            generator_resume: None,
+            frame_pin: None,
+            iter_checkpoint: None,
+            send_ex_caller_parent: None,
         };
         let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
             pending: None,
@@ -23485,6 +23867,8 @@ mod subwalk_checkpoint_tests {
             ancestor_frames: std::ptr::null(),
             ancestor_len: 0,
             active_caller_pc: 0,
+            step_iter_checkpoint: None,
+            step_send_ex_caller: None,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -23537,6 +23921,8 @@ mod subwalk_checkpoint_tests {
             ancestor_frames: std::ptr::null(),
             ancestor_len: 0,
             active_caller_pc: 0,
+            step_iter_checkpoint: None,
+            step_send_ex_caller: None,
         };
         let expected = &mut exchange as *mut SubWalkExchange<'_, crate::state::PyreSym> as *mut ();
         let _driver = SubWalkDriverGuard::install(&mut exchange);
@@ -24184,6 +24570,8 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         suspend_trace_position: None,
         effects_at_call: None,
         heap_writing_at_call: None,
+        iter_checkpoint_at_call: None,
+        send_ex_caller: None,
     };
 
     if !driver_pointer.is_null() {

@@ -48,8 +48,13 @@ env = Env(DATA)
 
 def drive(rounds):
     n = 0
+    expected = {
+        key: value for key, value in DATA.items() if not key.startswith("PYTHON")
+    }
     for _ in range(rounds):
         got = {key: value for key, value in env.items() if not key.startswith("PYTHON")}
+        if got != expected:
+            raise SystemExit("dict %s != %s" % (got, expected))
         n += len(got)
     return n
 

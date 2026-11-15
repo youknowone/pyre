@@ -711,7 +711,10 @@ fn durable_resume_frame<Sym: WalkSym>(
     // `cpu.bh_setarrayitem_gc_r` / `write_box_at` on the forwarded GCREF.
     if let Some(resume) = ctx.fbw_mode.generator_resume {
         let live = live_generator_resume_frame(resume);
-        if live != 0 && generator_resume_frame_copy(frame, live, resume) {
+        // Identity is the live root (`live_generator_resume_frame`), not
+        // pycode contents. A caller holding a pre-move copy must re-read
+        // that root (`gc_restore_root` / `_nonstandard_virtualizable`).
+        if live != 0 && frame == live {
             return Some(live);
         }
     }
@@ -739,32 +742,6 @@ fn live_generator_resume_frame(resume: super::GeneratorResumeSubwalk) -> usize {
     }
 }
 
-/// A heap pointer that is the live generator or a pre-move copy of it.
-///
-/// `new_with_vtable` can minor-collect more than once; an opref concrete
-/// or `InlineConcreteFrameGuard` may still name an intermediate copy.
-/// `cpu.bh_setarrayitem_gc_r` writes the forwarded GCREF.
-fn generator_resume_frame_copy(
-    frame: usize,
-    live: usize,
-    resume: super::GeneratorResumeSubwalk,
-) -> bool {
-    if frame == 0 || live == 0 {
-        return false;
-    }
-    if frame == live || frame == resume.frame {
-        return true;
-    }
-    let obj = frame as pyre_object::PyObjectRef;
-    unsafe {
-        if obj.is_null() || !pyre_object::py_type_check(obj, &pyre_interpreter::pyframe::FRAME_TYPE)
-        {
-            return false;
-        }
-        (*(frame as *const pyre_interpreter::PyFrame)).pycode as usize == resume.w_pycode
-    }
-}
-
 /// Own-frame extra-store target after forwarding a durable generator/portal.
 fn arm_durable_store_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, frame: usize) -> usize {
     if let Some(live) = durable_resume_frame(ctx, frame) {
@@ -773,6 +750,21 @@ fn arm_durable_store_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, frame: 
     } else {
         frame
     }
+}
+
+/// Re-read this walk's generator frame from the GC root. A callee-shadow
+/// copy taken before a collecting call is not identity.
+fn re_read_own_durable_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    fallback: usize,
+) -> usize {
+    if let Some(resume) = ctx.fbw_mode.generator_resume {
+        let live = live_generator_resume_frame(resume);
+        if live != 0 {
+            return live;
+        }
+    }
+    fallback
 }
 
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its
@@ -1019,6 +1011,34 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 ///
 /// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
 /// mirroring `setfield_gc_via_heapcache`'s parameter shape.
+/// `_nonstandard_virtualizable`: `box is self.metainterp.virtualizable_boxes[-1]`.
+/// After `jit_merge_point` the operand is a loop-input red, a different
+/// OpRef than `resume.frame_box`; `standard_virtualizable_box` is that red.
+fn vable_is_this_walk_generator_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+    resume: super::GeneratorResumeSubwalk,
+    live: usize,
+) -> bool {
+    if vable.is_none() {
+        return false;
+    }
+    if vable == resume.frame_box || ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        return true;
+    }
+    if current_inline_vable_target(ctx, vable).is_some() {
+        return true;
+    }
+    match ctx
+        .trace_ctx
+        .lookup_opref_concrete(vable)
+        .or_else(|| ctx.trace_ctx.recover_ref_value(vable, 8))
+    {
+        Some(Value::Ref(value)) if value.as_usize() == live => true,
+        _ => false,
+    }
+}
+
 fn current_inline_vable_target<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
@@ -1057,14 +1077,10 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
 ) -> Option<usize> {
     if let Some(resume) = ctx.fbw_mode.generator_resume {
         let live = live_generator_resume_frame(resume);
-        if live != 0 {
-            // This walk's virtualizable is the generator frame
-            // (`walk_generator_resume` / `_opimpl_setarrayitem_vable`).
-            // After `jit_merge_point` the operand is a loop-input red
-            // (`do_recursive_call` reds), a different OpRef than
-            // `resume.frame_box` and often without a concrete.
-            // Nested helpers clear `generator_resume` so their stores
-            // do not take this arm.
+        // `_nonstandard_virtualizable` (`pyjitpl.py`): only this walk's
+        // standard virtualizable box (`virtualizable_boxes[-1]`) is the
+        // generator frame. Any other box is a heap store on that object.
+        if live != 0 && vable_is_this_walk_generator_frame(ctx, vable, resume, live) {
             return Some(live);
         }
     }
@@ -1129,7 +1145,8 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
                 .and_then(|info| info.static_field_by_descr(&descr)),
             ctx.frame_state.borrow().callee_shadow.as_ref(),
         ) {
-            let frame = arm_durable_store_frame(ctx, shadow.concrete_frame);
+            let frame =
+                arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, shadow.concrete_frame));
             crate::state::store_live_frame_static_int(frame, field_index, value);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
@@ -1240,7 +1257,8 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
                 .and_then(|info| info.static_field_by_descr(&descr)),
             ctx.frame_state.borrow().callee_shadow.as_ref(),
         ) {
-            let frame = arm_durable_store_frame(ctx, shadow.concrete_frame);
+            let frame =
+                arm_durable_store_frame(ctx, re_read_own_durable_frame(ctx, shadow.concrete_frame));
             crate::state::store_live_frame_static_int(frame, field_index, imm);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;

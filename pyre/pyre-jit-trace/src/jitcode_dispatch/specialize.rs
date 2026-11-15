@@ -10728,10 +10728,31 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         iter_op,
         majit_ir::Value::Ref(majit_ir::GcRef(iter_obj as usize)),
     );
-    let parked_result = take_completed_nested_subwalk(ctx, op_pc);
+    let parked_result = take_completed_nested_subwalk_ex(ctx, op_pc);
     let helper_already_ran = parked_result.is_some();
+    let (index_before, seq_before, journal_mark) = match parked_result
+        .as_ref()
+        .and_then(|(_, checkpoint)| checkpoint.as_ref())
+    {
+        Some(checkpoint) => match checkpoint.kind {
+            CallEntryIterKind::List { index_before } => (
+                index_before,
+                checkpoint.seq_before(),
+                checkpoint.journal_mark,
+            ),
+            _ => (index_before, seq_before, journal_mark),
+        },
+        None => (index_before, seq_before, journal_mark),
+    };
+    if !helper_already_ran {
+        set_call_entry_iter_checkpoint::<Sym>(CallEntryIterCheckpoint::list(
+            index_before,
+            seq_before,
+            journal_mark,
+        ));
+    }
     let walk = match parked_result {
-        Some(done) => done.map(|outcome| (outcome, pre_fold_pos)),
+        Some((done, _)) => done.map(|outcome| (outcome, pre_fold_pos)),
         None => run_orthodox_helper_subwalk(
             ctx,
             op_pc,
@@ -19971,9 +19992,9 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let (concrete_current, concrete_remaining, _concrete_step) =
+    let (mut concrete_current, mut concrete_remaining, _concrete_step) =
         unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
-    let concrete_continues = concrete_remaining != 0;
+    let mut concrete_continues = concrete_remaining != 0;
 
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
@@ -19985,16 +20006,31 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let journal_mark = fbw_effect_journal_mark();
+    let mut journal_mark = fbw_effect_journal_mark();
     ctx.trace_ctx
         .set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(iter_obj as usize)));
     // Residual CALL replay consumes the parked helper
     // (`take_completed_nested_subwalk` / `finishframe` /
     // `make_result_of_lastop`) before a second `newframe`.
-    let parked_result = take_completed_nested_subwalk(ctx, op_pc);
+    let parked_result = take_completed_nested_subwalk_ex(ctx, op_pc);
     let helper_already_ran = parked_result.is_some();
+    if let Some((_, Some(checkpoint))) = parked_result.as_ref()
+        && let CallEntryIterKind::Range { current, remaining } = checkpoint.kind
+    {
+        concrete_current = current;
+        concrete_remaining = remaining;
+        concrete_continues = remaining != 0;
+        journal_mark = checkpoint.journal_mark;
+    }
+    if !helper_already_ran {
+        set_call_entry_iter_checkpoint::<Sym>(CallEntryIterCheckpoint::range(
+            concrete_current,
+            concrete_remaining,
+            journal_mark,
+        ));
+    }
     let walk = match parked_result {
-        Some(done) => done.map(|outcome| (outcome, pre_fold_pos)),
+        Some((done, _)) => done.map(|outcome| (outcome, pre_fold_pos)),
         None => {
             let sym = unsafe { &*sym_ptr };
             let Ok(nested_entry) =
