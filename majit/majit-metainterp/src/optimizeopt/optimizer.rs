@@ -2367,7 +2367,10 @@ impl Optimizer {
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF => {
                 // Check arg(0) is not null constant.
-                if let Some(0) = ctx.get_constant_int_box(&op.arg(0).get_box_replacement(false)) {
+                if let Some(0) = op
+                    .arg_ref(0)
+                    .with_box_replacement(|t| ctx.get_constant_int_box(t))
+                {
                     return false; // would deref null
                 }
                 true
@@ -4817,7 +4820,7 @@ impl Optimizer {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             let b_old = Operand::from_bound_op(op_rc);
-            let b_new = current_op.arg(0).get_box_replacement(false);
+            let b_new = current_op.arg_ref(0).get_box_replacement(false);
             ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }
@@ -5176,7 +5179,7 @@ impl Optimizer {
         // `_forwarded` info, so emitted ops and get_producing_op consumers can
         // read info off op.arg(i).
         for i in 0..op.num_args() {
-            let arg = self.force_box(&op.arg(i), ctx);
+            let arg = self.force_box(op.arg_ref(i), ctx);
             op.setarg(i, arg);
         }
         // force_box may force a virtual whose materialization defers an
@@ -5850,7 +5853,7 @@ impl Optimizer {
             return None;
         }
         // optimizer.py `_maybe_replace_guard_value`: constvalue = op.getarg(1).getint()
-        let constvalue = op.arg(1).get_box_replacement(false).const_int()?;
+        let constvalue = op.arg_ref(1).with_box_replacement(|t| t.const_int())?;
         // optimizer.py `_maybe_replace_guard_value`: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,

@@ -6934,7 +6934,8 @@ impl OptContext {
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
             argboxes.push(
-                self.get_constant_box(&op.arg(i).get_box_replacement(false))
+                op.arg_ref(i)
+                    .with_box_replacement(|t| self.get_constant_box(t))
                     .expect("constant_fold: arg must be Const (pure.rs:993-1006 pre-check)"),
             );
         }
@@ -6998,8 +6999,9 @@ impl OptContext {
         let descr = op.getdescr();
         if opnum.is_getfield() {
             // optimizer.py pure-getfield branch.
-            let gcref = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+            let gcref = match op
+                .arg_ref(0)
+                .with_box_replacement(|t| self.get_constant_box(t))
                 .expect("protect_speculative_operation: arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -7033,8 +7035,9 @@ impl OptContext {
                 | OpCode::ArraylenGc
         ) {
             // optimizer.py:834-841 array branch.
-            let array = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+            let array = match op
+                .arg_ref(0)
+                .with_box_replacement(|t| self.get_constant_box(t))
                 .expect("protect_speculative_operation: array arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -7059,8 +7062,9 @@ impl OptContext {
                 .expect("bh_arraylen_gc must succeed after protect_speculative_array")
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
-            let string = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+            let string = match op
+                .arg_ref(0)
+                .with_box_replacement(|t| self.get_constant_box(t))
                 .expect("protect_speculative_operation: string arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -7078,8 +7082,9 @@ impl OptContext {
                 .expect("bh_strlen must succeed after protect_speculative_string")
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
-            let unicode = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+            let unicode = match op
+                .arg_ref(0)
+                .with_box_replacement(|t| self.get_constant_box(t))
                 .expect("protect_speculative_operation: unicode arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -7106,8 +7111,9 @@ impl OptContext {
         // optimizer.py:860-862 shared bounds check:
         //   index = self.get_constant_box(op.getarg(1)).getint()
         //   if not (0 <= index < arraylength): raise SpeculativeError
-        let index = match self
-            .get_constant_box(&op.arg(1).get_box_replacement(false))
+        let index = match op
+            .arg_ref(1)
+            .with_box_replacement(|t| self.get_constant_box(t))
             .expect("protect_speculative_operation: arg1 must be Const")
         {
             Value::Int(i) => i,
@@ -8469,7 +8475,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0_box = op.arg(0).get_box_replacement(false);
+        let arg0_box = op.arg_ref(0).get_box_replacement(false);
         let arg0 = arg0_box.to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
