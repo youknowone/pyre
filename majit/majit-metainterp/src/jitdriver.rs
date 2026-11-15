@@ -2384,6 +2384,26 @@ fn map_runner_resume(resume: Option<usize>) -> FunctionEntryRunner {
     }
 }
 
+/// Greens a door already holding `live` should compare.
+///
+/// `GreenRefPin::reload` rewrites Ref slots in `live.values`; those bits
+/// are the `*greenargs` `warmstate.py maybe_compile_and_run` walks with
+/// `JitCell.comparekey`. Types come from the caller (`G::TYPES`) when
+/// supplied, else `live.types`.
+#[inline(always)]
+fn live_or_passed_greenargs<'a>(
+    live: Option<&'a majit_ir::GreenKey>,
+    greenargs: Option<(&'a [i64], &'a [GreenType])>,
+) -> Option<(&'a [i64], &'a [GreenType])> {
+    match live {
+        Some(live) => Some((
+            live.values.as_slice(),
+            greenargs.map_or(live.types.as_slice(), |(_, types)| types),
+        )),
+        None => greenargs,
+    }
+}
+
 fn door_ref_pin<St: JitState>(
     _state: &St,
     values: &[i64],
@@ -6060,11 +6080,9 @@ impl<S: JitState> JitDriver<S> {
         let pin = door_ref_pin(state, green_values, G::TYPES, caller_pin_save);
         let mut live = majit_ir::GreenKey::from_greenargs(green_values, G::TYPES);
         pin.reload(&mut live);
-        let values = live.values.clone();
-        let types = live.types.clone();
         self.back_edge_greenargs(
             green_key_hash,
-            Some((values.as_slice(), types.as_slice())),
+            Some((green_values, G::TYPES)),
             Some((&pin, &mut live)),
             target_pc,
             state,
@@ -6322,12 +6340,10 @@ impl<S: JitState> JitDriver<S> {
         let mut live = pin.live_clone(&green_key);
         let hash = live.get_uhash();
         pin.reload(&mut live);
-        let values = live.values.clone();
-        let types = live.types.clone();
         Ok(self
             .back_edge_greenargs(
                 hash,
-                Some((values.as_slice(), types.as_slice())),
+                Some((green_key.values.as_slice(), green_key.types.as_slice())),
                 Some((&pin, &mut live)),
                 target_pc,
                 state,
@@ -7021,7 +7037,10 @@ impl<S: JitState> JitDriver<S> {
         // does not occupy this door. Entry is the cell's procedure token.
         let jd_no = self.index().unwrap_or(0);
         let door = match self.meta.warm_state_ref_for_driver(jd_no) {
-            Some(warm) => warm.door_cell(green_key_hash, greenargs),
+            Some(warm) => warm.door_cell(
+                green_key_hash,
+                live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs),
+            ),
             None => DoorCell::Empty,
         };
         match door {
@@ -7124,7 +7143,10 @@ impl<S: JitState> JitDriver<S> {
         let carried_token = carried_procedure_token.is_some();
         let green_key = match &carried_procedure_token {
             Some(_) => green_key_hash,
-            None => self.resolved_entry_cell_key(green_key_hash, greenargs),
+            None => self.resolved_entry_cell_key(
+                green_key_hash,
+                live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs),
+            ),
         };
         // `warmstate.py maybe_compile_and_run`: `if cell.flags & JC_TRACING:
         // return`. Skip only THIS cell's `JC_TRACING`. A parked outer attempt
@@ -7220,7 +7242,9 @@ impl<S: JitState> JitDriver<S> {
                 let _direct_confirm_roots = direct_live_values
                     .as_mut()
                     .map(|values| crate::warmstate::root_confirm_ref_values(values));
-                let confirm_types = self.confirm_enter_jit_green_types(greenargs);
+                let confirm_args =
+                    live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs);
+                let confirm_types = self.confirm_enter_jit_green_types(confirm_args);
                 let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
                 if !self
                     .meta
@@ -7228,7 +7252,7 @@ impl<S: JitState> JitDriver<S> {
                     .is_some_and(|warm| {
                         warm.confirm_compiled_entry_for_cell_key(
                             green_key,
-                            greenargs.map(|(v, _)| v),
+                            confirm_args.map(|(v, _)| v),
                             &confirm_types,
                             &confirm_reds,
                         )
