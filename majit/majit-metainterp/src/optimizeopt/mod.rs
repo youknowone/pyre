@@ -5147,15 +5147,15 @@ impl OptContext {
             );
             return arg.clone();
         }
-        let resolved = arg.get_box_replacement(false);
         // `resoperation.py AbstractValue.get_box_replacement` is the walk
         // alone. A self-resolved recorder InputArg of the peeled body still
         // takes the preamble-constant rejoin: `import_state` forwards the
         // phase 2 host, not the box the body operations hold.
-        if resolved.same_box(arg) {
-            self.imported_inputarg_operand(arg).unwrap_or(resolved)
+        if arg.with_box_replacement(|resolved| resolved.same_box(arg)) {
+            self.imported_inputarg_operand(arg)
+                .unwrap_or_else(|| arg.clone())
         } else {
-            resolved
+            arg.get_box_replacement(false)
         }
     }
 
@@ -5320,9 +5320,7 @@ impl OptContext {
         if self.new_operations_drained {
             return None;
         }
-        op.get_box_replacement(false)
-            .ptr_info()
-            .and_then(|p| p.get_last_guard_pos())
+        op.with_box_replacement(|b| b.ptr_info().and_then(|p| p.get_last_guard_pos()))
     }
 
     /// `info.py getptrinfo(op) is not None` parity — true when
@@ -5352,9 +5350,10 @@ impl OptContext {
     /// Returns true when the chain-terminal carries `PtrInfo::Virtualizable`.
     pub fn is_virtualizable(&self, op: &Operand) -> bool {
         use crate::optimizeopt::info::PtrInfo;
-        op.get_box_replacement(false)
-            .ptr_info()
-            .is_some_and(|p| matches!(*p, PtrInfo::Virtualizable(_)))
+        op.with_box_replacement(|b| {
+            b.ptr_info()
+                .is_some_and(|p| matches!(*p, PtrInfo::Virtualizable(_)))
+        })
     }
 
     /// resoperation.py: op.get_forwarded() is not None — check if OpRef

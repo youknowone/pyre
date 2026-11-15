@@ -8204,17 +8204,19 @@ impl<S: JitState> JitDriver<S> {
             // `ResumeDataDirectReader(metainterp_sd, ...)` and
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
-            // in place. The decode borrows that table; it does not
-            // take a copy. `borrow_mut` only for `setup_jitdrivers_sd` and the
-            // `blackhole_from_resumedata` acquire loop; drop it
-            // before `resume_mainloop` so a nested resume can acquire
-            // from this same builder (`blackhole.py`
+            // in place. Snapshot the published `Arc<[u8]>` once and
+            // borrow `&[u8]` from it; the lock is not held across
+            // `blackhole_from_resumedata`. `borrow_mut` only for
+            // `setup_jitdrivers_sd` and the `blackhole_from_resumedata`
+            // acquire loop; drop it before `resume_mainloop` so a nested
+            // resume can acquire from this same builder (`blackhole.py`
             // `BlackholeInterpBuilder.acquire_interp`).
             if self.state_field_layout.total_live_values() == 0 {
                 self.state_field_layout = state.state_field_layout();
             }
             let cpu = self.meta.blackhole_cpu();
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta.staticdata);
+            let all_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
             let (mut bh, vable_ptr) = {
                 let mut bh_builder = self.meta.staticdata.blackholeinterpbuilder.borrow_mut();
                 bh_builder.debug_assert_cpu(cpu);
@@ -8230,12 +8232,11 @@ impl<S: JitState> JitDriver<S> {
                 if bh_builder.state_field_layout != self.state_field_layout {
                     bh_builder.state_field_layout = self.state_field_layout.clone();
                 }
-                let all_liveness = self.meta.staticdata.liveness_info.read();
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     jitcodes,
                     rd_consts_slice,
-                    &all_liveness,
+                    all_liveness.as_ref(),
                     fail_args,
                     rd_virtuals_slice,
                     Some(rd_pendingfields), // rd_guard_pendingfields
@@ -8429,7 +8430,6 @@ impl<S: JitState> JitDriver<S> {
                                 let jc = std::sync::Arc::clone(
                                     &self.meta.jitcodes()[terminal.jitcode_index],
                                 );
-                                let all_liveness = self.meta.staticdata.liveness_info.read();
                                 writeback_live_state_scalars_from_blackhole(
                                     state,
                                     &layout,
@@ -8439,7 +8439,7 @@ impl<S: JitState> JitDriver<S> {
                                     &terminal.registers_i,
                                     &terminal.registers_r,
                                     &terminal.registers_f,
-                                    &all_liveness,
+                                    all_liveness.as_ref(),
                                 );
                             }
                         }
