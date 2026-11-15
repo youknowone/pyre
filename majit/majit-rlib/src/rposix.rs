@@ -919,6 +919,10 @@ pub fn getegid() -> u64 {
     widen_gid(unsafe { c_getegid() })
 }
 
+// `rposix.DIRP` is `rffi.COpaquePtr('DIR')`.
+#[cfg(unix)]
+crate::rffi::copaque_ptr!(pub DIRP = "DIR");
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     #[cfg_attr(
@@ -931,7 +935,7 @@ crate::rffi::llexternal!(
     )]
     pub c_opendir = "opendir",
     [*const libc::c_char],
-    *mut libc::DIR,
+    DIRP,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
@@ -939,7 +943,7 @@ crate::rffi::llexternal!(
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_readdir = "readdir",
-    [*mut libc::DIR],
+    [DIRP],
     *mut DIRENT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO,
@@ -953,7 +957,7 @@ crate::rffi::llexternal!(
         link_name = "closedir$UNIX2003"
     )]
     pub c_closedir = "closedir",
-    [*mut libc::DIR],
+    [DIRP],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     releasegil = false
@@ -1841,7 +1845,7 @@ crate::rffi::llexternal!(
     )]
     pub c_fdopendir = "fdopendir",
     [crate::rffi::INT],
-    *mut libc::DIR,
+    DIRP,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
@@ -1857,7 +1861,7 @@ crate::rffi::llexternal!(
         link_name = "rewinddir$INODE64$UNIX2003"
     )]
     pub c_rewinddir = "rewinddir",
-    [*mut libc::DIR],
+    [DIRP],
     (),
     compilation_info = POSIX_ECI,
     releasegil = false
@@ -1866,7 +1870,7 @@ crate::rffi::llexternal!(
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dirfd = "dirfd",
-    [*mut libc::DIR],
+    [DIRP],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     releasegil = false,
@@ -1877,7 +1881,7 @@ crate::rffi::llexternal!(
 /// (`rposix.fdlistdir`).
 #[cfg(unix)]
 pub fn _listdir(
-    dirp: *mut libc::DIR,
+    dirp: DIRP,
     rewind: bool,
 ) -> Result<Result<Vec<Vec<u8>>, i32>, crate::rffi::MemoryError> {
     let mut result = Vec::new();

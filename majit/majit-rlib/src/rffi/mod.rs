@@ -11,8 +11,8 @@ pub use majit_jitcode::rffi::{
     RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
 };
 pub use majit_macros::{
-    call_aroundstate_target, cextern_variable, external_compilation_info, jit_close_stack,
-    llexternal,
+    call_aroundstate_target, cextern_variable, copaque_ptr, external_compilation_info,
+    jit_close_stack, llexternal,
 };
 
 /// `rffi.CHAR` (`lltype.Char`, 0..=255; `size_and_sign` reports it unsigned).
@@ -71,6 +71,7 @@ pub type CWCHARPP = *mut CWCHARP;
 mod buffer;
 mod callback;
 mod convert;
+mod opaque;
 
 pub use crate::getintfield;
 pub use crate::offsetof;
@@ -78,6 +79,7 @@ pub use crate::setintfield;
 pub use buffer::*;
 pub use callback::*;
 pub use convert::*;
+pub use opaque::*;
 
 use std::sync::OnceLock;
 

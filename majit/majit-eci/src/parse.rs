@@ -1,5 +1,5 @@
 //! `external_compilation_info!` input grammar and the `llexternal!` /
-//! `cextern_variable!` heads `compile_crate_ecis` reads.
+//! `cextern_variable!` / `copaque_ptr!` heads `compile_crate_ecis` reads.
 
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -235,6 +235,83 @@ impl Parse for CExternVariableHead {
             c_type,
             getter_only,
             declare_as_extern,
+        })
+    }
+}
+
+/// The `copaque_ptr!` tokens `compile_crate_ecis` and the proc macro share:
+/// outer attributes, visibility, name, c_name, then `key = expr` pairs
+/// (`rffi.COpaquePtr`). `typedef` / `c_pointer_typedef` is rejected.
+pub struct COpaquePtrHead {
+    pub attrs: Vec<Attribute>,
+    pub vis: Visibility,
+    pub name: Ident,
+    pub c_name: String,
+    pub compilation_info: Option<Expr>,
+}
+
+impl COpaquePtrHead {
+    /// `c_name` with every non-`[A-Za-z0-9_]` byte replaced by `_`.
+    pub fn size_key(&self) -> String {
+        copaque_size_key(&self.c_name)
+    }
+}
+
+/// `hints['c_name']` turned into the `$OUT_DIR/majit_copaque/<key>.rs` stem.
+pub fn copaque_size_key(c_name: &str) -> String {
+    c_name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                char::from(b)
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+impl Parse for COpaquePtrHead {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        let vis: Visibility = input.parse()?;
+        let name: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let c_name: LitStr = input.parse()?;
+
+        let mut compilation_info = None;
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key = Ident::parse_any(input)?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "compilation_info" => compilation_info = Some(input.parse()?),
+                "typedef" => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "copaque_ptr does not support `typedef`",
+                    ));
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown copaque_ptr kwarg `{other}`"),
+                    ));
+                }
+            }
+        }
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after copaque_ptr arguments"));
+        }
+        Ok(COpaquePtrHead {
+            attrs,
+            vis,
+            name,
+            c_name: c_name.value(),
+            compilation_info,
         })
     }
 }

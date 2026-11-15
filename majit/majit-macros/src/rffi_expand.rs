@@ -1,4 +1,5 @@
-//! Expansion of `llexternal`, `cextern_variable`, and `external_compilation_info`.
+//! Expansion of `llexternal`, `cextern_variable`, `copaque_ptr`, and
+//! `external_compilation_info`.
 //!
 //! `llexternal` (`rffi.py`) builds the funcptr, then `call_external_function`,
 //! then the forwarding wrapper. The derivations below follow that function's
@@ -18,6 +19,37 @@ use syn::{
 pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
     let parsed: LlexternalInput = syn::parse2(input)?;
     Ok(parsed.expand())
+}
+
+pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::COpaquePtrHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let vis = &head.vis;
+    let name = &head.name;
+    let to_name = format_ident!("{}_TO", name);
+    let c_name = &head.c_name;
+    let doc = format!("c_name: {c_name}");
+    let include_rel = format!("/majit_copaque/{}.rs", head.size_key());
+    Ok(quote! {
+        #(#attrs)*
+        #[doc = #doc]
+        #[repr(C)]
+        #[allow(non_camel_case_types)]
+        #vis struct #to_name {
+            _opaque: [u8; 0],
+        }
+        #(#attrs)*
+        impl ::majit_rlib::rffi::COpaque for #to_name {
+            const C_NAME: &'static str = #c_name;
+            const GETSIZE: usize = include!(concat!(env!("OUT_DIR"), #include_rel));
+        }
+        #(#attrs)*
+        #[allow(non_camel_case_types)]
+        #vis type #name = *mut #to_name;
+        #(#attrs)*
+        #[cfg(not(majit_eci_build))]
+        compile_error!("`copaque_ptr!` needs `majit_eci::build::compile_crate_ecis` in this crate's build.rs");
+    })
 }
 
 pub fn expand_cextern_variable(input: TokenStream) -> syn::Result<TokenStream> {

@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token, Type, UseTree};
 
 use crate::ExternalCompilationInfo;
-use crate::parse::{CExternVariableHead, EciInput, LlexternalHead};
+use crate::parse::{CExternVariableHead, COpaquePtrHead, EciInput, LlexternalHead};
 
 /// `rffi.py` `TYPES` on POSIX, minus the machine-word names `cdecl` spells
 /// without asking (`size_t`, `ssize_t`, `intptr_t`, `uintptr_t`).
@@ -238,6 +238,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected, extra);
     merge_cextern_variables(&mut collected);
+    write_copaque_sizes(&collected, extra);
 
     for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
@@ -274,6 +275,12 @@ struct CollectedCExternVariable {
     head: CExternVariableHead,
 }
 
+struct CollectedCOpaquePtr {
+    file_path: PathBuf,
+    module_path: Vec<String>,
+    head: COpaquePtrHead,
+}
+
 struct CollectedUse {
     module_path: Vec<String>,
     binding: Option<String>,
@@ -304,6 +311,7 @@ struct CrateItems {
     aliases: Vec<CollectedAlias>,
     llexternals: Vec<CollectedLlexternal>,
     cextern_variables: Vec<CollectedCExternVariable>,
+    copaque_ptrs: Vec<CollectedCOpaquePtr>,
     uses: Vec<CollectedUse>,
     modules: Vec<Vec<String>>,
     structs: Vec<CollectedStruct>,
@@ -431,6 +439,107 @@ fn merge_cextern_variables(collected: &mut CrateItems) {
         );
         collected.ecis[eci_idx].eci = collected.ecis[eci_idx].eci.merge(&[&generated]);
     }
+}
+
+/// `rffi.COpaque` `hints['getsize']`: `rffi_platform.sizeof` into
+/// `$OUT_DIR/majit_copaque/<key>.rs`. A failed `sizeof` writes a panicking
+/// const; rustc evaluates that associated const only where it is read.
+fn write_copaque_sizes(collected: &CrateItems, extra: &ExternalCompilationInfo) {
+    if collected.copaque_ptrs.is_empty() {
+        return;
+    }
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let dir = out_dir.join("majit_copaque");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        panic!("{}: {err}", dir.display());
+    }
+    let mut written: Vec<(String, Option<u64>)> = Vec::new();
+    for item in &collected.copaque_ptrs {
+        let eci = match &item.head.compilation_info {
+            Some(expr) => {
+                let idx = compilation_info_eci_idx(
+                    collected,
+                    &item.file_path,
+                    "copaque_ptr",
+                    &item.head.name.to_string(),
+                    &item.module_path,
+                    expr,
+                );
+                collected.ecis[idx].eci.merge(&[extra])
+            }
+            None => ExternalCompilationInfo::default().merge(&[extra]),
+        };
+        let key = item.head.size_key();
+        let (size, body) = match crate::rffi_platform::sizeof(&item.head.c_name, eci) {
+            Ok(size) => (Some(size), format!("{size}\n")),
+            Err(err) => {
+                let msg = format!(
+                    "rffi_platform.sizeof(\"{}\") failed: {}",
+                    item.head.c_name,
+                    short_sizeof_error(&err)
+                );
+                (
+                    None,
+                    format!("::core::panic!({})\n", rust_string_literal(&msg)),
+                )
+            }
+        };
+        if let Some((_, prev_size)) = written.iter().find(|(k, _)| k == &key) {
+            if *prev_size != size {
+                panic!(
+                    "{}: copaque_ptr `{}`: key `{key}` sizeof {size:?} differs from {prev_size:?}",
+                    item.file_path.display(),
+                    item.head.name
+                );
+            }
+            continue;
+        }
+        let path = dir.join(format!("{key}.rs"));
+        if let Err(err) = std::fs::write(&path, &body) {
+            panic!("{}: {err}", path.display());
+        }
+        written.push((key, size));
+    }
+}
+
+fn short_sizeof_error(err: &crate::platform::CompilationError) -> String {
+    let text = if !err.err.is_empty() {
+        err.err.as_str()
+    } else {
+        err.out.as_str()
+    };
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("compilation failed");
+    let mut short = String::new();
+    for c in line.chars() {
+        if short.len() >= 200 {
+            break;
+        }
+        if c == '\t' {
+            short.push(' ');
+        } else if !c.is_control() {
+            short.push(c);
+        }
+    }
+    short
+}
+
+fn rust_string_literal(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn cextern_c_type(
@@ -1406,6 +1515,35 @@ fn walk_items(
                             });
                         if attrs_cfgs_hold(&parsed.attrs, file_path) {
                             out.cextern_variables.push(CollectedCExternVariable {
+                                file_path: file_path.to_path_buf(),
+                                module_path: mod_path.to_vec(),
+                                head: parsed,
+                            });
+                        }
+                    }
+                    Some("copaque_ptr") => {
+                        let parsed: COpaquePtrHead = syn::parse2(mac.mac.tokens.clone())
+                            .unwrap_or_else(|err| {
+                                panic!("{}: {err}", file_path.display());
+                            });
+                        if attrs_cfgs_hold(&parsed.attrs, file_path) {
+                            let name = unraw_ident(&parsed.name);
+                            let to_name = format!("{name}_TO");
+                            let ty: Type = syn::parse_str(&format!("*mut {to_name}"))
+                                .unwrap_or_else(|err| {
+                                    panic!("{}: copaque_ptr `{name}`: {err}", file_path.display());
+                                });
+                            out.structs.push(CollectedStruct {
+                                module_path: mod_path.to_vec(),
+                                name: to_name,
+                                c_name: Some(parsed.c_name.clone()),
+                            });
+                            out.aliases.push(CollectedAlias {
+                                module_path: mod_path.to_vec(),
+                                name,
+                                ty,
+                            });
+                            out.copaque_ptrs.push(CollectedCOpaquePtr {
                                 file_path: file_path.to_path_buf(),
                                 module_path: mod_path.to_vec(),
                                 head: parsed,

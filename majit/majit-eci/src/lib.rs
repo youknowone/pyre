@@ -1215,4 +1215,40 @@ mod tests {
         assert_eq!(head.c_type.as_deref(), Some("FILE*"));
         assert_eq!(head.declare_as_extern, Some(false));
     }
+
+    #[test]
+    fn copaque_ptr_head_parses_with_compilation_info() {
+        let head: crate::parse::COpaquePtrHead =
+            syn::parse_str(r#"pub fd_set = "fd_set", compilation_info = ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "fd_set");
+        assert_eq!(head.c_name, "fd_set");
+        assert!(head.compilation_info.is_some());
+        assert_eq!(head.size_key(), "fd_set");
+    }
+
+    #[test]
+    fn copaque_ptr_head_parses_without_compilation_info() {
+        let head: crate::parse::COpaquePtrHead = syn::parse_str(r#"pub DIRP = "DIR""#).unwrap();
+        assert_eq!(head.name.to_string(), "DIRP");
+        assert_eq!(head.c_name, "DIR");
+        assert!(head.compilation_info.is_none());
+        assert_eq!(
+            crate::parse::copaque_size_key("struct RPyOpaque_ThreadLock"),
+            "struct_RPyOpaque_ThreadLock"
+        );
+    }
+
+    #[test]
+    fn copaque_ptr_head_rejects_typedef() {
+        let err = match syn::parse_str::<crate::parse::COpaquePtrHead>(
+            r#"pub HANDLE = "HANDLE", typedef = "HANDLE""#,
+        ) {
+            Ok(_) => panic!("expected typedef to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("typedef"),
+            "error names typedef: {err}"
+        );
+    }
 }

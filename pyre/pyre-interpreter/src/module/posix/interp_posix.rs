@@ -5083,7 +5083,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// (`interp_scandir.py:148-153`).  Returns the errno at the end: `0` for a
     /// clean end, or the failure `readdir` reported.  Does not close `dirp`.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn readdir_collect(dirp: *mut libc::DIR, mut f: impl FnMut(&[u8], i64, u8)) -> i32 {
+    fn readdir_collect(dirp: majit_rlib::rposix::DIRP, mut f: impl FnMut(&[u8], i64, u8)) -> i32 {
         loop {
             // `readdir` reports the end of the directory and a failure the
             // same way — a null return. `rposix.c_readdir` is

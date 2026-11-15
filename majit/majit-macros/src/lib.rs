@@ -53,6 +53,16 @@ pub fn cextern_variable(input: TokenStream) -> TokenStream {
     }
 }
 
+/// `rffi.COpaquePtr`: `Ptr(COpaque(...))`. `compile_crate_ecis` writes
+/// `hints['getsize']` under `$OUT_DIR/majit_copaque/`.
+#[proc_macro]
+pub fn copaque_ptr(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_copaque_ptr(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 /// `ExternalCompilationInfo` (`cbuild.py`) plus the link directives genc hands
 /// to the linker. C sources are compiled by `majit_eci::build::compile_crate_ecis`,
 /// which the crate's build.rs runs.
