@@ -1565,15 +1565,14 @@ fn output_link(
 
 /// Dispatch-loop head (`interp_jit.py PyFrame.dispatch` `while True`).
 ///
-/// `get_is_being_profiled` runs once before the loop; continues of the
-/// `while True` re-enter at `jit_merge_point`, not at that read.
+/// `get_is_being_profiled` runs at the head, before `jit_merge_point`; the
+/// startblock and every continue of the `while True` enter the head.
 struct DispatchLoop {
-    /// Profiled diamond (`get_is_being_profiled`). The startblock enters
-    /// here; opcode continues do not.
+    /// Profiled diamond (`get_is_being_profiled`). The startblock and every
+    /// opcode continue enter here.
     head: SpamBlockRef,
     head_state: FrameState,
-    /// Loop-carried join: `int_guard_value` + `jit_merge_point`. Opcode
-    /// continues link here so they do not re-walk the profiled diamond.
+    /// Join of the profiled diamond: `int_guard_value` + `jit_merge_point`.
     merge_join: SpamBlockRef,
     merge_join_state: FrameState,
     /// Extra inputarg of `merge_join`: the loop-carried
@@ -1682,15 +1681,13 @@ fn dispatch_continue_to_loop_head(
     // the merge would not see the opcode pc.
     let mut source = current_state.clone();
     source.dispatch_next_instr = Some(super::flow::Constant::signed(case_pc as i64).into());
-    // Unprofiled continue: `get_is_being_profiled` ran before the
-    // `while True` (`interp_jit.py PyFrame.dispatch`) and the green is
-    // already 0. A profiled continue is a different green; the join's
-    // `int_guard_value` leaves the trace.
-    let mut args = dispatch_link_args(&source, &dispatch.merge_join_state);
-    args.push(super::flow::Constant::signed(0).into());
+    // `interp_jit.py PyFrame.dispatch` re-reads
+    // `is_being_profiled = self.get_is_being_profiled()` after every
+    // `handle_bytecode`; the continue re-enters the head's diamond.
+    let args = dispatch_link_args(&source, &dispatch.head_state);
     append_exit(
         &current_block.block(),
-        super::flow::Link::new(args, Some(dispatch.merge_join.block()), None).into_ref(),
+        super::flow::Link::new(args, Some(dispatch.head.block()), None).into_ref(),
     );
 }
 
@@ -3002,9 +2999,8 @@ fn emit_portal_is_being_profiled_read(
 }
 
 /// Same diamond as [`emit_portal_is_being_profiled_read`], joining onto
-/// the dispatch-loop's pre-built `merge_join` so opcode continues can
-/// target that join (`interp_jit.py PyFrame.dispatch`:
-/// `is_being_profiled = self.get_is_being_profiled()` before `while True`).
+/// the dispatch-loop's pre-built `merge_join` (`interp_jit.py PyFrame.dispatch`:
+/// `is_being_profiled = self.get_is_being_profiled()` on every iteration).
 fn emit_portal_is_being_profiled_into(
     graph: &mut super::flow::FunctionGraph,
     current_block: &SpamBlockRef,
@@ -19126,13 +19122,16 @@ mod tests {
         let merge = pyjit
             .merge_entry_for(pjif_target)
             .expect("drain-prefix green maps to the dispatch-loop head");
-        let merge_at_head = follow_trampoline(merge);
-        assert_eq!(
-            resolved, merge_at_head,
+        // The continue re-enters the head's `get_is_being_profiled` diamond
+        // (`interp_jit.py PyFrame.dispatch`), which precedes the merge join
+        // that `merge_entry_for` names.
+        assert!(
+            pyjit.metadata.dispatch_head_contains(resolved) && resolved < merge,
             "if n > want: false-edge must dispatch-continue to the loop head \
              (pjif_target={pjif_target}..=join_store={join_store_pc}); \
              resolved trampoline jit_pc={resolved} py={resolved_py:?} pjif_pc={pjif_pc} merge={merge}"
         );
+        let merge_at_head = follow_trampoline(merge);
         assert_eq!(
             continue_next_instr,
             Some(dispatch_case_pc(&code, pjif_target)),

@@ -5666,13 +5666,18 @@ fn run_perfn_walk<Sym: WalkSym>(
         // without it loop-carried collection operands remain `OpRef::NONE`.
         if !is_bridge_trace {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-            // The shared `PyFrame.dispatch` loop head maps every green onto
-            // one jitcode offset, so `pcdep_trivia_at(entry)` floors head
-            // bytes to py 0. Seed the live Ref colors of the GREEN python
-            // pc (`first_op_offset`) so a FunctionEntry at a mid-function
-            // case (e.g. `returns_through_finally` at py 14) sees that
-            // instruction's stack/locals, not the function-entry live set.
-            let pcdep_at = pjc.first_op_offset(start_pc).unwrap_or(entry);
+            // An entry at the shared `PyFrame.dispatch` loop head seeds the
+            // head's own color->slot map (published over the head ranges,
+            // `pcdep_trivia_at`); the case colors behind the switch are
+            // reached through the head->case link copies
+            // (`pyjitpl.py MetaInterp.initialize_state_from_start`). Any
+            // other entry seeds the live Ref colors of the green python pc
+            // (`first_op_offset`).
+            let pcdep_at = if pjc.metadata.dispatch_head_contains(entry) {
+                entry
+            } else {
+                pjc.first_op_offset(start_pc).unwrap_or(entry)
+            };
             if let Some(pcdep) =
                 crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, pcdep_at as i32)
             {

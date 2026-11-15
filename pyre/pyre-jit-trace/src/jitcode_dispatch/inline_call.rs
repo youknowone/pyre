@@ -19331,14 +19331,6 @@ fn walk_generator_resume<Sym: WalkSym>(
                     .copied()
                     .unwrap_or(std::ptr::null_mut())
             };
-            if value.is_null() {
-                extra_ref_seeds.push((
-                    color as usize,
-                    ctx.trace_ctx.const_ref(0),
-                    ConcreteValue::Ref(pyre_object::PY_NULL),
-                ));
-                continue;
-            }
             let index = ctx.trace_ctx.const_int(slot as i64);
             let opref = crate::state::trace_array_getitem_value(ctx.trace_ctx, locals_array, index);
             // GETARRAYITEM can minor-collect; the box is the forwarded
