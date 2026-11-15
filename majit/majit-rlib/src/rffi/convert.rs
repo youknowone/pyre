@@ -1,5 +1,5 @@
 //! `rffi.cast` (`ll2ctypes.force_cast`), `ptradd`, `sizeof`, `size_and_sign`,
-//! `offsetof`, `setintfield`, `getintfield`.
+//! `offsetof`, `setintfield`, `getintfield`, `structcopy`.
 
 use super::SIGNED;
 
@@ -203,4 +203,57 @@ macro_rules! getintfield {
     ($pdst:expr, $field:ident) => {
         $crate::rffi::cast::<$crate::rffi::SIGNED>((*$pdst).$field)
     };
+}
+
+/// `rffi.structcopy`: copy every field of `*psrc` into `*pdst`.
+/// `_get_structcopy_fn` asserts `PDST == PSRC`; the shared `T` is that
+/// assertion. Copying the bytes also copies `_hints['padding']` fields, which
+/// no reader observes.
+///
+/// # Safety
+/// Both pointers must be valid, aligned and non-overlapping for one `T`.
+pub unsafe fn structcopy<T>(pdst: *mut T, psrc: *const T) {
+    unsafe { core::ptr::copy_nonoverlapping(psrc, pdst, 1) }
+}
+
+#[cfg(test)]
+mod tests {
+    #[repr(C)]
+    struct X2 {
+        x: isize,
+    }
+
+    #[repr(C)]
+    struct X1 {
+        a: isize,
+        x2: X2,
+        p: *mut X2,
+    }
+
+    #[test]
+    fn structcopy() {
+        let mut p2 = X2 { x: 123 };
+        let p2_ptr = &mut p2 as *mut X2;
+        let p1 = X1 {
+            a: 5,
+            x2: X2 { x: 456 },
+            p: p2_ptr,
+        };
+        let mut p1bis = X1 {
+            a: 0,
+            x2: X2 { x: 0 },
+            p: core::ptr::null_mut(),
+        };
+        let mut p2bis = X2 { x: 0 };
+        unsafe {
+            crate::rffi::structcopy(&mut p1bis, &p1);
+        }
+        assert_eq!(p1bis.a, 5);
+        assert_eq!(p1bis.x2.x, 456);
+        assert_eq!(p1bis.p, p2_ptr);
+        unsafe {
+            crate::rffi::structcopy(&mut p2bis, &p2);
+        }
+        assert_eq!(p2bis.x, 123);
+    }
 }
