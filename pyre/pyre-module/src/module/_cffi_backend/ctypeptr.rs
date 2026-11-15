@@ -8,7 +8,7 @@
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::collections::HashSet;
-use std::ffi::{CString, c_int};
+use std::ffi::{CString, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use super::cdataobj::{self, W_CData};
@@ -832,7 +832,7 @@ fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
 
 /// `W_CTypePointer.prepare_file` — a stream answers with the C `FILE` over
 /// it, and anything else with a null pointer.
-fn prepare_file(mut w_ob: PyObjectRef) -> Result<FILEP, PyError> {
+fn prepare_file(mut w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
     if !pyre_object::with_roots!(w_ob => pyre_interpreter::baseobjspace::isinstance(
         w_ob,
         pyre_interpreter::module::_io::io_base_type(),
@@ -843,13 +843,13 @@ fn prepare_file(mut w_ob: PyObjectRef) -> Result<FILEP, PyError> {
 }
 
 /// `ctypeptr.py prepare_file_argument`.
-fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<FILEP, PyError> {
+fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let file_slot = roots.base();
     let _ = roots.pin_root(w_fileobj);
     pyre_interpreter::baseobjspace::call_method_result(roots.get(file_slot), "flush", &[])?;
     if let Some(held) = held_file(roots.get(file_slot)) {
-        return Ok(held as FILEP);
+        return Ok(held as *mut c_void);
     }
 
     let w_fd =
@@ -890,7 +890,8 @@ fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<FILEP, PyError> {
         CFFI_FILEOBJ_SLOT,
         roots.get(handle_slot),
     )?;
-    Ok(llf)
+    // rffi.cast(rffi.CCHARP, ...llf): the FILE leaves as a plain data pointer.
+    Ok(llf.cast::<c_void>())
 }
 
 /// `CffiFileObj.close`, which `W_IOBase.close_w` runs before its flush.
