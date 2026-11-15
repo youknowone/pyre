@@ -16504,15 +16504,51 @@ fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
     out
 }
 
+/// Instantiated item spelling of a cast dest (`lltype.py`
+/// `direct_arrayitems`). One pointer or reference is peeled so
+/// `*mut ITEM<…>`, `&mut ITEM<…>`, and a by-value `ITEM<…>` name the
+/// same struct. The head is the crate-stripped declaration
+/// (`class_identity_spelling`); type arguments are the same AST strings
+/// [`render_adt_type_args`] gives the field rows. An empty argument
+/// list is the template. A span that still contains `??` is left for
+/// [`raw_struct_array_item_lltype_inner`], which keeps the template name.
+pub(in crate::front::mir) fn instantiated_struct_item_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(node, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    let struct_node = match one_level_pointer_pointee(node, llbc) {
+        Some(pointee) => {
+            let pointee = strip_ty_wrappers(pointee, llbc)?;
+            type_node_peel_aliases(pointee, llbc)?
+        }
+        None => node,
+    };
+    let def_id = adt_node_def_id(struct_node)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let adt = struct_node.as_object()?.get("Adt")?.as_object()?;
+    let identity = class_identity_spelling(td.item_meta.name_path_str(), tombstoned);
+    let args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    if args.is_empty() {
+        Some(identity)
+    } else {
+        Some(format!("{identity}<{}>", args.join(",")))
+    }
+}
+
 /// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
 /// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
-/// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
 /// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`).
-pub(crate) fn gcarray_item_struct_ptr_annotation(
+pub(crate) fn gcarray_item_struct_ptr_lltype(
     reg: &crate::front::StructFieldRegistry,
     item: &str,
-) -> Option<crate::annotator::model::SomeValue> {
-    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
 
     let item = crate::front::typestr::peel_pointer_prefix(item).unwrap_or(item);
@@ -16525,9 +16561,22 @@ pub(crate) fn gcarray_item_struct_ptr_annotation(
     let LowLevelType::Struct(st) = entry else {
         return None;
     };
-    Some(lltype_to_annotation(Ptr {
+    Some(LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Struct(*st),
-    }))
+    })))
+}
+
+/// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
+/// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
+/// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
+/// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`).
+pub(crate) fn gcarray_item_struct_ptr_annotation(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::annotator::model::SomeValue> {
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+
+    gcarray_item_struct_ptr_lltype(reg, item).map(lltype_to_annotation)
 }
 
 fn spelling_is_unsubstituted_typevar(ty: &str) -> bool {
