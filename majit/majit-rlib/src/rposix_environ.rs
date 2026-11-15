@@ -43,7 +43,12 @@ pub unsafe fn os_get_environ() -> CCHARPP {
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 crate::rffi::external_compilation_info! { const ENVIRON_ECI = {}; }
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-crate::rffi::cextern_variable!(pub os_get_environ, pub _os_set_environ = "environ", CCHARPP, compilation_info = ENVIRON_ECI);
+crate::rffi::cextern_variable!(
+    pub os_get_environ,
+    pub _os_set_environ = "environ",
+    CCHARPP,
+    compilation_info = ENVIRON_ECI
+);
 
 crate::rffi::llexternal!(
     pub os_getenv = "getenv",

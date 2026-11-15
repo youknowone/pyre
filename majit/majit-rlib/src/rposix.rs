@@ -115,7 +115,16 @@ const _: () = assert!(OFF_T_SIZE == core::mem::size_of::<i64>());
 crate::rffi::external_compilation_info! { const ERRNO_ECI = { includes: ["errno.h", "stdio.h"] }; }
 // Direct getters/setters, don't use directly!
 #[cfg(any(unix, windows))]
-crate::rffi::cextern_variable!(pub _get_errno, pub _set_errno = "errno", crate::rffi::INT, compilation_info = ERRNO_ECI, sandboxsafe = true, _nowrapper = true, c_type = "int", declare_as_extern = false);
+crate::rffi::cextern_variable!(
+    pub _get_errno,
+    pub _set_errno = "errno",
+    crate::rffi::INT,
+    compilation_info = ERRNO_ECI,
+    sandboxsafe = true,
+    _nowrapper = true,
+    c_type = "int",
+    declare_as_extern = false
+);
 
 // No C `errno` on this target, the thread-local slot stands in for it.
 #[cfg(not(any(unix, windows)))]
@@ -233,19 +242,12 @@ pub fn restore_closed_standard_fds() {}
 /// `rposix._errno_before`.
 pub fn _errno_before(save_err: i64) {
     if save_err & RFFI_READSAVED_ERRNO != 0 {
-        if save_err & RFFI_ALT_ERRNO != 0 {
-            unsafe {
-                _set_errno(
-                    rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32,
-                );
-            }
+        let value = if save_err & RFFI_ALT_ERRNO != 0 {
+            rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32
         } else {
-            unsafe {
-                _set_errno(
-                    rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32,
-                );
-            }
-        }
+            rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32
+        };
+        unsafe { _set_errno(value) };
     } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
         unsafe {
             _set_errno(0);
