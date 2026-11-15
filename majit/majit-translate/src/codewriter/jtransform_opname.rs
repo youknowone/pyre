@@ -241,13 +241,20 @@ pub fn lower_graph_with_callees(
                     .as_ref()
                     .expect("opname-spine link has no target block");
                 let target_id = block_map[&Rc::as_ptr(target)];
+                let target_inputargs = out.block(target_id).inputargs.clone();
+                let graph_name = out.name.clone();
                 let args: Vec<LinkArg> = link
                     .args
                     .iter()
-                    .map(|arg| {
+                    .enumerate()
+                    .map(|(i, arg)| {
                         // `Transformer._do_renaming_on_link` (`jtransform.py`).
                         let hlv = arg.as_ref().expect("opname-spine link arg is undefined");
-                        linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings))
+                        linkarg_from_hlvalue_matching_target(
+                            rename_void_hlvalue(hlv, &void_renamings),
+                            target_inputargs.get(i),
+                            &graph_name,
+                        )
                     })
                     .collect();
                 let exitcase = match &link.exitcase {
@@ -739,8 +746,16 @@ fn transduce_op(
                 OpKind::LoweredBlackholeOp {
                     opname: opname.to_string(),
                     args: vec![
-                        record_exact_value_linkarg(&op.args[0]),
-                        record_exact_value_linkarg(&op.args[1]),
+                        linkarg_from_hlvalue_matching_target(
+                            &op.args[0],
+                            hlvalue_as_var(&op.args[1]).as_ref(),
+                            &out.name,
+                        ),
+                        linkarg_from_hlvalue_matching_target(
+                            &op.args[1],
+                            hlvalue_as_var(&op.args[0]).as_ref(),
+                            &out.name,
+                        ),
                     ],
                 },
                 false,
@@ -1159,8 +1174,11 @@ fn transduce_op(
         // result is renamed to the argument, which is what the shared
         // `UnaryOp same_as` handling in `Transformer` does.
         "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr" => {
-            let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
+            if let Hlvalue::Constant(c) = &op.args[0] {
+                assert_rtyped_link_constant_kind(&out.name, c, &result);
+            }
+            let operand = materialize(out, block, &op.args[0]);
             let result_ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
@@ -1639,17 +1657,6 @@ fn malloc_flags_zero(hlv: &Hlvalue) -> bool {
     )
 }
 
-/// `jit_record_exact_value` operands pass through as [`LinkArg`], the
-/// same Variable-or-Constant carrier `FieldWrite.value` uses, so a
-/// Constant reaches `Assembler.emit_const` with its original
-/// `ConstValue`.
-fn record_exact_value_linkarg(hlv: &Hlvalue) -> LinkArg {
-    match hlv {
-        Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
-        Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
-    }
-}
-
 /// Runtime call operands, dropping Void. Void is compile-time only.
 ///
 /// `jtransform.py Transformer.make_three_lists` skips `kind == 'void'`
@@ -1744,6 +1751,18 @@ pub(crate) fn materialize_constant(
                         OpKind::ConstInt(0)
                     }
                 }
+                // Adapter `const_ref_addr_define_hlvalue`: a GCREF `_ptr`
+                // whose object is `_ptr_obj::IntCast(a)`. Spine A carries
+                // this as `OpKind::ConstRefAddr(a)` (`Assembler.emit_const`
+                // kind `'ref'`).
+                ConstValue::LLPtr(ptr)
+                    if ptr.nonzero()
+                        && let Ok(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(a),
+                        )) = ptr._obj0_value() =>
+                {
+                    OpKind::ConstRefAddr(a)
+                }
                 // `Assembler.emit_const` kind `'ref'`: a prebuilt
                 // `Ptr(STR)` from `StringRepr.convert_const` is stored
                 // in `constants_r`. The rich-graph carrier is
@@ -1756,13 +1775,13 @@ pub(crate) fn materialize_constant(
                 },
                 _ => fail(),
             },
-            // `Assembler.emit_const` kind `'int'`: `TYPE == llmemory.Address`
-            // → `value = adr2int(value)`. `cast_int_to_adr(n)` is
-            // `_address::IntCast(n)`; `NULL` is `_address::Null` — the
-            // same decode `resolve_const_i_value` uses for
-            // `LLAddress::Null` / `AddressAsInt::IntCast`.
+            // `Assembler.emit_const` (`assembler.py`): Address → int via
+            // `adr2int`. A catalogued address is relocated
+            // (`ConstIRelocKind::StaticAddr`); otherwise the assembler
+            // keeps the raw bits — the same split Spine A's
+            // `ConstRefAddr` arm does. `_address::Null` is 0.
             Some(LowLevelType::Address) => match &c.value {
-                ConstValue::LLAddress(_address::IntCast(n)) => OpKind::ConstInt(*n),
+                ConstValue::LLAddress(_address::IntCast(n)) => OpKind::ConstRefAddr(*n),
                 ConstValue::LLAddress(_address::Null) => OpKind::ConstInt(0),
                 _ => fail(),
             },
@@ -2034,6 +2053,52 @@ fn linkarg_from_hlvalue(hlv: &Hlvalue) -> LinkArg {
     match hlv {
         Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
         Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
+    }
+}
+
+/// `rtyper.py insert_link_conversions` rewrites each Constant link arg
+/// with `inputconst(r_a2, a1.value)` into the dest inputarg's repr, so
+/// `getkind` of the constant equals the target's. A mismatch is an
+/// ill-typed rtyped graph.
+fn linkarg_from_hlvalue_matching_target(
+    hlv: &Hlvalue,
+    target: Option<&FVar>,
+    graph_name: &str,
+) -> LinkArg {
+    if let (Hlvalue::Constant(c), Some(target)) = (hlv, target) {
+        assert_rtyped_link_constant_kind(graph_name, c, target);
+    }
+    linkarg_from_hlvalue(hlv)
+}
+
+fn history_kind_name(k: crate::model::ConcreteType) -> &'static str {
+    match k {
+        crate::model::ConcreteType::Signed => "int",
+        crate::model::ConcreteType::GcRef => "ref",
+        crate::model::ConcreteType::Float => "float",
+        crate::model::ConcreteType::Void => "void",
+        crate::model::ConcreteType::Unknown => "unknown",
+    }
+}
+
+fn assert_rtyped_link_constant_kind(graph_name: &str, c: &Constant, target: &FVar) {
+    let Some(const_ty) = c.concretetype.as_ref() else {
+        return;
+    };
+    let Some(target_ty) = target.concretetype() else {
+        return;
+    };
+    let k1 = crate::model::getkind(const_ty);
+    let k2 = crate::model::getkind(&target_ty);
+    if k1 == crate::model::ConcreteType::Void || k2 == crate::model::ConcreteType::Void {
+        return;
+    }
+    if k1 != k2 {
+        panic!(
+            "ill-typed rtyped graph {graph_name}: link constant kind {} != target kind {}",
+            history_kind_name(k1),
+            history_kind_name(k2),
+        );
     }
 }
 
@@ -5231,40 +5296,92 @@ mod tests {
         );
     }
 
-    /// `Assembler.emit_const` kind `'int'`: `TYPE == llmemory.Address`
-    /// → `adr2int`; `cast_int_to_adr(n)` (`_address::IntCast(n)`) is `n`.
+    fn gcref_static_address_const(addr: i64) -> (Constant, LowLevelType) {
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF};
+        let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+            panic!("GCREF must be a Ptr");
+        };
+        let p = _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(addr))), true);
+        (
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone()),
+            GCREF.clone(),
+        )
+    }
+
     #[test]
-    fn lower_graph_materializes_address_intcast_as_const_int() {
-        use crate::translator::rtyper::lltypesystem::lltype::_address;
-        let start = Block::shared(vec![]);
-        let returned = variable_with_lltype("returned", LowLevelType::Address);
-        let graph = FlowGraph::with_return_var(
-            "address_intcast_const",
-            start.clone(),
-            Hlvalue::Variable(returned.clone()),
+    fn materialize_constant_gcref_static_address_is_const_ref_addr() {
+        let (c, ptr_ty) = gcref_static_address_const(0x1000);
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_gcref_static");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstRefAddr(0x1000)),
+            "GCREF IntCast static address becomes ConstRefAddr: {:?}",
+            ops[0].kind
         );
-        start.borrow_mut().operations.push(SpaceOperation::new(
-            "same_as",
-            vec![constant_with_lltype(
-                ConstValue::LLAddress(_address::IntCast(42)),
-                LowLevelType::Address,
-            )],
-            Hlvalue::Variable(returned.clone()),
-        ));
+        assert_eq!(result.concretetype(), Some(ptr_ty));
+    }
+
+    /// `Assembler.emit_const` Address → `adr2int`; Spine A carries
+    /// `cast_int_to_adr(n)` (`_address::IntCast(n)`) as `ConstRefAddr(n)`.
+    /// `_address::Null` stays `ConstInt(0)`.
+    #[test]
+    fn materialize_constant_address_intcast_is_const_ref_addr() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        let c = Constant::with_concretetype(
+            ConstValue::LLAddress(_address::IntCast(42)),
+            LowLevelType::Address,
+        );
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_address_intcast");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstRefAddr(42)),
+            "Address IntCast(42) becomes ConstRefAddr(42): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Address));
+
+        let null = Constant::with_concretetype(
+            ConstValue::LLAddress(_address::Null),
+            LowLevelType::Address,
+        );
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_address_null");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &null, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstInt(0)),
+            "Address Null becomes ConstInt(0): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Address));
+    }
+
+    #[test]
+    #[should_panic(expected = "ill-typed rtyped graph")]
+    fn lower_graph_link_constant_kind_mismatch_panics() {
+        let start = Block::shared(vec![]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "link_kind_mismatch",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
         start.closeblock(vec![
             Link::new(
-                vec![Hlvalue::Variable(returned.clone())],
+                vec![signed_const(42)],
                 Some(graph.returnblock.clone()),
                 None,
             )
             .into_ref(),
         ]);
-        let model = lower_graph(&graph);
-        let ops = &model.block(model.startblock).operations;
-        assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(42))),
-            "Address IntCast(42) becomes ConstInt(42): {ops:?}"
-        );
+        let _ = lower_graph(&graph);
     }
 
     /// `rewrite_op_cast_primitive` / `rewrite_op_force_cast`: a Number
