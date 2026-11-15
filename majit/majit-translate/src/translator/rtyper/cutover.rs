@@ -11883,6 +11883,40 @@ mod tests {
         graph
     }
 
+    /// Direct `simple_call` of `OPTION_FN_PBC_CALLEE` (no `__fn_const`
+    /// head). `Bookkeeper.compute_at_fixpoint` drains
+    /// `annotator.call_sites` into `FunctionDesc.consider_call_site`
+    /// (`bookkeeper.py`), so the callee's call family is recorded
+    /// without hand-seeding `CallRegistry`.
+    fn option_fn_pbc_direct_caller_path() -> crate::parse::CallPath {
+        crate::parse::CallPath {
+            segments: vec!["option_fn_pbc_direct_caller".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    fn option_fn_pbc_direct_caller_legacy() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("option_fn_pbc_direct_caller").with_return_type("i64");
+        let start = graph.startblock;
+        let result = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec![OPTION_FN_PBC_CALLEE.into()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(start, Some(result));
+        graph
+    }
+
     fn option_fn_pbc_callee_pygraph() -> Rc<PyGraph> {
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{Block as FlowBlock, Link};
@@ -12093,6 +12127,242 @@ mod tests {
             0,
         );
         assert_eq!(jitcode.calldescr().result_type, 'i');
+    }
+
+    /// `CodeWriter::run_two_phase_prepass` threads the dual-gate
+    /// bookkeeper onto `CallControl`. Regular subjects install the
+    /// lifted body at `FunctionDesc.cached_none_key`, which
+    /// `drive_regular_subject` identity-checks against
+    /// `TwoPhaseSubject.graph` — the graph Spine B copygraphs.
+    fn two_phase_subject_graph_from_codewriter_bookkeeper(
+        callcontrol: &crate::codewriter::call::CallControl,
+        graph_name: &str,
+    ) -> crate::flowspace::model::GraphRef {
+        let bk = callcontrol
+            .bookkeeper()
+            .expect("run_two_phase_prepass sets CallControl.bookkeeper");
+        for entry in bk.descs.borrow().values() {
+            let Some(desc) = entry.as_function() else {
+                continue;
+            };
+            let desc = desc.borrow();
+            if desc.name != graph_name {
+                continue;
+            }
+            if let Some(pygraph) = desc.cached_none_key() {
+                return pygraph.graph.clone();
+            }
+        }
+        panic!("no FunctionDesc.cached_none_key graph for {graph_name}");
+    }
+
+    fn some_arm_exit_link_concretetype(
+        graph: &crate::flowspace::model::FunctionGraph,
+    ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        let found = {
+            let start = graph.startblock.borrow();
+            let mut found = None;
+            for link in &start.exits {
+                let link = link.borrow();
+                let is_true = matches!(
+                    &link.exitcase,
+                    Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Bool(true))
+                );
+                if !is_true {
+                    continue;
+                }
+                for arg in &link.args {
+                    if let Some(Hlvalue::Constant(c)) = arg {
+                        found = Some(
+                            c.concretetype
+                                .clone()
+                                .expect("Some-arm exit link constant has concretetype"),
+                        );
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        };
+        found.unwrap_or_else(|| {
+            panic!(
+                "Some-arm (true) exit has no Constant link arg\n{}",
+                dump_flowspace_graph(graph)
+            )
+        })
+    }
+
+    fn dump_flowspace_graph(graph: &crate::flowspace::model::FunctionGraph) -> String {
+        use crate::flowspace::model::Hlvalue;
+        fn fmt_hl(hl: &Hlvalue) -> String {
+            match hl {
+                Hlvalue::Variable(v) => {
+                    format!("Var({} : {:?})", v.name(), v.concretetype.borrow())
+                }
+                Hlvalue::Constant(c) => {
+                    format!("Const({:?} : {:?})", c.value, c.concretetype)
+                }
+            }
+        }
+        let blocks = graph.iterblocks();
+        let mut out = format!("FLOWGRAPH name={} blocks={}\n", graph.name, blocks.len());
+        for (i, block) in blocks.into_iter().enumerate() {
+            let b = block.borrow();
+            out.push_str(&format!(
+                "BLOCK[{i}] nops={} nexits={}\n",
+                b.operations.len(),
+                b.exits.len()
+            ));
+            out.push_str("  inputargs:\n");
+            for (j, arg) in b.inputargs.iter().enumerate() {
+                out.push_str(&format!("    [{j}] {}\n", fmt_hl(arg)));
+            }
+            for (j, op) in b.operations.iter().enumerate() {
+                let args: Vec<String> = op.args.iter().map(fmt_hl).collect();
+                out.push_str(&format!(
+                    "  op[{j}] {}({}) -> {}\n",
+                    op.opname,
+                    args.join(", "),
+                    fmt_hl(&op.result)
+                ));
+            }
+            out.push_str(&format!(
+                "  exitswitch: {:?}\n",
+                b.exitswitch.as_ref().map(fmt_hl)
+            ));
+            for (j, link) in b.exits.iter().enumerate() {
+                let link = link.borrow();
+                let args: Vec<String> = link
+                    .args
+                    .iter()
+                    .map(|a| a.as_ref().map(fmt_hl).unwrap_or_else(|| "None".into()))
+                    .collect();
+                out.push_str(&format!(
+                    "  exit[{j}] exitcase={:?} args=[{}]\n",
+                    link.exitcase.as_ref().map(fmt_hl),
+                    args.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
+    /// The opname spine assembles the rtyper-lowered two-phase subject of
+    /// a Match'd general graph (#2646 first slice); with the callee called
+    /// elsewhere the Some arm is `FunctionsPBCRepr` (`Ptr(FuncType)`), so
+    /// Spine B returns the funcptr constant on the true path and
+    /// `nullptr(FUNC)` on the false path (`FunctionsPBCRepr.convert_const(None)`,
+    /// `rtyper.py insert_link_conversions`).
+    #[test]
+    fn opname_spine_assembles_two_phase_match_option_fn_return_phi() {
+        let _lock = anchor_lock();
+        let graph = option_fn_return_phi_match_graph();
+        let path = crate::parse::CallPath {
+            segments: vec!["option_fn_return_phi_match".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        register_option_fn_pbc_callee(&registry);
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        graphs.insert(option_fn_pbc_callee_path(), option_fn_pbc_callee_legacy());
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs, &[]);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
+            .expect("publish reads the cache");
+        let DualGateOutcome::Match { .. } = outcome else {
+            panic!("two-phase Option<fn> return phi must Match, got {outcome:?}");
+        };
+
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        callcontrol.register_function_graph(path.clone(), graph.clone());
+        callcontrol
+            .register_function_graph(option_fn_pbc_callee_path(), option_fn_pbc_callee_legacy());
+        callcontrol.register_function_graph(
+            option_fn_pbc_direct_caller_path(),
+            option_fn_pbc_direct_caller_legacy(),
+        );
+        callcontrol.find_all_graphs_for_tests();
+        let mut codewriter = crate::codewriter::codewriter::CodeWriter::new();
+        codewriter.run_two_phase_prepass(&callcontrol);
+        let spine_a =
+            std::sync::Arc::new(crate::jitcode::JitCode::new("option_fn_return_phi_match"));
+        codewriter.transform_graph_to_jitcode(
+            &graph,
+            &path,
+            &mut callcontrol,
+            &crate::codewriter::jtransform::GraphTransformConfig::default(),
+            &spine_a,
+            false,
+            0,
+        );
+        // Same graph `opname_spine_jitcode_for_two_phase_subject`
+        // copygraphs: `FunctionDesc.cached_none_key` is `Rc::ptr_eq`
+        // with `TwoPhaseSubject.graph` (`drive_regular_subject`).
+        let subject = two_phase_subject_graph_from_codewriter_bookkeeper(
+            &callcontrol,
+            "option_fn_return_phi_match",
+        );
+        let some_ty = some_arm_exit_link_concretetype(&subject.borrow());
+        assert!(
+            crate::translator::rtyper::lltypesystem::rffi::_isfunctype(&some_ty),
+            "Some-arm exit link constant must be Ptr(FuncType) \
+             (FunctionsPBCRepr / SomePBC.rtyper_makerepr), got {some_ty:?}\n{}",
+            dump_flowspace_graph(&subject.borrow()),
+        );
+        let spine_b = codewriter
+            .opname_spine_jitcode_for_two_phase_subject(
+                &path,
+                &mut callcontrol,
+                &crate::codewriter::jtransform::GraphTransformConfig::default(),
+                0,
+            )
+            .expect("two-phase Match subject has an opname-spine jitcode");
+        let dump = spine_b.dump();
+        let n_int_return = dump
+            .lines()
+            .filter(|line| line.contains("int_return"))
+            .count();
+        assert_eq!(
+            n_int_return, 2,
+            "Spine B has two int_return insns (true funcptr / false nullptr(FUNC)); dump:\n{dump}"
+        );
+        let fnaddr_paths: Vec<&str> = spine_b
+            .body()
+            .reloc_consts_i
+            .iter()
+            .filter_map(|d| match &d.kind {
+                crate::jitcode::ConstIRelocKind::FnAddr { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fnaddr_paths.len(),
+            1,
+            "exactly one ConstIRelocKind::FnAddr; paths={fnaddr_paths:?} dump:\n{dump}"
+        );
+        assert!(
+            fnaddr_paths[0].contains(OPTION_FN_PBC_CALLEE),
+            "FnAddr path names {OPTION_FN_PBC_CALLEE}, got {:?}; dump:\n{dump}",
+            fnaddr_paths[0]
+        );
+        assert!(
+            dump.lines()
+                .any(|line| line.contains("int_return") && line.contains("Null")),
+            "false path returns nullptr(FUNC) (integer 0); dump:\n{dump}"
+        );
+        // Spine A keeps the front graph's four arms.
+        let diff = crate::codewriter::codewriter::CodeWriter::jitcode_byte_diff(&spine_a, &spine_b);
+        assert!(
+            diff.as_deref()
+                .is_some_and(|d| d.starts_with("body code bytes")),
+            "spines still differ on this graph; got {diff:?}"
+        );
     }
 
     /// One Some arm (value-used FnDef / `__fn_const` `SomePBC`) and one

@@ -1195,6 +1195,81 @@ impl CodeWriter {
         );
     }
 
+    /// #2646 instrument: assemble `path`'s rtyper-lowered two-phase graph through the opname spine into a
+    /// detached JitCode, so it can be compared with the production spine's JitCode for the same graph.
+    /// Returns None when the path has no two-phase subject or the subject was annotate/rtype skipped.
+    #[cfg(test)]
+    pub(crate) fn opname_spine_jitcode_for_two_phase_subject(
+        &mut self,
+        path: &crate::parse::CallPath,
+        callcontrol: &mut CallControl,
+        config: &GraphTransformConfig,
+        index: usize,
+    ) -> Option<std::sync::Arc<JitCode>> {
+        let copy = {
+            let registry = self.dual_gate_registry(callcontrol);
+            let tp = registry.two_phase();
+            let subject = tp.subjects.get(path)?;
+            if tp.rtype_skipped.contains(&subject.graph_key)
+                || tp.annotate_skipped.contains_key(path)
+            {
+                return None;
+            }
+            crate::flowspace::model::copygraph(
+                &subject.graph.borrow(),
+                false,
+                &std::collections::HashMap::new(),
+                false,
+            )
+        };
+        // Shell name mirrors `CallControl::get_jitcode` / Spine A for this path.
+        let leaf = path
+            .last_segment()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{path:?}"));
+        let name = match path.specialization {
+            crate::parse::GraphSpecialization::Regular => leaf,
+            crate::parse::GraphSpecialization::AccessDirect => {
+                format!("{leaf}{}", crate::parse::ACCESS_DIRECT_ALT_SUFFIX)
+            }
+        };
+        let jit = std::sync::Arc::new(JitCode::new(name));
+        self.transform_opname_graph_to_jitcode(
+            &copy,
+            path,
+            callcontrol,
+            config,
+            &jit,
+            false,
+            index,
+        );
+        Some(jit)
+    }
+
+    /// Byte-level comparison of two assembled JitCodes: the bincode serialisation of the body
+    /// (`JitCodeBody`: code, constant pools, reloc pools, register counts, labels, result types)
+    /// and the bincode of `calldescr()`. The shell header (`fnaddr`) is excluded because
+    /// `get_jitcode` writes it independently of the spine. Returns None when identical, else a
+    /// report naming the first differing component followed by both `dump()` texts.
+    #[cfg(test)]
+    pub(crate) fn jitcode_byte_diff(a: &JitCode, b: &JitCode) -> Option<String> {
+        let dumps = || format!("--- a dump ---\n{}\n--- b dump ---\n{}", a.dump(), b.dump());
+        if a.body().code != b.body().code {
+            return Some(format!("body code bytes\n{}", dumps()));
+        }
+        let a_body = bincode::serialize(a.body()).expect("JitCodeBody bincode (a)");
+        let b_body = bincode::serialize(b.body()).expect("JitCodeBody bincode (b)");
+        if a_body != b_body {
+            return Some(format!("whole-body bincode\n{}", dumps()));
+        }
+        let a_calldescr = bincode::serialize(a.calldescr()).expect("calldescr bincode (a)");
+        let b_calldescr = bincode::serialize(b.calldescr()).expect("calldescr bincode (b)");
+        if a_calldescr != b_calldescr {
+            return Some(format!("calldescr bincode\n{}", dumps()));
+        }
+        None
+    }
+
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py).
     ///
     /// Full pipeline: grab_initial_jitcodes → enum_pending_graphs loop → finished.

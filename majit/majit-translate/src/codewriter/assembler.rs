@@ -4307,6 +4307,26 @@ impl AssemblerEncode for Assembler {
         {
             return (self.emit_vtable_const(impl_key, trait_leaf, state), 'i');
         }
+        // `Assembler.emit_const` kind `'int'`: `Ptr` → `see_raw_object` →
+        // `cast_ptr_to_adr` → `Address` → `adr2int` (`assembler.py`). A
+        // non-null function pointer is that symbolic address, stored as
+        // `ConstIRelocKind::FnAddr` via `emit_fnaddr_const` — never the
+        // short form.
+        if let ConstValue::LLPtr(ptr) = value {
+            if ptr.nonzero()
+                && matches!(
+                    ptr._TYPE.TO,
+                    crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
+                )
+            {
+                let callee =
+                    crate::codewriter::jtransform_opname::callee_name_from_funcptr_value(value);
+                let target = crate::model::CallTarget::function_path(
+                    callee.split("::").filter(|s| !s.is_empty()),
+                );
+                return (self.emit_fnaddr_const(&target, state, callcontrol), 'i');
+            }
+        }
         let value = Self::resolve_const_i_value(value, callcontrol);
         self.emit_const_i_allow_short(value, allow_short, state)
     }

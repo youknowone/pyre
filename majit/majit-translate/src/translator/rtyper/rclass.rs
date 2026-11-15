@@ -2953,18 +2953,18 @@ impl InstanceRepr {
             ConstValue::LowLevelType(Box::new(object_lltype.clone())),
             LowLevelType::Void,
         );
-        // upstream: `cflags = inputconst(Void, {'flavor': flavor})` plus
-        // `flags['nonmovable'] = True` when requested. The flavor
-        // sentinel matches the `newtuple` emitter's encoding; the
-        // lowering pass reads the type from `ctype` and the flavor here.
-        let flavor_sentinel = match (self.gcflavor, nonmovable) {
-            (Flavor::Gc, false) => "flavor=gc",
-            (Flavor::Gc, true) => "flavor=gc;nonmovable",
-            (Flavor::Raw, false) => "flavor=raw",
-            (Flavor::Raw, true) => "flavor=raw;nonmovable",
-        };
+        // `InstanceRepr.new_instance`: `flags = {'flavor': self.gcflavor}`;
+        // `flags['nonmovable'] = True` when `nonmovable`; then
+        // `cflags = inputconst(Void, flags)`.
+        let mut flags = IndexMap::from([(
+            ConstValue::byte_str("flavor"),
+            ConstValue::byte_str(self.gcflavor.llflavor()),
+        )]);
+        if nonmovable {
+            flags.insert(ConstValue::byte_str("nonmovable"), ConstValue::Bool(true));
+        }
         let cflags =
-            Constant::with_concretetype(ConstValue::byte_str(flavor_sentinel), LowLevelType::Void);
+            Constant::with_concretetype(ConstValue::Dict(Arc::new(flags)), LowLevelType::Void);
         // upstream: `vptr = llops.genop('malloc', vlist,
         //                              resulttype=Ptr(self.object_type))`.
         let vptr = llops

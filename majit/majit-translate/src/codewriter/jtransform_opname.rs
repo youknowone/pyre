@@ -76,8 +76,12 @@ use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
 };
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
-use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
-use crate::translator::rtyper::lltypesystem::rstr::{STR, UNICODE};
+use crate::translator::rtyper::lltypesystem::lltype::{
+    _address, Array, GcKind, LowLevelType, Ptr, PtrTarget,
+};
+use crate::translator::rtyper::lltypesystem::rstr::{
+    STR, STRPTR, UNICODE, prebuilt_str_bytes_and_hash,
+};
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
 /// inherent id, so identity is the allocation address (RPython compares
@@ -176,8 +180,27 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
         // `getsubstruct` aliases are block-local: a chars-array Variable maps
         // back to the string Variable it was derived from in this block.
         let mut chars_alias: HashMap<FVar, FVar> = HashMap::new();
+        // `Transformer.optimize_block` `renamings` / `do_rename`'s Void
+        // branch (`jtransform.py`): block-local exactly like upstream's
+        // `renamings`.
+        let mut void_renamings: HashMap<FVar, Hlvalue> = HashMap::new();
         for op in &fb_ref.operations {
-            transduce_op(&mut out, id, op, &mut chars_alias, &family);
+            if matches!(
+                op.opname.as_str(),
+                "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr"
+            ) {
+                if let Hlvalue::Variable(result) = &op.result {
+                    if matches!(result.concretetype(), Some(LowLevelType::Void)) {
+                        void_renamings.insert(result.clone(), void_none_hlvalue());
+                        continue;
+                    }
+                }
+            }
+            if let Some(renamed) = rename_void_op_args(op, &void_renamings) {
+                transduce_op(&mut out, id, &renamed, &mut chars_alias, &family);
+            } else {
+                transduce_op(&mut out, id, op, &mut chars_alias, &family);
+            }
         }
 
         let we_are_jitted_switch = matches!(
@@ -200,9 +223,9 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                     .args
                     .iter()
                     .map(|arg| {
-                        linkarg_from_hlvalue(
-                            arg.as_ref().expect("opname-spine link arg is undefined"),
-                        )
+                        // `Transformer._do_renaming_on_link` (`jtransform.py`).
+                        let hlv = arg.as_ref().expect("opname-spine link arg is undefined");
+                        linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings))
                     })
                     .collect();
                 let exitcase = match &link.exitcase {
@@ -216,8 +239,14 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                 // make_exception_link (it asserts they are Some and, for an
                 // empty-target handler, unwraps them). Dropping them turns a
                 // faithful OverflowError edge into a flatten-time panic.
-                model_link.last_exception = link.last_exception.as_ref().map(linkarg_from_hlvalue);
-                model_link.last_exc_value = link.last_exc_value.as_ref().map(linkarg_from_hlvalue);
+                model_link.last_exception = link
+                    .last_exception
+                    .as_ref()
+                    .map(|hlv| linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings)));
+                model_link.last_exc_value = link
+                    .last_exc_value
+                    .as_ref()
+                    .map(|hlv| linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings)));
                 model_link
             })
             .collect();
@@ -238,7 +267,11 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
             }
             None
         } else {
-            match &fb_ref.exitswitch {
+            match fb_ref
+                .exitswitch
+                .as_ref()
+                .map(|hlv| rename_void_hlvalue(hlv, &void_renamings))
+            {
                 Some(Hlvalue::Variable(v)) => Some(ExitSwitch::Value(v.clone())),
                 _ => None,
             }
@@ -1079,10 +1112,11 @@ fn transduce_op(
                 result,
             );
         }
-        // `Transformer.rewrite_op_likely` / `rewrite_op_unlikely` return
-        // None ("no real effect"): the result is renamed to args[0].
-        // Emit `same_as` so the shared identity rewrite does that rename.
-        "likely" | "unlikely" => {
+        // `Transformer.rewrite_op_same_as`, `rewrite_op_cast_pointer`, and
+        // `rewrite_op_cast_opaque_ptr` (`jtransform.py`) return None: the
+        // result is renamed to the argument, which is what the shared
+        // `UnaryOp same_as` handling in `Transformer` does.
+        "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr" => {
             let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
             let result_ty = value_type_of(&result);
@@ -1352,6 +1386,13 @@ fn str_family_from_lltype(ty: &LowLevelType) -> Option<StrFamily> {
     } else {
         None
     }
+}
+
+/// `v.concretetype == rstr.STRPTR` (`Ptr(STR)` / `rpy_string`).
+/// `StringRepr.convert_const` stamps this lltype; UNICODE is
+/// `UNICODEPTR` and stays out.
+fn is_str_ptr(p: &Ptr) -> bool {
+    LowLevelType::Ptr(Box::new(p.clone())) == *STRPTR
 }
 
 #[expect(
@@ -1647,6 +1688,26 @@ pub(crate) fn materialize_constant(
                         OpKind::ConstInt(0)
                     }
                 }
+                // `Assembler.emit_const` kind `'ref'`: a prebuilt
+                // `Ptr(STR)` from `StringRepr.convert_const` is stored
+                // in `constants_r`. The rich-graph carrier is
+                // `OpKind::ConstStr` of the `rpy_string.chars` bytes
+                // (`prebuilt_str_bytes_and_hash`). UNICODE stays
+                // unmaterialised.
+                ConstValue::LLPtr(ptr) if is_str_ptr(p) => match prebuilt_str_bytes_and_hash(ptr) {
+                    Some((bytes, _)) => OpKind::ConstStr(bytes),
+                    None => fail(),
+                },
+                _ => fail(),
+            },
+            // `Assembler.emit_const` kind `'int'`: `TYPE == llmemory.Address`
+            // → `value = adr2int(value)`. `cast_int_to_adr(n)` is
+            // `_address::IntCast(n)`; `NULL` is `_address::Null` — the
+            // same decode `resolve_const_i_value` uses for
+            // `LLAddress::Null` / `AddressAsInt::IntCast`.
+            Some(LowLevelType::Address) => match &c.value {
+                ConstValue::LLAddress(_address::IntCast(n)) => OpKind::ConstInt(*n),
+                ConstValue::LLAddress(_address::Null) => OpKind::ConstInt(0),
                 _ => fail(),
             },
             None => match &c.value {
@@ -1693,14 +1754,20 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
 /// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
 /// `CallPath` a helper is registered under.
 fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
-    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let Hlvalue::Constant(c) = hlv else {
         panic!("jtransform_opname::lower_graph: direct_call callee operand is not a constant");
     };
-    let ConstValue::LLPtr(ptr) = &c.value else {
+    callee_name_from_funcptr_value(&c.value)
+}
+
+/// `_func._name` of a non-null funcptr `ConstValue::LLPtr`. Shared with
+/// `Assembler.emit_const_i_from_const_allow_short` (`assembler.rs`).
+pub(crate) fn callee_name_from_funcptr_value(value: &ConstValue) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let ConstValue::LLPtr(ptr) = value else {
         panic!(
             "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
-            c.value
+            value
         );
     };
     match ptr._obj0_value() {
@@ -1754,6 +1821,58 @@ fn lltype_is_gc_ptr(var: &FVar) -> bool {
         Some(LowLevelType::Ptr(ptr)) => ptr.TO._gckind() == GcKind::Gc,
         Some(LowLevelType::InteriorPtr(ip)) => ip.TO._gckind() == GcKind::Gc,
         _ => false,
+    }
+}
+
+/// `Constant(None, lltype.Void)` — `Transformer.optimize_block.do_rename`
+/// (`jtransform.py`) Void branch.
+fn void_none_hlvalue() -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ))
+}
+
+/// `Transformer._do_renaming` (`jtransform.py`): clone the op with renamed
+/// args only when some arg is in the block-local Void `renamings`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn rename_void_op_args(
+    op: &crate::flowspace::model::SpaceOperation,
+    void_renamings: &HashMap<FVar, Hlvalue>,
+) -> Option<crate::flowspace::model::SpaceOperation> {
+    if !op.args.iter().any(|arg| match arg {
+        Hlvalue::Variable(v) => void_renamings.contains_key(v),
+        _ => false,
+    }) {
+        return None;
+    }
+    let mut renamed = op.clone();
+    for arg in &mut renamed.args {
+        if let Hlvalue::Variable(v) = arg {
+            if let Some(mapped) = void_renamings.get(v) {
+                *arg = mapped.clone();
+            }
+        }
+    }
+    Some(renamed)
+}
+
+/// `Transformer._do_renaming_on_link` (`jtransform.py`): map a Variable
+/// through the block-local Void `renamings`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn rename_void_hlvalue<'a>(
+    hlv: &'a Hlvalue,
+    void_renamings: &'a HashMap<FVar, Hlvalue>,
+) -> &'a Hlvalue {
+    match hlv {
+        Hlvalue::Variable(v) => void_renamings.get(v).unwrap_or(hlv),
+        _ => hlv,
     }
 }
 
@@ -2499,6 +2618,48 @@ mod tests {
                 .expect("integer-bank alias graph drains to JitCode")
                 .code
                 .is_empty()
+        );
+    }
+
+    /// `Transformer.rewrite_op_cast_opaque_ptr` (`jtransform.py`) returns
+    /// None: the result is aliased to `op.args[0]`, the same `same_as`
+    /// rewrite as `rewrite_op_same_as` / `rewrite_op_cast_pointer`.
+    #[test]
+    fn lower_graph_aliases_cast_opaque_ptr_to_same_as() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "cast_opaque_ptr_alias",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let casted = variable_with_lltype("casted", STRPTR.clone());
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_opaque_ptr",
+            vec![Hlvalue::Variable(p.clone())],
+            Hlvalue::Variable(casted.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(casted.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        assert_eq!(startblock_unops(&model), vec!["same_as".to_string()]);
+        let op = &model.block(model.startblock).operations[0];
+        let OpKind::UnaryOp { operand, .. } = &op.kind else {
+            panic!("cast_opaque_ptr must lower to UnaryOp same_as, got {op:?}");
+        };
+        assert_eq!(op.result.as_ref(), Some(&casted));
+        assert_eq!(operand, &p);
+        assert_eq!(
+            model.block(model.startblock).exits[0].args,
+            vec![LinkArg::Value(casted)]
         );
     }
 
@@ -4771,6 +4932,76 @@ mod tests {
         let expected = build_number(None, crate::annotator::model::KnownType::RInt(class))
             .expect("UCHAR is interned");
         assert_eq!(result.concretetype(), Some(expected));
+    }
+
+    /// `Assembler.emit_const` kind `'ref'`: `StringRepr.convert_const`
+    /// prebuilt `Ptr(STR)` (`const_str_cache_llstr`) is `ConstStr` of
+    /// the `rpy_string.chars` bytes.
+    #[test]
+    fn lower_graph_materializes_prebuilt_str_ptr_as_const_str() {
+        let start = Block::shared(vec![]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "prebuilt_str_const",
+            start.clone(),
+            Hlvalue::Variable(returned.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![strptr_const()],
+            Hlvalue::Variable(returned.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(returned.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstStr(b) if b == b"hello")),
+            "prebuilt Ptr(STR) becomes ConstStr(b\"hello\"): {ops:?}"
+        );
+    }
+
+    /// `Assembler.emit_const` kind `'int'`: `TYPE == llmemory.Address`
+    /// → `adr2int`; `cast_int_to_adr(n)` (`_address::IntCast(n)`) is `n`.
+    #[test]
+    fn lower_graph_materializes_address_intcast_as_const_int() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        let start = Block::shared(vec![]);
+        let returned = variable_with_lltype("returned", LowLevelType::Address);
+        let graph = FlowGraph::with_return_var(
+            "address_intcast_const",
+            start.clone(),
+            Hlvalue::Variable(returned.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![constant_with_lltype(
+                ConstValue::LLAddress(_address::IntCast(42)),
+                LowLevelType::Address,
+            )],
+            Hlvalue::Variable(returned.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(returned.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(42))),
+            "Address IntCast(42) becomes ConstInt(42): {ops:?}"
+        );
     }
 
     /// `rewrite_op_cast_primitive` / `rewrite_op_force_cast`: a Number

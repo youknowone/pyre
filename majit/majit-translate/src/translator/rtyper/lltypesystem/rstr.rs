@@ -1113,11 +1113,11 @@ pub(crate) fn build_ll_utf8iter_helper_graph(
         ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
         LowLevelType::Void,
     );
-    let cflags = Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let cflags = gc_flavor_const()?;
     let v_iter = variable_with_lltype("iter", iter_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
-        vec![Hlvalue::Constant(c1), Hlvalue::Constant(cflags)],
+        vec![Hlvalue::Constant(c1), cflags],
         Hlvalue::Variable(v_iter.clone()),
     ));
     startblock.borrow_mut().operations.push(SpaceOperation::new(
