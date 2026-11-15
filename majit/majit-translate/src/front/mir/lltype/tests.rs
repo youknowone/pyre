@@ -16567,6 +16567,81 @@ fn core_alloc_layout_does_not_share_typeobject_layout_leaf() {
     );
 }
 
+/// A pointer field whose pointee leaf is ambiguous spells the qualified
+/// identity `adt_ast_head` paints. `bookkeeper.py` `getuniqueclassdef`
+/// is one ClassDef per class, so the row has to name that class. An
+/// unambiguous pointee keeps the TypeDecl leaf.
+#[test]
+fn ambiguous_layout_pointer_field_row_projects_classdef() {
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            code_struct(0, &["pyre_object", "typeobject", "Layout"]),
+            opaque_type(1, &["core", "alloc", "layout", "Layout"]),
+            code_struct(2, &["pyre_object", "typeobject", "PlainWord"]),
+            type_decl_struct(
+                3,
+                &["pyre_object", "typeobject", "Holder"],
+                vec![
+                    serde_json::json!({
+                        "name": "layout",
+                        "ty": {"RawPtr": [adt_node(0), "Shared"]},
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "plain",
+                        "ty": {"RawPtr": [adt_node(2), "Shared"]},
+                        "attr_info": null
+                    }),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::new();
+    let layout_ptr = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Shared"]}).into());
+    let plain_ptr = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(2), "Shared"]}).into());
+    let unpainted_layout = super::tyref_to_field_layout_string(&layout_ptr, &llbc, &gc, &raw);
+    let unpainted_plain = super::tyref_to_field_layout_string(&plain_ptr, &llbc, &gc, &raw);
+    assert_eq!(unpainted_layout, "*const Layout");
+    assert_eq!(unpainted_plain, "*const PlainWord");
+    let (_, _, mut fields, mut enums, mut origins, _, _, ids) =
+        super::derive_program_metadata(&llbc, &gc, super::no_immutable_fields(), &raw, &[]);
+    super::harden_duplicate_leaf_metadata(&mut fields, &mut origins, &mut enums, Some(&ids));
+    assert_eq!(
+        fields.field_type("typeobject::Holder", "plain"),
+        Some(unpainted_plain.as_str())
+    );
+    assert_eq!(
+        fields.field_type("typeobject::Holder", "plain"),
+        Some("*const PlainWord")
+    );
+    let layout_row = fields
+        .field_type("typeobject::Holder", "layout")
+        .expect("Holder.layout row")
+        .to_string();
+    assert_eq!(layout_row, "*const typeobject::Layout");
+    assert_ne!(layout_row, unpainted_layout);
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(std::rc::Rc::new(fields));
+    let crate::annotator::model::SomeValue::Instance(projected) =
+        bk.project_struct_field_type(&layout_row)
+    else {
+        panic!("qualified Layout pointer must project to SomeInstance");
+    };
+    let classdef = projected
+        .classdef
+        .as_ref()
+        .expect("qualified Layout pointer keeps its ClassDef");
+    assert!(projected.can_be_none, "a raw pointer instance is nullable");
+    let name = classdef.borrow().name.clone();
+    assert!(
+        name == "typeobject::Layout" || name == "typeobject.Layout",
+        "projected class is the qualified Layout, got {name}"
+    );
+}
+
 /// An Opaque scalar-word projection takes the declared name from the
 /// defining crate's harvest. `__pos_N` is only the missing-row fallback.
 #[test]

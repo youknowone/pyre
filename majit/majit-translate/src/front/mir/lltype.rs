@@ -5565,6 +5565,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
         llbc,
         gc_struct_ids,
         &std::collections::HashSet::<String>::new(),
+        no_tombstoned_leaves(),
     );
     if majit_ir::descr::is_shared_u8_slice_spelling(&spelling)
         || majit_ir::descr::is_option_of_u8_window_spelling(&spelling)
@@ -7204,6 +7205,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<ExceptionClassRawOwnedAttr> {
     if !tyref_is_by_value_raw_flavor_struct(ty, llbc, raw_alloc_flavor_structs) {
         return None;
@@ -7219,6 +7221,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        ambiguous_leaves,
     );
     let class_root =
         flavor_raw_pointer_class_root(&pointer, llbc, tombstoned, raw_alloc_flavor_structs)
@@ -13816,13 +13819,21 @@ pub(in crate::front::mir) fn json_ty_is_objectptr(node: &serde_json::Value, llbc
 /// marker that surfaces them for a follow-up widening rather than silently
 /// mislabelling a field.
 pub(in crate::front::mir) fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
+    tyref_to_ast_string_with(ty, llbc, no_tombstoned_leaves())
+}
+
+fn tyref_to_ast_string_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    ambiguous_leaves: &std::collections::HashSet<String>,
+) -> String {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => Some(v.as_ref()),
         TyRef::Other(v) => Some(v.as_ref()),
         TyRef::Dedup { id } => llbc.dedup_body(*id),
     };
     match body {
-        Some(v) => charon_type_value_to_ast_string(v, llbc, 0),
+        Some(v) => charon_type_value_to_ast_string_with(v, llbc, 0, ambiguous_leaves),
         None => match ty {
             TyRef::Dedup { id } => format!("??unresolved_dedup#{id}"),
             _ => "??no_body".to_string(),
@@ -13842,6 +13853,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if !tyref_is_borrowed_transparent_scalar(
         ty,
@@ -13859,11 +13871,12 @@ fn borrowed_transparent_scalar_field_layout_spelling(
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
     {
-        return Some(tyref_to_field_layout_string(
+        return Some(tyref_to_field_layout_string_with(
             &field.ty,
             llbc,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            ambiguous_leaves,
         ));
     }
     transparent_scalar_kind_layout_spelling(decl, llbc)
@@ -13882,6 +13895,22 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> String {
+    tyref_to_field_layout_string_with(
+        ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        no_tombstoned_leaves(),
+    )
+}
+
+pub(in crate::front::mir) fn tyref_to_field_layout_string_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> String {
     // A `FrameAnchor` / `&FrameAnchor` field is the frame pointer
     // (`tyref_to_ast_string` of a `RawPtr` to an ADT uses the TypeDecl
@@ -13914,6 +13943,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        ambiguous_leaves,
     ) {
         return spelling;
     }
@@ -13929,7 +13959,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // `&Handle` as `*mut {Deref::Target}`. The capture's declared type is
     // the handle, whose class the live `self` already carries
     // (`ClassDef.generalize_attr` with the value's `s_value`).
-    if let Some(reference) = tyref_reference_layout_string(ty, llbc) {
+    if let Some(reference) = tyref_reference_layout_string_with(ty, llbc, ambiguous_leaves) {
         return reference;
     }
     // A transparent GC handle is one pointer to its `Deref::Target`.
@@ -13968,7 +13998,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         // annotator's field projection answer `Instance(PyObject)` for it.
         return tyref_atomic_arg(ty, llbc)
             .and_then(|arg| serde_json::from_value::<TyRef>(arg.clone()).ok())
-            .map(|arg| tyref_to_ast_string(&arg, llbc))
+            .map(|arg| tyref_to_ast_string_with(&arg, llbc, ambiguous_leaves))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
     // A `Vec` of one-word items is the header address (`RustVecRepr`,
@@ -13985,13 +14015,13 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         return niche.storage_ty.to_string();
     }
     let Some(node) = tyref_node(ty, llbc) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     let Some(id) = adt_node_def_id(node) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     let Some(decl) = llbc.type_by_id(id) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     // A by-value integer newtype is the inner scalar in the containing
     // struct's descriptor (`history.getkind`). Spelling the wrapper leaf
@@ -14001,7 +14031,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         && !decl.published_struct_copy
         && let Some(inner) = integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids)
     {
-        return tyref_to_ast_string(inner, llbc);
+        return tyref_to_ast_string_with(inner, llbc, ambiguous_leaves);
     }
     // Foreign Opaque / `published_struct_copy`: `repr.transparent` is
     // false (`tyref_transparent_inner_value_type`). The linked kind is
@@ -14011,7 +14041,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         return transparent_scalar_kind_spelling(kind, transparent_scalar_decl_size(decl, llbc));
     }
     if !decl.is_repr_transparent() {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
         && !decl.published_struct_copy
@@ -14027,10 +14057,10 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
                 | ValueType::Unknown
         )
     {
-        return tyref_to_ast_string(&field.ty, llbc);
+        return tyref_to_ast_string_with(&field.ty, llbc, ambiguous_leaves);
     }
     transparent_scalar_kind_layout_spelling(decl, llbc)
-        .unwrap_or_else(|| tyref_to_ast_string(ty, llbc))
+        .unwrap_or_else(|| tyref_to_ast_string_with(ty, llbc, ambiguous_leaves))
 }
 
 fn transparent_scalar_decl_size(decl: &TypeDecl, llbc: &Llbc) -> u64 {
@@ -14042,25 +14072,36 @@ fn transparent_scalar_decl_size(decl: &TypeDecl, llbc: &Llbc) -> u64 {
 }
 
 /// The physical type spelling of a top-level Rust reference field.
-pub(in crate::front::mir) fn tyref_reference_layout_string(
+fn tyref_reference_layout_string_with(
     ty: &TyRef,
     llbc: &Llbc,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    fn visit(value: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<String> {
+    fn visit(
+        value: &serde_json::Value,
+        llbc: &Llbc,
+        depth: usize,
+        ambiguous_leaves: &std::collections::HashSet<String>,
+    ) -> Option<String> {
         if depth > 24 {
             return None;
         }
         let obj = value.as_object()?;
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            return visit(llbc.dedup_body(id)?, llbc, depth + 1);
+            return visit(llbc.dedup_body(id)?, llbc, depth + 1, ambiguous_leaves);
         }
         if let Some(pair) = obj.get("Value").and_then(serde_json::Value::as_array)
             && pair.len() == 2
         {
-            return visit(&pair[1], llbc, depth + 1);
+            return visit(&pair[1], llbc, depth + 1, ambiguous_leaves);
         }
         let reference = obj.get("Ref")?.as_array()?;
-        let inner = charon_type_value_to_ast_string(reference.get(1)?, llbc, depth + 1);
+        let inner = charon_type_value_to_ast_string_with(
+            reference.get(1)?,
+            llbc,
+            depth + 1,
+            ambiguous_leaves,
+        );
         let mutable = reference
             .get(2)
             .and_then(serde_json::Value::as_str)
@@ -14076,7 +14117,7 @@ pub(in crate::front::mir) fn tyref_reference_layout_string(
         TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
-    visit(value, llbc, 0)
+    visit(value, llbc, 0, ambiguous_leaves)
 }
 
 pub(in crate::front::mir) fn peel_ref_prefix(spelling: &str) -> &str {
@@ -14457,7 +14498,7 @@ fn charon_type_value_to_ast_string_with(
         }
         let inner = items
             .iter()
-            .map(|ty| charon_type_value_to_ast_string(ty, llbc, depth + 1))
+            .map(|ty| charon_type_value_to_ast_string_with(ty, llbc, depth + 1, tombstoned))
             .collect::<Vec<_>>()
             .join(",");
         return format!("({inner})");

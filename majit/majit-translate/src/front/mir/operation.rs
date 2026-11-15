@@ -1709,6 +1709,7 @@ impl<'a> Lowering<'a> {
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
                                     &self.raw_alloc_flavor_structs,
+                                    no_tombstoned_leaves(),
                                 )
                                 .expect("raw-owned exception attr has a pointer row");
                                 ValueType::Unsigned
@@ -7652,6 +7653,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            no_tombstoned_leaves(),
                         )
                         .expect("raw-owned exception attr has a pointer row");
                         ty = ValueType::Ref(Some(raw.class_root));
@@ -9277,6 +9279,7 @@ impl<'a> Lowering<'a> {
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
                                 &self.raw_alloc_flavor_structs,
+                                no_tombstoned_leaves(),
                             )
                             .map(|raw| raw.class_root)
                         })

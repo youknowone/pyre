@@ -7553,6 +7553,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                no_tombstoned_leaves(),
             )
         } else {
             tyref_to_field_layout_string(
