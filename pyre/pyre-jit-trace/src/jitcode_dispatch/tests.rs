@@ -32512,6 +32512,7 @@ fn own_frame_array_store_target_skips_foreign_generator_vable() {
         frame_root,
         w_pycode,
         frame_box: box_a,
+        merge_frame_box: OpRef::NONE,
     });
     let descr_pool: Vec<DescrRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -32548,6 +32549,101 @@ fn own_frame_array_store_target_skips_foreign_generator_vable() {
         "a second instance of the same pycode is a nonstandard box"
     );
     std::hint::black_box((&mut frame_a, &mut frame_b, &wc));
+}
+
+/// Inlined generator resume: `virtualizable_boxes[-1]` is the caller's
+/// frame (`_nonstandard_virtualizable`). That standard box must not
+/// retarget onto the generator.
+#[test]
+fn own_frame_array_store_target_skips_standard_caller_vable_during_generator_resume() {
+    use majit_ir::{GcRef, Value};
+    use pyre_interpreter::bytecode::ConstantData;
+    use pyre_interpreter::{Mode, compile_source};
+
+    pyre_interpreter::module::thread::ensure_runtime_thread();
+    let module =
+        compile_source("def g(n):\n    yield n\n", Mode::Exec).expect("compile should succeed");
+    let raw_code = module
+        .constants
+        .iter()
+        .find_map(|c| match c {
+            ConstantData::Code { code } => Some((**code).clone()),
+            _ => None,
+        })
+        .expect("source should contain a function body");
+    let mut gen_frame = pyre_interpreter::pyframe::PyFrame::new(raw_code.clone()).expect("gen");
+    gen_frame.fix_array_ptrs();
+    let mut caller_frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("caller");
+    caller_frame.fix_array_ptrs();
+    let addr_gen = (&mut *gen_frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let addr_caller = (&mut *caller_frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    assert_ne!(addr_gen, addr_caller);
+
+    let w_pycode = unsafe {
+        *((addr_gen as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
+    };
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(addr_gen as pyre_object::PyObjectRef);
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let box_gen = tc.const_ref(addr_gen as i64);
+    let box_caller = tc.const_ref(addr_caller as i64);
+    let box_merge = tc.const_ref((addr_gen as i64) ^ 1);
+    tc.set_opref_concrete(box_gen, Value::Ref(GcRef(addr_gen)));
+    tc.set_opref_concrete(box_caller, Value::Ref(GcRef(addr_caller)));
+    tc.set_greenfield_virtualizable_box(box_caller, Value::Ref(GcRef(addr_caller)));
+    assert_eq!(tc.standard_virtualizable_box(), Some(box_caller));
+
+    let mut mode = test_fbw_mode();
+    mode.generator_resume = Some(GeneratorResumeSubwalk {
+        frame: addr_gen,
+        frame_root,
+        w_pycode,
+        frame_box: box_gen,
+        merge_frame_box: box_merge,
+    });
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(
+        own_frame_array_store_target(&wc, box_gen),
+        Some(addr_gen),
+        "the GETFIELD box this resume bound still names the generator"
+    );
+    assert_eq!(
+        own_frame_array_store_target(&wc, box_merge),
+        Some(addr_gen),
+        "put_back_list_of_boxes3 rewrite of that same red still names the generator"
+    );
+    assert_ne!(
+        own_frame_array_store_target(&wc, box_caller),
+        Some(addr_gen),
+        "the caller's standard virtualizable is a different frame"
+    );
+    std::hint::black_box((&mut gen_frame, &mut caller_frame, &wc));
 }
 
 /// Walk-start FWW undo captures the whole `locals_cells_stack_w` array, so a

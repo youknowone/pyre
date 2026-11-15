@@ -2418,6 +2418,10 @@ pub struct GeneratorResumeSubwalk {
     /// generator, not a baked address — so suspension stores land on the
     /// same box the compiled loop re-reads.
     pub frame_box: OpRef,
+    /// Loop-input red `put_back_list_of_boxes3` wrote for the same frame
+    /// after this body's `jit_merge_point` (`reached_loop_header`). `NONE`
+    /// until that rewrite; never the caller's `virtualizable_boxes[-1]`.
+    pub merge_frame_box: OpRef,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -6764,6 +6768,33 @@ fn put_back_list_of_boxes3<Sym: WalkSym>(
     for &reg in red_f_regs {
         ctx.registers_f.set(reg, redboxes[i]);
         i += 1;
+    }
+}
+
+/// `put_back_list_of_boxes3` rewrite of this resume body's frame red.
+/// Only the box that already named `resume.frame_box` (or a prior rewrite
+/// of it) is recorded; the caller's `virtualizable_boxes[-1]` is a
+/// different frame (`_nonstandard_virtualizable`).
+fn note_generator_resume_merge_frame_box<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    prior_frame_red: Option<OpRef>,
+    new_frame_red: Option<OpRef>,
+) {
+    let Some(resume) = ctx.fbw_mode.generator_resume.as_mut() else {
+        return;
+    };
+    let Some(new_box) = new_frame_red else {
+        return;
+    };
+    if new_box == OpRef::NONE {
+        return;
+    }
+    let prior = prior_frame_red.unwrap_or(OpRef::NONE);
+    let is_this_frame = prior == resume.frame_box
+        || (resume.merge_frame_box != OpRef::NONE && prior == resume.merge_frame_box)
+        || new_box == resume.frame_box;
+    if is_this_frame {
+        resume.merge_frame_box = new_box;
     }
 }
 
@@ -14332,6 +14363,7 @@ fn reached_loop_header<Sym: WalkSym>(
     if let Some(from) = dead_array_tail_from {
         crate::trace_opcode::null_vable_dead_array_tail(ctx.trace_ctx, from);
     }
+    let prior_frame_red = reds.first().copied();
     let red_len = reds.len();
     let mut live_args = append_virtualizable_boxes(ctx.trace_ctx, reds);
     let before = live_args.clone();
@@ -14342,6 +14374,7 @@ fn reached_loop_header<Sym: WalkSym>(
     // `put_back_list_of_boxes3`: deduped reds go back to the registers.
     // Harmless on the close path; the continue path traces the new identity.
     put_back_list_of_boxes3(ctx, &red_i_regs, &red_r_regs, &red_f_regs, &live_args);
+    note_generator_resume_merge_frame_box(ctx, prior_frame_red, live_args.first().copied());
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if !sym_ptr.is_null() && (sym_reds.frame || sym_reds.ec) {
         // The walk owns this sym for the attempt. Publishing the deduped

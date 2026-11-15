@@ -10745,9 +10745,11 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         None => (index_before, seq_before, journal_mark),
     };
     if !helper_already_ran {
+        // `walker_guard_class` can collect; `seq_pin` is the forwarded
+        // list (`gctransform/shadowstack.py` `pop_roots`).
         set_call_entry_iter_checkpoint::<Sym>(CallEntryIterCheckpoint::list(
             index_before,
-            seq_before,
+            pinned_obj(&seq_pin, seq_before),
             journal_mark,
         ));
     }

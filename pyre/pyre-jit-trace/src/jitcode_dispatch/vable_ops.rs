@@ -1011,9 +1011,11 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 ///
 /// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
 /// mirroring `setfield_gc_via_heapcache`'s parameter shape.
-/// `_nonstandard_virtualizable`: `box is self.metainterp.virtualizable_boxes[-1]`.
-/// After `jit_merge_point` the operand is a loop-input red, a different
-/// OpRef than `resume.frame_box`; `standard_virtualizable_box` is that red.
+/// `_nonstandard_virtualizable`: a box is this walk's generator only when
+/// it is the operand this resume bound (`resume.frame_box`) or the
+/// `put_back_list_of_boxes3` rewrite of that same red. The portal
+/// `virtualizable_boxes[-1]` stays the caller's frame while the body is
+/// inlined (`portal_call_depth != 0`).
 fn vable_is_this_walk_generator_frame<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
@@ -1023,17 +1025,15 @@ fn vable_is_this_walk_generator_frame<Sym: WalkSym>(
     if vable.is_none() {
         return false;
     }
-    if vable == resume.frame_box || ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
-        return true;
-    }
-    if current_inline_vable_target(ctx, vable).is_some() {
-        return true;
-    }
-    match ctx
-        .trace_ctx
-        .lookup_opref_concrete(vable)
-        .or_else(|| ctx.trace_ctx.recover_ref_value(vable, 8))
+    if vable == resume.frame_box
+        || (resume.merge_frame_box != OpRef::NONE && vable == resume.merge_frame_box)
     {
+        return true;
+    }
+    // Pointer equality of a box the trace already stamped (`PTR_EQ` in
+    // `_nonstandard_virtualizable`). `recover_ref_value` guesses a load
+    // and is not that recorded concrete.
+    match ctx.trace_ctx.lookup_opref_concrete(vable) {
         Some(Value::Ref(value)) if value.as_usize() == live => true,
         _ => false,
     }
@@ -1078,13 +1078,12 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
     if let Some(resume) = ctx.fbw_mode.generator_resume {
         let live = live_generator_resume_frame(resume);
         // `_nonstandard_virtualizable` (`pyjitpl.py`): only this walk's
-        // standard virtualizable box (`virtualizable_boxes[-1]`) is the
-        // generator frame. Any other box is a heap store on that object.
+        // generator box is the live generator. The inline concrete frame
+        // is that same object, so a miss must not fall through to it.
         if live != 0 && vable_is_this_walk_generator_frame(ctx, vable, resume, live) {
             return Some(live);
         }
-    }
-    if let Some(frame) = current_inline_vable_target(ctx, vable) {
+    } else if let Some(frame) = current_inline_vable_target(ctx, vable) {
         return Some(frame);
     }
     let frame = ctx
@@ -1228,9 +1227,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         captured,
         inline_field_index,
     ) {
-        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
-            || ctx.fbw_mode.generator_resume.is_some()
-        {
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
             let frame = arm_durable_store_frame(ctx, frame);
             crate::state::store_live_frame_static_int(frame, field_index, value);
         }
@@ -1302,9 +1299,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     if let (Some(frame), Some(field_index)) =
         (own_frame_array_store_target(ctx, obj), inline_field_index)
     {
-        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
-            || ctx.fbw_mode.generator_resume.is_some()
-        {
+        if ctx.trace_ctx.standard_virtualizable_box() != Some(obj) {
             let frame = arm_durable_store_frame(ctx, frame);
             crate::state::store_live_frame_static_int(frame, field_index, imm);
         }
@@ -1944,28 +1939,25 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     };
     if index_value >= 0
         && let Some(frame) = own_frame_array_store_target(ctx, vable)
+        && ctx.trace_ctx.standard_virtualizable_box() != Some(vable)
     {
-        let extra = ctx.trace_ctx.standard_virtualizable_box() != Some(vable)
-            || ctx.fbw_mode.generator_resume.is_some();
-        if extra {
-            // Standard virtualizable already landed through `write_box_at`.
-            // Extra store is the inlined-callee / `callee_shadow` object.
-            let frame = arm_durable_store_frame(ctx, frame);
-            if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
-                crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
-            }
-            // Re-read after `vable_setarrayitem_checked`. The array store may
-            // itself collect, so the shadow reads the pin again below.
-            let live = live_after_vable_store(&store_root, value_bank, concrete);
-            crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
-            // Only this level's own frame: a store to a foreign vable must not
-            // bind in `locals()` through this shadow. The published word is the
-            // pin after both calls. A `NONE` Ref has no box and is not stored.
-            // Record the virtualizable object `write_box_at` targeted, not the
-            // operand register that held its address (`_opimpl_setarrayitem_vable`).
-            let live = live_after_vable_store(&store_root, value_bank, concrete);
-            publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
+        // Standard virtualizable already landed through `write_box_at`.
+        // Extra store is the inlined-callee / `callee_shadow` object.
+        let frame = arm_durable_store_frame(ctx, frame);
+        if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
+            crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
         }
+        // Re-read after `vable_setarrayitem_checked`. The array store may
+        // itself collect, so the shadow reads the pin again below.
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
+        crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
+        // Only this level's own frame: a store to a foreign vable must not
+        // bind in `locals()` through this shadow. The published word is the
+        // pin after both calls. A `NONE` Ref has no box and is not stored.
+        // Record the virtualizable object `write_box_at` targeted, not the
+        // operand register that held its address (`_opimpl_setarrayitem_vable`).
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
+        publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
     }
     let _ = _write;
     Ok((DispatchOutcome::Continue, op.next_pc))
