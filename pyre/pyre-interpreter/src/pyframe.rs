@@ -459,8 +459,9 @@ pub mod frame_locals_proxy {
             // `mapping` materializes a fresh dict, so every element of the
             // caller's slice is a pre-allocation copy by the time the call
             // reads it.  Publish the slice, take the snapshot, then rebuild it.
-            // The proxy payload itself is born non-moving, so `self` and the
-            // frame it reaches stay valid across the allocation.
+            // The proxy is non-moving; its `w_frame` field is forwarded by the
+            // collector, so the frame is read through the field after the
+            // allocation.
             let roots = pyre_object::gc_roots::push_roots();
             let args_base = roots.publish(args);
             roots.normalize(args_base, args.len());
@@ -554,16 +555,17 @@ pub mod frame_locals_proxy {
             // per local and `get_or_create_extra_locals` allocates the dict, so
             // both stores below would otherwise write pre-allocation copies.
             let roots = pyre_object::gc_roots::push_roots();
-            let key_slot = roots.publish(&[key, value]);
-            roots.normalize(key_slot, 2);
+            let key_slot = roots.publish(&[key, value, self.w_frame]);
+            roots.normalize(key_slot, 3);
             // The stores below target `locals_cells_stack_w`, so materialize it
             // first.  The force follows the publish rather than preceding the
             // region: it can collect, and `key` and `value` are pre-allocation
             // copies until they are rooted.
             self.force_locals();
             let value_slot = key_slot + 1;
+            let frame_slot = key_slot + 2;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
-                let frame = self.frame();
+                let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
                 let is_cell_kind = {
                     let code = frame.code();
                     index >= code.varnames.len() || super::cell_slot(code, index)
@@ -576,7 +578,8 @@ pub mod frame_locals_proxy {
             // `f_extra_locals` exact dict.  In particular, a PEP 709 hidden
             // local is read from the fast slot but proxy writes of the same
             // name do not mutate that slot or the module/eval locals mapping.
-            let extra = self.frame().get_or_create_extra_locals()?;
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }
+                .get_or_create_extra_locals()?;
             crate::baseobjspace::setitem(extra, roots.get(key_slot), roots.get(value_slot))
                 .map(|_| ())
         }
@@ -985,12 +988,14 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if let Some(value) = self.locals_plus_value(roots.get(key_slot))? {
                 return Ok(value);
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if !extra.is_null() {
-                let extra_slot = key_slot + 1;
+                let extra_slot = key_slot + 2;
                 let _ = roots.pin_root(extra);
                 if let Some(value) =
                     crate::baseobjspace::finditem(roots.get(extra_slot), roots.get(key_slot))?
@@ -1025,17 +1030,19 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if self.key_is_fast_local(roots.get(key_slot))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
             // A delete does not create the extras dict that a store would.
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 return Err(crate::PyError::key_error_with_key(roots.get(key_slot)));
             }
-            let extra_slot = key_slot + 1;
+            let extra_slot = key_slot + 2;
             let _ = roots.pin_root(extra);
             crate::baseobjspace::delitem(roots.get(extra_slot), roots.get(key_slot))
         }

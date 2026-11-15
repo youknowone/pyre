@@ -3688,9 +3688,40 @@ fn op_is_cast_ptr_to_int(op: &majit_translate::model::SpaceOperation) -> bool {
     }
 }
 
+fn used_variable_ids(
+    graph: &majit_translate::model::FunctionGraph,
+) -> std::collections::HashSet<u64> {
+    use majit_translate::inline::op_variable_refs;
+    use majit_translate::model::ExitSwitch;
+    let mut used = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            used.extend(op_variable_refs(&op.kind).into_iter().map(|var| var.id()));
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                used.insert(var.id());
+            }
+            Some(ExitSwitch::Fused { args, .. }) => {
+                used.extend(args.iter().map(|var| var.id()));
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let Some(var) = arg.as_variable() {
+                    used.insert(var.id());
+                }
+            }
+        }
+    }
+    used
+}
+
 /// After rtyping, unused `p as usize` must not remain as `cast_ptr_to_int`.
 /// `GcRef` retypes the source pointer; a surviving `CastPtrToInt` forces
-/// the virtual `NewWithVtable`.
+/// the virtual `NewWithVtable`. Casts with a user (the raw spill buffer of
+/// the allocation out-params) stay.
 #[test]
 fn frame_box_new_unused_cast_ptr_to_int_dies_after_rtype() {
     use majit_translate::front::mir::lower_fun_decl;
@@ -3703,20 +3734,25 @@ fn frame_box_new_unused_cast_ptr_to_int_dies_after_rtype() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
+        .expect("FrameBox::new_placed");
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new_placed");
         let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let used = used_variable_ids(&transformed.graph);
+        let unused: Vec<u64> = transformed
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| op_is_cast_ptr_to_int(op))
+            .filter_map(|op| op.result.as_ref().map(|var| var.id()))
+            .filter(|id| !used.contains(id))
+            .collect();
         assert!(
-            !transformed
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(op_is_cast_ptr_to_int),
-            "unused rtyped cast_ptr_to_int must die after transform_graph: {}",
+            unused.is_empty(),
+            "unused rtyped cast_ptr_to_int must die after transform_graph: unused={unused:?} {}",
             transformed.graph.dump()
         );
     });
