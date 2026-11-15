@@ -197,6 +197,8 @@ pub enum Const {
     Ref(GcRef),
 }
 
+const _: () = assert!(std::mem::size_of::<Const>() == 16);
+
 impl PartialEq for Const {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -491,6 +493,19 @@ impl Const {
             Value::Ref(v) => Const::from_gcref(v),
             Value::Void => panic!("Const::from_value: Void has no Const counterpart"),
         }
+    }
+
+    /// Payload word at offset 8. `history.py` `ConstInt.getint` /
+    /// `ConstPtr.getref_base` / `ConstFloat.getfloatstorage` are typed
+    /// field loads of `self.value`; every `Const` arm stores that word
+    /// here. TAGCONST decode uses this after a `debug_assert!` on the
+    /// bank's variant (`resume.py` numbering).
+    #[inline(always)]
+    pub fn payload_word(&self) -> i64 {
+        debug_assert_eq!(std::mem::size_of::<Const>(), 16);
+        // SAFETY: each arm is an 8-byte payload at offset 8, so this is
+        // the field load `as_raw_i64` performs on every arm.
+        unsafe { *(self as *const Const as *const i64).add(1) }
     }
 
     /// history.py ConstInt.getint — unsigned/signed integer value.
@@ -2204,6 +2219,21 @@ mod tests {
     fn test_gcref_null() {
         assert!(GcRef::NULL.is_null());
         assert!(!GcRef(0x1234).is_null());
+    }
+
+    #[test]
+    fn const_payload_word_matches_as_raw_i64() {
+        assert_eq!(std::mem::size_of::<Const>(), 16);
+        let cases = [
+            Const::Int(0x1111_2222_3333_4444),
+            Const::Int(-1),
+            Const::Float(2.5),
+            Const::Ref(GcRef(0x5555)),
+            Const::Ref(GcRef(0)),
+        ];
+        for c in cases {
+            assert_eq!(c.payload_word(), c.as_raw_i64());
+        }
     }
 
     #[test]
