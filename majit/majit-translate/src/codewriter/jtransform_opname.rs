@@ -77,7 +77,7 @@ use crate::model::{
 };
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, Array, GcKind, LowLevelType, Ptr, PtrTarget,
+    _address, Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{
     STR, STRPTR, UNICODE, prebuilt_str_bytes_and_hash,
@@ -734,9 +734,7 @@ fn transduce_op(
         "getfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
-            let owner_root = owner_root_of(&base);
-            let field = crate::model::FieldDescriptor::new(field_name, owner_root)
-                .with_owner_typeptr_hint(owner_typeptr_hint_of(&base));
+            let field = field_descriptor_of(&base, &field_name, "getfield");
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
             out.push_op_with_result_var(
@@ -830,9 +828,7 @@ fn transduce_op(
         "setfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
-            let owner_root = owner_root_of(&base);
-            let field = crate::model::FieldDescriptor::new(field_name, owner_root)
-                .with_owner_typeptr_hint(owner_typeptr_hint_of(&base));
+            let field = field_descriptor_of(&base, &field_name, "setfield");
             let value = linkarg_from_hlvalue(&op.args[2]);
             let ty = hlvalue_value_type(&op.args[2]);
             out.push_op_var(
@@ -1798,31 +1794,93 @@ fn field_name_of(hlv: &Hlvalue) -> String {
     }
 }
 
+/// Owning `Struct` of a field-access base — `jtransform.py
+/// rewrite_op_getfield`: `STRUCT = v_inst.concretetype.TO`.  A resolved
+/// `ForwardReference` is unwrapped the way `LowLevelType::short_name` /
+/// `Hash` unwrap `LowLevelType::ForwardReference` (`lltype.rs`).
+fn owner_struct_of(base: &FVar) -> Option<Struct> {
+    match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => owner_struct_of_ptr_target(&ptr.TO),
+        _ => None,
+    }
+}
+
+fn owner_struct_of_ptr_target(to: &PtrTarget) -> Option<Struct> {
+    match to {
+        PtrTarget::Struct(s) => Some(s.clone()),
+        PtrTarget::ForwardReference(fr) => resolved_struct_of(fr),
+        _ => None,
+    }
+}
+
+fn resolved_struct_of(fr: &ForwardReference) -> Option<Struct> {
+    match fr.resolved() {
+        Some(LowLevelType::Struct(s)) => Some(*s),
+        Some(_) => None,
+        None => panic!(
+            "jtransform_opname::owner_struct_of: ForwardReference is unresolved \
+             (cpu.fielddescrof needs STRUCT)"
+        ),
+    }
+}
+
+fn owner_struct_of_lltype(ty: &LowLevelType) -> Option<Struct> {
+    match ty {
+        LowLevelType::Ptr(ptr) => owner_struct_of_ptr_target(&ptr.TO),
+        LowLevelType::Struct(s) => Some((**s).clone()),
+        LowLevelType::ForwardReference(fr) => resolved_struct_of(fr),
+        _ => None,
+    }
+}
+
 /// The owning struct leaf of a field access — the pointee-struct name of
 /// the base pointer's `concretetype` (`Ptr(Struct("stringbuilder"))` →
 /// `"stringbuilder"`).  `None` when the base is not a pointer-to-struct,
 /// in which case the layout layer falls back to its type-string heuristic.
 fn owner_root_of(base: &FVar) -> Option<String> {
-    match base.concretetype()? {
-        LowLevelType::Ptr(ptr) => match ptr.TO {
-            PtrTarget::Struct(s) => Some(s._name),
-            _ => None,
-        },
-        _ => None,
-    }
+    owner_struct_of(base).map(|s| s._name)
 }
 
 /// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
 fn owner_typeptr_hint_of(base: &FVar) -> bool {
-    match base.concretetype() {
-        Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
-            PtrTarget::Struct(s) => {
-                matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true)))
-            }
-            _ => false,
-        },
-        _ => false,
+    owner_struct_of(base)
+        .is_some_and(|s| matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true))))
+}
+
+/// `FieldDescriptor` for a non-Void `getfield` / `setfield`.  Upstream
+/// `rewrite_op_getfield` always has the STRUCT (`cpu.fielddescrof(STRUCT,
+/// c_fieldname.value)`); a `Ptr` base without one is refused.  `_hints
+/// ['fieldnames']` maps the rtyper's mangled `inst_<attr>` ll name to the
+/// Rust layout attribute name.
+fn field_descriptor_of(
+    base: &FVar,
+    ll_field_name: &str,
+    opname: &str,
+) -> crate::model::FieldDescriptor {
+    let owner = owner_struct_of(base);
+    if matches!(base.concretetype(), Some(LowLevelType::Ptr(_))) && owner.is_none() {
+        panic!(
+            "jtransform_opname::lower_graph: {opname} on {ll_field_name} has no STRUCT owner \
+             (cpu.fielddescrof(STRUCT, name))"
+        );
     }
+    let field_name = owner
+        .as_ref()
+        .map(|s| field_name_for_struct(s, ll_field_name))
+        .unwrap_or_else(|| ll_field_name.to_string());
+    crate::model::FieldDescriptor::new(field_name, owner_root_of(base))
+        .with_owner_typeptr_hint(owner_typeptr_hint_of(base))
+}
+
+fn field_name_for_struct(owner: &Struct, ll_name: &str) -> String {
+    if let Some(ConstValue::Dict(map)) = owner._hints.get("fieldnames") {
+        if let Some(mapped) = map.get(&ConstValue::byte_str(ll_name)) {
+            if let Some(bytes) = mapped.as_byte_str() {
+                return String::from_utf8_lossy(bytes).into_owned();
+            }
+        }
+    }
+    ll_name.to_string()
 }
 
 /// Whether an operand is the null pointer constant (`ConstValue::None`),
@@ -1990,12 +2048,13 @@ fn value_type_from_lltype(lltype: &LowLevelType) -> ValueType {
 fn malloc_struct_owner(hlv: &Hlvalue) -> String {
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
-            ConstValue::LowLevelType(lltype) => match &**lltype {
-                LowLevelType::Struct(s) => s._name.clone(),
-                other => panic!(
-                    "jtransform_opname::lower_graph: malloc type operand is not a Struct: {other:?}"
-                ),
-            },
+            ConstValue::LowLevelType(lltype) => owner_struct_of_lltype(lltype)
+                .map(|s| s._name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "jtransform_opname::lower_graph: malloc type operand is not a Struct: {lltype:?}"
+                    )
+                }),
             other => panic!(
                 "jtransform_opname::lower_graph: malloc first operand is not a LowLevelType const: {other:?}"
             ),
@@ -2059,7 +2118,7 @@ mod tests {
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{
-        Array, LowLevelType, Ptr, PtrTarget, Struct,
+        Array, ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
@@ -5341,5 +5400,128 @@ mod tests {
                 .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
             "unhinted typeptr is not GuardClass: {ops:?}"
         );
+    }
+
+    /// `Ptr(ForwardReference(<resolved GcStruct m::W_X>))` with
+    /// `_hints['fieldnames']` mapping `inst_name` → `name`.  Models
+    /// `InstanceRepr.object_type` after `_setup_repr.become`.
+    fn w_x_instance_ptr() -> LowLevelType {
+        use std::sync::Arc;
+        let mut fieldnames = indexmap::IndexMap::new();
+        fieldnames.insert(
+            ConstValue::byte_str("inst_name"),
+            ConstValue::byte_str("name"),
+        );
+        let body = Struct::gc_with_hints(
+            "m::W_X",
+            vec![("inst_name".into(), LowLevelType::Signed)],
+            vec![("fieldnames".into(), ConstValue::Dict(Arc::new(fieldnames)))],
+        );
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Struct(Box::new(body)))
+            .expect("ForwardReference.become GcStruct");
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }))
+    }
+
+    /// `jtransform.py rewrite_op_getfield`: `STRUCT = v_inst.concretetype.TO`
+    /// after `ForwardReference.become`; `cpu.fielddescrof(STRUCT, name)`
+    /// uses the `fieldnames` hint so the descriptor is `name` on `m::W_X`.
+    #[test]
+    fn lower_graph_getfield_through_forward_reference_keeps_struct_owner() {
+        let ptr_ty = w_x_instance_ptr();
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("name", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "getfield_forward_reference",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("inst_name"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let model = lower_graph(&graph);
+        let field = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field),
+                _ => None,
+            })
+            .expect("getfield lowers to FieldRead");
+        assert_eq!(field.name, "name");
+        assert_eq!(field.owner_root.as_deref(), Some("m::W_X"));
+    }
+
+    #[test]
+    fn lower_graph_setfield_through_forward_reference_keeps_struct_owner() {
+        let ptr_ty = w_x_instance_ptr();
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "setfield_forward_reference",
+            startblock.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("inst_name"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&startblock, &graph, v);
+
+        let model = lower_graph(&graph);
+        let field = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field),
+                _ => None,
+            })
+            .expect("setfield lowers to FieldWrite");
+        assert_eq!(field.name, "name");
+        assert_eq!(field.owner_root.as_deref(), Some("m::W_X"));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no STRUCT owner")]
+    fn lower_graph_getfield_without_struct_owner_panics() {
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("x", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "getfield_without_struct_owner",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("item"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+        let _ = lower_graph(&graph);
     }
 }
