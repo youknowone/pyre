@@ -735,13 +735,15 @@ fn transduce_op(
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
             let owner_root = owner_root_of(&base);
+            let field = crate::model::FieldDescriptor::new(field_name, owner_root)
+                .with_owner_typeptr_hint(owner_typeptr_hint_of(&base));
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
                 OpKind::FieldRead {
                     base,
-                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    field,
                     ty,
                     pure: false,
                 },
@@ -829,13 +831,15 @@ fn transduce_op(
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
             let owner_root = owner_root_of(&base);
+            let field = crate::model::FieldDescriptor::new(field_name, owner_root)
+                .with_owner_typeptr_hint(owner_typeptr_hint_of(&base));
             let value = linkarg_from_hlvalue(&op.args[2]);
             let ty = hlvalue_value_type(&op.args[2]);
             out.push_op_var(
                 block,
                 OpKind::FieldWrite {
                     base,
-                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    field,
                     value,
                     ty,
                 },
@@ -1808,6 +1812,19 @@ fn owner_root_of(base: &FVar) -> Option<String> {
     }
 }
 
+/// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
+fn owner_typeptr_hint_of(base: &FVar) -> bool {
+    match base.concretetype() {
+        Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
+            PtrTarget::Struct(s) => {
+                matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true)))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether an operand is the null pointer constant (`ConstValue::None`),
 /// the second operand of the builder `ll_bool` `ptr_ne(builder, NULL)`.
 fn is_null_const(hlv: &Hlvalue) -> bool {
@@ -2037,8 +2054,8 @@ mod tests {
     use super::{lower_graph, materialize_constant};
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
-        Link, SpaceOperation, c_last_exception,
+        Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc,
+        Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{
@@ -5164,6 +5181,165 @@ mod tests {
             call_args.first(),
             Some(&LinkArg::Value(null_var)),
             "first argument is the ConstRefNull result: {call_args:?}"
+        );
+    }
+
+    fn transform_lowered(model: crate::model::FunctionGraph) -> crate::model::FunctionGraph {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+
+        let mut cc = CallControl::new();
+        Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&model)
+            .graph
+    }
+
+    fn close_return(startblock: &BlockRef, graph: &FlowGraph, value: Variable) {
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    /// `jtransform.py handle_getfield_typeptr`: `getfield(v, 'typeptr')` on
+    /// `Ptr(rclass.OBJECT)` is `-live-` + `guard_class(v)`, not a FieldRead.
+    /// `rclass.OBJECT` has no CallControl row; the STRUCT `_hints['typeptr']`
+    /// is what `is_typeptr_getset` reads.
+    #[test]
+    fn lower_graph_object_typeptr_getfield_becomes_guard_class() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let graph = FlowGraph::with_return_var(
+            "object_typeptr_getfield",
+            startblock.clone(),
+            Hlvalue::Variable(cls.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(cls.clone()),
+        ));
+        close_return(&startblock, &graph, cls);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let saw_handle = ops.windows(2).any(|window| {
+            matches!(&window[0].kind, OpKind::Live { forced } if forced.is_empty())
+                && matches!(&window[1].kind, OpKind::GuardClass { base } if *base == v)
+        });
+        assert!(
+            saw_handle,
+            "handle_getfield_typeptr is -live- + GuardClass {{ base: v }}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+            "OBJECT typeptr getfield must not stay FieldRead: {ops:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_setfield`: `is_typeptr_getset` drops the
+    /// store (`# done by 'new'`).
+    #[test]
+    fn lower_graph_object_typeptr_setfield_is_dropped() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let c = variable_with_lltype("c", CLASSTYPE.clone());
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(v.clone()),
+            Hlvalue::Variable(c.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "object_typeptr_setfield",
+            startblock.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+                Hlvalue::Variable(c),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&startblock, &graph, v);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.is_empty(),
+            "is_typeptr_getset setfield emits nothing; ops={ops:?}"
+        );
+    }
+
+    /// A `GcStruct` named field `typeptr` without `_hints['typeptr']` is an
+    /// ordinary load. `is_typeptr_getset` requires the hint.
+    #[test]
+    fn lower_graph_unhinted_typeptr_field_stays_field_read() {
+        let s = Struct::gc("S", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(s),
+        }));
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("tp", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "unhinted_typeptr_getfield",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let field = ops.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(field),
+            _ => None,
+        });
+        let field = field.unwrap_or_else(|| panic!("unhinted typeptr stays FieldRead: {ops:?}"));
+        assert_eq!(field.name, "typeptr");
+        assert!(
+            !field.owner_typeptr_hint,
+            "GcStruct S does not carry the typeptr hint"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
+            "unhinted typeptr is not GuardClass: {ops:?}"
         );
     }
 }
