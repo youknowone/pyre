@@ -3562,62 +3562,63 @@ impl ResumeDataLoopMemo {
         // box in `cached`; ResumeDataLoopMemo._number_boxes walks that
         // object. A miss is a bind-at-alloc / iterator-cache bug.
         let held = cached.or(snapshot_box.cached.as_ref());
-        let b = match held {
-            Some(cached) => cached.get_box_replacement(false),
-            None => panic!(
+        let Some(held) = held else {
+            panic!(
                 "_number_one: snapshot slot {raw_opref:?} has no iterator-cache box \
                  (TraceIterator._get)"
-            ),
+            );
         };
-        let opref = b.to_opref();
-        if opref.is_none() {
-            numb_state.append_short(NULLREF);
-            return Ok(());
-        }
-        // resume.py: isinstance(box, Const) → getconst
-        if env.is_const(&b) {
-            let (val, tp) = env.get_const(&b);
-            let tagged = self.getconst(val, tp)?;
-            numb_state.append_short(tagged);
-            return Ok(());
-        }
-        // ResumeDataLoopMemo._number_boxes: liveboxes
-        if let Some(tagged) = numb_state.liveboxes.get(&b) {
-            numb_state.append_short(tagged);
-            return Ok(());
-        }
-        // ResumeDataLoopMemo._number_boxes:
-        //
+        // resume.py ResumeDataLoopMemo._number_boxes:
         //     box = iter.get(...)
         //     box = box.get_box_replacement()
-        //     ...
-        //     if box.type == 'r':
-        //
-        // The type used for virtual classification is the replacement
-        // box's type (`AbstractValue.type`), not the original snapshot
-        // slot's fallback type. A snapshot slot can carry an Int fallback
-        // from tracing but forward to a Ref virtual after optimization;
-        // keeping the stale fallback would number that virtual as a TAGBOX
-        // and the subsequent fail-arg force would materialize it.
-        let box_type = b.type_();
-        let is_virtual = match box_type {
-            majit_ir::Type::Ref => env.is_virtual_ref(&b),
-            majit_ir::Type::Int => env.is_virtual_raw(&b),
-            _ => false,
-        };
-        let tagged = if is_virtual {
-            let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
-            numb_state.num_virtuals += 1;
-            t
-        } else {
-            // resume.py `_number_boxes` reads `box.type` off the box.
-            let t = tag(numb_state.num_boxes, TAGBOX)?;
-            numb_state.num_boxes += 1;
-            t
-        };
-        numb_state.liveboxes.insert(b, tagged);
-        numb_state.append_short(tagged);
-        Ok(())
+        // Walk the held box; clone only when liveboxes stores the terminal.
+        held.with_box_replacement(|b| {
+            if b.to_opref().is_none() {
+                numb_state.append_short(NULLREF);
+                return Ok(());
+            }
+            // resume.py: isinstance(box, Const) → getconst
+            if env.is_const(b) {
+                let (val, tp) = env.get_const(b);
+                let tagged = self.getconst(val, tp)?;
+                numb_state.append_short(tagged);
+                return Ok(());
+            }
+            // ResumeDataLoopMemo._number_boxes: liveboxes
+            if let Some(tagged) = numb_state.liveboxes.get(b) {
+                numb_state.append_short(tagged);
+                return Ok(());
+            }
+            // ResumeDataLoopMemo._number_boxes:
+            //
+            //     if box.type == 'r':
+            //
+            // The type used for virtual classification is the replacement
+            // box's type (`AbstractValue.type`), not the original snapshot
+            // slot's fallback type. A snapshot slot can carry an Int fallback
+            // from tracing but forward to a Ref virtual after optimization;
+            // keeping the stale fallback would number that virtual as a TAGBOX
+            // and the subsequent fail-arg force would materialize it.
+            let box_type = b.type_();
+            let is_virtual = match box_type {
+                majit_ir::Type::Ref => env.is_virtual_ref(b),
+                majit_ir::Type::Int => env.is_virtual_raw(b),
+                _ => false,
+            };
+            let tagged = if is_virtual {
+                let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
+                numb_state.num_virtuals += 1;
+                t
+            } else {
+                // resume.py `_number_boxes` reads `box.type` off the box.
+                let t = tag(numb_state.num_boxes, TAGBOX)?;
+                numb_state.num_boxes += 1;
+                t
+            };
+            numb_state.liveboxes.insert(b.clone(), tagged);
+            numb_state.append_short(tagged);
+            Ok(())
+        })
     }
 
     /// `resume.py ResumeDataLoopMemo._number_boxes(self, iter, iterator, numb_state)`.

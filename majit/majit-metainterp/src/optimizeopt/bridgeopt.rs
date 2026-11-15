@@ -70,15 +70,38 @@ pub fn serialize_optimizer_knowledge(
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
 ) -> Result<(), crate::resume::TagOverflow> {
     // bridgeopt.py `available_boxes = {}` followed by
-    // `available_boxes[box] = None`. Upstream's membership dict maps to
-    // LiveboxMap (identity-keyed: linear below 16, hash-indexed above).
-    let mut available_boxes = crate::resume::LiveboxMap::new();
-    for b in liveboxes.iter().flatten() {
-        // bridgeopt.py serialize_optimizer_knowledge tests the numbered box
-        // itself for membership in liveboxes_from_env.
-        if numb_state.liveboxes.contains_key(b) {
-            available_boxes.insert(b.clone(), 0);
-        }
+    // `available_boxes[box] = None` for `box in liveboxes` that are also
+    // in `liveboxes_from_env` (`numb_state.liveboxes`). Membership is
+    // identity on the numbered box (`ResumeDataLoopMemo._number_boxes`);
+    // the live slice is tested in place, without cloning into a second map.
+    fn in_available(
+        b: &Operand,
+        liveboxes: &[Option<Operand>],
+        liveboxes_from_env: &crate::resume::LiveboxMap,
+    ) -> bool {
+        liveboxes_from_env.contains_key(b) && liveboxes.iter().flatten().any(|live| live == b)
+    }
+
+    fn field_ok(
+        obj: &Operand,
+        val: &Operand,
+        liveboxes: &[Option<Operand>],
+        liveboxes_from_env: &crate::resume::LiveboxMap,
+        env: &dyn majit_ir::BoxEnv,
+    ) -> bool {
+        // bridgeopt.py serialize_optheap membership is after
+        // `AbstractValue.get_box_replacement`. Walk the box, then test
+        // Const / available_boxes (`ResumeDataVirtualAdder._gettagged`).
+        obj.with_box_replacement(|obj| {
+            val.with_box_replacement(|val| {
+                (obj.is_constant()
+                    || env.is_const(obj)
+                    || in_available(obj, liveboxes, liveboxes_from_env))
+                    && (val.is_constant()
+                        || env.is_const(val)
+                        || in_available(val, liveboxes, liveboxes_from_env))
+            })
+        })
     }
 
     // `serialize_optimizer_knowledge` records a known-class bit for each Ref
@@ -133,20 +156,11 @@ pub fn serialize_optimizer_knowledge(
         numb_state.append_int(0); // loopinvariant count
         return Ok(());
     };
-    // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
-    let field_ok = |obj: &Operand, val: &Operand| {
-        // bridgeopt.py serialize_optheap membership is after
-        // `AbstractValue.get_box_replacement`. Walk the box, then test
-        // Const / available_boxes (`ResumeDataVirtualAdder._gettagged`).
-        let obj = obj.get_box_replacement(false);
-        let val = val.get_box_replacement(false);
-        (obj.is_constant() || env.is_const(&obj) || available_boxes.contains_key(&obj))
-            && (val.is_constant() || env.is_const(&val) || available_boxes.contains_key(&val))
-    };
+    // bridgeopt.py serialize_optheap(available_boxes)
     let triples_struct: Vec<&(Operand, i32, Operand)> = knowledge
         .heap_fields
         .iter()
-        .filter(|(obj, _, val)| field_ok(obj, val))
+        .filter(|(obj, _, val)| field_ok(obj, val, liveboxes, &numb_state.liveboxes, env))
         .collect();
     numb_state.append_int(triples_struct.len() as i64);
     for (obj, descr_idx, val) in triples_struct {
@@ -160,7 +174,7 @@ pub fn serialize_optimizer_knowledge(
     let triples_array: Vec<&(Operand, i64, i32, Operand)> = knowledge
         .heap_arrayitems
         .iter()
-        .filter(|(obj, _, _, val)| field_ok(obj, val))
+        .filter(|(obj, _, _, val)| field_ok(obj, val, liveboxes, &numb_state.liveboxes, env))
         .collect();
     numb_state.append_int(triples_array.len() as i64);
     for (obj, index, descr_idx, val) in triples_array {
@@ -181,8 +195,11 @@ pub fn serialize_optimizer_knowledge(
         .loopinvariant_results
         .iter()
         .filter(|(_, result)| {
-            let result = result.get_box_replacement(false);
-            result.is_constant() || env.is_const(&result) || available_boxes.contains_key(&result)
+            result.with_box_replacement(|result| {
+                result.is_constant()
+                    || env.is_const(result)
+                    || in_available(result, liveboxes, &numb_state.liveboxes)
+            })
         })
         .collect();
     numb_state.append_int(tuples_loopinvariant.len() as i64);
