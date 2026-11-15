@@ -298,6 +298,27 @@ impl ExternalCompilationInfo {
         out
     }
 
+    /// `ExternalCompilationInfo.copy_without`: clone `self` and reset each
+    /// named attribute to the constructor default (empty list / `false` /
+    /// `None`). `_ATTRIBUTES` fields become `Vec::new()`, `use_cpp_linker`
+    /// becomes `false`, and `platform` becomes `None`. An unknown name
+    /// panics (`KeyError`).
+    pub fn copy_without(&self, names: &[&str]) -> ExternalCompilationInfo {
+        let mut out = self.clone();
+        for name in names {
+            if _ATTRIBUTES.contains(name) {
+                *out.field_mut(name) = Vec::new();
+            } else if *name == "use_cpp_linker" {
+                out.use_cpp_linker = false;
+            } else if *name == "platform" {
+                out.platform = None;
+            } else {
+                panic!("copy_without: unknown attribute {name:?}");
+            }
+        }
+        out
+    }
+
     /// `ExternalCompilationInfo.from_compiler_flags`.
     pub fn from_compiler_flags(flags: &str) -> Result<Self, String> {
         let mut pre_include_bits = Vec::new();
@@ -1035,6 +1056,20 @@ mod tests {
             eci.libraries.iter().any(|lib| lib.contains("ncurses")),
             "{eci:?}"
         );
+    }
+
+    #[test]
+    fn copy_without_empties_includes() {
+        let eci = ExternalCompilationInfo {
+            includes: vec!["stdio.h".into()],
+            post_include_bits: vec!["typedef int X;".into()],
+            libraries: vec!["foo".into()],
+            ..ExternalCompilationInfo::default()
+        };
+        let out = eci.copy_without(&["includes"]);
+        assert!(out.includes.is_empty());
+        assert_eq!(out.post_include_bits, vec!["typedef int X;".to_string()]);
+        assert_eq!(out.libraries, vec!["foo".to_string()]);
     }
 
     #[test]

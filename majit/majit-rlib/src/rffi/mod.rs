@@ -172,11 +172,92 @@ impl ExternalCompilationInfo {
     pub const fn new() -> Self {
         Self::DEFAULT
     }
+
+    /// `ExternalCompilationInfo.copy_without`: reset each named attribute
+    /// to the constructor default (empty slice / `false`). `"platform"` is
+    /// accepted and ignored: the runtime bag has no `platform`. An unknown
+    /// name panics (`KeyError`).
+    pub const fn copy_without(self, names: &[&str]) -> Self {
+        const fn str_eq(a: &str, b: &str) -> bool {
+            let a = a.as_bytes();
+            let b = b.as_bytes();
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        let mut out = self;
+        let mut i = 0;
+        while i < names.len() {
+            let name = names[i];
+            if str_eq(name, "pre_include_bits") {
+                out.pre_include_bits = &[];
+            } else if str_eq(name, "includes") {
+                out.includes = &[];
+            } else if str_eq(name, "include_dirs") {
+                out.include_dirs = &[];
+            } else if str_eq(name, "post_include_bits") {
+                out.post_include_bits = &[];
+            } else if str_eq(name, "libraries") {
+                out.libraries = &[];
+            } else if str_eq(name, "library_dirs") {
+                out.library_dirs = &[];
+            } else if str_eq(name, "separate_module_sources") {
+                out.separate_module_sources = &[];
+            } else if str_eq(name, "separate_module_files") {
+                out.separate_module_files = &[];
+            } else if str_eq(name, "compile_extra") {
+                out.compile_extra = &[];
+            } else if str_eq(name, "link_extra") {
+                out.link_extra = &[];
+            } else if str_eq(name, "frameworks") {
+                out.frameworks = &[];
+            } else if str_eq(name, "link_files") {
+                out.link_files = &[];
+            } else if str_eq(name, "testonly_libraries") {
+                out.testonly_libraries = &[];
+            } else if str_eq(name, "use_cpp_linker") {
+                out.use_cpp_linker = false;
+            } else if str_eq(name, "platform") {
+                // The runtime bag has no `platform`.
+            } else {
+                panic!("copy_without: unknown attribute");
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 impl Default for ExternalCompilationInfo {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+#[cfg(test)]
+mod copy_without_tests {
+    use super::ExternalCompilationInfo;
+
+    const _: ExternalCompilationInfo = ExternalCompilationInfo::DEFAULT.copy_without(&["includes"]);
+
+    #[test]
+    fn copy_without_empties_includes() {
+        let eci = ExternalCompilationInfo {
+            includes: &["a.h"],
+            post_include_bits: &["x"],
+            ..ExternalCompilationInfo::DEFAULT
+        };
+        let out = eci.copy_without(&["includes"]);
+        assert!(out.includes.is_empty());
+        assert_eq!(out.post_include_bits, &["x"]);
     }
 }
 
