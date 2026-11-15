@@ -70,11 +70,12 @@ use std::rc::Rc;
 
 use crate::flowspace::model::Variable as FVar;
 use crate::flowspace::model::{
-    Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, Hlvalue,
+    Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, GraphRef, Hlvalue,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
 };
+use crate::parse::CallPath;
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
@@ -126,11 +127,25 @@ impl StrFamily {
 /// operands and block inputargs — they are the same
 /// `crate::flowspace::model::Variable` type and carry their `concretetype`
 /// cell through unchanged, so no value-bridge round-trip is needed.
+pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
+    lower_graph_with_callees(graph, &|_| None)
+}
+
+/// Lower `graph`, resolving each `direct_call` / `jit_conditional_call`
+/// callee by graph identity when `callee_path` returns a [`CallPath`].
+///
+/// `call.py graphs_from` looks up `funcobj.graph` in
+/// `CallControl.jitcodes = {graph: jitcode}`; a miss falls back to
+/// `_func._name` (the `ll_*` helper path through
+/// `register_opname_helper_graph`).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
+pub fn lower_graph_with_callees(
+    graph: &FlowGraph,
+    callee_path: &dyn Fn(&GraphRef) -> Option<CallPath>,
+) -> crate::model::FunctionGraph {
     let mut out = crate::model::FunctionGraph::new(graph.name.clone());
     let family = detect_family(graph);
 
@@ -197,9 +212,16 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                 }
             }
             if let Some(renamed) = rename_void_op_args(op, &void_renamings) {
-                transduce_op(&mut out, id, &renamed, &mut chars_alias, &family);
+                transduce_op(
+                    &mut out,
+                    id,
+                    &renamed,
+                    &mut chars_alias,
+                    &family,
+                    callee_path,
+                );
             } else {
-                transduce_op(&mut out, id, op, &mut chars_alias, &family);
+                transduce_op(&mut out, id, op, &mut chars_alias, &family, callee_path);
             }
         }
 
@@ -340,6 +362,7 @@ fn transduce_op(
     op: &crate::flowspace::model::SpaceOperation,
     chars_alias: &mut HashMap<FVar, FVar>,
     family: &StrFamily,
+    callee_path: &dyn Fn(&GraphRef) -> Option<CallPath>,
 ) {
     match op.opname.as_str() {
         // `getsubstruct(s, "chars")` — interior pointer with no runtime
@@ -994,27 +1017,30 @@ fn transduce_op(
                 result,
             );
         }
-        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is the
-        // `_func._name` carried by the leading funcptr constant
-        // (`ConstValue::LLPtr` → `_ptr_obj::Func`); it becomes a
-        // `CallTarget::FunctionPath` whose single segment matches the helper's
-        // registered `CallPath`, so `register_opname_helper_graph` makes it
-        // resolve as a *regular* callee rather than a residual synthetic
-        // fnaddr.  The trailing operands are the call arguments; `OpKind::Call`
-        // takes `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
+        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is
+        // `funcobj.graph` when `callee_path` knows that graph (`call.py
+        // graphs_from`); otherwise `_func._name` on the leading funcptr
+        // (`ConstValue::LLPtr` → `_ptr_obj::Func`), split on `::` so
+        // `majit_rlib::jit::isconstant` and `register_opname_helper_graph`
+        // hit a regular CallPath rather than a residual fnaddr.  The
+        // trailing operands are the call arguments; `OpKind::Call` takes
+        // `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
         // are materialised through the same `ConstInt`/`ConstBool` path the
         // `int_*` arm uses.  The builder helpers' `direct_call`s all return a
         // value (`ll_min` → uint, `mallocfn` → the char buffer), so the result
         // is bound as a result var.
         "direct_call" => {
-            let callee = callee_name_from_funcptr(&op.args[0]);
-            // `_func._name` is the `::`-joined CallPath
-            // (`functionptr(ft, key.segments().join("::"), …)`). Split so
-            // a call to `majit_rlib::jit::isconstant` hits the marked
-            // oopspec rather than a one-segment residual.
-            let target = crate::model::CallTarget::function_path(
-                callee.split("::").filter(|s| !s.is_empty()),
-            );
+            let func = callee_func_from_funcptr(&op.args[0]);
+            // `call.py graphs_from` resolves `funcobj.graph` by identity
+            // (`CallControl.jitcodes = {graph: jitcode}`), never by
+            // `_func._name`.
+            let target = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => {
+                    let callee = callee_name_from_funcptr(&op.args[0]);
+                    CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()))
+                }
+            };
             // `ll_get_raw_address_of_string` is a FunctionPath Call. This
             // transducer has no CallControl; `rewrite_op_direct_call`
             // mints the `dont_look_inside` residual before `guess_call_kind`
@@ -1047,7 +1073,15 @@ fn transduce_op(
             );
             check_cond_call_operands(&op.args);
             let cond = materialize(out, block, &op.args[0]);
-            let callee = callee_name_from_funcptr(&op.args[1]);
+            let func = callee_func_from_funcptr(&op.args[1]);
+            // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
+            let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => {
+                    let name = callee_name_from_funcptr(&op.args[1]);
+                    CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
+                }
+            };
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
@@ -1056,7 +1090,7 @@ fn transduce_op(
                 out,
                 block,
                 cond,
-                &callee,
+                callee,
                 extra_args,
                 result,
                 "conditional_call",
@@ -1075,7 +1109,15 @@ fn transduce_op(
             );
             check_cond_call_operands(&op.args);
             let value = materialize(out, block, &op.args[0]);
-            let callee = callee_name_from_funcptr(&op.args[1]);
+            let func = callee_func_from_funcptr(&op.args[1]);
+            // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
+            let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => {
+                    let name = callee_name_from_funcptr(&op.args[1]);
+                    CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
+                }
+            };
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
@@ -1084,7 +1126,7 @@ fn transduce_op(
                 out,
                 block,
                 value,
-                &callee,
+                callee,
                 extra_args,
                 result,
                 "conditional_call_elidable",
@@ -1168,7 +1210,7 @@ pub(crate) fn emit_conditional_call_oopspec(
         out,
         block,
         cond,
-        callee_name,
+        CallTarget::function_path(callee_name.split("::").filter(|s| !s.is_empty())),
         extra_args,
         result,
         "conditional_call",
@@ -1193,7 +1235,7 @@ pub(crate) fn emit_conditional_call_value_oopspec(
         out,
         block,
         value,
-        callee_name,
+        CallTarget::function_path(callee_name.split("::").filter(|s| !s.is_empty())),
         extra_args,
         result,
         "conditional_call_elidable",
@@ -1213,7 +1255,7 @@ fn emit_conditional_call_oopspec_named(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
     cond: FVar,
-    callee_name: &str,
+    callee: CallTarget,
     extra_args: Vec<FVar>,
     result: FVar,
     helper_prefix: &str,
@@ -1223,9 +1265,23 @@ fn emit_conditional_call_oopspec_named(
         n <= 4,
         "the helper leaf `{helper_prefix}{{n}}` only exists for 0..=4"
     );
-    let fn_target = CallTarget::function_path(
-        std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
-    );
+    let fn_target = match callee {
+        CallTarget::FunctionPath {
+            mut segments,
+            fun_decl_id,
+            specialization,
+        } => {
+            segments.insert(0, FN_CONST_HEAD.to_string());
+            CallTarget::FunctionPath {
+                segments,
+                fun_decl_id,
+                specialization,
+            }
+        }
+        other => panic!(
+            "jtransform_opname::lower_graph: jit_conditional_call callee is not a FunctionPath: {other:?}"
+        ),
+    };
     let fn_var = out
         .push_op_var(
             block,
@@ -1754,10 +1810,31 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
 /// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
 /// `CallPath` a helper is registered under.
 fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
+    callee_func_from_funcptr(hlv)._name
+}
+
+/// Same decode as [`callee_name_from_funcptr`], returning the `_func`
+/// so Spine B can resolve by `graph_ref()` (`call.py graphs_from`
+/// `funcobj.graph`).
+fn callee_func_from_funcptr(
+    hlv: &Hlvalue,
+) -> crate::translator::rtyper::lltypesystem::lltype::_func {
     let Hlvalue::Constant(c) = hlv else {
         panic!("jtransform_opname::lower_graph: direct_call callee operand is not a constant");
     };
-    callee_name_from_funcptr_value(&c.value)
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let ConstValue::LLPtr(ptr) = &c.value else {
+        panic!(
+            "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
+            c.value
+        );
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => func,
+        other => panic!(
+            "jtransform_opname::lower_graph: direct_call callee funcptr does not resolve to a Func object: {other:?}"
+        ),
+    }
 }
 
 /// `_func._name` of a non-null funcptr `ConstValue::LLPtr`. Shared with
@@ -2110,7 +2187,7 @@ fn is_unichar_array_ptr(var: &FVar) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lower_graph, materialize_constant};
+    use super::{lower_graph, lower_graph_with_callees, materialize_constant};
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
         Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc,
@@ -3524,6 +3601,116 @@ mod tests {
         );
         assert_eq!(*argc, 2, "size + the materialised 1280");
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    fn funcptr_named_with_graph(
+        name: &str,
+    ) -> (
+        crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        crate::flowspace::model::GraphRef,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, functionptr_for_graph_with_type,
+        };
+        let start = Block::shared(vec![]);
+        let graph = std::rc::Rc::new(std::cell::RefCell::new(FlowGraph::new(name, start)));
+        let ft = FuncType {
+            args: vec![],
+            result: LowLevelType::Signed,
+        };
+        let ptr = functionptr_for_graph_with_type(&graph, ft);
+        (ptr, graph)
+    }
+
+    fn flow_graph_direct_calling(
+        funcptr: crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    ) -> FlowGraph {
+        let startblock = Block::shared(vec![]);
+        let return_var = variable_with_lltype("out", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "caller_direct_call",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![callee],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    fn lowered_direct_call_target(model: &crate::model::FunctionGraph) -> crate::model::CallTarget {
+        model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .expect("direct_call lowers to Call")
+    }
+
+    /// `call.py graphs_from` resolves by `funcobj.graph`, so a funcptr whose
+    /// `_name` is the rustc-style `a::<Impl>::m` still becomes the subject's
+    /// CallPath when the resolver maps that graph.
+    #[test]
+    fn lower_graph_direct_call_target_is_the_callee_graph_path() {
+        let (funcptr, callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let key = crate::flowspace::model::GraphKey::of(&callee_graph);
+        let resolved = crate::parse::CallPath::from_segments(["T", "m"]);
+        let model = lower_graph_with_callees(&flow, &|g| {
+            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
+        });
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::from_call_path(&resolved)
+        );
+    }
+
+    /// A subject path's `GraphSpecialization` is copied onto the CallTarget
+    /// (`CallTarget::from_call_path`).
+    #[test]
+    fn lower_graph_direct_call_keeps_callee_specialization() {
+        let (funcptr, callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let key = crate::flowspace::model::GraphKey::of(&callee_graph);
+        let resolved = crate::parse::CallPath {
+            segments: vec!["T".into(), "m".into()],
+            specialization: crate::parse::GraphSpecialization::AccessDirect,
+        };
+        let model = lower_graph_with_callees(&flow, &|g| {
+            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
+        });
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::from_call_path(&resolved)
+        );
+    }
+
+    /// `ll_*` helpers are not two-phase subjects: resolver `None` keeps
+    /// `_func._name` segments.
+    #[test]
+    fn lower_graph_direct_call_without_subject_graph_uses_func_name() {
+        let (funcptr, _callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let model = lower_graph_with_callees(&flow, &|_| None);
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::function_path(["a", "<Impl>", "m"])
+        );
     }
 
     /// Void-typed `direct_call` operands are compile-time only

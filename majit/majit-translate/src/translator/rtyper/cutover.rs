@@ -6533,7 +6533,7 @@ fn phase_a_try_drive(
             block_map,
             pygraph,
         ))) => {
-            call_registry.two_phase().subjects.insert(
+            call_registry.two_phase().insert_subject(
                 path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: graph.clone(),
@@ -11034,7 +11034,7 @@ mod tests {
         ad_path: &crate::parse::CallPath,
         pygraph: &Rc<PyGraph>,
     ) {
-        registry.two_phase().subjects.insert(
+        registry.two_phase().insert_subject(
             ad_path.clone(),
             crate::translator::rtyper::call_registry::TwoPhaseSubject {
                 graph: pygraph.graph.clone(),
@@ -11199,7 +11199,7 @@ mod tests {
             .expect("ensure_session for candidate subject");
         let translator = ann.translator.clone();
         translator.graphs.borrow_mut().push(caller.clone());
-        registry.two_phase().subjects.insert(
+        registry.two_phase().insert_subject(
             caller_path.clone(),
             crate::translator::rtyper::call_registry::TwoPhaseSubject {
                 graph: caller.clone(),
@@ -11510,6 +11510,32 @@ mod tests {
         );
         assert!(cached.access_directly.get());
         assert!(Rc::ptr_eq(&cached.graph, &subj.graph));
+    }
+
+    /// Prepass fills `subject_paths` as the inverse of `subjects`
+    /// (`call.py CallControl.jitcodes` / `graphs_from` `funcobj.graph`).
+    #[test]
+    fn two_phase_prepass_records_subject_graph_paths() {
+        let (registry, origin_path, ad_path, _, graphs) = origin_and_access_direct_fixture();
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path.clone(), ad_path.clone()]),
+            &graphs,
+            &[],
+        );
+        let tp = registry.two_phase();
+        assert!(
+            !tp.subjects.is_empty(),
+            "fixture must record at least one subject"
+        );
+        for (path, subject) in &tp.subjects {
+            assert_eq!(
+                tp.subject_paths.get(&subject.graph_key),
+                Some(path),
+                "subject_paths[{:?}] must be {path}",
+                subject.graph_key
+            );
+        }
     }
 
     /// After seeding, the subject's `value_to_var` typed Variables live
@@ -14311,7 +14337,7 @@ mod tests {
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -14412,7 +14438,7 @@ mod tests {
             .update_call_graph(&flow, &callee, (BlockKey::of(&caller_start), 0));
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 caller_path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -14429,7 +14455,7 @@ mod tests {
                 tp.annotate_skipped
                     .insert(callee_path, "phaseA fail".to_string());
             } else {
-                tp.subjects.insert(
+                tp.insert_subject(
                     callee_path,
                     crate::translator::rtyper::call_registry::TwoPhaseSubject {
                         graph: callee.clone(),
@@ -14570,7 +14596,7 @@ mod tests {
         );
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 caller_path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -14641,7 +14667,7 @@ mod tests {
         );
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 caller_path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -14743,7 +14769,7 @@ mod tests {
             .update_call_graph(&flow, &complete, (BlockKey::of(&caller_start), 0));
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 caller_path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -14756,7 +14782,7 @@ mod tests {
                     block_map: HashMap::new(),
                 },
             );
-            tp.subjects.insert(
+            tp.insert_subject(
                 callee_path,
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: complete.clone(),
@@ -16108,7 +16134,7 @@ mod tests {
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),
@@ -16226,7 +16252,7 @@ mod tests {
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         {
             let mut tp = registry.two_phase();
-            tp.subjects.insert(
+            tp.insert_subject(
                 path.clone(),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: flow.clone(),

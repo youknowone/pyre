@@ -1167,7 +1167,15 @@ impl CodeWriter {
             let matcher = ed.fn_exception_match.borrow();
             crate::jtransform::constant_fold_ll_issubclass_flowgraph(flow_graph, matcher.as_ref());
         }
-        let lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
+        let lowered = {
+            let registry = self.dual_gate_registry(callcontrol);
+            let tp = registry.two_phase();
+            crate::codewriter::jtransform_opname::lower_graph_with_callees(flow_graph, &|g| {
+                tp.subject_paths
+                    .get(&crate::flowspace::model::GraphKey::of(g))
+                    .cloned()
+            })
+        };
         // `lower_graph` leaves `direct_call` as `OpKind::Call`. Assembler
         // encodes a leftover Call as `direct_call_*`; there is no such
         // opcode in a jitcode (`jtransform.py rewrite_op_direct_call`).
