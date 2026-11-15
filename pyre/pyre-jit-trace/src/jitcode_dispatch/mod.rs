@@ -8977,13 +8977,8 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
-    /// `Some` re-executes that call. A bridge root leaves this unset; the
-    /// call position is `call_pc`.
+    /// `Some` re-executes that call. A bridge root leaves this unset.
     call_jitcode_pc: Option<usize>,
-    /// Jitcode pc of the CALL this frame is paused in. The handler records
-    /// that position, then sets `MIFrame.pc` to the first byte after the
-    /// opcode before the callee runs. Not the Rewind coordinate above.
-    call_pc: Option<usize>,
     /// Post-call resume pc. `MIFrame.pc` while the callee runs, and the pc
     /// half of `AbstractResumeDataReader.read_jitcode_pos_pc` restored by
     /// `MIFrame.setup_resume_at_op`. Includes a trailing `-live-`.
@@ -9218,19 +9213,6 @@ struct InlineParentBlackhole {
     float_values: Vec<(usize, OpRef)>,
 }
 
-/// The instruction whose next byte is `resume_pc`.
-///
-/// The handler sets `MIFrame.pc` to the first byte after the opcode before
-/// the callee runs. `AbstractResumeDataReader.read_jitcode_pos_pc` restores
-/// that word through `MIFrame.setup_resume_at_op`. The CALL's jitcode pc is
-/// the opcode that ends at that word; the opcode name is not consulted.
-fn jitcode_op_ending_at(
-    code: &[u8],
-    resume_pc: usize,
-) -> Option<crate::jitcode_runtime::DecodedOp> {
-    crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
-}
-
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
@@ -9261,7 +9243,6 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -9298,7 +9279,6 @@ pub(crate) fn ctor_continuation_assembler_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -9348,7 +9328,6 @@ pub(crate) fn operator_continuation_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,

@@ -1202,16 +1202,6 @@ mod seeded_frame_op_tests {
         }
     }
 
-    fn decoded(opname: &'static str) -> DecodedOp {
-        DecodedOp {
-            key: "",
-            opname,
-            argcodes: "",
-            pc: 0,
-            next_pc: 1,
-        }
-    }
-
     fn decoded_at(opname: &'static str, pc: usize) -> DecodedOp {
         DecodedOp {
             key: "",
@@ -4002,7 +3992,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         _assembler_code_roots.pin_roots(&[callable, w_code as pyre_object::PyObjectRef]);
     let callable_slot = assembler_base;
     let assembler_code_slot = assembler_base + 1;
-    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     // `_opimpl_recursive_call` residualizes with `assembler_call = False`
     // when `warmrunnerstate.inlining` is off. With inlining on, a callee
@@ -4031,7 +4020,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX);
         warm_state.inlining() && !warm_state.can_inline_callable_for_key(&pin, &callee_green_key)
     };
-    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     if !assembler_call {
         return Ok(None);
@@ -4186,7 +4174,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let code_pin = majit_metainterp::GreenRefPin::pin_one(pyre_object::gc_roots::shadow_stack_get(
         assembler_code_slot,
     ) as usize);
-    let w_code = code_pin.get() as *const ();
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     // The callee's globals OBJECT (`function.w_func_globals_obj`). A
     // `frame_stores_global` mismatch is stored on the inline frame as
@@ -18164,7 +18151,6 @@ fn descend_generatorentry<Sym: WalkSym>(
         none_op,
         majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
     );
-    let pycode = pin.get() as pyre_object::PyObjectRef;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
 
     // `space.next` dispatches on the iterator's type, and `send_ex` reads
@@ -18532,7 +18518,6 @@ pub(crate) fn send_ex_continuation_parent_frame(generator: OpRef) -> Option<Inli
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -18563,7 +18548,6 @@ pub(crate) fn send_ex_finished_after_teardown_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(after_teardown),
         call_stack_overrides: Vec::new(),
         blackhole: None,

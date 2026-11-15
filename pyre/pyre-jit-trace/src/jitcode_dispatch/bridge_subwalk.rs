@@ -1017,8 +1017,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // `setup_bridge_sym` decoded. Null refs and unboxed boxes stay. The
     // result slot is still overwritten when the stack image is captured.
     // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
-    // re-running the root CALL is not a resume of this frame. `call_pc` is
-    // the opcode that ends at `MIFrame.pc`; `resume_pc` is that pc.
+    // re-running the root CALL is not a resume of this frame.
     let stack_regs = root_sym.registers_r();
     let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
     let call_stack_overrides = (root_sym.nlocals()..stack_end)
@@ -1027,19 +1026,10 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
             paused_stack_box(trace_ctx, opref).map(|value| (slot, value))
         })
         .collect();
-    let call_pc = root_word.and_then(|resume| {
-        let code = unsafe { &*root_sym.jitcode() }
-            .payload
-            .jitcode
-            .code
-            .as_slice();
-        super::jitcode_op_ending_at(code, resume).map(|op| op.pc)
-    });
 
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc,
         resume_pc: root_word,
         call_stack_overrides,
         blackhole,
@@ -1077,9 +1067,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         } else {
             return None;
         };
-    // The recipe word is the post-call resume pc. The CALL is the opcode
-    // that ends there (`MIFrame.pc`); the opcode name is not consulted.
-    let call_pc = super::jitcode_op_ending_at(pjc.jitcode.code.as_slice(), entry).map(|op| op.pc);
+    // The recipe word is the post-call resume pc.
     // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
     // pc (`setup_resume_at_op`) whichever call op it paused after.
     let resume_marker_jit_pc = pjc
@@ -1260,7 +1248,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc,
         resume_pc: Some(entry),
         call_stack_overrides: Vec::new(),
         blackhole,
@@ -1928,7 +1915,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             pending_tails.push(InlineParentFrame {
                 jitcode_index: parent_recipe.jitcode_index as u32,
                 call_jitcode_pc: None,
-                call_pc: None,
                 resume_pc: Some(resume_pc),
                 call_stack_overrides: Vec::new(),
                 blackhole: None,

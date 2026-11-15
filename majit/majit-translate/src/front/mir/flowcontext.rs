@@ -1412,6 +1412,7 @@ fn atomic_shadow_slot_count(shadows: &[AtomicShadow]) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn empty_program_oopspec() -> &'static std::collections::HashSet<String> {
     static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
@@ -1546,6 +1547,7 @@ fn exception_transformed_formal_class_root(
 }
 
 impl<'a> Lowering<'a> {
+    #[cfg(test)]
     pub(in crate::front::mir) fn new(
         llbc: &'a Llbc,
         name: String,

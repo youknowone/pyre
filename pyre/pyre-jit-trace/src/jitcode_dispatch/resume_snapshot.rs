@@ -2706,7 +2706,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides,
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -2941,7 +2940,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -3016,7 +3014,6 @@ pub(crate) fn paused_helper_caller_frame_from_banks(
         InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: Some(call_jit_pc),
-            call_pc: Some(call_jit_pc),
             resume_pc: Some(resume_marker_jit_pc),
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3192,7 +3189,6 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc: Some(call_jit_pc),
         resume_pc: Some(resume_marker_jit_pc),
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
@@ -3622,7 +3618,6 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: Some(helper_jitcode_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,

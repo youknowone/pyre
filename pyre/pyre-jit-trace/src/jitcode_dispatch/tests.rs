@@ -27,7 +27,6 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
@@ -133,7 +132,6 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
@@ -817,7 +815,6 @@ fn dummy_foriter_caller_parent() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0xF0_11_E5,
         call_jitcode_pc: Some(4),
-        call_pc: Some(4),
         resume_pc: Some(8),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -1048,7 +1045,6 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -1074,7 +1070,6 @@ fn constructor_assembler_caller_frame(jitcode_index: u32) -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -3039,7 +3034,6 @@ fn portal_may_force_records_the_callee_execution_context() {
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
-            call_pc: None,
             resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3363,7 +3357,6 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
-            call_pc: None,
             resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -3928,7 +3921,6 @@ fn enter_inline_converted_call_trace_caller<'a>(
         vec![InlineParentFrame {
             jitcode_index,
             call_jitcode_pc: None,
-            call_pc: Some(0),
             resume_pc: Some(0),
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -8144,7 +8136,6 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
                 parents: vec![InlineParentFrame {
                     jitcode_index,
                     call_jitcode_pc: None,
-                    call_pc: Some(0),
                     resume_pc: Some(0),
                     call_stack_overrides: Vec::new(),
                     blackhole: None,
@@ -20614,7 +20605,6 @@ fn release_gil_forcing_stores_precede_call() {
     let parent = InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
-        call_pc: None,
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -26472,7 +26462,6 @@ fn paused_helper_parent_for_activation(
     InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_pc),
-        call_pc: Some(call_pc),
         resume_pc: Some(call_pc + 1),
         call_stack_overrides: Vec::new(),
         blackhole: None,
@@ -32992,7 +32981,6 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
     let parent = InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(CALL_JIT_PC),
-        call_pc: Some(CALL_JIT_PC),
         resume_pc: Some(LIVE_PC),
         call_stack_overrides: Vec::new(),
         blackhole: None,
