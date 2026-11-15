@@ -5867,19 +5867,25 @@ impl PyFrame {
         // the quote character too).  `code_repr` is a separate decision and
         // keeps its own quotes around a `%U`, which is why the two disagree on
         // the same path.
+        let lineno = self.get_last_lineno();
         let w_name =
             unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
+        let name = if !w_name.is_null() {
+            unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
+        } else {
+            rustpython_wtf8::Wtf8Buf::new()
+        };
+        // `getaddrstring` id; taken last because computing it can collect.
+        let addr = crate::display::repr_gc_addr(self as *const PyFrame as pyre_object::PyObjectRef);
         let mut repr = rustpython_wtf8::Wtf8Buf::new();
         repr.push_str("<frame at ");
-        repr.push_str(&crate::display::repr_addr(self as *const PyFrame as usize));
+        repr.push_str(&addr);
         repr.push_str(", file ");
         repr.push_str(&crate::display::format_wtf8_repr(&filename));
         repr.push_str(", line ");
-        repr.push_str(&self.get_last_lineno().to_string());
+        repr.push_str(&lineno.to_string());
         repr.push_str(", code ");
-        if !w_name.is_null() {
-            repr.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
-        }
+        repr.push_wtf8(&name);
         repr
     }
 
@@ -5935,7 +5941,7 @@ impl PyFrame {
                         &mut *frame_anchor.live(),
                     )
                 };
-                if !self.clear_references() {
+                if !unsafe { &mut *frame_anchor.live() }.clear_references() {
                     return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 return Ok(());

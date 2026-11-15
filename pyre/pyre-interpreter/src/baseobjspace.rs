@@ -25720,11 +25720,14 @@ pub fn generator_finalize(mut gen_obj: PyObjectRef) -> PyResult {
                 // generator.py `AsyncGenerator._finalize_`: the collector
                 // cleared the frame's weakref before `_finalize_`, so re-arm
                 // `frame.f_generator_wref = rweakref.ref(self)` before calling
-                // `w_finalizer`.  The pinned generator owns the non-moving
-                // frame across the WEAKREF allocation.
+                // `w_finalizer`.  The frame can move during the WEAKREF
+                // allocation, so it is re-read from the pinned generator
+                // (`shadowstack.py` `pop_roots` reload).
                 let wref = pyre_object::weakref::w_weakref_new(
                     pyre_object::gc_roots::shadow_stack_get(base),
                 );
+                let frame_ptr =
+                    w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(base));
                 (*(frame_ptr as *mut crate::pyframe::PyFrame)).f_generator_wref =
                     wref as PyObjectRef;
                 if pyre_object::gc_hook::try_gc_owns_object(
