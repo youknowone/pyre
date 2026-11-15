@@ -187,24 +187,49 @@ fn itimer_retval(val: &libc::itimerval) -> pyre_object::PyObjectRef {
     pyre_object::w_tuple_new(fields.take())
 }
 
+/// `lltype.malloc(c_sigset_t.TO, flavor='raw')` / `lltype.free`.
+#[cfg(all(unix, feature = "host_env"))]
+struct SigsetGuard(majit_rlib::rsignal::c_sigset_t);
+
+#[cfg(all(unix, feature = "host_env"))]
+impl Drop for SigsetGuard {
+    fn drop(&mut self) {
+        unsafe { majit_rlib::rffi::free_opaque(self.0) };
+    }
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+impl SigsetGuard {
+    fn malloc() -> Result<Self, crate::PyError> {
+        let ptr = majit_rlib::rffi::malloc_opaque::<majit_rlib::rsignal::c_sigset_t>().map_err(
+            |e| crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e),
+        )?;
+        Ok(Self(ptr))
+    }
+
+    fn as_ptr(&self) -> majit_rlib::rsignal::c_sigset_t {
+        self.0
+    }
+}
+
 /// interp_signal.py `SignalMask.__enter__` — `c_sigemptyset` then `c_sigaddset`.
 #[cfg(all(unix, feature = "host_env"))]
-fn fill_sigset(mut w_signals: PyObjectRef) -> Result<libc::sigset_t, crate::PyError> {
-    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+fn fill_sigset(mut w_signals: PyObjectRef) -> Result<SigsetGuard, crate::PyError> {
+    let mask = SigsetGuard::malloc()?;
     let _ = pyre_object::with_roots!(w_signals => unsafe {
-        majit_rlib::rsignal::c_sigemptyset(&mut mask)
+        majit_rlib::rsignal::c_sigemptyset(mask.as_ptr())
     });
     for it in pyre_object::with_roots!(w_signals => signal_set_items(w_signals))? {
         let signum = unsafe { pyre_object::w_int_get_value(it) };
         check_signum_in_range(signum)?;
-        let _ = unsafe { majit_rlib::rsignal::c_sigaddset(&mut mask, signum as _) };
+        let _ = unsafe { majit_rlib::rsignal::c_sigaddset(mask.as_ptr(), signum as _) };
     }
     Ok(mask)
 }
 
 /// interp_signal.py `_sigset_to_signals`.
 #[cfg(all(unix, feature = "host_env"))]
-fn sigset_to_signals(mask: &mut libc::sigset_t) -> pyre_object::PyObjectRef {
+fn sigset_to_signals(mask: majit_rlib::rsignal::c_sigset_t) -> pyre_object::PyObjectRef {
     let mut items = pyre_object::gc_roots::RootedItems::new();
     for s in 1..signalstate::NSIG {
         if unsafe { majit_rlib::rsignal::c_sigismember(mask, s) } == 1 {
@@ -1268,22 +1293,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // wider bound answers with a signal that has no name.
                     #[cfg(unix)]
                     {
-                        let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-                        let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(&mut mask) };
+                        let mask = SigsetGuard::malloc()?;
+                        let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(mask.as_ptr()) };
                         if ret != 0 {
                             return Err(crate::error::exception_from_saved_errno(
                                 pyre_object::PY_NULL,
                                 errno_w_type("OSError"),
                             ));
                         }
-                        let ret = unsafe { majit_rlib::rsignal::c_sigfillset(&mut mask) };
+                        let ret = unsafe { majit_rlib::rsignal::c_sigfillset(mask.as_ptr()) };
                         if ret != 0 {
                             return Err(crate::error::exception_from_saved_errno(
                                 pyre_object::PY_NULL,
                                 errno_w_type("OSError"),
                             ));
                         }
-                        Ok(sigset_to_signals(&mut mask))
+                        Ok(sigset_to_signals(mask.as_ptr()))
                     }
                     #[cfg(windows)]
                     {
@@ -1583,12 +1608,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             ));
                         }
                         let mut w_sigset = args[0];
-                        let mut set = pyre_object::with_roots!(w_sigset => fill_sigset(w_sigset))?;
+                        let set = pyre_object::with_roots!(w_sigset => fill_sigset(w_sigset))?;
                         let mut signum: libc::c_int = 0;
                         // interp_signal.sigwait — `rsignal.c_sigwait` returns
                         // the error number (`releasegil=True`).
                         let ret = pyre_object::with_roots!(w_sigset => unsafe {
-                            majit_rlib::rsignal::c_sigwait(&mut set, &mut signum)
+                            majit_rlib::rsignal::c_sigwait(set.as_ptr(), &mut signum)
                         });
                         if ret != 0 {
                             // interp_signal.py `sigwait` raises
@@ -1622,15 +1647,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_args| {
                     #[cfg(feature = "host_env")]
                     {
-                        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-                        let ret = unsafe { majit_rlib::rsignal::c_sigpending(&mut mask) };
+                        let mask = SigsetGuard::malloc()?;
+                        let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(mask.as_ptr()) };
                         if ret != 0 {
                             return Err(crate::error::exception_from_saved_errno(
                                 pyre_object::PY_NULL,
                                 errno_w_type("OSError"),
                             ));
                         }
-                        Ok(sigset_to_signals(&mut mask))
+                        let ret = unsafe { majit_rlib::rsignal::c_sigpending(mask.as_ptr()) };
+                        if ret != 0 {
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                            ));
+                        }
+                        Ok(sigset_to_signals(mask.as_ptr()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     Err(crate::PyError::not_implemented(
@@ -1714,12 +1746,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let how = pyre_object::with_roots!(
                             w_how, w_signals => crate::baseobjspace::gateway_int_w(w_how)
                         )? as i32;
-                        let mut set = pyre_object::with_roots!(
+                        let set = pyre_object::with_roots!(
                             w_how, w_signals => fill_sigset(w_signals)
                         )?;
-                        let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                        let previous = SigsetGuard::malloc()?;
                         let ret = unsafe {
-                            majit_rlib::rsignal::c_pthread_sigmask(how, &mut set, &mut previous)
+                            majit_rlib::rsignal::c_sigemptyset(previous.as_ptr())
+                        };
+                        if ret != 0 {
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                            ));
+                        }
+                        let ret = unsafe {
+                            majit_rlib::rsignal::c_pthread_sigmask(
+                                how,
+                                set.as_ptr(),
+                                previous.as_ptr(),
+                            )
                         };
                         if ret != 0 {
                             return Err(crate::error::exception_from_saved_errno(
@@ -1730,7 +1775,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // interp_signal.py:546-547 — if signals were
                         // unblocked, their handlers may now be pending.
                         checksignals_now()?;
-                        Ok(sigset_to_signals(&mut previous))
+                        Ok(sigset_to_signals(previous.as_ptr()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {

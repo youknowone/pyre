@@ -424,13 +424,34 @@ mod tests {
 // loops) works.  Synchronous fault signals are left untouched — they must
 // reach whichever thread generated them.
 
+/// `lltype.malloc(c_sigset_t.TO, flavor='raw')` / `lltype.free`.
+#[cfg(unix)]
+struct SigsetAlloc(majit_rlib::rsignal::c_sigset_t);
+
+#[cfg(unix)]
+impl Drop for SigsetAlloc {
+    fn drop(&mut self) {
+        unsafe { majit_rlib::rffi::free_opaque(self.0) };
+    }
+}
+
+/// Process-lifetime `c_sigset_t` from `malloc_opaque`; never freed.
+#[cfg(unix)]
+struct InheritedSigset(majit_rlib::rsignal::c_sigset_t);
+
+// SAFETY: process-lifetime raw `sigset_t`; written once at startup, then read.
+#[cfg(unix)]
+unsafe impl Send for InheritedSigset {}
+#[cfg(unix)]
+unsafe impl Sync for InheritedSigset {}
+
 /// Build the set of signals routed to the interpreter thread: every signal
 /// except the synchronous fault signals.
 #[cfg(unix)]
-fn async_signal_set() -> libc::sigset_t {
+fn async_signal_set() -> Option<SigsetAlloc> {
+    let ptr = majit_rlib::rffi::malloc_opaque::<majit_rlib::rsignal::c_sigset_t>().ok()?;
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut set);
+        let _ = majit_rlib::rsignal::c_sigfillset(ptr);
         for exc in [
             libc::SIGSEGV,
             libc::SIGBUS,
@@ -439,10 +460,10 @@ fn async_signal_set() -> libc::sigset_t {
             libc::SIGABRT,
             libc::SIGTRAP,
         ] {
-            libc::sigdelset(&mut set, exc);
+            libc::sigdelset(ptr.cast(), exc);
         }
-        set
     }
+    Some(SigsetAlloc(ptr))
 }
 
 /// The signals the process already had blocked before the routing below
@@ -450,18 +471,23 @@ fn async_signal_set() -> libc::sigset_t {
 /// — what `posix_spawn`'s `setsigmask` installs — has to outlive the routing,
 /// so those signals are never unblocked on the interpreter thread.
 #[cfg(unix)]
-static INHERITED_BLOCKED: std::sync::OnceLock<libc::sigset_t> = std::sync::OnceLock::new();
+static INHERITED_BLOCKED: std::sync::OnceLock<InheritedSigset> = std::sync::OnceLock::new();
 
 /// Block the async signals on the calling thread — called on the process's
 /// original thread before the interpreter thread is spawned.
 #[cfg(unix)]
 pub fn block_async_signals_on_origin_thread() {
+    let Some(set) = async_signal_set() else {
+        return;
+    };
+    let Ok(previous) = majit_rlib::rffi::malloc_opaque::<majit_rlib::rsignal::c_sigset_t>() else {
+        return;
+    };
     unsafe {
-        let set = async_signal_set();
-        let mut previous: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
-        let _ = INHERITED_BLOCKED.set(previous);
+        let _ = majit_rlib::rsignal::c_sigemptyset(previous);
+        let _ = majit_rlib::rsignal::c_pthread_sigmask(libc::SIG_BLOCK, set.0, previous);
     }
+    let _ = INHERITED_BLOCKED.set(InheritedSigset(previous));
 }
 
 /// Unblock the async signals on the calling thread — called once on the
@@ -469,16 +495,19 @@ pub fn block_async_signals_on_origin_thread() {
 /// its blocking syscalls.
 #[cfg(unix)]
 pub fn unblock_async_signals_on_interp_thread() {
+    let Some(set) = async_signal_set() else {
+        return;
+    };
     unsafe {
-        let mut set = async_signal_set();
         if let Some(inherited) = INHERITED_BLOCKED.get() {
             for signum in 1..NSIG {
-                if libc::sigismember(inherited, signum) == 1 {
-                    libc::sigdelset(&mut set, signum);
+                if majit_rlib::rsignal::c_sigismember(inherited.0, signum) == 1 {
+                    libc::sigdelset(set.0.cast(), signum);
                 }
             }
         }
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        let _ =
+            majit_rlib::rsignal::c_pthread_sigmask(libc::SIG_UNBLOCK, set.0, core::ptr::null_mut());
     }
 }
 

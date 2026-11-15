@@ -12554,11 +12554,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
             fn spawn_sigset(signals: &[i32]) -> Result<libc::sigset_t, i32> {
                 let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-                if unsafe { majit_rlib::rsignal::c_sigemptyset(&mut set) } != 0 {
+                if unsafe { majit_rlib::rsignal::c_sigemptyset((&raw mut set).cast()) } != 0 {
                     return Err(unsafe { majit_rlib::rposix::_get_errno() });
                 }
                 for &sig in signals {
-                    if unsafe { majit_rlib::rsignal::c_sigaddset(&mut set, sig) } != 0 {
+                    if unsafe { majit_rlib::rsignal::c_sigaddset((&raw mut set).cast(), sig) } != 0 {
                         return Err(unsafe { majit_rlib::rposix::_get_errno() });
                     }
                 }
