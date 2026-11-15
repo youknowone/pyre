@@ -19176,6 +19176,31 @@ fn walk_generator_resume<Sym: WalkSym>(
         gen_resume_decline("no_portal_frame_reg");
         return Ok(None);
     }
+    // `_opimpl_recursive_call` (`pyjitpl.py`) consults `can_inline_callable`
+    // before `perform_call`. `blackhole_if_trace_too_long` then
+    // `disable_noninlinable_function` stamps `JC_DONT_TRACE_HERE` on the
+    // resume greenkey `note_inline_subwalk_start` logged
+    // (`next_instr` = `resume_py_pc`). Without this consult the next portal
+    // retrace inlines the same body, aborts `ABORT_TOO_LONG` again, and
+    // never gives up (`warmstate.py` `JitCell` flags).
+    let is_being_profiled = crate::driver::frame_is_being_profiled(shape.frame as usize);
+    let pin = majit_metainterp::GreenRefPin::pin_one(shape.w_pycode as usize);
+    let mut callee_green_key = crate::driver::make_green_key_typed(
+        pin.live() as usize as *const (),
+        resume_py_pc,
+        is_being_profiled,
+    );
+    pin.reload(&mut callee_green_key);
+    if let Some((driver, _)) = crate::driver::try_driver_pair()
+        && !driver
+            .meta_interp_mut()
+            .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
+            .can_inline_callable_for_key(&pin, &mut callee_green_key)
+    {
+        gen_resume_decline("cannot_inline");
+        return Ok(None);
+    }
+    let w_pycode = pin.get() as *const ();
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
         crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
     else {
