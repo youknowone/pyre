@@ -1251,4 +1251,22 @@ mod tests {
             "error names typedef: {err}"
         );
     }
+
+    #[test]
+    fn llexternal_use_eci_head_parses_vis_and_fn() {
+        let head: crate::parse::LlexternalUseEciHead =
+            syn::parse_str(r#"pub do_use_eci = ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "do_use_eci");
+        assert!(matches!(head.vis, syn::Visibility::Public(_)));
+        let eci = &head.compilation_info;
+        assert_eq!(quote::quote!(#eci).to_string(), "ECI");
+        assert!(head.attrs.is_empty());
+
+        let head: crate::parse::LlexternalUseEciHead =
+            syn::parse_str(r#"fn do_use_test_eci = TEST_ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "do_use_test_eci");
+        assert!(matches!(head.vis, syn::Visibility::Inherited));
+        let eci = &head.compilation_info;
+        assert_eq!(quote::quote!(#eci).to_string(), "TEST_ECI");
+    }
 }

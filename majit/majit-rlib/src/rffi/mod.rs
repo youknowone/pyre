@@ -12,7 +12,7 @@ pub use majit_jitcode::rffi::{
 };
 pub use majit_macros::{
     call_aroundstate_target, cextern_variable, copaque_ptr, external_compilation_info,
-    jit_close_stack, llexternal,
+    jit_close_stack, llexternal, llexternal_use_eci,
 };
 
 /// `rffi.CHAR` (`lltype.Char`, 0..=255; `size_and_sign` reports it unsigned).
@@ -261,6 +261,25 @@ mod copy_without_tests {
         let out = eci.copy_without(&["includes"]);
         assert!(out.includes.is_empty());
         assert_eq!(out.post_include_bits, &["x"]);
+    }
+}
+
+#[cfg(test)]
+mod use_eci_tests {
+    use super::*;
+
+    external_compilation_info! {
+        const TEST_ECI = {
+            includes: ["stdio.h"],
+        };
+    }
+
+    llexternal_use_eci!(fn do_use_test_eci = TEST_ECI);
+
+    #[test]
+    fn use_eci_calls_the_dummy() {
+        do_use_test_eci();
+        assert_eq!(TEST_ECI.includes, ["stdio.h"]);
     }
 }
 

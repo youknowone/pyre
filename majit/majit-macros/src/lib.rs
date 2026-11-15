@@ -63,6 +63,16 @@ pub fn copaque_ptr(input: TokenStream) -> TokenStream {
     }
 }
 
+/// `rffi.llexternal_use_eci`: a `sandboxsafe`, `_nowrapper` no-op that names
+/// its ECI. `compile_crate_ecis` already links every declared ECI.
+#[proc_macro]
+pub fn llexternal_use_eci(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_llexternal_use_eci(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 /// `ExternalCompilationInfo` (`cbuild.py`) plus the link directives genc hands
 /// to the linker. C sources are compiled by `majit_eci::build::compile_crate_ecis`,
 /// which the crate's build.rs runs.

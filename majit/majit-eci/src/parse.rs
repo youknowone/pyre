@@ -1,5 +1,6 @@
 //! `external_compilation_info!` input grammar and the `llexternal!` /
-//! `cextern_variable!` / `copaque_ptr!` heads `compile_crate_ecis` reads.
+//! `cextern_variable!` / `copaque_ptr!` heads `compile_crate_ecis` reads,
+//! plus the `llexternal_use_eci!` head the proc macro shares.
 
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -311,6 +312,37 @@ impl Parse for COpaquePtrHead {
             vis,
             name,
             c_name: c_name.value(),
+            compilation_info,
+        })
+    }
+}
+
+/// The `llexternal_use_eci!` tokens the proc macro parses: outer attributes,
+/// visibility, optional `fn`, name, then the ECI (`rffi.llexternal_use_eci`).
+pub struct LlexternalUseEciHead {
+    pub attrs: Vec<Attribute>,
+    pub vis: Visibility,
+    pub name: Ident,
+    pub compilation_info: Expr,
+}
+
+impl Parse for LlexternalUseEciHead {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        let vis: Visibility = input.parse()?;
+        if input.peek(Token![fn]) {
+            input.parse::<Token![fn]>()?;
+        }
+        let name: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let compilation_info: Expr = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after llexternal_use_eci arguments"));
+        }
+        Ok(LlexternalUseEciHead {
+            attrs,
+            vis,
+            name,
             compilation_info,
         })
     }

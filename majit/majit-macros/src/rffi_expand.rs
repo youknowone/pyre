@@ -1,5 +1,5 @@
-//! Expansion of `llexternal`, `cextern_variable`, `copaque_ptr`, and
-//! `external_compilation_info`.
+//! Expansion of `llexternal`, `cextern_variable`, `copaque_ptr`,
+//! `llexternal_use_eci`, and `external_compilation_info`.
 //!
 //! `llexternal` (`rffi.py`) builds the funcptr, then `call_external_function`,
 //! then the forwarding wrapper. The derivations below follow that function's
@@ -49,6 +49,27 @@ pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
         #(#attrs)*
         #[cfg(not(majit_eci_build))]
         compile_error!("`copaque_ptr!` needs `majit_eci::build::compile_crate_ecis` in this crate's build.rs");
+    })
+}
+
+/// `rffi.llexternal_use_eci`: the `PYPY_NO_OP` dummy. `compile_crate_ecis` does
+/// not scan this macro; it already compiles every declared ECI with C sources
+/// and prints every ECI's link directives.
+pub fn expand_llexternal_use_eci(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::LlexternalUseEciHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let vis = &head.vis;
+    let name = &head.name;
+    let eci = &head.compilation_info;
+    let eci_doc = quote!(#eci).to_string().replace(" :: ", "::");
+    let doc = format!("`rffi.llexternal_use_eci({eci_doc})`: the `PYPY_NO_OP` dummy.");
+    Ok(quote! {
+        #(#attrs)*
+        #[inline(always)]
+        #[doc = #doc]
+        #vis fn #name() {
+            let _: &::majit_rlib::rffi::ExternalCompilationInfo = &#eci;
+        }
     })
 }
 
