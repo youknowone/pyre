@@ -9012,6 +9012,38 @@ pub(in crate::front::mir) fn type_decl_is_by_value_integer_newtype(
     integer_newtype_scalar_field_structural(field, llbc).is_some()
 }
 
+/// True when `ty` is a primitive word, not an instance with a classdef.
+///
+/// RPython `history.getkind` of that word is `'int'` / `'float'`
+/// (`IntegerRepr` / `BoolRepr` / `FloatRepr`). `unaryop.py`
+/// `SomeObject.getattr` has no attributes on an integer, so an inherent
+/// method whose receiver is this word is a `simple_call` of the FunDecl
+/// (`description.py` `FunctionDesc`), not `CallTarget::Method`.
+pub(in crate::front::mir) fn tyref_is_primitive_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    matches!(
+        tyref_to_value_type_with(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+            | ValueType::Int128
+            | ValueType::UInt128
+    )
+}
+
 fn integer_newtype_inner_field_structural<'a>(
     decl: &TypeDecl,
     fields: &'a [FieldDecl],

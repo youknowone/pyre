@@ -10616,6 +10616,23 @@ impl<'a> Lowering<'a> {
                 if fd.first_arg_local_name().is_some_and(|n| n != "self") {
                     return None;
                 }
+                // A Rust inherent method is statically dispatched. When the
+                // receiver is a primitive word (`IntegerRepr.lowleveltype`),
+                // `CallTarget::Method` would `getattr` that integer
+                // (`unaryop.py` `SomeObject.getattr`). The FunDecl is a
+                // `simple_call` of a function constant (`description.py`
+                // `FunctionDesc`) with the receiver as argument zero.
+                if fd.signature.inputs.first().is_some_and(|ty| {
+                    tyref_is_primitive_word(
+                        ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                }) {
+                    return None;
+                }
                 // `SomePtr.getattr` (`unaryop.py`) resolves struct fields and
                 // `_adtmeths` only. An inherent method is neither, so
                 // `CallTarget::Method`'s `getattr` + `simple_call` panics on a
