@@ -988,30 +988,29 @@ fn walk_jitcode_code_roots_in(
             unsafe { &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
         visitor(root);
     };
-    if majit_gc::shadow_stack::extra_root_walk_kind()
-        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
-    {
-        // `incminimark.py _minor_collection` consumes
-        // `old_objects_pointing_to_young`: a young wrapper reaches the table
-        // only through `register_live_code_wrapper`, which remembers it, and
-        // a JitCode-retained wrapper is one of the table's values. Old values
-        // do not move in a minor collection, so neither whole-table loop
-        // below has anything left to forward.
-        pyre_interpreter::pycode::walk_young_live_code_wrappers(&mut |wrapper| visit_one(wrapper));
-        return;
-    }
     // A wrapper is born before its jitcode exists. A minor in that window
     // copies it through `frame.pycode` / `Function.code` and recycles the
     // nursery; the map still holds the birth address unless this walk
     // forwards it (`framework.py root_walker.walk_roots`; `malloc_fixedsize`).
     // Old-gen entries that no jitcode retains are left to the object graph
     // so a major can reclaim them (`pycode_destructor` unmaps).
+    // `walk_all_live_code_wrappers` visits only the remembered young entries
+    // in a minor collection.
     pyre_interpreter::pycode::walk_all_live_code_wrappers(&mut |wrapper| {
         if !majit_gc::gc_is_nursery_object(*wrapper as usize) {
             return;
         }
         visit_one(wrapper);
     });
+    if majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        // `incminimark.py _minor_collection` consumes
+        // `old_objects_pointing_to_young`: a JitCode-retained wrapper is one
+        // of the table's values, so the remembered entries above cover it,
+        // and old values do not move in a minor collection.
+        return;
+    }
     for jc in sd.jitcodes.iter() {
         pyre_interpreter::pycode::walk_live_code_wrapper(
             jc.payload.code_ptr as *const (),

@@ -5040,26 +5040,6 @@ pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut 
     *wrapper = root as usize;
 }
 
-/// Minor-collection walk of [`LIVE_CODE_WRAPPERS`]: forward only the
-/// remembered entries and clear the list (`incminimark.py
-/// collect_oldrefs_to_nursery`). Every other value is old, and the old
-/// generation does not move in a minor collection.
-pub fn walk_young_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    let mut wrappers = live_code_wrappers().lock();
-    let LiveCodeWrappers { map, young } = &mut *wrappers;
-    for code_ptr in young.drain(..) {
-        let Some(wrapper) = map.get_mut(&code_ptr) else {
-            continue;
-        };
-        if *wrapper == 0 || !majit_gc::gc_is_nursery_object(*wrapper) {
-            continue;
-        }
-        let mut root = *wrapper as PyObjectRef;
-        forward(&mut root);
-        *wrapper = root as usize;
-    }
-}
-
 /// Forward every `LIVE_CODE_WRAPPERS` value in place.
 ///
 /// A wrapper is born before its jitcode exists, and
@@ -5073,9 +5053,30 @@ pub fn walk_young_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) 
 /// `malloc_fixedsize`). Old-gen interpreted-only entries are not a
 /// major mark set: that kept `w_globals` alive across
 /// `finalize_modules`' pre-clear collection.
+/// A minor collection forwards only the remembered young entries.
 pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut wrappers = live_code_wrappers().lock();
-    for wrapper in wrappers.map.values_mut() {
+    let LiveCodeWrappers { map, young } = &mut *wrappers;
+    if majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        // incminimark.py collect_oldrefs_to_nursery: forward only the
+        // remembered entries and drain the list. Every other value is
+        // old, and the old generation does not move in a minor collection.
+        for code_ptr in young.drain(..) {
+            let Some(wrapper) = map.get_mut(&code_ptr) else {
+                continue;
+            };
+            let mut root = *wrapper as PyObjectRef;
+            if root.is_null() {
+                continue;
+            }
+            forward(&mut root);
+            *wrapper = root as usize;
+        }
+        return;
+    }
+    for wrapper in map.values_mut() {
         let mut root = *wrapper as PyObjectRef;
         if root.is_null() {
             continue;
