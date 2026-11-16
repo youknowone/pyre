@@ -2546,6 +2546,15 @@ impl Bookkeeper {
         crate::codewriter::annotation_state::valuetype_to_someshell(&kind)
     }
 
+    /// Inner field-row layout of a harvested by-value
+    /// `#[repr(transparent)]` ADT, or `None`.
+    pub fn transparent_inner_field(&self, class_root: &str) -> Option<String> {
+        self.struct_fields
+            .borrow()
+            .as_ref()?
+            .transparent_inner_field(class_root)
+    }
+
     /// `getrepr` of a declared-Gc MiniMark container `Ptr` (`rptr.py` `PtrRepr`).
     pub fn gc_struct_ptr_lltype(
         &self,
@@ -4311,13 +4320,24 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        // `IdentityKey` is the object pointer (`identitydict.py`); minting
-        // a sibling ClassDef makes `generalize_key` raise
-        // `PyObject ∪ IdentityKey` (`rclass.py` no common base).
-        if is_identity_key_spelling(root) {
-            return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
-        }
         let registry = self.struct_fields.borrow().clone();
+        // By-value `#[repr(transparent)]` is the unique non-ZST field
+        // (`transparent_nonzst_field`). A pointer inner has no ClassDef
+        // (`llmemory.py` `GCREF`; `lltype.py` `Ptr`). Recurse only when
+        // the inner is itself a struct root.
+        if let Some(reg) = registry.as_ref()
+            && let Some(inner) = reg.transparent_inner_field(root)
+            && inner != root
+        {
+            if crate::front::typestr::peel_pointer_prefix(&inner).is_some()
+                || is_gcref_type_spelling(&inner)
+            {
+                return Err(AnnotatorError::new(format!(
+                    "repr(transparent) pointer wrapper has no ClassDef: {root}"
+                )));
+            }
+            return self.getuniqueclassdef_for_struct_root(&inner);
+        }
         // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
         // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
         // `SomePtr(GCREF)` and raises (`llannotation.py`
@@ -6185,14 +6205,6 @@ impl Bookkeeper {
                 self.project_struct_field_type("pyobject::PyObject"),
             );
         }
-        // `IdentityKey` is `repr(transparent)` over `PyObjectRef`
-        // (`IdentityDictStrategy`: the key is the object, compared by
-        // identity). The constructor is that pointer, so the dict key
-        // cell is the same nullable instance. A separate `IdentityKey`
-        // class has no common base with `PyObject`.
-        if is_identity_key_spelling(t) {
-            return self.project_struct_field_type("PyObjectRef");
-        }
         // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
         // function family `setllprofile` stores (`description.py`
         // `CallFamily`).
@@ -6220,6 +6232,15 @@ impl Bookkeeper {
         // unioned Integer ∪ Ptr at a call that takes the wrapper.
         if let Some(cell) = self.transparent_scalar_annotation(t) {
             return cell;
+        }
+        // By-value `#[repr(transparent)]` is the unique non-ZST field
+        // (`transparent_nonzst_field`). The wrapper intern is the inner
+        // intern (`rordereddict.py` `get_ll_dict`; `lltype.py`
+        // `_interior_ptr._expose` of a Ptr field is that pointer).
+        if let Some(inner) = self.transparent_inner_field(t)
+            && inner != t
+        {
+            return self.project_struct_field_type(&inner);
         }
         // A shared `&[u8]` / `*const [u8]` is the two-word fat window
         // `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`). Peel of
@@ -8242,13 +8263,6 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
-/// `identitydict.py IdentityKey`: `repr(transparent)` over `PyObjectRef`.
-/// The key cell is the object (`rclass.py` identity hash); a sibling
-/// ClassDef has no common base with `PyObject`.
-pub(crate) fn is_identity_key_spelling(stripped: &str) -> bool {
-    stripped == "IdentityKey" || stripped.ends_with("::IdentityKey")
-}
-
 /// `lltype.GCREF` (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
 /// and the Rust pointee `majit_gc::header::GCREFOpaque`
 /// (`type GCREF = *mut GCREFOpaque`). Compared by declared path in
@@ -8620,6 +8634,7 @@ pub(crate) fn struct_root_refuses_classdef_intern(
             struct_root_is_raw_word_c_struct(root, reg)
                 || reg.is_list_items_gcarray_owner(root)
                 || struct_root_is_gcarray_item(reg, root)
+                || transparent_pointer_wrapper_root(reg, root)
         })
 }
 
@@ -8644,7 +8659,20 @@ fn struct_root_refuses_classdef_new(
         || struct_root_is_string_family(root)
         || struct_root_is_core_option_or_result_template(root, registry)
         || struct_root_is_gcarray_ptr_wrapper(root, registry)
-        || registry.is_some_and(|reg| struct_root_is_gcarray_item(reg, root))
+        || registry.is_some_and(|reg| {
+            struct_root_is_gcarray_item(reg, root) || transparent_pointer_wrapper_root(reg, root)
+        })
+}
+
+/// By-value `#[repr(transparent)]` over a pointer has no ClassDef
+/// (`llmemory.py` `GCREF`; `lltype.py` `Ptr`). The wrapper intern is
+/// the inner intern (`transparent_nonzst_field`).
+fn transparent_pointer_wrapper_root(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
+    reg.transparent_inner_field(root).is_some_and(|inner| {
+        inner != root
+            && (crate::front::typestr::peel_pointer_prefix(&inner).is_some()
+                || is_gcref_type_spelling(&inner))
+    })
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -8688,6 +8716,12 @@ fn collect_referenced_struct_names(
     }
     if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
         collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    if let Some(inner) = reg.transparent_inner_field(stripped)
+        && inner != stripped
+    {
+        collect_referenced_struct_names(&inner, reg, out);
         return;
     }
     for wrapper in ["Vec<", "VecDeque<", "HashSet<", "BTreeSet<", "IndexSet<"] {
@@ -10235,14 +10269,6 @@ mod tests {
                 Some("pyre_interpreter::pyframe::PyFrame")
             );
         });
-    }
-
-    #[test]
-    fn identity_key_spelling_matches_qualified_and_leaf() {
-        assert!(is_identity_key_spelling("IdentityKey"));
-        assert!(is_identity_key_spelling("identitydict::IdentityKey"));
-        assert!(!is_identity_key_spelling("ObjectKey"));
-        assert!(!is_identity_key_spelling("pyobject::PyObject"));
     }
 
     #[test]
@@ -16753,6 +16779,31 @@ mod tests {
                 "Charon spells a capture as the ADT leaf; {spelling} is the inner word, got {projected:?}"
             );
         }
+    }
+
+    #[test]
+    fn transparent_pointer_wrapper_projects_as_the_inner_field() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.note_transparent_inner(
+            "identitydict::IdentityKey".to_string(),
+            "*mut pyobject::PyObject".to_string(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let s_key = bk.project_struct_field_type("identitydict::IdentityKey");
+        let s_value = bk.project_struct_field_type("*mut pyobject::PyObject");
+        assert_eq!(
+            s_key.tag(),
+            s_value.tag(),
+            "transparent wrapper projects as the inner pointer, key={s_key:?} value={s_value:?}"
+        );
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("identitydict::IdentityKey")
+                .is_err(),
+            "pointer wrapper has no ClassDef"
+        );
     }
 
     #[test]

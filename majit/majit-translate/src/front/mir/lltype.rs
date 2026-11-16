@@ -17165,6 +17165,18 @@ fn field_row_lltype(
     if spelling_is_declared_gc(&reg.gc_struct_ids, t) {
         return Some((*GCREF).clone());
     }
+    // By-value `#[repr(transparent)]` is the unique non-ZST field
+    // (`transparent_nonzst_field`). Peel before the nested inline
+    // Struct arm. The wrapper intern is the inner intern
+    // (`rordereddict.py` `get_ll_dict`; `lltype.py`
+    // `_interior_ptr._expose` of a Ptr field returns the pointer).
+    // A non-transparent by-value struct keeps the nested Struct.
+    if let Some(inner) = reg.transparent_inner_field(t)
+        && inner != t
+        && let Some(ll) = field_row_lltype(reg, &inner, visited)
+    {
+        return Some(ll);
+    }
     if reg.field_rows(t).is_some() {
         return raw_struct_array_item_lltype(reg, t, visited);
     }

@@ -6334,6 +6334,18 @@ pub(crate) fn derive_subject_inputcells(
                 cells.push(cell);
                 continue;
             }
+            // By-value `#[repr(transparent)]` is the unique non-ZST field
+            // (`transparent_nonzst_field`). Seed the inner intern so a
+            // pointer wrapper does not mint a sibling ClassDef
+            // (`rordereddict.py` `get_ll_dict`; `lltype.py`
+            // `_interior_ptr._expose` of a Ptr field is that pointer).
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && let Some(inner) = bk.transparent_inner_field(root)
+                && inner != root
+            {
+                cells.push(bk.project_struct_field_type(root));
+                continue;
+            }
             // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`,
             // `rstr.py` UniChar). `getkind` of that repr is still `'int'`.
             if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("char") {
@@ -6477,16 +6489,6 @@ pub(crate) fn derive_subject_inputcells(
                         || crate::front::mir::is_cow_str_family_class_root(root)
                 }) {
                     cells.push(crate::annotator::model::s_str0());
-                    continue;
-                }
-                // `IdentityKey` is the object pointer (`identitydict.py`).
-                // `project_struct_field_type` already aliases it to
-                // `PyObjectRef`; minting `IdentityKey` here made
-                // `generalize_key` raise `PyObject ∪ IdentityKey`.
-                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
-                    && crate::annotator::bookkeeper::is_identity_key_spelling(root)
-                {
-                    cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {

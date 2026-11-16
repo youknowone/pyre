@@ -488,6 +488,9 @@ pub(crate) fn absorb_semantic_program(
                     .entry(key)
                     .or_insert(kind);
             }
+            for (key, inner) in prog.struct_fields.transparent_inners {
+                acc.struct_fields.note_transparent_inner(key, inner);
+            }
             acc.struct_fields
                 .option_struct_ids
                 .extend(prog.struct_fields.option_struct_ids);
@@ -7148,6 +7151,53 @@ fn derive_program_metadata(
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
+                // By-value `#[repr(transparent)]` is the unique non-ZST
+                // field's layout (`transparent_nonzst_field`). Record the
+                // *inner* spelling — `tyref_to_field_layout_string_with` of
+                // the wrapper keeps a `ValueType::Ref` handle leaf
+                // (`PyError`). Qualify the inner the same way
+                // `field_row_struct_identity` qualifies a pointer field
+                // (`*mut PyObject` → `*mut pyobject::PyObject`) so
+                // `field_row_lltype` of the wrapper intern's the same
+                // pointer as a bare inner field. Skip a Deref handle: its
+                // harvest row is already the payload pointer
+                // (`transparent_handle_field_spelling`). Skip a generic
+                // wrapper (`UnsafeCell<T>`): its template field is the
+                // type parameter, so only an instantiation knows the
+                // inner. `field_row_lltype` peels before the nested
+                // inline Struct arm (`rordereddict.py` `get_ll_dict`;
+                // `lltype.py` `_interior_ptr._expose` of a Ptr field).
+                if td.is_repr_transparent()
+                    && handle_payload.is_none()
+                    && let Some((index, _)) = transparent_nonzst_field(td, llbc)
+                    && let Some(field) = fields.get(index)
+                    && !tyref_mentions_typevar(&field.ty, llbc)
+                    && let Some(node) = tyref_node(&field.ty, llbc)
+                {
+                    let peeled = type_node_peel_aliases(node, llbc)
+                        .cloned()
+                        .unwrap_or_else(|| node.clone());
+                    let peeled_ty = TyRef::Other(peeled.into());
+                    let layout = tyref_to_field_layout_string_with(
+                        &peeled_ty,
+                        llbc,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                        &ambiguous_leaves,
+                    );
+                    let inner =
+                        field_row_struct_identity(&peeled_ty, llbc, &layout).unwrap_or(layout);
+                    if !inner.is_empty()
+                        && inner != name
+                        && inner != canonical_name
+                        && inner != leaf
+                    {
+                        struct_fields.note_transparent_inner(name.clone(), inner.clone());
+                        if canonical_name != name && canonical_name.contains("::") {
+                            struct_fields.note_transparent_inner(canonical_name.clone(), inner);
+                        }
+                    }
+                }
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields
                     .fields
@@ -8574,6 +8624,9 @@ impl DuplicateLeafFacts {
                 .transparent_scalar_kinds
                 .entry(key)
                 .or_insert(kind);
+        }
+        for (key, inner) in other.struct_fields.transparent_inners {
+            self.struct_fields.note_transparent_inner(key, inner);
         }
         self.struct_fields
             .option_struct_ids
