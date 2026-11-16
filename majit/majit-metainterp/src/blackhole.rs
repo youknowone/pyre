@@ -353,6 +353,10 @@ pub struct BlackholeInterpreter {
     /// Set when handle_exception_in_frame finds a handler.
     /// Read by CheckExcMatch and other exception opcodes in the handler.
     pub exception_last_value: i64,
+    /// `blackhole.py _run_forever`'s `current_exc` local, held on the
+    /// running interpreter so the collector traces it with the interpreter's
+    /// other reference fields.
+    pending_exc: i64,
     /// Callback for the interpreter-level traceback record that occurs before
     /// an exception-table handler is entered.  The generic blackhole carries
     /// only raw frame/exception references; portal integrations install the
@@ -612,6 +616,7 @@ impl Default for BlackholeInterpreter {
             last_opcode_position: 0,
             entry_position: 0,
             exception_last_value: 0,
+            pending_exc: 0,
             record_caught_exception: None,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
@@ -1163,6 +1168,7 @@ impl BlackholeInterpreter {
         let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
         self.registers_r[..n_r].fill(0);
         self.exception_last_value = 0;
+        self.pending_exc = 0;
     }
 
     /// blackhole.py `get_current_position_info`.
@@ -3233,6 +3239,7 @@ impl BlackholeInterpBuilder {
                 &mut (*ctx).tmpreg_r,
                 &mut (*ctx).exception_last_value,
                 &mut (*ctx).virtualizable_ptr,
+                &mut (*ctx).pending_exc,
                 ctx as *const (),
             );
         }
@@ -3856,11 +3863,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
     // `_run_forever`'s `current_exc` is a traced `OBJECTPTR` local: the level
     // callbacks, `release_interp` and `handle_jitexception` between two
     // `resume_mainloop` calls can collect.
-    let mut current_exc_slot = [current_exc];
-    let _current_exc_root = crate::resume::ResumeRefRootsScope::enter();
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(&mut current_exc_slot);
-    }
+    bh.pending_exc = current_exc;
     loop {
         // executioncontext.py enter: publish this level's frame as
         // `ec.topframeref` before its residuals run (pyjitpl multi-frame
@@ -3870,9 +3873,9 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
             on_enter_level(bh.virtualizable_ptr);
         }
         // blackhole.py:1754-1755
-        match bh.resume_mainloop(current_exc_slot[0]) {
+        match bh.resume_mainloop(bh.pending_exc) {
             Ok(exc) => {
-                current_exc_slot[0] = exc;
+                bh.pending_exc = exc;
             }
             Err(jit_exc) => {
                 // blackhole.py:1756-1758
@@ -3884,7 +3887,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
                     on_leave_level,
                     terminal_out.as_deref_mut(),
                 ) {
-                    Ok((new_bh, exc)) => {
+                    Ok((mut new_bh, exc)) => {
                         // Handled at a recursive portal level.  `new_bh` is
                         // that portal frame (blackhole.py:1780 returns
                         // `blackholeinterp`), and its caller already holds the
@@ -3896,8 +3899,8 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
                         // they run on this arm too.  Re-entering `new_bh`
                         // instead would execute its tail a second time and
                         // overwrite the installed result.
+                        new_bh.pending_exc = exc;
                         bh = new_bh;
-                        current_exc_slot[0] = exc;
                     }
                     Err(propagated_exc) => {
                         // Bottommost or unhandled — propagate out
@@ -3921,14 +3924,16 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         // callback for each level it abandons on its walk.
         if let Some(on_leave_level) = on_leave_level {
             // `blackhole.py _run_forever`: `current_exc` after `_resume_mainloop`.
-            let exit = level_exit_after_resume(&bh, next.as_deref(), current_exc_slot[0]);
+            let exit = level_exit_after_resume(&bh, next.as_deref(), bh.pending_exc);
             if let Some(e) = on_leave_level(bh.virtualizable_ptr, exit) {
                 // pyframe.py execute_frame: return_trace/leave replace the
                 // pending outcome; the next `_resume_mainloop(current_exc)`
                 // raises it at the call site.
-                current_exc_slot[0] = e;
+                bh.pending_exc = e;
             }
         }
+        let mut next = next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
+        next.pending_exc = bh.pending_exc;
         builder.release_interp(bh);
         // blackhole.py:1760
         // RPython: blackholeinterp = blackholeinterp.nextblackholeinterp
@@ -3936,7 +3941,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         // bottommost frame always raises a JitException (via
         // _done_with_this_frame or _exit_frame_with_exception), so
         // this code is unreachable in normal operation.
-        bh = next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
+        bh = next;
     }
 }
 
@@ -6127,6 +6132,35 @@ mod tests {
                 roots.contains(&(EXC as usize)),
                 "the caught exception is invisible to the collector while the \
                  handler runs; roots were {roots:x?}",
+            );
+        }
+
+        /// `_run_forever`'s `current_exc` is a field of the pooled interpreter,
+        /// so `visit_bh_interp_entry` traces it with the other reference slots.
+        #[test]
+        fn pending_exc_is_walked_with_the_interpreter() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            const EXC: i64 = 0x7f00_0000_def0;
+            bh.pending_exc = EXC;
+            bh.tmpreg_r = 0;
+            let pending_addr = std::ptr::from_mut(&mut bh.pending_exc) as usize;
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut bh.registers_r,
+                    &mut bh.tmpreg_r,
+                    &mut bh.exception_last_value,
+                )
+            };
+            let mut visited: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| {
+                visited.push(std::ptr::from_mut(slot) as usize);
+            });
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                visited.contains(&pending_addr),
+                "`pending_exc` is invisible to the collector; visited were {visited:x?}",
             );
         }
 

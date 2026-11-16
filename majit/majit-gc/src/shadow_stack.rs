@@ -346,8 +346,9 @@ thread_local! {
     /// traces these through the GC-managed reader/blackhole objects; pyre
     /// stores raw `i64`, so the slices are registered here for the
     /// construction window and popped when it ends.
-    static RESUME_REF_ROOTS_STACK: RefCell<Vec<ResumeRefRoots>> =
-        RefCell::new(Vec::with_capacity(16));
+    static RESUME_REF_ROOTS_STACK: ResumeRefRootStack = ResumeRefRootStack {
+        entries: UnsafeCell::new(Vec::with_capacity(16)),
+    };
 }
 
 /// Root structures owned by one registered mutator thread.
@@ -368,7 +369,7 @@ struct MutatorEntry {
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
     bh_interp_roots: *const RefCell<Vec<BhInterpEntry>>,
-    resume_ref_roots_stack: *const RefCell<Vec<ResumeRefRoots>>,
+    resume_ref_roots_stack: *const ResumeRefRootStack,
     extra_areas: Vec<Option<MutatorExtraArea>>,
     pruners: Vec<MutatorPruner>,
     young_reconcilers: Vec<MutatorYoungReconciler>,
@@ -1925,13 +1926,16 @@ struct BhRegsEntry {
 /// The traced fields of one pooled blackhole interpreter (`blackhole.py
 /// BlackholeInterpreter`: `registers_r`, `tmpreg_r`, `exception_last_value`,
 /// `virtualizable_ptr`). `regs` names the `Vec` itself, so a `setposition`
-/// that regrows the bank is followed.
+/// that regrows the bank is followed. `pending_exc_ptr` is
+/// `blackhole.py _run_forever`'s `current_exc` local, held on the
+/// interpreter so the collector traces it with those fields.
 #[derive(Clone, Copy)]
 struct BhInterpEntry {
     regs: *mut Vec<i64>,
     tmpreg_ptr: *mut i64,
     exc_ptr: *mut i64,
     vable_ptr: *mut i64,
+    pending_exc_ptr: *mut i64,
     live_ctx: *const (),
 }
 
@@ -2018,8 +2022,9 @@ pub unsafe fn register_bh_interp(
     tmpreg: *mut i64,
     exc: *mut i64,
     vable: *mut i64,
+    pending_exc: *mut i64,
 ) {
-    unsafe { register_bh_interp_with_live(regs, tmpreg, exc, vable, std::ptr::null()) }
+    unsafe { register_bh_interp_with_live(regs, tmpreg, exc, vable, pending_exc, std::ptr::null()) }
 }
 
 /// [`register_bh_interp`] plus the interpreter pointer for collection-time
@@ -2033,6 +2038,7 @@ pub unsafe fn register_bh_interp_with_live(
     tmpreg: *mut i64,
     exc: *mut i64,
     vable: *mut i64,
+    pending_exc: *mut i64,
     live_ctx: *const (),
 ) {
     BH_INTERP_ROOTS.with(|roots| {
@@ -2041,6 +2047,7 @@ pub unsafe fn register_bh_interp_with_live(
             tmpreg_ptr: tmpreg,
             exc_ptr: exc,
             vable_ptr: vable,
+            pending_exc_ptr: pending_exc,
             live_ctx,
         });
     });
@@ -2071,6 +2078,7 @@ unsafe fn visit_bh_interp_entry(entry: &BhInterpEntry, visitor: &mut dyn FnMut(&
     visitor(unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) });
     visitor(unsafe { &mut *(entry.exc_ptr as *mut GcRef) });
     visitor(unsafe { &mut *(entry.vable_ptr as *mut GcRef) });
+    visitor(unsafe { &mut *(entry.pending_exc_ptr as *mut GcRef) });
 }
 
 /// Pop blackhole register entries back to the given depth.
@@ -2165,7 +2173,10 @@ pub fn bh_regs_depth() -> usize {
 
 /// Current depth of the resume-construction ref-slice root stack.
 pub fn resume_ref_roots_depth() -> usize {
-    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().len())
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe { (*ss.entries.get()).len() }
+    })
 }
 
 /// Whether a ref slice starting at `ptr` is currently registered as a
@@ -2176,10 +2187,17 @@ pub fn resume_ref_roots_depth() -> usize {
 /// place by a collection their allocations trigger — instead of arguing it.
 pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        ss.borrow()
-            .iter()
-            .any(|entry| entry.ptr == ptr.cast_mut().cast())
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe {
+            (*ss.entries.get())
+                .iter()
+                .any(|entry| entry.ptr == ptr.cast_mut().cast())
+        }
     })
+}
+
+struct ResumeRefRootStack {
+    entries: UnsafeCell<Vec<ResumeRefRoots>>,
 }
 
 struct ResumeRefRoots {
@@ -2216,11 +2234,14 @@ pub unsafe fn push_resume_ref_root(slot: &mut GcRef) {
         );
     }
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        ss.borrow_mut().push(ResumeRefRoots {
-            ptr: (slot as *mut GcRef).cast(),
-            len: 1,
-            stride: std::mem::size_of::<GcRef>(),
-        });
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe {
+            (*ss.entries.get()).push(ResumeRefRoots {
+                ptr: (slot as *mut GcRef).cast(),
+                len: 1,
+                stride: std::mem::size_of::<GcRef>(),
+            });
+        }
     });
 }
 
@@ -2255,19 +2276,54 @@ pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
         }
     }
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        ss.borrow_mut().push(ResumeRefRoots {
-            ptr: slice.as_mut_ptr().cast(),
-            len: slice.len(),
-            stride: std::mem::size_of::<i64>(),
-        });
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe {
+            (*ss.entries.get()).push(ResumeRefRoots {
+                ptr: slice.as_mut_ptr().cast(),
+                len: slice.len(),
+                stride: std::mem::size_of::<i64>(),
+            });
+        }
     });
 }
 
 /// Pop resume-construction ref-slice roots back to the given depth.
 pub fn pop_resume_ref_roots_to(depth: usize) {
     let _ = RESUME_REF_ROOTS_STACK.try_with(|ss| {
-        ss.borrow_mut().truncate(depth);
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe {
+            (*ss.entries.get()).truncate(depth);
+        }
     });
+}
+
+/// Captures this thread's resume-root stack pointer and depth in one TLS
+/// access. `Drop` truncates through that pointer, without another TLS trip.
+///
+/// `!Send`: the pointer names this thread's TLS stack.
+pub struct ResumeRefRootsDepthGuard {
+    stack: *mut Vec<ResumeRefRoots>,
+    base_depth: usize,
+}
+
+impl ResumeRefRootsDepthGuard {
+    pub fn enter() -> Self {
+        RESUME_REF_ROOTS_STACK.with(|ss| {
+            let stack = ss.entries.get();
+            ResumeRefRootsDepthGuard {
+                stack,
+                // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+                base_depth: unsafe { (*stack).len() },
+            }
+        })
+    }
+}
+
+impl Drop for ResumeRefRootsDepthGuard {
+    fn drop(&mut self) {
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        unsafe { (*self.stack).truncate(self.base_depth) };
+    }
 }
 
 /// Walk all registered resume-construction ref slices as GC roots.
@@ -2277,7 +2333,9 @@ pub fn pop_resume_ref_roots_to(depth: usize) {
 /// visitor's `copy_nursery_object` guard unchanged.
 pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        for entry in ss.borrow().iter() {
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        let entries = unsafe { &*ss.entries.get() };
+        for entry in entries.iter() {
             unsafe { entry.walk(&mut visitor) };
         }
     });
@@ -2324,9 +2382,8 @@ pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     );
     let registry = lock_mutator_registry();
     for mutator in registry.iter() {
-        // SAFETY: the owner is quiesced and the registered slices stay pinned
-        // for the complete resume-construction window.
-        let entries = unsafe { &*(*mutator.resume_ref_roots_stack).as_ptr() };
+        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        let entries = unsafe { &*(*(*mutator.resume_ref_roots_stack).entries.get()) };
         for entry in entries.iter() {
             unsafe { entry.walk(&mut visitor) };
         }

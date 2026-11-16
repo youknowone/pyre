@@ -9198,20 +9198,14 @@ impl Drop for DeadFrameRefRoots {
 /// `virtuals_cache` / `registers_r` slices never outlive the construction
 /// window in the GC root set.
 pub struct ResumeRefRootsScope {
-    base_depth: usize,
+    _guard: majit_gc::shadow_stack::ResumeRefRootsDepthGuard,
 }
 
 impl ResumeRefRootsScope {
     pub(crate) fn enter() -> Self {
         ResumeRefRootsScope {
-            base_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+            _guard: majit_gc::shadow_stack::ResumeRefRootsDepthGuard::enter(),
         }
-    }
-}
-
-impl Drop for ResumeRefRootsScope {
-    fn drop(&mut self) {
-        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.base_depth);
     }
 }
 
