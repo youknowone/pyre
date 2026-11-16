@@ -2257,8 +2257,14 @@ pub unsafe fn push_resume_ref_root(slot: &mut GcRef) {
 #[inline]
 #[track_caller]
 pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
+    // The entry captures `len` now; an empty slice has no slot to trace,
+    // and `pop_resume_ref_roots_to` truncates to a depth, so skipping the
+    // push leaves every enclosing scope balanced.
+    if slice.is_empty() {
+        return;
+    }
     debug_assert!(
-        slice.is_empty() || !crate::gc_is_nursery_object(slice.as_ptr() as usize),
+        !crate::gc_is_nursery_object(slice.as_ptr() as usize),
         "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
         slice.as_ptr() as usize,
         slice.len(),

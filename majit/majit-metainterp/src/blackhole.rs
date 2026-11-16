@@ -3864,6 +3864,10 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
     // callbacks, `release_interp` and `handle_jitexception` between two
     // `resume_mainloop` calls can collect.
     bh.pending_exc = current_exc;
+    // `pending_exc` is traced through the pool registration
+    // (`acquire_interp_new`); every interpreter `_run_forever` drives comes
+    // from `acquire_interp`.
+    debug_assert!(bh.rooted, "_run_forever on an interpreter outside the pool");
     loop {
         // executioncontext.py enter: publish this level's frame as
         // `ec.topframeref` before its residuals run (pyjitpl multi-frame
@@ -3933,6 +3937,10 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
             }
         }
         let mut next = next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
+        debug_assert!(
+            next.rooted,
+            "_run_forever on an interpreter outside the pool"
+        );
         next.pending_exc = bh.pending_exc;
         builder.release_interp(bh);
         // blackhole.py:1760
