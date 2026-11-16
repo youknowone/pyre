@@ -276,18 +276,23 @@ fn graph_arg_lltypes(graph: &FunctionGraph) -> Vec<LowLevelType> {
 
 /// `description.py FunctionDesc.cachedgraph` stamps `graph.name` to
 /// `name__<argtypes>` while the function object (and its oopspec) stays
-/// the unspecialized identity. Helper graphs this walk registers under
-/// that label are relabelled; a graphless funcptr and a HOST_ENV
-/// `rlib/jit.py` builtin keep `func._name`. `jit_conditional_call`
-/// and `jit_conditional_call_value` store the funcptr in args[1]
-/// (`rlist.py _ll_list_resize_ge` / `rstr.py LLHelpers.ll_strhash`).
+/// the unspecialized identity. Only funcptrs whose callee graph the walk
+/// follows (`follow`) are relabelled; a graphless funcptr, a HOST_ENV
+/// `rlib/jit.py` builtin, and any other skipped callee keep `func._name`.
+/// `jit_conditional_call` and `jit_conditional_call_value` store the
+/// funcptr in args[1] (`rlist.py _ll_list_resize_ge` /
+/// `rstr.py LLHelpers.ll_strhash`).
 ///
 /// When the callee graph already carries a specialized stamped name
 /// (`unspecialized_helper_name(&graph.name) != graph.name`), `func._name`
 /// takes that stamp so a uniquified `leaf_n` is what later `func._name`
 /// lookups find. `specialized_callee_leaf` would recompute the colliding
 /// `name__<argtypes>` label.
-fn specialize_direct_call_funcptr_names(graph: &FunctionGraph, rtyper: &RPythonTyper) {
+fn specialize_direct_call_funcptr_names(
+    graph: &FunctionGraph,
+    rtyper: &RPythonTyper,
+    follow: &dyn Fn(usize) -> bool,
+) {
     for block in graph.iterblocks() {
         for op in &mut block.borrow_mut().operations {
             let funcptr_idx = match op.opname.as_str() {
@@ -305,6 +310,12 @@ fn specialize_direct_call_funcptr_names(graph: &FunctionGraph, rtyper: &RPythonT
                 continue;
             };
             if func.graph.is_none() || host_env_jit_builtin_func(func) {
+                continue;
+            }
+            let Some(graph_id) = func.graph else {
+                continue;
+            };
+            if !follow(graph_id) {
                 continue;
             }
             let callee = func.graph_ref().or_else(|| {
@@ -649,7 +660,7 @@ fn visit_direct_call_callees(
     seen: &mut HashSet<usize>,
     follow: &dyn Fn(usize) -> bool,
 ) {
-    specialize_direct_call_funcptr_names(graph, rtyper);
+    specialize_direct_call_funcptr_names(graph, rtyper, follow);
     bind_ll_list_resize_hint_really_from_graph(cc, graph);
     for func in direct_call_funcobjs(graph) {
         if !follow_regular_direct_call(cc, &func) {
@@ -699,8 +710,8 @@ fn visit_direct_call_callees(
             let mut graph = callee.borrow_mut();
             stamp_specialized_graph_name(&mut graph, &leaf);
         }
-        specialize_direct_call_funcptr_names(graph, rtyper);
-        specialize_direct_call_funcptr_names(&callee.borrow(), rtyper);
+        specialize_direct_call_funcptr_names(graph, rtyper, follow);
+        specialize_direct_call_funcptr_names(&callee.borrow(), rtyper, follow);
         register_callee_graph(
             cc,
             path.clone(),
@@ -1568,7 +1579,7 @@ mod tests {
             unwrap_pygraph(build_ll_find_helper_graph(LL_FIND, STRPTR.clone()).expect("ll_find"));
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        specialize_direct_call_funcptr_names(&find_flow, &rtyper);
+        specialize_direct_call_funcptr_names(&find_flow, &rtyper, &|_| true);
         let find_xf = Transformer::new(&GraphTransformConfig::default())
             .with_callcontrol(&mut cc)
             .transform(&lower_graph(&find_flow));
@@ -2661,7 +2672,7 @@ mod tests {
                 &mut HashSet::new(),
                 &|_| true,
             );
-            specialize_direct_call_funcptr_names(&helper.graph.borrow(), &rtyper);
+            specialize_direct_call_funcptr_names(&helper.graph.borrow(), &rtyper, &|_| true);
 
             let mut value_names = Vec::new();
             let mut direct_names = Vec::new();
@@ -3014,6 +3025,12 @@ mod tests {
             cc.function_graphs().keys().is_empty(),
             "non-helper callee must not register; registered {:?}",
             cc.function_graphs().keys()
+        );
+        let funcs = direct_call_funcobjs(&parent);
+        assert_eq!(funcs.len(), 1, "caller has one direct_call");
+        assert_eq!(
+            funcs[0]._name, "not_a_lowlevel_helper",
+            "non-helper callee funcptr keeps func._name"
         );
     }
 
