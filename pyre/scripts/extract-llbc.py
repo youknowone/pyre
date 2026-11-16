@@ -74,6 +74,8 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::num::_::is_ascii_whitespace",
     "--include",
+    "core::num::_::is_ascii_digit",
+    "--include",
     "core::num::_::wrapping_sub",
     "--include",
     "core::char::methods::_::from_u32",
