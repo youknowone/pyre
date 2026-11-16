@@ -1979,6 +1979,20 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[S] as Join<&str>>::join(items, sep)` is `sep.join(items)`
+                // (`unaryop.py` `method_join`, `rstr.py`
+                // `AbstractStringRepr.rtype_method_join`).
+                if self.try_lower_slice_join(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                    second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `Wtf8::from_bytes_unchecked` / `str::from_utf8_unchecked`
                 // identity is rewritten to `same_as` after Result-scope /
                 // combinator capture (`from_bytes_one_word`).

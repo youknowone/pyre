@@ -2137,6 +2137,56 @@ fn sre_flag_names_folds_to_a_str_list() {
     );
 }
 
+/// `flag_items.join("|")` is `<[String]>::join`. The front rewrites it
+/// to `sep.join(items)` (`unaryop.py` `method_join`).
+#[test]
+fn sre_pattern_flag_tail_slice_join_lowers_to_str_join() {
+    let g = lower_function(
+        interp(),
+        "pyre_interpreter::module::_sre::interp_sre::sre_pattern_flag_tail",
+    )
+    .expect("sre_pattern_flag_tail lowers");
+    let mut residual = 0usize;
+    let mut method_join = 0usize;
+    for op in g.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let n = segments.len();
+                if n >= 3
+                    && segments[n - 3] == "slice"
+                    && segments[n - 2] == "<Impl>"
+                    && segments[n - 1] == "join"
+                {
+                    residual += 1;
+                }
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } if name == "join" && receiver_root.as_deref() == Some("str") => {
+                method_join += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        residual, 0,
+        "sre_pattern_flag_tail left alloc::slice::<Impl>::join"
+    );
+    assert!(
+        method_join >= 1,
+        "sre_pattern_flag_tail must emit str.join, got {method_join}"
+    );
+}
+
 fn leftover_ok_or_else(graph: &majit_translate::model::FunctionGraph) -> usize {
     graph
         .blocks
