@@ -1222,9 +1222,10 @@ pub struct MapAttrCache {
     indexes: Vec<u16>,
     cached_attrs: Vec<MapRef>,
     /// Bucket indexes whose `attrs` or `cached_attrs` slot was given a young
-    /// object (`incminimark.py old_objects_pointing_to_young`). A minor
-    /// collection drains it; a major collection clears it after walking every
-    /// slot.
+    /// object (`incminimark.py old_objects_pointing_to_young`). Only a minor
+    /// collection drains it (`collect_oldrefs_to_nursery`): a whole-cache
+    /// walk can come from major marking, which does not forward nursery
+    /// objects.
     young: Vec<usize>,
 }
 
@@ -1403,7 +1404,6 @@ pub unsafe fn walk_map_attr_cache(f: &mut dyn FnMut(*mut PyObjectRef)) {
     for slot in cache.cached_attrs.iter_mut() {
         f(slot as *mut MapRef as *mut PyObjectRef);
     }
-    cache.young.clear();
 }
 
 // ── LOAD_ATTR / STORE_ATTR inline cache (mapdict.py CacheEntry) ─────────

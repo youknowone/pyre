@@ -4910,9 +4910,10 @@ struct LiveCodeWrappers {
     /// `code_ptr -> wrapper` (the existing map, unchanged type).
     map: majit_gc::address_dict::AddressMap<usize>,
     /// `code_ptr`s whose stored wrapper was young when stored
-    /// (`incminimark.py old_objects_pointing_to_young`). A minor
-    /// collection drains it; a major collection clears it after the
-    /// whole-table walk.
+    /// (`incminimark.py old_objects_pointing_to_young`). Only a minor
+    /// collection drains it (`collect_oldrefs_to_nursery`): a whole-table
+    /// walk can come from major marking, which does not forward nursery
+    /// objects.
     young: Vec<usize>,
 }
 
@@ -5072,8 +5073,6 @@ pub fn walk_young_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) 
 /// `malloc_fixedsize`). Old-gen interpreted-only entries are not a
 /// major mark set: that kept `w_globals` alive across
 /// `finalize_modules`' pre-clear collection.
-/// After the whole-table walk, `young` is cleared: every value has been
-/// visited, and the caller already filters nursery values.
 pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut wrappers = live_code_wrappers().lock();
     for wrapper in wrappers.map.values_mut() {
@@ -5084,7 +5083,6 @@ pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
         forward(&mut root);
         *wrapper = root as usize;
     }
-    wrappers.young.clear();
 }
 
 /// One `box_code_object` allocation graph and what still reads it.
