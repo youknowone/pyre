@@ -177,4 +177,9 @@ fn emit_llbc_extraction_placeholders() {
         "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n",
     )
     .unwrap();
+    std::fs::write(
+        format!("{out_dir}/generated_fnaddr_adapters.rs"),
+        "pub fn generated_fnaddr_adapters() -> Vec<(&'static str, i64)> {\n    Vec::new()\n}\n",
+    )
+    .unwrap();
 }

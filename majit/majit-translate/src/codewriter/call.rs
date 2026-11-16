@@ -5453,9 +5453,12 @@ pub struct CallControl {
     array_descrs: std::cell::RefCell<
         rustc_hash::FxHashMap<u64, std::sync::Arc<dyn majit_ir::descr::ArrayDescr>>,
     >,
-    /// Interior-field descrs keyed by `(ARRAY id, field name)`.
+    /// Interior-field descrs keyed by `(ARRAY id, OF StructId, field name)`.
+    /// The OF identity is `owner_id` / `struct_id_for_name` of ARRAY.OF
+    /// (`get_field_descr(REALARRAY.OF, name)`); one interned template
+    /// ARRAY must not clobber another instantiation's STRUCT.
     interiorfield_descrs:
-        std::cell::RefCell<rustc_hash::FxHashMap<(u64, String), majit_ir::descr::DescrRef>>,
+        std::cell::RefCell<rustc_hash::FxHashMap<(u64, u64, String), majit_ir::descr::DescrRef>>,
 
     /// The effect analyzers' `_analyzed_calls` results. `call.py`
     /// builds `raise_analyzer`, `virtualizable_analyzer`,
@@ -5766,6 +5769,47 @@ fn is_known_by_value_struct(
         return false;
     }
     known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
+}
+
+/// Balanced `<…>` with no unsubstituted `??` — a `get_ll_dict` DICTENTRY
+/// instantiation, not the TypeDecl template.
+fn spelling_is_concrete_instantiation(name: &str) -> bool {
+    majit_ir::descr::generic_args_span(name).is_some_and(|s| !s.contains("??"))
+}
+
+/// ARRAY identity hashed into `get_array_descr`. Interned OF is that
+/// identity only when it is a concrete instantiation; otherwise the dump
+/// peel, then `owner_root`, then the interned STRUCT ARRAY (never a
+/// pointer-item interned ARRAY).
+fn interiorfield_array_identity(
+    interned_of_struct: bool,
+    interned_is_inst: bool,
+    interned_atid: Option<String>,
+    dump: &str,
+    dump_is_inst: bool,
+    owner_root: Option<&str>,
+    elem_name: &str,
+) -> String {
+    if interned_is_inst {
+        return interned_atid.unwrap_or_else(|| dump.to_string());
+    }
+    if dump_is_inst {
+        return dump.to_string();
+    }
+    if let Some(root) = owner_root {
+        let compact = root.replace(", ", ",");
+        if spelling_is_concrete_instantiation(&compact) {
+            return format!("GcArray<{compact}>");
+        }
+    }
+    if spelling_is_concrete_instantiation(elem_name) {
+        return format!("GcArray<{}>", elem_name.replace(", ", ","));
+    }
+    if interned_of_struct {
+        interned_atid.unwrap_or_else(|| dump.to_string())
+    } else {
+        dump.to_string()
+    }
 }
 
 /// Pointee spelling of an `AtomicPtr<T>`.
@@ -6556,6 +6600,24 @@ impl CallControl {
         if self.struct_fields.fields.contains_key(&compact) {
             return Some(compact);
         }
+        if spelling_is_concrete_instantiation(&compact) {
+            // `get_ll_dict` DICTENTRY: resolve the instantiated STRUCT
+            // (`struct_id_for_name` / dual-published `{path}{suffix}` keys
+            // `register_ordereddict_entry_rows` inserted). Do not add a
+            // bare-leaf alias; `counter::Entry` shares that leaf.
+            let canonical = majit_ir::descr::canonical_struct_name(&compact);
+            if canonical != compact && self.struct_fields.fields.contains_key(&canonical) {
+                return Some(canonical);
+            }
+            if majit_ir::descr::struct_id_for_name(&compact).is_some()
+                || majit_ir::descr::struct_id_for_name(&canonical).is_some()
+            {
+                if self.struct_fields.fields.contains_key(&canonical) {
+                    return Some(canonical);
+                }
+                return Some(compact);
+            }
+        }
         let template = majit_ir::descr::strip_generic_args(&compact);
         if template.as_ref() != compact.as_str()
             && self.struct_fields.fields.contains_key(template.as_ref())
@@ -6572,6 +6634,38 @@ impl CallControl {
             return None;
         }
         None
+    }
+
+    /// ARRAY.OF spelling for descr mint. Interned OF is the ARRAY identity
+    /// only when it is a concrete `get_ll_dict` instantiation; otherwise
+    /// peel dump `array_type_id`, then `owner_root`.
+    fn array_of_elem_spelling(
+        &self,
+        interned_of_struct: Option<&str>,
+        dump: Option<&str>,
+        owner_root: Option<&str>,
+    ) -> Option<String> {
+        let interned_is_inst = interned_of_struct.is_some_and(spelling_is_concrete_instantiation);
+        let dump_elem = dump.map(|s| self.dump_array_elem_name(s));
+        let dump_is_inst = dump_elem
+            .as_deref()
+            .is_some_and(spelling_is_concrete_instantiation);
+        let owner_inst = owner_root
+            .map(|r| r.replace(", ", ","))
+            .filter(|s| spelling_is_concrete_instantiation(s));
+        let raw = if interned_is_inst {
+            interned_of_struct.map(str::to_string)
+        } else if dump_is_inst {
+            dump_elem.clone()
+        } else if let Some(root) = owner_inst {
+            Some(root)
+        } else if let Some(name) = interned_of_struct {
+            Some(name.to_string())
+        } else {
+            dump_elem
+        }?;
+        let raw = raw.replace(", ", ",");
+        Some(self.array_of_field_owner(&raw).unwrap_or(raw))
     }
 
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
@@ -7035,7 +7129,28 @@ impl CallControl {
         Option<majit_ir::effectinfo::DescrSetMember>,
     ) {
         let intern_id = array.map(|arr| self.intern_array(arr));
-        if let Some(id) = intern_id
+        let interned_of_struct_early =
+            array.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
+                    Some(s._name)
+                }
+                _ => None,
+            });
+        let interned_is_inst = interned_of_struct_early
+            .as_deref()
+            .is_some_and(spelling_is_concrete_instantiation);
+        let dump_elem_early = array_type_id
+            .as_deref()
+            .map(|s| self.dump_array_elem_name(s));
+        let dump_is_inst = dump_elem_early
+            .as_deref()
+            .is_some_and(spelling_is_concrete_instantiation);
+        // Interned template OF must not pin a 32-byte ARRAY descr when
+        // dump names a `get_ll_dict` DICTENTRYARRAY instantiation.
+        let skip_interned_array_cache =
+            interned_of_struct_early.is_some() && !interned_is_inst && dump_is_inst;
+        if !skip_interned_array_cache
+            && let Some(id) = intern_id
             && let Some(cached) = self.array_descrs.borrow().get(&id).cloned()
         {
             cached.set_index(idx);
@@ -7058,8 +7173,14 @@ impl CallControl {
         let arr = interned_arr.as_ref().or(array);
         let (array_type_id, len_offset, ir_type) = if let Some(arr) = arr {
             let item_ty = offset_array_item_value_type(&arr.OF);
+            let interned_atid = array_type_id_of_lltype(arr);
+            let atid = if skip_interned_array_cache {
+                dump_array_type_id.clone().unwrap_or(interned_atid)
+            } else {
+                interned_atid
+            };
             (
-                Some(array_type_id_of_lltype(arr)),
+                Some(atid),
                 array_len_offset_from_hints(arr),
                 effect_array_ir_type(&item_ty),
             )
@@ -7071,22 +7192,20 @@ impl CallControl {
         // is the interned ARRAY's OF when present. Dump-only peels
         // `GcArray<Entry<K,V>>` keeping `<K,V>` (`extract_element_type_from_str`,
         // `get_ll_dict` DICTENTRYARRAY).
-        let interned_of_struct = arr.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
-                Some(s._name)
-            }
-            _ => None,
+        let interned_of_struct = interned_of_struct_early.clone().or_else(|| {
+            arr.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
+                    Some(s._name)
+                }
+                _ => None,
+            })
         });
-        let elem_name = interned_of_struct.clone().or_else(|| {
-            array_type_id
-                .as_deref()
-                .map(|s| self.dump_array_elem_name(s))
-        });
-        let elem_name = elem_name.map(|n| n.replace(", ", ","));
-        let field_owner = elem_name
-            .as_deref()
-            .and_then(|n| self.array_of_field_owner(n));
-        let elem_ref = field_owner.as_deref().or(elem_name.as_deref());
+        let elem_name = self.array_of_elem_spelling(
+            interned_of_struct.as_deref(),
+            dump_array_type_id.as_deref(),
+            None,
+        );
+        let elem_ref = elem_name.as_deref();
         // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
         // answer (`descr.py get_array_descr`). Dump-only peels the
         // harvest path; an interned non-Struct OF is not Struct even
@@ -7101,7 +7220,12 @@ impl CallControl {
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 elem_ref
-                    .map(|n| compute_struct_size(self, n))
+                    .map(|n| {
+                        majit_ir::descr::struct_id_for_name(n)
+                            .and_then(|id| self.struct_layout_for_id(id))
+                            .map(|layout| layout.size)
+                            .unwrap_or_else(|| compute_struct_size(self, n))
+                    })
                     .unwrap_or_else(crate::layout::target_word_size),
                 majit_ir::value::Type::Ref,
             )
@@ -7380,7 +7504,7 @@ impl CallControl {
                 (arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>, None)
             }
         };
-        if let Some(id) = intern_id {
+        if !skip_interned_array_cache && let Some(id) = intern_id {
             self.array_descrs.borrow_mut().insert(id, ad_arc.clone());
         }
         // Per-trace codewriter id stamp — analyzer's
@@ -7963,7 +8087,7 @@ impl CallControl {
         array_type_id: &Option<String>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
-        self.interiorfielddescrof_with_array(idx, array_type_id, &None, field_name)
+        self.interiorfielddescrof_with_array(idx, array_type_id, &None, field_name, None, None)
     }
 
     pub fn interiorfielddescrof_with_array(
@@ -7972,8 +8096,10 @@ impl CallControl {
         array_type_id: &Option<String>,
         array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         field_name: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+        owner_root: Option<&str>,
     ) -> Option<majit_ir::descr::DescrRef> {
-        self.interiorfielddescrof_keyed(idx, array_type_id, array, field_name)
+        self.interiorfielddescrof_keyed(idx, array_type_id, array, field_name, owner_id, owner_root)
             .map(|(descr, _)| descr)
     }
 
@@ -7983,6 +8109,8 @@ impl CallControl {
         array_type_id: &Option<String>,
         array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         field_name: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+        owner_root: Option<&str>,
     ) -> Option<(
         majit_ir::descr::DescrRef,
         majit_ir::effectinfo::DescrSetMember,
@@ -7998,26 +8126,9 @@ impl CallControl {
                     }
                     _ => None,
                 });
-        // Interned ARRAY.OF Struct is `cpu.arraydescrof(ARRAY)` identity.
-        // An interned pointer-item ARRAY sharing a dump STRUCT spelling
-        // must not reuse that intern id (`descr.py` `isinstance(ARRAY.OF,
-        // lltype.Struct)`).
-        if interned_of_struct.is_some()
-            && let Some(id) = intern_id
-            && let Some(cached) = self
-                .interiorfield_descrs
-                .borrow()
-                .get(&(id, field_name.to_string()))
-                .cloned()
-        {
-            cached.set_index(idx);
-            let atid = array_type_id_of_lltype(&self.interned_array(id));
-            let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
-                array_id: majit_ir::descr::path_hash(&atid),
-                name: field_name.to_string(),
-            };
-            return Some((cached, member));
-        }
+        let interned_is_inst = interned_of_struct
+            .as_deref()
+            .is_some_and(spelling_is_concrete_instantiation);
         let array_str = match (array_type_id.as_deref(), array.as_ref()) {
             (Some(s), _) => s,
             (None, Some(arr)) => {
@@ -8028,23 +8139,57 @@ impl CallControl {
                     &Some(array_type_id_of_lltype(arr)),
                     array,
                     field_name,
+                    owner_id,
+                    owner_root,
                 );
             }
             (None, None) => return None,
         };
+        let dump_elem = self.dump_array_elem_name(array_str);
+        let dump_is_inst = spelling_is_concrete_instantiation(&dump_elem.replace(", ", ","));
         // ARRAY.OF.fieldname — interned OF is the specialized DICTENTRY
-        // (`get_ll_dict`). Dump-only peels `GcArray<Entry<K,V>>` keeping
-        // `<K,V>` (`extract_element_type_from_str`, `consider_array(ARRAY)`).
-        let elem_name = if let Some(name) = interned_of_struct.clone() {
-            name
-        } else {
-            self.dump_array_elem_name(array_str)
-        };
-        let elem_name = elem_name.replace(", ", ",");
+        // (`get_ll_dict`) only when it is a concrete instantiation.
+        // Otherwise peel dump, then `owner_root`.
+        let elem_name = self.array_of_elem_spelling(
+            interned_of_struct.as_deref(),
+            Some(array_str),
+            owner_root,
+        )?;
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
         }
-        let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
+        // `get_interiorfield_descr` does `get_field_descr(REALARRAY.OF, name)`
+        // of the same STRUCT `fielddescrof_concrete` keys on.
+        let registry_struct_id = owner_root
+            .and_then(majit_ir::descr::struct_id_for_name)
+            .or_else(|| majit_ir::descr::struct_id_for_name(&elem_name));
+        let sid = owner_id.or(registry_struct_id);
+        let of_sid = sid.map(|id| id.as_u64()).unwrap_or(0);
+        // Interned ARRAY.OF Struct is `cpu.arraydescrof(ARRAY)` identity.
+        // Key by OF StructId so a template intern does not return an
+        // instantiation's descr, or the reverse (`get_ll_dict` one
+        // DICTENTRYARRAY per (DICTKEY, DICTVALUE)).
+        if interned_of_struct.is_some()
+            && let Some(id) = intern_id
+            && let Some(cached) = self
+                .interiorfield_descrs
+                .borrow()
+                .get(&(id, of_sid, field_name.to_string()))
+                .cloned()
+        {
+            cached.set_index(idx);
+            let array_id = cached
+                .as_interior_field_descr()
+                .map(|ifd| ifd.array_descr().cache_key())
+                .unwrap_or_else(|| {
+                    majit_ir::descr::path_hash(&array_type_id_of_lltype(&self.interned_array(id)))
+                });
+            let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
+                array_id,
+                name: field_name.to_string(),
+            };
+            return Some((cached, member));
+        }
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
@@ -8059,239 +8204,263 @@ impl CallControl {
         // here so the analyzer's interiorfield idx lives ONLY on the
         // outer `SimpleInteriorFieldDescr.index`, mirroring PyPy's
         // FieldDescr / InteriorFieldDescr index namespace split.
-        let fields = self.struct_fields.fields.get(&elem_name)?;
-        let mut offset: usize = 0;
-        let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
-        for row in fields {
-            let fname = &row.name;
-            let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
-            // Same skip, same reason as `fielddescrof_concrete`: this walk
-            // hands its match to `field_pos_in`, and `heaptracker.py
-            // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
-            // `Void` before anything else.
-            if ir_type == majit_ir::value::Type::Void {
-                continue;
+        let layout = sid.and_then(|id| self.struct_layout_for_id(id));
+        let elem_canonical = majit_ir::descr::canonical_struct_name(&elem_name);
+        let struct_key = match sid {
+            Some(sid) => majit_ir::descr::LLType::Struct(sid.as_u64()),
+            None => majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(&elem_canonical)),
+        };
+        let (struct_size, item_size) = match layout.as_ref() {
+            Some(layout) => (layout.size, layout.size),
+            None => {
+                let n = compute_struct_size(self, &elem_name);
+                (n, n)
             }
-            if fname == "typeptr" {
-                continue;
-            }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
-            if self.is_known_struct(fty) {
-                offset = offset.saturating_add(compute_struct_size(self, fty));
-                continue;
-            }
-            if fname == field_name {
-                // `all_interiorfielddescrs` takes the offset from the
-                // registered layout (`symbolic.get_field_token`). The running
-                // total above does not insert `repr(C)` padding, so a `bool`
-                // before a pointer is one byte early. Prefer the layout field
-                // when it is present.
-                let (offset, field_size, flag, ir_type) = self
-                    .struct_layout_for(&elem_name)
-                    .and_then(|layout| {
-                        layout
-                            .fields
-                            .iter()
-                            .find(|f| f.name == field_name)
-                            .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
-                    })
-                    .unwrap_or((offset, field_size, flag, ir_type));
-                // Use-import resolver: hash the canonical
-                // `defining_module::Bare` form so analyzer hits the
-                // same `_cache_size` slot the runtime's qualified
-                // def-path dual-publish wrote to (PyPy
-                // `cache[STRUCT]` lltype-object identity).  When the
-                // resolver has no entry (legacy `parse_source` entry
-                // without module_path), `canonical_struct_name`
-                // returns the bare name verbatim and we hit the
-                // simple-name slot — same Arc via dual-publish.
-                let elem_canonical = majit_ir::descr::canonical_struct_name(&elem_name);
-                let struct_key =
-                    majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(&elem_canonical));
-                // Seed parent (Round 6 parity, descr.py:238) so the
-                // returned SizeDescr Arc carries vtable/all_fielddescrs
-                // populated by either the runtime publish or the
-                // analyzer-only mint.
-                let struct_size = compute_struct_size(self, &elem_name);
-                let rank = self.field_immutability(Some(&elem_name), field_name);
-                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
-                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
-                let size_descr_arc = {
-                    let mut gc = majit_ir::descr::gc_cache().lock();
-                    gc.get_size_descr(
-                        struct_key.clone(),
-                        struct_size,
-                        0,
-                        self.size_descr_immutable_flag(&elem_name, None),
-                    )
-                };
-                // Field-walk pass (same convergence pattern as
-                // `fielddescrof_concrete` B-3): when runtime published
-                // the element struct's SizeDescr via
-                // `build_object_descr_group`, its PyreFieldDescrs live
-                // in `all_fielddescrs` already.  Return that Arc so
-                // `compute_bitstrings`' downstream `set_ei_index` on
-                // the interior field's INNER FieldDescr lands on the
-                // SAME slot the runtime reads.  Name match: bare or
-                // `.{field_name}` suffix per descr.py.
-                if let Some(sd) = size_descr_arc.as_size_descr() {
-                    let needle = format!(".{}", field_name);
-                    for fd in sd.all_fielddescrs() {
-                        let stored = fd.field_name();
-                        if stored == field_name || stored.ends_with(&needle) {
-                            found = Some(fd.clone());
-                            break;
-                        }
-                    }
+        };
+        let mut found_leaf: Option<(
+            usize,
+            usize,
+            majit_ir::descr::ArrayFlag,
+            majit_ir::value::Type,
+        )> = None;
+        let mut layout_index_in_parent: Option<usize> = None;
+        if let Some(ref layout) = layout {
+            // `symbolic.get_field_token` of REALARRAY.OF — do not walk
+            // TypeDecl TypeVar rows once the instantiated STRUCT has a layout.
+            let mut index_in_parent = 0usize;
+            for fl in &layout.fields {
+                if fl.field_type == majit_ir::value::Type::Void || fl.name == "typeptr" {
+                    continue;
                 }
-                if found.is_none() {
-                    // No runtime publish for this `(STRUCT, fieldname)` —
-                    // analyzer-only mint.  Index from the same walker
-                    // `fielddescrof_concrete` uses, so the inner FieldDescr of
-                    // an interior access and the direct field access agree
-                    // (`descr.py`, one numberer per STRUCT).
-                    let index_in_parent = field_pos_in(self, &elem_name, field_name);
-                    let load_is_acquire =
-                        is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
-                    let store_is_release =
-                        is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
-                    let mut gc = majit_ir::descr::gc_cache().lock();
-                    let mint = gc.get_field_descr(
-                        struct_key,
-                        field_name,
-                        None,
-                        offset,
-                        field_size,
-                        ir_type,
-                        is_immutable,
-                        is_quasi_immutable,
-                        flag,
-                        u32::MAX,
-                        false,
-                        // Always a claim: `field_pos_in` walks the owner's layout and
-                        // panics rather than hand back an unnumbered field.
-                        Some(index_in_parent),
-                        load_is_acquire,
-                        store_is_release,
+                if fl.name == field_name {
+                    found_leaf = Some((fl.offset, fl.size, fl.flag, fl.field_type));
+                    layout_index_in_parent = Some(index_in_parent);
+                    break;
+                }
+                index_in_parent += 1;
+            }
+        } else {
+            let fields = self.struct_fields.fields.get(&elem_name)?;
+            let mut offset: usize = 0;
+            for row in fields {
+                let fname = &row.name;
+                let fty = &row.ty;
+                let (flag, ir_type, field_size) =
+                    get_type_flag(fty, &self.raw_alloc_flavor_structs);
+                // Same skip, same reason as `fielddescrof_concrete`: this walk
+                // hands its match to `field_pos_in`, and `heaptracker.py
+                // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
+                // `Void` before anything else.
+                if ir_type == majit_ir::value::Type::Void {
+                    continue;
+                }
+                if fname == "typeptr" {
+                    continue;
+                }
+                // `heaptracker.py` `get_fielddescr_index_in`: step past a by-value nested struct
+                // field's bytes; `get_fielddescr_index_in` recurses into it for
+                // the position.  Mirrors the `fielddescrof_concrete` walk; the
+                // corpus's array-element structs carry no by-value nested struct
+                // field, so this never fires there.
+                if self.is_known_struct(fty) {
+                    offset = offset.saturating_add(compute_struct_size(self, fty));
+                    continue;
+                }
+                if fname == field_name {
+                    // `all_interiorfielddescrs` takes the offset from the
+                    // registered layout (`symbolic.get_field_token`). The running
+                    // total above does not insert `repr(C)` padding, so a `bool`
+                    // before a pointer is one byte early. Prefer the layout field
+                    // when it is present.
+                    found_leaf = Some(
+                        self.struct_layout_for(&elem_name)
+                            .and_then(|layout| {
+                                layout
+                                    .fields
+                                    .iter()
+                                    .find(|f| f.name == field_name)
+                                    .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
+                            })
+                            .unwrap_or((offset, field_size, flag, ir_type)),
                     );
-                    found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+                    break;
                 }
-                let field_descr = found?;
-                let item_size = compute_struct_size(self, &elem_name);
-                // `get_interiorfield_descr` (`descr.py`) builds on
-                // `get_array_descr`, so this mint and `arraydescrof_concrete`
-                // share one basesize: `symbolic.get_array_token`'s items
-                // offset. `array_items_base` is that offset. `GcEntries`
-                // places `[Entry; 0]` there, and `Entry.f_hash` (`u64`)
-                // rounds a 4-byte length word up to 8. `get_array_descr`
-                // keys the cache on the atid alone.
-                let base_size =
-                    self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
-                // Interned ARRAY.OF Struct is the ARRAY identity
-                // (`descr.py get_array_descr`). A pointer-item interned
-                // ARRAY must not publish InteriorField under that ARRAY's
-                // identity; the dump harvest path is the STRUCT ARRAY.
-                let interned_atid = if interned_of_struct.is_some() {
-                    if let Some(id) = intern_id {
-                        array_type_id_of_lltype(&self.interned_array(id))
-                    } else {
-                        array_str.to_string()
-                    }
-                } else {
-                    array_str.to_string()
-                };
-                let array_id = majit_ir::descr::path_hash(&interned_atid);
-                let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
-                    array_id,
-                    name: field_name.to_string(),
-                };
-                let array_key = majit_ir::descr::LLType::Array(array_id);
-                let cached: majit_ir::descr::DescrRef = {
-                    let mut gc = majit_ir::descr::gc_cache().lock();
-                    gc.get_array_descr(
-                        array_key.clone(),
-                        base_size,
-                        item_size,
-                        ArrayFlag::Struct,
-                        majit_ir::value::Type::Ref,
-                        false, // !nolength — length word at offset 0
-                        0,     // length_offset
-                        false, // is_pure
-                        '\x00',
-                    )
-                };
-                let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
-                    majit_ir::descr::descr_arc_as_array_descr(cached)
-                        .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
-                // `descr.py:429-436` builds an interior field out of the array
-                // descr and the element-struct field descr, so both halves
-                // travel — the runtime miss branch has to rebuild the same two.
-                majit_ir::descr::record_ei_descr_mint(
-                    member.clone(),
-                    majit_ir::effectinfo::DescrMintSpec::InteriorField {
-                        array: Box::new(majit_ir::effectinfo::DescrMintSpec::Array {
-                            base_size,
-                            item_size,
-                            flag: ArrayFlag::Struct,
-                            item_type: majit_ir::value::Type::Ref,
-                            nolength: false,
-                            length_offset: 0,
-                            is_pure: false,
-                            concrete_type: '\x00',
-                        }),
-                        field_struct_id: majit_ir::descr::path_hash(&elem_canonical),
-                        field_name: field_name.to_string(),
-                        field: Box::new(majit_ir::effectinfo::DescrMintSpec::Field {
-                            struct_size,
-                            offset: field_descr.offset(),
-                            field_size: field_descr.field_size(),
-                            field_type: field_descr.field_type(),
-                            flag: field_descr.field_flag(),
-                            is_immutable: field_descr.is_immutable(),
-                            is_quasi_immutable: field_descr.is_quasi_immutable(),
-                            index_in_parent: field_descr.index_in_parent(),
-                        }),
-                    },
-                );
-                let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
-                    array_key,
-                    field_name.to_string(),
-                    String::new(),
-                    array_descr.clone(),
-                    field_descr.clone(),
-                );
-                let already = self
-                    .interiorfield_descrs
-                    .borrow()
-                    .values()
-                    .any(|d| std::sync::Arc::ptr_eq(d, &descr_from_gc));
-                let descr: majit_ir::descr::DescrRef = if already {
-                    std::sync::Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
-                        idx,
-                        array_descr,
-                        field_descr,
-                    )) as majit_ir::descr::DescrRef
-                } else {
-                    descr_from_gc
-                };
-                descr.set_index(idx);
-                if interned_of_struct.is_some()
-                    && let Some(id) = intern_id
-                {
-                    self.interiorfield_descrs
-                        .borrow_mut()
-                        .insert((id, field_name.to_string()), descr.clone());
-                }
-                return Some((descr, member));
+                offset = offset.saturating_add(field_size);
             }
-            offset = offset.saturating_add(field_size);
         }
-        None
+        let (offset, field_size, flag, ir_type) = found_leaf?;
+        let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+        let rank = self.field_immutability(Some(&elem_name), field_name);
+        let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+        let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
+        let size_descr_arc = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_size_descr(
+                struct_key.clone(),
+                struct_size,
+                0,
+                self.size_descr_immutable_flag(&elem_name, None),
+            )
+        };
+        // Field-walk pass (same convergence pattern as
+        // `fielddescrof_concrete` B-3): when runtime published
+        // the element struct's SizeDescr via
+        // `build_object_descr_group`, its PyreFieldDescrs live
+        // in `all_fielddescrs` already.  Return that Arc so
+        // `compute_bitstrings`' downstream `set_ei_index` on
+        // the interior field's INNER FieldDescr lands on the
+        // SAME slot the runtime reads.  Name match: bare or
+        // `.{field_name}` suffix per descr.py.
+        if let Some(sd) = size_descr_arc.as_size_descr() {
+            let needle = format!(".{}", field_name);
+            for fd in sd.all_fielddescrs() {
+                let stored = fd.field_name();
+                if stored == field_name || stored.ends_with(&needle) {
+                    found = Some(fd.clone());
+                    break;
+                }
+            }
+        }
+        if found.is_none() {
+            // No runtime publish for this `(STRUCT, fieldname)` —
+            // analyzer-only mint.  Index from the same walker
+            // `fielddescrof_concrete` uses, so the inner FieldDescr of
+            // an interior access and the direct field access agree
+            // (`descr.py`, one numberer per STRUCT).
+            let index_in_parent = layout_index_in_parent
+                .unwrap_or_else(|| field_pos_in(self, &elem_name, field_name));
+            let load_is_acquire =
+                is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
+            let store_is_release =
+                is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            let mint = gc.get_field_descr(
+                struct_key,
+                field_name,
+                None,
+                offset,
+                field_size,
+                ir_type,
+                is_immutable,
+                is_quasi_immutable,
+                flag,
+                u32::MAX,
+                false,
+                // Always a claim: `field_pos_in` walks the owner's layout and
+                // panics rather than hand back an unnumbered field.
+                Some(index_in_parent),
+                load_is_acquire,
+                store_is_release,
+            );
+            found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+        }
+        let field_descr = found?;
+        // `get_interiorfield_descr` (`descr.py`) builds on
+        // `get_array_descr`, so this mint and `arraydescrof_concrete`
+        // share one basesize: `symbolic.get_array_token`'s items
+        // offset. `array_items_base` is that offset. `GcEntries`
+        // places `[Entry; 0]` there, and `Entry.f_hash` (`u64`)
+        // rounds a 4-byte length word up to 8. `get_array_descr`
+        // keys the cache on the atid alone.
+        let base_size = self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
+        let interned_array_atid =
+            intern_id.map(|id| array_type_id_of_lltype(&self.interned_array(id)));
+        let interned_atid = interiorfield_array_identity(
+            interned_of_struct.is_some(),
+            interned_is_inst,
+            interned_array_atid,
+            array_str,
+            dump_is_inst,
+            owner_root,
+            &elem_name,
+        );
+        let array_id = majit_ir::descr::path_hash(&interned_atid);
+        let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
+            array_id,
+            name: field_name.to_string(),
+        };
+        let array_key = majit_ir::descr::LLType::Array(array_id);
+        let cached: majit_ir::descr::DescrRef = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_array_descr(
+                array_key.clone(),
+                base_size,
+                item_size,
+                ArrayFlag::Struct,
+                majit_ir::value::Type::Ref,
+                false, // !nolength — length word at offset 0
+                0,     // length_offset
+                false, // is_pure
+                '\x00',
+            )
+        };
+        let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+            majit_ir::descr::descr_arc_as_array_descr(cached)
+                .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+        // `descr.py` `get_interiorfield_descr` builds an interior field out of the array
+        // descr and the element-struct field descr, so both halves
+        // travel — the runtime miss branch has to rebuild the same two.
+        let field_struct_id = match sid {
+            Some(sid) => sid.as_u64(),
+            None => majit_ir::descr::path_hash(&elem_canonical),
+        };
+        majit_ir::descr::record_ei_descr_mint(
+            member.clone(),
+            majit_ir::effectinfo::DescrMintSpec::InteriorField {
+                array: Box::new(majit_ir::effectinfo::DescrMintSpec::Array {
+                    base_size,
+                    item_size,
+                    flag: ArrayFlag::Struct,
+                    item_type: majit_ir::value::Type::Ref,
+                    nolength: false,
+                    length_offset: 0,
+                    is_pure: false,
+                    concrete_type: '\x00',
+                }),
+                field_struct_id,
+                field_name: field_name.to_string(),
+                field: Box::new(majit_ir::effectinfo::DescrMintSpec::Field {
+                    struct_size,
+                    offset: field_descr.offset(),
+                    field_size: field_descr.field_size(),
+                    field_type: field_descr.field_type(),
+                    flag: field_descr.field_flag(),
+                    is_immutable: field_descr.is_immutable(),
+                    is_quasi_immutable: field_descr.is_quasi_immutable(),
+                    index_in_parent: field_descr.index_in_parent(),
+                }),
+            },
+        );
+        let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+            array_key,
+            field_name.to_string(),
+            String::new(),
+            array_descr.clone(),
+            field_descr.clone(),
+        );
+        let already = self
+            .interiorfield_descrs
+            .borrow()
+            .values()
+            .any(|d| std::sync::Arc::ptr_eq(d, &descr_from_gc));
+        let descr: majit_ir::descr::DescrRef = if already {
+            std::sync::Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                idx,
+                array_descr,
+                field_descr,
+            )) as majit_ir::descr::DescrRef
+        } else {
+            descr_from_gc
+        };
+        descr.set_index(idx);
+        if interned_of_struct.is_some()
+            && let Some(id) = intern_id
+        {
+            self.interiorfield_descrs
+                .borrow_mut()
+                .insert((id, of_sid, field_name.to_string()), descr.clone());
+        }
+        Some((descr, member))
     }
 
     /// Insert into `function_graphs`. All graph writes go through this
@@ -11823,6 +11992,29 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
         .collect()
 }
 
+/// Map a calldescr argument/result class onto the word-ABI string
+/// `calldescr_abi_for_path` publishes (`"ww>w"`-style).
+fn calldescr_class_to_abi_char(c: char) -> Option<char> {
+    match c {
+        'i' | 'r' | 'S' => Some('w'),
+        'f' | 'L' => Some('f'),
+        'v' => None,
+        _ => Some('w'),
+    }
+}
+
+pub(crate) fn calldescr_abi_string(arg_classes: &str, result: char) -> String {
+    let mut s = String::new();
+    for c in arg_classes.chars() {
+        if let Some(mapped) = calldescr_class_to_abi_char(c) {
+            s.push(mapped);
+        }
+    }
+    s.push('>');
+    s.push(calldescr_class_to_abi_char(result).unwrap_or('v'));
+    s
+}
+
 fn graph_non_void_arg_types(
     graph: &FunctionGraph,
     raw_alloc_flavor_structs: &HashSet<String>,
@@ -12565,28 +12757,12 @@ impl CallControl {
         None
     }
 
-    fn calldescr_abi_for_path(&self, path: &CallPath) -> Option<String> {
+    pub(crate) fn calldescr_abi_for_path(&self, path: &CallPath) -> Option<String> {
         let args = self.declared_non_void_arg_classes(path)?;
         let result = self
             .declared_result_argclass(path)
             .or_else(|| self.declared_return_kind(path))?;
-        let mut s = String::new();
-        for c in args.chars() {
-            match c {
-                'i' | 'r' | 'S' => s.push('w'),
-                'f' | 'L' => s.push('f'),
-                'v' => {}
-                _ => s.push('w'),
-            }
-        }
-        s.push('>');
-        match result {
-            'i' | 'r' | 'S' => s.push('w'),
-            'f' | 'L' => s.push('f'),
-            'v' => s.push('v'),
-            _ => s.push('w'),
-        }
-        Some(s)
+        Some(calldescr_abi_string(&args, result))
     }
 
     fn record_fnaddr_abi_mismatch(&self, path: &CallPath, row_abi: &str, calldescr_abi: &str) {
@@ -16275,12 +16451,12 @@ fn add_interiorfield(
     indices.push(index);
     if let Some(arr) = array {
         if let Some((descr, key)) =
-            cc.interiorfielddescrof_keyed(index, &None, &Some(arr.clone()), field_name)
+            cc.interiorfielddescrof_keyed(index, &None, &Some(arr.clone()), field_name, None, None)
         {
             descrs.push((descr, Some(key)));
         }
     } else if let Some((descr, key)) =
-        cc.interiorfielddescrof_keyed(index, array_type_id, &None, field_name)
+        cc.interiorfielddescrof_keyed(index, array_type_id, &None, field_name, None, None)
     {
         descrs.push((descr, Some(key)));
     }
@@ -21060,10 +21236,10 @@ mod tests {
         ))));
         let spelling = Some(array_type_id_of_lltype(&signed));
         let d_signed = cc
-            .interiorfielddescrof_with_array(0, &spelling, &Some(signed), "v")
+            .interiorfielddescrof_with_array(0, &spelling, &Some(signed), "v", None, None)
             .expect("signed interiorfield");
         let d_float = cc
-            .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
+            .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v", None, None)
             .expect("float interiorfield");
         assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
     }
@@ -21101,7 +21277,7 @@ mod tests {
             array_descr.is_array_of_structs(),
             "interned ARRAY.OF Struct must be FLAG_STRUCT"
         );
-        cc.interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+        cc.interiorfielddescrof_with_array(0, &dump, &Some(array), "v", None, None)
             .expect("interiorfield of interned STRUCT ARRAY");
     }
 
@@ -21151,7 +21327,7 @@ mod tests {
                 .is_array_of_structs()
         );
         let ifd = cc
-            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v", None, None)
             .expect("interiorfield of interned STRUCT ARRAY");
         assert!(
             ifd.as_interior_field_descr()
@@ -21196,7 +21372,7 @@ mod tests {
             "interned ARRAY.OF Ptr must not be FLAG_STRUCT"
         );
         let ifd = cc
-            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v")
+            .interiorfielddescrof_with_array(0, &dump, &Some(array), "v", None, None)
             .expect("dump STRUCT InteriorField");
         assert!(
             ifd.as_interior_field_descr()
@@ -25968,7 +26144,14 @@ mod tests {
             ))))
         };
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid.clone()), &Some(arr.clone()), "f_hash")
+            .interiorfielddescrof_keyed(
+                1,
+                &Some(atid.clone()),
+                &Some(arr.clone()),
+                "f_hash",
+                None,
+                None,
+            )
             .expect("interior field descr");
         let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
         assert_eq!(interior.array_descr().base_size(), 8);
@@ -26039,7 +26222,7 @@ mod tests {
             ))))
         };
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "value")
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "value", None, None)
             .expect("interior field descr");
         let offset = descr
             .as_interior_field_descr()
@@ -26133,7 +26316,7 @@ mod tests {
         cc.set_struct_layout(elem_sid, inst_layout);
 
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid), &None, "f_valid")
+            .interiorfielddescrof_keyed(1, &Some(atid), &None, "f_valid", None, None)
             .expect("dump interior field descr");
         let offset = descr
             .as_interior_field_descr()
@@ -26228,7 +26411,7 @@ mod tests {
                 ],
             ))));
             let atid = format!("GcArray<{elem}>");
-            cc.interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            cc.interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid", None, None)
                 .expect("interior field descr")
                 .0
         };
@@ -26275,6 +26458,240 @@ mod tests {
             assert_eq!(narrow_ifd.array_descr().item_size(), 32);
             assert_eq!(wide_ifd.array_descr().item_size(), 40);
         }
+    }
+
+    /// Interned ARRAY.OF is the TypeDecl template (jtransform concretetype);
+    /// dump still names the instantiation. `get_ll_dict` DICTENTRYARRAY
+    /// must win: `f_valid` at 16, itemsize 40, ARRAY identity the dump atid.
+    #[test]
+    fn interiorfielddescrof_keyed_interned_template_does_not_override_instantiation() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            template_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("template f_valid")
+                .offset,
+            8
+        );
+        assert_eq!(
+            inst_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("instantiation f_valid")
+                .offset,
+            16
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                template,
+                vec![
+                    ("key".into(), GCREF.clone()),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid.clone()), &Some(arr), "f_valid", None, None)
+            .expect("interior field descr");
+        let ifd = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(ifd.field_descr().offset(), 16);
+        assert_eq!(ifd.array_descr().item_size(), 40);
+        assert_ne!(ifd.field_descr().offset(), 8);
+        assert_eq!(
+            ifd.array_descr().cache_key(),
+            majit_ir::descr::path_hash(&atid),
+        );
+        assert_ne!(
+            ifd.array_descr().cache_key(),
+            majit_ir::descr::path_hash(&format!("GcArray<{template}>")),
+        );
+    }
+
+    /// Twin of the interned-template test: dump ARRAY identity is the
+    /// unsuffixed template, but `owner_id` is the instantiated STRUCT
+    /// (`fielddescrof_concrete` / `get_field_descr(REALARRAY.OF, name)`).
+    #[test]
+    fn interiorfielddescrof_keyed_interned_template_owner_id_uses_instantiation() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let dump_atid = format!("GcArray<{template}>");
+        let inst_atid = format!("GcArray<{elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            template_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("template f_valid")
+                .offset,
+            8
+        );
+        assert_eq!(
+            inst_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("instantiation f_valid")
+                .offset,
+            16
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                template,
+                vec![
+                    ("key".into(), GCREF.clone()),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(
+                1,
+                &Some(dump_atid.clone()),
+                &Some(arr),
+                "f_valid",
+                Some(elem_sid),
+                Some(elem.as_str()),
+            )
+            .expect("interior field descr");
+        let ifd = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(ifd.field_descr().offset(), 16);
+        assert_eq!(ifd.array_descr().item_size(), 40);
+        assert_ne!(ifd.field_descr().offset(), 8);
+        assert_eq!(
+            ifd.array_descr().cache_key(),
+            majit_ir::descr::path_hash(&inst_atid),
+        );
+        assert_ne!(
+            ifd.array_descr().cache_key(),
+            majit_ir::descr::path_hash(&dump_atid),
+        );
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
@@ -33217,12 +33634,19 @@ mod tests {
             ))))
         };
         assert!(
-            cc.interiorfielddescrof_with_array(0, &spelling, &Some(arr.clone()), "marker")
-                .is_none(),
+            cc.interiorfielddescrof_with_array(
+                0,
+                &spelling,
+                &Some(arr.clone()),
+                "marker",
+                None,
+                None
+            )
+            .is_none(),
             "a zero-sized element field has no interior descr to mint"
         );
         assert!(
-            cc.interiorfielddescrof_with_array(1, &spelling, &Some(arr), "value")
+            cc.interiorfielddescrof_with_array(1, &spelling, &Some(arr), "value", None, None)
                 .is_some(),
             "the stored element field still resolves"
         );

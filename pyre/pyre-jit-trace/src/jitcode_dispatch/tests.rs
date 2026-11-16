@@ -1959,21 +1959,22 @@ fn a_handler_abort_is_not_a_later_resume_blocker() {
     assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
 }
 
-/// An `inline_call` whose descr does not resolve to a JitCode is the same
-/// condition one level down: a callee the scan holds nothing about.  Falling
-/// through would read it as executing no effect and holding no blocker — the
-/// most permissive answer there is, reached by not looking — and would let the
-/// blocker behind it be classified as effect-free, which says a rewind covers
-/// it.
+/// An `inline_call` whose descr does not resolve to a JitCode is still a
+/// call the blackhole executes (`bhimpl_inline_call_*` / `cpu.bh_call_*`).
+/// It is an effect, so a residual behind it is `blocker_after_effect`, not
+/// an unread region (`body_not_walked` is decode failure).
 #[test]
-fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
+fn an_inline_call_whose_callee_does_not_resolve_is_an_effect() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = inline_call_with_descr(7);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
-    assert!(summary.body_not_walked);
+    assert!(
+        !summary.body_not_walked,
+        "a missing JitCode descr is an executed call, not an unread region"
+    );
     assert_eq!(
         summary.blocker_effect_free, None,
         "an unresolved callee may have executed an effect, so nothing behind \
@@ -2128,6 +2129,8 @@ fn a_callable_callees_reachable_abort_is_not_a_resume_blocker() {
 /// the blackhole calls it natively (`bhimpl_inline_call_*`).
 #[test]
 fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
     fn install_inline_helper(name: &str, descr: u16) -> usize {
         let mut code = inline_call_with_descr(descr);
         code.extend(void_return());
@@ -2204,6 +2207,8 @@ fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
 /// scan must not treat that callee's reachable abort as a blocker.
 #[test]
 fn list_type_call_resume_levels_do_not_reach_a_blocker() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
     if let (Some(index), Some(resume_pc)) = (
         crate::ctor_continuation::jitcode_index(),
         crate::ctor_continuation::resume_pc(),
@@ -28376,6 +28381,207 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
         wc.trace_ctx.concrete_of_opref(dst),
         None,
         "a non-constant index into a headerless array stays unstamped"
+    );
+    drop(wc);
+    drop(storage);
+}
+
+#[test]
+fn getinteriorfield_gc_i_cache_miss_records_op_and_writes_dst() {
+    // First `getinteriorfield_gc_i/rid>i` is a heapcache miss — record
+    // GetinteriorfieldGcI with [array, index] + descr; write recorder
+    // result into i-dst and update heapcache.
+    let byte = *insns_opname_to_byte()
+        .get("getinteriorfield_gc_i/rid>i")
+        .expect("`getinteriorfield_gc_i/rid>i` must be in insns table");
+    // Operand layout `rid>i`: 1B r-reg(2) + 1B i-reg(3) +
+    // 2B descr(LE 1) + 1B i-dst(5).
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
+    let array = regs_r[2];
+    let index = regs_i[3];
+    let dst_pre = regs_i[5];
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+    done_descr_ref_for_tests();
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getinteriorfield_gc_i must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "getinteriorfield_gc_i/rid>i operand layout = 5 bytes"
+    );
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
+    assert_ne!(dst_post, dst_pre);
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before + 1);
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::GetinteriorfieldGcI);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![array, index],
+        "GetinteriorfieldGcI args must be [array, index]",
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &last.getdescr().expect("must carry interior field descr"),
+        &descr,
+    ));
+    assert_eq!(dst_post, last.pos().get());
+}
+
+/// Immortal (non-GC) array-of-struct: `try_gc_owns` is false on this
+/// storage, matching `getarrayitem_gc_headerless_const_index_stamps_the_byte`.
+/// `interior_sanity_load` still stamps `bh_getinteriorfield_gc_i`.
+#[test]
+fn getinteriorfield_gc_i_immortal_array_stamps_the_byte() {
+    let byte = *insns_opname_to_byte()
+        .get("getinteriorfield_gc_i/rid>i")
+        .expect("`getinteriorfield_gc_i/rid>i` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let cpu = PureArrayTestCpu;
+    let mut storage = vec![0u8; 8 + 32];
+    storage[..std::mem::size_of::<usize>()].copy_from_slice(&1usize.to_ne_bytes());
+    storage[8 + 8] = 0x01;
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    regs_i[3] = tc.const_int(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("immortal getinteriorfield");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert!(
+        !dst.is_constant(),
+        "a getinteriorfield miss records the load"
+    );
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        Some(majit_ir::Value::Int(1))
+    );
+    assert_eq!(wc.trace_ctx.num_ops(), ops_before + 1);
+    drop(wc);
+    drop(storage);
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let mut storage = vec![0u8; 8 + 32];
+    storage[..std::mem::size_of::<usize>()].copy_from_slice(&1usize.to_ne_bytes());
+    storage[8 + 8] = 0x01;
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    let zero = tc.const_int(0);
+    let idx = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(idx, majit_ir::Value::Int(0));
+    regs_i[3] = idx;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(&code, 0, &mut wc).expect("non-const immortal getinteriorfield");
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        Some(majit_ir::Value::Int(1)),
+        "a non-constant index whose Box.value is Int(0) still stamps"
     );
     drop(wc);
     drop(storage);

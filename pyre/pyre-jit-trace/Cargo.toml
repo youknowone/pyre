@@ -30,6 +30,7 @@ pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true, features = ["host_env"] }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
+ctor = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }

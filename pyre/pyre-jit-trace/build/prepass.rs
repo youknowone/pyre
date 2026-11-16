@@ -11,6 +11,8 @@
 mod call_spec;
 #[path = "../src/codegen_cache.rs"]
 mod codegen_cache;
+#[path = "fnaddr_adapters.rs"]
+mod fnaddr_adapters;
 #[path = "../src/llbc_fingerprint.rs"]
 mod llbc_fingerprint;
 #[path = "../src/pypyjit_driver_layout.rs"]
@@ -67,6 +69,7 @@ const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "minted_exception_classes.rs",
+    "generated_fnaddr_adapters.rs",
     "jit_metadata.json",
     "jitcodes.bin",
     "jitcodes_index.bin",
@@ -2326,6 +2329,12 @@ fn real_main() {
             bincode::serialize(&pipeline.symbolic_fnaddr_paths).unwrap(),
         )
         .unwrap();
+        // `rtyper.py` `getfunctionptr(graph)`: one word-ABI adapter per
+        // nameable symbolic target. Runtime rebinding consults the table.
+        fnaddr_adapters::write_generated_fnaddr_adapters(
+            out_dir,
+            &pipeline.symbolic_fnaddr_targets,
+        );
 
         // Same ASLR hazard for the static-data addresses the codewriter baked
         // into `constants_i` (host `PyType` singletons and prebuilt refs supplied

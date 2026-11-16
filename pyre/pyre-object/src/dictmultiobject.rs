@@ -500,7 +500,8 @@ pub unsafe fn dict_entries_insert_hashed(
 /// # Safety
 /// Same as [`dict_entries_probe_hashed`]; `index` must be a live entry index.
 pub unsafe fn dict_entries_value_at(entries: &ObjectDictStorage, index: usize) -> PyObjectRef {
-    *entries.get_slot(index).unwrap().1
+    debug_assert!(entries.get_slot(index).is_some());
+    entries.value_at(index)
 }
 
 /// Overwrite the value at an entry index the caller already settled on —
@@ -2930,7 +2931,7 @@ unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
 /// not installed (pyre-object lib tests, snapshot tools) we fall back
 /// to the limited-type builtin equality below — sufficient for the
 /// hashable-builtin smoke tests but not for arbitrary user types.
-pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
+pub unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     // Once `space.eq_w` has raised earlier in this probe, nothing may match —
     // not by user comparison and not by identity.  The Rust `Eq` callback
     // cannot abort the `IndexMap` scan, so answering `false` for the rest of it

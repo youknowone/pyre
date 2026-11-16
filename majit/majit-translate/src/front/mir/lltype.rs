@@ -14056,9 +14056,17 @@ pub(in crate::front::mir) fn json_ty_byte_size(
     {
         return Some(size as i64);
     }
-    decl.size_align_for_target(llbc, &target)?
-        .0
-        .map(|size| size as i64)
+    if let Some(size) = decl
+        .size_align_for_target(llbc, &target)
+        .and_then(|(s, _)| s)
+    {
+        return Some(size as i64);
+    }
+    // Generic `repr(C)` Adt: Charon leaves size/offsets as OffsetOf.
+    // Walk declaration order with the node's type arguments
+    // (`instantiated_field_size_align` / `llmemory.sizeof` after subst).
+    super::consteval::instantiated_field_size_align(llbc, node, &[], &[], 0)
+        .map(|(size, _)| size as i64)
 }
 
 pub(in crate::front::mir) fn json_ty_raw_store_descr(
