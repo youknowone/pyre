@@ -19252,8 +19252,9 @@ fn non_reflexive_from_fn_item_const_is_not_identity_spec() {
 }
 
 /// `opt.map(str::to_string)` shape: a `FnDef` constant of the blanket
-/// `impl<T: Display> ToString for T`. Direct calls alias
-/// (`is_to_string_identity`) when the receiver is string-family; a
+/// `impl<T: Display> ToString for T`. Direct calls lower to
+/// `UnaryOp "str"` (`unaryop.py` `SomeObject.str`, `rmodel.py`
+/// `Repr.rtype_str`, `rstr.py` `AbstractStringRepr.ll_str`); a
 /// fn-item value is `FunctionDesc.getuniquegraph` of that instantiation
 /// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
 fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -> Llbc {
@@ -19331,13 +19332,55 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
                 serde_json::json!({"Use": [{"Const": [{
                     "FnDef": {
                         "kind": {"Fun": 1},
-                        "generics": fn_def_generics
+                        "generics": fn_def_generics.clone()
                     }
                 }, fn_ty.clone()]}, "No"]}),
             )],
             interior_return(),
         )],
     );
+    let concrete_recv = serde_json::json!({"Ref": ["Erased", self_ty.clone(), "Shared"]});
+    let call_types = if to_string_generic {
+        vec![self_ty.clone()]
+    } else {
+        vec![]
+    };
+    let call_to_string = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "call_to_string"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [concrete_recv.clone()],
+            "output": string_ty.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        interior_local(0, None, &string_ty),
+                        interior_local(1, Some("s"), &concrete_recv)
+                    ]
+                },
+                "body": [
+                    interior_bb(
+                        vec![],
+                        interior_call_with_types(
+                            1,
+                            vec![interior_copy(interior_place(1, &concrete_recv))],
+                            interior_place(0, &string_ty),
+                            1,
+                            2,
+                            call_types,
+                        ),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        }
+    });
     let string_decl = serde_json::json!({
         "def_id": 0,
         "item_meta": {
@@ -19392,7 +19435,7 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
     llbc_with_types_traits(
         "fixture",
         vec![string_decl],
-        vec![caller, to_string],
+        vec![caller, to_string, call_to_string],
         vec![trait_decl],
         vec![trait_impl],
     )
@@ -19403,7 +19446,7 @@ fn builtin_str_ty() -> serde_json::Value {
 }
 
 /// A `FnDef` constant of blanket `ToString::to_string` instantiated at
-/// `str` names the specialized identity graph, not the unregistered
+/// `str` names the specialized `str(arg0)` graph, not the unregistered
 /// generic template `to_string`.
 #[test]
 fn string_family_to_string_fn_item_const_registers_identity_spec() {
@@ -19421,8 +19464,8 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
-        "T = str is string-family; str(s) of a string is the string"
+        super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
+        "T = str is string-family; spec computes str(arg0)"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
         .expect("build semantic program for string-family ToString fn-item");
@@ -19448,7 +19491,7 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
     assert!(
         tail.last()
             .is_some_and(|leaf| leaf.starts_with("to_string__spec_")),
-        "fn-const names the specialized identity, not the generic template; tail={tail:?}"
+        "fn-const names the specialized str graph, not the generic template; tail={tail:?}"
     );
     assert_eq!(
         tail.last().map(String::as_str),
@@ -19471,13 +19514,20 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         });
     assert!(
         !residual_to_string,
-        "identity body has no residual to_string call; ops={:?}",
+        "str body has no residual to_string call; ops={:?}",
         graph_ops(spec.graph())
     );
+    assert_graph_is_str_of_arg0(spec.graph());
+    let direct = program
+        .functions
+        .iter()
+        .find(|f| f.name == "call_to_string")
+        .unwrap_or_else(|| panic!("expected call_to_string, functions={names:?}"));
+    assert_graph_is_str_of_arg0(direct.graph());
 }
 
-/// Blanket `ToString` of a non-string `Display` type is not identity:
-/// a FnDef constant of that `to_string` does not enqueue an identity spec.
+/// Blanket `ToString` of a non-string `Display` type is not string-str:
+/// a FnDef constant of that `to_string` does not enqueue a str spec.
 #[test]
 fn non_string_to_string_fn_item_const_is_not_identity_spec() {
     let i64_ty = interior_i64();
@@ -19494,7 +19544,7 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        !super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
+        !super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
         "T = i64 is outside the string family"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
@@ -19504,7 +19554,62 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         !names
             .iter()
             .any(|name| name.starts_with("to_string__spec_")),
-        "non-string ToString must not enqueue an identity spec; functions={names:?}"
+        "non-string ToString must not enqueue a str spec; functions={names:?}"
+    );
+}
+
+/// `str(arg0)` graph: one `UnaryOp "str"` on the first startblock
+/// inputarg, whose result is returned. An identity alias returns arg0
+/// with no `str` op.
+fn assert_graph_is_str_of_arg0(graph: &FunctionGraph) {
+    let arg0 = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .unwrap_or_else(|| panic!("expected arg0; graph={graph:#?}"));
+    let str_ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "str"))
+        .collect();
+    assert_eq!(
+        str_ops.len(),
+        1,
+        "exactly one UnaryOp str; ops={:?}",
+        graph_ops(graph)
+    );
+    match &str_ops[0].kind {
+        OpKind::UnaryOp { operand, .. } => {
+            assert_eq!(
+                operand.id(),
+                arg0.id(),
+                "str operand is arg0; ops={:?}",
+                graph_ops(graph)
+            );
+        }
+        other => panic!("expected UnaryOp str, got {other:?}"),
+    }
+    let result = str_ops[0]
+        .result
+        .as_ref()
+        .unwrap_or_else(|| panic!("UnaryOp str has a result; ops={:?}", graph_ops(graph)));
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
+                .iter()
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_eq!(
+        returned.map(|v| v.id()),
+        Some(result.id()),
+        "returns the UnaryOp str result; ops={:?}",
+        graph_ops(graph)
     );
 }
 
