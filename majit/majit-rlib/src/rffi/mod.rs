@@ -200,6 +200,13 @@ impl ExternalCompilationInfo {
         let mut i = 0;
         while i < names.len() {
             let name = names[i];
+            let mut j = 0;
+            while j < i {
+                if str_eq(names[j], name) {
+                    panic!("copy_without: attribute already removed");
+                }
+                j += 1;
+            }
             if str_eq(name, "pre_include_bits") {
                 out.pre_include_bits = &[];
             } else if str_eq(name, "includes") {
@@ -261,6 +268,12 @@ mod copy_without_tests {
         let out = eci.copy_without(&["includes"]);
         assert!(out.includes.is_empty());
         assert_eq!(out.post_include_bits, &["x"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "copy_without: attribute already removed")]
+    fn copy_without_name_twice() {
+        let _ = ExternalCompilationInfo::DEFAULT.copy_without(&["includes", "includes"]);
     }
 }
 

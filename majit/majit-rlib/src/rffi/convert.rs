@@ -207,23 +207,26 @@ macro_rules! getintfield {
 
 /// `rffi.structcopy`: copy every field of `*psrc` into `*pdst`.
 /// `_get_structcopy_fn` asserts `PDST == PSRC`; the shared `T` is that
-/// assertion. Copying the bytes also copies `_hints['padding']` fields, which
-/// no reader observes.
+/// assertion. For a `#[repr(C)]` struct the byte copy writes every field
+/// `_get_structcopy_fn` copies, plus `_hints['padding']` bytes no reader
+/// observes.
 ///
 /// # Safety
-/// Both pointers must be valid, aligned and non-overlapping for one `T`.
-pub unsafe fn structcopy<T>(pdst: *mut T, psrc: *const T) {
-    unsafe { core::ptr::copy_nonoverlapping(psrc, pdst, 1) }
+/// Both pointers must be valid and aligned for one `T` (overlap allowed).
+pub unsafe fn structcopy<T: Copy>(pdst: *mut T, psrc: *const T) {
+    unsafe { core::ptr::copy(psrc, pdst, 1) }
 }
 
 #[cfg(test)]
 mod tests {
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct X2 {
         x: isize,
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct X1 {
         a: isize,
         x2: X2,
@@ -255,5 +258,14 @@ mod tests {
             crate::rffi::structcopy(&mut p2bis, &p2);
         }
         assert_eq!(p2bis.x, 123);
+    }
+
+    #[test]
+    fn structcopy_self() {
+        let mut p2 = X2 { x: 123 };
+        unsafe {
+            crate::rffi::structcopy(&raw mut p2, &raw const p2);
+        }
+        assert_eq!(p2.x, 123);
     }
 }

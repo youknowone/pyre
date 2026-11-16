@@ -252,24 +252,34 @@ pub struct COpaquePtrHead {
 }
 
 impl COpaquePtrHead {
-    /// `c_name` with every non-`[A-Za-z0-9_]` byte replaced by `_`.
+    /// Per-declaration injective key: escaped `c_name`, `__`, then the Rust
+    /// name (`COpaque.lazy_getsize` is one cache per declaration).
     pub fn size_key(&self) -> String {
-        copaque_size_key(&self.c_name)
+        copaque_size_key(&self.c_name, &self.name.to_string())
     }
 }
 
-/// `hints['c_name']` turned into the `$OUT_DIR/majit_copaque/<key>.rs` stem.
-pub fn copaque_size_key(c_name: &str) -> String {
-    c_name
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'_' {
-                char::from(b)
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// `$OUT_DIR/majit_copaque/<key>.rs` stem: escaped `c_name` + `__` + `rust_name`.
+/// Escaping keeps `[A-Za-z0-9]` and writes every other byte (including `_`) as
+/// `_` plus two lowercase hex digits.
+pub fn copaque_size_key(c_name: &str, rust_name: &str) -> String {
+    let mut out = String::new();
+    for b in c_name.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(char::from(b));
+        } else {
+            out.push('_');
+            out.push(char::from(hex_digit(b >> 4)));
+            out.push(char::from(hex_digit(b & 0x0f)));
+        }
+    }
+    out.push_str("__");
+    out.push_str(rust_name);
+    out
+}
+
+fn hex_digit(n: u8) -> u8 {
+    if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
 impl Parse for COpaquePtrHead {

@@ -52,9 +52,9 @@ pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
     })
 }
 
-/// `rffi.llexternal_use_eci`: the `PYPY_NO_OP` dummy. `compile_crate_ecis` does
-/// not scan this macro; it already compiles every declared ECI with C sources
-/// and prints every ECI's link directives.
+/// `rffi.llexternal_use_eci`: the `PYPY_NO_OP` dummy. `compile_crate_ecis`
+/// collects this macro and resolves `compilation_info` to an
+/// `external_compilation_info!` const, so that ECI is in the compiled set.
 pub fn expand_llexternal_use_eci(input: TokenStream) -> syn::Result<TokenStream> {
     let head: majit_eci::parse::LlexternalUseEciHead = syn::parse2(input)?;
     let attrs = &head.attrs;

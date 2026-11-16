@@ -7,7 +7,9 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token, Type, UseTree};
 
 use crate::ExternalCompilationInfo;
-use crate::parse::{CExternVariableHead, COpaquePtrHead, EciInput, LlexternalHead};
+use crate::parse::{
+    CExternVariableHead, COpaquePtrHead, EciInput, LlexternalHead, LlexternalUseEciHead,
+};
 
 /// `rffi.py` `TYPES` on POSIX, minus the machine-word names `cdecl` spells
 /// without asking (`size_t`, `ssize_t`, `intptr_t`, `uintptr_t`).
@@ -238,6 +240,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected, extra);
     merge_cextern_variables(&mut collected);
+    resolve_llexternal_use_ecis(&collected);
     write_copaque_sizes(&collected, extra);
 
     for item in collected.ecis {
@@ -281,6 +284,12 @@ struct CollectedCOpaquePtr {
     head: COpaquePtrHead,
 }
 
+struct CollectedLlexternalUseEci {
+    file_path: PathBuf,
+    module_path: Vec<String>,
+    head: LlexternalUseEciHead,
+}
+
 struct CollectedUse {
     module_path: Vec<String>,
     binding: Option<String>,
@@ -312,6 +321,7 @@ struct CrateItems {
     llexternals: Vec<CollectedLlexternal>,
     cextern_variables: Vec<CollectedCExternVariable>,
     copaque_ptrs: Vec<CollectedCOpaquePtr>,
+    llexternal_use_ecis: Vec<CollectedLlexternalUseEci>,
     uses: Vec<CollectedUse>,
     modules: Vec<Vec<String>>,
     structs: Vec<CollectedStruct>,
@@ -549,15 +559,18 @@ fn cextern_c_type(
     if let Some(c_type) = &item.head.c_type {
         return c_type.clone();
     }
-    match type_path_last_ident(&item.head.ty).as_deref() {
-        Some("CCHARPP") => "char **".into(),
-        Some("CCHARP") => "char *".into(),
-        Some("INT") | Some("LONG") => panic!(
+    match resolved_cextern_extern_path(&item.head.ty, &item.module_path, resolve)
+        .as_deref()
+        .and_then(classify_cextern_rffi_type)
+    {
+        Some(CexternRffiCType::CharPP) => "char **".into(),
+        Some(CexternRffiCType::CharP) => "char *".into(),
+        Some(CexternRffiCType::AmbiguousInt) => panic!(
             "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
             item.file_path.display(),
             item.head.name
         ),
-        _ => {
+        None => {
             let template = crate::cdecl::gettype(&item.head.ty, &item.module_path, resolve)
                 .unwrap_or_else(|msg| {
                     panic!(
@@ -571,14 +584,59 @@ fn cextern_c_type(
     }
 }
 
-fn type_path_last_ident(ty: &Type) -> Option<String> {
-    match ty {
-        Type::Path(type_path) if type_path.qself.is_none() => {
-            type_path.path.segments.last().map(|s| s.ident.to_string())
-        }
-        Type::Paren(paren) => type_path_last_ident(&paren.elem),
-        Type::Group(group) => type_path_last_ident(&group.elem),
+/// `rffi.CExternVariable` default `c_type` when the resolved type is a `rffi` alias.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CexternRffiCType {
+    CharPP,
+    CharP,
+    AmbiguousInt,
+}
+
+/// Match a resolved extern path against `majit_rlib::rffi::{CCHARPP, CCHARP, INT, LONG}`.
+pub(crate) fn classify_cextern_rffi_type(resolved: &[String]) -> Option<CexternRffiCType> {
+    let [a, b, c] = resolved else {
+        return None;
+    };
+    if a != "majit_rlib" || b != "rffi" {
+        return None;
+    }
+    match c.as_str() {
+        "CCHARPP" => Some(CexternRffiCType::CharPP),
+        "CCHARP" => Some(CexternRffiCType::CharP),
+        "INT" | "LONG" => Some(CexternRffiCType::AmbiguousInt),
         _ => None,
+    }
+}
+
+fn resolved_cextern_extern_path(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<crate::cdecl::Resolved>,
+) -> Option<Vec<String>> {
+    let mut current = ty.clone();
+    let mut module_path = module_path.to_vec();
+    let mut visited: Vec<(Vec<String>, String)> = Vec::new();
+    loop {
+        current = match current {
+            Type::Paren(paren) => *paren.elem,
+            Type::Group(group) => *group.elem,
+            Type::Path(type_path) if type_path.qself.is_none() => {
+                match resolve(&type_path.path, &module_path) {
+                    Some(crate::cdecl::Resolved::Alias(target, alias_module)) => {
+                        let key = (module_path.clone(), path_text(&type_path.path));
+                        if visited.contains(&key) {
+                            return None;
+                        }
+                        visited.push(key);
+                        module_path = alias_module;
+                        target
+                    }
+                    Some(crate::cdecl::Resolved::Extern(p)) => return Some(p),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
     }
 }
 
@@ -592,6 +650,13 @@ fn resolve_macro_type(
 ) -> Option<crate::cdecl::Resolved> {
     match resolve_path(collected, path, module_path) {
         Some(Target::Local(m, n)) => {
+            if is_majit_rlib_rffi_module(&m) {
+                return Some(crate::cdecl::Resolved::Extern(vec![
+                    "majit_rlib".into(),
+                    "rffi".into(),
+                    n,
+                ]));
+            }
             if let Some(alias) = collected
                 .aliases
                 .iter()
@@ -706,6 +771,34 @@ fn compilation_info_eci_idx(
                 "{}: {kind} `{item_name}`: compilation_info `{eci_name}` not found",
                 file_path.display(),
             )
+        }
+    }
+}
+
+fn is_majit_rlib_rffi_module(module: &[String]) -> bool {
+    std::env::var("CARGO_PKG_NAME").ok().as_deref() == Some("majit-rlib") && module == ["rffi"]
+}
+
+/// `llexternal_use_eci` `compilation_info` must name a collected
+/// `external_compilation_info!` const, the same lookup `llexternal` uses.
+fn resolve_llexternal_use_ecis(collected: &CrateItems) {
+    for item in &collected.llexternal_use_ecis {
+        let resolved = match expr_as_path(&item.head.compilation_info) {
+            Some(path) => match resolve_path(collected, path, &item.module_path) {
+                Some(Target::Local(m, n)) => collected
+                    .ecis
+                    .iter()
+                    .any(|eci| eci.module_path == m && eci.name == n),
+                _ => false,
+            },
+            None => false,
+        };
+        if !resolved {
+            panic!(
+                "{}: llexternal_use_eci `{}`: compilation_info must name an external_compilation_info! const",
+                item.file_path.display(),
+                item.head.name
+            );
         }
     }
 }
@@ -1550,6 +1643,19 @@ fn walk_items(
                             });
                         }
                     }
+                    Some("llexternal_use_eci") => {
+                        let parsed: LlexternalUseEciHead = syn::parse2(mac.mac.tokens.clone())
+                            .unwrap_or_else(|err| {
+                                panic!("{}: {err}", file_path.display());
+                            });
+                        if attrs_cfgs_hold(&parsed.attrs, file_path) {
+                            out.llexternal_use_ecis.push(CollectedLlexternalUseEci {
+                                file_path: file_path.to_path_buf(),
+                                module_path: mod_path.to_vec(),
+                                head: parsed,
+                            });
+                        }
+                    }
                     Some("include") => {
                         if let Some(included) = out_dir_include_path(&mac.mac)
                             && included.exists()
@@ -1936,4 +2042,46 @@ fn env_key(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod classify_cextern_rffi_type_tests {
+    use super::{CexternRffiCType, classify_cextern_rffi_type};
+
+    fn path(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn classifies_rffi_aliases() {
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "CCHARPP"])),
+            Some(CexternRffiCType::CharPP)
+        );
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "CCHARP"])),
+            Some(CexternRffiCType::CharP)
+        );
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "INT"])),
+            Some(CexternRffiCType::AmbiguousInt)
+        );
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "LONG"])),
+            Some(CexternRffiCType::AmbiguousInt)
+        );
+    }
+
+    #[test]
+    fn ignores_paths_that_only_end_in_int() {
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "UINT"])),
+            None
+        );
+        assert_eq!(classify_cextern_rffi_type(&path(&["other", "INT"])), None);
+        assert_eq!(
+            classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "VOIDP"])),
+            None
+        );
+    }
 }

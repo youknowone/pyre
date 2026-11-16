@@ -341,7 +341,11 @@ impl ExternalCompilationInfo {
     /// panics (`KeyError`).
     pub fn copy_without(&self, names: &[&str]) -> ExternalCompilationInfo {
         let mut out = self.clone();
+        let mut removed: Vec<&str> = Vec::new();
         for name in names {
+            if removed.contains(name) {
+                panic!("copy_without: attribute {name:?} already removed");
+            }
             if _ATTRIBUTES.contains(name) {
                 *out.field_mut(name) = Vec::new();
             } else if *name == "use_cpp_linker" {
@@ -351,6 +355,7 @@ impl ExternalCompilationInfo {
             } else {
                 panic!("copy_without: unknown attribute {name:?}");
             }
+            removed.push(*name);
         }
         out
     }
@@ -1109,6 +1114,16 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "copy_without: attribute \"includes\" already removed")]
+    fn copy_without_name_twice() {
+        let eci = ExternalCompilationInfo {
+            includes: vec!["stdio.h".into()],
+            ..ExternalCompilationInfo::default()
+        };
+        let _ = eci.copy_without(&["includes", "includes"]);
+    }
+
+    #[test]
     #[should_panic(expected = "Mixing ECI for different platforms")]
     fn merge_rejects_mixed_platforms() {
         let left = ExternalCompilationInfo {
@@ -1223,7 +1238,7 @@ mod tests {
         assert_eq!(head.name.to_string(), "fd_set");
         assert_eq!(head.c_name, "fd_set");
         assert!(head.compilation_info.is_some());
-        assert_eq!(head.size_key(), "fd_set");
+        assert_eq!(head.size_key(), "fd_5fset__fd_set");
     }
 
     #[test]
@@ -1232,9 +1247,18 @@ mod tests {
         assert_eq!(head.name.to_string(), "DIRP");
         assert_eq!(head.c_name, "DIR");
         assert!(head.compilation_info.is_none());
+        assert_eq!(head.size_key(), "DIR__DIRP");
         assert_eq!(
-            crate::parse::copaque_size_key("struct RPyOpaque_ThreadLock"),
-            "struct_RPyOpaque_ThreadLock"
+            crate::parse::copaque_size_key("struct RPyOpaque_ThreadLock", "RLock"),
+            "struct_20RPyOpaque_5fThreadLock__RLock"
+        );
+        assert_eq!(
+            crate::parse::copaque_size_key("struct X", "Foo"),
+            "struct_20X__Foo"
+        );
+        assert_eq!(
+            crate::parse::copaque_size_key("struct_X", "Foo"),
+            "struct_5fX__Foo"
         );
     }
 
