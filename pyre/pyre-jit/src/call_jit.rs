@@ -722,6 +722,26 @@ extern "C" fn jit_exc_clear_shim() {
     clear_residual_call_exception();
 }
 
+/// Peek the backend `_store_exception` cell `GUARD_NO_EXCEPTION` resets
+/// (`assembler.py` `_store_and_reset_exception`). A leftover
+/// `BH_LAST_EXC_VALUE` after that reset is not a pending raise.
+extern "C" fn jit_exc_peek_shim() -> i64 {
+    crate::eval::jit_exc_value_peek_backend()
+}
+
+/// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear`
+/// over the residual-call pair. Reads the same backend cell
+/// [`jit_exc_peek_shim`] tests, so `rpyexc_occurred` and the fetch agree
+/// (upstream's both read `exc_data`). Every residual raise writes that
+/// cell and `BH_LAST_EXC_VALUE` together
+/// ([`publish_residual_call_exception`]); the fetch clears both.
+extern "C" fn jit_exc_fetch_shim() -> i64 {
+    let value = crate::eval::jit_exc_value_peek_backend();
+    drain_backend_jit_exc();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    value
+}
+
 /// Publish a raise from a may-force residual helper to BOTH executors.
 ///
 /// `bh_call_fn`/`bh_call_fn_N` is bound as the may-force CALL target
@@ -1303,7 +1323,6 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
-    let w_exc = _roots.get(base);
     let w_code = _roots.get(base + 1);
     let w_globals = _roots.get(base + 2);
     // `record_application_traceback` requires the traceback's own frame
@@ -1326,6 +1345,9 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    // `createframe_obj` allocates the frame and can collect; re-read the
+    // exception from its root slot (`shadowstack.py` `pop_roots`).
+    let w_exc = _roots.get(base);
     let recorded = unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
@@ -1392,7 +1414,6 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
-    let w_exc = _roots.get(base);
     let w_code = _roots.get(base + 1);
     let w_globals = _roots.get(base + 2);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
@@ -1409,6 +1430,9 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    // `createframe_obj` allocates the frame and can collect; re-read the
+    // exception from its root slot (`shadowstack.py` `pop_roots`).
+    let w_exc = _roots.get(base);
     let recorded = unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
@@ -2456,6 +2480,8 @@ pub fn install_jit_call_bridge() {
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
         register_jit_exc_clearer(jit_exc_clear_shim);
+        pyre_object::interp_exceptions::register_residual_exc_peek(jit_exc_peek_shim);
+        pyre_object::interp_exceptions::register_residual_exc_fetch(jit_exc_fetch_shim);
         // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // the prebuilt `W_BaseException(MemoryError, "")` singleton

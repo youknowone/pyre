@@ -2439,8 +2439,8 @@ pub(crate) fn semantic_slot_for_reg_color(
 /// it at this PC per the `(bank, color, slot)` map. Used by the deep-kept
 /// operand-stack recovery in `walker_capture_snapshot_for_last_guard_impl` to
 /// name the guard-PC register (`registers_r[color]`) holding a kept operand-
-/// stack slot the walk mirror lost. Returns the smallest matching color;
-/// `None` when no live Ref color owns the slot at this PC.
+/// stack slot. Returns the smallest matching color; `None` when no live Ref
+/// color owns the slot at this PC.
 pub(crate) fn semantic_slot_color_for_ref_slot(
     pcdep_entries: &[(u8, u16, u16)],
     slot: usize,
@@ -10790,16 +10790,22 @@ fn seed_bridge_standing_exception_from_current(
     // SAVE_EXCEPTION result as its exception.
     let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get())
         as pyre_object::PyObjectRef;
-    let exc_box = if exc.is_null() {
-        OpRef::NONE
+    let (exc_box, live) = if exc.is_null() {
+        (OpRef::NONE, pyre_object::PY_NULL)
     } else {
-        ctx.const_ref(exc as i64)
+        // Same intern-then-re-read as `seed_standing_exception_for_walk`.
+        let (exc_box, concrete) = crate::jitcode_dispatch::intern_live_exc(ctx, exc as usize);
+        let live = match concrete {
+            ConcreteValue::Ref(p) => p,
+            _ => pyre_object::PY_NULL,
+        };
+        (exc_box, live)
     };
-    sym.current_exc_value.set(exc);
+    sym.current_exc_value.set(live);
     sym.current_exc_box = exc_box;
-    sym.last_exc_value.set(exc);
+    sym.last_exc_value.set(live);
     sym.last_exc_box = exc_box;
-    sym.class_of_last_exc_is_const = !exc.is_null();
+    sym.class_of_last_exc_is_const = !live.is_null();
 }
 
 impl JitState for PyreJitState {
@@ -15321,7 +15327,6 @@ mod tests {
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
-                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),

@@ -488,23 +488,22 @@ fn pyre_object_gc_write_barrier_managed_trampoline(obj: majit_gc::GCREF) {
 /// `pyre_interpreter::baseobjspace::eq_w` (line-by-line port of
 /// `baseobjspace.py W_ObjectSpace.eq_w`).  Registered at
 /// JIT init so all subsequent `dict_keys_equal` calls reach the full
-/// comparison protocol.  A raising `__eq__` (or `__bool__` of its
-/// result) cannot return a `Result` across the bucket probe, so the
-/// `PyError` is stashed on the shared pending slot and flagged via
-/// `dict_eq_hook::signal_eq_error`; the checked dict op converts the
-/// flag to a `DictKeyError` after the probe.
+/// comparison protocol.
+///
+/// `baseobjspace.py eq_w` raises through `get_and_call_function`. This
+/// residual keeps the `fn -> bool` ABI and publishes the raise on the
+/// one ll exception state (`exceptiontransform.py` `rpyexc_raise`) so
+/// `GUARD_NO_EXCEPTION` after `eq_w_hooked` fails (`jtransform.py
+/// handle_residual_call`, `pyjitpl.py handle_possible_exception`).
 unsafe fn pyre_object_eq_w_trampoline(
     a: pyre_object::PyObjectRef,
     b: pyre_object::PyObjectRef,
 ) -> bool {
     match pyre_interpreter::baseobjspace::eq_w(a, b) {
         Ok(v) => v,
-        Err(e) => {
-            pyre_interpreter::baseobjspace::set_pending_hash_error(e);
-            // `a` outlived a user `__eq__` and so may name the pre-collection
-            // copy.  It is stored as a presence token — `take_eq_error` only
-            // tests the slot for null — and never followed.
-            pyre_object::dict_eq_hook::signal_eq_error(a);
+        Err(mut e) => {
+            pyre_interpreter::baseobjspace::note_dict_callback_raise(false);
+            crate::call_jit::publish_residual_call_exception(e.to_exc_object());
             false
         }
     }
@@ -516,17 +515,18 @@ unsafe fn pyre_object_eq_w_trampoline(
 /// (same eq_w + same hash_w → same key, different hash_w → distinct).
 /// Routes through `try_hash_value` (the strict Result-bearing hash)
 /// so unhashable types, user `__hash__ = None`, and user `__hash__`
-/// exceptions are all caught.  On error, signals via
-/// `dict_eq_hook::signal_hash_error` and stores the `PyError` in
-/// `PENDING_HASH_ERROR` for the caller to retrieve.
+/// exceptions are all caught.
+///
+/// `descroperation.py hash_w` raises through `get_and_call_function`.
+/// This residual keeps the `fn -> i64` ABI and publishes the raise on
+/// the one ll exception state; the dummy 0 is what the exception
+/// transformer leaves in the return register.
 unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
     match pyre_interpreter::builtins::try_hash_value(obj) {
         Ok(h) => h,
-        Err(e) => {
-            pyre_interpreter::baseobjspace::set_pending_dict_hash_error(e);
-            // A presence token, as in `pyre_object_eq_w_trampoline`: stale
-            // after a user `__hash__`, and only ever tested for null.
-            pyre_object::dict_eq_hook::signal_hash_error(obj);
+        Err(mut e) => {
+            pyre_interpreter::baseobjspace::note_dict_callback_raise(true);
+            crate::call_jit::publish_residual_call_exception(e.to_exc_object());
             0
         }
     }
@@ -7284,11 +7284,9 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // and double-applies the residual's non-journaled body effects.
         //
         // `tracing_before_residual_call` stamps the identity box
-        // (`standard_virtualizable_ptr` / the live frame). A root portal seed
-        // can point `virtualizable_heap_ptr` at the `snapshot_for_tracing`
-        // copy, which still holds an Active compiled-loop token, so the heap
-        // filter above misses TOKEN_TRACING_RESCALL. `force_now` on the frame
-        // Python handed over clears the stamped token.
+        // (`standard_virtualizable_ptr` / the live frame), and `force_now`
+        // decides from that object's own `vable_token`.  `force_now` on the
+        // frame Python handed over clears the stamped token.
         if traced_frame_escaped {
             pyre_jit_trace::jitcode_dispatch::attribute_last_escape_force();
             let frame_rescall = matches!(
@@ -8576,6 +8574,8 @@ pub fn eval_with_jit(
     // entry.  The portal runner is pyre's JIT-aware execution entry for the
     // same frame and must perform the interpreter-side check before compiled
     // code exists; compiled callees additionally carry the backend prologue.
+    // Both checks allocate only on their `Err` path, after which the frame
+    // is not used, so the frame needs no root across them.
     pyre_interpreter::stack_check::drain_jit_pending_exception()?;
     pyre_interpreter::stack_check::stack_check()?;
     eval_with_jit_inner(frame, resume)

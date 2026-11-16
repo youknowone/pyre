@@ -1146,6 +1146,34 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
     });
 }
 
+/// `install_ascii_items` pins the list and the fresh block around the
+/// owner barrier + field stores. `pin_block` / `UnicodeArray::install`
+/// as callees refuse the rewrite (`returns_index` / nested Open); the
+/// in-body `shadow_stack_len` + `pin_root` shape is the one
+/// `ll_listslice_new_int_list` uses, so the walked jitcode has no
+/// residual `push_roots`.
+#[test]
+fn install_ascii_items_bracket_is_scalar_replaced() {
+    let llbc = object_llbc();
+    let graph = lower_named(llbc, "install_ascii_items");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "pin_block",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "install_ascii_items still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
 /// `ll_listslice_new_int_list` pins source and dest around `newlist` +
 /// `ll_arraycopy`. The native RootScope is scalar-replaced so a
 /// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.
@@ -1824,7 +1852,7 @@ fn zip_two_tuple_next_erases_the_nested_root_brackets() {
     });
 }
 
-/// `FrameBox::new` closes with `drop(frame_root)`, which Charon spells as
+/// `FrameBox::new_placed` closes with `drop(frame_root)`, which Charon spells as
 /// `_t = Move(guard); core::mem::drop(Move(_t))`. Production harvests
 /// pyre-object's root-stack effects before lowering the interpreter, the
 /// same order `lib.rs` uses; that Call is Close of the watched Guard so
@@ -1848,11 +1876,11 @@ fn frame_box_new_erases_the_explicit_drop_root_bracket() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
-    let graph =
-        lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower FrameBox::new: {e:?}"));
+        .expect("FrameBox::new_placed");
+    let graph = lower_fun_decl(&context, fd)
+        .unwrap_or_else(|e| panic!("lower FrameBox::new_placed: {e:?}"));
     let leftover: Vec<String> = graph
         .blocks
         .iter()
@@ -1882,7 +1910,7 @@ fn frame_box_new_erases_the_explicit_drop_root_bracket() {
         .collect();
     assert!(
         leftover.is_empty(),
-        "FrameBox::new still calls root-bracket leaves after explicit-drop erasure: {leftover:?}"
+        "FrameBox::new_placed still calls root-bracket leaves after explicit-drop erasure: {leftover:?}"
     );
 }
 

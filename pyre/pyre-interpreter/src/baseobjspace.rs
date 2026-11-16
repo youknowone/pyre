@@ -127,47 +127,59 @@ pub fn space_lookup_builtin(name: &str) -> Option<PyObjectRef> {
     }
 }
 
-// ── Pending dict-key-callback error slot ─────────────────────────────
-// The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`
-// / `pyre_object_eq_w_trampoline` in pyre-jit) cannot return a `Result`
-// across the pyre-object dict probe, so on a raising `__hash__` or
-// `__eq__` they stash the concrete PyError here.  Dict entry gates call
-// `take_pending_hash_error` after a checked dict op returns
-// `DictKeyError` to recover whichever exception was raised.
+// ── Dict-key-callback exception recovery ─────────────────────────────
+// `descroperation.py hash_w` / `baseobjspace.py eq_w` raise through
+// `get_and_call_function`. The crate-boundary trampoline keeps the
+// `fn -> i64` / `fn -> bool` ABI and publishes that raise on the one ll
+// exception state (`exceptiontransform.py` `rpyexc_raise`). Checked dict
+// ops peek `rpyexc_occurred` after the residual (IndexMap `Eq` cannot
+// abort) and return `DictKeyError`; the interpreter fetches the instance
+// here. The exception object is already a GC root of `BH_LAST_EXC_VALUE`
+// / backend `JIT_EXC_VALUE`.
+//
+// `rdict.py ll_dict_lookup` propagates a raising `hash_w` and a raising
+// `eq_w` the same way, but the 3.15 container message
+// (`dict_unhashable_type`) applies to the hash half only. The exception
+// state does not record which callback raised, so each trampoline notes
+// it at the raise. Like `exc_data`, the note is per thread; every raise
+// a checked dict op recovers passes through one of the two trampolines,
+// so the note always describes the exception being fetched.
 thread_local! {
-    static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
     static PENDING_ERROR_FROM_HASH: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Store an error raised by the equality half of the dict `r_dict` callback
-/// pair.  The historical name is retained for existing callers; hash
-/// callbacks use [`set_pending_dict_hash_error`] so Python 3.14's hash-only
-/// dict-key error remapping does not rewrite equality errors.
-pub fn set_pending_hash_error(e: PyError) {
-    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
+/// Record whether the raise a dict-key callback just published came from
+/// `hash_w` (`true`) or `eq_w` (`false`).
+pub fn note_dict_callback_raise(from_hash: bool) {
+    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(from_hash));
 }
 
-pub fn set_pending_dict_hash_error(e: PyError) {
-    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(true));
-}
-
-pub fn take_pending_hash_error() -> PyError {
-    PyError::from_raw(take_pending_hash_error_raw() as PyObjectRef)
-}
-
-/// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with` read has no extractable graph; the call stays a
-/// residual, and the error travels as its raw handle so the residual call has a word-ABI target.
+/// Recover the exception a failed `hash_w` / `eq_w` residual left in the
+/// one ll exception state. Empty fetch is the unhashable-type default
+/// the previous pending slot materialised.
+///
+/// `dont_look_inside`: returns a `PyError` as a value; publishing that
+/// object through `BH_LAST_EXC_VALUE` would convert the return into a
+/// raise (`jit_fnaddr` leaves this unpublished).
 #[majit_macros::dont_look_inside]
-fn take_pending_hash_error_raw() -> *mut crate::error::PyErrorObject {
+pub fn take_pending_hash_error() -> PyError {
     PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
-    PENDING_HASH_ERROR
-        .with(|cell| {
-            cell.take()
-                .unwrap_or_else(|| PyError::type_error("unhashable type"))
-        })
-        .as_raw()
+    fetch_pending_callback_error()
+}
+
+/// The one ll exception state also carries a collector failure from the
+/// checked op (`AbstractTypedStrategy.switch_to_object_strategy`), so the
+/// fetched word may be the low-level MemoryError singleton
+/// (`runtime_ops::fetch_memory_error`).
+fn fetch_pending_callback_error() -> PyError {
+    let obj = pyre_object::interp_exceptions::rpyexc_fetch();
+    if obj.is_null() {
+        PyError::type_error("unhashable type")
+    } else if crate::runtime_ops::rpyexc_fetched_is_memory_error_singleton(obj) {
+        crate::runtime_ops::asynchronous_memory_error()
+    } else {
+        unsafe { PyError::from_exc_object(obj) }
+    }
 }
 
 /// Convert the failure modes of a checked set-table operation back into
@@ -180,39 +192,6 @@ pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyEr
             PyError::runtime_error("Set changed size during iteration")
         }
         pyre_object::setobject::SetUpdateError::Memory => crate::runtime_ops::fetch_memory_error(),
-    }
-}
-
-/// Root the exception parked in `PENDING_HASH_ERROR` while a raising
-/// `__hash__`/`__eq__` propagates across a dict probe. Its `PyError` holds GC
-/// refs the precise collector does not reach through the raw `Cell`; forward
-/// them in place via [`PyError::walk_gc_refs`]. Never materialises the
-/// lazy-null `exc_object`.
-pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    PENDING_HASH_ERROR.with(|cell| {
-        unsafe { walk_pending_hash_error_area(cell as *const _ as *const (), visitor) };
-    });
-}
-
-pub(crate) fn capture_pending_hash_error_area() -> *const () {
-    PENDING_HASH_ERROR.with(|cell| cell as *const _ as *const ())
-}
-
-/// Walk the deferred dict callback error belonging to one stopped mutator.
-///
-/// # Safety
-/// `data` must come from [`capture_pending_hash_error_area`], and the owning
-/// mutator must be quiesced.
-pub(crate) unsafe fn walk_pending_hash_error_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    let cell = unsafe { &*(data as *const Cell<Option<PyError>>) };
-    // SAFETY: the owning mutator is stopped, so the collector has exclusive
-    // access to the Cell interior while forwarding the PyError's object slots.
-    let opt = unsafe { &mut *cell.as_ptr() };
-    if let Some(err) = opt.as_mut() {
-        err.walk_gc_refs(visitor);
     }
 }
 
@@ -232,14 +211,12 @@ pub fn clear_method_cache() {
 /// callback errors, non-TypeError exceptions, and TypeError subclasses pass
 /// through unchanged.
 ///
-/// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
-/// is fetched first: `w_dict_store_checked` reports that as the same
-/// `DictKeyError` sentinel as a hash failure.
+/// A collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
+/// reaches here as the same `DictKeyError` sentinel as a hash failure, and
+/// both sit in the one ll exception state; the fetch tells them apart by
+/// value. `gc_alloc_failed_pending` (`rpyexc_occurred`) is true for either.
 #[majit_macros::dont_look_inside]
 pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return crate::runtime_ops::fetch_memory_error();
-    }
     take_pending_hash_error_for(key, wrap_dict_key_hash_error)
 }
 
@@ -261,18 +238,18 @@ pub fn take_pending_frozendict_key_error(key: PyObjectRef) -> PyError {
 
 /// Recover the exception a failed hash left pending and give it the calling
 /// container's context.  [`take_pending_hash_error`] is the same recovery
-/// without the context, for a caller with no operand to name.  An error from
-/// anywhere but the hash is returned as raised: only hashing is what the
-/// wrappers describe.
+/// without the context, for a caller with no operand to name.
+///
+/// IndexMap `Eq` cannot abort, so a raising `__hash__` and a raising
+/// `__eq__` share this recovery. Only a hash raise takes `wrap`, which
+/// applies `dict_unhashable_type` to an exact `TypeError`; an `__eq__`
+/// raise propagates as raised (`ll_dict_lookup`).
 fn take_pending_hash_error_for(
     subject: PyObjectRef,
     wrap: fn(PyObjectRef, PyError) -> PyError,
 ) -> PyError {
     let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
-    let err = PENDING_HASH_ERROR.with(|cell| {
-        cell.take()
-            .unwrap_or_else(|| PyError::type_error("unhashable type"))
-    });
+    let err = fetch_pending_callback_error();
     if !from_hash {
         return err;
     }
@@ -320,13 +297,10 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 /// Recover a pending key-hash error naming `container` as `dict` or
 /// `frozendict` (`dict_unhashable_type`).
 ///
-/// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
-/// is fetched first, matching [`take_pending_dict_key_error`].
+/// A collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
+/// comes out of the same fetch, as in [`take_pending_dict_key_error`].
 #[majit_macros::dont_look_inside]
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
-    if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return crate::runtime_ops::fetch_memory_error();
-    }
     if container_is_frozendict(container) {
         take_pending_frozendict_key_error(key)
     } else {
@@ -17755,6 +17729,7 @@ fn generator_unpack_into(
             // the frame rests on `POP_TOP` after the wrap-time prologue,
             // and that pop consumes the None.  Later resumes after
             // `YIELD_VALUE` use the same push so `x = yield` sees it.
+            let frame = &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
             w_generator_set_started(gen_obj());
             let result = generator_invoke_execute_frame(gen_obj(), frame, pyre_object::w_none());
             match result {
@@ -17762,6 +17737,12 @@ fn generator_unpack_into(
                 // finalized the frame for any escaping error.
                 Err(e) => return Err(e),
                 Ok(w_result) => {
+                    // The generator body can collect and move the frame, so the
+                    // frame is re-read from the pinned generator (`generator.py`
+                    // `unpack_into` `frame = self.frame`; `shadowstack.py`
+                    // `pop_roots`).
+                    let frame =
+                        &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
@@ -24864,13 +24845,15 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
     // send GeneratorExit (or the error that close raised) into this frame.
     // Doing the delegate close here, not only inside JIT resume, keeps
     // `os.fwalk().close()` from depending on whether the portal compiled.
-    let err = if generator_get_delegate(gen_obj).is_null() {
-        PyError::new(PyErrorKind::GeneratorExit, String::new())
-    } else {
-        pyre_object::with_roots!(gen_obj => generator_close_iter(gen_obj))
-            .err()
-            .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
-    };
+    let err = pyre_object::with_roots!(gen_obj => {
+        if generator_get_delegate(gen_obj).is_null() {
+            PyError::new(PyErrorKind::GeneratorExit, String::new())
+        } else {
+            generator_close_iter(gen_obj)
+                .err()
+                .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
+        }
+    });
     let sent = pyre_object::with_roots!(gen_obj => {
         generator_send_error(gen_obj, err, None)
     });
@@ -25718,11 +25701,14 @@ pub fn generator_finalize(mut gen_obj: PyObjectRef) -> PyResult {
                 // generator.py `AsyncGenerator._finalize_`: the collector
                 // cleared the frame's weakref before `_finalize_`, so re-arm
                 // `frame.f_generator_wref = rweakref.ref(self)` before calling
-                // `w_finalizer`.  The pinned generator owns the non-moving
-                // frame across the WEAKREF allocation.
+                // `w_finalizer`.  The frame can move during the WEAKREF
+                // allocation, so it is re-read from the pinned generator
+                // (`shadowstack.py` `pop_roots` reload).
                 let wref = pyre_object::weakref::w_weakref_new(
                     pyre_object::gc_roots::shadow_stack_get(base),
                 );
+                let frame_ptr =
+                    w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(base));
                 (*(frame_ptr as *mut crate::pyframe::PyFrame)).f_generator_wref =
                     wref as PyObjectRef;
                 if pyre_object::gc_hook::try_gc_owns_object(

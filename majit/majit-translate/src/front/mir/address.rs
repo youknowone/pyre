@@ -344,6 +344,8 @@ fn residual_arg_store_descr(
         .or_else(|| residual_scalar_word_descr(ty, llbc, gc_struct_ids))
 }
 
+/// Residual rustc `&T` of a copy word. An oopspec callee is rewritten
+/// by `jtransform.py` `handle_builtin_call` and keeps the word.
 fn residual_scalar_ref_callee(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -499,14 +501,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
                 let PlaceKind::Local(id) = place.kind else {
                     continue;
                 };
-                bind_function_local_primitive_cell(
-                    &mut locals,
-                    &mut descr,
-                    body,
-                    arg_count,
-                    id as usize,
-                    llbc,
-                );
+                bind_closure_captured_cell_local(&mut locals, &mut descr, body, id as usize, llbc);
             }
         }
     }
@@ -537,22 +532,75 @@ fn bind_function_local_primitive_cell(
     id: usize,
     llbc: &Llbc,
 ) {
-    if id <= arg_count || locals.contains(id) {
+    // Residual `&T` of a parameter stays a function-scope spill
+    // (`collect_function_scope_spill_cells`). A closure capture of that
+    // same argument is [`bind_closure_captured_cell_local`].
+    if id <= arg_count {
+        return;
+    }
+    bind_cell_scalar_local(locals, descr, body, id, llbc, primitive_scalar_cell_descr);
+}
+
+/// Exclusive capture of a by-value primitive, or of a `repr(transparent)`
+/// wrapper of one, including a function argument (`rdtoa.py` `strtod`
+/// `end_ptr`). Local 0 is the return slot.
+fn bind_closure_captured_cell_local(
+    locals: &mut bit_set::BitSet,
+    descr: &mut [Option<(ValueType, usize, bool)>],
+    body: &Unstructured,
+    id: usize,
+    llbc: &Llbc,
+) {
+    if id == 0 {
+        return;
+    }
+    bind_cell_scalar_local(
+        locals,
+        descr,
+        body,
+        id,
+        llbc,
+        function_local_primitive_cell_descr,
+    );
+}
+
+fn bind_cell_scalar_local(
+    locals: &mut bit_set::BitSet,
+    descr: &mut [Option<(ValueType, usize, bool)>],
+    body: &Unstructured,
+    id: usize,
+    llbc: &Llbc,
+    cell_descr_of: impl FnOnce(&TyRef, &Llbc) -> Option<(ValueType, usize, bool)>,
+) {
+    if locals.contains(id) {
         return;
     }
     let Some(decl) = body.locals.locals.get(id) else {
         return;
     };
-    if !tyref_is_primitive_scalar(&decl.ty, llbc) {
-        return;
-    }
-    let Some(cell_descr) =
-        tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
-    else {
+    let Some(cell_descr) = cell_descr_of(&decl.ty, llbc) else {
         return;
     };
     locals.insert(id);
     descr[id] = Some(cell_descr);
+}
+
+fn primitive_scalar_cell_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+    if !tyref_is_primitive_scalar(ty, llbc) {
+        return None;
+    }
+    tyref_node(ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+}
+
+/// Char-varsize cell descr of a function-local primitive, or of a
+/// `repr(transparent)` wrapper whose unique field is that primitive.
+/// A transparent GCREF newtype is not a primitive and stays out.
+fn function_local_primitive_cell_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<(ValueType, usize, bool)> {
+    tyref_primitive_or_transparent_primitive_node(ty, llbc)
+        .and_then(|node| json_ty_raw_store_descr(node, llbc))
 }
 
 /// Residual `&T` of a parameter or field: one Char-varsize cell for the
@@ -2293,7 +2341,17 @@ impl<'a> Lowering<'a> {
             if self.tyref_is_nullable_gcref(&ty) {
                 continue;
             }
-            if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
+            if tyref_is_raw_pointer(&ty, self.llbc) {
+                // A thin scalar raw pointer (`*mut i64`) can be the
+                // relocated slot (`rffi.scoped_alloc` of Signed). A GC
+                // / byte pointer (`*mut PyObject`, `GCREF`, `*mut u8` /
+                // `rffi.py` `CCHARP`) is not this slot.
+                if raw_scalar_address_value_type(&ty, self.llbc).is_some() {
+                    return true;
+                }
+                continue;
+            }
+            if output_type_is_ref(&ty, self.llbc) {
                 return true;
             }
             match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {
@@ -2487,6 +2545,13 @@ impl<'a> Lowering<'a> {
         let Some(ty) = self.mir_local_ty(local) else {
             return true;
         };
+        // A GC reference is kind `'ref'` (`history.py` `getkind` on
+        // `llmemory.GCREF`), never a raw scalar's address, so it cannot
+        // carry the spilled cell; `raw_scalar_spill_result_escapes` makes
+        // the same exemption.
+        if self.tyref_is_nullable_gcref(&ty) {
+            return false;
+        }
         if depth > 8 {
             return self.raw_scalar_spill_result_escapes(&ty);
         }
