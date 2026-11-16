@@ -8233,6 +8233,33 @@ mod tests {
             take_pending, raw_take_pending,
             "must not publish the raw PyError item"
         );
+
+        let fetch_memory: extern "C" fn() -> i64 =
+            crate::runtime_ops::__majit_call_target_fetch_memory_error;
+        let fetch_memory = fetch_memory as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::runtime_ops::fetch_memory_error"],
+            fetch_memory
+        );
+        let raw_fetch_memory = crate::runtime_ops::fetch_memory_error as *const () as usize as i64;
+        assert_ne!(
+            fetch_memory, raw_fetch_memory,
+            "must not publish the raw PyError item"
+        );
+
+        let obj_or_memory: extern "C" fn(i64) -> i64 =
+            crate::runtime_ops::__majit_call_target_obj_or_memory_error;
+        let obj_or_memory = obj_or_memory as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::runtime_ops::obj_or_memory_error"],
+            obj_or_memory
+        );
+        let raw_obj_or_memory =
+            crate::runtime_ops::obj_or_memory_error as *const () as usize as i64;
+        assert_ne!(
+            obj_or_memory, raw_obj_or_memory,
+            "must not publish the raw Result item"
+        );
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
