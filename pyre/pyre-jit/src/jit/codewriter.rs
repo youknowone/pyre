@@ -3161,18 +3161,21 @@ fn catch_label_for_dispatch_pc(
 }
 
 /// `PyFrame.handle_operation_error` unrolls `lookup_exceptiontable` as a
-/// switch on the head's `next_instr` green. `tr_armed` stays the canraise
-/// block; `dispatch_x` is a Value switch (not canraise).
+/// switch on `last_instr` read from the frame after the hook raised.
+/// `tr_armed` stays the canraise block; `dispatch_x` is a Value switch
+/// (not canraise). Each case links into the shared unwind landing;
+/// the default raises out (`graph.exceptblock`).
 ///
 /// `PyFrame.handle_bytecode` wraps `dispatch_bytecode` in try/except
-/// `OperationError`. `dispatch_bytecode` stores `last_instr` before
-/// `bytecode_only_trace`, so a raising trace hook is looked up against
-/// the current instruction.
+/// `OperationError`. A trace callback may have written `last_instr`
+/// (`fset_f_lineno`); the switch therefore reads the frame rather than
+/// the green captured before the hook.
 fn emit_trace_arm_exception_dispatch(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
     tr_armed: &SpamBlockRef,
     armed_state: &FrameState,
+    frame_var: super::flow::Variable,
     catch_for_pc: &[Option<u16>],
     catch_sites: &[ExceptionCatchSite],
     unwind_memo: &mut Vec<SharedUnwindEntry>,
@@ -3186,15 +3189,11 @@ fn emit_trace_arm_exception_dispatch(
         return;
     }
     let seeded = exception_landing_state(graph, armed_state);
-    // Seeded state must already carry the switch green and the
-    // guessexception pair (`flowcontext.py guessexception`). Check both
-    // before creating `dispatch_x`: an early return after
+    // Seeded state must already carry the guessexception pair
+    // (`flowcontext.py guessexception`). Check before creating
+    // `dispatch_x`: an early return after
     // `attach_materialized_exception_edge` would leave that block with
     // no exits.
-    let Some(super::flow::FlowValue::Variable(switch_next)) = seeded.dispatch_next_instr.clone()
-    else {
-        return;
-    };
     if seeded.last_exception.is_none() {
         return;
     }
@@ -3226,11 +3225,27 @@ fn emit_trace_arm_exception_dispatch(
             return;
         }
     };
+    // `handle_operation_error`: `lookup_exceptiontable(self.last_instr)`
+    // reads the frame after the hook raised, so a trace callback that
+    // wrote `last_instr` (`fset_f_lineno`) selects the handler.
+    let last_instr = emit_vable_getfield_int(
+        graph,
+        &dispatch_x.block(),
+        frame_var,
+        VABLE_LAST_INSTR_FIELD_IDX,
+        offset,
+    );
     dispatch_x.block().borrow_mut().exitswitch =
-        Some(super::flow::ExitSwitch::Value(switch_next.into()));
+        Some(super::flow::ExitSwitch::Value(last_instr.into()));
 
+    let mut keyed: Vec<usize> = Vec::new();
     for py_pc in 0..code.instructions.len() {
         if !is_python_instruction_start(code, py_pc) {
+            continue;
+        }
+        // `last_instr` holds the opcode pc after EXTENDED_ARG.
+        let key_pc = dispatch_last_instr_pc(code, py_pc);
+        if keyed.contains(&key_pc) {
             continue;
         }
         let Some(catch_label) = catch_label_for_dispatch_pc(code, catch_for_pc, py_pc) else {
@@ -3243,38 +3258,8 @@ fn emit_trace_arm_exception_dispatch(
         else {
             continue;
         };
-        let (b_p, b_p_state) =
-            copy_spam_block_at_pc(code, graph, &x_state, py_pc, all_walker_blocks);
-        // `copy` keeps X's last-exception pair. Check before emitting
-        // switch cases: a `continue` after `append_exit` would leave
-        // `B_P` as a switch target with no raise/catch.
-        let Some(evalue) = b_p_state
-            .last_exception
-            .as_ref()
-            .map(|(_, value)| value.clone())
-        else {
-            continue;
-        };
-        arm_blocks.push(b_p.block());
-        trace_arm_blocks.push(b_p.block());
-        let args = x_state.getoutputargs(&b_p_state);
-        let emit_case = |key_pc: usize| {
-            let case_key: super::flow::FlowValue =
-                super::flow::Constant::signed(key_pc as i64).into();
-            append_exit(
-                &dispatch_x.block(),
-                super::flow::Link::new(args.clone(), Some(b_p.block()), Some(case_key.clone()))
-                    .with_llexitcase(case_key)
-                    .into_ref(),
-            );
-        };
-        emit_case(py_pc);
-        let skipped = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py_pc);
-        if skipped != py_pc && !is_python_instruction_start(code, skipped) {
-            emit_case(skipped);
-        }
-        record_graph_op(&b_p.block(), "raise", vec![evalue.into()], None, offset);
-        let mut catch_source = b_p_state.clone();
+        keyed.push(key_pc);
+        let mut catch_source = x_state.clone();
         // Handler entry is reached by `goto`, not through the `next_instr`
         // switch, so the catch edge carries no `next_instr` green
         // (opcode-case catch edges carry none either, and
@@ -3285,16 +3270,35 @@ fn emit_trace_arm_exception_dispatch(
             .copied()
             .unwrap_or(site.stack_depth);
         sync_stack_state(graph, &mut catch_source, depth_p);
-        attach_catch_exception_edge(
-            code,
+        // `handle_operation_error` unwinds to the handler's depth, pushes
+        // the exception and continues at the handler: a plain link into
+        // the shared unwind landing, carrying X's exception pair.
+        let edge_state = handler_entry_state_from_catch_site(code, graph, &catch_source, &site);
+        let raising_depth = (catch_source.stack.len() as u16).max(depth_p);
+        let (landing, lasti_int) = lookup_or_create_shared_unwind(
             graph,
-            &b_p.block(),
-            &site.landing,
-            &catch_source,
-            &site,
             unwind_memo,
-            depth_at_pc,
+            &site,
+            &edge_state,
+            &site.landing,
+            raising_depth,
         );
+        update_catch_landing_state(graph, &landing, &edge_state);
+        let Some(target_state) = landing.framestate() else {
+            continue;
+        };
+        let mut args = edge_state.getoutputargs(&target_state);
+        if lasti_int.is_some() {
+            args.push(super::flow::Constant::signed(site.lasti_py_pc as i64).into());
+        }
+        let case_key: super::flow::FlowValue = super::flow::Constant::signed(key_pc as i64).into();
+        let link = super::flow::Link::new(args, Some(landing.block()), Some(case_key.clone()))
+            .with_llexitcase(case_key)
+            .into_ref();
+        append_exit(&dispatch_x.block(), link.clone());
+        // `update_catch_landing_state` rewrites the args of every
+        // registered incoming link when a later edge widens the landing.
+        landing.add_incoming_exception_link(link);
     }
 
     if dispatch_x.block().borrow().exits.is_empty() {
@@ -3467,12 +3471,14 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     // `handle_bytecode` / `handle_operation_error`: a raising
     // `bytecode_only_trace` looks up `lookup_exceptiontable(self.last_instr)`.
     // Do not key the catch off this reload block's `py_pc` (the head
-    // passes 0). The exception successor switches on `next_instr`.
+    // passes 0). The exception successor switches on `last_instr` from
+    // the frame.
     emit_trace_arm_exception_dispatch(
         code,
         graph,
         &tr_armed,
         &armed_state,
+        frame_var,
         catch_for_pc,
         catch_sites,
         unwind_memo,
@@ -22950,6 +22956,27 @@ def f(x):
                 .count()
                 >= 2,
             "head already switches on next_instr; exception dispatch adds a second switch"
+        );
+        let switch_indices: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opname.starts_with("switch"))
+            .map(|(index, _)| index)
+            .collect();
+        let second_switch = switch_indices[1];
+        // Flatten emits `-live-` immediately before the switch; skip it
+        // so the assertion names the `last_instr` getfield.
+        let pred = ops[..second_switch]
+            .iter()
+            .rev()
+            .find(|op| op.opname != "live")
+            .map(|op| op.opname);
+        assert_eq!(
+            pred,
+            Some("getfield_vable_i"),
+            "exception dispatch must switch on last_instr from the frame, got {:?}",
+            ops.get(second_switch.saturating_sub(3)..second_switch)
+                .map(|window| window.iter().map(|op| op.opname).collect::<Vec<_>>()),
         );
     }
 
