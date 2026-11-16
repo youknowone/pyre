@@ -389,10 +389,8 @@ impl SomePtr {
         match example.getattr(attr) {
             Ok(v) => {
                 if v != lltype::LowLevelValue::Void {
-                    let v_lltype = annotation_to_lltype(s_value, None)?;
-                    example
-                        .setattr(attr, v_lltype._defl())
-                        .map_err(AnnotatorError::new)?;
+                    let stored = llvalue_for_ptr_field_store(&v, s_value)?;
+                    example.setattr(attr, stored).map_err(AnnotatorError::new)?;
                 }
                 Ok(SomeValue::Impossible)
             }
@@ -480,6 +478,67 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
         true,
         std::collections::BTreeMap::new(),
     )))
+}
+
+/// Store counterpart of [`highlevel_of_ptr_field_annotation`] /
+/// [`gc_class_root_ptr_as_instance`].
+///
+/// `InstanceRepr.lowleveltype` is `Ptr(self.object_type)` (`rclass.py`
+/// `InstanceRepr`). `externalvsinternal` (`rmodel.py`, `gcref=False`)
+/// keeps that object pointer as the internal repr. The store is
+/// `annlowlevel.cast_instance_to_base_ptr`: a `SomeInstance` whose
+/// classdef is the field's class root, or a subclass of it
+/// (`ClassDef.commonbase(value, field) == field`, `rclass.py`
+/// `InstanceRepr.convert_const`), writes that `Ptr(GcStruct)`.
+/// `rordereddict.py` `DICTENTRY` holds `value_repr.lowleveltype` in
+/// the value field. Any other instance still has no low-level type
+/// (`annotation_to_lltype`).
+fn class_root_ptr_from_instance(
+    field_example: &lltype::LowLevelValue,
+    s_value: &SomeValue,
+) -> Option<lltype::LowLevelValue> {
+    use crate::annotator::classdesc::ClassDef;
+
+    let SomeValue::Instance(inst) = s_value else {
+        return None;
+    };
+    let value_cd = inst.classdef.as_ref()?;
+    let field_ty = lltype::typeOf_value(field_example);
+    let lltype::LowLevelType::Ptr(p) = &field_ty else {
+        return None;
+    };
+    let lltype::PtrTarget::Struct(st) = &p.TO else {
+        return None;
+    };
+    if st._gckind != lltype::GcKind::Gc {
+        return None;
+    }
+    let name = st._name.clone();
+    let bk = bookkeeper::getbookkeeper()?;
+    let registered = bk
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .is_some_and(|reg| reg.fields.contains_key(name.as_str()));
+    if !registered {
+        return None;
+    }
+    let field_cd = bk.getuniqueclassdef_for_struct_root(&name).ok()?;
+    let common = ClassDef::commonbase(value_cd, &field_cd)?;
+    if !std::rc::Rc::ptr_eq(&common, &field_cd) {
+        return None;
+    }
+    Some(field_ty._defl())
+}
+
+fn llvalue_for_ptr_field_store(
+    field_example: &lltype::LowLevelValue,
+    s_value: &SomeValue,
+) -> Result<lltype::LowLevelValue, AnnotatorError> {
+    if let Some(stored) = class_root_ptr_from_instance(field_example, s_value) {
+        return Ok(stored);
+    }
+    Ok(annotation_to_lltype(s_value, None)?._defl())
 }
 
 /// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
@@ -754,11 +813,10 @@ impl SomeInteriorPtr {
             );
         };
         let mut example = self.ll_ptrtype._example();
-        if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
-            let v_lltype = annotation_to_lltype(s_value, None)?;
-            example
-                .setattr(attr, v_lltype._defl())
-                .map_err(AnnotatorError::new)?;
+        let field = example.getattr(attr).map_err(AnnotatorError::new)?;
+        if field != lltype::LowLevelValue::Void {
+            let stored = llvalue_for_ptr_field_store(&field, s_value)?;
+            example.setattr(attr, stored).map_err(AnnotatorError::new)?;
         }
         Ok(SomeValue::Impossible)
     }
@@ -1720,6 +1778,135 @@ mod tests {
         assert!(
             !matches!(value, SomeValue::String(_)),
             "interior OBJECTPTR value must not read as SomeString, got {value:?}"
+        );
+    }
+
+    /// `Entry<i64, *mut class-root>` value reads as that class's nullable
+    /// instance. Storing that class (or a subclass) succeeds;
+    /// `annlowlevel.cast_instance_to_base_ptr`. An unrelated class still
+    /// has no low-level type.
+    #[test]
+    fn gcarray_item_class_root_value_getattr_is_instance_setattr_accepts_it() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::classdesc::ClassDef;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use std::rc::Rc;
+
+        let root_name = "owner::GcClass";
+        let mut reg = crate::front::StructFieldRegistry::default();
+        let id = majit_ir::descr::StructId::from_canonical(root_name);
+        reg.class_identity.insert(
+            root_name.to_string(),
+            Some(crate::front::semantic::ClassIdentity {
+                id,
+                spelling: root_name.to_string(),
+            }),
+        );
+        reg.note_declared_gc_name(root_name);
+        reg.fields.insert(
+            root_name.to_string(),
+            vec![("w_class".to_string(), format!("*mut {root_name}"))],
+        );
+        reg.fields.insert(
+            "owner::Other".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "storage::Entry".to_string(),
+            vec![
+                ("key".to_string(), "i64".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), format!("*mut {root_name}")),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let reg = Rc::new(reg);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::clone(&reg));
+        let _pos = bk.at_position(None);
+
+        let item = format!("storage::Entry<i64,*mut {root_name}>");
+        let ptr_ty = crate::front::mir::gcarray_item_struct_ptr_lltype(reg.as_ref(), &item)
+            .expect("item pointer");
+        let LowLevelType::Ptr(built) = ptr_ty else {
+            panic!("item pointer is Ptr");
+        };
+        let entry = SomePtr::new(*built);
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+
+        let SomeValue::Instance(value) = entry.getattr(&attr("value")).unwrap() else {
+            panic!(
+                "class-root value must read as SomeInstance, got {:?}",
+                entry.getattr(&attr("value"))
+            );
+        };
+        assert!(value.can_be_none);
+        let root = bk
+            .getuniqueclassdef_for_struct_root(root_name)
+            .expect("class root");
+        assert!(
+            value
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
+        );
+
+        let same = SomeValue::Instance(SomeInstance::new(
+            Some(Rc::clone(&root)),
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        entry
+            .setattr(&attr("value"), &same)
+            .expect("store the class root");
+
+        let sub = ClassDef::new_standalone("owner::Sub", Some(&root));
+        let sub_value = SomeValue::Instance(SomeInstance::new(
+            Some(sub),
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        entry
+            .setattr(&attr("value"), &sub_value)
+            .expect("store a subclass");
+
+        let other = bk
+            .getuniqueclassdef_for_struct_root("owner::Other")
+            .expect("unrelated class");
+        let other_value = SomeValue::Instance(SomeInstance::new(
+            Some(other),
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        let err = entry.setattr(&attr("value"), &other_value).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("should return a low-level type"),
+            "unrelated instance must still fail, got {err:?}"
+        );
+
+        let PtrTarget::Struct(st) = &entry.ll_ptrtype.TO else {
+            panic!("item pointer targets a Struct");
+        };
+        let interior = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(st.clone()))),
+            TO: Box::new(LowLevelType::Struct(Box::new(st.clone()))),
+            offsets: vec![],
+        });
+        interior
+            .setattr(&attr("value"), &same)
+            .expect("interior store of the class root");
+        let err = interior.setattr(&attr("value"), &other_value).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("should return a low-level type"),
+            "interior store of an unrelated instance must still fail, got {err:?}"
         );
     }
 }

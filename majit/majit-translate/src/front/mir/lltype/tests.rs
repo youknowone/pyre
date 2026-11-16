@@ -21536,6 +21536,103 @@ fn field_row_declared_gc_pointer_is_gcref() {
     assert_eq!(got, (*GCREF).clone());
 }
 
+/// `Entry<i64, *mut class-root>` (`rordereddict.py` `DICTENTRY`): the
+/// value field is `Ptr(GcStruct)` of that root. A declared-GC pointee
+/// with no class identity, a `GCREF` spelling, and a `GcArray` wrapper
+/// stay `*GCREF`.
+#[test]
+fn field_row_declared_gc_class_root_pointer_is_gcstruct_ptr() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget};
+
+    let root = "owner::GcClass";
+    let mut reg = crate::front::StructFieldRegistry::default();
+    note_class_identity(&mut reg, root);
+    reg.note_declared_gc_name(root);
+    reg.fields.insert(
+        root.to_string(),
+        vec![("w_class".to_string(), format!("*mut {root}"))],
+    );
+    reg.note_declared_gc_name("owner::GcPlain");
+    reg.fields.insert(
+        "storage::Entry".to_string(),
+        vec![
+            ("key".to_string(), "i64".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), format!("*mut {root}")),
+            ("plain".to_string(), "*mut owner::GcPlain".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+
+    let value = super::field_row_lltype(&reg, &format!("*mut {root}"), &mut field_row_visited())
+        .expect("class-root pointer field");
+    assert_gc_class_root_ptr(&value, root);
+
+    let plain = super::field_row_lltype(&reg, "*mut owner::GcPlain", &mut field_row_visited())
+        .expect("declared-GC pointer without a class identity");
+    assert_eq!(plain, (*GCREF).clone());
+
+    let gcref_name = "majit_gc::header::GCREFOpaque";
+    note_class_identity(&mut reg, gcref_name);
+    reg.note_declared_gc_name(gcref_name);
+    reg.fields.insert(
+        gcref_name.to_string(),
+        vec![("word".to_string(), "i64".to_string())],
+    );
+    let gcref = super::field_row_lltype(
+        &reg,
+        &format!("*mut {gcref_name}"),
+        &mut field_row_visited(),
+    )
+    .expect("GCREF spelling");
+    assert_eq!(gcref, (*GCREF).clone());
+
+    note_class_identity(&mut reg, "storage::Block");
+    reg.note_declared_gc_name("storage::Block");
+    reg.fields.insert(
+        "storage::Block".to_string(),
+        vec![
+            ("length".to_string(), "usize".to_string()),
+            ("items".to_string(), "[i64; 0]".to_string()),
+        ],
+    );
+    let block = super::field_row_lltype(&reg, "*mut storage::Block", &mut field_row_visited())
+        .expect("GcArray wrapper pointer");
+    assert_eq!(block, (*GCREF).clone());
+
+    let item = format!("storage::Entry<i64,*mut {root}>");
+    let ptr = super::gcarray_item_struct_ptr_lltype(&reg, &item).expect("item pointer");
+    let LowLevelType::Ptr(p) = &ptr else {
+        panic!("item pointer is Ptr, got {ptr:?}");
+    };
+    let PtrTarget::Struct(st) = &p.TO else {
+        panic!("item pointer targets a Struct, got {:?}", p.TO);
+    };
+    assert_eq!(st._name, item);
+    assert_eq!(st._gckind, GcKind::Raw, "ITEM stays a raw Struct");
+    assert_gc_class_root_ptr(&st.getattr_field_type("value").expect("value"), root);
+    assert_eq!(
+        st.getattr_field_type("plain"),
+        Some((*GCREF).clone()),
+        "declared-GC pointee without a class identity stays GCREF"
+    );
+}
+
+fn assert_gc_class_root_ptr(
+    got: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    root: &str,
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    let LowLevelType::Ptr(p) = got else {
+        panic!("class-root field must be Ptr, got {got:?}");
+    };
+    let PtrTarget::Struct(st) = &p.TO else {
+        panic!("class-root field must point at a Struct, got {:?}", p.TO);
+    };
+    assert_eq!(st._gckind, GcKind::Gc);
+    assert_eq!(st._name, root);
+}
+
 #[test]
 fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;

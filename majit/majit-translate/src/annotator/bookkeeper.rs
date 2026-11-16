@@ -4318,26 +4318,10 @@ impl Bookkeeper {
             return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
         }
         let registry = self.struct_fields.borrow().clone();
-        // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
-        // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
-        // `SomePtr(GCREF)` and raises (`llannotation.py`
-        // `pairtype(SomePtr, SomeObject).union`).
-        if is_gcref_type_spelling(root) {
-            return Err(AnnotatorError::new(format!(
-                "lltype.GcOpaqueType has no ClassDef: {root}"
-            )));
-        }
-        if struct_root_refuses_classdef_new(root, registry.as_deref()) {
-            return Err(AnnotatorError::new(format!(
-                "struct root {root} is not a ClassDef intern"
-            )));
-        }
-        // rlist.py ListRepr / listdef.py ListDef: a list is not a
-        // class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
-        if crate::front::semantic::is_list_family_spelling(root) {
-            return Err(AnnotatorError::new(format!(
-                "listdef.py ListDef has no ClassDef: {root}"
-            )));
+        // `is_identity_key_spelling` above redirects; it is not a refusal.
+        // The three refusals live in `struct_root_has_no_classdef`.
+        if let Some(why) = struct_root_has_no_classdef(root, registry.as_deref()) {
+            return Err(AnnotatorError::new(why.message(root)));
         }
 
         let determinism_trace = crate::determinism_trace_enabled();
@@ -4374,10 +4358,7 @@ impl Bookkeeper {
             if graph.contains(&n) {
                 continue;
             }
-            if struct_root_refuses_classdef_new(&n, registry.as_deref()) {
-                continue;
-            }
-            if crate::front::semantic::is_list_family_spelling(&n) {
+            if struct_root_has_no_classdef(&n, registry.as_deref()).is_some() {
                 continue;
             }
             // Register the node's identity ClassDef in `descs` (RPython's
@@ -8663,6 +8644,60 @@ fn struct_root_refuses_classdef_new(
         || struct_root_is_core_option_or_result_template(root, registry)
         || struct_root_is_gcarray_ptr_wrapper(root, registry)
         || registry.is_some_and(|reg| struct_root_is_gcarray_item(reg, root))
+}
+
+/// Which check of [`struct_root_has_no_classdef`] fired.
+///
+/// These are the refusals [`Bookkeeper::getuniqueclassdef_for_struct_root`]
+/// applies before interning, in that order. `is_identity_key_spelling`
+/// redirects to `pyobject::PyObject` and is not an arm.
+pub(crate) enum StructRootNoClassdef {
+    /// `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
+    /// `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
+    /// `SomePtr(GCREF)` and raises (`llannotation.py`
+    /// `pairtype(SomePtr, SomeObject).union`).
+    GcOpaque,
+    /// [`struct_root_refuses_classdef_new`], including
+    /// [`struct_root_is_core_option_or_result_template`].
+    NotIntern,
+    /// rlist.py `ListRepr` / listdef.py `ListDef`: a list is not a
+    /// class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
+    ListDef,
+}
+
+impl StructRootNoClassdef {
+    fn message(self, root: &str) -> String {
+        match self {
+            Self::GcOpaque => format!("lltype.GcOpaqueType has no ClassDef: {root}"),
+            Self::NotIntern => format!("struct root {root} is not a ClassDef intern"),
+            Self::ListDef => format!("listdef.py ListDef has no ClassDef: {root}"),
+        }
+    }
+}
+
+/// Registry-only pre-intern refusal of
+/// [`Bookkeeper::getuniqueclassdef_for_struct_root`].
+///
+/// One sequence: [`is_gcref_type_spelling`], then
+/// [`struct_root_refuses_classdef_new`], then
+/// [`crate::front::semantic::is_list_family_spelling`]. Option/Result
+/// templates are the [`struct_root_is_core_option_or_result_template`]
+/// arm of [`struct_root_refuses_classdef_new`] (`tyref_is_option` /
+/// `tyref_is_result`, intern key without `<…>`).
+pub(crate) fn struct_root_has_no_classdef(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> Option<StructRootNoClassdef> {
+    if is_gcref_type_spelling(root) {
+        return Some(StructRootNoClassdef::GcOpaque);
+    }
+    if struct_root_refuses_classdef_new(root, registry) {
+        return Some(StructRootNoClassdef::NotIntern);
+    }
+    if crate::front::semantic::is_list_family_spelling(root) {
+        return Some(StructRootNoClassdef::ListDef);
+    }
+    None
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
