@@ -3713,11 +3713,25 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         }
     }
 
-    // blackhole.py:1767-1769
+    // Bottommost entry: exception goes through. warmspot.py
+    // handle_jitexception reads ContinueRunningNormally from the
+    // exception lists, so covering CRN does not build a
+    // BlackholeTerminalImage. blackhole.py
+    // BlackholeInterpBuilder.release_interp still returns the interp.
     if bh.nextblackholeinterp.is_none() {
-        // Bottommost entry: exception goes through
         if let Some(terminal_out) = terminal_out {
-            BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            let skip_image = match &exc {
+                JitException::ContinueRunningNormally(args) => {
+                    bh.state_field_layout.has_no_scalar_identity()
+                        || bh.state_field_layout.crn_reds_are_identity(args)
+                }
+                _ => false,
+            };
+            if skip_image {
+                *terminal_out = None;
+            } else {
+                BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            }
         }
         builder.release_interp(bh);
         drop(exc_roots);
@@ -4192,6 +4206,41 @@ mod tests {
         assert_eq!(live_r, vec![1]);
         assert_eq!(layout.total_live_values(), live_i.len() + live_r.len());
         assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn crn_reds_are_identity_requires_the_layout_flag_and_matching_lengths() {
+        use crate::jitexc::ContinueRunningNormallyArgs;
+
+        // two int scalars + one plain `[int]` (ptr, len) → total_slots 4;
+        // one vable identity + three ref scalars → red_ref 4; one float.
+        let mut layout = StateFieldLayout::new(2, 1, 1, 1);
+        layout.num_ref_scalars = 3;
+        layout.num_float_scalars = 1;
+        let rows = [
+            (false, 4usize, 4usize, 1usize, false, false),
+            (true, 4, 4, 1, true, false),
+            (true, 3, 4, 1, false, true),
+            (true, 4, 3, 1, false, true),
+            (true, 4, 4, 0, false, true),
+        ];
+        for (flag, n_int, n_ref, n_float, want, skip_debug) in rows {
+            if skip_debug && cfg!(debug_assertions) {
+                continue;
+            }
+            layout.merge_point_reds_are_identity = flag;
+            let args = ContinueRunningNormallyArgs {
+                red_int: vec![0; n_int],
+                red_ref: vec![0; n_ref],
+                red_float: vec![0; n_float],
+                ..ContinueRunningNormallyArgs::default()
+            };
+            assert_eq!(
+                layout.crn_reds_are_identity(&args),
+                want,
+                "flag={flag} red_int={n_int} red_ref={n_ref} red_float={n_float}"
+            );
+        }
     }
 
     // ── state_field handler register-slot tests (#183) ──
@@ -8802,6 +8851,9 @@ pub struct StateFieldLayout {
     /// stream would encode the state scalar where the re-executed
     /// jit_merge_point op expects the green pc.
     pub int_scalar_base: usize,
+    /// The `jit_merge_point` reds are exactly the state-field identity
+    /// slots, in identity order: no named red precedes them in a bank.
+    pub merge_point_reds_are_identity: bool,
 }
 
 impl StateFieldLayout {
@@ -8820,6 +8872,7 @@ impl StateFieldLayout {
             num_float_scalars: 0,
             float_scalar_base: 0,
             int_scalar_base,
+            merge_point_reds_are_identity: false,
         }
     }
 
@@ -8842,6 +8895,7 @@ impl StateFieldLayout {
             num_float_scalars: 0,
             float_scalar_base: 0,
             int_scalar_base,
+            merge_point_reds_are_identity: false,
         }
     }
 
@@ -8856,6 +8910,44 @@ impl StateFieldLayout {
         self.num_float_scalars = num_float_scalars;
         self.float_scalar_base = float_scalar_base;
         self
+    }
+
+    /// A jitdriver with no scalar identity slots. The portal is this
+    /// shape: its reds are the virtualizable frame and `ec`, not
+    /// `#[jit_interp]` scalars, and `state_field_layout` stays the empty
+    /// default.
+    pub fn has_no_scalar_identity(&self) -> bool {
+        self.num_scalars == 0
+            && self.num_ref_scalars == 0
+            && self.num_float_scalars == 0
+            && self.num_vable_identity_slots == 0
+            && self.num_plain_int_arrays == 0
+    }
+
+    /// Whether `ContinueRunningNormally` red lists are the identity
+    /// slots in identity order (`warmspot.py handle_jitexception` reads
+    /// those lists). A true flag with a length mismatch is an encoder
+    /// bug: debug builds assert, release returns false.
+    pub fn crn_reds_are_identity(&self, args: &crate::jitexc::ContinueRunningNormallyArgs) -> bool {
+        if !self.merge_point_reds_are_identity {
+            return false;
+        }
+        let lengths_match = args.red_int.len() == self.total_slots()
+            && args.red_ref.len() == self.num_vable_identity_slots + self.num_ref_scalars
+            && args.red_float.len() == self.num_float_scalars;
+        debug_assert!(
+            lengths_match,
+            "merge_point_reds_are_identity is set but CRN red lengths \
+             differ from identity slots (red_int={} total_slots={} \
+             red_ref={} vable+ref={} red_float={} float={})",
+            args.red_int.len(),
+            self.total_slots(),
+            args.red_ref.len(),
+            self.num_vable_identity_slots + self.num_ref_scalars,
+            args.red_float.len(),
+            self.num_float_scalars,
+        );
+        lengths_match
     }
 
     /// Total int identity slots: the real scalar count plus two words
