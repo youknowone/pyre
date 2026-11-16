@@ -1195,6 +1195,61 @@ impl CodeWriter {
             let matcher = ed.fn_exception_match.borrow();
             crate::jtransform::constant_fold_ll_issubclass_flowgraph(flow_graph, matcher.as_ref());
         }
+        // `call.py guess_call_kind` reads `funcobj.graph.func.oopspec`.
+        // Stamp leftover `direct_call` CallPaths before
+        // `lower_graph_with_callees` so the Call keys the same
+        // `_name`-split path the leftover arm falls back to.
+        {
+            let oopspec_marks = {
+                let registry = self.dual_gate_registry(callcontrol);
+                let tp = registry.two_phase();
+                let mut marks = Vec::new();
+                for block in flow_graph.iterblocks() {
+                    for op in &block.borrow().operations {
+                        if op.opname != "direct_call" {
+                            continue;
+                        }
+                        let Some(callee) = op.args.first() else {
+                            continue;
+                        };
+                        let func =
+                            crate::codewriter::jtransform_opname::callee_func_from_funcptr(callee);
+                        let Some(callee_graph) = func.graph_ref() else {
+                            // No name table: a helper whose funcptr has no
+                            // `graph` cannot expose `graph.func.oopspec`.
+                            continue;
+                        };
+                        if tp
+                            .subject_paths
+                            .contains_key(&crate::flowspace::model::GraphKey::of(&callee_graph))
+                        {
+                            continue;
+                        }
+                        let callee_graph_b = callee_graph.borrow();
+                        let Some(spec) = callee_graph_b
+                            .func
+                            .as_ref()
+                            .and_then(|func| func.oopspec.clone())
+                        else {
+                            continue;
+                        };
+                        let path = crate::codewriter::jtransform_opname::callpath_from_func_name(
+                            &func._name,
+                        );
+                        let argnames =
+                            crate::codewriter::jtransform_opname::startblock_oopspec_argnames(
+                                &callee_graph_b,
+                            );
+                        marks.push((path, spec, argnames));
+                    }
+                }
+                marks
+            };
+            for (path, spec, argnames) in oopspec_marks {
+                callcontrol.mark_oopspec(path.clone(), spec);
+                callcontrol.mark_oopspec_argnames(path, argnames);
+            }
+        }
         let lowered = {
             let registry = self.dual_gate_registry(callcontrol);
             let tp = registry.two_phase();
@@ -1990,9 +2045,12 @@ mod opname_spine_prejit_tests {
     use crate::model::OpKind;
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, LowLevelType, Ptr, PtrTarget, functionptr,
+        FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
     };
     use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+    use crate::translator::rtyper::rlist::{
+        build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
+    };
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
     use crate::translator::translator::TranslationContext;
 
@@ -2188,6 +2246,54 @@ mod opname_spine_prejit_tests {
             "typeptr getfield feeding indirect_call must survive; ops={:?}",
             graph_opnames(&graph)
         );
+    }
+
+    /// Spine B `direct_call` of `ll_fixed_length` is `arraylen_gc`, not a
+    /// leftover `residual_call` (`do_fixed_list_len`, `jtransform.py`).
+    #[test]
+    fn opname_spine_direct_call_to_fixed_list_length_helper_is_arraylen() {
+        let helper = build_ll_fixed_length_helper_graph(
+            "ll_fixed_length",
+            items_array_ptr_lltype(&LowLevelType::Signed),
+        )
+        .expect("build_ll_fixed_length_helper_graph");
+        let ft = FuncType {
+            args: vec![items_array_ptr_lltype(&LowLevelType::Signed)],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr_for_graph_with_type(&helper.graph, ft);
+        let l = variable_with_lltype("l", items_array_ptr_lltype(&LowLevelType::Signed));
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(l.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_fixed_len",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![c_fn, Hlvalue::Variable(l)],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let path = CallPath::from_segments(["caller_fixed_len"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("arraylen"),
+            "assembled jitcode must contain arraylen; dump:\n{dump}"
+        );
+        assert!(
+            !dump.contains("residual_call"),
+            "assembled jitcode must not contain residual_call; dump:\n{dump}"
+        );
+        let _keep_helper = helper;
     }
 
     #[test]

@@ -335,7 +335,7 @@ pub fn lower_graph_with_callees(
 /// Same source as `effect_graph_from_rtyped_helper`'s `OpKind::Input { name }`
 /// (`Variable::name_prefix` when renamed); strip the intern trailing `_`
 /// so the names match harvested `#[oopspec]` argnames (no numbering suffix).
-fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
+pub(crate) fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
     graph
         .startblock
         .borrow()
@@ -1051,10 +1051,7 @@ fn transduce_op(
             // `_func._name`.
             let target = match func.graph_ref().and_then(|g| callee_path(&g)) {
                 Some(path) => CallTarget::from_call_path(&path),
-                None => {
-                    let callee = callee_name_from_funcptr(&op.args[0]);
-                    CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()))
-                }
+                None => CallTarget::from_call_path(&callpath_from_func_name(&func._name)),
             };
             // `ll_get_raw_address_of_string` is a FunctionPath Call. This
             // transducer has no CallControl; `rewrite_op_direct_call`
@@ -1824,6 +1821,14 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
     }
 }
 
+/// `_func._name` split used when `graphs_from` has no subject path
+/// (`call.py` falls back to the funcobj name). Shared with the opname
+/// spine's oopspec walk so `mark_oopspec` keys the same CallPath the
+/// leftover `direct_call` Call will guess.
+pub(crate) fn callpath_from_func_name(name: &str) -> CallPath {
+    CallPath::from_segments(name.split("::").filter(|s| !s.is_empty()))
+}
+
 /// Decode a `direct_call` callee operand — the leading funcptr constant.
 /// `ConstValue::LLPtr` wraps an `_ptr` whose underlying object is an
 /// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
@@ -1835,7 +1840,7 @@ fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
 /// Same decode as [`callee_name_from_funcptr`], returning the `_func`
 /// so Spine B can resolve by `graph_ref()` (`call.py graphs_from`
 /// `funcobj.graph`).
-fn callee_func_from_funcptr(
+pub(crate) fn callee_func_from_funcptr(
     hlv: &Hlvalue,
 ) -> crate::translator::rtyper::lltypesystem::lltype::_func {
     let Hlvalue::Constant(c) = hlv else {

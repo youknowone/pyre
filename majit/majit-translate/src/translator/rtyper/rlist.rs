@@ -1227,10 +1227,12 @@ pub(crate) fn build_ll_fixed_length_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `ll_fixed_length.oopspec = 'list.len(l)'` (`lltypesystem/rlist.py`).
+    func.oopspec = Some("list.len(l)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -1923,10 +1925,13 @@ pub(crate) fn build_ll_fixed_getitem_fast_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `ll_fixed_getitem_fast.oopspec = 'list.getitem(l, index)'`
+    // (`lltypesystem/rlist.py`).
+    func.oopspec = Some("list.getitem(l, index)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -1984,10 +1989,13 @@ pub(crate) fn build_ll_fixed_getitem_fast_foldable_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `ll_getitem_foldable_nonneg.oopspec = 'list.getitem_foldable(l, index)'`
+    // (`rlist.py`).
+    func.oopspec = Some("list.getitem_foldable(l, index)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -2047,10 +2055,13 @@ pub(crate) fn build_ll_fixed_setitem_fast_helper_graph(
         Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `ll_fixed_setitem_fast.oopspec = 'list.setitem(l, index, item)'`
+    // (`lltypesystem/rlist.py`).
+    func.oopspec = Some("list.setitem(l, index, item)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -12878,6 +12889,48 @@ mod tests {
             block_op_sequences(&nonfoldable),
             vec![vec!["getarrayitem".to_string()], vec![]],
             "non-foldable helper body must be the plain element load"
+        );
+    }
+
+    /// `ll_fixed_length.oopspec = 'list.len(l)'` (`lltypesystem/rlist.py`).
+    #[test]
+    fn fixed_list_length_helper_carries_list_len_oopspec() {
+        let helper = build_ll_fixed_length_helper_graph(
+            "ll_fixed_length",
+            items_array_ptr_lltype(&LowLevelType::Signed),
+        )
+        .expect("build_ll_fixed_length_helper_graph");
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("list.len(l)"),
+            "builder stamps `ll_fixed_length.oopspec` (`lltypesystem/rlist.py`)"
+        );
+        assert_eq!(
+            helper
+                .graph
+                .borrow()
+                .func
+                .as_ref()
+                .and_then(|func| func.oopspec.as_deref()),
+            Some("list.len(l)"),
+            "graph.func.oopspec is the same stamp `guess_call_kind` reads"
+        );
+    }
+
+    /// `ll_getitem_foldable_nonneg.oopspec = 'list.getitem_foldable(l, index)'`
+    /// (`rlist.py`).
+    #[test]
+    fn fixed_list_foldable_getitem_helper_carries_getitem_foldable_oopspec() {
+        let helper = build_ll_fixed_getitem_fast_foldable_helper_graph(
+            "ll_fixed_getitem_fast_foldable",
+            items_array_ptr_lltype(&LowLevelType::Signed),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_fixed_getitem_fast_foldable_helper_graph");
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("list.getitem_foldable(l, index)"),
+            "builder stamps `ll_getitem_foldable_nonneg.oopspec` (`rlist.py`)"
         );
     }
 
