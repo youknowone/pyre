@@ -500,16 +500,24 @@ impl Const {
 
     /// Payload word at offset 8. `history.py` `ConstInt.getint` /
     /// `ConstPtr.getref_base` / `ConstFloat.getfloatstorage` are typed
-    /// field loads of `self.value`; every `Const` arm stores that word
-    /// here. TAGCONST decode uses this after a `debug_assert!` on the
+    /// field loads of `self.value`; on 64-bit targets every `Const` arm
+    /// stores that word here, and other targets take the typed load.
+    /// TAGCONST decode uses this after a `debug_assert!` on the
     /// bank's variant (`resume.py` numbering).
     #[inline(always)]
     pub fn payload_word(&self) -> i64 {
-        debug_assert_eq!(std::mem::size_of::<Const>(), 16);
-        // SAFETY: `#[repr(u64)]` stores the discriminant as a u64 then the
-        // 8-byte payload in every arm, so offset 8 is the field load
-        // `as_raw_i64` performs on every arm.
-        unsafe { *(self as *const Const as *const i64).add(1) }
+        #[cfg(target_pointer_width = "64")]
+        {
+            debug_assert_eq!(std::mem::size_of::<Const>(), 16);
+            // SAFETY: `#[repr(u64)]` stores the discriminant as a u64 then an
+            // 8-byte payload in every arm on a 64-bit target (`GcRef` is a
+            // `usize`), so offset 8 is the field load `as_raw_i64` performs.
+            unsafe { *(self as *const Const as *const i64).add(1) }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            self.as_raw_i64()
+        }
     }
 
     /// history.py ConstInt.getint — unsigned/signed integer value.
