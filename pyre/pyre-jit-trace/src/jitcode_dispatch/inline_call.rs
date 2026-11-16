@@ -2005,15 +2005,17 @@ fn helper_walk_reachable_inline_call_descrs(
 /// the walker still enters it (`run_inline_call_subwalk`). An unpublished
 /// blocker behind a published wrapper is therefore reached by the walk
 /// after a may-force callback has already run.
+/// A JitCode is revisited when it is re-entered at a different pc, because a
+/// scan from a resume pc does not cover the body before it.
 pub(crate) fn helper_walk_reaches_unpublished_blocker(
     jitcode_index: usize,
     pc: usize,
-    seen: &mut Vec<usize>,
+    seen: &mut Vec<(usize, usize)>,
 ) -> bool {
-    if seen.contains(&jitcode_index) {
+    if seen.contains(&(jitcode_index, pc)) {
         return false;
     }
-    seen.push(jitcode_index);
+    seen.push((jitcode_index, pc));
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return true;
     };
