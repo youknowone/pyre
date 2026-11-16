@@ -16,12 +16,8 @@ const OPTION_PATH: &str = "core::option::Option";
 const NONNULL_PATH: &str = "core::ptr::non_null::NonNull";
 const PYERROR_PATH: &str = "pyre_interpreter::error::PyError";
 
-const ALLOWED_CRATES: &[&str] = &[
-    "pyre_object",
-    "pyre_interpreter",
-    "majit_rlib",
-    "pyre_module",
-];
+// pyre-jit-trace has no runtime dependency on pyre-module, so its graphs are not adapted here.
+const ALLOWED_CRATES: &[&str] = &["pyre_object", "pyre_interpreter", "majit_rlib"];
 
 /// First-failing skip reasons, in check order.
 const SKIP_REASONS: &[&str] = &[
@@ -219,7 +215,6 @@ struct SelectedAdapter<'a> {
     rust_path: String,
     arg_abi: &'a str,
     result_abi: char,
-    pyre_module: bool,
 }
 
 fn select_target<'a>(
@@ -273,7 +268,6 @@ fn select_target<'a>(
         rust_path,
         arg_abi,
         result_abi,
-        pyre_module: head == "pyre_module",
     })
 }
 
@@ -294,9 +288,6 @@ fn ret_shape_ok(decl: &SymbolicTargetDecl, exception_transformed: bool, result_a
 }
 
 fn emit_adapter(out: &mut String, adapter: &SelectedAdapter<'_>) {
-    if adapter.pyre_module {
-        out.push_str("#[cfg(feature = \"pyre-module\")]\n");
-    }
     out.push_str("#[allow(unused_unsafe, clippy::all)]\n");
     out.push_str("pub extern \"C\" fn __gen_fnaddr_adapter_");
     let _ = write!(out, "{}", adapter.index);
@@ -340,9 +331,6 @@ fn emit_table(out: &mut String, selected: &[SelectedAdapter<'_>]) {
     out.push_str("pub fn generated_fnaddr_adapters() -> Vec<(&'static str, i64)> {\n");
     out.push_str("    let mut rows = Vec::new();\n");
     for adapter in selected {
-        if adapter.pyre_module {
-            out.push_str("    #[cfg(feature = \"pyre-module\")]\n");
-        }
         out.push_str("    rows.push((\"");
         out.push_str(adapter.path);
         out.push_str("\", __gen_fnaddr_adapter_");
