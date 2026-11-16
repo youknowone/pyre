@@ -9997,8 +9997,9 @@ pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
     entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
 }
 
-/// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
-/// serves every monomorphization; the bare `Entry` class would union `key`.
+/// `<K,V>` suffix for `rordereddict_entries::Entry`. The suffix keeps `()`
+/// (a set's `DICTVALUE`) because `get_ll_dict` keys the entry on both key
+/// and value types, matching the registered `Entry<ObjectKey,()>` row.
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10008,12 +10009,13 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     if !entry_family_is_entry_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    enum_instantiation_suffix_from_args(&type_args)
 }
 
-/// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The entries array
-/// header is `DICTENTRYARRAY` of `get_ll_dict`, one per `(DICTKEY, DICTVALUE)`;
-/// the bare class would share one ARRAY across key types.
+/// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The suffix keeps
+/// `()` (a set's `DICTVALUE`) because `get_ll_dict` keys the entry on both
+/// key and value types, matching the registered `Entry<ObjectKey,()>` row.
 pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10023,7 +10025,8 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    enum_instantiation_suffix_from_args(&type_args)
 }
 
 /// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
