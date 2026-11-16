@@ -3181,7 +3181,7 @@ impl AssemblerEncode for Assembler {
                     callcontrol,
                     array_type_id,
                     array,
-                    &field.name,
+                    field,
                     &self.current_graph_name,
                 );
                 let descr_idx = self.emit_ready_descr(descr);
@@ -3243,7 +3243,7 @@ impl AssemblerEncode for Assembler {
                     callcontrol,
                     array_type_id,
                     array,
-                    &field.name,
+                    field,
                     &self.current_graph_name,
                 );
                 let descr_idx = self.emit_ready_descr(descr);
@@ -7449,9 +7449,10 @@ fn interiorfield_bh_descr(
     callcontrol: Option<&CallControl>,
     array_type_id: &Option<String>,
     array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
-    field_name: &str,
+    field: &crate::model::FieldDescriptor,
     graph_name: &Option<String>,
 ) -> crate::jitcode::BhDescr {
+    let field_name = field.name.as_str();
     let Some(cc) = callcontrol else {
         panic!(
             "interior field access requires a CallControl \
@@ -7466,7 +7467,18 @@ fn interiorfield_bh_descr(
         cc.descr_indices
             .interiorfield_index_dump(array_type_id, field_name)
     };
-    let Some(descr) = cc.interiorfielddescrof_with_array(idx, array_type_id, array, field_name)
+    // `get_interiorfield_descr` does `get_field_descr(REALARRAY.OF, name)`
+    // of the same STRUCT `fielddescrof` already keys on (`owner_id`).
+    let Some(descr) = cc
+        .interiorfielddescrof_keyed(
+            idx,
+            array_type_id,
+            array,
+            field_name,
+            field.owner_id,
+            field.owner_root.as_deref(),
+        )
+        .map(|(d, _)| d)
     else {
         panic!(
             "interiorfielddescrof returned no descr \

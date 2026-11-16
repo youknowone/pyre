@@ -2298,14 +2298,31 @@ pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
     jit_trace_fnaddr_tables().1.contains(&(addr as i64))
 }
 
+/// Rows a later crate generates from the translator's symbolic targets
+/// (`getfunctionptr(graph)` for a graph whose function had no published
+/// address). Installed once, before the first `jit_trace_fnaddrs` call.
+/// `OnceLock` mirrors `OPTIONAL_MODULE_HOOKS` (`importing.rs`).
+static GENERATED_FNADDR_ROWS: std::sync::OnceLock<fn() -> Vec<(&'static str, i64)>> =
+    std::sync::OnceLock::new();
+
 /// [`build_jit_trace_fnaddrs`], built once per process.  Every input is fixed
 /// before `main` runs: function addresses, the macro registry (linked, or
-/// filled from constructors on wasm32) and the optional-module hooks, which
-/// `pyre-module` installs from its own constructor.
+/// filled from constructors on wasm32), the optional-module hooks, which
+/// `pyre-module` installs from its own constructor, and the generated
+/// fnaddr rows, which `pyre-jit-trace` installs from its own constructor.
+static JIT_TRACE_FNADDR_TABLES: std::sync::OnceLock<(Vec<(&'static str, i64)>, Vec<i64>)> =
+    std::sync::OnceLock::new();
+
+pub fn set_generated_fnaddr_rows(rows: fn() -> Vec<(&'static str, i64)>) {
+    assert!(
+        JIT_TRACE_FNADDR_TABLES.get().is_none(),
+        "set_generated_fnaddr_rows: jit_trace_fnaddrs already built; a late install would leave every predicate blind to the rows",
+    );
+    let _ = GENERATED_FNADDR_ROWS.set(rows);
+}
+
 fn jit_trace_fnaddr_tables() -> &'static (Vec<(&'static str, i64)>, Vec<i64>) {
-    use std::sync::OnceLock;
-    static TABLES: OnceLock<(Vec<(&'static str, i64)>, Vec<i64>)> = OnceLock::new();
-    TABLES.get_or_init(build_jit_trace_fnaddrs)
+    JIT_TRACE_FNADDR_TABLES.get_or_init(build_jit_trace_fnaddrs)
 }
 
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
@@ -5275,6 +5292,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
 
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         (hooks.publish_fnaddrs)(&mut entries);
+    }
+    if let Some(rows) = GENERATED_FNADDR_ROWS.get() {
+        for (path, addr) in rows() {
+            if entries.iter().any(|(existing, _)| *existing == path) {
+                continue;
+            }
+            entries.push((path, addr));
+        }
     }
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /

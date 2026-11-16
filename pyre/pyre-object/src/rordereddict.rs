@@ -786,6 +786,31 @@ impl<K, V, S> RDict<K, V, S> {
         unsafe { (*self.entry_ptr().add(slot)).f_valid }
     }
 
+    /// `ll_dict_getitem`'s `d.entries[index].value`: one interior-field read
+    /// of the entries array.
+    #[inline]
+    pub fn value_at(&self, slot: usize) -> V
+    where
+        V: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).value }
+    }
+
+    /// `entries[i].f_hash`: one interior-field read of the entries array.
+    #[inline]
+    fn hash_at(&self, slot: usize) -> u64 {
+        unsafe { (*self.entry_ptr().add(slot)).f_hash }
+    }
+
+    /// `entries[i].key`: one interior-field read of the entries array.
+    #[inline]
+    fn key_at(&self, slot: usize) -> K
+    where
+        K: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).key }
+    }
+
     /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
     #[inline]
     fn entry_at(&self, slot: usize) -> &Entry<K, V> {
@@ -1110,8 +1135,7 @@ where
         if index >= VALID_OFFSET {
             let slot = (index - VALID_OFFSET) as usize;
             if slot < d.num_ever_used_items && d.entry_valid(slot) {
-                let e = d.entry_at(slot);
-                if e.f_hash == hash && key.equivalent(&e.key) {
+                if d.hash_at(slot) == hash && key.equivalent(&d.key_at(slot)) {
                     return slot as isize;
                 }
             }
@@ -1572,8 +1596,7 @@ where
             } else {
                 let slot = (index - VALID_OFFSET) as usize;
                 if slot < self.num_ever_used_items && self.entry_valid(slot) {
-                    let e = self.entry_at(slot);
-                    if e.f_hash == hash && key.equivalent(&e.key) {
+                    if self.hash_at(slot) == hash && key.equivalent(&self.key_at(slot)) {
                         return Ok(slot);
                     }
                 }
@@ -1617,7 +1640,7 @@ where
         let mut slot = 0usize;
         while slot < self.num_ever_used_items {
             if self.entry_valid(slot) {
-                let hash = self.entry_at(slot).f_hash;
+                let hash = self.hash_at(slot);
                 self.insert_clean(hash, slot as u32);
             }
             slot += 1;
@@ -1912,7 +1935,7 @@ where
         if !self.entry_valid(slot) {
             return None;
         }
-        let hash = self.entry_at(slot).f_hash;
+        let hash = self.hash_at(slot);
         Some(self.take_slot(hash, slot))
     }
 
@@ -1921,8 +1944,8 @@ where
         K: EntryDummy,
         V: EntryDummy,
     {
-        let key = self.entry_at(slot).key;
-        let value = self.entry_at(slot).value;
+        let key = self.key_at(slot);
+        let value = self.value_at(slot);
         ll_dict_del(self, hash, slot);
         (key, value)
     }
@@ -1965,7 +1988,7 @@ where
         if !self.entry_valid(slot) {
             return false;
         }
-        let hash = self.entry_at(slot).f_hash;
+        let hash = self.hash_at(slot);
         if last {
             if slot + 1 == self.num_ever_used_items {
                 return false;
@@ -1987,10 +2010,10 @@ where
             let mut rest = Vec::with_capacity(self.num_live_items);
             for i in 0..self.num_ever_used_items {
                 if self.entry_valid(i) {
-                    let e = self.entry_at(i);
-                    Self::pin_gcrefs_of(e.key);
-                    Self::pin_gcrefs_of(e.value);
-                    rest.push((e.key, e.value));
+                    let (k, v) = (self.key_at(i), self.value_at(i));
+                    Self::pin_gcrefs_of(k);
+                    Self::pin_gcrefs_of(v);
+                    rest.push((k, v));
                 }
             }
             // The old array is left to the collector, as `ll_dict_clear` does.

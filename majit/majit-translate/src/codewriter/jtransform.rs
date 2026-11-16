@@ -10648,21 +10648,33 @@ impl<'a> Transformer<'a> {
                 field,
                 self.callcontrol.as_deref(),
             );
-            if gc || offset.is_err() {
-                return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::Abort {
-                        kind: crate::model::UnknownKind::UnsupportedExpr {
-                            variant: crate::model::UnsupportedExprKind::RawAddr,
-                        },
-                    },
-                }]);
-            }
-            let offset = offset.expect("raw offset");
             let OpKind::FieldRead { base, .. } = &op.kind else {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
             };
-            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+            match offset {
+                // `jtransform.py` `rewrite_op_getsubstruct` of the first nested
+                // struct of a GcStruct is the parent itself
+                // (`GcStruct._first_struct`); the result stays a Ref.
+                // A raw owner at offset 0 still goes through
+                // `rewrite_raw_substruct_address` so the result stays
+                // Signed (`cast_ptr_to_int` / int-bank identity).
+                Ok(0) if gc => return RewriteResult::Identity(base.clone()),
+                Ok(offset) if !gc => {
+                    return self.rewrite_raw_substruct_address(op, base, offset, graph);
+                }
+                // A nonzero interior of a GC object has no Ref-bank form:
+                // `rewrite_op_getsubstruct` refuses `_gckind == 'gc'`.
+                _ => {
+                    return RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::Abort {
+                            kind: crate::model::UnknownKind::UnsupportedExpr {
+                                variant: crate::model::UnsupportedExprKind::RawAddr,
+                            },
+                        },
+                    }]);
+                }
+            }
         }
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)` for
         // any field of a `_gckind == 'raw'` STRUCT. A Pointer field
@@ -22266,6 +22278,169 @@ mod tests {
         assert_eq!(
             w_class_base, &frame,
             "w_class is read off the outer object; ops={ops:?}"
+        );
+    }
+
+    /// `taken_by_address` of a FLAG_STRUCT at offset 0 of a GC owner
+    /// (`ObjectKey` at `Entry`+0). `jtransform.py rewrite_op_getsubstruct`
+    /// of `GcStruct._first_struct` is the parent pointer; the result stays
+    /// a Ref. The wide-inline GC arm used to plant `Abort { RawAddr }`.
+    #[test]
+    fn rewrite_op_getfield_gc_wide_inline_borrow_offset_zero_is_identity() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "jtransform_entry::Entry";
+        let key = "jtransform_entry::ObjectKey";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let key_id = majit_ir::descr::StructId::from_canonical(key);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (key.to_string(), Some(key_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 3 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "key".into(),
+                        offset: 0,
+                        size: 2 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "value".into(),
+                        offset: 2 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            key_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "hash".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "obj".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::headerless(owner)]);
+
+        let mut graph = FunctionGraph::new("get_slot_key");
+        let entry = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "entry".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, entry.clone());
+        let key_ref = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: entry.clone(),
+                    field: FieldDescriptor::new("key", Some(owner.into()))
+                        .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        // Returned so `simplify.py transform_dead_op_vars` /
+        // `prune_dead_phis` keeps the read (`lloperation.py`
+        // `enum_ops_without_sideeffects` of `getfield`).
+        let hash_result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key_ref,
+                    field: FieldDescriptor::new("hash", Some(key.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(hash_result));
+
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::Abort { .. })),
+            "offset-0 GC wide-inline borrow is the parent pointer, not Abort; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "key"
+            )),
+            "taken_by_address key at offset 0 is identity, not a pointer load; ops={ops:?}"
+        );
+        let hash = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "hash"
+            )
+        });
+        let hash_base = match &hash.expect("hash getfield").kind {
+            OpKind::FieldRead { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            hash_base, &entry,
+            "hash is read off the outer object; ops={ops:?}"
         );
     }
 

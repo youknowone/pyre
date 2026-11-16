@@ -52,7 +52,12 @@ use crate::virtualizable::VirtualizableInfo;
 /// Returns `None` for non-field descrs (the sanity check is then
 /// skipped at the caller — same behavior as `cpu == None`).
 fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
-    let f = descr.as_field_descr()?;
+    descr_to_bh_field_descr_from_field(descr.as_field_descr()?)
+}
+
+fn descr_to_bh_field_descr_from_field(
+    f: &dyn majit_ir::descr::FieldDescr,
+) -> Option<majit_jitcode::jitcode::BhDescr> {
     Some(majit_jitcode::jitcode::BhDescr::Field {
         offset: f.offset(),
         field_size: f.field_size(),
@@ -63,7 +68,7 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         field_flag: bh_field_flag(f),
         is_field_signed: f.is_field_signed(),
         is_immutable: f.is_immutable(),
-        is_quasi_immutable: descr.is_quasi_immutable(),
+        is_quasi_immutable: f.is_quasi_immutable(),
         // A live `FieldDescr` reached `get_field_descr` already, so its index
         // is the parent's arbitrated answer, not an unresolved claim.
         index_in_parent: Some(f.index_in_parent()),
@@ -116,6 +121,31 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         interior_fields: Vec::new(),
         is_gc_managed: a.is_gc_managed(),
         load_is_acquire: a.load_is_acquire(),
+    })
+}
+
+fn descr_to_bh_interior_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
+    let ifd = descr.as_interior_field_descr()?;
+    let a = ifd.array_descr();
+    let f = ifd.field_descr();
+    Some(majit_jitcode::jitcode::BhDescr::InteriorField {
+        array: Box::new(majit_jitcode::jitcode::BhDescr::Array {
+            base_size: a.base_size(),
+            itemsize: a.item_size(),
+            len_offset: a.len_descr().map(|fd| fd.offset()),
+            type_id: a.cache_key(),
+            gc_type_id: a.type_id(),
+            item_type: a.item_type(),
+            is_array_of_pointers: a.is_array_of_pointers(),
+            is_array_of_structs: a.is_array_of_structs(),
+            is_item_signed: a.is_item_signed(),
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+            is_gc_managed: a.is_gc_managed(),
+            load_is_acquire: a.load_is_acquire(),
+        }),
+        field: Box::new(descr_to_bh_field_descr_from_field(f)?),
     })
 }
 
@@ -1680,6 +1710,48 @@ impl TraceCtx {
                 &bh_descr,
             ))),
             Type::Float => Some(Value::Float(crate::executor::do_getarrayitem_gc_f(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Void => None,
+        }
+    }
+
+    /// Array-side analogue of [`Self::array_sanity_load`] for
+    /// `GETINTERIORFIELD_GC_*`. `executor.execute` dispatches through
+    /// `bhimpl_getinteriorfield_gc_*` → `cpu.bh_getinteriorfield_gc_*`
+    /// (`llmodel.py bh_getinteriorfield_gc_i`). No `gc_owns` gate.
+    pub fn interior_sanity_load(
+        &self,
+        array_ptr: i64,
+        index: i64,
+        descr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let cpu_ptr = self.cpu?;
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let bh_descr = descr_to_bh_interior_field_descr(descr)?;
+        match kind {
+            Type::Int => Some(Value::Int(crate::executor::do_getinteriorfield_gc_i(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Ref => Some(Value::Ref(crate::executor::do_getinteriorfield_gc_r(
+                cpu,
+                (),
+                array_ptr,
+                index,
+                &bh_descr,
+            ))),
+            Type::Float => Some(Value::Float(crate::executor::do_getinteriorfield_gc_f(
                 cpu,
                 (),
                 array_ptr,
