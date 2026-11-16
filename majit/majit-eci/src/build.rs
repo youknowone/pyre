@@ -239,7 +239,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected, extra);
-    merge_cextern_variables(&mut collected);
+    merge_cextern_variables(&mut collected, extra);
     resolve_llexternal_use_ecis(&collected);
     write_copaque_sizes(&collected, extra);
 
@@ -405,8 +405,12 @@ fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationI
 
 /// `rffi.CExternVariable`: merge each declaration's getter/setter C into
 /// its named ECI (`eci.merge` of `separate_module_sources` and
-/// `post_include_bits`).
-fn merge_cextern_variables(collected: &mut CrateItems) {
+/// `post_include_bits`). Typedefs in `RFFI_TYPES` / `SIMPLE_TYPES` are
+/// measured the same way `generate_macro_wrapper` measures them, so a
+/// `libc::uid_t` site becomes the integer class `rffi_platform.SimpleType`
+/// recorded. `extra` is the `compile_crate_ecis` ECI the macro-wrapper
+/// path already merges into each SimpleType configure.
+fn merge_cextern_variables(collected: &mut CrateItems, extra: &ExternalCompilationInfo) {
     let items = std::mem::take(&mut collected.cextern_variables);
     let mut eci_idxs: Vec<usize> = Vec::new();
     for item in &items {
@@ -419,8 +423,21 @@ fn merge_cextern_variables(collected: &mut CrateItems) {
             &item.head.compilation_info,
         ));
     }
-    let measured_rffi: Vec<(String, crate::rffi_platform::IntType)> = Vec::new();
-    let measured_simple: Vec<((usize, String), crate::rffi_platform::IntType)> = Vec::new();
+    let mut sites: Vec<(Vec<&syn::Type>, &[String], usize)> = Vec::new();
+    for (item, eci_idx) in items.iter().zip(&eci_idxs) {
+        sites.push((vec![&item.head.ty], item.module_path.as_slice(), *eci_idx));
+    }
+    let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(
+        collected,
+        sites
+            .iter()
+            .map(|(types, module_path, eci_idx)| (types.as_slice(), *module_path, *eci_idx)),
+    );
+    let (measured_rffi, measured_simple) = if rffi_names.is_empty() && simple_groups.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        measure_collected_inttypes(collected, extra, rffi_names, simple_groups)
+    };
     for (item, eci_idx) in items.iter().zip(&eci_idxs) {
         let eci_idx = *eci_idx;
         let resolve =
@@ -596,17 +613,17 @@ fn cextern_c_type(
 enum CexternDefaultCTypeError {
     /// `TYPE == INT or TYPE == LONG`.
     AmbiguousInt,
-    /// `PrimitiveType[TYPE]` KeyError: pointer, struct, array, function, or
-    /// unmeasured typedef (`pid_t`).
+    /// `PrimitiveType[TYPE]` KeyError: pointer other than `CCHARP`/`CCHARPP`,
+    /// struct, array, function, `CONST_CCHARP` (`const char *@`), or a
+    /// typedef in neither `RFFI_TYPES` nor `SIMPLE_TYPES`.
     NoPrimitive,
 }
 
 /// Default `c_type` from a `gettype` template: integer identity, then the
 /// non-integer primitive spellings `int_template` / `rffi_type_template` /
-/// `last_segment_c_type` can emit (`Char` / `Float` / `SingleFloat` / `Void`).
-/// `UniChar` / `Bool` have no scalar spelling there. Unknown typedefs are not
-/// measured (`measured_rffi` / `measured_simple` stay empty in
-/// `merge_cextern_variables`).
+/// `last_segment_c_type` can emit (`Char` / `Float` / `SingleFloat` / `Void`),
+/// then `CCHARP`/`CCHARPP` structure (`char *@` / `char **@`). `UniChar` /
+/// `Bool` have no scalar spelling there. `CONST_CCHARP` stays `NoPrimitive`.
 fn cextern_default_c_type(
     template: &str,
     model: &CIntDataModel,
@@ -618,6 +635,8 @@ fn cextern_default_c_type(
             Ok(crate::cdecl::cdecl(template, ""))
         }
     } else if matches!(template, "char @" | "float @" | "double @" | "void @") {
+        Ok(crate::cdecl::cdecl(template, ""))
+    } else if matches!(template, "char *@" | "char **@") {
         Ok(crate::cdecl::cdecl(template, ""))
     } else {
         Err(CexternDefaultCTypeError::NoPrimitive)
@@ -1033,18 +1052,38 @@ fn measure_macro_wrapper_inttypes(
     Vec<(String, crate::rffi_platform::IntType)>,
     Vec<((usize, String), crate::rffi_platform::IntType)>,
 ) {
-    let mut rffi_names = Vec::new();
-    let mut simple_groups: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut sites: Vec<(Vec<&syn::Type>, &[String], usize)> = Vec::new();
     for (item, eci_idx) in llexternals.iter().zip(eci_idxs) {
         if item.head.macro_.is_none() {
             continue;
         }
         let eci_idx = eci_idx.expect("macro llexternal eci_idx");
+        let mut types: Vec<&syn::Type> = item.head.args.iter().collect();
+        types.push(&item.head.result);
+        sites.push((types, item.module_path.as_slice(), eci_idx));
+    }
+    measure_inttypes_for_type_sites(
+        collected,
+        extra,
+        sites
+            .iter()
+            .map(|(types, module_path, eci_idx)| (types.as_slice(), *module_path, *eci_idx)),
+    )
+}
+
+/// Split `libc` names at each type site into `RFFI_TYPES` and per-ECI
+/// `SIMPLE_TYPES` groups. Empty groups mean no `rffi_platform.configure`.
+fn collect_inttype_groups_for_sites<'a>(
+    collected: &CrateItems,
+    sites: impl IntoIterator<Item = (&'a [&'a syn::Type], &'a [String], usize)>,
+) -> (Vec<String>, Vec<(usize, Vec<String>)>) {
+    let mut rffi_names = Vec::new();
+    let mut simple_groups: Vec<(usize, Vec<String>)> = Vec::new();
+    for (types, module_path, eci_idx) in sites {
         let mut names = Vec::new();
-        for ty in &item.head.args {
-            collect_macro_inttypes(collected, ty, &item.module_path, &mut names);
+        for ty in types {
+            collect_macro_inttypes(collected, ty, module_path, &mut names);
         }
-        collect_macro_inttypes(collected, &item.head.result, &item.module_path, &mut names);
         for name in names {
             if RFFI_TYPES.contains(&name.as_str()) {
                 if !rffi_names.contains(&name) {
@@ -1062,7 +1101,30 @@ fn measure_macro_wrapper_inttypes(
             }
         }
     }
+    (rffi_names, simple_groups)
+}
 
+fn measure_inttypes_for_type_sites<'a>(
+    collected: &CrateItems,
+    extra: &ExternalCompilationInfo,
+    sites: impl IntoIterator<Item = (&'a [&'a syn::Type], &'a [String], usize)>,
+) -> (
+    Vec<(String, crate::rffi_platform::IntType)>,
+    Vec<((usize, String), crate::rffi_platform::IntType)>,
+) {
+    let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(collected, sites);
+    measure_collected_inttypes(collected, extra, rffi_names, simple_groups)
+}
+
+fn measure_collected_inttypes(
+    collected: &CrateItems,
+    extra: &ExternalCompilationInfo,
+    rffi_names: Vec<String>,
+    simple_groups: Vec<(usize, Vec<String>)>,
+) -> (
+    Vec<(String, crate::rffi_platform::IntType)>,
+    Vec<((usize, String), crate::rffi_platform::IntType)>,
+) {
     let measured_rffi = if rffi_names.is_empty() {
         Vec::new()
     } else {
@@ -2158,8 +2220,8 @@ fn env_key(name: &str) -> String {
 mod classify_cextern_rffi_type_tests {
     use super::{
         CIntDataModel, CexternDefaultCTypeError, CexternRffiCType, CollectedCExternVariable,
-        cextern_c_type, cextern_default_c_type, cextern_template_is_ambiguous_int,
-        classify_cextern_rffi_type,
+        CrateItems, cextern_c_type, cextern_default_c_type, cextern_template_is_ambiguous_int,
+        classify_cextern_rffi_type, collect_inttype_groups_for_sites,
     };
     use std::path::PathBuf;
 
@@ -2373,13 +2435,74 @@ mod classify_cextern_rffi_type_tests {
     #[test]
     fn cextern_default_c_type_rejects_non_primitives() {
         let model = CIntDataModel::from_cfg("linux", 64);
-        for template in ["void *@", "struct foo @", "pid_t @"] {
+        for template in ["void *@", "struct foo @", "pid_t @", "const char *@"] {
             assert_eq!(
                 cextern_default_c_type(template, &model),
                 Err(CexternDefaultCTypeError::NoPrimitive),
                 "{template}"
             );
         }
+    }
+
+    #[test]
+    fn cextern_default_c_type_accepts_char_pointer_templates() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            cextern_default_c_type("char *@", &model),
+            Ok("char *".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("char **@", &model),
+            Ok("char **".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("const char *@", &model),
+            Err(CexternDefaultCTypeError::NoPrimitive)
+        );
+    }
+
+    #[test]
+    fn cextern_type_site_collects_measurable_libc_names() {
+        let collected = CrateItems::default();
+        let uid: syn::Type = syn::parse_str("libc::uid_t").unwrap();
+        let gid: syn::Type = syn::parse_str("libc::gid_t").unwrap();
+        let pid: syn::Type = syn::parse_str("libc::pid_t").unwrap();
+        let time: syn::Type = syn::parse_str("libc::time_t").unwrap();
+        let sock: syn::Type = syn::parse_str("libc::socklen_t").unwrap();
+        let ino: syn::Type = syn::parse_str("libc::ino_t").unwrap();
+        let charp: syn::Type = syn::parse_str("*mut std::ffi::c_char").unwrap();
+        let uid_ty: [&syn::Type; 1] = [&uid];
+        let gid_ty: [&syn::Type; 1] = [&gid];
+        let pid_ty: [&syn::Type; 1] = [&pid];
+        let time_ty: [&syn::Type; 1] = [&time];
+        let sock_ty: [&syn::Type; 1] = [&sock];
+        let ino_ty: [&syn::Type; 1] = [&ino];
+        let charp_ty: [&syn::Type; 1] = [&charp];
+        let empty: &[String] = &[];
+        let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(
+            &collected,
+            [
+                (uid_ty.as_slice(), empty, 0usize),
+                (gid_ty.as_slice(), empty, 0),
+                (pid_ty.as_slice(), empty, 1),
+                (time_ty.as_slice(), empty, 1),
+                (sock_ty.as_slice(), empty, 0),
+                (ino_ty.as_slice(), empty, 0),
+                (charp_ty.as_slice(), empty, 0),
+            ],
+        );
+        assert_eq!(rffi_names, vec!["pid_t".to_string(), "time_t".to_string()]);
+        assert_eq!(
+            simple_groups,
+            vec![(
+                0usize,
+                vec![
+                    "uid_t".to_string(),
+                    "gid_t".to_string(),
+                    "socklen_t".to_string()
+                ]
+            )]
+        );
     }
 
     #[test]
