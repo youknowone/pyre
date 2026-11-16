@@ -4735,7 +4735,34 @@ impl Bookkeeper {
             self.intern_class_by_qualname_with_bases(&canon_root, vec![template_host])
         };
         let variant_path = format!("{canon_root}::{variant_name}");
-        self.intern_class_by_qualname_with_bases(&variant_path, vec![enum_host])
+        let variant_host = self.intern_class_by_qualname_with_bases(&variant_path, vec![enum_host]);
+        // `InstanceRepr.new_instance` (rclass.py) initializes instance
+        // attributes from class-level defaults via
+        // `ClassDesc.read_attribute` (classdesc.py). A payload variant is
+        // interned with an empty class dict, so the tag is skipped unless
+        // it is a class-level default here — the same
+        // `class Some(Option): __discriminant = 1` entry
+        // `unit_variant_fold` stamps on unit variants. Stamp at first
+        // mint, before any `getuniqueclassdef` of the variant.
+        if variant_host.class_get("__discriminant").is_none() {
+            let tag = {
+                let guard = self.enum_variant_by_discriminant.borrow();
+                guard.as_ref().and_then(|map| {
+                    let leaf = template.rsplit("::").next().unwrap_or(template.as_str());
+                    map.get(template.as_str())
+                        .or_else(|| map.get(leaf))
+                        .and_then(|by_discr| {
+                            by_discr.iter().find_map(|(tag, name)| {
+                                (name.as_str() == variant_name).then_some(*tag)
+                            })
+                        })
+                })
+            };
+            if let Some(tag) = tag {
+                variant_host.class_set("__discriminant", ConstValue::Int(tag));
+            }
+        }
+        variant_host
     }
 
     /// Build the discriminant→variant narrowing `knowntypedata` for a
@@ -15395,6 +15422,86 @@ mod tests {
             cd.borrow().name.contains("<usize>"),
             "ClassDef name must keep the suffix, got {}",
             cd.borrow().name
+        );
+    }
+
+    #[test]
+    fn enum_variant_host_carries_its_discriminant_in_the_class_dict() {
+        use crate::annotator::classdesc::ClassDictEntry;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for base in [
+            "Option",
+            "option::Option",
+            "Option<i64>",
+            "option::Option<i64>",
+        ] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for some in [
+            "Option::Some",
+            "option::Option::Some",
+            "Option<i64>::Some",
+            "option::Option<i64>::Some",
+        ] {
+            reg.fields.insert(
+                some.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        for none in [
+            "Option::None",
+            "option::Option::None",
+            "Option<i64>::None",
+            "option::Option<i64>::None",
+        ] {
+            reg.fields
+                .insert(none.to_string(), Vec::<(String, String)>::new());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "None".to_string());
+        by_discr.insert(1, "Some".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("Option".to_string(), by_discr.clone());
+        map.insert("option::Option".to_string(), by_discr.clone());
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+        let tag_of = |variant: &str| -> i64 {
+            by_discr
+                .iter()
+                .find_map(|(tag, name)| (name.as_str() == variant).then_some(*tag))
+                .expect("registered table carries the variant")
+        };
+        let disc_of = |enum_root: &str, variant: &str| -> i64 {
+            let host = bk.intern_enum_variant_host(enum_root, variant);
+            let classdef = bk.getuniqueclassdef(&host).expect("variant ClassDef");
+            let classdesc = classdef.borrow().classdesc.clone();
+            match ClassDesc::read_attribute(&classdesc, "__discriminant") {
+                Some(ClassDictEntry::Constant(c)) => match c.value {
+                    ConstValue::Int(tag) => tag,
+                    other => panic!("__discriminant is not Int: {other:?}"),
+                },
+                other => panic!("read_attribute(__discriminant) is {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            disc_of("Option<i64>", "Some"),
+            tag_of("Some"),
+            "Option<i64>::Some class dict tag matches the registered table"
+        );
+        assert_eq!(
+            disc_of("Option<i64>", "None"),
+            tag_of("None"),
+            "Option<i64>::None class dict tag matches the registered table"
         );
     }
 
