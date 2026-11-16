@@ -5727,33 +5727,6 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
-    /// (`alloc::string::<Impl>::to_string`) — a `String` clone of a value
-    /// that is already a string in the lifted model (`String`/`&str`/`str`
-    /// all lower to the immutable rpy_string), so it is an identity.  The
-    /// path alone cannot tell the string specialization from the blanket
-    /// `impl<T: Display> ToString for T` (both monomorphize to the same
-    /// `<Impl>::to_string`), so gate on the receiver type: fold only when
-    /// the argument is itself string-family.  A non-string `to_string`
-    /// (an integer's `ll_int2dec`) has a receiver outside the family and
-    /// keeps its ordinary lowering.
-    pub(in crate::front::mir) fn is_to_string_identity(
-        &self,
-        reg: &RegularCall,
-        first_arg_ty: Option<&TyRef>,
-    ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if !fd.item_meta.name_path_str().ends_with("::to_string") {
-            return false;
-        }
-        first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
-    }
-
     pub(in crate::front::mir) fn is_to_string_path(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -5767,9 +5740,9 @@ impl<'a> Lowering<'a> {
     /// (&self) -> String`, and a string-family `<_ as Clone>::clone(&self)`
     /// — an owned copy of a value that is already a string in the lifted
     /// model (`String`/`&str`/`str`/`Wtf8`/`Wtf8Buf` all lower to the
-    /// immutable rpy_string), so it is an identity on the receiver, the same
-    /// alias shape as `to_string`.  `clone` / `to_owned` are generic leaves
-    /// shared by every `Clone` / `ToOwned` impl, so gate on the receiver
+    /// immutable rpy_string), so it is an identity on the receiver.
+    /// `clone` / `to_owned` are generic leaves shared by every `Clone` /
+    /// `ToOwned` impl, so gate on the receiver
     /// being a string value (`tyref_is_string_value`): a `Vec`/`BigInt`/`[T]`
     /// (`<[T]>::to_owned -> Vec<T>`) receiver is outside the family and keeps
     /// its ordinary lowering.  A receiver-string `clone`/`to_owned`/
@@ -7049,7 +7022,7 @@ impl<'a> Lowering<'a> {
     /// cannot route on the classdef-less `Option` receiver (the `getattr
     /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
     /// `args.first().copied()`).  Bind the destination to the receiver
-    /// instead, the same alias shape as `to_string` / `NonNull::as_ptr`.
+    /// instead, the same alias shape as `NonNull::as_ptr`.
     ///
     /// Gated on BOTH the receiver and the destination: a slice/iterator
     /// `.copied()` or a `Vec::clone` — a real copy, not an identity — has a

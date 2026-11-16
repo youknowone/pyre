@@ -4151,21 +4151,33 @@ impl<'l> CrateLowering<'l> {
                 body = crate::front::clause_spec::identity_unstructured(&ty);
             }
         }
-        if to_string_instantiation_is_string_identity(llbc, fd, &req.types, &req.const_generics) {
+        if to_string_instantiation_is_string_str(llbc, fd, &req.types, &req.const_generics) {
             // `<T as ToString>::to_string` of a string-family T is
-            // `str(s)` of a string: the string itself (`rstr.py` one
-            // immutable rpy_string; `rbuiltin.py` `rtype_builtin_str` /
-            // `ll_str`). alloc extracts as Opaque; a fn-item value is
-            // `FunctionDesc.getuniquegraph` of that instantiation, the
-            // same identity direct calls alias (`is_to_string_identity`).
+            // `str(s)`: `unaryop.py` `SomeObject.str` annotates a fresh
+            // `SomeString()`; `rmodel.py` `Repr.rtype_str` emits
+            // `gendirectcall(self.ll_str, v)` (`rstr.py`
+            // `AbstractStringRepr.ll_str`). alloc extracts as Opaque; a
+            // fn-item value is `FunctionDesc.getuniquegraph` of that
+            // instantiation. The body is one Call of this FunDecl on
+            // arg0; `lower_call` lowers that to `UnaryOp "str"` and
+            // returns before `enqueue_spec`, so the copy does not
+            // re-enter `declare_spec`.
             if let Some(src) = fd.signature.inputs.first() {
-                let ty = crate::front::clause_spec::subst_tyref(
+                let arg_ty = crate::front::clause_spec::subst_tyref(
                     src,
                     llbc,
                     &req.types,
                     &req.const_generics,
                 );
-                body = crate::front::clause_spec::identity_unstructured(&ty);
+                let dest_ty = crate::front::clause_spec::subst_tyref(
+                    &fd.signature.output,
+                    llbc,
+                    &req.types,
+                    &req.const_generics,
+                );
+                body = crate::front::clause_spec::to_string_str_unstructured(
+                    fd.def_id, &arg_ty, &dest_ty,
+                );
             }
         }
         let Some(mut body) = body else {
