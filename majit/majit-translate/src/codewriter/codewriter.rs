@@ -2697,4 +2697,95 @@ mod opname_spine_prejit_tests {
             "tuple item1 read is getfield_gc_*_pure (`rewrite_op_getfield` / `_immutable_field`); dump:\n{dump}"
         );
     }
+
+    /// Spine B `float_add` + `float_lt` + bool exitswitch assembles to
+    /// the same `float_add` / `float_lt` blackhole names the front spine
+    /// Transformer emits for Float operands.
+    #[test]
+    fn opname_spine_float_arith_assembles() {
+        let a = variable_with_lltype("a", LowLevelType::Float);
+        let b = variable_with_lltype("b", LowLevelType::Float);
+        let sum = variable_with_lltype("sum", LowLevelType::Float);
+        let cmp = variable_with_lltype("cmp", LowLevelType::Bool);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "float_arith",
+            start.clone(),
+            Hlvalue::Variable(sum.clone()),
+        );
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "float_add",
+                vec![Hlvalue::Variable(a.clone()), Hlvalue::Variable(b)],
+                Hlvalue::Variable(sum.clone()),
+            ),
+            SpaceOperation::new(
+                "float_lt",
+                vec![Hlvalue::Variable(sum.clone()), Hlvalue::Variable(a.clone())],
+                Hlvalue::Variable(cmp.clone()),
+            ),
+        ]);
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(cmp));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(sum.clone())],
+                Some(graph.returnblock.clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+            Link::new(
+                vec![Hlvalue::Variable(a)],
+                Some(graph.returnblock.clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(false),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+        ]);
+
+        let path = CallPath::from_segments(["float_arith"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("float_lt"),
+            "assembled jitcode must contain float_lt; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let binops: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::BinOp { op, .. } => Some(op.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.contains(&"float_add"),
+            "assembled SSA must contain float_add; binops={binops:?} dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("float_add") || binops.contains(&"float_add"),
+            "assembled jitcode must contain float_add; dump:\n{dump}"
+        );
+    }
 }

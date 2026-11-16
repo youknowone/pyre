@@ -586,6 +586,48 @@ fn transduce_op(
                 result,
             );
         }
+        // `bhimpl_float_neg` / `bhimpl_float_abs` via `_add_default_ops`.
+        // Keep the full opname, matching `int_neg`: the assembler passes
+        // already-prefixed unary names through, and the shared Transformer
+        // emits the same `UnaryOp` for a float-kind `neg` / `abs`.
+        name @ ("float_neg" | "float_abs") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `Transformer.rewrite_op_float_is_true`: `float_ne` against
+        // `Constant(0.0, lltype.Float)`, then `rewrite_operation`.
+        "float_is_true" => {
+            let operand = materialize(out, block, &op.args[0]);
+            let zero = materialize(
+                out,
+                block,
+                &Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::Float(0.0_f64.to_bits()),
+                    LowLevelType::Float,
+                )),
+            );
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: "float_ne".to_string(),
+                    lhs: operand,
+                    rhs: zero,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
         // `Transformer`'s generated rename methods.  These old low-level
         // spellings all re-enter `rewrite_operation` under the corresponding
         // signed int-bank opname.  Store the bare rich-graph name because the
@@ -668,6 +710,31 @@ fn transduce_op(
                 block,
                 OpKind::BinOp {
                     op: bare,
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // Float arithmetic and compares that survive as blackhole ops
+        // (`bhimpl_float_*`, `_add_default_ops` `keep_operation_unchanged`).
+        // `rewrite_op_float_add` / `rewrite_op_float_mul` /
+        // `rewrite_op_float_{lt,le,gt,ge}` are `_rewrite_symmetric`;
+        // `float_sub` / `float_truediv` / `float_eq` / `float_ne` have no
+        // rewrite.  Keep the full llop name: the assembler preserves
+        // `float_*` `BinOp` labels, and the shared Transformer emits the
+        // same spelling after its float-kind rewrite.
+        name @ ("float_add" | "float_sub" | "float_mul" | "float_truediv" | "float_lt"
+        | "float_le" | "float_eq" | "float_ne" | "float_gt" | "float_ge") => {
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: name.to_string(),
                     lhs,
                     rhs,
                     result_ty,
@@ -930,6 +997,34 @@ fn transduce_op(
                 block,
                 OpKind::UnaryOp {
                     op: "cast_int_to_float".to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
+        // Float-bank unaries that survive as blackhole ops.  `cast_int_to_float`
+        // / `cast_float_to_int` / `cast_float_to_singlefloat` /
+        // `cast_singlefloat_to_float` have no `rewrite_op_*` and pass through
+        // `_add_default_ops`.  `rewrite_op_convert_float_bytes_to_longlong`
+        // / `rewrite_op_convert_longlong_bytes_to_float` are `_noop_rewrite`.
+        // `rewrite_op_cast_uint_to_float` / `rewrite_op_cast_float_to_uint`
+        // are `_do_builtin_call`; emit the same `UnaryOp` the shared
+        // Transformer residualizes, matching `int_floordiv`.
+        name @ ("cast_int_to_float"
+        | "cast_float_to_int"
+        | "cast_uint_to_float"
+        | "cast_float_to_uint"
+        | "cast_float_to_singlefloat"
+        | "cast_singlefloat_to_float"
+        | "convert_float_bytes_to_longlong"
+        | "convert_longlong_bytes_to_float") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
                     operand,
                     result_ty: value_type_of(&result),
                 },
@@ -2982,6 +3077,240 @@ mod tests {
         let body = jitcode
             .try_body()
             .expect("int div/mod graph drains through builtin residual calls");
+        assert!(!body.code.is_empty());
+    }
+
+    #[test]
+    fn lower_graph_float_binop_and_compare_arms() {
+        let lhs = variable_with_lltype("lhs", LowLevelType::Float);
+        let rhs = variable_with_lltype("rhs", LowLevelType::Float);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(lhs.clone()),
+            Hlvalue::Variable(rhs.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            "float_binop_and_compare",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let cases = [
+            ("float_add", LowLevelType::Float),
+            ("float_sub", LowLevelType::Float),
+            ("float_mul", LowLevelType::Float),
+            ("float_truediv", LowLevelType::Float),
+            ("float_lt", LowLevelType::Bool),
+            ("float_eq", LowLevelType::Bool),
+        ];
+        let mut last = None;
+        for (index, (opname, result_ty)) in cases.into_iter().enumerate() {
+            let result = variable_with_lltype(&format!("f_{index}"), result_ty);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![
+                    Hlvalue::Variable(lhs.clone()),
+                    Hlvalue::Variable(rhs.clone()),
+                ],
+                Hlvalue::Variable(result.clone()),
+            ));
+            last = Some(result);
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(last.expect("float family is non-empty"))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let binary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => op.as_str(),
+                other => panic!("float binop/compare must lower to BinOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            binary,
+            vec![
+                "float_add",
+                "float_sub",
+                "float_mul",
+                "float_truediv",
+                "float_lt",
+                "float_eq"
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_graph_int_float_cast_arms() {
+        let signed = variable_with_lltype("signed", LowLevelType::Signed);
+        let float = variable_with_lltype("float", LowLevelType::Float);
+        let unsigned = variable_with_lltype("unsigned", LowLevelType::Unsigned);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(signed.clone()),
+            Hlvalue::Variable(float.clone()),
+            Hlvalue::Variable(unsigned.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Float);
+        let graph = FlowGraph::with_return_var(
+            "int_float_casts",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let cases = [
+            (
+                "cast_int_to_float",
+                Hlvalue::Variable(signed),
+                LowLevelType::Float,
+            ),
+            (
+                "cast_float_to_int",
+                Hlvalue::Variable(float),
+                LowLevelType::Signed,
+            ),
+            (
+                "cast_uint_to_float",
+                Hlvalue::Variable(unsigned),
+                LowLevelType::Float,
+            ),
+        ];
+        let mut last = None;
+        for (index, (opname, operand, result_ty)) in cases.into_iter().enumerate() {
+            let result = variable_with_lltype(&format!("cast_{index}"), result_ty);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![operand],
+                Hlvalue::Variable(result.clone()),
+            ));
+            last = Some(result);
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(last.expect("cast family is non-empty"))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let unary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op.as_str(),
+                other => panic!("int/float cast must lower to UnaryOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            unary,
+            vec![
+                "cast_int_to_float",
+                "cast_float_to_int",
+                "cast_uint_to_float"
+            ]
+        );
+    }
+
+    /// `Transformer.rewrite_op_float_is_true`: `float_ne` against 0.0.
+    #[test]
+    fn lower_graph_rewrites_float_is_true_to_float_ne() {
+        let operand = variable_with_lltype("operand", LowLevelType::Float);
+        let start = Block::shared(vec![Hlvalue::Variable(operand.clone())]);
+        let returned = variable_with_lltype("returned", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            "float_is_true_rewrite",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let truth = variable_with_lltype("truth", LowLevelType::Bool);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "float_is_true",
+            vec![Hlvalue::Variable(operand.clone())],
+            Hlvalue::Variable(truth.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(truth.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert_eq!(ops.len(), 2, "ConstFloat(0.0) then float_ne; ops={ops:?}");
+        match &ops[0].kind {
+            OpKind::ConstFloat(bits) => assert_eq!(*bits, 0.0_f64.to_bits()),
+            other => panic!("float_is_true must materialise 0.0, got {other:?}"),
+        }
+        match &ops[1].kind {
+            OpKind::BinOp { op, lhs, rhs, .. } => {
+                assert_eq!(op, "float_ne");
+                assert_eq!(lhs, &operand);
+                assert_eq!(rhs, ops[0].result.as_ref().expect("zero result"));
+            }
+            other => panic!("float_is_true must lower to float_ne, got {other:?}"),
+        }
+        assert_eq!(ops[1].result.as_ref(), Some(&truth));
+    }
+
+    /// `Transformer.rewrite_op_cast_uint_to_float = _do_builtin_call`.
+    /// Feed the shared Transformer the same `UnaryOp` the front spine
+    /// residualizes; with no helper graph that is the `_ll_1_cast_*`
+    /// residual call.
+    #[test]
+    fn lower_graph_routes_cast_uint_to_float_through_the_builtin_call_rewrite() {
+        let operand = variable_with_lltype("operand", LowLevelType::Unsigned);
+        let start = Block::shared(vec![Hlvalue::Variable(operand.clone())]);
+        let returned = variable_with_lltype("returned", LowLevelType::Float);
+        let graph = FlowGraph::with_return_var(
+            "lowlevel_cast_uint_to_float",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let casted = variable_with_lltype("casted", LowLevelType::Float);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_uint_to_float",
+            vec![Hlvalue::Variable(operand)],
+            Hlvalue::Variable(casted.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(casted)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        assert_eq!(
+            startblock_unops(&model),
+            vec!["cast_uint_to_float".to_string()]
+        );
+
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let path = CallPath::from_segments(["lowlevel_cast_uint_to_float"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let body = jitcode
+            .try_body()
+            .expect("cast_uint_to_float drains through builtin residual call");
         assert!(!body.code.is_empty());
     }
 
