@@ -277,7 +277,14 @@ impl SomePtr {
                     return Ok(carray_item_field_annotation(field_t));
                 }
                 match example.getattr(attr) {
-                    Ok(v) => Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v))),
+                    Ok(v) => {
+                        if let Some(field_t) = ptr_struct_field_lltype(&self.ll_ptrtype, attr)
+                            && let Some(projected) = inlined_struct_field_projection(&field_t)
+                        {
+                            return Ok(projected);
+                        }
+                        Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
+                    }
                     // A raw-pointer `p.is_null()` whose receiver keeps its
                     // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
                     // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
@@ -401,6 +408,96 @@ impl SomePtr {
                 Err(AnnotatorError::new(self.ll_ptrtype._nofield(attr)))
             }
         }
+    }
+}
+
+/// Implicit `annlowlevel.cast_base_ptr_to_instance` of the same Rust
+/// fn-pointer adaptation as [`SomePtr::call`]'s instance-argument
+/// conversion (`annlowlevel.cast_instance_to_base_ptr`).
+/// `ll_to_annotation(FUNC.RESULT)` for a `Ptr(FuncType)` call: a GC
+/// instance pointer is the instance annotation (`llannotation.py`
+/// `ll_to_annotation` of `Ptr(GcStruct)` of a class); `rclass.OBJECTPTR`
+/// is the root instance. `GCREF` stays `SomePtr`.
+fn ll_fn_ptr_result_annotation(s: SomeValue) -> SomeValue {
+    let s = highlevel_of_ptr_field_annotation(s);
+    if let SomeValue::Ptr(p) = &s {
+        let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
+        if ty == *crate::translator::rtyper::rclass::OBJECTPTR {
+            return SomeValue::Instance(SomeInstance::new(
+                None,
+                true,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+    }
+    s
+}
+
+/// FUNC.ARGS[i] is a GC instance pointer: `rclass.OBJECTPTR`, or a
+/// class's `InstanceRepr.lowleveltype` (`Ptr(object_type)`, `rclass.py`).
+fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
+    if ty == &*crate::translator::rtyper::rclass::OBJECTPTR {
+        return true;
+    }
+    let lltype::LowLevelType::Ptr(p) = ty else {
+        return false;
+    };
+    match &p.TO {
+        lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
+        lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
+        _ => false,
+    }
+}
+
+/// By-value ADT field read through a pointer to a container.
+///
+/// [`Bookkeeper::project_struct_field_type`](crate::annotator::bookkeeper::Bookkeeper::project_struct_field_type)
+/// of a by-value ADT field of a GC instance is that ADT's `SomeInstance`;
+/// the codewriter copies the same spelling as an inlined substruct
+/// (`emit_inlined_struct_leaf_copy`). `lltype.py` `_ptr._expose` rewraps
+/// a nested container (`lltype.py` `ContainerType`) as `Ptr` of that
+/// container, or as `_interior_ptr` when the parent is Gc and the
+/// container is Raw. `lltype.py` `SomePtr.getattr` returns
+/// `llannotation.py` `ll_to_annotation` of that pointer
+/// (`llannotation.py` `SomeInteriorPtr` inherits the same getattr). A
+/// field whose lltype is an inlined `Struct` is not a pointer word:
+/// return the projection of the struct's name when it is not
+/// `Impossible`. `STRPTR`, `Ptr(GcStruct)`, scalars, and `Bool` stay on
+/// [`highlevel_of_ptr_field_annotation`].
+fn inlined_struct_field_projection(field_t: &lltype::LowLevelType) -> Option<SomeValue> {
+    let lltype::LowLevelType::Struct(st) = field_t else {
+        return None;
+    };
+    let bk = bookkeeper::getbookkeeper()?;
+    let projected = bk.project_struct_field_type(&st._name);
+    if matches!(projected, SomeValue::Impossible) {
+        None
+    } else {
+        Some(projected)
+    }
+}
+
+/// Declared lltype of `attr` on a struct pointer, before `_ptr._expose`
+/// rewraps a nested container.
+fn ptr_struct_field_lltype(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowLevelType> {
+    match &ptr.TO {
+        lltype::PtrTarget::Struct(st) => st.getattr_field_type(attr),
+        lltype::PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(lltype::LowLevelType::Struct(st)) => st.getattr_field_type(attr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Declared lltype of `attr` when an interior pointer's `TO` is a struct.
+fn interior_struct_field_lltype(
+    ptr: &lltype::InteriorPtr,
+    attr: &str,
+) -> Option<lltype::LowLevelType> {
+    match ptr.TO.as_ref() {
+        lltype::LowLevelType::Struct(st) => st.getattr_field_type(attr),
+        _ => None,
     }
 }
 
@@ -784,6 +881,11 @@ impl SomeInteriorPtr {
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => {
                 let v = example.getattr(attr).map_err(AnnotatorError::new)?;
+                if let Some(field_t) = interior_struct_field_lltype(&self.ll_ptrtype, attr)
+                    && let Some(projected) = inlined_struct_field_projection(&field_t)
+                {
+                    return Ok(projected);
+                }
                 Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
             }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
@@ -1969,6 +2071,161 @@ mod tests {
                 .unwrap_or("")
                 .contains("should return a low-level type"),
             "interior store of an unrelated instance must still fail, got {err:?}"
+        );
+    }
+
+    /// An item struct's inlined two-field key reads as that key's
+    /// `SomeInstance`. [`Bookkeeper::project_struct_field_type`] of the
+    /// by-value struct name is the same annotation, including
+    /// `can_be_None`. A scalar field stays an integer. A
+    /// `Ptr(GcStruct)` class-root field stays that class's nullable
+    /// instance. `SomeInteriorPtr.getattr` is the same three reads.
+    #[test]
+    fn gcarray_item_inlined_by_value_key_getattr_is_instance() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use std::rc::Rc;
+
+        let root_name = "owner::GcClass";
+        let key_name = "host::TwoFieldKey";
+        let mut reg = crate::front::StructFieldRegistry::default();
+        let root_id = majit_ir::descr::StructId::from_canonical(root_name);
+        reg.class_identity.insert(
+            root_name.to_string(),
+            Some(crate::front::semantic::ClassIdentity {
+                id: root_id,
+                spelling: root_name.to_string(),
+            }),
+        );
+        reg.note_declared_gc_name(root_name);
+        reg.fields.insert(
+            root_name.to_string(),
+            vec![("w_class".to_string(), format!("*mut {root_name}"))],
+        );
+        let key_id = majit_ir::descr::StructId::from_canonical(key_name);
+        reg.class_identity.insert(
+            key_name.to_string(),
+            Some(crate::front::semantic::ClassIdentity {
+                id: key_id,
+                spelling: key_name.to_string(),
+            }),
+        );
+        reg.fields.insert(
+            key_name.to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "storage::Entry".to_string(),
+            vec![
+                ("key".to_string(), key_name.to_string()),
+                ("count".to_string(), "i64".to_string()),
+                ("value".to_string(), format!("*mut {root_name}")),
+            ],
+        );
+        let reg = Rc::new(reg);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::clone(&reg));
+        let _pos = bk.at_position(None);
+
+        let item = format!("storage::Entry<{key_name},*mut {root_name}>");
+        let ptr_ty = crate::front::mir::gcarray_item_struct_ptr_lltype(reg.as_ref(), &item)
+            .expect("item pointer");
+        let LowLevelType::Ptr(built) = ptr_ty else {
+            panic!("item pointer is Ptr");
+        };
+        let item_struct = match &built.TO {
+            PtrTarget::Struct(st) => st.clone(),
+            other => panic!("item pointer targets a Struct, got {other:?}"),
+        };
+        let key_field = item_struct
+            .getattr_field_type("key")
+            .expect("inlined key field");
+        let projected = {
+            let LowLevelType::Struct(key_st) = &key_field else {
+                panic!("two-field key stays an inlined Struct, got {key_field:?}");
+            };
+            match bk.project_struct_field_type(&key_st._name) {
+                SomeValue::Instance(inst) => inst,
+                other => panic!("key projection must be SomeInstance, got {other:?}"),
+            }
+        };
+        let entry = SomePtr::new(*built);
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+        let assert_key = |got: SomeValue| {
+            let SomeValue::Instance(inst) = got else {
+                panic!("inlined key must read as SomeInstance, got {got:?}");
+            };
+            assert_eq!(inst.can_be_none, projected.can_be_none);
+            assert!(
+                inst.classdef.as_ref().is_some_and(|cd| {
+                    projected
+                        .classdef
+                        .as_ref()
+                        .is_some_and(|want| Rc::ptr_eq(cd, want))
+                }),
+                "key classdef must be the projection's ClassDef"
+            );
+        };
+        assert_key(entry.getattr(&attr("key")).unwrap());
+
+        let count = entry.getattr(&attr("count")).unwrap();
+        assert!(
+            matches!(count, SomeValue::Integer(_)),
+            "scalar field stays an integer, got {count:?}"
+        );
+
+        let SomeValue::Instance(value) = entry.getattr(&attr("value")).unwrap() else {
+            panic!(
+                "class-root value must read as SomeInstance, got {:?}",
+                entry.getattr(&attr("value"))
+            );
+        };
+        assert!(value.can_be_none);
+        let root = bk
+            .getuniqueclassdef_for_struct_root(root_name)
+            .expect("class root");
+        assert!(
+            value
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
+        );
+        assert!(
+            projected
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| !Rc::ptr_eq(cd, &root)),
+            "the key ClassDef is not the value's class root"
+        );
+
+        let interior = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(item_struct.clone()))),
+            TO: Box::new(LowLevelType::Struct(Box::new(item_struct))),
+            offsets: vec![],
+        });
+        assert_key(interior.getattr(&attr("key")).unwrap());
+        let interior_count = interior.getattr(&attr("count")).unwrap();
+        assert!(
+            matches!(interior_count, SomeValue::Integer(_)),
+            "interior scalar field stays an integer, got {interior_count:?}"
+        );
+        let SomeValue::Instance(interior_value) = interior.getattr(&attr("value")).unwrap() else {
+            panic!(
+                "interior class-root value must read as SomeInstance, got {:?}",
+                interior.getattr(&attr("value"))
+            );
+        };
+        assert!(interior_value.can_be_none);
+        assert!(
+            interior_value
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
         );
     }
 }
