@@ -27,6 +27,7 @@ pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
     let vis = &head.vis;
     let name = &head.name;
     let to_name = format_ident!("{}_TO", name);
+    let marker_ident = format_ident!("_alloc_flavor_{}_TO", name);
     let c_name = &head.c_name;
     let doc = format!("c_name: {c_name}");
     let include_rel = format!("/majit_copaque/{}.rs", head.size_key());
@@ -38,6 +39,12 @@ pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
         #vis struct #to_name {
             _opaque: [u8; 0],
         }
+        #(#attrs)*
+        /// `rffi.COpaque` is `lltype.OpaqueType` with `hints['external'] = 'C'`: raw, non-GC storage
+        /// (`rclass.py getgcflavor` reads `_alloc_flavor_`).
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #marker_ident: &str = "raw";
         #(#attrs)*
         impl ::majit_rlib::rffi::COpaque for #to_name {
             const C_NAME: &'static str = #c_name;
