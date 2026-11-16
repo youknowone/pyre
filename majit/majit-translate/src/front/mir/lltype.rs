@@ -17117,19 +17117,27 @@ fn field_row_lltype(
         if pointee.starts_with("??") {
             return None;
         }
-        // rstr.py `STRPTR = Ptr(STR)` before declared-GC `GCREF` and
-        // classed `OBJECTPTR`. The STR layout (`Utf8Str` / `BytesBlock`)
-        // implements GcType and has a class identity, so those later
-        // arms would otherwise steal the field. `project_struct_field_type`
-        // of the same spelling is SomeString; wrap (`newbytes`) takes
-        // that STR, not a W_Root.
+        // rstr.py `STRPTR = Ptr(STR)` before `llmemory.GCREF` and
+        // `rclass.OBJECTPTR`. Same order as `fn_ptr_tyref_to_lltype`.
+        // The STR layout (`Utf8Str` / `BytesBlock`) implements GcType
+        // and has a class identity, so those later arms would otherwise
+        // steal the field. `project_struct_field_type` of the same
+        // spelling is SomeString; wrap (`newbytes`) takes that STR, not
+        // a W_Root.
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
         }
-        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
+        // `llmemory.py` `GCREF` is only the erased pointer
+        // (`annlowlevel.cast_instance_to_gcref`, `rerased`).
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
             return Some((*GCREF).clone());
         }
-        if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
+        // Harvest `GcType` without class identity. A classed instance
+        // field is `rclass.py` `InstanceRepr.lowleveltype` (`OBJECTPTR`);
+        // `rordereddict.py` `get_ll_dict` uses `r_key.lowleveltype`.
+        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee)
+            && !spelling_has_class_identity(reg, pointee)
+        {
             return Some((*GCREF).clone());
         }
         // Shared scalar mapping (`scalar_lltype`); a raw pointer to that

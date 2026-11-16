@@ -22386,8 +22386,10 @@ mod tests {
         };
         // `value` is a plain `*mut PyObject`; `key` is
         // `repr(transparent)` over that same pointer (`identitydict.py`).
-        // `lltype.py` `_interior_ptr._expose` of a Ptr field is the
-        // pointer, so both getattrs intern the same way.
+        // `field_row_lltype` intern's a classed instance pointer as
+        // `rclass.py` `OBJECTPTR` (`InstanceRepr.lowleveltype`);
+        // `highlevel_of_ptr_field_annotation` → `objectptr_as_instance`
+        // lifts both getattrs to nullable `Instance(pyobject::PyObject)`.
         let s_key = getattr_entry(&field_attr("key")).expect("SomePtr.getattr key of DICTENTRY");
         let s_value =
             getattr_entry(&field_attr("value")).expect("SomePtr.getattr value of DICTENTRY");
@@ -22431,16 +22433,10 @@ mod tests {
             "ITEM key lltype equals the value field lltype, dest={s_entry:?}, item={item}"
         );
         match (&s_key, &s_value) {
-            (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
-                assert_eq!(
-                    a.ll_ptrtype, b.ll_ptrtype,
-                    "getattr key and value intern the same pointer, dest={s_entry:?}, item={item}"
-                );
-            }
             (SomeValue::Instance(_), SomeValue::Instance(_)) => {}
             (k, v) => panic!(
-                "getattr key and value must annotate the same way, key={k:?} value={v:?}, \
-                 dest={s_entry:?}, item={item}"
+                "getattr key and value intern as Instance of the classed *mut PyObject, \
+                 key={k:?} value={v:?}, dest={s_entry:?}, item={item}"
             ),
         }
         assert_eq!(
