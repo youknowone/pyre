@@ -7353,27 +7353,22 @@ fn build_class_inner(
                     },
                     _ => Vec::new(),
                 };
-                // The Vec of refs is not a GC root. Pin each value before the
-                // call, then pass reloaded words into it.
-                let _prepare_kw_roots = pyre_object::gc_roots::push_roots();
-                let prepare_kw_base = pyre_object::gc_roots::shadow_stack_len();
-                for (_, value) in &prepare_kwds {
-                    let _ = pyre_object::gc_roots::pin_root(*value);
-                }
+                // `prepare` and the keyword values are live together across
+                // the call, so publish them in one run in this function's
+                // scope and pass reloaded words into the call.
+                let mut live = Vec::with_capacity(1 + prepare_kwds.len());
+                live.push(prepare);
+                live.extend(prepare_kwds.iter().map(|(_, value)| *value));
+                let prepare_slot = roots.pin_roots(&live);
                 let prepare_kwds: Vec<(Wtf8Buf, PyObjectRef)> = prepare_kwds
                     .iter()
                     .enumerate()
-                    .map(|(index, (key, _))| {
-                        (
-                            key.clone(),
-                            pyre_object::gc_roots::shadow_stack_get(prepare_kw_base + index),
-                        )
-                    })
+                    .map(|(index, (key, _))| (key.clone(), roots.get(prepare_slot + 1 + index)))
                     .collect();
                 let ns_obj = if !prepare_kwds.is_empty() {
                     call_with_kwargs_in_ctx(
                         take_last_exec_ctx(),
-                        prepare,
+                        roots.get(prepare_slot),
                         &[
                             pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                             bases(),
@@ -7383,7 +7378,7 @@ fn build_class_inner(
                 } else {
                     clear_call_error();
                     let r = crate::call_function(
-                        prepare,
+                        roots.get(prepare_slot),
                         &[
                             pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                             bases(),
@@ -7437,12 +7432,10 @@ fn build_class_inner(
     // AttributeError.  `type_descr_prepare` answers `w_module_dict_new()`
     // for the same fallback; an absent `w_metaclass` is pyre's spelling of
     // the builtin `type` winner, which never looked the method up.
-    let _ns_root = pyre_object::gc_roots::push_roots();
-    let w_namespace_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(match w_namespace {
+    let w_namespace_root = roots.pin_roots(&[match w_namespace {
         Some(ns) => ns,
         None => pyre_object::w_module_dict_new(),
-    });
+    }]);
 
     let exec_ctx = take_last_exec_ctx();
 
