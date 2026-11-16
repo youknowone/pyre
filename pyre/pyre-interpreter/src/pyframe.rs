@@ -620,6 +620,12 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
+            // The frame is a movable nursery object; `w_str_new_managed`,
+            // `hash_w_strict` and `eq_w` below can collect, so pin it before
+            // those calls and re-read it after (`shadowstack.py`
+            // `push_roots` / `pop_roots`).
+            let frame_slot = candidate_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             // No force here; see [`Self::force_locals`] on the read direction.
             // An exact `str` is decided by WTF-8 bytes, so its hash is not
             // read and cannot fail.  Every other key is hashed before the
@@ -665,9 +671,9 @@ pub mod frame_locals_proxy {
             // descent's blocker frontier (`fast2locals`).
             let code = self.frame().code();
             let nvar = code.varnames.len();
-            // The name borrow ends before `self.frame()`.  `locals_w!` stays
-            // in this function so the virtualizable array getfield and the
-            // access share a basic block.
+            // The name borrow ends before the frame is re-read from
+            // `frame_slot`.  `locals_w!` stays in this function so the
+            // virtualizable array getfield and the access share a basic block.
             macro_rules! consider_local {
                 ($index:expr, $name:expr, $is_cell:expr) => {{
                     let same = {
@@ -683,7 +689,7 @@ pub mod frame_locals_proxy {
                         }
                     };
                     if same {
-                        let frame = self.frame();
+                        let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
                         if $index < locals_w!(frame).len() {
                             let slot = locals_w!(frame)[$index];
                             let value = super::unwrap_localsplus_slot($is_cell, slot);
@@ -809,7 +815,12 @@ pub mod frame_locals_proxy {
         /// `@jit.unroll_safe` for the same reason as [`Self::pin_entries`].
         #[majit_macros::unroll_safe]
         fn entry_count(&self) -> i64 {
-            let extra = self.frame().get_extra_locals();
+            // `locals_plus_names` allocates a `Vec`, so pin the nursery frame
+            // before that call and re-read it in the loop (`shadowstack.py`
+            // `push_roots` / `pop_roots`).
+            let roots = pyre_object::gc_roots::push_roots();
+            let frame_slot = roots.pin_roots(&[self.w_frame]);
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             let mut size = if extra.is_null() {
                 0
             } else {
@@ -819,7 +830,7 @@ pub mod frame_locals_proxy {
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
             for (index, _name, cell_slot) in locals_plus_names(code) {
-                let frame = self.frame();
+                let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
                 if index >= locals_w!(frame).len() {
                     continue;
                 }
@@ -1075,14 +1086,16 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if self.locals_plus_value(roots.get(key_slot))?.is_some() {
                 return Ok(true);
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 return Ok(false);
             }
-            let extra_slot = key_slot + 1;
+            let extra_slot = key_slot + 2;
             let _ = roots.pin_root(extra);
             crate::baseobjspace::contains(roots.get(extra_slot), roots.get(key_slot))
         }
@@ -1214,12 +1227,14 @@ pub mod frame_locals_proxy {
             let args_base = roots.publish(&args[1..]);
             let nargs = args.len() - 1;
             roots.normalize(args_base, nargs);
+            let frame_slot = args_base + nargs;
+            let _ = roots.pin_root(self.w_frame);
             if self.key_is_fast_local(roots.get(args_base))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 // A frame with no extras dict answers the default if one was
                 // passed and reports the key itself otherwise; it does not
@@ -1230,7 +1245,7 @@ pub mod frame_locals_proxy {
                     Err(crate::PyError::key_error_with_key(roots.get(args_base)))
                 };
             }
-            let extra_slot = args_base + nargs;
+            let extra_slot = frame_slot + 1;
             let _ = roots.pin_root(extra);
             let mut call_args = Vec::with_capacity(nargs);
             for i in 0..nargs {
