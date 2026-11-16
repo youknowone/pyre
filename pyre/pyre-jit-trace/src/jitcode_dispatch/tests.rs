@@ -2257,6 +2257,48 @@ fn walk_reaches_unpublished_blocker_behind_a_callable_inline_callee() {
     );
 }
 
+/// A scan of a JitCode that started at a later resume pc does not cover
+/// the prefix before that pc, so a re-entry at pc 0 must be scanned.
+#[test]
+fn walk_rescans_a_jitcode_reentered_at_a_lower_pc() {
+    fn first_callable_wrapper_index() -> Option<usize> {
+        let descrs = crate::jitcode_runtime::descr_ref_table();
+        for slot in 0..descrs.len().min(u16::MAX as usize + 1) {
+            let Some(index) = descrs
+                .at(slot)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+            else {
+                continue;
+            };
+            let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(index) else {
+                continue;
+            };
+            if !majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr) {
+                continue;
+            }
+            if super::inline_call::helper_walk_reaches_unpublished_blocker(
+                index,
+                0,
+                &mut Vec::new(),
+            ) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    let index = first_callable_wrapper_index()
+        .expect("a JitCode descr whose callable callee reaches an unpublished inline blocker");
+    assert!(
+        super::inline_call::helper_walk_reaches_unpublished_blocker(
+            index,
+            0,
+            &mut vec![(index, 1)]
+        ),
+        "an earlier scan of the same JitCode from a later pc does not cover pc 0"
+    );
+}
+
 /// Helper levels numbered for `list(iterable)`'s type call.
 ///
 /// `descr_call`'s None-check residual (`bh_check_init_returned_none`) is a
