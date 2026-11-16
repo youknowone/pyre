@@ -4237,6 +4237,37 @@ impl Bookkeeper {
         )
     }
 
+    /// Mark an enum base's `__discriminant` as a mutable instance attribute.
+    ///
+    /// The tag lives in the Rust value, so `InstanceRepr._setup_repr`
+    /// (`rclass.py`) must place it on the instance STRUCT rather than the
+    /// vtable. `Attribute.modified` (`classdesc.py`) must precede that
+    /// setup; pyre pre-mints enum classdefs before any tag write is
+    /// annotated — the same attrs-before-repr ordering
+    /// [`Self::getuniqueclassdef_for_enum_variant`] already applies to
+    /// variant payload rows. A niche `Option<&T>` / nullable-pointer Option
+    /// stores no tag field (`rtype_getattr` `ptr_nonzero`); skip those.
+    fn mark_enum_base_discriminant_instance_attr(
+        classdef: &Rc<RefCell<ClassDef>>,
+        root: &str,
+    ) -> Result<(), AnnotatorError> {
+        let name = classdef.borrow().name.clone();
+        let is_nullable_pointer_option = |spelling: &str| {
+            strip_generic_leaf(spelling, "Option").is_some_and(|inner| {
+                let inner = inner.trim();
+                is_direct_pointer_word_spelling(inner) || is_fn_type_spelling(inner)
+            })
+        };
+        if is_nullable_pointer_option(root) || is_nullable_pointer_option(&name) {
+            return Ok(());
+        }
+        let mut classdef_mut = classdef.borrow_mut();
+        if let Some(attr) = classdef_mut.attrs.get_mut("__discriminant") {
+            attr.modified(Some(classdef))?;
+        }
+        Ok(())
+    }
+
     /// Resolve a struct type-root name to its canonical, bookkeeper-
     /// REGISTERED `ClassDef`, with instance attributes projected from
     /// the threaded `StructFieldRegistry`.
@@ -4438,7 +4469,16 @@ impl Bookkeeper {
                 .insert(root.to_string());
         }
         let host = self.intern_class_by_qualname(root);
-        self.getuniqueclassdef(&host)
+        let classdef = self.getuniqueclassdef(&host)?;
+        if self
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.is_enum_base(root))
+        {
+            Self::mark_enum_base_discriminant_instance_attr(&classdef, root)?;
+        }
+        Ok(classdef)
     }
 
     /// Class object for a generic core enum receiver whose annotation reads
@@ -4472,6 +4512,7 @@ impl Bookkeeper {
         let host = self.intern_class_by_qualname(&identity.spelling);
         let classdef = self.getuniqueclassdef(&host).ok()?;
         self.project_struct_rows(&identity.spelling).ok()?;
+        Self::mark_enum_base_discriminant_instance_attr(&classdef, &identity.spelling).ok()?;
         Some(classdef)
     }
 
@@ -4505,15 +4546,14 @@ impl Bookkeeper {
         // A generic core enum receiver uses the declaration class object
         // (`Bookkeeper.getuniqueclassdef`); its variant still subclasses
         // that object for `ClassRepr.getclsfield` knowntypedata narrowing.
-        if self.getuniqueclassdef_for_struct_root(enum_root).is_err()
-            && self
-                .getuniqueclassdef_for_core_enum_decl_receiver(enum_root)
-                .is_none()
-        {
-            return Err(AnnotatorError::new(format!(
-                "struct root {enum_root} is not a ClassDef intern"
-            )));
-        }
+        let base = self
+            .getuniqueclassdef_for_struct_root(enum_root)
+            .ok()
+            .or_else(|| self.getuniqueclassdef_for_core_enum_decl_receiver(enum_root))
+            .ok_or_else(|| {
+                AnnotatorError::new(format!("struct root {enum_root} is not a ClassDef intern"))
+            })?;
+        Self::mark_enum_base_discriminant_instance_attr(&base, enum_root)?;
         // Variant subclass — interned WITH the base so ClassDesc::new
         // wires basedef. The SAME interning primitive the variant
         // CONSTRUCTOR path uses ([`Self::intern_enum_variant_host`]), so
@@ -15133,6 +15173,35 @@ mod tests {
             ),
             other => panic!("expected SomeInstance(variant), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enum_base_discriminant_is_an_instance_attribute_at_mint() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<f64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("option::Option<f64>")
+            .expect("Option<f64> enum base classdef");
+        let disc = classdef.borrow();
+        let attr = disc
+            .attrs
+            .get("__discriminant")
+            .expect("__discriminant projected at mint");
+        assert!(
+            !attr.readonly,
+            "enum base __discriminant is an instance attribute at mint, before any setattr"
+        );
     }
 
     #[test]

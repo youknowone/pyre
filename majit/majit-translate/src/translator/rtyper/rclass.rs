@@ -6302,6 +6302,92 @@ mod tests {
     }
 
     #[test]
+    fn enum_discriminant_read_lowers_to_instance_getfield() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "option::Option<f64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        ann.bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root("option::Option<f64>")
+            .expect("Option<f64> classdef");
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let v_inst = Variable::new();
+        v_inst.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_inst_h = Hlvalue::Variable(v_inst);
+        let v_attr = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::byte_str("__discriminant"),
+            LowLevelType::Void,
+        ));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let spaceop = SpaceOperation::new(
+            "getattr",
+            vec![v_inst_h.clone(), v_attr.clone()],
+            Hlvalue::Variable(v_result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().extend([v_inst_h, v_attr]);
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("__discriminant")));
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+            SomeValue::String(s_attr),
+        ]);
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        hop.args_r.borrow_mut().push(Some(
+            crate::translator::rtyper::rmodel::impossible_repr() as Arc<dyn Repr>
+        ));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+        *hop.r_result.borrow_mut() = Some(signed_repr() as Arc<dyn Repr>);
+
+        let out = repr
+            .rtype_getattr(&hop)
+            .expect("getattr __discriminant")
+            .expect("getfield result");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1, "one getfield, ops={:?}", ops.ops);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        assert_eq!(ops.ops[0].args.len(), 2);
+        let Hlvalue::Constant(cname) = &ops.ops[0].args[1] else {
+            panic!("getfield field name must be a constant");
+        };
+        assert_eq!(
+            cname.value,
+            ConstValue::byte_str("inst___discriminant"),
+            "discriminant read is an instance field, not typeptr or a vtable cls_ field"
+        );
+    }
+
+    #[test]
     fn instance_repr_pyerror_to_exc_object_emits_residual_direct_call() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInstance, SomeObject, SomeValue};
