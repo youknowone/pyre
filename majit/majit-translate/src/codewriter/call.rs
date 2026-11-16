@@ -8223,21 +8223,17 @@ impl CallControl {
             majit_ir::descr::ArrayFlag,
             majit_ir::value::Type,
         )> = None;
-        let mut layout_index_in_parent: Option<usize> = None;
         if let Some(ref layout) = layout {
             // `symbolic.get_field_token` of REALARRAY.OF — do not walk
             // TypeDecl TypeVar rows once the instantiated STRUCT has a layout.
-            let mut index_in_parent = 0usize;
             for fl in &layout.fields {
                 if fl.field_type == majit_ir::value::Type::Void || fl.name == "typeptr" {
                     continue;
                 }
                 if fl.name == field_name {
                     found_leaf = Some((fl.offset, fl.size, fl.flag, fl.field_type));
-                    layout_index_in_parent = Some(index_in_parent);
                     break;
                 }
-                index_in_parent += 1;
             }
         } else {
             let fields = self.struct_fields.fields.get(&elem_name)?;
@@ -8327,8 +8323,18 @@ impl CallControl {
             // `fielddescrof_concrete` uses, so the inner FieldDescr of
             // an interior access and the direct field access agree
             // (`descr.py`, one numberer per STRUCT).
-            let index_in_parent = layout_index_in_parent
-                .unwrap_or_else(|| field_pos_in(self, &elem_name, field_name));
+            // `heaptracker.py` `get_fielddescr_index_in` numbers flattened
+            // leaves. A nested Struct container (`Entry.key`) is not a leaf,
+            // but `rewrite_op_getinteriorfield` still encodes that field, so
+            // the mint must produce a descr. `field_pos_in` panics on the
+            // negative sentinel; pass no claim and let `get_field_descr`
+            // floor it.
+            let numbered =
+                crate::codewriter::heaptracker::is_header_word(self, &elem_name, field_name)
+                    || crate::codewriter::heaptracker::get_fielddescr_index_in(
+                        self, &elem_name, field_name, 0,
+                    ) >= 0;
+            let index_in_parent = numbered.then(|| field_pos_in(self, &elem_name, field_name));
             let load_is_acquire =
                 is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
             let store_is_release =
@@ -8346,9 +8352,7 @@ impl CallControl {
                 flag,
                 u32::MAX,
                 false,
-                // Always a claim: `field_pos_in` walks the owner's layout and
-                // panics rather than hand back an unnumbered field.
-                Some(index_in_parent),
+                index_in_parent,
                 load_is_acquire,
                 store_is_release,
             );
@@ -26692,6 +26696,123 @@ mod tests {
             ifd.array_descr().cache_key(),
             majit_ir::descr::path_hash(&dump_atid),
         );
+    }
+
+    /// `heaptracker.py get_fielddescr_index_in` numbers flattened non-Void
+    /// leaves. A two-leaf nested key (`hash`, `obj`) consumes 0 and 1, so
+    /// `f_valid`, `value`, `f_hash` are 2, 3, 4.
+    #[test]
+    fn interiorfielddescrof_keyed_nested_key_index_in_parent_is_recursive_census() {
+        let key_ty = "nested_key_index::ObjectKey";
+        let elem = "nested_key_index::Entry";
+        let atid = format!("GcArray<{elem}>");
+        let elem_sid = majit_ir::descr::StructId::from_canonical(elem);
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (elem.to_string(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([elem.to_string(), key_ty.to_string()]);
+        let key_layout = StructLayout::from_type_strings(
+            &key_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), key_layout.size)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), key_layout.align)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(key_ty.to_string(), key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(key_sid, key_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            let key = Struct::new(
+                key_ty,
+                vec![
+                    ("hash".into(), LowLevelType::Signed),
+                    ("obj".into(), GCREF.clone()),
+                ],
+            );
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    ("key".into(), LowLevelType::Struct(Box::new(key))),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        for (name, want) in [("f_valid", 2usize), ("value", 3), ("f_hash", 4)] {
+            let (descr, _) = cc
+                .interiorfielddescrof_keyed(
+                    1,
+                    &Some(atid.clone()),
+                    &Some(arr.clone()),
+                    name,
+                    None,
+                    None,
+                )
+                .expect(name);
+            assert_eq!(
+                descr
+                    .as_interior_field_descr()
+                    .expect("InteriorFieldDescr")
+                    .field_descr()
+                    .index_in_parent(),
+                want,
+                "{name}"
+            );
+        }
+        for (name, want) in [("hash", 0usize), ("obj", 1)] {
+            if let Some((descr, _)) = cc.interiorfielddescrof_keyed(
+                1,
+                &Some(atid.clone()),
+                &Some(arr.clone()),
+                name,
+                None,
+                None,
+            ) {
+                assert_eq!(
+                    descr
+                        .as_interior_field_descr()
+                        .expect("InteriorFieldDescr")
+                        .field_descr()
+                        .index_in_parent(),
+                    want,
+                    "{name}"
+                );
+            }
+        }
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

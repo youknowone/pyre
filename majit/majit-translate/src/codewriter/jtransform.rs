@@ -10883,6 +10883,7 @@ impl<'a> Transformer<'a> {
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
 
+
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
         // raw_store through it keeps that int base (`_gckind == 'raw'`).
@@ -10895,33 +10896,21 @@ impl<'a> Transformer<'a> {
                 field,
                 self.callcontrol.as_deref(),
             );
+            if gc || offset.is_err() {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]);
+            }
+            let offset = offset.expect("raw offset");
             let OpKind::FieldRead { base, .. } = &op.kind else {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
             };
-            match offset {
-                // `jtransform.py` `rewrite_op_getsubstruct` of the first nested
-                // struct of a GcStruct is the parent itself
-                // (`GcStruct._first_struct`); the result stays a Ref.
-                // A raw owner at offset 0 still goes through
-                // `rewrite_raw_substruct_address` so the result stays
-                // Signed (`cast_ptr_to_int` / int-bank identity).
-                Ok(0) if gc => return RewriteResult::Identity(base.clone()),
-                Ok(offset) if !gc => {
-                    return self.rewrite_raw_substruct_address(op, base, offset, graph);
-                }
-                // A nonzero interior of a GC object has no Ref-bank form:
-                // `rewrite_op_getsubstruct` refuses `_gckind == 'gc'`.
-                _ => {
-                    return RewriteResult::Replace(vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::Abort {
-                            kind: crate::model::UnknownKind::UnsupportedExpr {
-                                variant: crate::model::UnsupportedExprKind::RawAddr,
-                            },
-                        },
-                    }]);
-                }
-            }
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)` for
         // any field of a `_gckind == 'raw'` STRUCT. A Pointer field
@@ -22624,11 +22613,12 @@ mod tests {
     }
 
     /// `taken_by_address` of a FLAG_STRUCT at offset 0 of a GC owner
-    /// (`ObjectKey` at `Entry`+0). `jtransform.py rewrite_op_getsubstruct`
-    /// of `GcStruct._first_struct` is the parent pointer; the result stays
-    /// a Ref. The wide-inline GC arm used to plant `Abort { RawAddr }`.
+    /// (`ObjectKey` at `Entry`+0). `jtransform.py`
+    /// `Transformer.rewrite_op_getsubstruct` refuses every owner whose
+    /// `_gckind != 'raw'`, so a GC wide-inline borrow aborts with
+    /// `RawAddr`.
     #[test]
-    fn rewrite_op_getfield_gc_wide_inline_borrow_offset_zero_is_identity() {
+    fn rewrite_op_getfield_gc_wide_inline_borrow_offset_zero_aborts() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
         use crate::model::FieldDescriptor;
 
@@ -22759,30 +22749,12 @@ mod tests {
             .flat_map(|block| block.operations.iter())
             .collect();
         assert!(
-            ops.iter()
-                .all(|op| !matches!(op.kind, OpKind::Abort { .. })),
-            "offset-0 GC wide-inline borrow is the parent pointer, not Abort; ops={ops:?}"
-        );
-        assert!(
-            ops.iter().all(|op| !matches!(
+            ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::FieldRead { field, .. } if field.name == "key"
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
             )),
-            "taken_by_address key at offset 0 is identity, not a pointer load; ops={ops:?}"
-        );
-        let hash = ops.iter().find(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. } if field.name == "hash"
-            )
-        });
-        let hash_base = match &hash.expect("hash getfield").kind {
-            OpKind::FieldRead { base, .. } => base,
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            hash_base, &entry,
-            "hash is read off the outer object; ops={ops:?}"
+            "a GC wide-inline borrow aborts; ops={ops:?}"
         );
     }
 

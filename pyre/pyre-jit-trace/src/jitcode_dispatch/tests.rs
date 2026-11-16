@@ -1959,22 +1959,21 @@ fn a_handler_abort_is_not_a_later_resume_blocker() {
     assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
 }
 
-/// An `inline_call` whose descr does not resolve to a JitCode is still a
-/// call the blackhole executes (`bhimpl_inline_call_*` / `cpu.bh_call_*`).
-/// It is an effect, so a residual behind it is `blocker_after_effect`, not
-/// an unread region (`body_not_walked` is decode failure).
+/// An `inline_call` whose descr does not resolve to a JitCode is the same
+/// condition one level down: a callee the scan holds nothing about.  Falling
+/// through would read it as executing no effect and holding no blocker — the
+/// most permissive answer there is, reached by not looking — and would let the
+/// blocker behind it be classified as effect-free, which says a rewind covers
+/// it.
 #[test]
-fn an_inline_call_whose_callee_does_not_resolve_is_an_effect() {
+fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = inline_call_with_descr(7);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
-    assert!(
-        !summary.body_not_walked,
-        "a missing JitCode descr is an executed call, not an unread region"
-    );
+    assert!(summary.body_not_walked);
     assert_eq!(
         summary.blocker_effect_free, None,
         "an unresolved callee may have executed an effect, so nothing behind \

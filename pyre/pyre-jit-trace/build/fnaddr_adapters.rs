@@ -119,7 +119,11 @@ fn parse_abi(abi: &str) -> Option<(&str, char)> {
 }
 
 fn is_nonnull_adt(ty: &TyShape) -> bool {
-    matches!(ty, TyShape::Adt { path, .. } if path == NONNULL_PATH)
+    matches!(ty,
+        TyShape::Adt { path, args }
+            if path == NONNULL_PATH
+                && args.len() == 1
+                && !matches!(args.first(), Some(TyShape::Other)))
 }
 
 fn is_option_nonnull(ty: &TyShape) -> bool {
@@ -146,7 +150,9 @@ fn is_pyerror_adt(ty: &TyShape) -> bool {
 
 fn shape_fits_word(ty: &TyShape) -> bool {
     match ty {
-        TyShape::Bool | TyShape::Char | TyShape::Int { .. } | TyShape::RawPtr { .. } => true,
+        TyShape::Bool | TyShape::Char => true,
+        TyShape::Int { bits, .. } => *bits <= 64,
+        TyShape::RawPtr { sized: true, .. } => true,
         TyShape::Ref { sized: true, .. } => true,
         _ => is_nonnull_adt(ty) || is_option_nonnull(ty),
     }

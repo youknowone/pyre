@@ -714,7 +714,7 @@ fn ty_shape_from_json(
         return ty_shape_from_ref(r, llbc, depth);
     }
     if let Some(rp) = obj.get("RawPtr") {
-        return ty_shape_from_raw_ptr(rp);
+        return ty_shape_from_raw_ptr(rp, llbc, depth);
     }
     if let Some(items) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
         return if items.is_empty() {
@@ -838,15 +838,23 @@ fn ty_shape_from_ref(
 }
 
 #[cfg(feature = "mir-frontend")]
-fn ty_shape_from_raw_ptr(rp: &serde_json::Value) -> pipeline::TyShape {
+fn ty_shape_from_raw_ptr(
+    rp: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> pipeline::TyShape {
     let Some(arr) = rp.as_array() else {
+        return pipeline::TyShape::Other;
+    };
+    let Some(inner) = arr.get(0) else {
         return pipeline::TyShape::Other;
     };
     let mutable = arr
         .get(1)
         .and_then(serde_json::Value::as_str)
         .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
-    pipeline::TyShape::RawPtr { mutable }
+    let sized = !json_ty_is_unsized(inner, llbc, depth + 1);
+    pipeline::TyShape::RawPtr { mutable, sized }
 }
 
 #[cfg(feature = "mir-frontend")]
@@ -924,6 +932,15 @@ fn ty_shape_from_adt(
         Some(_) => return pipeline::TyShape::Other,
         None => {}
     }
+    // A TypeDecl whose `ptr_metadata` is not `None` is a DST; a one-word
+    // adapter cannot carry that metadata (`lltype.py` `getfunctionptr`).
+    if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64)
+        && llbc
+            .type_by_id(def_id)
+            .is_some_and(|td| adt_ptr_metadata_is_unsized(&td.ptr_metadata))
+    {
+        return pipeline::TyShape::Other;
+    }
     let path = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
         llbc.type_by_id(def_id).map(|td| td.item_meta.name_path())
     } else if let Some(path) = adt
@@ -972,6 +989,223 @@ fn adt_type_args(
         return map_types(types);
     }
     Vec::new()
+}
+
+#[cfg(all(test, feature = "mir-frontend"))]
+mod ty_shape_tests {
+    use super::ty_shape_from_json;
+    use crate::pipeline::TyShape;
+    use serde_json::{Value, json};
+
+    const NONNULL: &str = "core::ptr::non_null::NonNull";
+    const OPTION: &str = "core::option::Option";
+
+    fn llbc_from_json(v: Value) -> majit_charon_reader::Llbc {
+        let bytes = serde_json::to_vec(&v).expect("fixture serializes");
+        majit_charon_reader::Llbc::from_slice(&bytes).expect("fixture parses")
+    }
+
+    fn empty_llbc() -> majit_charon_reader::Llbc {
+        llbc_from_json(json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": { "crate_name": "c", "fun_decls": [] }
+        }))
+    }
+
+    fn type_decl(id: u64, name: &str, ptr_metadata: Value) -> Value {
+        json!({
+            "def_id": id,
+            "item_meta": {
+                "name": [{"Ident": [name, 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }},
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": []},
+            "ptr_metadata": ptr_metadata
+        })
+    }
+
+    fn llbc_with_decl(id: u64, name: &str, ptr_metadata: Value) -> majit_charon_reader::Llbc {
+        llbc_from_json(json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [],
+                "type_decls": [type_decl(id, name, ptr_metadata)]
+            }
+        }))
+    }
+
+    fn shape_of(ty: Value) -> TyShape {
+        ty_shape_from_json(Some(&ty), &empty_llbc(), 0)
+    }
+
+    fn int_ty(signed: bool, kind: &str) -> Value {
+        if signed {
+            json!({"Scalar": {"Integer": {"Signed": kind}}})
+        } else {
+            json!({"Scalar": {"Integer": {"Unsigned": kind}}})
+        }
+    }
+
+    fn raw_ptr(pointee: Value) -> Value {
+        json!({"RawPtr": [pointee, "Shared"]})
+    }
+
+    fn path_adt(path: &str, args: Vec<Value>) -> Value {
+        json!({"Adt": {"id": {"Path": path}, "generics": {"types": args}}})
+    }
+
+    #[test]
+    fn ty_shape_int_widths_include_i64_and_128() {
+        assert!(matches!(
+            shape_of(int_ty(true, "I64")),
+            TyShape::Int {
+                signed: true,
+                bits: 64
+            }
+        ));
+        assert!(matches!(
+            shape_of(int_ty(true, "I128")),
+            TyShape::Int {
+                signed: true,
+                bits: 128
+            }
+        ));
+        assert!(matches!(
+            shape_of(int_ty(false, "U128")),
+            TyShape::Int {
+                signed: false,
+                bits: 128
+            }
+        ));
+    }
+
+    #[test]
+    fn ty_shape_from_raw_ptr_records_pointee_sizedness() {
+        assert!(matches!(
+            shape_of(raw_ptr(int_ty(false, "U8"))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: true
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"Slice": [int_ty(false, "U8")]}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"Adt": {"builtin": "Str"}}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"DynTrait": {}}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+    }
+
+    #[test]
+    fn ty_shape_from_adt_maps_a_nominal_dst_to_other() {
+        let dst = llbc_with_decl(0, "Dst", json!("Length"));
+        let thin = llbc_with_decl(0, "Thin", json!("None"));
+        assert!(matches!(
+            ty_shape_from_json(Some(&json!({"Adt": {"id": 0}})), &dst, 0),
+            TyShape::Other
+        ));
+        assert!(matches!(
+            ty_shape_from_json(Some(&json!({"Adt": {"id": 0}})), &thin, 0),
+            TyShape::Adt { path, args }
+                if path == "Thin" && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ty_shape_nonnull_and_option_args_preserve_pointee_shape() {
+        let sized = path_adt(NONNULL, vec![int_ty(false, "U8")]);
+        assert!(matches!(
+            shape_of(sized.clone()),
+            TyShape::Adt { path, args }
+                if path == NONNULL
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Int {
+                            signed: false,
+                            bits: 8
+                        }]
+                    )
+        ));
+        assert!(matches!(
+            shape_of(path_adt(OPTION, vec![sized])),
+            TyShape::Adt { path, args }
+                if path == OPTION
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Adt { path: inner, args: inner_args }]
+                            if inner == NONNULL
+                                && matches!(
+                                    inner_args.as_slice(),
+                                    [TyShape::Int {
+                                        signed: false,
+                                        bits: 8
+                                    }]
+                                )
+                    )
+        ));
+
+        let slice = json!({"Slice": [int_ty(false, "U8")]});
+        let unsized_nn = path_adt(NONNULL, vec![slice.clone()]);
+        assert!(matches!(
+            shape_of(unsized_nn.clone()),
+            TyShape::Adt { path, args }
+                if path == NONNULL && matches!(args.as_slice(), [TyShape::Other])
+        ));
+        assert!(matches!(
+            shape_of(path_adt(OPTION, vec![unsized_nn])),
+            TyShape::Adt { path, args }
+                if path == OPTION
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Adt { path: inner, args: inner_args }]
+                            if inner == NONNULL
+                                && matches!(inner_args.as_slice(), [TyShape::Other])
+                    )
+        ));
+
+        let dst = llbc_with_decl(0, "Dst", json!("Length"));
+        let nn_dst = json!({
+            "Adt": {
+                "id": {"Path": NONNULL},
+                "generics": {"types": [{"Adt": {"id": 0}}]}
+            }
+        });
+        assert!(matches!(
+            ty_shape_from_json(Some(&nn_dst), &dst, 0),
+            TyShape::Adt { path, args }
+                if path == NONNULL && matches!(args.as_slice(), [TyShape::Other])
+        ));
+    }
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
