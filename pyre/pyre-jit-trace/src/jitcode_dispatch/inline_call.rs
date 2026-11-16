@@ -17821,13 +17821,12 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// `resume_py_pc`.
 ///
 /// A dispatch-loop body (`has_shared_dispatch_merge`, true for a
-/// single-case body too) resumes the same way a plain-portal FunctionEntry
-/// does: `merge_entry_for` names the shared `PyFrame.dispatch` head, and
-/// `static_entry_merge_point` (`warmspot.py split_before_jit_merge_point`)
-/// advances past the `get_is_being_profiled` diamond to the
-/// `jit_merge_point`. Tracing starts there with the greens as constants;
-/// locals and stack are read from the frame virtualizable
-/// (`interp_jit.py PyFrame.dispatch`, `opimpl_jit_merge_point`).
+/// single-case body too) resumes at the start of the shared
+/// `PyFrame.dispatch` head: the walk reads
+/// `is_being_profiled = self.get_is_being_profiled()` off the generator
+/// frame and promotes it (`jtransform.py promote_greens`) before
+/// `jit_merge_point`, then switches on `next_instr`. Locals and stack are
+/// seeded from the frame virtualizable slots live at the head `-live-`.
 ///
 /// A body without a shared dispatch merge keeps the instruction-start first
 /// op (or `derive_resume_marker` at-or-before `-live-`) as the walk entry.
@@ -17836,13 +17835,11 @@ fn generator_resume_marker_offset(
     resume_py_pc: usize,
 ) -> Option<usize> {
     if pjc.metadata.has_shared_dispatch_merge() {
-        let off = pjc.merge_entry_for(resume_py_pc)?;
-        return crate::trace::static_entry_merge_point(
-            pjc.jitcode.code.as_slice(),
-            pjc.loop_scan(),
-            off,
-        )
-        .map(|m| m.pc);
+        let merge = pjc.merge_entry_for(resume_py_pc)?;
+        // The head's first range starts at its `-live-`, ahead of the
+        // `get_is_being_profiled` diamond that joins the merge.
+        let head = pjc.metadata.dispatch_head_by_jit_pc.first()?.0 as usize;
+        return (head < merge).then_some(head);
     }
     let metadata = &pjc.metadata;
     let n_py = metadata.n_py_instrs as usize;
@@ -19380,10 +19377,9 @@ fn walk_generator_resume<Sym: WalkSym>(
         // `[next_instr, is_being_profiled, pycode]`. A function CALL
         // enters at bytecode 0; this resume enters at `resume_py_pc`.
         let is_being_profiled = live_frame_is_being_profiled(ctx);
-        // `warmspot.py split_before_jit_merge_point`: seed the Int greens
-        // `gi` = `[next_instr, is_being_profiled]` the merge lists, as
-        // `try_walker_inline_resolved_user_call_inner` does at function
-        // entry. This resume's `next_instr` is `resume_py_pc`.
+        // Seed the `next_instr` Int green (`gi[0]` of the merge after the
+        // head) with `resume_py_pc`. `is_being_profiled` (`gi[1]`) is
+        // computed by the head's `get_is_being_profiled` diamond.
         let extra_int_seeds: Vec<(usize, OpRef, ConcreteValue)> =
             crate::trace::static_entry_merge_point_green_regs(
                 body.code,
@@ -19391,7 +19387,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 resume_marker,
             )
             .map(|gi| {
-                let values = [resume_py_pc as i64, is_being_profiled as i64];
+                let values = [resume_py_pc as i64];
                 gi.iter()
                     .zip(values)
                     .map(|(&color, value)| {
