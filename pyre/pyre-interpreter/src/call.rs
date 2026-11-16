@@ -7146,8 +7146,8 @@ pub(crate) fn real_build_class_args(
 }
 
 fn real_build_class_from(
-    mut body_fn: PyObjectRef,
-    mut name_obj: PyObjectRef,
+    body_fn: PyObjectRef,
+    name_obj: PyObjectRef,
     base_args: &[PyObjectRef],
     kwds_dict: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -7164,82 +7164,76 @@ fn real_build_class_from(
 
     // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
     //
-    // The class-definition keywords are collected into a fresh dict that only
-    // `build_class_inner` consumes, so the guard is opened before the arm that
-    // fills it: `update_bases` and both `w_tuple_new` calls run between the
-    // two, and a guard scoped to the arm would unpin the dict across them.
-    // `build_class_inner` re-pins its own parameter copy. A class statement
-    // without keywords opens no scope at all — `pin_root` is
-    // `dont_look_inside`, so an unconditional one would residualise in every
-    // traced class body.
-    // Open the keyword-dict bracket in this function, not in a `map`
-    // closure: `compiling.py build_class` roots `kwds_w` on `build_class`
-    // itself, and a generated `FnOnce` would own a `push_roots` that cannot
-    // see the collections below.
-    let extra_roots = if kwds_dict.is_some() {
-        Some(pyre_object::gc_roots::push_roots())
-    } else {
-        None
-    };
-    let (metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
-        {
-            let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
-            let extra_slot = extra_roots.base();
-            let w_metaclass = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") };
-            // Collect extra kwargs (not metaclass).
-            // `w_dict_items` already dispatches `is_module_dict` so a
-            // class statement with `**module_dict` (rare but valid)
-            // walks the strategy.
-            // Born young, and `w_dict_store` allocates on strategy promotion —
-            // the bracket in `call_with_kwargs`.
-            let _ = extra_roots.pin_root(pyre_object::w_dict_new());
-            unsafe {
-                for (k, v) in pyre_object::w_dict_items(last) {
-                    if pyre_object::is_str(k) {
-                        let key = pyre_object::w_str_get_wtf8(k).as_str();
-                        if key != Ok("metaclass") {
-                            pyre_object::w_dict_store(extra_roots.get(extra_slot), k, v);
-                        }
-                    }
+    // `compiling.py build_class` keeps `w_func`, `w_name`, `bases_w` and
+    // `kwds_w` live across `space.newtuple`, `__mro_entries__`, `__prepare__`
+    // and the metaclass call, all of which can collect. One scope roots them
+    // here: the body function, the name, the keyword dict and every base are
+    // published in one run, and each use below reads its slot back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let n_bases = base_args.len();
+    let mut live = Vec::with_capacity(3 + n_bases);
+    live.push(body_fn);
+    live.push(name_obj);
+    live.push(kwds_dict.unwrap_or(pyre_object::PY_NULL));
+    live.extend_from_slice(base_args);
+    let base = roots.pin_roots(&live);
+    let body_fn_slot = base;
+    let name_slot = base + 1;
+    let kwds_slot = base + 2;
+    let args_base = base + 3;
+    let base_args_now =
+        || -> Vec<PyObjectRef> { (0..n_bases).map(|i| roots.get(args_base + i)).collect() };
+
+    // `metaclass` is taken out of the keywords; the rest go into a fresh dict
+    // that only `build_class_inner` consumes. `w_dict_new` and `w_dict_store`
+    // allocate, so the metaclass value and every key/value of the snapshot are
+    // published before the first of them and read back from their slots.
+    let (meta_slot, extra_slot) = if kwds_dict.is_some() {
+        let w_metaclass =
+            unsafe { pyre_object::w_dict_getitem_str(roots.get(kwds_slot), "metaclass") };
+        let meta_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_metaclass.unwrap_or(pyre_object::PY_NULL));
+        let items = unsafe { pyre_object::w_dict_items(roots.get(kwds_slot)) };
+        let n_items = items.len();
+        let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+        let items_base = roots.pin_roots(&flat);
+        let extra_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        for i in 0..n_items {
+            let k = roots.get(items_base + 2 * i);
+            if unsafe { pyre_object::is_str(k) } {
+                let key = unsafe { pyre_object::w_str_get_wtf8(k) }.as_str();
+                if key != Ok("metaclass") {
+                    unsafe {
+                        pyre_object::w_dict_store(
+                            roots.get(extra_slot),
+                            k,
+                            roots.get(items_base + 2 * i + 1),
+                        )
+                    };
                 }
             }
-            (w_metaclass, Some(extra_roots.get(extra_slot)))
         }
+        (Some(meta_slot), Some(extra_slot))
     } else {
         (None, None)
     };
 
     // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
     // is `UnicodeEncodeError` ("surrogates not allowed").
-    let name =
-        pyre_object::with_roots!(body_fn, name_obj => crate::baseobjspace::str_utf8_w(name_obj))?;
+    let name = crate::baseobjspace::str_utf8_w(roots.get(name_slot))?;
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
-    //
-    // Neither tuple has a referrer besides this frame's Rust locals until
-    // `w_type_new` stores the resolved one into `W_TypeObject.bases`, and
-    // `__mro_entries__`, `__prepare__`, the class body and the metaclass call
-    // all run in between.  A tuple is nursery-allocated, so a raw copy goes
-    // stale as soon as one of those collects, and an unreferenced one is
-    // swept besides; every use below therefore reads its slot back, and both
-    // slots stay pinned until `build_class_inner`, the one consumer, returns.
-    let bases_roots = pyre_object::gc_roots::push_roots();
-    let orig_bases_slot = bases_roots.base();
-    let _ = bases_roots.pin_root(pyre_object::w_tuple_new(base_args.to_vec()));
+    let orig_bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_tuple_new(base_args_now()));
     let (resolved_bases, bases_changed) =
-        update_bases(base_args, bases_roots.get(orig_bases_slot))?;
+        update_bases(&base_args_now(), roots.get(orig_bases_slot))?;
     // Non-type bases are not rejected here: `__build_class__` hands the
     // resolved tuple to whichever metaclass was selected, and a metaclass
     // that is not a type may legitimately accept them.  `best_base` performs
     // the `bases must be types` check on the type-construction path.
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = bases_roots.pin_root(pyre_object::w_tuple_new(resolved_bases));
-    let bases_tuple = bases_roots.get(bases_slot);
-    let w_orig_bases = if bases_changed {
-        Some(bases_roots.get(orig_bases_slot))
-    } else {
-        None
-    };
+    let _ = roots.pin_root(pyre_object::w_tuple_new(resolved_bases));
 
     // compiling.py:169-183 — choose the initial metaclass from the first
     // resolved base (or `type` for an empty base list), then run
@@ -7252,12 +7246,16 @@ fn real_build_class_from(
     // winner, so `build_class_inner` can retain its raw default construction
     // path without changing the app-level algorithm.
     let w_type_type = crate::typedef::w_type();
+    let metaclass = meta_slot
+        .map(|slot| roots.get(slot))
+        .filter(|w_meta| !w_meta.is_null());
     let w_metaclass = match metaclass {
         Some(w_meta) if unsafe { pyre_object::is_type(w_meta) } => {
-            Some(calculate_metaclass(w_meta, bases_tuple)?)
+            Some(calculate_metaclass(w_meta, roots.get(bases_slot))?)
         }
         Some(w_meta) => Some(w_meta),
         None => {
+            let bases_tuple = roots.get(bases_slot);
             let initial = unsafe {
                 pyre_object::w_tuple_getitem(bases_tuple, 0)
                     .and_then(crate::typedef::r#type)
@@ -7274,15 +7272,12 @@ fn real_build_class_from(
     };
 
     build_class_inner(
-        body_fn,
+        roots.get(body_fn_slot),
         name,
-        bases_tuple,
+        roots.get(bases_slot),
         w_metaclass,
-        extra_kwargs.map(|_| {
-            let roots = extra_roots.as_ref().expect("opened for a kwargs dict");
-            roots.get(roots.base())
-        }),
-        w_orig_bases,
+        extra_slot.map(|slot| roots.get(slot)),
+        bases_changed.then(|| roots.get(orig_bases_slot)),
     )
 }
 
