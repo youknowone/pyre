@@ -7390,9 +7390,10 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
     }
 }
 
-/// `slot -> Variable.id` of the dispatch-loop head's locals and stack
-/// (`setup_dispatch_loop` builds them from frame slot indices). Same
-/// snapshot shape as the per-PC `pcdep_slot_var_resume` capture.
+/// `slot -> Variable.id` of one dispatch-head block's locals and stack
+/// (`setup_dispatch_loop` builds the head and merge-join states from
+/// frame slot indices; later head blocks copy into fresh Variables).
+/// Same snapshot shape as the per-PC `pcdep_slot_var_resume` capture.
 fn frame_state_slot_vars(state: &FrameState) -> Vec<(u16, u32)> {
     let mut snap = Vec::new();
     let nloc = state.locals_w.len();
@@ -7409,9 +7410,10 @@ fn frame_state_slot_vars(state: &FrameState) -> Vec<(u16, u32)> {
     snap
 }
 
-/// Color a compact `[locals | stack]` slot→Variable snapshot. Head
-/// Variables are live by construction (`setup_dispatch_loop` union), so
-/// this does not gate on the graph live-oracle the per-PC map uses.
+/// Color a compact `[locals | stack]` slot→Variable snapshot. Each
+/// head block's Variables are live by construction (`setup_dispatch_loop`
+/// union, then copies), so this does not gate on the graph live-oracle
+/// the per-PC map uses.
 fn color_slot_var_snapshot(
     snap: &[(u16, u32)],
     colorings: [&crate::jit::regalloc::Coloring; 3],
@@ -16575,12 +16577,26 @@ impl CodeWriter {
             .iter()
             .map(surviving_graph_block)
             .collect();
-        // Head `-live-` is the union of instruction-start locals/stack
-        // (`setup_dispatch_loop`). Per-PC trivia floors those bytes to py 0,
-        // which has an empty color→slot map; publish the head's own map so a
-        // generator resume that enters at the `jit_merge_point` can seed
-        // every live Ref, null slots included (`PyFrame.dispatch`).
-        let head_slot_var: Vec<(u16, u32)> = frame_state_slot_vars(&dispatch_loop.merge_join_state);
+        // Each head block carries its own FrameState: `setup_dispatch_loop`
+        // builds the head and merge-join states, and the profiled diamond /
+        // `bytecode_only_trace` arm copy theirs into fresh Variables.
+        // `flatten.py insert_renamings` may color a link's source and target
+        // differently, so the color→slot map is per block. A block that
+        // `remove_trivial_links` folded into its predecessor no longer owns
+        // a label and is skipped.
+        let head_block_slot_vars: Vec<(super::flow::BlockRef, Vec<(u16, u32)>)> =
+            [dispatch_loop.head.clone(), dispatch_loop.merge_join.clone()]
+                .into_iter()
+                .chain(all_walker_blocks[first_head_walker_block..].iter().cloned())
+                .filter_map(|spam| {
+                    let block = spam.block();
+                    if surviving_graph_block(&block).as_ptr_addr() != block.as_ptr_addr() {
+                        return None;
+                    }
+                    let state = spam.framestate()?;
+                    Some((block, frame_state_slot_vars(&state)))
+                })
+                .collect();
 
         // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
         // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py`) into the
@@ -17157,24 +17173,31 @@ impl CodeWriter {
                     .collect()
             })
             .collect();
-        let head_pcdep: Vec<(u8, u16, u16)> = color_slot_var_snapshot(
-            &head_slot_var,
-            [
-                &splice_regallocs[Kind::Int.index()].coloring,
-                &splice_regallocs[Kind::Ref.index()].coloring,
-                &splice_regallocs[Kind::Float.index()].coloring,
-            ],
-            &alloc_result.rename,
-        )
-        .into_iter()
-        .map(|(bank, color, slot)| {
-            (
-                bank,
-                color,
-                frame_layout_slot(slot, nlocals, stack_base_absolute),
-            )
-        })
-        .collect();
+        let head_block_pcdep: Vec<(super::flow::BlockRef, Vec<(u8, u16, u16)>)> =
+            head_block_slot_vars
+                .iter()
+                .map(|(block, snap)| {
+                    let entries = color_slot_var_snapshot(
+                        snap,
+                        [
+                            &splice_regallocs[Kind::Int.index()].coloring,
+                            &splice_regallocs[Kind::Ref.index()].coloring,
+                            &splice_regallocs[Kind::Float.index()].coloring,
+                        ],
+                        &alloc_result.rename,
+                    )
+                    .into_iter()
+                    .map(|(bank, color, slot)| {
+                        (
+                            bank,
+                            color,
+                            frame_layout_slot(slot, nlocals, stack_base_absolute),
+                        )
+                    })
+                    .collect();
+                    (block.clone(), entries)
+                })
+                .collect();
         for entries in &mut const_ref_slots_at_pc {
             for (slot, _) in entries {
                 *slot = frame_layout_slot(*slot, nlocals, stack_base_absolute);
@@ -17222,7 +17245,7 @@ impl CodeWriter {
             num_regs,
             result_color_at_pc,
             pcdep_color_slots,
-            head_pcdep,
+            head_block_pcdep,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
             &dispatch_head_block,
@@ -17302,7 +17325,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
-        head_pcdep: Vec<(u8, u16, u16)>,
+        head_block_pcdep: Vec<(super::flow::BlockRef, Vec<(u8, u16, u16)>)>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
         dispatch_head: &super::flow::BlockRef,
@@ -17390,6 +17413,20 @@ impl CodeWriter {
                 combined_indices.push(end_idx);
             }
         }
+        let head_block_range_base = combined_indices.len();
+        let mut head_block_range_meta: Vec<(usize, bool)> = Vec::new();
+        for (k, (block, _)) in head_block_pcdep.iter().enumerate() {
+            for (start_idx, end_idx) in
+                labeled_block_insn_ranges(&ssarepr, std::slice::from_ref(block))
+            {
+                combined_indices.push(start_idx);
+                let has_end = end_idx.is_some();
+                if let Some(end_idx) = end_idx {
+                    combined_indices.push(end_idx);
+                }
+                head_block_range_meta.push((k, has_end));
+            }
+        }
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -17424,6 +17461,25 @@ impl CodeWriter {
             }
             merged
         };
+        let mut head_block_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        {
+            let mut cursor = head_block_range_base;
+            for &(owner, has_end) in &head_block_range_meta {
+                let start = combined_bytes[cursor];
+                cursor += 1;
+                let end = if has_end {
+                    let end = combined_bytes[cursor];
+                    cursor += 1;
+                    end
+                } else {
+                    jitcode.code.len()
+                };
+                if start < end {
+                    head_block_ranges.push((start, end, owner));
+                }
+            }
+            head_block_ranges.sort_unstable_by_key(|&(start, _, _)| start);
+        }
         let dispatch_head_off =
             dispatch_head_insn.map(|_| combined_bytes[dispatch_head_index_slot]);
         let dispatch_switch_pc =
@@ -18198,25 +18254,21 @@ impl CodeWriter {
                 },
             );
             // Instruction-start `-live-` trivia is keyed by opcode py_pc.
-            // Head bytes use offset -1 and would floor to py 0; record the
-            // head's locals/stack coloring the same way so
+            // Head bytes use offset -1 and would floor to py 0; each head
+            // block publishes its own locals/stack coloring so
             // `pcdep_trivia_at` at the `jit_merge_point` names every live
             // Ref (`setup_dispatch_loop`).
-            if !head_pcdep.is_empty() {
-                let head_ranges: Vec<(usize, usize, usize)> = dispatch_head_by_jit_pc
-                    .iter()
-                    .map(|&(start, end)| (start as usize, end as usize, 0))
-                    .collect();
+            if !head_block_ranges.is_empty() {
                 Self::override_predecessor_twin_ranges(
                     &mut pcdep_trivia_pred_by_jit_pc,
-                    &head_ranges,
-                    |_| head_pcdep.clone(),
+                    &head_block_ranges,
+                    |owner| head_block_pcdep[owner].1.clone(),
                 );
-                for &(start, _) in &dispatch_head_by_jit_pc {
+                for &(start, _, owner) in &head_block_ranges {
                     Self::upsert_predecessor_twin(
                         &mut pcdep_trivia_marker_by_jit_pc,
-                        start as usize,
-                        head_pcdep.clone(),
+                        start,
+                        head_block_pcdep[owner].1.clone(),
                     );
                 }
             }
