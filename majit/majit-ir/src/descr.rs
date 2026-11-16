@@ -821,7 +821,7 @@ pub fn register_struct_ids(table: std::collections::HashMap<String, Option<Struc
 
 /// `raw` without its leading reference / raw-pointer markers: each of
 /// `*const `, `*mut `, `&mut `, `&` repeated, in that order, then trimmed.
-fn strip_pointer_markers(raw: &str) -> &str {
+pub fn strip_pointer_markers(raw: &str) -> &str {
     fn strip_repeated<'a>(mut s: &'a str, prefix: &str) -> &'a str {
         while let Some(rest) = s.strip_prefix(prefix) {
             s = rest;

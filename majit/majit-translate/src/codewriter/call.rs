@@ -6474,15 +6474,25 @@ impl CallControl {
         is_known_by_value_struct(&self.known_struct_names, name)
     }
 
-    /// Field-row owner for ARRAY.OF. Prefer a harvested instantiation
-    /// (`get_ll_dict` DICTENTRY) when interned OF kept `<K,V>`. The
-    /// TypeDecl template is used only when both the instantiation and the
-    /// template have registered layouts with equal `size`, `align`,
-    /// `gckind` and `fields` (`get_interiorfield_descr` keys on ARRAY.OF).
+    /// Field-row owner for ARRAY.OF. `rordereddict.py` `get_ll_dict` mints
+    /// one DICTENTRY per `(DICTKEY, DICTVALUE)`. Interned ARRAY.OF names a
+    /// key by its ClassDef identity while harvested field rows use the CAST
+    /// leaf, so each type argument is rewritten to that leaf with leading
+    /// pointer markers kept, and accepted only when
+    /// [`majit_ir::descr::struct_id_for_name`] of the original and rewritten
+    /// spellings agree. The TypeDecl template is used only when both the
+    /// instantiation and the template have registered layouts with equal
+    /// `size`, `align`, `gckind` and `fields` (`get_interiorfield_descr`
+    /// keys on ARRAY.OF).
     fn array_of_field_owner(&self, elem_name: &str) -> Option<String> {
         let compact = elem_name.replace(", ", ",");
         if self.struct_fields.fields.contains_key(&compact) {
             return Some(compact);
+        }
+        if let Some(rewritten) = self.rewrite_array_of_field_owner_args(&compact)
+            && self.struct_fields.fields.contains_key(&rewritten)
+        {
+            return Some(rewritten);
         }
         let template = majit_ir::descr::strip_generic_args(&compact);
         if template.as_ref() != compact.as_str()
@@ -6500,6 +6510,48 @@ impl CallControl {
             return None;
         }
         None
+    }
+
+    /// Rewrite each top-level generic argument: split off leading pointer
+    /// markers (`*const `, `*mut `, `&mut `, `&`, repeated), apply
+    /// [`majit_ir::descr::class_root_leaf`] to the remainder, and re-prepend
+    /// the markers. A changed argument is accepted only when
+    /// [`majit_ir::descr::struct_id_for_name`] of the original and rewritten
+    /// spellings are both `Some` and equal; otherwise the rewrite is `None`.
+    fn rewrite_array_of_field_owner_args(&self, compact: &str) -> Option<String> {
+        let span = majit_ir::descr::generic_args_span(compact)?;
+        let start = compact.find('<')?;
+        let inner = span.strip_prefix('<')?.strip_suffix('>')?;
+        let args = crate::front::mir::split_top_level_type_args(inner);
+        let mut rewritten = Vec::with_capacity(args.len());
+        for arg in args {
+            let remainder = majit_ir::descr::strip_pointer_markers(arg);
+            let markers = if remainder.is_empty() {
+                ""
+            } else {
+                match arg.find(remainder) {
+                    Some(pos) => &arg[..pos],
+                    None => "",
+                }
+            };
+            let new_arg = format!("{}{}", markers, majit_ir::descr::class_root_leaf(remainder));
+            if new_arg != arg {
+                let orig_id = majit_ir::descr::struct_id_for_name(arg);
+                let new_id = majit_ir::descr::struct_id_for_name(&new_arg);
+                match (orig_id, new_id) {
+                    (Some(a), Some(b)) if a == b => {}
+                    _ => return None,
+                }
+            }
+            rewritten.push(new_arg);
+        }
+        let end = start + span.len();
+        Some(format!(
+            "{}<{}>{}",
+            &compact[..start],
+            rewritten.join(","),
+            &compact[end..]
+        ))
     }
 
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
@@ -26071,6 +26123,266 @@ mod tests {
             assert_eq!(narrow_ifd.array_descr().item_size(), 32);
             assert_eq!(wide_ifd.array_descr().item_size(), 40);
         }
+    }
+
+    /// Interned ARRAY.OF names the key by ClassDef identity
+    /// (`Entry<keymod::WideKey,*mut PyObject>`); field rows are the CAST
+    /// leaf (`Entry<WideKey,*mut PyObject>`). `get_ll_dict` mints one
+    /// DICTENTRY per `(DICTKEY, DICTVALUE)`, so `f_valid` is the
+    /// instantiation offset. A name with no row does not fall back to
+    /// the template.
+    #[test]
+    fn interiorfielddescrof_interned_class_identity_arg_finds_leaf_row() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let interned_elem = format!("{template}<keymod::{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{interned_elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+                ("keymod::WideKey".to_string(), Some(key_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let template_valid = template_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("template f_valid")
+            .offset;
+        let inst_valid = inst_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("instantiation f_valid")
+            .offset;
+        assert_eq!(template_valid, 8);
+        assert_eq!(inst_valid, 16);
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        assert_eq!(
+            cc.array_of_field_owner(&interned_elem).as_deref(),
+            Some(elem.as_str())
+        );
+        assert_eq!(
+            cc.array_of_field_owner(
+                "rordereddict_entries::Entry<keymod::MissingKey,*mut PyObject>"
+            ),
+            None
+        );
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                interned_elem.as_str(),
+                vec![
+                    ("key".into(), LowLevelType::Signed),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            .expect("interned interior field descr");
+        let offset = descr
+            .as_interior_field_descr()
+            .expect("InteriorFieldDescr")
+            .field_descr()
+            .offset();
+        assert_eq!(offset, inst_valid);
+        assert_ne!(offset, template_valid);
+    }
+
+    /// Interned ARRAY.OF names `keymod::WideKey` while the CAST leaf row
+    /// is `WideKey`; the two spellings resolve to different StructIds, so
+    /// the rewrite must not take that leaf row (`get_interiorfield_descr`
+    /// keys on the ARRAY.OF type object).
+    #[test]
+    fn interiorfielddescrof_interned_arg_of_other_declaration_does_not_take_leaf_row() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let interned_elem = format!("{template}<keymod::{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{interned_elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let other_sid = majit_ir::descr::StructId::from_canonical("keymod::WideKey");
+        assert_ne!(other_sid, key_sid);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+                ("keymod::WideKey".to_string(), Some(other_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let inst_valid = inst_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("instantiation f_valid")
+            .offset;
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        assert_ne!(
+            cc.array_of_field_owner(&interned_elem).as_deref(),
+            Some(elem.as_str())
+        );
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                interned_elem.as_str(),
+                vec![
+                    ("key".into(), LowLevelType::Signed),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        match cc.interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid") {
+            None => {}
+            Some((descr, _)) => {
+                let offset = descr
+                    .as_interior_field_descr()
+                    .expect("InteriorFieldDescr")
+                    .field_descr()
+                    .offset();
+                assert_ne!(offset, inst_valid);
+            }
+        }
+    }
+
+    /// `Entry<*mut keymod::WideKey,*mut PyObject>` keeps the `*mut `
+    /// marker on the rewritten leaf when the two spellings share a
+    /// StructId (`strip_pointer_markers`).
+    #[test]
+    fn interiorfielddescrof_interned_pointer_arg_keeps_markers() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<*mut {key_ty},*mut PyObject>");
+        let interned_elem = format!("{template}<*mut keymod::{key_ty},*mut PyObject>");
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (key_ty.to_string(), Some(key_sid)),
+                ("keymod::WideKey".to_string(), Some(key_sid)),
+            ]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            elem.clone(),
+            vec![
+                ("key".into(), format!("*mut {key_ty}")),
+                ("f_valid".into(), "bool".into()),
+                ("value".into(), "*mut PyObject".into()),
+                ("f_hash".into(), "u64".into()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        assert_eq!(
+            cc.array_of_field_owner(&interned_elem).as_deref(),
+            Some(elem.as_str())
+        );
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

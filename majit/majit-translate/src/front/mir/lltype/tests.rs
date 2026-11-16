@@ -16156,6 +16156,32 @@ fn entry_instantiation_splits_key_class() {
 }
 
 #[test]
+fn entry_struct_instantiation_suffix_keeps_unit_value() {
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            code_struct(0, &["pyre_object", "rordereddict_entries", "Entry"]),
+            code_struct(1, &["pyre_object", "dictmultiobject", "ObjectKey"]),
+        ],
+        vec![],
+    );
+    let key = named_adt(1, vec![]);
+    let unit = serde_json::json!({"Tuple": []});
+    let node = named_adt(0, vec![key, unit]);
+    let adt = node.get("Adt").and_then(|v| v.as_object()).expect("Adt");
+    assert_eq!(
+        super::entry_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::Entry",
+            adt,
+            &llbc,
+            &std::collections::HashSet::new(),
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
+    );
+}
+
+#[test]
 fn gc_entries_instantiation_splits_key_class() {
     let llbc = llbc_with_types(
         "pyre_object",
@@ -16398,6 +16424,32 @@ fn entry_family_holder_instantiation_splits_key_class() {
             &tomb,
         ),
         None
+    );
+}
+
+#[test]
+fn gc_entries_struct_instantiation_suffix_keeps_unit_value() {
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            code_struct(0, &["pyre_object", "rordereddict_entries", "GcEntries"]),
+            code_struct(1, &["pyre_object", "dictmultiobject", "ObjectKey"]),
+        ],
+        vec![],
+    );
+    let key = named_adt(1, vec![]);
+    let unit = serde_json::json!({"Tuple": []});
+    let node = named_adt(0, vec![key, unit]);
+    let adt = node.get("Adt").and_then(|v| v.as_object()).expect("Adt");
+    assert_eq!(
+        super::gc_entries_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::GcEntries",
+            adt,
+            &llbc,
+            &std::collections::HashSet::new(),
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
     );
 }
 
