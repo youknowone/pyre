@@ -23238,8 +23238,9 @@ mod tests {
         };
         // `value` is a plain `*mut PyObject`; `key` is
         // `repr(transparent)` over that same pointer (`identitydict.py`).
-        // `lltype.py` `_interior_ptr._expose` of a Ptr field is the
-        // pointer, so both getattrs intern the same way.
+        // `field_row_lltype` intern's a classed instance pointer as
+        // `rclass.py` `OBJECTPTR` (`InstanceRepr.lowleveltype`);
+        // `lltype.py` `SomePtr.getattr` of that field stays SomePtr.
         let s_key = getattr_entry(&field_attr("key")).expect("SomePtr.getattr key of DICTENTRY");
         let s_value =
             getattr_entry(&field_attr("value")).expect("SomePtr.getattr value of DICTENTRY");
@@ -23282,19 +23283,22 @@ mod tests {
             key_ll, value_ll,
             "ITEM key lltype equals the value field lltype, dest={s_entry:?}, item={item}"
         );
-        match (&s_key, &s_value) {
-            (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
+        let objectptr = |s: &SomeValue, which: &str| match s {
+            SomeValue::Ptr(p) => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                use crate::translator::rtyper::rclass::OBJECTPTR;
                 assert_eq!(
-                    a.ll_ptrtype, b.ll_ptrtype,
-                    "getattr key and value intern the same pointer, dest={s_entry:?}, item={item}"
+                    LowLevelType::from(p.ll_ptrtype.clone()),
+                    *OBJECTPTR,
+                    "getattr {which} stays SomePtr(OBJECTPTR), dest={s_entry:?}, item={item}"
                 );
             }
-            (SomeValue::Instance(_), SomeValue::Instance(_)) => {}
-            (k, v) => panic!(
-                "getattr key and value must annotate the same way, key={k:?} value={v:?}, \
-                 dest={s_entry:?}, item={item}"
+            other => panic!(
+                "getattr {which} stays SomePtr(OBJECTPTR), got {other:?}, dest={s_entry:?}, item={item}"
             ),
-        }
+        };
+        objectptr(&s_key, "key");
+        objectptr(&s_value, "value");
         assert_eq!(
             s_key_proj.tag(),
             s_value_proj.tag(),

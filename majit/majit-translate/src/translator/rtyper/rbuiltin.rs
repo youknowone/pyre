@@ -3482,6 +3482,12 @@ pub fn rtype_cast_instance_to_base_ptr(
             lltype,
         ))));
     }
+    if !matches!(r_arg.lowleveltype(), LowLevelType::Ptr(_)) {
+        return Err(TyperError::message(format!(
+            "rtype_cast_instance_to_base_ptr: argument lowleveltype is not a Ptr, got {:?}",
+            r_arg.lowleveltype()
+        )));
+    }
     let v_arg = hop.inputarg(r_arg.as_ref(), 0)?;
     Ok(hop.genop("cast_pointer", vec![v_arg], GenopResult::LLType(lltype)))
 }
@@ -9263,6 +9269,45 @@ mod tests {
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
         assert_eq!(ops.ops.last().map(|op| op.result.clone()), Some(out));
+    }
+
+    #[test]
+    fn rtype_cast_instance_to_base_ptr_non_ptr_is_typererror() {
+        use crate::annotator::model::SomeInteger;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(
+                std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")))
+                    as std::sync::Arc<dyn Repr>,
+            ));
+        let objectptr = OBJECTPTR.clone();
+        let LowLevelType::Ptr(ptr) = &objectptr else {
+            panic!("OBJECTPTR must be a Ptr");
+        };
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((**ptr).clone())) as std::sync::Arc<dyn Repr>);
+
+        let err = rtype_cast_instance_to_base_ptr(&hop, &HashMap::new())
+            .expect_err("non-Ptr argument is a TyperError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ptr"),
+            "TyperError names the Ptr assert, got {msg}"
+        );
     }
 
     #[test]

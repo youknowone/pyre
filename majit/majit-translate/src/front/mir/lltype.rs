@@ -17703,7 +17703,7 @@ fn raw_struct_array_item_lltype_inner(
     out
 }
 
-fn field_row_lltype(
+pub(in crate::front::mir) fn field_row_lltype(
     reg: &crate::front::StructFieldRegistry,
     ty: &str,
     visited: &mut std::collections::HashSet<String>,
@@ -17728,19 +17728,27 @@ fn field_row_lltype(
         if pointee.starts_with("??") {
             return None;
         }
-        // rstr.py `STRPTR = Ptr(STR)` before declared-GC `GCREF` and
-        // classed `OBJECTPTR`. The STR layout (`Utf8Str` / `BytesBlock`)
-        // implements GcType and has a class identity, so those later
-        // arms would otherwise steal the field. `project_struct_field_type`
-        // of the same spelling is SomeString; wrap (`newbytes`) takes
-        // that STR, not a W_Root.
+        // rstr.py `STRPTR = Ptr(STR)` before `llmemory.GCREF` and
+        // `rclass.OBJECTPTR`. Same order as `fn_ptr_tyref_to_lltype`.
+        // The STR layout (`Utf8Str` / `BytesBlock`) implements GcType
+        // and has a class identity, so those later arms would otherwise
+        // steal the field. `project_struct_field_type` of the same
+        // spelling is SomeString; wrap (`newbytes`) takes that STR, not
+        // a W_Root.
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
         }
-        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
+        // `llmemory.py` `GCREF` is only the erased pointer
+        // (`annlowlevel.cast_instance_to_gcref`, `rerased`).
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
             return Some((*GCREF).clone());
         }
-        if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
+        // Harvest `GcType` without class identity. A classed instance
+        // field is `rclass.py` `InstanceRepr.lowleveltype` (`OBJECTPTR`);
+        // `rordereddict.py` `get_ll_dict` uses `r_key.lowleveltype`.
+        if spelling_is_declared_gc(&reg.gc_struct_ids, pointee)
+            && !spelling_has_class_identity(reg, pointee)
+        {
             return Some((*GCREF).clone());
         }
         // Shared scalar mapping (`scalar_lltype`); a raw pointer to that
@@ -17814,7 +17822,10 @@ fn pointer_to_raw_struct_lltype(
 /// Harvest wrote a class object for `pointee` (`record_struct_id` /
 /// `class_identity`). `Some(None)` is two declarations sharing a
 /// spelling (`Bookkeeper.getdesc` refuses to merge) — not classed.
-fn spelling_has_class_identity(reg: &crate::front::StructFieldRegistry, pointee: &str) -> bool {
+pub(in crate::front::mir) fn spelling_has_class_identity(
+    reg: &crate::front::StructFieldRegistry,
+    pointee: &str,
+) -> bool {
     let template = majit_ir::descr::strip_generic_args(pointee.trim());
     let template = template.as_ref();
     if template.is_empty() {
@@ -17827,6 +17838,60 @@ fn spelling_has_class_identity(reg: &crate::front::StructFieldRegistry, pointee:
         .into_iter()
         .chain(resolved.as_deref())
         .any(|key| matches!(reg.class_identity.get(key), Some(Some(_))))
+}
+
+/// Mix-level boundary of a harvested `OBJECTPTR` field: store emits
+/// `cast_instance_to_base_ptr` (`annlowlevel.py`; `rclass.py`
+/// `ll_cast_to_object`); load emits `__cast_instance_intrinsic`
+/// (`annlowlevel.py` `cast_base_ptr_to_instance` /
+/// `CastBasePtrToInstanceEntry`). `SomePtr.getattr` / `setattr`
+/// (`lltype.py`) stay on the field word; the frontend crosses the
+/// instance boundary with those casts.
+///
+/// The container is a `GcArray` ITEM (`struct_root_template_is_gcarray_item`)
+/// or a raw-word struct (`is_raw_word_struct_owner`) — the same
+/// containers `gcarray_item_struct_ptr_annotation` /
+/// `raw_struct_ptr_annotation` type as `SomePtr`. The field row is
+/// `rclass::OBJECTPTR` (`field_row_lltype`). The value is a
+/// classed pointer, including a by-value `#[repr(transparent)]`
+/// wrapper peeled to one (`ObjectKey` / `IdentityKey`).
+pub(in crate::front::mir) fn harvested_ll_objectptr_field(
+    reg: &crate::front::StructFieldRegistry,
+    owner_root: &str,
+    field_ty_spelling: &str,
+) -> bool {
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    if !crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, owner_root)
+        && !reg.is_raw_word_struct_owner(owner_root)
+    {
+        return false;
+    }
+    let Some(ll) = field_row_lltype(
+        reg,
+        field_ty_spelling,
+        &mut std::collections::HashSet::new(),
+    ) else {
+        return false;
+    };
+    ll == *OBJECTPTR && spelling_is_classed_instance(reg, field_ty_spelling)
+}
+
+/// Pointer whose pointee has class identity, or a by-value
+/// `#[repr(transparent)]` wrapper peeled to that pointer
+/// (`field_row_lltype` by-value peel / `peel_transparent_cast_root`).
+fn spelling_is_classed_instance(reg: &crate::front::StructFieldRegistry, spelling: &str) -> bool {
+    let spelling = spelling.trim();
+    if let Some(pointee) = crate::front::typestr::peel_pointer_prefix(spelling) {
+        let pointee = pointee.trim().trim_start_matches("mut ");
+        return spelling_has_class_identity(reg, pointee);
+    }
+    if let Some(inner) = reg.transparent_inner_field(spelling)
+        && inner != spelling
+    {
+        return spelling_is_classed_instance(reg, &inner);
+    }
+    false
 }
 
 /// Format a Charon builtin ADT id (`Box`/`Slice`/`Str`/`Array`).

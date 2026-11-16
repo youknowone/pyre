@@ -16848,6 +16848,547 @@ fn raw_unicode_value_storage_field_write_emits_a_class_cast() {
     );
 }
 
+fn is_cast_instance_to_base_ptr(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_instance_to_base_ptr")
+    )
+}
+
+fn field_store_value_var<'a>(ops: &'a [&SpaceOperation], name: &str) -> Option<&'a Variable> {
+    ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite { field, value, .. } if field.name == name => value.as_variable(),
+        OpKind::InteriorFieldWrite { field, value, .. } if field.name == name => Some(value),
+        _ => None,
+    })
+}
+
+fn graph_cast_instance_to_base_ptr_results<'a>(ops: &'a [&SpaceOperation]) -> Vec<&'a Variable> {
+    ops.iter()
+        .filter(|op| is_cast_instance_to_base_ptr(&op.kind))
+        .filter_map(|op| op.result.as_ref())
+        .collect()
+}
+
+/// `fn f(entry: *mut Entry, p: *mut PyObject) { (*entry).value = p; }`
+/// with `Entry` the ITEM of a declared-GC `{length, [Entry; 0]}` wrapper.
+/// The `value` row is `OBJECTPTR` (`field_row_lltype`); mix-level store
+/// is `cast_instance_to_base_ptr` (`annlowlevel.py`).
+fn harvested_entry_value_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_entry_value",
+        2,
+        vec![entry_ptr.clone(), classed_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("entry"), &entry_ptr),
+            interior_local(2, Some("p"), &classed_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &entry_ptr, &entry, &classed_ptr, 2),
+                interior_use(interior_place(2, &classed_ptr)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+/// A harvested `GcArray` ITEM `OBJECTPTR` field store emits
+/// `cast_instance_to_base_ptr` as the stored operand (`annlowlevel.py`).
+/// Phase-A setattr is the census gate of the live graphs; this harness
+/// asserts the op shape.
+#[test]
+fn harvested_entry_objectptr_field_store_emits_cast_instance_to_base_ptr() {
+    let llbc = harvested_entry_value_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for harvested Entry value store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_entry_value")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_entry_value in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    let wraps = graph_cast_instance_to_base_ptr_results(&ops);
+    assert_eq!(
+        wraps.len(),
+        1,
+        "store of a classed *mut PyObject into Entry.value emits one cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    let stored = field_store_value_var(&ops, "value").expect("FieldWrite/InteriorFieldWrite value");
+    assert_eq!(
+        stored,
+        wraps[0],
+        "the stored operand is the cast_instance_to_base_ptr result; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(entry: *mut Entry) -> *mut Class { (*entry).value }` with `Entry`
+/// the ITEM of a declared-GC `{length, [Entry; 0]}` wrapper. Mix-level
+/// load is `__cast_instance_intrinsic` (`annlowlevel.py`
+/// `cast_base_ptr_to_instance`).
+fn harvested_entry_value_load_llbc(classed_path: &[&str], fn_name: &str) -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let classed_decl = interior_struct(0, classed_path, &[("pad", interior_i64())], 8, &[0], false);
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        fn_name,
+        1,
+        vec![entry_ptr.clone()],
+        classed_ptr.clone(),
+        vec![
+            interior_local(0, None, &classed_ptr),
+            interior_local(1, Some("entry"), &entry_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &classed_ptr),
+                interior_use(interior_field(1, &entry_ptr, &entry, &classed_ptr, 2)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+fn harvested_objectptr_field_load_cast<'a>(
+    ops: &'a [&SpaceOperation],
+    field_name: &str,
+) -> Option<(&'a str, &'a Variable)> {
+    let mut field_res: Option<&'a Variable> = None;
+    for op in ops {
+        match &op.kind {
+            OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. }
+                if field.name == field_name =>
+            {
+                field_res = op.result.as_ref();
+            }
+            OpKind::Call { args, .. } => {
+                if let Some(root) = crate::model::cast_instance_root(&op.kind)
+                    && let Some(src) = field_res
+                    && args.first().and_then(LinkArg::as_variable) == Some(src)
+                {
+                    return Some((root, op.result.as_ref()?));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn assert_harvested_entry_value_load_cast(
+    fn_name: &str,
+    classed_path: &[&str],
+    expected_leaf: &str,
+) {
+    let llbc = harvested_entry_value_load_llbc(classed_path, fn_name);
+    let program =
+        crate::test_support::build_semantic_program_from_llbc(&llbc).unwrap_or_else(|err| {
+            panic!("build semantic program for harvested Entry value load {fn_name}: {err}")
+        });
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == fn_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "{fn_name} in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    let (root, _) = harvested_objectptr_field_load_cast(&ops, "value").unwrap_or_else(|| {
+        panic!(
+            "load of harvested OBJECTPTR Entry.value emits __cast_instance_intrinsic of the FieldRead; graph={}",
+            graph.dump()
+        )
+    });
+    assert_eq!(
+        majit_ir::descr::class_root_leaf(root),
+        expected_leaf,
+        "cast root is the dest class, not a name-keyed PyObject; root={root:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// Direct `x = (*entry).value` into a `*mut PyObject` local.
+#[test]
+fn harvested_entry_objectptr_field_load_emits_cast_instance() {
+    assert_harvested_entry_value_load_cast(
+        "load_entry_value",
+        &["pyre_object", "pyobject", "PyObject"],
+        "PyObject",
+    );
+}
+
+/// Same load whose classed pointee is not PyObject: the cast root is
+/// that class (`tyref_class_root_with`), never a `"pyobject::PyObject"`
+/// name key.
+#[test]
+fn harvested_entry_objectptr_field_load_cast_root_is_dest_class() {
+    assert_harvested_entry_value_load_cast(
+        "load_entry_other",
+        &["fixture", "OtherObj"],
+        "OtherObj",
+    );
+}
+
+/// `fn f(h: &mut Holder, p: *mut PyObject) { h.value = p; }` — Holder is a
+/// high-level instance (declared GC, not a harvested low-level struct).
+/// Mix-level `cast_instance_to_base_ptr` is not emitted.
+fn high_level_holder_value_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let holder = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let holder_ref = serde_json::json!({"Ref": ["Erased", holder.clone(), "Mut"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let holder_decl = interior_struct(
+        1,
+        &["fixture", "Holder"],
+        &[("value", classed_ptr.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let caller = interior_caller(
+        "store_holder_value",
+        2,
+        vec![holder_ref.clone(), classed_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("h"), &holder_ref),
+            interior_local(2, Some("p"), &classed_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &holder_ref, &holder, &classed_ptr, 0),
+                interior_use(interior_place(2, &classed_ptr)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, holder_decl],
+        vec![caller],
+        &[0, 1],
+    )
+}
+
+#[test]
+fn high_level_instance_attr_store_has_no_cast_instance_to_base_ptr() {
+    let llbc = high_level_holder_value_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for high-level Holder store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_holder_value")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_holder_value in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    assert!(
+        graph_cast_instance_to_base_ptr_results(&ops).is_empty(),
+        "high-level instance attr store must not emit cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        field_store_value_var(&ops, "value").is_some(),
+        "the store is FieldWrite/InteriorFieldWrite value; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(p: *mut Point, n: i64) { (*p).y = n; }` — integer field, no mix-level cast.
+fn integer_field_store_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let point = interior_adt(0);
+    let point_ptr = interior_raw_mut(point.clone());
+    let unit = serde_json::json!({"Tuple": []});
+    let point_decl = interior_struct(
+        0,
+        &["fixture", "Point"],
+        &[("x", i64_ty.clone()), ("y", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_point_y",
+        2,
+        vec![point_ptr.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &point_ptr),
+            interior_local(2, Some("n"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &point_ptr, &point, &i64_ty, 1),
+                interior_use(interior_place(2, &i64_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![point_decl], vec![caller])
+}
+
+#[test]
+fn integer_field_store_has_no_cast_instance_to_base_ptr() {
+    let llbc = integer_field_store_llbc();
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for integer field store");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "store_point_y")
+        .unwrap_or_else(|| {
+            panic!(
+                "store_point_y in {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .graph();
+    let ops = graph_ops(graph);
+    assert!(
+        graph_cast_instance_to_base_ptr_results(&ops).is_empty(),
+        "integer field store must not emit cast_instance_to_base_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        field_store_value_var(&ops, "y").is_some(),
+        "the store is FieldWrite/InteriorFieldWrite y; graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(entry: *mut Entry) { (*entry).value = 1i64; }` — an integer Const
+/// into a harvested `OBJECTPTR` field is not an instance
+/// (`CastObjectToPtrEntry.specialize_call`).
+fn harvested_entry_objectptr_integer_const_store_llbc() -> Llbc {
+    let classed = interior_adt(0);
+    let entry = interior_adt(1);
+    let classed_ptr = interior_raw_mut(classed);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let usize_ty = interior_usize();
+    let i64_ty = interior_i64();
+    let unit = serde_json::json!({"Tuple": []});
+    let classed_decl = interior_struct(
+        0,
+        &["pyre_object", "pyobject", "PyObject"],
+        &[("pad", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let entry_decl = interior_struct(
+        1,
+        &["fixture", "Entry"],
+        &[
+            ("hash", usize_ty.clone()),
+            ("key", classed_ptr.clone()),
+            ("value", classed_ptr.clone()),
+        ],
+        24,
+        &[0, 8, 16],
+        false,
+    );
+    let entries_decl = interior_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        8,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "store_entry_value_int_const",
+        1,
+        vec![entry_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("entry"), &entry_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &entry_ptr, &entry, &classed_ptr, 2),
+                serde_json::json!({"Use": [interior_const_i64("1", &i64_ty), "No"]}),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![classed_decl, entry_decl, entries_decl],
+        vec![caller],
+        &[0, 2],
+    )
+}
+
+#[test]
+fn harvested_entry_objectptr_integer_const_field_write_is_unsupported() {
+    let llbc = harvested_entry_objectptr_integer_const_store_llbc();
+    let skipped = super::LoweringSkips::default();
+    let tomb = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let mut state = super::CrateLoweringState::new(
+        &llbc,
+        &tomb,
+        std::collections::HashMap::new(),
+        skipped.clone(),
+        &gc,
+        &std::collections::HashSet::new(),
+        None,
+        None,
+        crate::codewriter::call::StructLayoutTable::default(),
+    );
+    state.note_loaded_crate_bodies(&llbc);
+    let functions =
+        super::CrateLowering::new(&llbc, crate::HostStaticAddrs::default(), &[], &state)
+            .lower_all(None, None);
+    assert!(
+        functions.is_empty(),
+        "integer Const FieldWrite into harvested OBJECTPTR must not produce a graph"
+    );
+    let skipped = skipped.borrow();
+    let msg = skipped
+        .iter()
+        .find(|(name, _)| name.contains("store_entry_value_int_const"))
+        .map(|(_, m)| m.as_str())
+        .unwrap_or("");
+    assert!(
+        msg.contains("unsupported MIR") && msg.contains("cast_instance_to_base_ptr"),
+        "the body declines as Unsupported wrap, not a silent store; skipped={skipped:?}"
+    );
+    assert!(
+        msg.contains("value"),
+        "Unsupported must name the field store; skipped={skipped:?}"
+    );
+}
+
 #[test]
 fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
     let llbc = header_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);

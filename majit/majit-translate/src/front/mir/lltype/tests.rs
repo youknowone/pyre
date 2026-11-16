@@ -24910,6 +24910,51 @@ fn field_row_declared_gc_pointer_is_gcref() {
     assert_eq!(got, (*GCREF).clone());
 }
 
+/// A pointee that is both `GcType` (`note_declared_gc_name`) and classed
+/// (`record_struct_id` `class_identity`) is `rclass.py`
+/// `InstanceRepr.lowleveltype` (`OBJECTPTR`), not `llmemory.py` `GCREF`.
+/// `lltype.py` `SomePtr.getattr` of that ITEM field stays SomePtr.
+#[test]
+fn field_row_declared_gc_and_classed_pointer_is_objectptr() {
+    use crate::annotator::model::{SomeString, SomeValue};
+    use crate::flowspace::model::{ConstValue, Constant};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.note_declared_gc_name("owner::GcInst");
+    note_class_identity(&mut reg, "owner::GcInst");
+    let got = super::field_row_lltype(&reg, "*mut owner::GcInst", &mut field_row_visited())
+        .expect("classed declared-GC pointer field");
+    assert_eq!(got, OBJECTPTR.clone());
+
+    let mut reg = slot_block_registry("*mut owner::GcInst");
+    reg.note_declared_gc_name("owner::GcInst");
+    note_class_identity(&mut reg, "owner::GcInst");
+    let s = super::struct_item_flexible_gcarray_block_annotation(
+        &reg,
+        "storage::SlotBlock",
+        "[storage::Slot; 0]",
+    )
+    .expect("classed declared-GC ITEM field intern");
+    let SomeValue::Ptr(ptr) = s else {
+        panic!("must intern SomePtr(GcArray), got {s:?}")
+    };
+    let mut s_attr = SomeString::new(false, false);
+    s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+    let s_value = ptr
+        .getattr(&SomeValue::String(s_attr))
+        .expect("GcArray ITEM getattr value");
+    let SomeValue::Ptr(p) = &s_value else {
+        panic!("OBJECTPTR ITEM field getattr stays SomePtr(OBJECTPTR), got {s_value:?}")
+    };
+    assert_eq!(
+        LowLevelType::from(p.ll_ptrtype.clone()),
+        *OBJECTPTR,
+        "OBJECTPTR ITEM field getattr stays SomePtr(OBJECTPTR), got {s_value:?}"
+    );
+}
+
 #[test]
 fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
@@ -24940,6 +24985,7 @@ fn field_row_str_family_pointer_is_strptr_ahead_of_declared_gc_and_classed() {
 #[test]
 fn field_row_transparent_by_value_pointer_matches_inner_lltype() {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
 
     let raw_object = serde_json::json!({"RawPtr": [adt_node(0), "Mut"]});
     let bool_ty = serde_json::json!({"Scalar": "Bool"});
@@ -25006,9 +25052,11 @@ fn field_row_transparent_by_value_pointer_matches_inner_lltype() {
         &std::collections::HashSet::new(),
         &[],
     );
-    // Production `*mut PyObject` is a declared-GC pointee, so the
-    // pointer arm intern's `GCREF` (`llmemory.py` `GCREF`). Seed that
-    // fact so the bare inner has an lltype; the wrapper must match it.
+    // Harvest records class identity for `pyobject::PyObject`
+    // (`record_struct_id`). Seed declared-GC as production does: a
+    // classed instance field is `rclass.py` `InstanceRepr.lowleveltype`
+    // (`OBJECTPTR`), not `llmemory.py` `GCREF`. The wrapper still
+    // intern's as the inner (`rordereddict.py` `get_ll_dict`).
     fields.note_declared_gc_name("pyobject::PyObject");
 
     let inner = fields
@@ -25036,6 +25084,11 @@ fn field_row_transparent_by_value_pointer_matches_inner_lltype() {
 
     let inner_ll = super::field_row_lltype(&fields, &inner, &mut field_row_visited())
         .expect("bare inner field-row lltype");
+    assert_eq!(
+        inner_ll,
+        OBJECTPTR.clone(),
+        "harvested classed PyObject intern's OBJECTPTR (`InstanceRepr.lowleveltype`)"
+    );
     let transparent_ll =
         super::field_row_lltype(&fields, "TransparentKey", &mut field_row_visited())
             .or_else(|| {

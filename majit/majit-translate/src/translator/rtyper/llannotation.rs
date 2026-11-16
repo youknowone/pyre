@@ -411,8 +411,10 @@ impl SomePtr {
 /// nullable SomeString, a registered class-root `Ptr(GcStruct)` is the
 /// nullable instance. `llannotation.py` `lltype_to_annotation` of `Ptr`
 /// is SomePtr; the conversion is the same Rust adaptation as
-/// [`gc_class_root_ptr_as_instance`]. A `rclass.py` `OBJECTPTR` field is
-/// the root instance ([`objectptr_as_instance`]).
+/// [`gc_class_root_ptr_as_instance`]. A `rclass.py` `OBJECTPTR` field
+/// stays SomePtr (`lltype.py` `SomePtr.getattr`); mix-level code
+/// converts with `cast_base_ptr_to_instance`
+/// (`annlowlevel.py` `CastBasePtrToInstanceEntry`).
 fn highlevel_of_ptr_field_annotation(s: SomeValue) -> SomeValue {
     if let Some(s_str) = strptr_as_somestring(&s) {
         return s_str;
@@ -420,7 +422,7 @@ fn highlevel_of_ptr_field_annotation(s: SomeValue) -> SomeValue {
     if let Some(inst) = gc_class_root_ptr_as_instance(&s) {
         return inst;
     }
-    objectptr_as_instance(&s).unwrap_or(s)
+    s
 }
 
 /// A field whose lltype is `rstr.STRPTR` (`Ptr(GcStruct('rpy_string'))`)
@@ -452,29 +454,6 @@ fn lltype_is_strptr(ty: &lltype::LowLevelType) -> bool {
         }),
         _ => false,
     }
-}
-
-/// `rclass.py` `OBJECTPTR` (`InstanceRepr.lowleveltype`) is the root
-/// instance. `llannotation.py` `lltype_to_annotation` of `Ptr` is
-/// SomePtr; a field holding that word reads as the instance so it unions
-/// with intern of the same class (`rclass.py` `InstanceRepr`).
-fn objectptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
-    let SomeValue::Ptr(p) = s else {
-        return None;
-    };
-    let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
-    if ty != *crate::translator::rtyper::rclass::OBJECTPTR {
-        return None;
-    }
-    let classdef = bookkeeper::getbookkeeper().and_then(|bk| {
-        bk.getuniqueclassdef_for_struct_root("pyobject::PyObject")
-            .ok()
-    });
-    Some(SomeValue::Instance(SomeInstance::new(
-        classdef,
-        true,
-        std::collections::BTreeMap::new(),
-    )))
 }
 
 /// A field read off a raw struct whose value points at a GC struct that is
