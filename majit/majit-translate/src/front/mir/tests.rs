@@ -43348,6 +43348,48 @@ fn one_word_handle_by_value_struct_decl_is_none() {
     );
 }
 
+/// A `#[repr(transparent)]` struct whose unique non-ZST field is a
+/// `RawPtr` of a str-family pointee is one word. `gc_ref_pointer` is
+/// false (`ValueType::Str`, `rstr.STRPTR`). `heaptracker.py`
+/// `all_fielddescrs` recurses only into `lltype.Struct`.
+/// `rordereddict.py` `_ll_dict_del_entry` stores `entry.key` as one
+/// field. A two-field struct stays an inlined STRUCT.
+#[test]
+fn transparent_rawptr_by_value_struct_decl_is_none() {
+    let utf8 = interior_struct(1, &["Utf8Str"], &[("hash", interior_i64())], 8, &[0], false);
+    let key = transparent_unique_field_decl(
+        0,
+        &["fixture", "StrPtrKey"],
+        interior_raw_mut(interior_adt(1)),
+    );
+    let pair = interior_struct(
+        2,
+        &["fixture", "Pair"],
+        &[("a", interior_i64()), ("b", interior_i64())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let key_ty = TyRef::Other(interior_adt(0).into());
+    let pair_ty = TyRef::Other(interior_adt(2).into());
+    let llbc = llbc_with_types("fixture", vec![key, utf8, pair], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::<String>::new();
+    assert_eq!(super::tyref_to_value_type(&key_ty, &llbc), ValueType::Str);
+    assert!(
+        !super::gc_ref_pointer(&key_ty, &llbc, tomb, &gc, 0, &raw),
+        "a str pointer is not ValueType::Ref"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&key_ty, &llbc, tomb, &gc, &raw).is_none(),
+        "a transparent single RawPtr is one field, not an inlined STRUCT"
+    );
+    let pair_decl = super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc, &raw)
+        .expect("a two-field struct stays an inlined STRUCT");
+    assert_eq!(pair_decl.item_meta.name_path_str(), "fixture::Pair");
+}
+
 /// An outer struct whose field is a `repr(transparent)` generic wrapper
 /// instantiated at a two-word struct. The wrapper's unique non-ZST
 /// field is itself that struct (`heaptracker.all_fielddescrs` walks the
@@ -43554,6 +43596,224 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
         .expect("exact layout for instantiated Entry");
     assert_eq!(layout.field_offsets.get("f_valid"), Some(&16));
     assert_eq!(layout.size, Some(40));
+}
+
+/// `Entry<K, V>` (`rordereddict.py` `DICTENTRY`): a `#[repr(transparent)]`
+/// key whose unique non-ZST field is a `RawPtr` is that pointer
+/// (`rmodel.py` `externalvsinternal`, `gcref=False`). The item name keeps
+/// [`render_adt_type_args`]. A two-field key stays one inline
+/// `lltype.Struct`. The unsuffixed template is `??TypeVar`;
+/// `intern_field_rows` reads the monomorph
+/// `register_ordereddict_entry_rows` published (`get_ll_dict` mints one
+/// `DICTENTRY` per key/value pair).
+#[test]
+fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let tv1 = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let u64_ty = scalar_ty("U64");
+    let raw_u8 = serde_json::json!({"RawPtr": [
+        {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+        "Mut"
+    ]});
+    let ptr_key = transparent_unique_field_decl(0, &["host", "PtrKey"], named_adt(1, vec![]));
+    let obj_ref = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["host", "ObjRef"], true),
+        "kind": {"Alias": {"aliased_ty": interior_raw_mut(interior_adt(2))}},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [],
+                "repr": {"repr_algo": "Rust", "transparent": false}
+            }
+        }]
+    });
+    let gc_class = interior_struct(
+        2,
+        &["owner", "GcClass"],
+        &[("w_class", interior_i64())],
+        8,
+        &[0],
+        false,
+    );
+    let str_ptr_key =
+        transparent_unique_field_decl(3, &["host", "StrPtrKey"], interior_raw_mut(interior_adt(4)));
+    let utf8 = interior_struct(4, &["Utf8Str"], &[("hash", interior_i64())], 8, &[0], false);
+    let wide_key = interior_struct(
+        5,
+        &["host", "WideKey"],
+        &[
+            (
+                "hash",
+                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+            ),
+            ("obj", raw_u8.clone()),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let entry = serde_json::json!({
+        "def_id": 6,
+        "item_meta": interior_meta(&["host", "rordereddict_entries", "Entry"], true),
+        "kind": {"Struct": [
+            {"name": "key", "ty": tv0, "attr_info": null},
+            {"name": "f_valid", "ty": bool_ty, "attr_info": null},
+            {"name": "value", "ty": tv1, "attr_info": null},
+            {"name": "f_hash", "ty": u64_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let entry_of = |key_id: u64| named_adt(6, vec![named_adt(key_id, vec![]), raw_u8.clone()]);
+    let holder = type_decl_struct(
+        7,
+        &["host", "Holder"],
+        vec![
+            serde_json::json!({"name": "ptr", "ty": entry_of(0), "attr_info": null}),
+            serde_json::json!({"name": "text", "ty": entry_of(3), "attr_info": null}),
+            serde_json::json!({"name": "wide", "ty": entry_of(5), "attr_info": null}),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            ptr_key,
+            obj_ref,
+            gc_class,
+            str_ptr_key,
+            utf8,
+            wide_key,
+            entry,
+            holder,
+        ],
+        vec![],
+    );
+    let mut known = std::collections::HashSet::new();
+    let mut fields = crate::front::semantic::StructFieldRegistry::default();
+    let mut ids = std::collections::HashMap::new();
+    let mut layouts = std::collections::HashMap::new();
+    let gc = std::collections::HashSet::new();
+    super::register_ordereddict_entry_rows(
+        &llbc,
+        &mut known,
+        &mut fields,
+        &mut ids,
+        &mut layouts,
+        &gc,
+        &std::collections::HashSet::new(),
+    );
+
+    let ptr_item = "rordereddict_entries::Entry<PtrKey,*mut u8>";
+    let str_item = "rordereddict_entries::Entry<StrPtrKey,*mut u8>";
+    let wide_item = "rordereddict_entries::Entry<WideKey,*mut u8>";
+    {
+        let row_ty = |item: &str, name: &str| -> String {
+            fields
+                .fields
+                .get(item)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {item}; keys={:?}",
+                        fields.fields.keys().collect::<Vec<_>>()
+                    )
+                })
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{item} missing {name}"))
+                .ty
+                .clone()
+        };
+        assert_eq!(row_ty(ptr_item, "key"), "*mut GcClass");
+        assert_eq!(row_ty(str_item, "key"), "*mut Utf8Str");
+        assert_eq!(row_ty(wide_item, "key"), "WideKey");
+        for item in [ptr_item, str_item, wide_item] {
+            assert_eq!(row_ty(item, "value"), "*mut u8");
+            assert_eq!(row_ty(item, "f_valid"), "bool");
+            assert_eq!(row_ty(item, "f_hash"), "u64");
+        }
+    }
+
+    fields.fields.insert(
+        "rordereddict_entries::Entry".to_string(),
+        vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let root = "owner::GcClass";
+    for key in ["GcClass", root] {
+        fields.class_identity.insert(
+            key.to_string(),
+            Some(crate::front::semantic::ClassIdentity {
+                id: majit_ir::descr::StructId::from_canonical(root),
+                spelling: root.to_string(),
+            }),
+        );
+    }
+    fields.note_declared_gc_name(root);
+    fields.fields.insert(
+        root.to_string(),
+        vec![("w_class".to_string(), format!("*mut {root}"))],
+    );
+    fields.fields.insert(
+        "WideKey".to_string(),
+        vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("obj".to_string(), "*mut u8".to_string()),
+        ],
+    );
+
+    let item_struct = |item: &str| {
+        let ptr = super::gcarray_item_struct_ptr_lltype(&fields, item).unwrap_or_else(|| {
+            panic!("item lltype {item}");
+        });
+        let LowLevelType::Ptr(p) = ptr else {
+            panic!("{item} pointer is Ptr, got {ptr:?}");
+        };
+        let PtrTarget::Struct(st) = p.TO else {
+            panic!("{item} targets a Struct, got {:?}", p.TO);
+        };
+        assert_eq!(st._name, item);
+        assert_eq!(st._gckind, GcKind::Raw);
+        st
+    };
+    let ptr_st = item_struct(ptr_item);
+    let key = ptr_st.getattr_field_type("key").expect("class-root key");
+    let LowLevelType::Ptr(p) = &key else {
+        panic!("class-root key must be Ptr, got {key:?}");
+    };
+    let PtrTarget::Struct(root_st) = &p.TO else {
+        panic!("class-root key must point at a Struct, got {:?}", p.TO);
+    };
+    assert_eq!(root_st._gckind, GcKind::Gc);
+    assert_eq!(root_st._name, root);
+
+    let str_st = item_struct(str_item);
+    assert_eq!(str_st.getattr_field_type("key"), Some(STRPTR.clone()));
+
+    let wide_st = item_struct(wide_item);
+    let wide_key = wide_st.getattr_field_type("key").expect("wide key");
+    let LowLevelType::Struct(wide) = &wide_key else {
+        panic!("two-field key stays an inline Struct, got {wide_key:?}");
+    };
+    assert_eq!(wide._name, "WideKey");
+    assert_eq!(wide._gckind, GcKind::Raw);
+    assert!(wide.getattr_field_type("hash").is_some());
+    assert!(wide.getattr_field_type("obj").is_some());
 }
 
 /// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.

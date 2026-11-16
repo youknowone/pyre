@@ -531,11 +531,37 @@ fn class_root_ptr_from_instance(
     Some(field_ty._defl())
 }
 
+/// Store counterpart of [`strptr_as_somestring`].
+///
+/// `StringRepr.lowleveltype` is `Ptr(STR)` (`rstr.py` `StringRepr`).
+/// `annlowlevel.llstr` returns `lltype.nullptr(STR)` for None and
+/// `mallocstr` otherwise. `rordereddict.py` `_ll_dict_del_entry` stores
+/// one `entry.key` field. A `SomeString` written into a field whose
+/// lltype is `rstr.STRPTR` is that pointer. This is not an
+/// `annotation_to_ll_map` entry: `annotation_to_lltype` stays the
+/// scalars plus `Address`.
+fn strptr_from_somestring(
+    field_example: &lltype::LowLevelValue,
+    s_value: &SomeValue,
+) -> Option<lltype::LowLevelValue> {
+    if !matches!(s_value, SomeValue::String(_)) {
+        return None;
+    }
+    let field_ty = lltype::typeOf_value(field_example);
+    if !lltype_is_strptr(&field_ty) {
+        return None;
+    }
+    Some(field_ty._defl())
+}
+
 fn llvalue_for_ptr_field_store(
     field_example: &lltype::LowLevelValue,
     s_value: &SomeValue,
 ) -> Result<lltype::LowLevelValue, AnnotatorError> {
     if let Some(stored) = class_root_ptr_from_instance(field_example, s_value) {
+        return Ok(stored);
+    }
+    if let Some(stored) = strptr_from_somestring(field_example, s_value) {
         return Ok(stored);
     }
     Ok(annotation_to_lltype(s_value, None)?._defl())
@@ -1740,6 +1766,42 @@ mod tests {
         assert!(
             !matches!(value, SomeValue::String(_)),
             "OBJECTPTR value must not read as SomeString, got {value:?}"
+        );
+    }
+
+    /// Storing a `SomeString` into a field whose lltype is `rstr.STRPTR`
+    /// succeeds (`annlowlevel.llstr`, `rstr.py` `StringRepr.lowleveltype`).
+    /// A `SomeInteger` does not.
+    #[test]
+    fn strptr_field_setattr_accepts_somestring() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeString;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _pos = bk.at_position(None);
+        let entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("key".into(), STRPTR.clone())],
+            )),
+        });
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+        let key = attr("key");
+        assert!(
+            entry
+                .setattr(&key, &SomeValue::String(SomeString::new(false, false)),)
+                .is_ok()
+        );
+        let nullable = s_str0().noneify().expect("nullable SomeString");
+        assert!(entry.setattr(&key, &nullable).is_ok());
+        assert!(
+            entry
+                .setattr(&key, &SomeValue::Integer(SomeInteger::new(false, false)),)
+                .is_err()
         );
     }
 
