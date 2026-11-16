@@ -299,7 +299,6 @@ fn build_semantic_program_via_active_frontend(
                     exception_class_hints.clone(),
                 );
                 exception_class_hint_ends.push(exception_class_hints.len());
-                prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -399,6 +398,7 @@ fn build_semantic_program_via_active_frontend(
                         fnptr_field_families.push(row);
                     }
                 }
+                prof.mark(&format!("    harvest {p}"));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
