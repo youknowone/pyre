@@ -762,11 +762,23 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // exception pending for a caller's `except OverflowError`.
         // `GUARD_NOT_FORCED` keeps the CALL-boundary collapse
         // `helper_subwalk_level` `Ok(None)` preserved for FOR_ITER.
+        // A non-exception guard in an unpublished portal helper
+        // (`HelperChain::NoHelper`) uses the same numbering when every
+        // helper section has a resume marker that
+        // `helper_resume_reaches_blocker` cannot reach; `resume.py
+        // blackhole_from_resumedata` then runs that section from the
+        // guard. A missing marker or a residual blocker falls through to
+        // CALL-boundary collapse unless a heap-writing residual or
+        // journaled live-heap effect has already run since the CALL, in
+        // which case the guard is refused.
+        // A helper whose return is not the CALL's result (`HelperReturn::Converted`
+        // / `CalleePrologue`) still collapses to that CALL entry, as
+        // `helper_subwalk_level` does: no MIFrame holds the conversion.
         let exception_guard = matches!(
             ctx.trace_ctx.last_guard_opcode(),
             Some(OpCode::GuardNoException | OpCode::GuardException)
         );
-        if exception_guard && ctx.fbw_mode.transparent_helper_subwalk {
+        if ctx.fbw_mode.transparent_helper_subwalk && exception_guard {
             let frames = looked_inside_helper_resume_frames(
                 ctx,
                 op_pc,
@@ -780,6 +792,62 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 frames,
                 scope.guard_stamp,
             );
+        } else if ctx.fbw_mode.transparent_helper_subwalk && helper_chain == HelperChain::NoHelper {
+            let converted = unpublished_helper_resumes_at_call_entry(ctx);
+            if !converted {
+                let frames = looked_inside_helper_resume_frames(
+                    ctx,
+                    op_pc,
+                    after_residual_call,
+                    &scope,
+                    parent_frames.clone(),
+                );
+                let helper_sections_ok = match &frames {
+                    Ok(frames) => frames.iter().all(|f| {
+                        if !crate::state::jitcode_is_transparent_helper(f.jitcode_index as i32) {
+                            return true;
+                        }
+                        match f.resume_marker_jit_pc {
+                            Some(pc) => {
+                                !helper_resume_reaches_blocker(f.jitcode_index as usize, pc, None)
+                            }
+                            None => false,
+                        }
+                    }),
+                    Err(_) => false,
+                };
+                if let (Ok(frames), true) = (frames, helper_sections_ok) {
+                    if fbw_debug_abort_enabled() {
+                        eprintln!("[looked-inside-guard] frames op_pc={op_pc}");
+                    }
+                    return walker_capture_transparent_helper_snapshot(
+                        ctx,
+                        op_pc,
+                        frames,
+                        scope.guard_stamp,
+                    );
+                }
+            }
+            let heap_moved = ctx
+                .fbw_mode
+                .transparent_helper_heap_writing_at_entry
+                .is_some_and(|n| fbw_heap_writing_effect_count() != n);
+            let journal_moved = ctx
+                .fbw_mode
+                .transparent_helper_journal_at_entry
+                .is_some_and(|m| fbw_journaled_effect_delta_since(m) != 0);
+            if heap_moved || journal_moved {
+                if fbw_debug_abort_enabled() {
+                    eprintln!("[looked-inside-guard] refuse op_pc={op_pc} converted={converted}");
+                }
+                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op_pc,
+                    symbolic: 0,
+                });
+            }
+            if fbw_debug_abort_enabled() {
+                eprintln!("[looked-inside-guard] collapse op_pc={op_pc} converted={converted}");
+            }
         }
         if helper_chain != HelperChain::Numbered && walker_inline_guard_resumes_in_callee(ctx) {
             // A STRICT straight-line callee (gh#420) whose own frame is not
