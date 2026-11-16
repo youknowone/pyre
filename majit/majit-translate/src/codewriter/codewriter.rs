@@ -2072,7 +2072,7 @@ mod opname_spine_prejit_tests {
     use crate::model::{CallTarget, OpKind};
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
+        FuncType, GCREF, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, build_ll_append_char_helper_graph,
@@ -2086,6 +2086,8 @@ mod opname_spine_prejit_tests {
     use crate::translator::rtyper::rlist::{
         build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
     };
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+    use crate::translator::rtyper::rtuple::TUPLE_TYPE;
     use crate::translator::rtyper::rtyper::{
         RPythonTyper, constant_with_lltype, functionptr_const, variable_with_lltype,
     };
@@ -2594,5 +2596,105 @@ mod opname_spine_prejit_tests {
             "oopspec publication path equals the lowered Call path"
         );
         let _keep = ann;
+    }
+
+    /// `TUPLE_TYPE([Ptr(gc), Signed])` malloc / setfield / getfield
+    /// assembles: `new` of `tuple2<GCREF,isize>`, then a pure item1 read
+    /// (`rewrite_op_getfield` / `STRUCT._immutable_field`).
+    #[test]
+    fn opname_spine_tuple_malloc_and_item_read_assemble() {
+        let tuple_ty = TUPLE_TYPE(&[GCREF.clone(), LowLevelType::Signed]);
+        let p = variable_with_lltype("p", GCREF.clone());
+        let t = variable_with_lltype("t", tuple_ty.clone());
+        let item1 = variable_with_lltype("item1", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "tuple_malloc_item_read",
+            start.clone(),
+            Hlvalue::Variable(item1.clone()),
+        );
+        let void0 = variable_with_lltype("set0", LowLevelType::Void);
+        let void1 = variable_with_lltype("set1", LowLevelType::Void);
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "malloc",
+                vec![
+                    lowlevel_type_const(tuple_ty),
+                    gc_flavor_const().expect("gc flavor const"),
+                ],
+                Hlvalue::Variable(t.clone()),
+            ),
+            SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(t.clone()),
+                    field_name_const("item0"),
+                    Hlvalue::Variable(p),
+                ],
+                Hlvalue::Variable(void0),
+            ),
+            SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(t.clone()),
+                    field_name_const("item1"),
+                    constant_with_lltype(ConstValue::Int(7), LowLevelType::Signed),
+                ],
+                Hlvalue::Variable(void1),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(t), field_name_const("item1")],
+                Hlvalue::Variable(item1.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, item1);
+
+        let path = CallPath::from_segments(["tuple_malloc_item_read"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("new"),
+            "assembled jitcode must contain new; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let news: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::New { owner } => Some(owner.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(news, vec!["tuple2<GCREF,isize>"], "dump:\n{dump}");
+        let item1_reads: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::FieldRead { field, pure, .. } if field.name == "item1" => Some(*pure),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            item1_reads,
+            vec![true],
+            "tuple item1 read is getfield_gc_*_pure (`rewrite_op_getfield` / `_immutable_field`); dump:\n{dump}"
+        );
     }
 }

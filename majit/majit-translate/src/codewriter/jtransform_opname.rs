@@ -765,23 +765,25 @@ fn transduce_op(
         // `ByteStr` constant (`void_field_const`); the owning struct identity
         // is the pointee-struct leaf of the base pointer's `concretetype`
         // (`Ptr(Struct("stringbuilder"))` → `"stringbuilder"`), which keys the
-        // layout registry the assembler resolves offsets through.  These are
-        // the mutable low-level fields of the builder container
-        // (`current_pos`/`current_end`/`total_size`), so the read is not
-        // `_pure`.
+        // layout registry the assembler resolves offsets through.  An rtyper
+        // tuple's identity is the lltype spelling (`tuple{n}<s0,…>`), not the
+        // bare `tuple{n}` leaf.  `rewrite_op_getfield` sets `_pure` from
+        // `STRUCT._immutable_field(name)`; a struct with the `immutable`
+        // hint (`TUPLE_TYPE`) is `getfield_gc_*_pure`.
         "getfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
             let field = field_descriptor_of(&base, &field_name, "getfield");
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
+            let pure = owner_struct_of(&base).is_some_and(|s| s._immutable_field(&field_name));
             out.push_op_with_result_var(
                 block,
                 OpKind::FieldRead {
                     base,
                     field,
                     ty,
-                    pure: false,
+                    pure,
                 },
                 result,
             );
@@ -1936,10 +1938,32 @@ fn owner_struct_of_lltype(ty: &LowLevelType) -> Option<Struct> {
 
 /// The owning struct leaf of a field access — the pointee-struct name of
 /// the base pointer's `concretetype` (`Ptr(Struct("stringbuilder"))` →
-/// `"stringbuilder"`).  `None` when the base is not a pointer-to-struct,
-/// in which case the layout layer falls back to its type-string heuristic.
+/// `"stringbuilder"`).  An rtyper tuple uses the lltype spelling
+/// (`tuple{n}<s0,…>`) rather than the bare `tuple{n}` leaf.  `None` when
+/// the base is not a pointer-to-struct, in which case the layout layer
+/// falls back to its type-string heuristic.
 fn owner_root_of(base: &FVar) -> Option<String> {
-    owner_struct_of(base).map(|s| s._name)
+    owner_struct_of(base).as_ref().map(struct_owner_spelling)
+}
+
+/// STRUCT identity used as a FieldRead/New owner. An rtyper tuple's
+/// identity is `ll_tuple_owner_spelling`; any other struct keeps `_name`.
+/// `tuple_struct_items` matching with no item spelling is a lowering gap.
+fn struct_owner_spelling(s: &Struct) -> String {
+    match crate::translator::rtyper::rtuple::tuple_struct_items(s) {
+        None => s._name.clone(),
+        Some(items) => {
+            if let Some(sp) = crate::codewriter::call::ll_tuple_owner_spelling(s) {
+                return sp;
+            }
+            for lt in &items {
+                if crate::codewriter::call::lltype_item_spelling(lt).is_none() {
+                    panic!("rtyper tuple item lltype {lt:?} has no spelling");
+                }
+            }
+            panic!("rtyper tuple item lltype has no spelling");
+        }
+    }
 }
 
 /// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
@@ -1969,8 +1993,13 @@ fn field_descriptor_of(
         .as_ref()
         .map(|s| field_name_for_struct(s, ll_field_name))
         .unwrap_or_else(|| ll_field_name.to_string());
-    crate::model::FieldDescriptor::new(field_name, owner_root_of(base))
+    let owner_root = owner_root_of(base);
+    let owner_id = owner_root
+        .as_deref()
+        .and_then(majit_ir::descr::struct_id_for_name);
+    crate::model::FieldDescriptor::new(field_name, owner_root)
         .with_owner_typeptr_hint(owner_typeptr_hint_of(base))
+        .with_owner_id(owner_id)
 }
 
 fn field_name_for_struct(owner: &Struct, ll_name: &str) -> String {
@@ -2196,7 +2225,8 @@ fn malloc_struct_owner(hlv: &Hlvalue) -> String {
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
             ConstValue::LowLevelType(lltype) => owner_struct_of_lltype(lltype)
-                .map(|s| s._name)
+                .as_ref()
+                .map(struct_owner_spelling)
                 .unwrap_or_else(|| {
                     panic!(
                         "jtransform_opname::lower_graph: malloc type operand is not a Struct: {lltype:?}"
@@ -5832,5 +5862,57 @@ mod tests {
         ));
         close_return(&startblock, &graph, result);
         let _ = lower_graph(&graph);
+    }
+
+    /// `TUPLE_TYPE([Ptr(gc), Signed])` mallocs and `getfield(item0)` under
+    /// the lltype spelling `tuple2<GCREF,isize>`, not the bare `tuple2`
+    /// leaf. `rewrite_op_getfield` / `STRUCT._immutable_field` makes the
+    /// read `_pure`.
+    #[test]
+    fn lower_graph_tuple_getfield_owner_is_the_lltype_spelling() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rtuple::TUPLE_TYPE;
+
+        let tuple_ty = TUPLE_TYPE(&[GCREF.clone(), LowLevelType::Signed]);
+        let t = variable_with_lltype("t", tuple_ty.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(t.clone())]);
+        let result = variable_with_lltype("item0", GCREF.clone());
+        let graph = FlowGraph::with_return_var(
+            "tuple_getfield_owner",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(t),
+                constant_with_lltype(ConstValue::byte_str("item0"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let model = lower_graph(&graph);
+        let (owner, name, pure, owner_id) = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, pure, .. } => Some((
+                    field.owner_root.clone(),
+                    field.name.clone(),
+                    *pure,
+                    field.owner_id,
+                )),
+                _ => None,
+            })
+            .expect("getfield lowers to FieldRead");
+        assert_eq!(owner.as_deref(), Some("tuple2<GCREF,isize>"));
+        assert_eq!(name, "item0");
+        assert!(pure, "TUPLE_TYPE immutable hint is getfield_gc_*_pure");
+        assert_eq!(
+            owner_id,
+            majit_ir::descr::struct_id_for_name("tuple2<GCREF,isize>")
+        );
     }
 }
