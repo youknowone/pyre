@@ -188,6 +188,9 @@ impl Value {
 /// A constant value known at trace time.
 ///
 /// Mirrors rpython/jit/metainterp/resoperation.py Const* classes.
+/// `#[repr(u64)]` is a data-carrying primitive-repr enum: u64 tag then
+/// the 8-byte payload in every arm, which [`Const::payload_word`] loads.
+#[repr(u64)]
 #[derive(Clone, Copy, Debug)]
 pub enum Const {
     Int(i64),
@@ -503,8 +506,9 @@ impl Const {
     #[inline(always)]
     pub fn payload_word(&self) -> i64 {
         debug_assert_eq!(std::mem::size_of::<Const>(), 16);
-        // SAFETY: each arm is an 8-byte payload at offset 8, so this is
-        // the field load `as_raw_i64` performs on every arm.
+        // SAFETY: `#[repr(u64)]` stores the discriminant as a u64 then the
+        // 8-byte payload in every arm, so offset 8 is the field load
+        // `as_raw_i64` performs on every arm.
         unsafe { *(self as *const Const as *const i64).add(1) }
     }
 

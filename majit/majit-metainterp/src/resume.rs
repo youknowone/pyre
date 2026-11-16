@@ -7075,14 +7075,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     ) -> Self {
         // resume.py _init
         let mut resumecodereader = Reader::new(rd_numb);
-        let ptr = rd_numb.as_ptr();
-        let len = rd_numb.len();
-        let mut cur_pos = 0usize;
-        let mut items_read = 0usize;
-        let items_resume_section = Reader::take_item_from(ptr, len, &mut cur_pos, &mut items_read);
-        let count = Reader::take_item_from(ptr, len, &mut cur_pos, &mut items_read);
-        resumecodereader.cur_pos = cur_pos;
-        resumecodereader.items_read = items_read;
+        let items_resume_section = resumecodereader.next_item();
+        let count = resumecodereader.next_item();
 
         // resume.py:1368-1376
         let (resume_after_guard_not_forced, virtuals_cache) =
@@ -7984,12 +7978,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py consume_virtualref_info
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
-        let mut cur_pos = self.resumecodereader.cur_pos;
-        let mut items_read = self.resumecodereader.items_read;
-        let code = self.resumecodereader.code_addr();
-        let size = Reader::next_item_from(code, &mut cur_pos, &mut items_read);
-        self.resumecodereader.cur_pos = cur_pos;
-        self.resumecodereader.items_read = items_read;
+        let size = self.resumecodereader.next_item_bound();
         // resume.py:1390-1391
         if vrefinfo.is_none() || size == 0 {
             // resume.py:1391: assert size == 0
@@ -8057,12 +8046,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         ginfo: Option<&dyn GreenfieldInfo>,
     ) {
         // resume.py:1425
-        let mut cur_pos = self.resumecodereader.cur_pos;
-        let mut items_read = self.resumecodereader.items_read;
-        let code = self.resumecodereader.code_addr();
-        let vable_size = Reader::next_item_from(code, &mut cur_pos, &mut items_read);
-        self.resumecodereader.cur_pos = cur_pos;
-        self.resumecodereader.items_read = items_read;
+        let vable_size = self.resumecodereader.next_item_bound();
 
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
@@ -8078,12 +8062,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         } else {
             // resume.py:1433-1435
             self.resumecodereader.jump(vable_size as usize);
-            let mut cur_pos = self.resumecodereader.cur_pos;
-            let mut items_read = self.resumecodereader.items_read;
-            let code = self.resumecodereader.code_addr();
-            let vref_size = Reader::next_item_from(code, &mut cur_pos, &mut items_read);
-            self.resumecodereader.cur_pos = cur_pos;
-            self.resumecodereader.items_read = items_read;
+            let vref_size = self.resumecodereader.next_item_bound();
             self.resumecodereader.jump(vref_size as usize * 2);
         }
     }
