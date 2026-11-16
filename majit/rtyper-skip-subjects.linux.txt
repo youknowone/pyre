@@ -1648,7 +1648,6 @@ two-phase-annotate-skipped	pyre_object::dictmultiobject::w_module_dict_setitem_s
 two-phase-annotate-skipped	pyre_object::dictmultiobject::w_module_dict_setitem_str_module_strategy
 two-phase-annotate-skipped	pyre_object::dictmultiobject::w_module_dict_store_inner
 two-phase-annotate-skipped	pyre_object::dictmultiobject::w_module_dict_store_inner_checked
-two-phase-annotate-skipped	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-annotate-skipped	pyre_object::generator::w_async_generator_new
 two-phase-annotate-skipped	pyre_object::generator::w_coroutine_new
 two-phase-annotate-skipped	pyre_object::generator::w_generator_new
@@ -1804,7 +1803,6 @@ two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::get_empty_storage
 two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::getitem_str_hashed
 two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::length
 two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::switch_to_object_strategy
-two-phase-rtype-skipped	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-rtype-skipped	pyre_object::identitydict::<Impl>::get_empty_storage
 two-phase-rtype-skipped	pyre_object::identitydict::<Impl>::length
 two-phase-rtype-skipped	pyre_object::identitydict::<Impl>::switch_to_object_strategy

@@ -6158,6 +6158,12 @@ impl Bookkeeper {
         // share `project_rust_vec` the same way.
         let list_family_owned = crate::front::semantic::list_family_bare_vec_spelling(t);
         let t = list_family_owned.as_deref().unwrap_or(t);
+        // rffi.py `CArrayPtr`: a one-level bool / GCREF cell-pointer field is
+        // the same `Ptr(CArray(T))` a callback formal of that spelling is
+        // (`fn_ptr_cell_pointer_lltype`); `rffi.CStruct` keeps the field type.
+        if let Some(llty) = fn_ptr_cell_pointer_lltype(t) {
+            return crate::translator::rtyper::llannotation::lltype_to_annotation(llty);
+        }
         // Fat `&dyn Trait` is `two_word_fat_struct` (`{data, len}`), not a
         // classdef-less instance. `getitem` of that pair is FatData / FatLen.
         if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(t) {
@@ -8989,21 +8995,6 @@ fn split_paren_group(input: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// One-level pointer to `bool` (`*mut bool` / `*const bool` / `&mut bool`
-/// / `&bool`). `fn_ptr_tyref_to_lltype` returns `Signed` for that slot
-/// so `SomePtr.call` matches the call-site `SomeInteger` (`lltype.py`
-/// `_func` arg equality).
-fn one_level_ptr_to_bool_spelling(spelling: &str) -> bool {
-    let t = spelling.trim();
-    let inner = t
-        .strip_prefix("*mut ")
-        .or_else(|| t.strip_prefix("*const "))
-        .or_else(|| t.strip_prefix("&mut "))
-        .or_else(|| t.strip_prefix("& "))
-        .or_else(|| t.strip_prefix('&'));
-    inner.is_some_and(|s| s.trim() == "bool")
-}
-
 fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
     let mut t = spelling.trim();
     loop {
@@ -9044,25 +9035,65 @@ fn result_ok_of_exception_carrier<'a>(
     }
 }
 
+/// One-level cell-pointer prefix: `&mut ` (reference) or `*mut ` / `*const `
+/// (raw). Shared `&` is not a cell pointer (`tyref_cell_pointer_lltype`).
+fn strip_one_level_cell_pointer_prefix(spelling: &str) -> Option<(&str, bool)> {
+    let t = spelling.trim();
+    if let Some(inner) = t.strip_prefix("&mut ") {
+        return Some((inner.trim(), true));
+    }
+    t.strip_prefix("*mut ")
+        .or_else(|| t.strip_prefix("*const "))
+        .map(|inner| (inner.trim(), false))
+}
+
+/// A one-level pointer to `bool` or to the GCREF word is a C cell pointer
+/// (`rffi.py` `CArrayPtr`). One mapping for argument and result positions,
+/// matching `fn_ptr_tyref_to_lltype`, and the producer-side input
+/// `class_root` (`"*mut bool"` / `"*mut GCREF"`).
+pub(crate) fn fn_ptr_cell_pointer_lltype(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    let (inner, is_ref) = strip_one_level_cell_pointer_prefix(spelling)?;
+
+    if inner == "bool" {
+        return Some(crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(
+            LowLevelType::Bool,
+        ));
+    }
+
+    if !is_ref
+        && (spelling_is_declared_path(inner, "majit_gc::header::GCREF")
+            || inner == "GcRef"
+            || inner.ends_with("::GcRef"))
+    {
+        return Some(crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(
+            GCREF.clone(),
+        ));
+    }
+    None
+}
+
 /// Arg lltype of a fn-pointer spelling. Matches `fn_ptr_tyref_to_lltype`
 /// of the Charon `FnPtr` skip_binder: integers / bool / float stay
-/// primitive; `str` is `STRPTR`; a one-level pointer to `bool` is the
-/// slot address `Signed`; `GCREF` / `GCREFOpaque` is `GCREF`; everything
-/// else — slices, ADTs, `Result`, class pointers, `()` — is `OBJECTPTR`.
+/// primitive; `str` is `STRPTR`; a one-level pointer to `bool` or to the
+/// GCREF word is `CArrayPtr(T)` (`rffi.py` `CArrayPtr`); `GCREF` /
+/// `GCREFOpaque` is `GCREF`; everything else — slices, ADTs, `Result`,
+/// class pointers, `()` — is `OBJECTPTR`.
 fn fn_ptr_arg_lltype(
     spelling: &str,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
-    if one_level_ptr_to_bool_spelling(spelling) {
-        return LowLevelType::Signed;
+    if let Some(t) = fn_ptr_cell_pointer_lltype(spelling) {
+        return t;
     }
     if is_gcref_type_spelling(spelling) {
         return GCREF.clone();
     }
     let t = peel_ref_and_ptr_prefixes(spelling);
-    // `majit_ir::GcRef` is the GCREF word (`llmemory.GCREF`). `*mut GcRef`
-    // is a root slot the call site annotates as GCREF; OBJECTPTR is a
-    // class instance pointer (`*mut PyObject`).
+    // `majit_ir::GcRef` is the GCREF word (`llmemory.GCREF`). A one-level
+    // pointer to it is `CArrayPtr` above; a bare `GcRef` is the word itself.
     if t == "GcRef" || t.ends_with("::GcRef") {
         return GCREF.clone();
     }
@@ -9113,8 +9144,8 @@ fn fn_ptr_result_lltype(
     if t == "()" {
         return LowLevelType::Void;
     }
-    if one_level_ptr_to_bool_spelling(t) {
-        return LowLevelType::Signed;
+    if let Some(cell) = fn_ptr_cell_pointer_lltype(t) {
+        return cell;
     }
     if is_gcref_type_spelling(t) {
         return GCREF.clone();
@@ -11662,25 +11693,24 @@ mod tests {
                 args: vec![
                     LowLevelType::Unsigned,
                     LowLevelType::Unsigned,
-                    LowLevelType::Signed,
+                    crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(LowLevelType::Bool),
                 ],
                 result: GCREF.clone(),
             }),
-            "*mut bool FUNC arg is Signed; RESULT GCREFOpaque is GCREF"
+            "*mut bool FUNC arg is CArrayPtr(Bool); RESULT GCREFOpaque is GCREF"
         );
 
-        let rooted = FuncType {
+        let cell = FuncType {
             args: vec![
                 LowLevelType::Unsigned,
                 LowLevelType::Unsigned,
-                GCREF.clone(),
-                LowLevelType::Signed,
+                crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(GCREF.clone()),
+                crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(LowLevelType::Bool),
             ],
             result: GCREF.clone(),
         };
         for spelling in [
             "unsafe fn(u32, usize, *mut GCREF, *mut bool) -> GCREF",
-            "unsafe fn(u32, usize, *mut GCREFOpaque, *mut bool) -> *mut GCREFOpaque",
             "unsafe fn(u32, usize, *mut GcRef, *mut bool) -> GcRef",
         ] {
             let s = fn_ptr_somevalue_for_spelling(spelling)
@@ -11690,10 +11720,146 @@ mod tests {
             };
             assert_eq!(
                 p.ll_ptrtype.TO,
-                PtrTarget::Func(rooted.clone()),
-                "{spelling}: *mut GCREF / *mut GcRef FUNC arg is GCREF"
+                PtrTarget::Func(cell.clone()),
+                "{spelling}: *mut GCREF / *mut GcRef FUNC arg is CArrayPtr(GCREF)"
             );
         }
+        let opaque = fn_ptr_somevalue_for_spelling(
+            "unsafe fn(u32, usize, *mut GCREFOpaque, *mut bool) -> *mut GCREFOpaque",
+        )
+        .expect("opaque spelling is a fn pointer");
+        let SomeValue::Ptr(p_opaque) = &opaque else {
+            panic!("*mut GCREFOpaque slot must seed SomePtr, got {opaque:?}");
+        };
+        assert_eq!(
+            p_opaque.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![
+                    LowLevelType::Unsigned,
+                    LowLevelType::Unsigned,
+                    GCREF.clone(),
+                    crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(LowLevelType::Bool),
+                ],
+                result: GCREF.clone(),
+            }),
+            "*mut GCREFOpaque FUNC arg is the GCREF word"
+        );
+    }
+
+    #[test]
+    fn fn_ptr_cell_pointer_spelling_matches_tyref_classifier() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        for spelling in ["&mut bool", "*mut bool", "*const bool"] {
+            assert_eq!(
+                fn_ptr_cell_pointer_lltype(spelling),
+                Some(CArrayPtr(LowLevelType::Bool)),
+                "{spelling} is CArrayPtr(Bool)"
+            );
+        }
+        for spelling in [
+            "*mut GCREF",
+            "*const GCREF",
+            "*mut GcRef",
+            "*mut majit_ir::GcRef",
+        ] {
+            assert_eq!(
+                fn_ptr_cell_pointer_lltype(spelling),
+                Some(CArrayPtr(GCREF.clone())),
+                "{spelling} is CArrayPtr(GCREF)"
+            );
+        }
+        for spelling in ["&bool", "& GCREF", "&mut GCREF", "&GcRef", "&mut GcRef"] {
+            assert_eq!(
+                fn_ptr_cell_pointer_lltype(spelling),
+                None,
+                "{spelling} is not a cell pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_cell_pointer_is_carrayptr() {
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("*mut bool"),
+            lltype_to_annotation(CArrayPtr(LowLevelType::Bool)),
+        );
+        assert_eq!(
+            bk.project_struct_field_type("*const bool"),
+            lltype_to_annotation(CArrayPtr(LowLevelType::Bool)),
+        );
+        assert_eq!(
+            bk.project_struct_field_type("*mut i32"),
+            crate::annotator::model::s_int(),
+        );
+    }
+
+    #[test]
+    fn fn_spelling_out_param_pointers_are_carrayptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        let ft = func_type_from_fn_spelling(
+            "fn(u32, usize, *mut majit_gc::header::GCREF, *mut bool) -> u64",
+            &|_| false,
+            &|_| false,
+        )
+        .expect("out-param spelling is a fn pointer");
+        assert_eq!(
+            ft.args,
+            vec![
+                LowLevelType::Unsigned,
+                LowLevelType::Unsigned,
+                CArrayPtr(GCREF.clone()),
+                CArrayPtr(LowLevelType::Bool),
+            ],
+            "one-level pointer to the GCREF alias or bool is CArrayPtr(T) (`rffi.py` CArrayPtr)"
+        );
+        let opaque = func_type_from_fn_spelling(
+            "fn(*mut majit_gc::header::GCREFOpaque)",
+            &|_| false,
+            &|_| false,
+        )
+        .expect("opaque spelling is a fn pointer");
+        assert_eq!(
+            opaque.args,
+            vec![GCREF.clone()],
+            "*mut GCREFOpaque is the GCREF word"
+        );
+        let bool_out = func_type_from_fn_spelling("fn() -> *mut bool", &|_| false, &|_| false)
+            .expect("bool out-param result is a fn pointer");
+        assert_eq!(
+            bool_out.result,
+            CArrayPtr(LowLevelType::Bool),
+            "fn() -> *mut bool RESULT is CArrayPtr(Bool)"
+        );
+        let gcref_cell =
+            func_type_from_fn_spelling("fn() -> *mut majit_gc::header::GCREF", &|_| false, &|_| {
+                false
+            })
+            .expect("GCREF cell result is a fn pointer");
+        assert_eq!(
+            gcref_cell.result,
+            CArrayPtr(GCREF.clone()),
+            "fn() -> *mut majit_gc::header::GCREF RESULT is CArrayPtr(GCREF)"
+        );
+        let opaque_out = func_type_from_fn_spelling(
+            "fn() -> *mut majit_gc::header::GCREFOpaque",
+            &|_| false,
+            &|_| false,
+        )
+        .expect("opaque result is a fn pointer");
+        assert_eq!(
+            opaque_out.result,
+            GCREF.clone(),
+            "fn() -> *mut majit_gc::header::GCREFOpaque RESULT is GCREF"
+        );
     }
 
     #[test]

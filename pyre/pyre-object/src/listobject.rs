@@ -2239,16 +2239,8 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_LIST_USER_GC_TYPE_ID,
-            W_LIST_USER_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_collecting(W_LIST_USER_GC_TYPE_ID, W_LIST_USER_OBJECT_SIZE);
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
         .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
@@ -2277,9 +2269,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
     }
     unsafe {
         std::ptr::write(raw as *mut W_ListObjectUser, body);
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
     }
     raw as PyObjectRef
 }
@@ -2628,28 +2618,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
     }
     storage.reload_typed_blocks();
-    let mut allocation_root = match strategy {
-        ListStrategy::Object => items_block as crate::gc_hook::GCREF,
-        ListStrategy::Integer | ListStrategy::IntOrFloat => {
-            storage.int_items.block as crate::gc_hook::GCREF
-        }
-        ListStrategy::Float => storage.float_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Bytes => storage.bytes_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Ascii => storage.ascii_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Empty
-        | ListStrategy::Size
-        | ListStrategy::SimpleRange
-        | ListStrategy::Range => std::ptr::null_mut(),
-    };
-    let mut needs_write_barrier = true;
-    let raw = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_LIST_GC_TYPE_ID,
-            W_LIST_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    };
+    let raw = crate::gc_hook::try_gc_alloc_collecting(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
     // The `malloc_typed` header below is the answer for a missing hook, not
     // for a GC that owns the heap and refused: that one raises MemoryError
     // (`_ll_malloc_fixedsize`) and this returns PY_NULL.
@@ -2699,8 +2668,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     if matches!(
         strategy,
         ListStrategy::Object | ListStrategy::Bytes | ListStrategy::Ascii
-    ) && needs_write_barrier
-    {
+    ) {
         list_write_barrier_impl(raw as PyObjectRef, true);
     }
     raw as PyObjectRef
@@ -2778,26 +2746,7 @@ unsafe fn w_list_from_storage_and_strategy(
     float_items.reload_block(float_slot);
     bytes_items.reload_block(bytes_slot);
     ascii_items.reload_block(ascii_slot);
-    let mut allocation_root = match strategy {
-        ListStrategy::Object => items_block as crate::gc_hook::GCREF,
-        ListStrategy::Integer | ListStrategy::IntOrFloat => {
-            int_items.block as crate::gc_hook::GCREF
-        }
-        ListStrategy::Float => float_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Bytes => bytes_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Ascii => ascii_items.block as crate::gc_hook::GCREF,
-        ListStrategy::Empty
-        | ListStrategy::Size
-        | ListStrategy::SimpleRange
-        | ListStrategy::Range => std::ptr::null_mut(),
-    };
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::try_gc_alloc_collecting_rooted(
-        W_LIST_GC_TYPE_ID,
-        W_LIST_OBJECT_SIZE,
-        &mut allocation_root,
-        &mut needs_write_barrier,
-    );
+    let raw = crate::gc_hook::try_gc_alloc_collecting(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
         .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
@@ -2836,8 +2785,7 @@ unsafe fn w_list_from_storage_and_strategy(
     if matches!(
         strategy,
         ListStrategy::Object | ListStrategy::Bytes | ListStrategy::Ascii
-    ) && needs_write_barrier
-    {
+    ) {
         list_write_barrier_impl(obj, true);
     }
     obj

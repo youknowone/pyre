@@ -19,7 +19,7 @@
 //! (`DICT_INITSIZE` is 8).
 //!
 //! Entries are `_ll_malloc_entries`: collecting nursery malloc
-//! (`try_gc_alloc_collecting_rooted`), matching `lltype.malloc(ENTRIES, n,
+//! (`try_gc_alloc_collecting`), matching `lltype.malloc(ENTRIES, n,
 //! zero=True)` of a `GcArray`. `ll_new_weakdict` allocates the `WEAKDICT`
 //! header the same collecting way (`lltype.malloc(WEAKDICT)`). A prebuilt
 //! table (`WeakKeyDictRepr.convert_const`) uses `ll_new_weakdict_prebuilt`
@@ -140,20 +140,11 @@ fn entries_bytes(n: usize) -> usize {
         .expect("weakkeydict entries size")
 }
 
-/// Collecting nursery malloc (`try_gc_alloc_collecting_rooted`) with the
+/// Collecting nursery malloc (`try_gc_alloc_collecting`) with the
 /// no-GC host fallback `alloc_entries` uses.
 fn alloc_collecting_or_host(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
     if tid != 0 {
-        let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-        let mut needs_write_barrier = true;
-        let raw = unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
-                tid,
-                bytes,
-                &mut allocation_root,
-                &mut needs_write_barrier,
-            )
-        };
+        let raw = crate::gc_hook::try_gc_alloc_collecting(tid, bytes);
         let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
             .allocated_or_raise()
             .unwrap_or(std::ptr::null_mut());
@@ -162,9 +153,7 @@ fn alloc_collecting_or_host(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
         }
         if !raw.is_null() {
             unsafe { std::ptr::write_bytes(raw as *mut u8, 0, bytes) };
-            if needs_write_barrier {
-                crate::gc_hook::try_gc_write_barrier_managed(raw);
-            }
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
             return raw;
         }
     }

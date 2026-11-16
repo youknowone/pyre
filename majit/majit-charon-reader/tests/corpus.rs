@@ -119,10 +119,27 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
+    // + 2 for the one-level `*mut bool` actuals, `cell_ptr_forward` and
+    // `cell_ptr_from_local`.
+    //
+    // + 4 for the one-level `&bool` / `&mut bool` direct-call pair:
+    // `bool_ref_read`, `bool_ref_direct_caller`, `bool_mut_set`, and
+    // `bool_mut_direct_caller`.
+    //
+    // + 1 for `bool_mut_then_shared_direct_caller`, exclusive then shared
+    // borrow of a cell-bound bool local.
+    //
+    // + 2 for the cell-pointer field pair, `cell_ptr_field_call` and
+    // `cell_ptr_field_store`. `CellPtrHolder` is a type, so it
+    // contributes no body.
+    //
+    // + 1 for `gcref_raw_local_to_callback`, the raw address of a bare
+    // GCREF local passed to a `*mut GCREF` callback.
+    //
     // Measured on Charon 0.1.315 (nightly-2026.11.09) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
-    // longer its own local item, and this artefact holds 105.
-    assert_eq!(local_count, 105, "105 local fns expected");
+    // longer its own local item, and this artefact holds 115.
+    assert_eq!(local_count, 115, "115 local fns expected");
 }
 
 #[test]

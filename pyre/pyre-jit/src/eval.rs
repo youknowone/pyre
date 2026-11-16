@@ -126,30 +126,6 @@ fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> maji
     majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as majit_gc::GCREF
 }
 
-/// Rooted collecting allocation trampoline. Unlike registering the slot around
-/// every residual call, MiniMark exposes it only to the nursery-full
-/// `collect_and_reserve` path, matching RPython's translated stack-map root.
-///
-/// # Safety
-/// `root` must remain a valid mutable GC-pointer slot until this call returns.
-/// `needs_write_barrier` must remain a valid mutable `bool` slot.
-unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
-    type_id: u32,
-    size: usize,
-    root: *mut majit_gc::GCREF,
-    needs_write_barrier: *mut bool,
-) -> majit_gc::GCREF {
-    unsafe {
-        majit_gc::alloc_nursery_collecting_typed_rooted(
-            type_id,
-            size,
-            root as *mut majit_ir::GcRef,
-            needs_write_barrier,
-        )
-        .0 as majit_gc::GCREF
-    }
-}
-
 /// `gc.collect(n)` (interp_gc.py) trampoline. Bridges pyre-object's
 /// `try_gc_collect` to `majit_gc::collect_generation`, which fans out to the
 /// active backend's `dynasm_collect_generation` /
@@ -6604,9 +6580,6 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
         pyre_object_gc_alloc_collecting_trampoline,
-    );
-    pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(
-        pyre_object_gc_alloc_collecting_rooted_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_freeze_hook(pyre_object_gc_freeze_trampoline);

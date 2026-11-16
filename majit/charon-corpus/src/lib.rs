@@ -950,3 +950,73 @@ pub fn mem_drop_usize(x: usize) {
 pub fn tail_len(s: &[i64]) -> usize {
     s.get(1..).unwrap_or(&[]).len()
 }
+
+/// Forwards a `*mut bool` into a fn-pointer formal of the same type.
+#[inline(never)]
+pub fn cell_ptr_forward(p: *mut bool, f: fn(*mut bool)) {
+    f(p)
+}
+
+/// Takes the address of a local bool and passes it to a fn-pointer.
+#[inline(never)]
+pub fn cell_ptr_from_local(f: fn(*mut bool)) -> bool {
+    let mut b = false;
+    f(&mut b as *mut bool);
+    b
+}
+
+/// Reads a shared `&bool` formal.
+#[inline(never)]
+pub fn bool_ref_read(p: &bool) -> bool {
+    *p
+}
+
+/// Passes a shared borrow of a bool to a direct callee.
+#[inline(never)]
+pub fn bool_ref_direct_caller(b: bool) -> bool {
+    bool_ref_read(&b)
+}
+
+/// Writes through a `&mut bool` formal.
+#[inline(never)]
+pub fn bool_mut_set(p: &mut bool) {
+    *p = true;
+}
+
+/// Passes an exclusive borrow of a local bool to a direct callee.
+#[inline(never)]
+pub fn bool_mut_direct_caller() -> bool {
+    let mut b = false;
+    bool_mut_set(&mut b);
+    b
+}
+
+/// Passes an exclusive borrow, then a shared borrow, of a cell-bound local bool.
+#[inline(never)]
+pub fn bool_mut_then_shared_direct_caller() -> bool {
+    let mut b = false;
+    bool_mut_set(&mut b);
+    bool_ref_read(&b)
+}
+
+/// One-level `*mut bool` cell stored as a struct field (`rffi.CArrayPtr`).
+#[repr(C)]
+pub struct CellPtrHolder {
+    pub p: *mut bool,
+}
+
+#[inline(never)]
+pub fn cell_ptr_field_call(holder: &CellPtrHolder, f: fn(*mut bool)) {
+    f(holder.p)
+}
+
+#[inline(never)]
+pub fn cell_ptr_field_store(holder: &mut CellPtrHolder, p: *mut bool) {
+    holder.p = p;
+}
+
+/// Raw address of a bare GCREF local passed to a callback.
+#[inline(never)]
+pub fn gcref_raw_local_to_callback(mut value: majit_gc::GCREF, callback: fn(*mut majit_gc::GCREF)) {
+    callback(&raw mut value)
+}

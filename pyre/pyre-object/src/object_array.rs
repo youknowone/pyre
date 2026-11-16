@@ -2128,16 +2128,9 @@ unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut F
     if young {
         let _roots = crate::gc_roots::push_roots();
         let save = crate::gc_roots::pin_roots(values);
-        let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-        let mut needs_write_barrier = true;
-        let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
-                PY_OBJECT_ARRAY_GC_TYPE_ID,
-                payload,
-                &mut allocation_root,
-                &mut needs_write_barrier,
-            )
-        })
+        let raw = crate::gc_hook::GcAllocOutcome::from_hook(
+            crate::gc_hook::try_gc_alloc_collecting(PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
+        )
         .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
         let block = if !raw.is_null() {
@@ -2155,7 +2148,7 @@ unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut F
             // Barrier before the items, matching `alloc_list_items_block_gc`:
             // an old-gen spill must be on the remembered set before young
             // MRO entries land.
-            if !raw.is_null() && needs_write_barrier {
+            if !raw.is_null() {
                 crate::gc_hook::try_gc_write_barrier(block as crate::gc_hook::GCREF);
             }
             let items = (*block).items_mut_ptr();

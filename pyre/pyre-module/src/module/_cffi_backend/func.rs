@@ -343,16 +343,9 @@ pub fn rawbytes_from_charp(ptr: *mut u8) -> *mut RawBytes {
         "GcType::SIZE drift from std::mem::size_of"
     );
     let type_id = RawBytes::type_id();
-    let mut allocation_root: pyre_object::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
-            type_id,
-            RawBytes::SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(
+        pyre_object::gc_hook::try_gc_alloc_collecting(type_id, RawBytes::SIZE),
+    )
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     if raw.is_null() {
@@ -364,9 +357,7 @@ pub fn rawbytes_from_charp(ptr: *mut u8) -> *mut RawBytes {
     }
     unsafe {
         std::ptr::write(raw as *mut RawBytes, value);
-        if needs_write_barrier {
-            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
-        }
+        pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
     }
     raw as *mut RawBytes
 }

@@ -163,26 +163,27 @@ pub fn w_pytraceback_new(
     // Nursery, same as `space.allocate_instance(PyTraceback)` /
     // `malloc_fixedsize` → `collect_and_reserve`.  The host-side constructor
     // used to take the no-collect hook and spill old when the nursery was
-    // full.  `w_next` is the chain child handed to the rooted slot; `frame`
-    // stays on the shadow stack this bracket already published and is
-    // re-read below.  Before the GC hook is wired (bootstrap, tests) the
-    // collecting hook returns `None`; fall back to the leaked `malloc_typed`
-    // block.
-    let mut allocation_root = roots.get(inputs) as pyre_object::gc_hook::GCREF;
-    let mut needs_write_barrier = true;
-    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+    // full.  `w_next` and `frame` stay on the shadow stack this bracket
+    // already published and are re-read below.  Before the GC hook is wired
+    // (bootstrap, tests) the collecting hook returns `None`; fall back to the
+    // leaked `malloc_typed` block.
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(
+        pyre_object::gc_hook::try_gc_alloc_collecting(
             PYTRACEBACK_GC_TYPE_ID,
             PYTRACEBACK_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+        ),
+    )
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let tb_slot = if raw.is_null() {
         None
     } else {
+        // The nursery is not zero-filled. Clear before publication so a
+        // collection during pin_root sees only null GC fields
+        // (`framework.py` `gct_zero_gc_pointers_inside`).
+        unsafe {
+            std::ptr::write_bytes(raw as *mut u8, 0, PYTRACEBACK_OBJECT_SIZE);
+        }
         // Root the fresh block before `get_instantiate` below can allocate.
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(raw as PyObjectRef);
@@ -228,11 +229,8 @@ pub fn w_pytraceback_new(
     unsafe {
         std::ptr::write(raw, value);
     }
-    // The node may point at a still-young `w_next` and frame; remember it
-    // if this alloc spilled old.
-    if needs_write_barrier {
-        pyre_object::gc_hook::try_gc_write_barrier(raw as pyre_object::gc_hook::GCREF);
-    }
+    // The barrier is a no-op for a nursery result and remembers an old spill.
+    pyre_object::gc_hook::try_gc_write_barrier(raw as pyre_object::gc_hook::GCREF);
     // `try_gc_write_barrier` is a `gc_op`; the slot is the live copy.
     pyre_object::gc_roots::shadow_stack_get(tb_slot)
 }

@@ -1870,6 +1870,12 @@ pub(in crate::front::mir) fn input_param_value_type(
     is_first_param: bool,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> ValueType {
+    // One-level `&mut bool` / raw `*bool` / raw `*GCREF`: the address of
+    // the cell (`rffi.py` `CArrayPtr`), not the scalar pointee. `getkind`
+    // of that raw Ptr is `'int'`.
+    if tyref_cell_pointer_lltype(local_ty, llbc).is_some() {
+        return ValueType::Int;
+    }
     if matches!(ty, ValueType::Ref(None))
         && tyref_is_void_zst(local_ty, llbc)
         && !tyref_keeps_empty_class_instance(local_ty, llbc, tombstoned_leaves)
@@ -10862,6 +10868,15 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
     stamp_raw_c_void_ptr(var, ty, llbc);
 }
 
+/// Stamp a one-level bool / GCREF cell pointer `CArrayPtr(T)`
+/// (`rffi.py` `CArrayPtr`). The producing op is Int-banked
+/// (`getkind` of a raw Ptr).
+pub(in crate::front::mir) fn stamp_cell_pointer(var: &Variable, ty: &TyRef, llbc: &Llbc) {
+    if let Some(llty) = tyref_cell_pointer_lltype(ty, llbc) {
+        var.set_concretetype(Some(llty));
+    }
+}
+
 /// Stamp a raw `void *` / `void **` cell (`rffi.py` `VOIDP` / `VOIDPP`).
 pub(in crate::front::mir) fn stamp_raw_c_void_ptr(var: &Variable, ty: &TyRef, llbc: &Llbc) {
     use crate::translator::rtyper::lltypesystem::rffi::{VOIDP, VOIDPP};
@@ -11035,6 +11050,12 @@ fn fn_ptr_tyref_to_lltype(
     {
         return GCREF.clone();
     }
+    // A one-level pointer to `bool` or to the GCREF word is
+    // `rffi.CArrayPtr(T)` (`rffi.py` `CArrayPtr`). Same classifier as
+    // the producer (`tyref_cell_pointer_lltype`).
+    if let Some(t) = tyref_cell_pointer_lltype(ty, llbc) {
+        return t;
+    }
     // A one-level pointer to a named class is `rclass.OBJECTPTR`
     // (`SomePtr.call` takes a `SomeInstance` argument as that pointer).
     // `tyref_to_value_type` paints an unharvested fieldless struct as
@@ -11044,31 +11065,10 @@ fn fn_ptr_tyref_to_lltype(
         && let Some(pointee) = one_level_pointer_pointee(node, llbc)
     {
         let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
-        // `*mut GCREF` is a root slot (`tyref_is_gcref_spelling` of the
-        // pointer is false: two levels onto GCREFOpaque). The call site
-        // annotates that slot as GCREF (`is_gcref_type_spelling` peels
-        // prefixes). `valuetype_to_lltype(Ref)` would paint OBJECTPTR
-        // and `SomePtr.call` would reject the GCREF argument.
-        // `*mut GcRef` is the same word (`majit_ir::GcRef`).
-        if fn_ptr_pointee_is_gcref(pointee, llbc) {
-            return GCREF.clone();
-        }
         if let Some(root) = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves()) {
             if !crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
                 return OBJECTPTR.clone();
             }
-        }
-        // `*mut bool` is a primitive slot address (`SomeInteger` /
-        // Signed at the call site). `valuetype_to_lltype` of `Ref` would
-        // paint it `OBJECTPTR` and `SomePtr.call` would reject the
-        // Signed argument (`lltype.py` `_func` arg equality).
-        if pointee
-            .as_object()
-            .and_then(|o| o.get("Scalar"))
-            .and_then(scalar_value_type)
-            == Some(crate::model::ValueType::Bool)
-        {
-            return LowLevelType::Signed;
         }
     }
     let inputs = value_type_inputs(llbc);
@@ -11081,6 +11081,68 @@ fn fn_ptr_tyref_to_lltype(
         struct_fields,
     ))
     .unwrap_or_else(|| OBJECTPTR.clone())
+}
+
+/// One-level pointer or reference to `bool` or to the GCREF word
+/// (`rffi.py` `CArrayPtr`). Shared by fn-pointer formals
+/// (`fn_ptr_tyref_to_lltype`) and the producer (parameter typing,
+/// `Rvalue::Ref` / `Rvalue::RawPtr` of a cell). The GCREF word itself
+/// (`tyref_is_gcref_spelling`) is not a cell pointer.
+pub(in crate::front::mir) fn tyref_cell_pointer_lltype(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    let node = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc))?;
+    let obj = node.as_object()?;
+    // `&mut bool` and raw `*bool` / `*GCREF` only (`rffi.py` `CArrayPtr`).
+    // A shared `&bool` is the scalar (`lltype.Ptr` has no primitive
+    // pointee) and `&mut GCREF` is the managed `MutRef` cell.
+    let (pointee, is_ref) = if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array)
+    {
+        if arr.get(2).and_then(serde_json::Value::as_str) != Some("Mut") {
+            return None;
+        }
+        (arr.get(1)?, true)
+    } else if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        (arr.first()?, false)
+    } else {
+        return None;
+    };
+    let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
+    if fn_ptr_pointee_is_gcref(pointee, llbc) {
+        return (!is_ref).then(|| CArrayPtr(GCREF.clone()));
+    }
+    if pointee
+        .as_object()
+        .and_then(|o| o.get("Scalar"))
+        .and_then(scalar_value_type)
+        == Some(crate::model::ValueType::Bool)
+    {
+        return Some(CArrayPtr(LowLevelType::Bool));
+    }
+    None
+}
+
+/// Canonical `class_root` of [`tyref_cell_pointer_lltype`]: `"*mut bool"`
+/// or `"*mut GCREF"`, the spellings `fn_ptr_cell_pointer_lltype`
+/// recognizes. `tyref_to_ast_string` strips `Ref`.
+pub(in crate::front::mir) fn tyref_cell_pointer_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+    let ptr = tyref_cell_pointer_lltype(ty, llbc)?;
+    if ptr == CArrayPtr(LowLevelType::Bool) {
+        Some("*mut bool".to_string())
+    } else {
+        Some("*mut GCREF".to_string())
+    }
 }
 
 /// Pointee of a one-level pointer that is the GCREF word: `*mut GCREFOpaque`,
@@ -13985,11 +14047,18 @@ pub(in crate::front::mir) fn json_ty_raw_store_descr(
     }
     let size = json_ty_literal_byte_size(node)? as usize;
     let lit = node.as_object()?.get("Scalar")?;
-    if matches!(lit.as_str(), Some("Bool" | "Char")) {
+    // `rbool.py` `BoolRepr` (`lltype.Bool`): keep the one-byte cell, type the element Bool.
+    if lit.as_str() == Some("Bool") {
+        return Some((ValueType::Bool, size, false));
+    }
+    if lit.as_str() == Some("Char") {
         return Some((ValueType::Int, size, false));
     }
     let lit = lit.as_object()?;
-    if lit.contains_key("Bool") || lit.contains_key("Char") {
+    if lit.contains_key("Bool") {
+        return Some((ValueType::Bool, size, false));
+    }
+    if lit.contains_key("Char") {
         return Some((ValueType::Int, size, false));
     }
     if let Some(int) = lit.get("Integer").and_then(serde_json::Value::as_object) {
@@ -17626,6 +17695,10 @@ fn field_row_lltype(
     let t = ty.trim();
     if t.starts_with("??") {
         return None;
+    }
+    // rffi.py `CArrayPtr`; same row `project_struct_field_type` annotates.
+    if let Some(llty) = crate::annotator::bookkeeper::fn_ptr_cell_pointer_lltype(t) {
+        return Some(llty);
     }
     // Fat `&[T]` / `&str` / `&dyn Trait` (`fat_ptr_layout::spelling_is_fat_ptr`,
     // the same unsized-pointee walk `tyref_is_fat_ref` uses on a TyRef).

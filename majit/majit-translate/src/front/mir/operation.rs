@@ -3364,7 +3364,16 @@ impl<'a> Lowering<'a> {
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, kind, .. } => {
                 if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    // A shared `&bool` is the Bool scalar (`tyref_cell_pointer_lltype`
+                    // answers None), so the borrow reads the cell: `p[0]` of the
+                    // `rffi.CArrayPtr` (`rptr.py` `PtrRepr.rtype_getitem`).
+                    if !borrow_kind_is_exclusive(&kind)
+                        && tyref_cell_pointer_lltype(dest_ty, self.llbc).is_none()
+                    {
+                        return Ok((None, self.emit_cell_load(mir_bb, cell)?));
+                    }
                     let v = self.defined_local(mir_bb, cell)?;
+                    let v = self.emit_cell_pointer_cast(mir_bb, dest_ty, v);
                     return Ok((None, v));
                 }
                 // `&mut *p` of a cell parameter is that cell. The reborrow
@@ -3401,6 +3410,15 @@ impl<'a> Lowering<'a> {
                 // assigned, or `recorded_alias_locals`).
                 if dest_local.is_some_and(|local| self.scalar_address_locals.contains(&local))
                     && let Some(inner) = self.raw_primitive_deref_inner(&place)
+                {
+                    let v = self.resolve_place(mir_bb, inner)?;
+                    return Ok((None, v));
+                }
+                // `&mut *p` of a bool / GCREF cell pointer is that address:
+                // such a dest is `CArrayPtr(T)` whatever construction
+                // classified. Resolving the deref would `RawLoad` the pointee.
+                if tyref_cell_pointer_lltype(dest_ty, self.llbc).is_some()
+                    && let Some(inner) = self.raw_primitive_reborrow_inner(&place)
                 {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -3446,7 +3464,25 @@ impl<'a> Lowering<'a> {
             Rvalue::RawPtr { place, .. } => {
                 if let Some(cell) = self.cell_local_of_address_place(&place) {
                     let v = self.defined_local(mir_bb, cell)?;
+                    let v = self.emit_cell_pointer_cast(mir_bb, dest_ty, v);
                     return Ok((None, v));
+                }
+                // `rffi.CArrayPtr(GCREF)` names real storage; a bare GCREF local
+                // has none the GC traces (`shadowstack.py` `push_roots` roots live
+                // references instead), so its raw address is not lowered.
+                // `tyref_is_gcref_spelling` is `Ptr(GCREFOpaque)`;
+                // `tyref_decl_names_gcref` is the `GcRef` newtype.
+                if matches!(&place.kind, PlaceKind::Local(_))
+                    && (tyref_is_gcref_spelling(&place.ty, self.llbc)
+                        || tyref_decl_names_gcref(&place.ty, self.llbc))
+                    && tyref_cell_pointer_lltype(dest_ty, self.llbc)
+                        == Some(crate::translator::rtyper::lltypesystem::rffi::CArrayPtr(
+                            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+                        ))
+                {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: raw address of a bare GCREF local has no traced cell storage"
+                    )));
                 }
                 // `&raw const/mut *p` is the address `p` by type
                 // (`cast_ptr_to_adr`), including a multiply assigned dest.
@@ -6933,6 +6969,28 @@ impl<'a> Lowering<'a> {
         Some(clone_place(inner))
     }
 
+    /// `rffi.cast(CArrayPtr(T), addr)` of a Char-varsize cell address
+    /// (`lltype.py` `ann_cast_int_to_ptr`). The allocation stays
+    /// `CArray(Char)` (`emit_raw_cell_malloc`). Raw `*mut bool` /
+    /// `*mut GCREF` and `&mut bool` take the cast; `tyref_cell_pointer_lltype`
+    /// fails closed for shared `&bool` and references to GCREF.
+    fn emit_cell_pointer_cast(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        addr: Variable,
+    ) -> Variable {
+        let Some(ptr_ty) = tyref_cell_pointer_lltype(dest_ty, self.llbc) else {
+            return addr;
+        };
+        let Some(item) = raw_array_ptr_item(&ptr_ty) else {
+            return addr;
+        };
+        let item = item.clone();
+        let bb_id = self.emit_bb(mir_bb);
+        emit_cast_int_to_carray_ptr(&mut self.graph, bb_id, addr, &item)
+    }
+
     /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
     /// would `RawLoad` a primitive.
     ///
@@ -6943,7 +7001,33 @@ impl<'a> Lowering<'a> {
         &self,
         place: &Place,
     ) -> Option<Place> {
-        let inner = self.raw_primitive_deref_inner(place)?;
+        let inner = match self.raw_primitive_deref_inner(place) {
+            Some(inner) => inner,
+            // `&*r` of a `&bool` / `&mut bool` / GCREF cell reference: `r` is
+            // the cell address (`CArrayPtr(T)`), so its deref is a raw load too.
+            None => {
+                let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) = &place.kind else {
+                    return None;
+                };
+                if name != "Deref"
+                    || tyref_cell_pointer_lltype(&inner.ty, self.llbc).is_none()
+                    || function_local_primitive_cell_descr(&place.ty, self.llbc).is_none()
+                {
+                    return None;
+                }
+                clone_place(inner)
+            }
+        };
+        // A closure-env cell-address field is the raw Array(Char)
+        // address (`rdtoa.py` `strtod` `end_ptr`). Treating it as a
+        // typed cell pointer would skip `atomic_ref_place` and the
+        // inner env would not see the forwarded address.
+        if self
+            .closure_env_cell_address_field_pointee(&inner)
+            .is_some()
+        {
+            return None;
+        }
         if let PlaceKind::Local(local) = inner.kind
             && self.atomic_ref_place.contains_key(&(local as usize))
         {
@@ -7736,6 +7820,8 @@ impl<'a> Lowering<'a> {
             self.static_addrs.error_carrier,
             self.struct_fields,
         );
+        stamp_cell_pointer(&res, &place_ty, self.llbc);
+        stamp_cell_pointer(&res, &field_ty, self.llbc);
         if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
             || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
             || tyref_is_u8_window(&field_ty, self.llbc)
@@ -8010,6 +8096,9 @@ impl<'a> Lowering<'a> {
         };
         if let Some(owner) = field.owner_root.as_deref() {
             value = self.coerce_gcref_null_store(bb_id, owner, &field.name, value);
+        }
+        if let LinkArg::Value(var) = &value {
+            stamp_cell_pointer(var, dest_ty, self.llbc);
         }
         value = self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
 
@@ -9552,6 +9641,7 @@ impl<'a> Lowering<'a> {
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
                     && (tyref_is_raw_pointer(&inner.ty, self.llbc)
+                        || tyref_cell_pointer_lltype(&inner.ty, self.llbc).is_some()
                         || scalar_address
                         || self
                             .closure_env_cell_address_field_pointee(&inner)

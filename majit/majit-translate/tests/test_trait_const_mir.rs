@@ -83,7 +83,7 @@ fn nursery_spec_folds_gc_type_size() {
                 OpKind::Call { target, args, .. }
                     if call_segments(target)
                         .and_then(|segments| segments.last())
-                        .is_some_and(|leaf| leaf == "try_gc_alloc_collecting_rooted") =>
+                        .is_some_and(|leaf| leaf == "try_gc_alloc_collecting") =>
                 {
                     Some(args.clone())
                 }
@@ -111,24 +111,15 @@ fn nursery_spec_folds_gc_type_size() {
         };
         assert!(n > 0, "{} folded a non-positive size {n}", function.name);
         sizes.push((function.name.clone(), n));
-        let has_char_cell = function
+        let has_raw_malloc = function
             .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::RawMalloc {
-                        owner,
-                        length: Some(_),
-                        ..
-                    } if owner == "Array(Char)"
-                )
-            });
+            .any(|op| matches!(&op.kind, OpKind::RawMalloc { .. }));
         assert!(
-            has_char_cell,
-            "{} has no Char-varsize cell for the address-taken bool",
+            !has_raw_malloc,
+            "{} still allocates a raw cell after the collecting hook lost its bool out-parameter",
             function.name
         );
         let has_tuple_spill = function

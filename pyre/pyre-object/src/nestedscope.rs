@@ -101,20 +101,13 @@ pub fn new_cell_family(name: String) -> *const CellFamily {
         TypeIdCell::UNASSIGNED => 0,
         id => id,
     };
-    // Headerless payload: no GC child to preserve. The dummy root satisfies
-    // `try_gc_alloc_collecting_rooted`; live pointers in the caller sit on
-    // the shadow stack (`w_code_new_owned` pins the wrapper and families
+    // Headerless payload: no GC child to preserve. Live pointers in the caller
+    // sit on the shadow stack (`w_code_new_owned` pins the wrapper and families
     // table).
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            type_id,
-            CellFamily::SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_collecting(
+        type_id,
+        CellFamily::SIZE,
+    ))
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     if raw.is_null() {
@@ -125,9 +118,7 @@ pub fn new_cell_family(name: String) -> *const CellFamily {
     }
     unsafe {
         std::ptr::write(raw as *mut CellFamily, value);
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
     }
     raw as *const CellFamily
 }

@@ -415,16 +415,10 @@ pub fn w_getset_property_instantiate(
     let _roots = crate::gc_roots::push_roots();
     let save = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_roots(&[fget, fset, fdel, doc, reqcls, name, w_objclass]);
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_GETSET_PROPERTY_GC_TYPE_ID,
-            W_GETSET_PROPERTY_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_collecting(
+        W_GETSET_PROPERTY_GC_TYPE_ID,
+        W_GETSET_PROPERTY_OBJECT_SIZE,
+    ))
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let value = GetSetProperty {
@@ -450,9 +444,7 @@ pub fn w_getset_property_instantiate(
     }
     unsafe {
         std::ptr::write(raw as *mut GetSetProperty, value);
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
     }
     raw as PyObjectRef
 }

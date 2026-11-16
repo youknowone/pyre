@@ -691,19 +691,14 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
-    let value_slot = std::ptr::addr_of_mut!(unicode.value).cast::<crate::gc_hook::GCREF>();
-    let mut needs_write_barrier = true;
-    let raw = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_UNICODE_GC_TYPE_ID,
-            W_UNICODE_OBJECT_SIZE,
-            value_slot,
-            &mut needs_write_barrier,
-        )
-    };
+    let roots = crate::gc_roots::push_roots();
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(unicode.value as PyObjectRef);
+    let raw = crate::gc_hook::try_gc_alloc_collecting(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
         .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut());
+    unicode.value = roots.get(value_slot) as *mut UnicodeValueStorage;
     if raw.is_null() {
         if crate::gc_hook::gc_alloc_failed_pending() {
             return crate::PY_NULL;
@@ -711,14 +706,16 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         let recovered = unsafe { utf8_payload_wtf8(unicode.value).to_owned() };
         return w_str_from_wtf8_immortal(recovered);
     }
+    // Clear (the nursery is not zero-filled; framework.py
+    // gct_zero_gc_pointers_inside), pin, barrier before stores, reload.
+    unsafe { std::ptr::write_bytes(raw as *mut u8, 0, W_UNICODE_OBJECT_SIZE) };
+    let raw_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+    crate::gc_hook::try_gc_write_barrier(roots.get(raw_slot) as crate::gc_hook::GCREF);
+    unicode.value = roots.get(value_slot) as *mut UnicodeValueStorage;
+    let raw = roots.get(raw_slot) as crate::gc_hook::GCREF;
     unsafe {
         std::ptr::write(raw as *mut W_UnicodeObject, unicode);
-    }
-    // A nursery header needs no creation barrier.  The collecting allocator
-    // can spill the header to old-gen; remember that old-to-young value edge
-    // exactly as listobject.py's rooted constructor does for its items block.
-    if needs_write_barrier {
-        crate::gc_hook::try_gc_write_barrier(raw);
     }
     raw as PyObjectRef
 }
@@ -3004,12 +3001,7 @@ mod tests {
         }
     }
 
-    unsafe fn intern_test_gc_alloc_collecting_rooted(
-        type_id: u32,
-        payload_size: usize,
-        _root: *mut crate::gc_hook::GCREF,
-        needs_write_barrier: *mut bool,
-    ) -> crate::gc_hook::GCREF {
+    fn intern_test_gc_alloc_collecting(type_id: u32, payload_size: usize) -> crate::gc_hook::GCREF {
         if !crate::gc_hook::hook_test_effects_visible() {
             return std::ptr::null_mut();
         }
@@ -3020,9 +3012,6 @@ mod tests {
         let obj = unsafe { (*gc).alloc_with_type_no_collect(type_id, payload_size) };
         if obj.is_null() {
             return std::ptr::null_mut();
-        }
-        unsafe {
-            *needs_write_barrier = !(*gc).is_in_nursery(obj.0);
         }
         obj.0 as crate::gc_hook::GCREF
     }
@@ -3079,7 +3068,7 @@ mod tests {
             if !gc.is_null() {
                 unsafe { drop(Box::from_raw(gc)) };
             }
-            crate::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+            crate::gc_hook::clear_gc_alloc_collecting_hook();
             crate::gc_hook::clear_gc_write_barrier_hook();
             crate::gc_hook::clear_gc_write_barrier_managed_hook();
             crate::gc_hook::clear_gc_owns_object_hook();
@@ -3161,9 +3150,7 @@ mod tests {
         });
         crate::gc_hook::register_gc_alloc_hook(intern_test_gc_alloc);
         crate::gc_hook::register_gc_alloc_stable_hook(intern_test_gc_alloc);
-        crate::gc_hook::register_gc_alloc_collecting_rooted_hook(
-            intern_test_gc_alloc_collecting_rooted,
-        );
+        crate::gc_hook::register_gc_alloc_collecting_hook(intern_test_gc_alloc_collecting);
         crate::gc_hook::register_gc_write_barrier_hook(intern_test_gc_write_barrier);
         crate::gc_hook::register_gc_write_barrier_managed_hook(intern_test_gc_write_barrier);
         crate::gc_hook::register_gc_owns_object_hook(intern_test_gc_owns_object);

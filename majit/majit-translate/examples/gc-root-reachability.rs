@@ -82,7 +82,7 @@ fn main() {
     // the memory goes to.
     //
     // `pyre-object.ullbc` is not optional either, and leaving it out fails
-    // quietly rather than loudly.  `gc_hook::try_gc_alloc_collecting_rooted` --
+    // quietly rather than loudly.  `gc_hook::try_gc_alloc_collecting` --
     // the hook every host-side collecting allocation goes through -- occurs 16
     // times in `pyre-object.ullbc` and **zero** times in
     // `pyre-interpreter.ullbc` (a nonsense pattern scores zero in both, so the

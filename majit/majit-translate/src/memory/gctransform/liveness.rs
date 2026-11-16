@@ -4213,7 +4213,7 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(1, "helper".into());
         names.insert(20, "pyre_object::weakref::w_weakref_new".into());
-        names.insert(11, "gc_hook::try_gc_alloc_collecting_rooted".into());
+        names.insert(11, "gc_hook::try_gc_alloc_collecting".into());
         let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
         callees.insert(1, HashSet::from([20]));
         callees.insert(20, HashSet::from([11]));

@@ -422,7 +422,6 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
 /// because it allocates through the collecting rooted hook.
 pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::alloc_nursery_collecting_typed",
-    "majit_gc::alloc_nursery_collecting_typed_rooted",
     "majit_gc::alloc_fast_nursery_collecting_typed_rooted",
     "majit_gc::alloc_fast_nursery_collecting_typed_roots",
     // Reported UNMATCHED, and that is the answer rather than a gap: these are
@@ -446,7 +445,7 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     // `incminimark.py` `minor_collection_with_major_progress`.
     "majit_gc::collect_nursery_with_major_progress",
     // The host hook the interpreter reaches them through.
-    "gc_hook::try_gc_alloc_collecting_rooted",
+    "gc_hook::try_gc_alloc_collecting",
     // A requested collection, which is the one collection point an interpreter
     // body reaches without running Python at all (`gc.collect()`).
     "gc_hook::try_gc_collect",
@@ -522,11 +521,8 @@ pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
         &["eval::pyre_object_gc_alloc_trampoline"],
     ),
     (
-        "gc_hook::try_gc_alloc_collecting_rooted",
-        &[
-            "eval::pyre_object_gc_alloc_collecting_rooted_trampoline",
-            "eval::pyre_object_gc_alloc_collecting_trampoline",
-        ],
+        "gc_hook::try_gc_alloc_collecting",
+        &["eval::pyre_object_gc_alloc_collecting_trampoline"],
     ),
     (
         "gc_hook::try_gc_collect",

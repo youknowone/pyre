@@ -628,14 +628,30 @@ fn front_graph_carries_no_synthesized_exception_edges() {
 
     let llbc = load_corpus();
     let mut checked = 0usize;
+    let mut skipped_gcref_raw_local = false;
     common::with_lowering(llbc, |context| {
         for fd in llbc.iter_local_fns() {
             let Some(body): Option<Unstructured> = fd.unstructured() else {
                 continue;
             };
-            let graph = lower_fun_decl(context, fd).unwrap_or_else(|e| {
-                panic!("{} failed to lower: {e}", fd.item_meta.name_path_str())
-            });
+            let graph = match lower_fun_decl(context, fd) {
+                Ok(graph) => graph,
+                Err(LowerError::Unsupported(ref msg))
+                    if fd.item_meta.name_path_str()
+                        == "charon_corpus::gcref_raw_local_to_callback"
+                        && msg.contains(
+                            "raw address of a bare GCREF local has no traced cell storage",
+                        ) =>
+                {
+                    assert!(
+                        !skipped_gcref_raw_local,
+                        "gcref_raw_local_to_callback skip must happen exactly once"
+                    );
+                    skipped_gcref_raw_local = true;
+                    continue;
+                }
+                Err(e) => panic!("{} failed to lower: {e}", fd.item_meta.name_path_str()),
+            };
 
             // Invariant A.  The iterator `next`-diamond rewrite
             // (`front::iter_next`) is the one sanctioned synthesized
@@ -712,6 +728,10 @@ fn front_graph_carries_no_synthesized_exception_edges() {
         assert!(
             checked >= 4,
             "expected to lower at least the 4 corpus shapes, got {checked}",
+        );
+        assert!(
+            skipped_gcref_raw_local,
+            "charon_corpus::gcref_raw_local_to_callback must be skipped as Unsupported"
         );
     });
 }
