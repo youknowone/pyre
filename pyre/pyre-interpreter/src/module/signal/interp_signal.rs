@@ -83,32 +83,6 @@ pub fn checksignals_now() -> Result<(), crate::PyError> {
     unsafe { (*ec).checksignals() }
 }
 
-/// interp_signal.py `SignalMask.__enter__` — unpack a list / tuple
-/// / set of signal numbers, the argument shape `sigwait` / `sigpending`
-/// share with `pthread_sigmask`.
-#[cfg(all(feature = "host_env", unix))]
-fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    unsafe {
-        if pyre_object::is_list(arg) {
-            let n = pyre_object::w_list_len(arg);
-            Ok((0..n)
-                .filter_map(|i| pyre_object::w_list_getitem(arg, i as i64))
-                .collect())
-        } else if pyre_object::is_tuple(arg) {
-            let n = pyre_object::w_tuple_len(arg);
-            Ok((0..n)
-                .filter_map(|i| pyre_object::w_tuple_getitem(arg, i as i64))
-                .collect())
-        } else if pyre_object::is_set_or_frozenset(arg) {
-            Ok(pyre_object::w_set_items(arg))
-        } else {
-            Err(crate::PyError::type_error(
-                "argument must be an iterable of signal numbers",
-            ))
-        }
-    }
-}
-
 /// `space.w_OSError` / `get_itimer_error(space)` for
 /// `error.py exception_from_saved_errno` / `exception_from_errno`.
 /// Falls back to `OSError` if `class_name` is not registered.
@@ -213,14 +187,28 @@ impl SigsetGuard {
 }
 
 /// interp_signal.py `SignalMask.__enter__` — `c_sigemptyset` then `c_sigaddset`.
+/// `space.unpackiterable` then `space.int_w`; OverflowError from `int_w`
+/// becomes ValueError `"signal number out of range"` (`check_signum_in_range`).
 #[cfg(all(unix, feature = "host_env"))]
 fn fill_sigset(mut w_signals: PyObjectRef) -> Result<SigsetGuard, crate::PyError> {
     let mask = SigsetGuard::malloc()?;
     let _ = pyre_object::with_roots!(w_signals => unsafe {
         majit_rlib::rsignal::c_sigemptyset(mask.as_ptr())
     });
-    for it in pyre_object::with_roots!(w_signals => signal_set_items(w_signals))? {
-        let signum = unsafe { pyre_object::w_int_get_value(it) };
+    let items = pyre_object::with_roots!(w_signals => {
+        crate::baseobjspace::unpackiterable(w_signals, -1)
+    })?;
+    let _item_roots = pyre_object::gc_roots::push_roots();
+    let items_base = pyre_object::gc_roots::pin_roots(&items);
+    for i in 0..items.len() {
+        let it = pyre_object::gc_roots::shadow_stack_get(items_base + i);
+        let signum = crate::baseobjspace::int_w(it).map_err(|err| {
+            if err.kind == crate::PyErrorKind::OverflowError {
+                crate::PyError::value_error("signal number out of range")
+            } else {
+                err
+            }
+        })?;
         check_signum_in_range(signum)?;
         let _ = unsafe { majit_rlib::rsignal::c_sigaddset(mask.as_ptr(), signum as _) };
     }
@@ -1648,13 +1636,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     #[cfg(feature = "host_env")]
                     {
                         let mask = SigsetGuard::malloc()?;
-                        let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(mask.as_ptr()) };
-                        if ret != 0 {
-                            return Err(crate::error::exception_from_saved_errno(
-                                pyre_object::PY_NULL,
-                                errno_w_type("OSError"),
-                            ));
-                        }
                         let ret = unsafe { majit_rlib::rsignal::c_sigpending(mask.as_ptr()) };
                         if ret != 0 {
                             return Err(crate::error::exception_from_saved_errno(
@@ -1751,15 +1732,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                         let previous = SigsetGuard::malloc()?;
                         let ret = unsafe {
-                            majit_rlib::rsignal::c_sigemptyset(previous.as_ptr())
-                        };
-                        if ret != 0 {
-                            return Err(crate::error::exception_from_saved_errno(
-                                pyre_object::PY_NULL,
-                                errno_w_type("OSError"),
-                            ));
-                        }
-                        let ret = unsafe {
                             majit_rlib::rsignal::c_pthread_sigmask(
                                 how,
                                 set.as_ptr(),
@@ -1772,7 +1744,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 errno_w_type("OSError"),
                             ));
                         }
-                        // interp_signal.py:546-547 — if signals were
+                        // interp_signal.py `pthread_sigmask` — if signals were
                         // unblocked, their handlers may now be pending.
                         checksignals_now()?;
                         Ok(sigset_to_signals(previous.as_ptr()))
