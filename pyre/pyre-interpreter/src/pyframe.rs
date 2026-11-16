@@ -815,30 +815,51 @@ pub mod frame_locals_proxy {
         /// `@jit.unroll_safe` for the same reason as [`Self::pin_entries`].
         #[majit_macros::unroll_safe]
         fn entry_count(&self) -> i64 {
-            // `locals_plus_names` allocates a `Vec`, so pin the nursery frame
-            // before that call and re-read it in the loop (`shadowstack.py`
-            // `push_roots` / `pop_roots`).
-            let roots = pyre_object::gc_roots::push_roots();
-            let frame_slot = roots.pin_roots(&[self.w_frame]);
-            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
+            let extra = self.frame().get_extra_locals();
             let mut size = if extra.is_null() {
                 0
             } else {
                 unsafe { pyre_object::dictmultiobject::w_dict_len(extra) as i64 }
             };
-            // `code` addresses the compiler code object, which lives outside
-            // the GC heap and so stays valid across those collections.
+            // Same slot order as [`Self::locals_plus_value`]: varnames, then
+            // the pure-cellvar band, then freevars.  Positional indexing
+            // rather than that `Vec` because this graph is `unroll_safe`: a
+            // collected `Vec` puts the iterator and the allocation on the
+            // descent's blocker frontier.  Nothing in the loops allocates,
+            // so the frame cannot move.
             let code = self.frame().code();
-            for (index, _name, cell_slot) in locals_plus_names(code) {
-                let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
-                if index >= locals_w!(frame).len() {
-                    continue;
+            let nvar = code.varnames.len();
+            for index in 0..nvar {
+                let is_cell = super::cell_slot(code, index);
+                let frame = self.frame();
+                if index < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(is_cell, locals_w!(frame)[index]);
+                    // `framelocalsproxy_hasval`.
+                    if !value.is_null() {
+                        size += 1;
+                    }
                 }
-                let slot = locals_w!(frame)[index];
-                let value = super::unwrap_localsplus_slot(cell_slot, slot);
-                // `framelocalsproxy_hasval`.
-                if !value.is_null() {
-                    size += 1;
+            }
+            let npure = super::npure_cellvars(code);
+            for i in 0..npure {
+                let slot = nvar + i;
+                let frame = self.frame();
+                if slot < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(true, locals_w!(frame)[slot]);
+                    if !value.is_null() {
+                        size += 1;
+                    }
+                }
+            }
+            let nfree = code.freevars.len();
+            for i in 0..nfree {
+                let slot = nvar + npure + i;
+                let frame = self.frame();
+                if slot < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(true, locals_w!(frame)[slot]);
+                    if !value.is_null() {
+                        size += 1;
+                    }
                 }
             }
             size
