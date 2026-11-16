@@ -10024,12 +10024,15 @@ impl<'a> Lowering<'a> {
         // Only a body this LLBC extracted can be copied here. An Opaque
         // import is the same function object in the defining crate
         // (`bookkeeper.py` `getdesc`); enqueue on that crate's queue.
-        // The reflexive `impl<T> From<T> for T` is the exception: its
-        // body is identity and `declare_spec` builds that graph
-        // (`FunctionDesc.getuniquegraph`).
+        // Two identity bodies are the exception and `declare_spec`
+        // builds them (`FunctionDesc.getuniquegraph`):
+        //   * the reflexive `impl<T> From<T> for T`
+        //   * `ToString::to_string` whose substituted receiver is
+        //     string-family (`rstr.py` / `rbuiltin.py` `rtype_builtin_str`)
         let path = fd.item_meta.name_path();
         if !crate::front::clause_spec::decl_has_unstructured_body(fd)
             && !fun_decl_is_reflexive_from(self.llbc, fd)
+            && !fun_decl_to_string_is_string_identity(self.llbc, fd, generics)
         {
             return self.enqueue_cross_crate_spec(fd, generics, &path);
         }
