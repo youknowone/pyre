@@ -13838,19 +13838,95 @@ fn by_value_struct_enum_payload_store_is_one_fieldwrite() {
         "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
     );
     assert!(
+        !matches!(
+            super::inline_struct_field_leaves(
+                &llbc,
+                no_tombstoned_leaves(),
+                &gc_struct_ids,
+                "PayloadShell::Variant",
+                "__pos_0",
+                &raw_alloc,
+                None,
+            ),
+            crate::model::InlineFieldShape::Inline(_)
+        ),
+        "an enum-variant owner is not an inlined Struct"
+    );
+    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+}
+
+#[test]
+fn inline_struct_field_typevar_first_field_is_unknown() {
+    let wrapper = struct_decl(
+        0,
+        ident_path(&["fixture", "Wrapper"]),
+        serde_json::json!([
+            {
+                "name": "first",
+                "ty": {"TypeVar": {"Bound": [0, 0]}},
+                "attr_info": null
+            },
+            {
+                "name": "payload",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![wrapper], vec![]);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(matches!(
         super::inline_struct_field_leaves(
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            "PayloadShell::Variant",
-            "__pos_0",
+            "Wrapper",
+            "first",
             &raw_alloc,
             None,
-        )
-        .is_none(),
-        "an enum-variant owner is not an inlined Struct"
+        ),
+        crate::model::InlineFieldShape::Unknown
+    ));
+}
+
+/// `lltype.Ptr` / `heaptracker.all_fielddescrs` treat a pointer field as
+/// one word; the pointee's type arguments do not make it an inlined Struct.
+#[test]
+fn inline_struct_field_raw_pointer_to_generic_is_not_inline() {
+    let wrapper = struct_decl(
+        0,
+        ident_path(&["fixture", "Wrapper"]),
+        serde_json::json!([
+            {
+                "name": "first",
+                "ty": {"RawPtr": [{"TypeVar": {"Bound": [0, 0]}}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "payload",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
     );
-    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+    let llbc = llbc_with_types("fixture", vec![wrapper], vec![]);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(matches!(
+        super::inline_struct_field_leaves(
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            "Wrapper",
+            "first",
+            &raw_alloc,
+            None,
+        ),
+        crate::model::InlineFieldShape::NotInline
+    ));
 }
 
 /// Same FieldWrite shape for a one-word transparent handle in a fixture

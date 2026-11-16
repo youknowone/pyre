@@ -7283,6 +7283,12 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
     node_is_string_value(node, llbc)
 }
 
+enum ByValueStructShape<'l> {
+    Struct(&'l TypeDecl),
+    NotInline,
+    Unknown,
+}
+
 /// A field type that is itself an inlined `lltype.Struct`, not a pointer
 /// word and not a type the rtyper already represents as one value.
 ///
@@ -7301,6 +7307,9 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// `PyreDecodeContext.pos_delta` is one
 /// `getfield(PyreDecodeContext, "pos_delta")`. A `repr(transparent)` scalar wrapper
 /// is that word ([`tyref_transparent_inner_value_type`]); copying its fields would getattr them on Integer and `getfield_raw_r` a marker.
+///
+/// Maps the tri-state classifier back to `Option`: both proven
+/// non-struct and unresolved stay `None`.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -7309,27 +7318,80 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<&'l TypeDecl> {
-    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
-    let obj = node.as_object()?;
+    match tyref_by_value_struct_shape(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        struct_fields,
+    ) {
+        ByValueStructShape::Struct(td) => Some(td),
+        ByValueStructShape::NotInline | ByValueStructShape::Unknown => None,
+    }
+}
+
+fn tyref_by_value_struct_shape<'l>(
+    ty: &TyRef,
+    llbc: &'l Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> ByValueStructShape<'l> {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return ByValueStructShape::Unknown;
+    };
+    let Some(obj) = node.as_object() else {
+        return ByValueStructShape::Unknown;
+    };
     if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if type_node_is_thin_box(node, llbc) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
-    let id = adt_node_def_id(node)?;
-    let td = llbc.type_by_id(id)?;
+    if !obj.contains_key("Adt") {
+        // Only a recognized non-struct kind proves absence
+        // (`lltype.Struct._first_struct` inspects a concrete field type).
+        // `TypeVar`, `TraitType`, `DynTrait` and any other kind leave the
+        // shape unresolved.
+        return if [
+            "Scalar", "Literal", "Never", "FnPtr", "FnDef", "Array", "Slice",
+        ]
+        .iter()
+        .any(|k| obj.contains_key(*k))
+        {
+            ByValueStructShape::NotInline
+        } else {
+            ByValueStructShape::Unknown
+        };
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        let builtin = obj
+            .get("Adt")
+            .and_then(|v| v.as_object())
+            .and_then(|adt| adt.get("builtin"))
+            .and_then(|v| v.as_str());
+        return match builtin {
+            Some(b) if b != "Box" => ByValueStructShape::NotInline,
+            _ => ByValueStructShape::Unknown,
+        };
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return ByValueStructShape::Unknown;
+    };
     if type_decl_is_builtin_adt(td) || type_decl_is_closure_env(td) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if td.item_meta.name_path_str() == "alloc::boxed::Box" {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested RPython
     // struct (`nestedscope.py CellFamily.ever_mutated`). Expanding the
     // payload as `{field}.value` misses fielddescrof.
     if tyref_is_unsafecell(ty, llbc) || tyref_is_std_cell(ty, llbc) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     let path = td.item_meta.name_path();
     if path == "cell::Cell"
@@ -7337,13 +7399,13 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         || path.ends_with("::UnsafeCell")
         || path.ends_with("::cell::Cell")
     {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if field_ty_is_inline_vec(ty, llbc) || tyref_is_string_value(ty, llbc) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if transparent_handle_field_spelling(
         ty,
@@ -7354,10 +7416,10 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     )
     .is_some()
     {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     // A GC handle is one pointer word (`gc_ref_pointer`). `all_fielddescrs`
     // does not recurse into Ptr; `InstanceRepr.setfield` writes one field.
@@ -7375,7 +7437,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         raw_alloc_flavor_structs,
         struct_fields,
     ) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     // One integer word is not an inlined STRUCT. `getcalldescr` reads
     // that lltype off the value (`call.py`); leaf-copy would GETFIELD
@@ -7383,7 +7445,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if let TypeDeclKind::Struct(fields) = &td.kind
         && integer_newtype_inner_field(td, fields, llbc, gc_struct_ids).is_some()
     {
-        return None;
+        return ByValueStructShape::NotInline;
     }
     // A transparent wrapper over a scalar is that scalar's one-word field
     // (`lltype.py` has no substruct for it), so it is not an inlined struct.
@@ -7398,9 +7460,9 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         ),
         Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
     ) {
-        return None;
+        return ByValueStructShape::NotInline;
     }
-    Some(td)
+    ByValueStructShape::Struct(td)
 }
 
 /// By-value ADT after leaving `Ref` and `RawPtr` in place.
@@ -7818,9 +7880,10 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
 
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
 ///
-/// `None` keeps the existing one-word copy.  `Some` is whether `field` sits
-/// at offset 0 in `owner`, plus declaration-order leaves relative to the
+/// `NotInline` keeps the existing one-word copy. `Inline` is whether `field`
+/// sits at offset 0 in `owner`, plus declaration-order leaves relative to the
 /// inner owner (`collect_by_value_struct_leaves` on the nested decl).
+/// Missing owner, field, or type information is `Unknown`, not absence.
 /// `typeptr`-like header words are ordinary leaves: this is a copy of an
 /// existing value, not an allocation. A deeper by-value sub-struct's
 /// leaves peel leading offset-0 hops (`nest_inline_leaf`).
@@ -7832,35 +7895,65 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     field_name: &str,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
-) -> Option<crate::model::InlineStructExpansion> {
-    let td = type_decl_by_owner_root(llbc, owner)?;
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return None;
+) -> crate::model::InlineFieldShape {
+    let Some(td) = type_decl_by_owner_root(llbc, owner) else {
+        return crate::model::InlineFieldShape::Unknown;
     };
-    let (field_idx, field) = fields
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return crate::model::InlineFieldShape::Unknown;
+    };
+    let Some((field_idx, field)) = fields
         .iter()
         .enumerate()
-        .find(|(_, f)| f.name.as_deref() == Some(field_name))?;
-    let nested = tyref_by_value_struct_decl(
+        .find(|(_, f)| f.name.as_deref() == Some(field_name))
+    else {
+        return crate::model::InlineFieldShape::Unknown;
+    };
+    // A pointer field is one word whatever its pointee's generic arguments
+    // (`lltype.Ptr`); only a by-value field can hide an inline struct.
+    let is_pointer_word = tyref_node(&field.ty, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .is_some_and(|node| {
+            node.as_object()
+                .is_some_and(|o| o.contains_key("Ref") || o.contains_key("RawPtr"))
+                || type_node_is_thin_box(node, llbc)
+        });
+    // The declaration's field type is not substituted with the owner's
+    // generic arguments; a type variable in a by-value field leaves the
+    // shape unknown.
+    if !is_pointer_word && super::tyref_mentions_typevar(&field.ty, llbc) {
+        return crate::model::InlineFieldShape::Unknown;
+    }
+    match tyref_by_value_struct_shape(
         &field.ty,
         llbc,
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
         struct_fields,
-    )?;
-    Some(crate::model::InlineStructExpansion {
-        at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
-        leaves: collect_by_value_struct_leaves(
-            nested,
-            &field.ty,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-            struct_fields,
-        ),
-    })
+    ) {
+        ByValueStructShape::NotInline => crate::model::InlineFieldShape::NotInline,
+        ByValueStructShape::Unknown => crate::model::InlineFieldShape::Unknown,
+        ByValueStructShape::Struct(nested) => {
+            let offset_zero = match type_decl_struct_field_offset(td, llbc, field_idx) {
+                Some(0) => Some(true),
+                Some(_) => Some(false),
+                None => None,
+            };
+            crate::model::InlineFieldShape::Inline(crate::model::InlineStructExpansion {
+                offset_zero,
+                leaves: collect_by_value_struct_leaves(
+                    nested,
+                    &field.ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                    struct_fields,
+                ),
+            })
+        }
+    }
 }
 
 /// Whether the pointee of exactly one raw-pointer layer is a string-family

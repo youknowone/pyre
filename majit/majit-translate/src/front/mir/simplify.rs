@@ -77,7 +77,7 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
     guard_words: &std::collections::HashSet<Variable>,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> crate::model::InlineFieldShape,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<(), LowerError> {
     // `GcRef(p as usize)` is a GCREF word (`ConstRefNull` for `GcRef::NULL`).
@@ -264,7 +264,7 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
 /// above must have replaced every one; a survivor is a front-end gap.
 pub(in crate::front::mir) fn refuse_inlined_struct_field_writes(
     graph: &FunctionGraph,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> crate::model::InlineFieldShape,
 ) -> Result<(), LowerError> {
     let malloc_args = crate::model::typed_malloc_arg_vars(graph);
     for block in &graph.blocks {
@@ -278,7 +278,10 @@ pub(in crate::front::mir) fn refuse_inlined_struct_field_writes(
             let Some(owner) = field.owner_root.as_deref() else {
                 continue;
             };
-            if expand_inline_struct(owner, &field.name).is_some() {
+            if matches!(
+                expand_inline_struct(owner, &field.name),
+                crate::model::InlineFieldShape::Inline(_)
+            ) {
                 return Err(LowerError::Unsupported(format!(
                     "by-value store of inlined struct field {owner}.{} was not lowered to leaf stores",
                     field.name

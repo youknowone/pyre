@@ -331,9 +331,14 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
         return std::ptr::null_mut();
     }
 
-    crate::lltype::malloc_typed(Weakref {
-        weakptr: rooted_target,
-    })
+    w_weakref_new_immortal(rooted_target)
+}
+
+/// Pre-GC bootstrap: the Box-immortal `Weakref` described on [`w_weakref_new`]. Upstream has no such path
+/// (`gct_weakref_create` always runs `malloc_fixedsize`); it is opaque to the JIT like any `not_rpython` helper.
+#[majit_macros::dont_look_inside]
+fn w_weakref_new_immortal(target: PyObjectRef) -> *mut Weakref {
+    crate::lltype::malloc_typed(Weakref { weakptr: target })
 }
 
 /// `ll_weakref_deref(wref)` (gctypelayout.py). Reads the

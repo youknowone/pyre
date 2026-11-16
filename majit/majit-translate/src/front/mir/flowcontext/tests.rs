@@ -85,7 +85,7 @@ fn simplify_lowered_graph(
         struct_field_attrs,
         sweep_dead_vars,
         guard_words,
-        &|_, _| None,
+        &|_, _| crate::model::InlineFieldShape::NotInline,
         &std::collections::HashMap::new(),
     )
     .expect("inline-struct expansion is off");

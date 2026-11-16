@@ -1238,7 +1238,7 @@ fn header_read_narrows_to_a_typed_field_read() {
 /// resolved cases differ by that input alone.
 #[test]
 fn boxing_cluster_fuses_once_the_class_address_resolves() {
-    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, InlineFieldShape, OpKind, ValueType};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
     let attrs = std::collections::HashMap::from([
@@ -1263,7 +1263,12 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
     // Without a resolvable class address the cluster is left alone.
     let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
     assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        majit_translate::model::fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &|_, _| InlineFieldShape::NotInline,
+            &std::collections::HashMap::new(),
+        ),
         0,
         "an unresolvable class-static address declines the fuse, silently",
     );
@@ -1292,7 +1297,12 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
     );
 
     assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        majit_translate::model::fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &|_, _| InlineFieldShape::NotInline,
+            &std::collections::HashMap::new(),
+        ),
         1,
         "the cluster fuses once the class address is a constant",
     );
