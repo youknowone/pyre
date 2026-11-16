@@ -7219,9 +7219,16 @@ fn real_build_class_from(
         (None, None)
     };
 
-    // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
-    // is `UnicodeEncodeError` ("surrogates not allowed").
-    let name = crate::baseobjspace::str_utf8_w(roots.get(name_slot))?;
+    // `compiling.py build_class` hands the original name object to
+    // `__prepare__` and the metaclass; only `type.__new__` converts it to
+    // text (and rejects a lone surrogate there).
+    // A non-str name is a TypeError ("__build_class__: name is not a string").
+    let w_name = roots.get(name_slot);
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(crate::PyError::type_error(
+            "__build_class__: name is not a string",
+        ));
+    }
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
     let orig_bases_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7273,7 +7280,7 @@ fn real_build_class_from(
 
     build_class_inner(
         roots.get(body_fn_slot),
-        name,
+        roots.get(name_slot),
         roots.get(bases_slot),
         w_metaclass,
         extra_slot.map(|slot| roots.get(slot)),
@@ -7289,65 +7296,44 @@ fn real_build_class_from(
 /// way before calling.
 fn build_class_inner(
     body_fn: PyObjectRef,
-    name: &str,
+    w_name: PyObjectRef,
     bases: PyObjectRef,
     w_metaclass: Option<PyObjectRef>,
     extra_kwargs: Option<PyObjectRef>,
     w_orig_bases: Option<PyObjectRef>,
 ) -> PyResult {
-    // The class-definition keywords survive the class body call and the whole
-    // metaclass construction below, and the parameter is a raw copy taken
-    // before any of it. Pin it once and read it back at each of the three
-    // sites that consume it. A class statement without keywords opens no
-    // scope: `pin_root` is `dont_look_inside`, so an unconditional one would
-    // residualise in every traced class body.
-    // Same as `build_class`: the keyword mapping is a local of this
-    // function, so the bracket lives here rather than on a `map` closure.
-    let kwds_roots = if let Some(kw) = extra_kwargs {
-        let scope = pyre_object::gc_roots::push_roots();
-        let slot = scope.base();
-        let _ = scope.pin_root(kw);
-        Some((scope, slot))
-    } else {
-        None
-    };
-    let current_kwds = || kwds_roots.as_ref().map(|(scope, slot)| scope.get(*slot));
-
-    // `bases` and `w_orig_bases` are raw copies taken before `__prepare__` and
-    // before the class body runs, and both execute Python.  A tuple is
-    // nursery-allocated, so a copy held across those calls names the pre-move
-    // address by the time `is_tuple` / `w_tuple_len` read it, and one with no
-    // heap edge is swept besides.  Publish both and read them back at each site
-    // that consumes them.
-    let bases_scope = pyre_object::gc_roots::push_roots();
-    let bases_slot = bases_scope.base();
-    let _ = bases_scope.pin_root(bases);
-    let orig_bases_slot = w_orig_bases.map(|w_orig_bases| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_orig_bases);
-        slot
-    });
-    // The class body's frame is built from the function's code, globals and
-    // closure at the bottom of this function, after `__prepare__` has run.
-    // The globals are a dict and the closure a tuple, both nursery-allocated,
-    // so the three are read off `body_fn` there rather than cached here.  A
-    // `Function` is `try_gc_alloc_stable`, so its own address survives; what
-    // the pin buys is that the block is still allocated when that late read
-    // happens.
-    let body_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(body_fn);
-    let bases = || bases_scope.get(bases_slot);
-    // `__prepare__` / the metaclass `__new__` run Python. The parameter is a
-    // raw copy; read it once into a slot before any of those calls.
+    // Every incoming reference is a raw copy taken by the caller, and the
+    // `__prepare__` call, the class body and the metaclass construction below
+    // all run Python. Publish the whole live set in one run before any of
+    // them, so no pin's normalization can move a reference that is not yet
+    // published, and read each one back from its slot at every use:
+    // - `bases` / `w_orig_bases`: nursery tuples read by `is_tuple` /
+    //   `w_tuple_len` after the body runs.
+    // - `body_fn`: the class body's frame is built from its code, globals and
+    //   closure at the bottom of this function, after `__prepare__`.
+    // - `w_name`: handed to `__prepare__` and the metaclass as the same object.
+    // - `w_metaclass` and the class-definition keywords: consumed by
+    //   `__prepare__` and the metaclass call.
+    // Absent optional references take a NULL slot.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[
+        bases,
+        w_orig_bases.unwrap_or(pyre_object::PY_NULL),
+        body_fn,
+        w_name,
+        w_metaclass.unwrap_or(pyre_object::PY_NULL),
+        extra_kwargs.unwrap_or(pyre_object::PY_NULL),
+    ]);
+    let bases_slot = base;
+    let orig_bases_slot = w_orig_bases.map(|_| base + 1);
+    let body_fn_slot = base + 2;
+    let w_name_slot = base + 3;
     let has_metaclass = w_metaclass.is_some();
-    let metaclass_slot = if has_metaclass {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_metaclass.unwrap_or(pyre_object::PY_NULL));
-        Some(slot)
-    } else {
-        None
-    };
-    let w_metaclass_live = || metaclass_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let metaclass_slot = has_metaclass.then_some(base + 4);
+    let kwds_slot = extra_kwargs.map(|_| base + 5);
+    let current_kwds = || kwds_slot.map(|slot| roots.get(slot));
+    let bases = || roots.get(bases_slot);
+    let w_metaclass_live = || metaclass_slot.map(|slot| roots.get(slot));
 
     // Call metaclass.__prepare__(name, bases, **kwds) if it exists.
     // PyPy: build_class → metaclass.__prepare__(name, bases, **kwds)
@@ -7368,7 +7354,7 @@ fn build_class_inner(
                     _ => Vec::new(),
                 };
                 // The Vec of refs is not a GC root. Pin each value before the
-                // name malloc, then pass reloaded words into the call.
+                // call, then pass reloaded words into it.
                 let _prepare_kw_roots = pyre_object::gc_roots::push_roots();
                 let prepare_kw_base = pyre_object::gc_roots::shadow_stack_len();
                 for (_, value) in &prepare_kwds {
@@ -7389,24 +7375,19 @@ fn build_class_inner(
                         take_last_exec_ctx(),
                         prepare,
                         &[
-                            {
-                                let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                                let _ = pyre_object::gc_roots::pin_root(
-                                    pyre_object::w_str_new_managed(name),
-                                );
-                                pyre_object::gc_roots::shadow_stack_get(name_slot)
-                            },
+                            pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                             bases(),
                         ],
                         &prepare_kwds,
                     )?
                 } else {
                     clear_call_error();
-                    let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
                     let r = crate::call_function(
                         prepare,
-                        &[pyre_object::gc_roots::shadow_stack_get(name_slot), bases()],
+                        &[
+                            pyre_object::gc_roots::shadow_stack_get(w_name_slot),
+                            bases(),
+                        ],
                     );
                     if r.is_null() {
                         // __prepare__ was found but raised during execution —
@@ -7570,10 +7551,7 @@ fn build_class_inner(
     let w_type = if has_metaclass {
         // compiling.py `build_class`: `space.call_args(w_meta, args)` with
         // `args_w=[w_name, w_bases, w_namespace]` — the same object the
-        // body wrote.  Name allocation can collect, so reload the namespace
-        // after the pin.
-        let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+        // body wrote. Reload the namespace from its slot.
         let w_namespace = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         clear_call_error();
         let result = if let Some(kw) = current_kwds() {
@@ -7582,7 +7560,7 @@ fn build_class_inner(
             if has_extra {
                 call_metaclass_with_kwargs(
                     w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
-                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                     bases(),
                     w_namespace,
                     kw,
@@ -7591,7 +7569,7 @@ fn build_class_inner(
                 crate::call_function(
                     w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                     &[
-                        pyre_object::gc_roots::shadow_stack_get(name_slot),
+                        pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                         bases(),
                         w_namespace,
                     ],
@@ -7601,7 +7579,7 @@ fn build_class_inner(
             crate::call_function(
                 w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                 &[
-                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    pyre_object::gc_roots::shadow_stack_get(w_name_slot),
                     bases(),
                     w_namespace,
                 ],
@@ -7613,6 +7591,9 @@ fn build_class_inner(
             if let Some(err) = take_call_error() {
                 return Err(err);
             }
+            let name = unsafe {
+                pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(w_name_slot))
+            };
             return Err(PyError::type_error(format!(
                 "metaclass call for {name} returned NULL"
             )));
@@ -7635,6 +7616,12 @@ fn build_class_inner(
         // `__hash__` again — running a side-effecting one an extra time, and
         // dropping the entry outright once that `__hash__` starts raising,
         // because the store surface cannot report an error.
+        // `typeobject.py descr__new__`: `name = space.text_w(w_name)`; a lone
+        // surrogate is `UnicodeEncodeError` ("surrogates not allowed"). Owned,
+        // because the allocations below can move the name's payload.
+        let name =
+            crate::baseobjspace::str_utf8_w(pyre_object::gc_roots::shadow_stack_get(w_name_slot))?
+                .to_owned();
         let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
@@ -7698,7 +7685,7 @@ fn build_class_inner(
         // every such step.
         let w_root = pyre_object::gc_roots::shadow_stack_len();
         let w = pyre_object::w_type_new(
-            name,
+            &name,
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             pyre_object::gc_roots::shadow_stack_get(dict_root) as pyre_object::gc_hook::GCREF,
         );
@@ -7893,10 +7880,8 @@ fn build_class_inner(
         // `Python/bltinmodule.c builtin___build_class__` read at v3.15.0
         // and v3.15.1.
         if cell_value.is_null() {
-            let name_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
             let name_repr = crate::builtins::py_repr_clipped_200(
-                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(w_name_slot),
             )?;
             let class_repr = crate::builtins::py_repr_clipped_200(w_type())?;
             return Err(PyError::runtime_error(crate::display::wtf8_format!(
@@ -7910,13 +7895,11 @@ fn build_class_inner(
         if !std::ptr::eq(cell_value, w_type()) {
             let cell_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(cell_value);
-            let name_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
             let cell_repr = crate::builtins::py_repr_clipped_200(
                 pyre_object::gc_roots::shadow_stack_get(cell_slot),
             )?;
             let name_repr = crate::builtins::py_repr_clipped_200(
-                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(w_name_slot),
             )?;
             let class_repr = crate::builtins::py_repr_clipped_200(w_type())?;
             return Err(PyError::type_error(crate::display::wtf8_format!(
