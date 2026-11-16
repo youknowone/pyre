@@ -2788,4 +2788,65 @@ mod opname_spine_prejit_tests {
             "assembled jitcode must contain float_add; dump:\n{dump}"
         );
     }
+
+    /// Spine B `cast_ptr_to_int` of a GC pointer assembles as the same
+    /// `cast_ptr_to_int` UnaryOp the front spine Transformer keeps.
+    #[test]
+    fn opname_spine_cast_ptr_to_int_assembles() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "cast_ptr_to_int",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_ptr_to_int",
+            vec![Hlvalue::Variable(p)],
+            Hlvalue::Variable(n.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(n)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let path = CallPath::from_segments(["cast_ptr_to_int"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let unaries: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::UnaryOp { op, .. } => Some(op.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unaries.contains(&"cast_ptr_to_int"),
+            "assembled SSA must contain cast_ptr_to_int; unaries={unaries:?} dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("unaryop") || dump.contains("cast_ptr_to_int"),
+            "assembled jitcode dumps UnaryOp as unaryop; dump:\n{dump}"
+        );
+    }
 }
