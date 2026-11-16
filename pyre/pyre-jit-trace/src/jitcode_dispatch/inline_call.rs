@@ -3287,16 +3287,14 @@ fn summarize_body_blockers_from(
                 // own scan could not read is a region of this descent.
                 summary.body_not_walked |= callee.body_not_walked;
             } else {
-                // The `d` operand did not resolve to a JitCode descr.
-                // `read_inline_call_jitcode` panics on that encoding;
-                // production `handle_regular_call` inlines store
-                // `RuntimeBhDescr::JitCode` and the blackhole native-calls
-                // `jitcode.fnaddr` (`bhimpl_inline_call_*`). A test that
-                // feeds `None` still has to treat the call as an effect:
-                // the callee ran, so a residual behind it is
-                // `blocker_after_effect`. It is not an unread bytecode
-                // region (`body_not_walked` is decode stop / resume_pc
-                // missing / callee.body_not_walked).
+                // The `d` operand did not resolve to a JitCode descr, so this
+                // op's callee is a body the scan holds nothing about.  Falling
+                // through silently would read it as a callee that executes no
+                // effect and holds no blocker — the most permissive answer
+                // available, arrived at by not looking.  It is the same
+                // condition `body_not_walked` already names one level down: a
+                // region of this descent the scan did not walk.
+                summary.body_not_walked = true;
                 effect = true;
                 summary.first_effect_pc.get_or_insert(d.pc);
             }

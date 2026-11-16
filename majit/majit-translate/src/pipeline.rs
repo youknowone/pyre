@@ -197,8 +197,10 @@ pub enum TyShape {
     Float {
         bits: u32,
     },
+    /// `*const T` / `*mut T`; `sized` is false for `str`, slices, `dyn`.
     RawPtr {
         mutable: bool,
+        sized: bool,
     },
     /// `&T` / `&mut T`; `sized` is false for `str`, slices, `dyn`.
     Ref {
