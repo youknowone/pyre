@@ -16361,6 +16361,10 @@ impl CodeWriter {
                             -1,
                         );
                         if let Some(boxed_var) = boxed_lasti {
+                            // The lasti slot carries the boxed value, not the
+                            // producerless Ref `push_fresh_ref` reserved, so the
+                            // handler link argument has a defining op.
+                            current_state.stack[depth as usize] = boxed_var.into();
                             let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
                             let v_lasti_idx: super::flow::FlowValue =
                                 super::flow::Constant::signed(lasti_depth_value).into();
