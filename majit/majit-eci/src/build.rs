@@ -574,15 +574,53 @@ fn cextern_c_type(
                         item.head.name
                     )
                 });
-            if cextern_template_is_ambiguous_int(&template, &CIntDataModel::from_target_env()) {
-                panic!(
+            match cextern_default_c_type(&template, &CIntDataModel::from_target_env()) {
+                Ok(c_type) => c_type,
+                Err(CexternDefaultCTypeError::AmbiguousInt) => panic!(
                     "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
                     item.file_path.display(),
                     item.head.name
-                );
+                ),
+                Err(CexternDefaultCTypeError::NoPrimitive) => panic!(
+                    "{}: cextern_variable `{}`: no primitive C type for this type: give a c_type",
+                    item.file_path.display(),
+                    item.head.name
+                ),
             }
-            crate::cdecl::cdecl(&template, "")
         }
+    }
+}
+
+/// `CExternVariable` `c_type is None` after `TYPE == CCHARPP` / `CCHARP`.
+#[derive(Debug, PartialEq, Eq)]
+enum CexternDefaultCTypeError {
+    /// `TYPE == INT or TYPE == LONG`.
+    AmbiguousInt,
+    /// `PrimitiveType[TYPE]` KeyError: pointer, struct, array, function, or
+    /// unmeasured typedef (`pid_t`).
+    NoPrimitive,
+}
+
+/// Default `c_type` from a `gettype` template: integer identity, then the
+/// non-integer primitive spellings `int_template` / `rffi_type_template` /
+/// `last_segment_c_type` can emit (`Char` / `Float` / `SingleFloat` / `Void`).
+/// `UniChar` / `Bool` have no scalar spelling there. Unknown typedefs are not
+/// measured (`measured_rffi` / `measured_simple` stay empty in
+/// `merge_cextern_variables`).
+fn cextern_default_c_type(
+    template: &str,
+    model: &CIntDataModel,
+) -> Result<String, CexternDefaultCTypeError> {
+    if cextern_template_int_identity(template, model).is_some() {
+        if cextern_template_is_ambiguous_int(template, model) {
+            Err(CexternDefaultCTypeError::AmbiguousInt)
+        } else {
+            Ok(crate::cdecl::cdecl(template, ""))
+        }
+    } else if matches!(template, "char @" | "float @" | "double @" | "void @") {
+        Ok(crate::cdecl::cdecl(template, ""))
+    } else {
+        Err(CexternDefaultCTypeError::NoPrimitive)
     }
 }
 
@@ -2119,8 +2157,9 @@ fn env_key(name: &str) -> String {
 #[cfg(test)]
 mod classify_cextern_rffi_type_tests {
     use super::{
-        CIntDataModel, CexternRffiCType, CollectedCExternVariable, cextern_c_type,
-        cextern_template_is_ambiguous_int, classify_cextern_rffi_type,
+        CIntDataModel, CexternDefaultCTypeError, CexternRffiCType, CollectedCExternVariable,
+        cextern_c_type, cextern_default_c_type, cextern_template_is_ambiguous_int,
+        classify_cextern_rffi_type,
     };
     use std::path::PathBuf;
 
@@ -2305,6 +2344,80 @@ mod classify_cextern_rffi_type_tests {
     #[should_panic(expected = "ambiguous type on 32-bit machines: give a c_type")]
     fn cextern_c_type_i32_without_c_type_is_ambiguous() {
         let item = collected(r#"pub get_x, pub set_x = "x", i32, compilation_info = ECI"#);
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    fn cextern_default_c_type_accepts_primitives() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            cextern_default_c_type("double @", &model),
+            Ok("double".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("float @", &model),
+            Ok("float".into())
+        );
+        assert_eq!(cextern_default_c_type("char @", &model), Ok("char".into()));
+        assert_eq!(cextern_default_c_type("void @", &model), Ok("void".into()));
+        assert_eq!(
+            cextern_default_c_type("unsigned int @", &model),
+            Ok("unsigned int".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("int @", &model),
+            Err(CexternDefaultCTypeError::AmbiguousInt)
+        );
+    }
+
+    #[test]
+    fn cextern_default_c_type_rejects_non_primitives() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        for template in ["void *@", "struct foo @", "pid_t @"] {
+            assert_eq!(
+                cextern_default_c_type(template, &model),
+                Err(CexternDefaultCTypeError::NoPrimitive),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn cextern_c_type_uint_is_not_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::UINT, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "unsigned int");
+    }
+
+    #[test]
+    fn cextern_c_type_double_is_primitive() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::DOUBLE, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "double");
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_voidp_needs_c_type() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::VOIDP, compilation_info = ECI"#,
+        );
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_pid_t_needs_c_type() {
+        let item = collected(r#"pub get_x, pub set_x = "x", pid_t, compilation_info = ECI"#);
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_struct_needs_c_type() {
+        let item = collected(r#"pub get_x, pub set_x = "x", stat, compilation_info = ECI"#);
         let _ = cextern_c_type(&item, &resolve_as_extern);
     }
 }
