@@ -399,6 +399,10 @@ pub fn pyerror_from_rpyexc_value(value: PyObjectRef) -> crate::PyError {
 ///
 /// Consumes the cell (`rpyexc_fetch_exception`) and maps it through
 /// [`pyerror_from_rpyexc_value`].
+///
+/// Residual (`get_jitcode_calldescr` `getfunctionptr`). The word-ABI
+/// trampoline returns the error as one GC-ref word (`ResidualRefResult`).
+#[majit_macros::getfunctionptr]
 #[inline]
 pub fn fetch_memory_error() -> crate::PyError {
     pyerror_from_rpyexc_value(rpyexc_fetch_exception())
@@ -452,6 +456,11 @@ pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
 /// (`incminimark.py major_collection_step` `raise MemoryError`) and returns
 /// a fresh `OperationError(w_MemoryError, w_None)` (`pyopcode.py
 /// handle_asynchronous_error`).
+///
+/// Residual (`get_jitcode_calldescr` `getfunctionptr`). The word-ABI
+/// trampoline returns the Ok object as one GC-ref word and publishes Err
+/// through `ResidualError`.
+#[majit_macros::getfunctionptr]
 #[inline]
 pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null() {
