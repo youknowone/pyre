@@ -23773,10 +23773,13 @@ pub(crate) fn splice_active_driver_ancestors<Sym: WalkSym>(trace_ctx: &TraceCtx)
 /// A helper walk whose return is not the CALL's result (`HelperReturn::Converted` /
 /// `CalleePrologue`) has no frame that holds the conversion, so a guard below it
 /// resumes at the Python CALL entry, as `helper_subwalk_level` does.
+/// `FbwWalkMode::call_entry_helper_chain` is the `'v'` boxed descent whose
+/// return the walk takes back inside the CALL; `helper_blackhole_resumes_at_call`
+/// declines the abort latch under it for the same reason.
 pub(crate) fn unpublished_helper_resumes_at_call_entry<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
-    if ctx.fbw_mode.helper_return.resumes_at_call_entry() {
+    if ctx.fbw_mode.helper_return.resumes_at_call_entry() || ctx.fbw_mode.call_entry_helper_chain {
         return true;
     }
     SUBWALK_DRIVER.with(|slot| {
@@ -23793,7 +23796,8 @@ pub(crate) fn unpublished_helper_resumes_at_call_entry<Sym: WalkSym>(
             unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
         ancestors.iter().any(|frame| {
             frame.fbw_mode.transparent_helper_subwalk
-                && frame.fbw_mode.helper_return.resumes_at_call_entry()
+                && (frame.fbw_mode.helper_return.resumes_at_call_entry()
+                    || frame.fbw_mode.call_entry_helper_chain)
         })
     })
 }

@@ -772,8 +772,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // journaled live-heap effect has already run since the CALL, in
         // which case the guard is refused.
         // A helper whose return is not the CALL's result (`HelperReturn::Converted`
-        // / `CalleePrologue`) still collapses to that CALL entry, as
-        // `helper_subwalk_level` does: no MIFrame holds the conversion.
+        // / `CalleePrologue`, or a boxed `'v'` `call_entry_helper_chain`) still
+        // collapses to that CALL entry, as `helper_subwalk_level` does: no
+        // MIFrame holds the conversion.
         let exception_guard = matches!(
             ctx.trace_ctx.last_guard_opcode(),
             Some(OpCode::GuardNoException | OpCode::GuardException)
