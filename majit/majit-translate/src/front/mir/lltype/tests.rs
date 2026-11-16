@@ -14714,6 +14714,185 @@ fn entry_family_holder_wrapper_splits_on_mir_and_registry() {
     );
     assert!(reg.template_holds_split_entry_family("fixture::H"));
     assert!(reg.struct_root_rows_known("fixture::H<u64,i64>"));
+    // Registry follows the same nested holder the MIR predicate named
+    // above (`PtrW` → `*mut H<K,V>` → `GcEntries`). A row that names
+    // `H` at concrete arguments does not (`get_ll_dict`).
+    reg.fields.insert(
+        "fixture::PtrW".to_string(),
+        vec![(
+            "inner".to_string(),
+            "*mut fixture::H<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::PtrW"));
+    assert!(reg.struct_root_rows_known("fixture::PtrW<u64,i64>"));
+    reg.fields.insert(
+        "fixture::PtrW2".to_string(),
+        vec![("inner".to_string(), "*mut fixture::H<i64,i64>".to_string())],
+    );
+    assert!(!reg.template_holds_split_entry_family("fixture::PtrW2"));
+    assert!(!reg.struct_root_rows_known("fixture::PtrW2<u64,i64>"));
+}
+
+#[test]
+fn entry_family_holder_concrete_unit_and_f32_keep_suffix() {
+    // `rordereddict.py` `get_ll_dict`: one `DICT` per concrete
+    // `(DICTKEY, DICTVALUE)`, a Void key included. `()` and `f32` suffix.
+    // An unsubstituted parameter does not (`bookkeeper.py` `getuniqueclassdef`).
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let f32_ty = serde_json::json!({"Scalar": {"Float": "F32"}});
+    let unit = serde_json::json!({"Adt": {"builtin": "Tuple", "generics": {"types": []}}});
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let family = || named_adt(0, vec![tvar(0), tvar(1)]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "GcEntries"],
+                vec![],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "Holder"],
+                vec![named_copy_field("entries", raw_mut(family()))],
+            ),
+            type_decl_struct(2, &["pyobject", "PyObject"], vec![]),
+        ],
+        vec![],
+    );
+    let tomb = std::collections::HashSet::new();
+    let suffix = |args: Vec<serde_json::Value>| {
+        let node = named_adt(1, args);
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Holder",
+            node.get("Adt")
+                .and_then(serde_json::Value::as_object)
+                .expect("Adt"),
+            &llbc,
+            &tomb,
+        )
+    };
+    assert_eq!(
+        suffix(vec![unit, i64_ty.clone()]).as_deref(),
+        Some("<(),i64>")
+    );
+    assert_eq!(
+        suffix(vec![f32_ty, i64_ty.clone()]).as_deref(),
+        Some("<f32,i64>")
+    );
+    assert_eq!(
+        suffix(vec![i64_ty.clone(), raw_mut(named_adt(2, vec![]))]).as_deref(),
+        Some("<i64,*mut PyObject>")
+    );
+    assert_eq!(suffix(vec![tvar(0), i64_ty]), None);
+}
+
+#[test]
+fn entry_family_holder_finite_chain_splits_and_cycle_stops() {
+    // `bookkeeper.py` `getdesc` keys one descriptor per class object.
+    // A finite chain of holders still suffixes. A holder whose only
+    // field is itself, with no entry family, stops and does not.
+    const DEPTH: usize = 10;
+    const LEAVES: [&str; DEPTH] = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9"];
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let mut decls = Vec::with_capacity(DEPTH + 2);
+    decls.push(type_decl_struct(
+        0,
+        &["pyre_object", "rordereddict_entries", "GcEntries"],
+        vec![],
+    ));
+    for i in 0..DEPTH {
+        let field = if i + 1 == DEPTH {
+            raw_mut(named_adt(0, vec![tvar(0), tvar(1)]))
+        } else {
+            raw_mut(named_adt((i + 2) as u64, vec![tvar(0), tvar(1)]))
+        };
+        decls.push(type_decl_struct(
+            (i + 1) as u64,
+            &["fixture", LEAVES[i]],
+            vec![named_copy_field("inner", field)],
+        ));
+    }
+    let node_id = (DEPTH + 1) as u64;
+    decls.push(type_decl_struct(
+        node_id,
+        &["fixture", "Node"],
+        vec![named_copy_field(
+            "next",
+            raw_mut(named_adt(node_id, vec![tvar(0), tvar(1)])),
+        )],
+    ));
+    let llbc = llbc_with_types("fixture", decls, vec![]);
+    let tomb = std::collections::HashSet::new();
+    fn adt_of(node: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        node.get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .expect("Adt")
+    }
+    let concrete = named_adt(1, vec![u64_ty.clone(), i64_ty.clone()]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::D0",
+            adt_of(&concrete),
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<u64,i64>"),
+        "a 10-deep holder chain keeps the instantiation"
+    );
+    let cycle = named_adt(node_id, vec![u64_ty, i64_ty]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Node",
+            adt_of(&cycle),
+            &llbc,
+            &tomb,
+        ),
+        None,
+        "a self-referential holder with no entry family does not split"
+    );
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "rordereddict_entries::GcEntries".to_string(),
+        vec![(
+            "items".to_string(),
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+        )],
+    );
+    for i in 0..(DEPTH - 1) {
+        reg.fields.insert(
+            format!("fixture::{}", LEAVES[i]),
+            vec![(
+                "inner".to_string(),
+                format!("*mut fixture::{}<??TypeVar#0,??TypeVar#1>", LEAVES[i + 1]),
+            )],
+        );
+    }
+    reg.fields.insert(
+        format!("fixture::{}", LEAVES[DEPTH - 1]),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::D0"));
+    assert!(reg.struct_root_rows_known("fixture::D0<u64,i64>"));
+    reg.fields.insert(
+        "fixture::Node".to_string(),
+        vec![(
+            "next".to_string(),
+            "*mut fixture::Node<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(!reg.template_holds_split_entry_family("fixture::Node"));
+    assert!(!reg.struct_root_rows_known("fixture::Node<u64,i64>"));
 }
 
 #[test]
