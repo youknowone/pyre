@@ -565,11 +565,6 @@ fn cextern_c_type(
     {
         Some(CexternRffiCType::CharPP) => "char **".into(),
         Some(CexternRffiCType::CharP) => "char *".into(),
-        Some(CexternRffiCType::AmbiguousInt) => panic!(
-            "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
-            item.file_path.display(),
-            item.head.name
-        ),
         None => {
             let template = crate::cdecl::gettype(&item.head.ty, &item.module_path, resolve)
                 .unwrap_or_else(|msg| {
@@ -579,6 +574,13 @@ fn cextern_c_type(
                         item.head.name
                     )
                 });
+            if cextern_template_is_ambiguous_int(&template, &CIntDataModel::from_target_env()) {
+                panic!(
+                    "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
+                    item.file_path.display(),
+                    item.head.name
+                );
+            }
             crate::cdecl::cdecl(&template, "")
         }
     }
@@ -589,10 +591,9 @@ fn cextern_c_type(
 pub(crate) enum CexternRffiCType {
     CharPP,
     CharP,
-    AmbiguousInt,
 }
 
-/// Match a resolved extern path against `majit_rlib::rffi::{CCHARPP, CCHARP, INT, LONG}`.
+/// Match a resolved extern path against `majit_rlib::rffi::{CCHARPP, CCHARP}`.
 pub(crate) fn classify_cextern_rffi_type(resolved: &[String]) -> Option<CexternRffiCType> {
     let [a, b, c] = resolved else {
         return None;
@@ -603,8 +604,79 @@ pub(crate) fn classify_cextern_rffi_type(resolved: &[String]) -> Option<CexternR
     match c.as_str() {
         "CCHARPP" => Some(CexternRffiCType::CharPP),
         "CCHARP" => Some(CexternRffiCType::CharP),
-        "INT" | "LONG" => Some(CexternRffiCType::AmbiguousInt),
         _ => None,
+    }
+}
+
+/// Data model `rffi.CExternVariable` uses when comparing `TYPE == INT or TYPE == LONG`.
+/// `rarithmetic.build_int` / `lltype.build_number` identify an integer class by
+/// `(signed, bits)`; C `int` is 32 bits, C `long` is 32 on Windows or 32-bit
+/// pointers and 64 otherwise, and `Signed`/`intptr_t`/`ssize_t` follow the
+/// pointer width (`LONG_BIT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CIntDataModel {
+    int_bits: u32,
+    long_bits: u32,
+    ptr_bits: u32,
+}
+
+impl CIntDataModel {
+    fn from_cfg(os: &str, pointer_width: u32) -> Self {
+        let long_bits = if os == "windows" || pointer_width == 32 {
+            32
+        } else {
+            64
+        };
+        Self {
+            int_bits: 32,
+            long_bits,
+            ptr_bits: pointer_width,
+        }
+    }
+
+    fn from_target_env() -> Self {
+        let os = match std::env::var("CARGO_CFG_TARGET_OS") {
+            Ok(os) => os,
+            Err(_) => {
+                if cfg!(windows) {
+                    "windows".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        let pointer_width = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
+            .ok()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(usize::BITS);
+        Self::from_cfg(&os, pointer_width)
+    }
+}
+
+/// Integer identity `(signed, bits)` of a `gettype` template under `model`.
+/// Spellings from `int_template` / `rffi_type_template` / `last_segment_c_type`.
+fn cextern_template_int_identity(template: &str, model: &CIntDataModel) -> Option<(bool, u32)> {
+    Some(match template {
+        "signed char @" => (true, 8),
+        "unsigned char @" => (false, 8),
+        "short @" => (true, 16),
+        "unsigned short @" => (false, 16),
+        "int @" => (true, model.int_bits),
+        "unsigned int @" => (false, model.int_bits),
+        "long @" => (true, model.long_bits),
+        "unsigned long @" => (false, model.long_bits),
+        "long long @" => (true, 64),
+        "unsigned long long @" => (false, 64),
+        "Signed @" | "ssize_t @" | "intptr_t @" => (true, model.ptr_bits),
+        "size_t @" | "uintptr_t @" => (false, model.ptr_bits),
+        _ => return None,
+    })
+}
+
+fn cextern_template_is_ambiguous_int(template: &str, model: &CIntDataModel) -> bool {
+    match cextern_template_int_identity(template, model) {
+        Some((true, bits)) => bits == model.int_bits || bits == model.long_bits,
+        _ => false,
     }
 }
 
@@ -2046,10 +2118,41 @@ fn env_key(name: &str) -> String {
 
 #[cfg(test)]
 mod classify_cextern_rffi_type_tests {
-    use super::{CexternRffiCType, classify_cextern_rffi_type};
+    use super::{
+        CIntDataModel, CexternRffiCType, CollectedCExternVariable, cextern_c_type,
+        cextern_template_is_ambiguous_int, classify_cextern_rffi_type,
+    };
+    use std::path::PathBuf;
 
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn collected(src: &str) -> CollectedCExternVariable {
+        CollectedCExternVariable {
+            file_path: PathBuf::from("test.rs"),
+            module_path: Vec::new(),
+            head: syn::parse_str(src).unwrap_or_else(|err| panic!("{src}: {err}")),
+        }
+    }
+
+    fn resolve_as_extern(
+        path: &syn::Path,
+        _module_path: &[String],
+    ) -> Option<crate::cdecl::Resolved> {
+        Some(crate::cdecl::Resolved::Extern(
+            path.segments.iter().map(|s| s.ident.to_string()).collect(),
+        ))
+    }
+
+    fn assert_ambiguous(model: &CIntDataModel, cases: &[(&str, &str, bool)]) {
+        for (name, template, expected) in cases {
+            assert_eq!(
+                cextern_template_is_ambiguous_int(template, model),
+                *expected,
+                "{name} template {template} under {model:?}"
+            );
+        }
     }
 
     #[test]
@@ -2064,11 +2167,11 @@ mod classify_cextern_rffi_type_tests {
         );
         assert_eq!(
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "INT"])),
-            Some(CexternRffiCType::AmbiguousInt)
+            None
         );
         assert_eq!(
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "LONG"])),
-            Some(CexternRffiCType::AmbiguousInt)
+            None
         );
     }
 
@@ -2083,5 +2186,125 @@ mod classify_cextern_rffi_type_tests {
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "VOIDP"])),
             None
         );
+    }
+
+    #[test]
+    fn from_cfg_lp64_llp64_ilp32() {
+        let lp64 = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            lp64,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 64,
+                ptr_bits: 64
+            }
+        );
+        let llp64 = CIntDataModel::from_cfg("windows", 64);
+        assert_eq!(
+            llp64,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 32,
+                ptr_bits: 64
+            }
+        );
+        let ilp32 = CIntDataModel::from_cfg("linux", 32);
+        assert_eq!(
+            ilp32,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 32,
+                ptr_bits: 32
+            }
+        );
+    }
+
+    #[test]
+    fn lp64_signed_int_and_long_classes_are_ambiguous() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_ambiguous(
+            &model,
+            &[
+                ("INT", "int @", true),
+                ("LONG", "Signed @", true),
+                ("LONGLONG", "Signed @", true),
+                ("SIGNED", "Signed @", true),
+                ("i32", "int @", true),
+                ("i64", "Signed @", true),
+                ("isize", "Signed @", true),
+                ("std::ffi::c_long", "Signed @", true),
+                ("UINT", "unsigned int @", false),
+                ("ULONG", "size_t @", false),
+                ("SHORT", "short @", false),
+                ("CHAR", "char @", false),
+                ("u32", "unsigned int @", false),
+                ("u64", "size_t @", false),
+                ("usize", "size_t @", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn llp64_only_signed_32_is_ambiguous() {
+        let model = CIntDataModel::from_cfg("windows", 64);
+        assert_ambiguous(
+            &model,
+            &[
+                ("INT", "int @", true),
+                ("LONG", "int @", true),
+                ("i32", "int @", true),
+                ("LONGLONG", "Signed @", false),
+                ("SIGNED", "Signed @", false),
+                ("i64", "Signed @", false),
+                ("isize", "Signed @", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn cextern_c_type_ccharpp_feeds_generate_cextern_variable() {
+        let item = collected(
+            r#"pub os_get_environ, pub _os_set_environ = "environ", majit_rlib::rffi::CCHARPP, compilation_info = ECI"#,
+        );
+        let c_type = cextern_c_type(&item, &resolve_as_extern);
+        assert_eq!(c_type, "char **");
+        let eci = crate::generate_cextern_variable("environ", &c_type, false, false, &[]);
+        assert!(
+            eci.separate_module_sources[0].contains("char ** get_environ () { return environ; }"),
+            "{:?}",
+            eci.separate_module_sources
+        );
+    }
+
+    #[test]
+    fn cextern_c_type_keeps_explicit_int() {
+        let item = collected(
+            r#"pub _get_errno, pub _set_errno = "errno", majit_rlib::rffi::INT, compilation_info = ECI, c_type = "int""#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "int");
+    }
+
+    #[test]
+    fn cextern_c_type_short_is_not_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::SHORT, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "short");
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous type on 32-bit machines: give a c_type")]
+    fn cextern_c_type_int_without_c_type_is_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::INT, compilation_info = ECI"#,
+        );
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous type on 32-bit machines: give a c_type")]
+    fn cextern_c_type_i32_without_c_type_is_ambiguous() {
+        let item = collected(r#"pub get_x, pub set_x = "x", i32, compilation_info = ECI"#);
+        let _ = cextern_c_type(&item, &resolve_as_extern);
     }
 }
