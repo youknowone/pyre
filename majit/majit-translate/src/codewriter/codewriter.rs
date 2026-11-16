@@ -2038,6 +2038,7 @@ mod opname_spine_prejit_tests {
     use crate::codewriter::call::CallControl;
     use crate::codewriter::codewriter::CodeWriter;
     use crate::codewriter::jtransform::GraphTransformConfig;
+    use crate::flatten::{FlatOp, SSARepr};
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
         Variable,
@@ -2047,12 +2048,14 @@ mod opname_spine_prejit_tests {
     use crate::translator::rtyper::lltypesystem::lltype::{
         FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
     };
+    use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, build_ll_strconcat_helper_graph};
     use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
     use crate::translator::rtyper::rlist::{
         build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
     };
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
     use crate::translator::translator::TranslationContext;
+    use majit_ir::descr::{ExtraEffect, OopSpecIndex};
 
     fn graph_opnames(graph: &FunctionGraph) -> Vec<String> {
         graph
@@ -2293,6 +2296,77 @@ mod opname_spine_prejit_tests {
             !dump.contains("residual_call"),
             "assembled jitcode must not contain residual_call; dump:\n{dump}"
         );
+        let _keep_helper = helper;
+    }
+
+    /// Spine B `direct_call` of `ll_strconcat` is a residual call with
+    /// `OopSpecIndex::StrConcat` / `ExtraEffect::ElidableOrMemoryError`
+    /// (`_handle_stroruni_call`, `jtransform.py`).
+    #[test]
+    fn opname_spine_direct_call_to_strconcat_helper_is_str_concat_residual() {
+        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+            .expect("build_ll_strconcat_helper_graph");
+        let ft = FuncType {
+            args: vec![STRPTR.clone(), STRPTR.clone()],
+            result: STRPTR.clone(),
+        };
+        let funcptr = functionptr_for_graph_with_type(&helper.graph, ft);
+        let s1 = variable_with_lltype("s1", STRPTR.clone());
+        let s2 = variable_with_lltype("s2", STRPTR.clone());
+        let result = variable_with_lltype("result", STRPTR.clone());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(s1.clone()),
+            Hlvalue::Variable(s2.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_strconcat",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![c_fn, Hlvalue::Variable(s1), Hlvalue::Variable(s2)],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let path = CallPath::from_segments(["caller_strconcat"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("residual_call"),
+            "assembled jitcode must contain residual_call; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let residuals: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::CallResidual { descriptor, .. } => Some(&descriptor.extra_info),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            residuals.len(),
+            1,
+            "exactly one residual_call; dump:\n{dump}"
+        );
+        assert_eq!(residuals[0].oopspecindex, OopSpecIndex::StrConcat);
+        assert_eq!(residuals[0].extraeffect, ExtraEffect::ElidableOrMemoryError);
         let _keep_helper = helper;
     }
 
