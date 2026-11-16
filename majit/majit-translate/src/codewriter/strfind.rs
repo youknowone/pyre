@@ -555,7 +555,22 @@ fn register_direct_call_callees(
     rtyper: &RPythonTyper,
     graph: &crate::flowspace::model::FunctionGraph,
 ) {
-    visit_direct_call_callees(cc, rtyper, graph, true, &mut HashSet::new());
+    visit_direct_call_callees(cc, rtyper, graph, true, &mut HashSet::new(), &|_| true);
+}
+
+/// `call.py CallControl.find_all_graphs` walks every `direct_call` whose
+/// `guess_call_kind` is `'regular'` by `funcobj.graph`. Restricted here to
+/// rtyper low-level helper graphs (`annlowlevel.py` helper graphs live on
+/// `rtyper.lowlevel_helper_graphs`). Nested callees of a helper are
+/// themselves helpers or not; the same predicate applies at every depth.
+pub(crate) fn register_lowlevel_helper_callees(
+    cc: &mut CallControl,
+    rtyper: &RPythonTyper,
+    graph: &crate::flowspace::model::FunctionGraph,
+) {
+    visit_direct_call_callees(cc, rtyper, graph, true, &mut HashSet::new(), &|id| {
+        rtyper.is_lowlevel_helper_graph(id)
+    });
 }
 
 /// `call.py CallControl.guess_call_kind` on a `direct_call` funcobj.
@@ -564,6 +579,17 @@ fn register_direct_call_callees(
 /// walk is a graph not yet in the candidate set — still registered here.
 fn follow_regular_direct_call(cc: &CallControl, func: &_func) -> bool {
     if func.graph.is_none() {
+        return false;
+    }
+    // `call.py guess_call_kind` `hasattr(targetgraph.func, 'oopspec')` →
+    // `'builtin'`.
+    if let Some(graph) = func.graph_ref()
+        && graph
+            .borrow()
+            .func
+            .as_ref()
+            .is_some_and(|func| func.oopspec.is_some())
+    {
         return false;
     }
     if host_env_jit_builtin_func(func) {
@@ -621,6 +647,7 @@ fn visit_direct_call_callees(
     graph: &crate::flowspace::model::FunctionGraph,
     offer_candidate: bool,
     seen: &mut HashSet<usize>,
+    follow: &dyn Fn(usize) -> bool,
 ) {
     specialize_direct_call_funcptr_names(graph, rtyper);
     bind_ll_list_resize_hint_really_from_graph(cc, graph);
@@ -632,6 +659,9 @@ fn visit_direct_call_callees(
         let graph_id = func
             .graph
             .expect("regular direct_call funcptr carries graph");
+        if !follow(graph_id) {
+            continue;
+        }
         if !seen.insert(graph_id) {
             continue;
         }
@@ -644,7 +674,14 @@ fn visit_direct_call_callees(
                 if offer_candidate && !cc.is_candidate(&path) {
                     register_callee_graph(cc, path.clone(), &callee.borrow(), true, graph_id);
                     let nested_offer = cc.is_candidate(&path);
-                    visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer, seen);
+                    visit_direct_call_callees(
+                        cc,
+                        rtyper,
+                        &callee.borrow(),
+                        nested_offer,
+                        seen,
+                        follow,
+                    );
                 }
                 continue;
             }
@@ -672,7 +709,7 @@ fn visit_direct_call_callees(
             graph_id,
         );
         let nested_offer = offer_candidate && cc.is_candidate(&path);
-        visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer, seen);
+        visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer, seen, follow);
     }
 }
 
@@ -931,7 +968,9 @@ mod tests {
     };
     use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::policy::JitPolicy;
-    use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, Struct, functionptr};
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        FuncType, Ptr, Struct, functionptr, functionptr_for_graph_with_type,
+    };
     use crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR;
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_find_helper_graph, build_ll_strhash_helper_graph, funcobj_from_funcptr_constant,
@@ -1206,6 +1245,7 @@ mod tests {
             &elidable.graph.borrow(),
             false,
             &mut HashSet::new(),
+            &|_| true,
         );
         assert!(
             residual_first.has_function_graph(&path),
@@ -1269,6 +1309,7 @@ mod tests {
             &elidable.graph.borrow(),
             false,
             &mut HashSet::new(),
+            &|_| true,
         );
         assert!(candidate_first.is_candidate(&path));
         assert!(candidate_first.jitcode_handle(&path).is_some());
@@ -2463,6 +2504,7 @@ mod tests {
             &prep.graph.borrow(),
             false,
             &mut HashSet::new(),
+            &|_| true,
         );
         let path = CallPath::from_segments(["_ll_list_resize_ge"]);
         register_callee_graph(
@@ -2508,6 +2550,7 @@ mod tests {
             &prep.graph.borrow(),
             false,
             &mut HashSet::new(),
+            &|_| true,
         );
         let path = CallPath::from_segments(["_ll_list_resize_ge"]);
         register_callee_graph(
@@ -2616,6 +2659,7 @@ mod tests {
                 &helper.graph.borrow(),
                 false,
                 &mut HashSet::new(),
+                &|_| true,
             );
             specialize_direct_call_funcptr_names(&helper.graph.borrow(), &rtyper);
 
@@ -2690,6 +2734,7 @@ mod tests {
             &prep.graph.borrow(),
             false,
             &mut HashSet::new(),
+            &|_| true,
         );
         let path = CallPath::from_segments(["_ll_list_resize_ge"]);
         register_callee_graph(
@@ -2901,5 +2946,113 @@ mod tests {
             "look_inside_graph refuses `_jit_look_inside_ = False`"
         );
         assert_eq!(cc.lookup_function_fnaddr(&path), Some(0x5000));
+    }
+
+    fn caller_direct_call_of(
+        funcptr: crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        arg: LowLevelType,
+    ) -> FlowGraph {
+        let start = Block::shared(vec![]);
+        let ret = variable_with_lltype("out", LowLevelType::Signed);
+        let parent = FlowGraph::with_return_var("caller", start.clone(), Hlvalue::Variable(ret));
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee,
+                Hlvalue::Variable(variable_with_lltype("x", arg.clone())),
+            ],
+            Hlvalue::Variable(out),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![constant_with_lltype(
+                    ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )],
+                Some(parent.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        parent
+    }
+
+    /// A `direct_call` whose callee is not in `lowlevel_helper_graphs` is
+    /// skipped (`call.py CallControl.find_all_graphs` restricted to
+    /// `annlowlevel.py` helper graphs).
+    #[test]
+    fn lowlevel_helper_walk_skips_non_helper_callee_graphs() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let arg = LowLevelType::Signed;
+        let callee_graph = residual_named_helper("not_a_lowlevel_helper", arg.clone()).into_ref();
+        ann.translator
+            .graphs
+            .borrow_mut()
+            .push(callee_graph.clone());
+        let graph_id = GraphKey::of(&callee_graph).as_usize();
+        assert!(
+            !rtyper.is_lowlevel_helper_graph(graph_id),
+            "fixture graph is not in lowlevel_helper_graphs"
+        );
+        let ft = FuncType {
+            args: vec![arg.clone()],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr(
+            ft,
+            "not_a_lowlevel_helper",
+            Some(graph_id),
+            Some("not_a_lowlevel_helper".to_string()),
+        );
+        let parent = caller_direct_call_of(funcptr, arg);
+        let mut cc = CallControl::new();
+        register_lowlevel_helper_callees(&mut cc, &rtyper, &parent);
+        assert!(
+            cc.function_graphs().keys().is_empty(),
+            "non-helper callee must not register; registered {:?}",
+            cc.function_graphs().keys()
+        );
+    }
+
+    /// `call.py guess_call_kind` `hasattr(targetgraph.func, 'oopspec')` →
+    /// `'builtin'`; even `follow = |_| true` does not register it.
+    #[test]
+    fn lowlevel_helper_walk_treats_oopspec_callee_as_builtin() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let arg = LowLevelType::Signed;
+        let mut callee = residual_named_helper("oopspec_helper", arg.clone());
+        if let Some(func) = callee.func.as_mut() {
+            func.oopspec = Some("stroruni.concat(s1, s2)".to_string());
+            func._elidable_function_ = false;
+        }
+        let callee_graph = callee.into_ref();
+        ann.translator
+            .graphs
+            .borrow_mut()
+            .push(callee_graph.clone());
+        let ft = FuncType {
+            args: vec![arg.clone()],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr_for_graph_with_type(&callee_graph, ft);
+        let parent = caller_direct_call_of(funcptr, arg);
+        let mut cc = CallControl::new();
+        visit_direct_call_callees(
+            &mut cc,
+            &rtyper,
+            &parent,
+            true,
+            &mut HashSet::new(),
+            &|_| true,
+        );
+        assert!(
+            cc.function_graphs().keys().is_empty(),
+            "oopspec callee is builtin and must not be followed; registered {:?}",
+            cc.function_graphs().keys()
+        );
     }
 }

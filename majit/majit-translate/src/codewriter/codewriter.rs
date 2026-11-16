@@ -1185,6 +1185,25 @@ impl CodeWriter {
                 prejit_remove_obvious_noops(flow_graph, &translator);
             }
         }
+        // `call.py CallControl.find_all_graphs` walks regular `direct_call`
+        // callees. Spine B restricts that walk to rtyper low-level helper
+        // graphs so leftover `_name`s become specialized leaves before
+        // oopspec publication and `lower_graph_with_callees` read them.
+        // Clone the rtyper `Rc` out so the registry borrow ends before
+        // `callcontrol` is passed `&mut`.
+        {
+            let rtyper = self
+                .dual_gate_registry(callcontrol)
+                .session_if_started()
+                .map(|(_ann, rt)| std::rc::Rc::clone(&rt));
+            if let Some(rt) = rtyper {
+                crate::codewriter::strfind::register_lowlevel_helper_callees(
+                    callcontrol,
+                    &rt,
+                    flow_graph,
+                );
+            }
+        }
         // jtransform.py transform_graph starts with
         // constant_fold_ll_issubclass(graph, cpu) on the flowspace
         // graph. Spine B is the remaining entry that still holds
@@ -2035,27 +2054,40 @@ mod exception_class_hierarchy_tests {
 #[cfg(test)]
 mod opname_spine_prejit_tests {
     use super::prejit_remove_obvious_noops;
+    use crate::annotator::annrpython::RPythonAnnotator;
     use crate::codewriter::call::CallControl;
     use crate::codewriter::codewriter::CodeWriter;
     use crate::codewriter::jtransform::GraphTransformConfig;
+    use crate::codewriter::jtransform_opname::{callpath_from_func_name, lower_graph_with_callees};
+    use crate::codewriter::strfind::{register_lowlevel_helper_callees, specialized_helper_leaf};
     use crate::flatten::{FlatOp, SSARepr};
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
         Variable,
     };
-    use crate::model::OpKind;
+    use crate::model::{CallTarget, OpKind};
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
         FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
     };
-    use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, build_ll_strconcat_helper_graph};
+    use crate::translator::rtyper::lltypesystem::rbuilder::{
+        STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, build_ll_append_char_helper_graph,
+        build_ll_grow_by_helper_graph,
+    };
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        STRPTR, build_ll_mallocstr_helper_graph, build_ll_strconcat_helper_graph,
+        chars_array_ptr_lltype_from_strptr, direct_call_funcobjs,
+    };
     use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
     use crate::translator::rtyper::rlist::{
         build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
     };
-    use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+    use crate::translator::rtyper::rtyper::{
+        RPythonTyper, constant_with_lltype, functionptr_const, variable_with_lltype,
+    };
     use crate::translator::translator::TranslationContext;
     use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+    use std::rc::Rc;
 
     fn graph_opnames(graph: &FunctionGraph) -> Vec<String> {
         graph
@@ -2399,5 +2431,164 @@ mod opname_spine_prejit_tests {
             .clone()
             .expect("link arg");
         assert_eq!(link_arg, Hlvalue::Variable(x));
+    }
+
+    /// Spine B `direct_call` of a stringbuilder helper resolves by the
+    /// specialized `cachedgraph` leaf (`call.py CallControl.find_all_graphs`
+    /// restricted to `rtyper.lowlevel_helper_graphs`).
+    #[test]
+    fn opname_spine_stringbuilder_helpers_resolve_by_specialized_graph_path() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_append_char".to_string(),
+                vec![STRINGBUILDERPTR.clone(), LowLevelType::Char],
+                LowLevelType::Void,
+                move |rtyper, _args, _result| {
+                    let chars_ptr = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+                    let malloc = rtyper.lowlevel_helper_function_with_builder(
+                        "mallocstr".to_string(),
+                        vec![LowLevelType::Signed],
+                        STRPTR.clone(),
+                        move |_r, _a, _res| {
+                            build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+                        },
+                    )?;
+                    let mallocfn = functionptr_const(rtyper, &malloc)?;
+                    let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                        "ll_grow_by".to_string(),
+                        vec![STRINGBUILDERPTR.clone(), LowLevelType::Signed],
+                        LowLevelType::Void,
+                        move |_r, _a, _res| {
+                            build_ll_grow_by_helper_graph(
+                                "ll_grow_by",
+                                STRINGBUILDERPTR.clone(),
+                                STRINGPIECEPTR.clone(),
+                                STRINGPIECE.clone(),
+                                STRPTR.clone(),
+                                mallocfn,
+                            )
+                        },
+                    )?;
+                    let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+                    build_ll_append_char_helper_graph(
+                        "ll_append_char",
+                        STRINGBUILDERPTR.clone(),
+                        LowLevelType::Char,
+                        chars_ptr,
+                        STRPTR.clone(),
+                        grow_by_fn,
+                    )
+                },
+            )
+            .expect("ll_append_char helper");
+
+        let c_fn = functionptr_const(&rtyper, &helper).expect("ll_append_char funcptr");
+        let builder = variable_with_lltype("ll_builder", STRINGBUILDERPTR.clone());
+        let ch = variable_with_lltype("ch", LowLevelType::Char);
+        let result = variable_with_lltype("result", LowLevelType::Void);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(builder.clone()),
+            Hlvalue::Variable(ch.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_append_char",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fn),
+                Hlvalue::Variable(builder),
+                Hlvalue::Variable(ch),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let mut cc = CallControl::new();
+        register_lowlevel_helper_callees(&mut cc, &rtyper, &graph);
+
+        let funcs = direct_call_funcobjs(&graph);
+        assert_eq!(funcs.len(), 1, "caller has one direct_call");
+        let expected_leaf = specialized_helper_leaf(
+            "ll_append_char",
+            &[STRINGBUILDERPTR.clone(), LowLevelType::Char],
+        );
+        assert_eq!(funcs[0]._name, expected_leaf);
+        let path = callpath_from_func_name(&funcs[0]._name);
+        assert!(
+            cc.has_function_graph(&path),
+            "missing {path}; registered {:?}",
+            cc.function_graphs().keys()
+        );
+        if cc.is_candidate(&path) {
+            assert!(
+                cc.jitcode_handle(&path).is_some(),
+                "look-inside helper has a jitcode handle"
+            );
+        }
+
+        let concat = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_strconcat".to_string(),
+                vec![STRPTR.clone(), STRPTR.clone()],
+                STRPTR.clone(),
+                move |_r, _a, _res| build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone()),
+            )
+            .expect("ll_strconcat helper");
+        let concat_fn = functionptr_const(&rtyper, &concat).expect("ll_strconcat funcptr");
+        let s1 = variable_with_lltype("s1", STRPTR.clone());
+        let s2 = variable_with_lltype("s2", STRPTR.clone());
+        let concat_result = variable_with_lltype("result", STRPTR.clone());
+        let concat_start = Block::shared(vec![
+            Hlvalue::Variable(s1.clone()),
+            Hlvalue::Variable(s2.clone()),
+        ]);
+        let concat_caller = FunctionGraph::with_return_var(
+            "caller_strconcat",
+            concat_start.clone(),
+            Hlvalue::Variable(concat_result.clone()),
+        );
+        concat_start
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(
+                "direct_call",
+                vec![
+                    Hlvalue::Constant(concat_fn),
+                    Hlvalue::Variable(s1),
+                    Hlvalue::Variable(s2),
+                ],
+                Hlvalue::Variable(concat_result.clone()),
+            ));
+        close_return(&concat_start, &concat_caller, concat_result);
+
+        register_lowlevel_helper_callees(&mut cc, &rtyper, &concat_caller);
+        let concat_funcs = direct_call_funcobjs(&concat_caller);
+        assert_eq!(concat_funcs.len(), 1);
+        let published = callpath_from_func_name(&concat_funcs[0]._name);
+        let lowered = lower_graph_with_callees(&concat_caller, &|_| None);
+        let call_targets: Vec<_> = lowered
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_targets,
+            vec![CallTarget::from_call_path(&published)],
+            "oopspec publication path equals the lowered Call path"
+        );
+        let _keep = ann;
     }
 }
