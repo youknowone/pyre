@@ -1992,15 +1992,17 @@ impl FrameBox {
             .unwrap_or(std::ptr::null_mut())
         };
         if !raw.is_null() {
-            // RPython allocation results stay live in the translated shadow
-            // stack while the caller initializes their fields.  Free-threaded
-            // pyre must expose the same root before entering the write-barrier
-            // GC operation: a contended barrier is an entry safepoint, so an
-            // unrooted fresh frame could otherwise be swept by another
-            // collector between this allocation and the barrier below.
-            let _ = frame_root.pin_root(raw as pyre_object::PyObjectRef);
-            // Read back through the bracket's own cell rather than
-            // `shadow_stack_get`, which resolves the thread-local per slot.
+            // Pin first: `pin_roots` may wait behind a foreign collection that
+            // moves the frame. Barrier before the stores so an old placement is
+            // already in the remembered set when the young references land
+            // (`framework.py` `transform_generic_set` then `setfield`;
+            // `incminimark.py` `remember_young_pointer`). The nursery is not
+            // zero-filled, so the payload is cleared before the pin (`framework.py`
+            // `gct_zero_gc_pointers_inside`): a collection during the pin traces
+            // an all-null frame. Every later use reads the slot.
+            unsafe { std::ptr::write_bytes(raw as *mut u8, 0, std::mem::size_of::<PyFrame>()) };
+            let frame_slot = frame_root.pin_roots(&[raw as pyre_object::PyObjectRef]);
+            pyre_object::gc_hook::try_gc_write_barrier_managed(frame_root.get(frame_slot) as _);
             frame.ob_header.w_class = frame_root.get(inputs);
             frame.pycode = frame_root.get(inputs + 1) as *const ();
             frame.locals_cells_stack_w =
@@ -2023,13 +2025,10 @@ impl FrameBox {
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as pyre_object::gc_hook::GCREF
             ));
-            let ptr = raw as *mut PyFrame;
+            let ptr = frame_root.get(frame_slot) as *mut PyFrame;
             unsafe {
                 std::ptr::write(ptr, frame);
             }
-            // The barrier's TRACK_YOUNG_PTRS test makes this a no-op for a
-            // nursery frame and remembers an old spill.
-            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
@@ -5907,8 +5906,9 @@ impl PyFrame {
         let lineno = self.get_last_lineno();
         let roots = pyre_object::gc_roots::push_roots();
         let frame_slot = roots.pin_roots(&[self as *const PyFrame as pyre_object::PyObjectRef]);
+        let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
         let w_name =
-            unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
+            unsafe { crate::pycode::w_code_name_obj(frame.pycode as pyre_object::PyObjectRef) };
         let name = if !w_name.is_null() {
             unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
         } else {
