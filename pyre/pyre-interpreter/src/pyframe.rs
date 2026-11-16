@@ -2243,7 +2243,7 @@ impl FrameBox {
         // rewrite it. `owner_root` is the same slot; `FrameAnchor` is the
         // reload used after each collecting call.
         let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(self.frame_ptr()) };
-        unsafe { (*frame_anchor.live()).run_generator_prologue()? };
+        PyFrame::run_generator_prologue(&frame_anchor)?;
         let register_final = unsafe {
             crate::pycode::w_code_yields_inside_try(
                 (*frame_anchor.live()).pycode as pyre_object::PyObjectRef,
@@ -5890,6 +5890,8 @@ impl PyFrame {
         // keeps its own quotes around a `%U`, which is why the two disagree on
         // the same path.
         let lineno = self.get_last_lineno();
+        let roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = roots.pin_roots(&[self as *const PyFrame as pyre_object::PyObjectRef]);
         let w_name =
             unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
         let name = if !w_name.is_null() {
@@ -5897,8 +5899,8 @@ impl PyFrame {
         } else {
             rustpython_wtf8::Wtf8Buf::new()
         };
-        // `getaddrstring` id; taken last because computing it can collect.
-        let addr = crate::display::repr_gc_addr(self as *const PyFrame as pyre_object::PyObjectRef);
+        // `getaddrstring` id; read from the root because `w_code_name_obj` can collect.
+        let addr = crate::display::repr_gc_addr(roots.get(frame_slot));
         let mut repr = rustpython_wtf8::Wtf8Buf::new();
         repr.push_str("<frame at ");
         repr.push_str(&addr);
@@ -7070,19 +7072,28 @@ impl PyFrame {
     ///
     /// The prefix handlers are the same `execute_make_cell` /
     /// `execute_copy_free_vars` / `execute_load_fast` / `execute_get_iter` /
-    /// `execute_get_aiter` the eval loop uses. `RETURN_GENERATOR` itself is not executed: the
+    /// `execute_get_aiter` the eval loop uses. The frame is re-read from
+    /// the caller's anchor before each handler because `MAKE_CELL` allocates.
+    /// `RETURN_GENERATOR` itself is not executed: the
     /// generator is allocated by the caller after this returns. The frame
     /// stays at `last_instr == -1`; [`Self::next_instr`] reports
     /// `after_return_generator_index` (the `POP_TOP`) so the first resume
     /// starts there. An error raised here propagates to the caller without a
     /// traceback entry for this frame, which `_PyFrame_IsIncomplete` keeps out
     /// of tracebacks until it reaches `_co_firsttraceable`.
-    pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
-        let after_return_generator = crate::pycode::after_return_generator_index(self.code());
-        if after_return_generator == 0 {
-            return Ok(());
+    pub fn run_generator_prologue(
+        frame_anchor: &crate::eval::FrameAnchor,
+    ) -> Result<(), crate::PyError> {
+        let after_return_generator;
+        let code;
+        {
+            let frame = unsafe { &mut *frame_anchor.live() };
+            after_return_generator = crate::pycode::after_return_generator_index(frame.code());
+            if after_return_generator == 0 {
+                return Ok(());
+            }
+            code = unsafe { &*pyframe_get_pycode(frame) };
         }
-        let code = unsafe { &*pyframe_get_pycode(self) };
         let mut pc = 0usize;
         while pc < after_return_generator {
             let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc)
@@ -7091,20 +7102,25 @@ impl PyFrame {
             };
             match instruction {
                 crate::bytecode::Instruction::MakeCell { .. } => {
-                    let _ = crate::pyopcode::execute_make_cell(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_make_cell(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::CopyFreeVars { .. } => {
-                    let _ = crate::pyopcode::execute_copy_free_vars(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_copy_free_vars(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::LoadFast { .. }
                 | crate::bytecode::Instruction::LoadFastBorrow { .. } => {
-                    let _ = crate::pyopcode::execute_load_fast(self, code, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_load_fast(frame, code, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::GetIter { .. } => {
-                    let _ = crate::pyopcode::execute_get_iter(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_get_iter(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::GetAiter => {
-                    let _ = crate::pyopcode::execute_get_aiter(self)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_get_aiter(frame)?;
                 }
                 crate::bytecode::Instruction::ReturnGenerator => {
                     // CPython copies the frame after this opcode; do not
