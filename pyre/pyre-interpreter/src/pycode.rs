@@ -4905,6 +4905,17 @@ pub unsafe fn w_code_get_lineno_for_pc_tracing(w_code: PyObjectRef, pc: isize) -
     unsafe { crate::pyframe::offset2lineno(w_code, pc) }
 }
 
+#[derive(Default)]
+struct LiveCodeWrappers {
+    /// `code_ptr -> wrapper` (the existing map, unchanged type).
+    map: majit_gc::address_dict::AddressMap<usize>,
+    /// `code_ptr`s whose stored wrapper was young when stored
+    /// (`incminimark.py old_objects_pointing_to_young`). A minor
+    /// collection drains it; a major collection clears it after the
+    /// whole-table walk.
+    young: Vec<usize>,
+}
+
 /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
 /// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
 /// the wrapper's `w_globals` — the only point both the raw pointer and the
@@ -4917,6 +4928,8 @@ pub unsafe fn w_code_get_lineno_for_pc_tracing(w_code: PyObjectRef, pc: isize) -
 /// this mapping during every minor collection; an executing frame also
 /// refreshes the mapping from its live `pycode` field. The collector destructor
 /// removes every other mapping before its pointer can dangle.
+/// `young` is the remembered set of those stored values that were nursery
+/// objects at the store.
 ///
 /// Process-global, not per-thread: `pycode.py` keeps `w_globals` on the
 /// shared `PyCode` instance, and a code object stamped on one thread must be
@@ -4929,13 +4942,11 @@ pub unsafe fn w_code_get_lineno_for_pc_tracing(w_code: PyObjectRef, pc: isize) -
 /// (`majit_gc::address_dict::AddressHasher`). Rust's default `SipHash` was 4.3%
 /// of a call-heavy interpreted loop on its own, because every frame creation
 /// refreshes its own entry.
-static LIVE_CODE_WRAPPERS: std::sync::OnceLock<
-    parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>>,
-> = std::sync::OnceLock::new();
+static LIVE_CODE_WRAPPERS: std::sync::OnceLock<parking_lot::Mutex<LiveCodeWrappers>> =
+    std::sync::OnceLock::new();
 
-fn live_code_wrappers() -> &'static parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>> {
-    LIVE_CODE_WRAPPERS
-        .get_or_init(|| parking_lot::Mutex::new(majit_gc::address_dict::AddressMap::default()))
+fn live_code_wrappers() -> &'static parking_lot::Mutex<LiveCodeWrappers> {
+    LIVE_CODE_WRAPPERS.get_or_init(|| parking_lot::Mutex::new(LiveCodeWrappers::default()))
 }
 
 /// Record `wrapper` as the live wrapper for `code_ptr`. No-op on null inputs.
@@ -4949,15 +4960,28 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     }
     let wrapper = wrapper as usize;
     let mut wrappers = live_code_wrappers().lock();
-    match wrappers.get_mut(&(code_ptr as usize)) {
+    let LiveCodeWrappers { map, young } = &mut *wrappers;
+    match map.get_mut(&(code_ptr as usize)) {
         // The refresh exists for a wrapper that moved, and an unmoved one is
         // the common case: every frame this code object runs comes back here.
         // Leaving the slot alone spares the store and, on a table at its load
         // factor, the rehash that inserting over an existing key still risks.
         Some(live) if *live == wrapper => {}
-        Some(live) => *live = wrapper,
+        Some(live) => {
+            *live = wrapper;
+            // incminimark.py remember_young_pointer: a young value stored into this
+            // old table is the only edge a minor walk must visit.
+            if majit_gc::gc_is_nursery_object(wrapper) {
+                young.push(code_ptr as usize);
+            }
+        }
         None => {
-            wrappers.insert(code_ptr as usize, wrapper);
+            map.insert(code_ptr as usize, wrapper);
+            // incminimark.py remember_young_pointer: a young value stored into this
+            // old table is the only edge a minor walk must visit.
+            if majit_gc::gc_is_nursery_object(wrapper) {
+                young.push(code_ptr as usize);
+            }
         }
     }
 }
@@ -4984,7 +5008,7 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
         return PY_NULL;
     }
     let mut wrappers = live_code_wrappers().lock();
-    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
+    let Some(wrapper) = wrappers.map.get_mut(&(code_ptr as usize)) else {
         return PY_NULL;
     };
     // A collection root walk may have installed a forwarding pointer before
@@ -5007,12 +5031,32 @@ pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut 
         return;
     }
     let mut wrappers = live_code_wrappers().lock();
-    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
+    let Some(wrapper) = wrappers.map.get_mut(&(code_ptr as usize)) else {
         return;
     };
     let mut root = *wrapper as PyObjectRef;
     forward(&mut root);
     *wrapper = root as usize;
+}
+
+/// Minor-collection walk of [`LIVE_CODE_WRAPPERS`]: forward only the
+/// remembered entries and clear the list (`incminimark.py
+/// collect_oldrefs_to_nursery`). Every other value is old, and the old
+/// generation does not move in a minor collection.
+pub fn walk_young_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let mut wrappers = live_code_wrappers().lock();
+    let LiveCodeWrappers { map, young } = &mut *wrappers;
+    for code_ptr in young.drain(..) {
+        let Some(wrapper) = map.get_mut(&code_ptr) else {
+            continue;
+        };
+        if *wrapper == 0 || !majit_gc::gc_is_nursery_object(*wrapper) {
+            continue;
+        }
+        let mut root = *wrapper as PyObjectRef;
+        forward(&mut root);
+        *wrapper = root as usize;
+    }
 }
 
 /// Forward every `LIVE_CODE_WRAPPERS` value in place.
@@ -5028,9 +5072,11 @@ pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut 
 /// `malloc_fixedsize`). Old-gen interpreted-only entries are not a
 /// major mark set: that kept `w_globals` alive across
 /// `finalize_modules`' pre-clear collection.
+/// After the whole-table walk, `young` is cleared: every value has been
+/// visited, and the caller already filters nursery values.
 pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut wrappers = live_code_wrappers().lock();
-    for wrapper in wrappers.values_mut() {
+    for wrapper in wrappers.map.values_mut() {
         let mut root = *wrapper as PyObjectRef;
         if root.is_null() {
             continue;
@@ -5038,6 +5084,7 @@ pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
         forward(&mut root);
         *wrapper = root as usize;
     }
+    wrappers.young.clear();
 }
 
 /// One `box_code_object` allocation graph and what still reads it.
@@ -5285,8 +5332,8 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     let wrapper = obj_addr as PyObjectRef;
     {
         let mut wrappers = live_code_wrappers().lock();
-        if wrappers.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
-            wrappers.remove(&(code.code_ptr as usize));
+        if wrappers.map.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
+            wrappers.map.remove(&(code.code_ptr as usize));
         }
     }
     w_globals_stamped_codes().lock().remove(&obj_addr);
