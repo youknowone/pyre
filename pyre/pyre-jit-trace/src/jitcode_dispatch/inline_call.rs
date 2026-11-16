@@ -19145,6 +19145,166 @@ fn bind_nested_generator_resume_at_parent<'a, Sym: WalkSym>(
     }
 }
 
+/// Jitcode pc whose `-live-` / pcdep names the registers a generator-resume
+/// MIFrame must seed (`MetaInterp.newframe` / `MIFrame.setup_call`).
+///
+/// `generator_resume_marker_offset` is the dispatch-head start.
+/// `static_entry_merge_point` may place that start on the
+/// `get_is_being_profiled` diamond, before the head `-live-`. Seeding from
+/// the last live *before* the marker reads a prologue window and drops
+/// head-live stack colors. `run_perfn_walk` uses `pcdep_trivia_at` at a pc
+/// `dispatch_head_contains`.
+fn generator_resume_seed_pc(pjc: &crate::pyjitcode::PyJitCode, resume_marker: usize) -> usize {
+    if pjc.metadata.dispatch_head_contains(resume_marker) {
+        crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+            .skip_while(|op| op.pc < resume_marker)
+            .find(|op| op.opname == "live" && pjc.metadata.dispatch_head_contains(op.pc))
+            .map(|op| op.pc)
+            .unwrap_or(resume_marker)
+    } else {
+        crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+            .take_while(|op| op.pc <= resume_marker)
+            .filter(|op| op.opname == "live")
+            .last()
+            .map(|op| op.pc)
+            .unwrap_or(resume_marker)
+    }
+}
+
+/// Portal-frame register seeds for a generator resume.
+///
+/// `MetaInterp.newframe` / `MIFrame.setup_call` write the call's argument
+/// boxes into the new frame's registers before `_interpret` continues.
+/// `_send_ex` (`GeneratorOrCoroutine._send_ex`) then `execute_frame`
+/// (`PyFrame.execute_frame`) reads locals and the operand stack off that
+/// frame. Direct (`run_sub_jitcode_walk_from`) and nested
+/// (`SubWalkDriver::push_frame`) resumes share this so the child bank is
+/// filled once, before either walk.
+fn generator_resume_entry_seeds<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pjc: &crate::pyjitcode::PyJitCode,
+    body: &SubJitCodeBody,
+    resume_marker: usize,
+    resume_py_pc: usize,
+    frame_box: OpRef,
+    frame_root: usize,
+    ec_box: OpRef,
+) -> (
+    Vec<(usize, OpRef, ConcreteValue)>,
+    Vec<(usize, OpRef, ConcreteValue)>,
+) {
+    let portal_frame_reg = pjc.metadata.portal_frame_reg;
+    let portal_ec_reg = pjc.metadata.portal_ec_reg;
+    let mut extra_ref_seeds: Vec<(usize, OpRef, ConcreteValue)> = Vec::new();
+    if portal_frame_reg != u16::MAX {
+        extra_ref_seeds.push((
+            portal_frame_reg as usize,
+            frame_box,
+            ConcreteValue::Ref(live_generator_frame(frame_root) as pyre_object::PyObjectRef),
+        ));
+    }
+    if portal_ec_reg != u16::MAX {
+        extra_ref_seeds.push((
+            portal_ec_reg as usize,
+            ec_box,
+            ConcreteValue::Ref(
+                pyre_interpreter::call::getexecutioncontext() as pyre_object::PyObjectRef
+            ),
+        ));
+    }
+    let seed_pc = generator_resume_seed_pc(pjc, resume_marker);
+    let pcdep = crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, seed_pc as i32)
+        .unwrap_or_default();
+    let live_r = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+        pjc.jitcode.index() as i32,
+        seed_pc as i32,
+    )
+    .ref_;
+    // Head entry: seed the head's own color→slot map (`run_perfn_walk`
+    // `pcdep_trivia_at` when `dispatch_head_contains`). A nonempty prologue
+    // `live_r` must not win; that window omits stack colors live at the
+    // head `-live-`.
+    let colors: Vec<u32> = if pjc.metadata.dispatch_head_contains(seed_pc) || live_r.is_empty() {
+        pcdep
+            .iter()
+            .filter(|&&(bank, _, _)| bank == 1)
+            .map(|&(_, color, _)| color as u32)
+            .collect()
+    } else {
+        live_r
+    };
+    if !colors.is_empty() {
+        let locals_array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_box);
+        for color in colors {
+            if color == portal_frame_reg as u32 || color == portal_ec_reg as u32 {
+                continue;
+            }
+            let Some(slot) = pcdep
+                .iter()
+                .find_map(|&(bank, c, slot)| (bank == 1 && c as u32 == color).then_some(slot))
+            else {
+                continue;
+            };
+            // GETFIELD of `locals_cells_stack_w` / GETARRAYITEM of a prior
+            // slot can minor-collect. Re-read the frame from its root, copy
+            // the slot, and drop the reference before the next recording
+            // (`pyjitpl.py` `_do_getarrayitem_gc_any` keeps the array in a
+            // frontend box).
+            let value = {
+                let frame_ref = unsafe { &*live_generator_frame(frame_root) };
+                locals_w!(frame_ref)
+                    .as_slice()
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or(std::ptr::null_mut())
+            };
+            let index = ctx.trace_ctx.const_int(slot as i64);
+            let opref = crate::state::trace_array_getitem_value(ctx.trace_ctx, locals_array, index);
+            // GETARRAYITEM can minor-collect; the box is the forwarded
+            // slot, the locals copy is the pre-move address.
+            let value = walker_concrete_ref_object(ctx, opref).unwrap_or(value);
+            extra_ref_seeds.push((color as usize, opref, ConcreteValue::Ref(value)));
+        }
+    }
+    // A later `const_ref` intern can minor-collect; the `ConstPtr` slot
+    // is the forwarded copy of each seed. The frame seed is not a
+    // constant: bake it from the root after the same window.
+    for (_, opref, concrete) in &mut extra_ref_seeds {
+        if *opref == frame_box {
+            *concrete =
+                ConcreteValue::Ref(live_generator_frame(frame_root) as pyre_object::PyObjectRef);
+        } else if opref.is_constant()
+            && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(*opref)
+        {
+            *concrete = ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef);
+        }
+    }
+    // Seed the `next_instr` Int green (`gi[0]` of the merge after the
+    // head) with `resume_py_pc`. `is_being_profiled` (`gi[1]`) is
+    // computed by the head's `get_is_being_profiled` diamond.
+    let extra_int_seeds: Vec<(usize, OpRef, ConcreteValue)> =
+        crate::trace::static_entry_merge_point_green_regs(
+            body.code,
+            pjc.loop_scan(),
+            resume_marker,
+        )
+        .map(|gi| {
+            let values = [resume_py_pc as i64];
+            gi.iter()
+                .zip(values)
+                .map(|(&color, value)| {
+                    (
+                        color as usize,
+                        ctx.trace_ctx.const_int(value),
+                        ConcreteValue::Int(value),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (extra_int_seeds, extra_ref_seeds)
+}
+
 /// Walk the already-installed portal-shaped body of a suspended generator
 /// from `resume_execute_frame` to its next `yield`.
 fn walk_generator_resume<Sym: WalkSym>(
@@ -19472,98 +19632,17 @@ fn walk_generator_resume<Sym: WalkSym>(
     let ec_box = ctx
         .trace_ctx
         .const_ref(pyre_interpreter::call::getexecutioncontext() as i64);
-    let mut extra_ref_seeds: Vec<(usize, OpRef, ConcreteValue)> = Vec::new();
-    let portal_frame_reg = pjc.metadata.portal_frame_reg;
-    let portal_ec_reg = pjc.metadata.portal_ec_reg;
     // `const_ref` of the execution context can intern and minor-collect.
-    if portal_frame_reg != u16::MAX {
-        extra_ref_seeds.push((
-            portal_frame_reg as usize,
-            frame_box,
-            ConcreteValue::Ref(live_generator_frame(frame_root) as pyre_object::PyObjectRef),
-        ));
-    }
-    if portal_ec_reg != u16::MAX {
-        extra_ref_seeds.push((
-            portal_ec_reg as usize,
-            ec_box,
-            ConcreteValue::Ref(
-                pyre_interpreter::call::getexecutioncontext() as pyre_object::PyObjectRef
-            ),
-        ));
-    }
-    let pcdep = crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, resume_marker as i32)
-        .unwrap_or_default();
-    // Head `-live-` (`live_marker_at_or_before`): every live Ref is a
-    // frame slot (`PyFrame.dispatch` reads locals/stack off the
-    // virtualizable), null included. `pcdep_trivia_at` is the color→slot
-    // map the snapshot encoder uses.
-    let live_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
-        .take_while(|op| op.pc <= resume_marker)
-        .filter(|op| op.opname == "live")
-        .last()
-        .map(|op| op.pc)
-        .unwrap_or(resume_marker);
-    let live_r = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
-        pjc.jitcode.index() as i32,
-        live_pc as i32,
-    )
-    .ref_;
-    let colors: Vec<u32> = if live_r.is_empty() {
-        pcdep
-            .iter()
-            .filter(|&&(bank, _, _)| bank == 1)
-            .map(|&(_, color, _)| color as u32)
-            .collect()
-    } else {
-        live_r
-    };
-    if !colors.is_empty() {
-        let locals_array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_box);
-        for color in colors {
-            if color == portal_frame_reg as u32 || color == portal_ec_reg as u32 {
-                continue;
-            }
-            let Some(slot) = pcdep
-                .iter()
-                .find_map(|&(bank, c, slot)| (bank == 1 && c as u32 == color).then_some(slot))
-            else {
-                continue;
-            };
-            // GETFIELD of `locals_cells_stack_w` / GETARRAYITEM of a prior
-            // slot can minor-collect. Re-read the frame from its root, copy
-            // the slot, and drop the reference before the next recording
-            // (`pyjitpl.py` `_do_getarrayitem_gc_any` keeps the array in a
-            // frontend box).
-            let value = {
-                let frame_ref = unsafe { &*live_generator_frame(frame_root) };
-                locals_w!(frame_ref)
-                    .as_slice()
-                    .get(slot as usize)
-                    .copied()
-                    .unwrap_or(std::ptr::null_mut())
-            };
-            let index = ctx.trace_ctx.const_int(slot as i64);
-            let opref = crate::state::trace_array_getitem_value(ctx.trace_ctx, locals_array, index);
-            // GETARRAYITEM can minor-collect; the box is the forwarded
-            // slot, the locals copy is the pre-move address.
-            let value = walker_concrete_ref_object(ctx, opref).unwrap_or(value);
-            extra_ref_seeds.push((color as usize, opref, ConcreteValue::Ref(value)));
-        }
-    }
-    // A later `const_ref` intern can minor-collect; the `ConstPtr` slot
-    // is the forwarded copy of each seed. The frame seed is not a
-    // constant: bake it from the root after the same window.
-    for (_, opref, concrete) in &mut extra_ref_seeds {
-        if *opref == frame_box {
-            *concrete =
-                ConcreteValue::Ref(live_generator_frame(frame_root) as pyre_object::PyObjectRef);
-        } else if opref.is_constant()
-            && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(*opref)
-        {
-            *concrete = ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef);
-        }
-    }
+    let (extra_int_seeds, mut extra_ref_seeds) = generator_resume_entry_seeds(
+        ctx,
+        &pjc,
+        &body,
+        resume_marker,
+        resume_py_pc,
+        frame_box,
+        frame_root,
+        ec_box,
+    );
 
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
@@ -19604,29 +19683,6 @@ fn walk_generator_resume<Sym: WalkSym>(
         gen_frame,
     );
     let (walk_result, deferred_portal_leave) = {
-        // Seed the `next_instr` Int green (`gi[0]` of the merge after the
-        // head) with `resume_py_pc`. `is_being_profiled` (`gi[1]`) is
-        // computed by the head's `get_is_being_profiled` diamond.
-        let extra_int_seeds: Vec<(usize, OpRef, ConcreteValue)> =
-            crate::trace::static_entry_merge_point_green_regs(
-                body.code,
-                pjc.loop_scan(),
-                resume_marker,
-            )
-            .map(|gi| {
-                let values = [resume_py_pc as i64];
-                gi.iter()
-                    .zip(values)
-                    .map(|(&color, value)| {
-                        (
-                            color as usize,
-                            ctx.trace_ctx.const_int(value),
-                            ConcreteValue::Int(value),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let code_pin = majit_metainterp::GreenRefPin::pin_one(
             pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
         );
@@ -24469,7 +24525,10 @@ fn python_portal_callee_shadow<Sym: WalkSym>(
     let Ok(jitcode_index) = i32::try_from(index) else {
         return shadow;
     };
-    let Some(pcdep) = crate::state::pcdep_trivia_at(jitcode_index, start_pc as i32) else {
+    let seed_pc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
+        .map(|pjc| generator_resume_seed_pc(&pjc, start_pc))
+        .unwrap_or(start_pc);
+    let Some(pcdep) = crate::state::pcdep_trivia_at(jitcode_index, seed_pc as i32) else {
         return shadow;
     };
     for &(bank, color, slot) in &pcdep {
