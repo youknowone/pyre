@@ -800,8 +800,11 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     /// `entries[i].f_hash`: one interior-field read of the entries array.
+    ///
+    /// `ll_dict_lookup` compares this cached digest before `keyeq`
+    /// (`rordereddict.py` `entry_hash`).
     #[inline]
-    fn hash_at(&self, slot: usize) -> u64 {
+    pub(crate) fn hash_at(&self, slot: usize) -> u64 {
         unsafe { (*self.entry_ptr().add(slot)).f_hash }
     }
 
@@ -1809,17 +1812,31 @@ where
         K: GcRefOffsets,
         V: GcRefOffsets,
     {
+        let hash = self.hash_of(&key);
+        self.insert_hashed(hash, &key, key, value)
+    }
+
+    /// `ll_dict_setitem_with_hash` when the digest is already known.
+    ///
+    /// Object-keyed tables store a one-word key and keep `hash_w` in
+    /// `f_hash`, so the probe (`eq_w`) is a different type from the stored
+    /// `K` (`rordereddict.py` `get_ll_dict`).
+    pub fn insert_hashed<Q>(&mut self, hash: u64, probe: &Q, key: K, value: V) -> Option<V>
+    where
+        K: GcRefOffsets,
+        V: GcRefOffsets,
+        Q: Equivalent<K> + ?Sized,
+    {
         let _roots = crate::gc_roots::push_roots();
         let mut key = key;
         let mut value = value;
         let value_slot = pin_gcrefs(&_roots, &value);
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
-        let hash = self.hash_of(&key);
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return None;
         }
-        let index_slot = match self.lookup_for_store(hash, &key) {
+        let index_slot = match self.lookup_for_store(hash, probe) {
             Ok(slot) => {
                 reload_gcrefs(&_roots, &mut value, value_slot);
                 assert!(self.entry_valid(slot), "valid slot");
@@ -1852,13 +1869,23 @@ where
         K: GcRefOffsets,
         V: GcRefOffsets,
     {
+        let hash = self.hash_of(&key);
+        self.insert_known_absent_hashed(hash, key, value);
+    }
+
+    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` with a digest the
+    /// caller already holds (`rordereddict.py` `ll_call_insert_clean_function`).
+    pub fn insert_known_absent_hashed(&mut self, hash: u64, key: K, value: V)
+    where
+        K: GcRefOffsets,
+        V: GcRefOffsets,
+    {
         let _roots = crate::gc_roots::push_roots();
         let mut key = key;
         let mut value = value;
         let value_slot = pin_gcrefs(&_roots, &value);
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
-        let hash = self.hash_of(&key);
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return;
         }
@@ -2001,7 +2028,7 @@ where
             let (k, v) = self.take_slot(hash, slot);
             Self::pin_gcrefs_of(k);
             Self::pin_gcrefs_of(v);
-            self.insert(k, v);
+            self.insert_known_absent_hashed(hash, k, v);
         } else {
             if self.next_valid_slot(0) == Some(slot) {
                 return false;
@@ -2018,7 +2045,7 @@ where
                     let (k, v) = (self.key_at(i), unsafe { self.value_at(i) });
                     Self::pin_gcrefs_of(k);
                     Self::pin_gcrefs_of(v);
-                    rest.push((k, v));
+                    rest.push((self.hash_at(i), k, v));
                 }
             }
             // The old array is left to the collector, as `ll_dict_clear` does.
@@ -2028,9 +2055,9 @@ where
             self.num_live_items = 0;
             self.resize_counter = 0;
             self.generation = self.generation.wrapping_add(1);
-            self.insert(k, v);
-            for (k, v) in rest {
-                self.insert(k, v);
+            self.insert_known_absent_hashed(hash, k, v);
+            for (h, k, v) in rest {
+                self.insert_known_absent_hashed(h, k, v);
             }
         }
         true
@@ -2155,6 +2182,40 @@ where
         if n == 0 {
             return Self::with_hasher(S::default());
         }
+        let mut hashes = vec![0u64; n];
+        {
+            let dst = Self::with_hasher(S::default());
+            for slot in 0..n {
+                if live[slot] {
+                    hashes[slot] = dst.hash_of(&keys[slot]);
+                }
+            }
+        }
+        Self::from_preserved_slots_with_hashes(keys, &hashes, live, index_len)
+    }
+
+    /// [`Self::from_preserved_slots`] with the cached `f_hash` already known.
+    ///
+    /// Object-keyed tables cannot re-derive `hash_w` from the stored pointer
+    /// (`get_ll_dict` keeps that digest in `f_hash`).
+    pub fn from_preserved_slots_with_hashes(
+        keys: &[K],
+        hashes: &[u64],
+        live: &[bool],
+        index_len: usize,
+    ) -> Self
+    where
+        K: Copy + EntryDummy + GcRefOffsets,
+        V: Copy + EntryDummy,
+        S: BuildHasher + Default,
+        (K, V): GcEntriesType,
+    {
+        let n = keys.len();
+        debug_assert_eq!(live.len(), n);
+        debug_assert_eq!(hashes.len(), n);
+        if n == 0 {
+            return Self::with_hasher(S::default());
+        }
         let _roots = crate::gc_roots::push_roots();
         let mut key_slots = Vec::with_capacity(n);
         for key in keys {
@@ -2175,7 +2236,7 @@ where
                 continue;
             }
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
-            let hash = dst.hash_of(&key);
+            let hash = hashes[slot];
             dst.barrier_entries();
             unsafe {
                 std::ptr::write(

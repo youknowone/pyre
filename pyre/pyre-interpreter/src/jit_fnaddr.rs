@@ -77,6 +77,7 @@ impl<T> ResidualRet for *mut T {}
 /// One-word `repr(transparent)` dict keys. `ObjectKey` / `IdentitySetKey`
 /// are two words and stay off this trait.
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
+impl ResidualSlot for pyre_object::dictmultiobject::ObjectEntryKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
@@ -887,6 +888,16 @@ pub mod word_publish {
         }
     }
     impl WordAbi for pyre_object::identitydict::IdentityKey {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            Self(reg as usize as pyre_object::PyObjectRef)
+        }
+        fn into_reg(self) -> i64 {
+            self.0 as usize as i64
+        }
+    }
+    impl WordAbi for pyre_object::dictmultiobject::ObjectEntryKey {
         type Reg = i64;
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
@@ -6467,7 +6478,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::dictmultiobject::IntKeyHash,
     >(&mut entries);
     register_rdict_dont_look_inside_inst::<
-        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::dictmultiobject::ObjectEntryKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        pyre_object::dictmultiobject::ObjectEntryKey,
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
@@ -6502,7 +6518,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::dictmultiobject::StrKeyBuildHasher,
     >(&mut entries);
     register_rdict_dont_look_inside_inst::<
-        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::dictmultiobject::ObjectEntryKey,
         (),
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
