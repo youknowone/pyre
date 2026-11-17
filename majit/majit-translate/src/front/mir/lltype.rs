@@ -17251,20 +17251,18 @@ fn field_row_lltype(
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
         }
-        // Declared-GC with a class identity is the instance pointer.
-        // `InstanceRepr.lowleveltype` is `Ptr(self.object_type)`
-        // (`rclass.py` `InstanceRepr`). `externalvsinternal`
-        // (`rmodel.py`, `gcref=False`) keeps that pointer as the
-        // internal repr. `rordereddict.py` `DICTENTRY` stores
-        // `value_repr.lowleveltype` in the value field.
-        // `gc_class_root_ptr_as_instance` reads it back as the
-        // nullable instance. A declared-GC pointee with no class
-        // identity, and a `GCREF` spelling (`is_gcref_type_spelling`),
-        // stay one opaque GC word. Both are one pointer word.
+        // A declared-GC pointee is one `llmemory.GCREF`
+        // (`rmodel.py` `externalvsinternal`, the `gcref=True` arm,
+        // `GCRefRepr`). A class-identity pointee that is not
+        // declared-GC is `rclass.OBJECTPTR`
+        // (`getinstancerepr(rtyper, None)`, the `gcref=False` arm)
+        // on the later arm. `rordereddict.py` `_setup_repr` stores
+        // that internal lowleveltype in `DICTENTRY`. Declared-GC is
+        // reached first, so `*mut` of a declared-GC class root is
+        // `GCREF`, not `OBJECTPTR`. `rdict.py`
+        // `AbstractDictRepr.recast_key` / `recast_value` recovers the
+        // external repr from the declared row.
         if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
-            if let Some(ptr) = class_root_gc_struct_ptr(reg, pointee) {
-                return Some(ptr);
-            }
             return Some((*GCREF).clone());
         }
         if crate::annotator::bookkeeper::is_gcref_type_spelling(pointee) {
@@ -17307,69 +17305,6 @@ fn field_row_lltype(
     }
     if reg.field_rows(t).is_some() {
         return raw_struct_array_item_lltype(reg, t, visited);
-    }
-    None
-}
-
-/// `Ptr(GcStruct)` of a declared-GC class root.
-///
-/// `owner_ll_container` builds the container with `Struct::registry_fields`
-/// when the harvested layout's `_gckind` is Gc, and `pointer_field_lltype`
-/// wraps that container. `Struct::gc` is the same `_build` with
-/// `GcKind::Gc`; `gc_class_root_ptr_as_instance` recognizes that pointer
-/// (a `GcKind::Gc` struct whose `_name` is an exact `struct_fields` key
-/// `getuniqueclassdef_for_struct_root` accepts). This path has the
-/// registry and not the layout table. Interior rows stay off the struct:
-/// the field is the instance pointer, and a pointer back to the same
-/// root would re-enter through `visited`.
-fn class_root_gc_struct_ptr(
-    reg: &crate::front::StructFieldRegistry,
-    pointee: &str,
-) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
-
-    let name = class_root_struct_name(reg, pointee)?;
-    // `_name` is the key `getuniqueclassdef_for_struct_root` interns.
-    // The refusal sequence is `struct_root_has_no_classdef` (GCREF,
-    // `struct_root_refuses_classdef_new`, list family). A refused name
-    // does not read as an instance (`gc_class_root_ptr_as_instance`).
-    if crate::annotator::bookkeeper::struct_root_has_no_classdef(&name, Some(reg)).is_some() {
-        return None;
-    }
-    let body = Struct::gc(&name, Vec::<(String, LowLevelType)>::new());
-    let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
-    Some(LowLevelType::Ptr(Box::new(ptr)))
-}
-
-/// `ClassIdentity.spelling` when that string is the exact `struct_fields`
-/// key. Aliases of one declaration store the same spelling
-/// (`class_identity_spelling`).
-///
-/// Keys are the template, [`majit_ir::descr::canonical_struct_name`], and
-/// [`crate::front::StructFieldRegistry::resolved_owner_key`]. A bare leaf
-/// is not probed: [`crate::front::mir::harden_duplicate_leaf_metadata`]
-/// withdraws an ambiguous one, and `resolved_owner_key` is the one owner
-/// resolution.
-fn class_root_struct_name(
-    reg: &crate::front::StructFieldRegistry,
-    pointee: &str,
-) -> Option<String> {
-    let template = majit_ir::descr::strip_generic_args(pointee.trim());
-    let template = template.as_ref();
-    if template.is_empty() {
-        return None;
-    }
-    let canon = majit_ir::descr::canonical_struct_name(template);
-    let resolved = reg.resolved_owner_key(template);
-    for key in [template, canon.as_str()]
-        .into_iter()
-        .chain(resolved.as_deref())
-    {
-        if let Some(Some(ci)) = reg.class_identity.get(key)
-            && reg.fields.contains_key(&ci.spelling)
-        {
-            return Some(ci.spelling.clone());
-        }
     }
     None
 }
