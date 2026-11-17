@@ -834,6 +834,9 @@ pub struct ListRootGuard {
     /// Shadow-stack depth before the push; the livevars are `base .. base + len`.
     base: usize,
     len: usize,
+    /// The shadow stack is per-thread: a depth taken on one thread names a
+    /// different slot on another.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl ListRootGuard {
@@ -848,6 +851,7 @@ impl ListRootGuard {
         Self {
             base,
             len: refs.len(),
+            _not_send: PhantomData,
         }
     }
 
@@ -866,12 +870,24 @@ impl ListRootGuard {
 impl Drop for ListRootGuard {
     #[inline]
     fn drop(&mut self) {
-        // `gc_pop_roots`: these livevars are the top of the stack again.
-        debug_assert_eq!(
-            majit_gc::shadow_stack::depth(),
-            self.base + self.len,
-            "ListRootGuard dropped out of LIFO order"
-        );
+        // `gc_pop_roots`: these livevars are the top of the stack again. Root
+        // scopes nest (`push_roots` / `pop_roots` pair up around one call); a
+        // guard dropped under a newer one would unregister that one's roots.
+        let depth = majit_gc::shadow_stack::depth();
+        if depth != self.base + self.len {
+            if std::thread::panicking() {
+                // Unwinding: an inner scope may not have popped. Saturate to
+                // this span's base so a second assert does not hide the
+                // original report.
+                majit_gc::shadow_stack::try_pop_to(self.base);
+                return;
+            }
+            panic!(
+                "ListRootGuard dropped out of LIFO order: depth {depth}, span {}..{}",
+                self.base,
+                self.base + self.len
+            );
+        }
         majit_gc::shadow_stack::try_pop_to(self.base);
     }
 }
