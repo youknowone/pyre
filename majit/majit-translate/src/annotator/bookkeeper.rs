@@ -4311,10 +4311,11 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        // `IdentityKey` is the object pointer (`identitydict.py`); minting
-        // a sibling ClassDef makes `generalize_key` raise
+        // `IdentityKey` / `ObjectEntryKey` are the object pointer
+        // (`identitydict.py`; `rordereddict.py` `get_ll_dict` DICTKEY).
+        // Minting a sibling ClassDef makes `generalize_key` raise
         // `PyObject ∪ IdentityKey` (`rclass.py` no common base).
-        if is_identity_key_spelling(root) {
+        if is_object_pointer_key_spelling(root) {
             return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
         }
         let registry = self.struct_fields.borrow().clone();
@@ -6185,12 +6186,11 @@ impl Bookkeeper {
                 self.project_struct_field_type("pyobject::PyObject"),
             );
         }
-        // `IdentityKey` is `repr(transparent)` over `PyObjectRef`
-        // (`IdentityDictStrategy`: the key is the object, compared by
-        // identity). The constructor is that pointer, so the dict key
-        // cell is the same nullable instance. A separate `IdentityKey`
-        // class has no common base with `PyObject`.
-        if is_identity_key_spelling(t) {
+        // `IdentityKey` / `ObjectEntryKey` are `repr(transparent)` over
+        // `PyObjectRef`. The constructor is that pointer, so the dict key
+        // cell is the same nullable instance. A separate key class has no
+        // common base with `PyObject` (`rclass.py`).
+        if is_object_pointer_key_spelling(t) {
             return self.project_struct_field_type("PyObjectRef");
         }
         // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
@@ -8259,6 +8259,29 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
 /// ClassDef has no common base with `PyObject`.
 pub(crate) fn is_identity_key_spelling(stripped: &str) -> bool {
     stripped == "IdentityKey" || stripped.ends_with("::IdentityKey")
+}
+
+/// Stored `DICTENTRY.key` for object-eq dicts (`rordereddict.py`
+/// `get_ll_dict`). Same one-word `PyObjectRef` wrapper as IdentityKey;
+/// the `hash_w` digest lives in `Entry.f_hash`.
+pub(crate) fn is_object_entry_key_spelling(stripped: &str) -> bool {
+    stripped == "ObjectEntryKey" || stripped.ends_with("::ObjectEntryKey")
+}
+
+/// One-word wrapped `PyObjectRef` stored as `DICTENTRY.key`.
+pub(crate) fn is_object_pointer_key_spelling(stripped: &str) -> bool {
+    is_identity_key_spelling(stripped) || is_object_entry_key_spelling(stripped)
+}
+
+/// One-word dict-key wrappers (`rordereddict.py` `DICTKEY`).
+/// `IdentityKey` / `ObjectEntryKey` wrap `PyObjectRef`; `BytesKey` /
+/// `StrKey` wrap a STR pointer. None of them is an inline STRUCT.
+pub(crate) fn is_dict_key_word_spelling(stripped: &str) -> bool {
+    is_object_pointer_key_spelling(stripped)
+        || stripped == "BytesKey"
+        || stripped.ends_with("::BytesKey")
+        || stripped == "StrKey"
+        || stripped.ends_with("::StrKey")
 }
 
 /// `lltype.GCREF` (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
@@ -10630,7 +10653,97 @@ mod tests {
         assert!(is_identity_key_spelling("IdentityKey"));
         assert!(is_identity_key_spelling("identitydict::IdentityKey"));
         assert!(!is_identity_key_spelling("ObjectKey"));
+        assert!(!is_identity_key_spelling("ObjectEntryKey"));
         assert!(!is_identity_key_spelling("pyobject::PyObject"));
+        assert!(is_object_entry_key_spelling("ObjectEntryKey"));
+        assert!(is_object_entry_key_spelling(
+            "dictmultiobject::ObjectEntryKey"
+        ));
+        assert!(!is_object_entry_key_spelling("ObjectKey"));
+        assert!(is_object_pointer_key_spelling("IdentityKey"));
+        assert!(is_object_pointer_key_spelling("ObjectEntryKey"));
+        assert!(!is_object_pointer_key_spelling("ObjectKey"));
+        assert!(is_dict_key_word_spelling("BytesKey"));
+        assert!(is_dict_key_word_spelling("celldict::StrKey"));
+        assert!(!is_dict_key_word_spelling("ObjectKey"));
+        assert!(!is_dict_key_word_spelling("pyobject::PyObject"));
+    }
+
+    #[test]
+    fn object_entry_key_projects_as_nullable_pyobject_like_identity_key() {
+        use super::super::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Empty Bookkeeper has no PyObject intern; seed the same
+        // registry rows `struct_root_alias_and_registered_root_share_one_classdef`
+        // uses so `project_struct_field_type("PyObjectRef")` can resolve.
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        // Probe `ObjectKey` stays a two-word STRUCT (`hash`, `obj`).
+        // An unregistered name is `Impossible` (`project_struct_field_type`).
+        reg.fields.insert(
+            "dictmultiobject::ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "PyObjectRef".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let root_classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let SomeValue::Instance(ident) = bk.project_struct_field_type("IdentityKey") else {
+            panic!("IdentityKey must project to a nullable PyObject instance")
+        };
+        let SomeValue::Instance(stored) =
+            bk.project_struct_field_type("dictmultiobject::ObjectEntryKey")
+        else {
+            panic!("ObjectEntryKey must project to a nullable PyObject instance")
+        };
+        assert!(
+            ident.can_be_none,
+            "IdentityKey cell is nullable PyObjectRef"
+        );
+        assert!(
+            stored.can_be_none,
+            "ObjectEntryKey cell is nullable PyObjectRef"
+        );
+        let ident_class = ident.classdef.expect("IdentityKey aliases PyObject");
+        let stored_class = stored.classdef.expect("ObjectEntryKey aliases PyObject");
+        assert!(
+            Rc::ptr_eq(&ident_class, &root_classdef),
+            "IdentityKey ClassDef is PyObject, got {}",
+            ident_class.borrow().name
+        );
+        assert!(
+            Rc::ptr_eq(&stored_class, &root_classdef),
+            "ObjectEntryKey ClassDef is PyObject, got {}",
+            stored_class.borrow().name
+        );
+
+        let SomeValue::Instance(probe) = bk.project_struct_field_type("dictmultiobject::ObjectKey")
+        else {
+            panic!("ObjectKey probe must stay SomeInstance")
+        };
+        let probe_class = probe.classdef.expect("ObjectKey keeps its probe ClassDef");
+        let probe_name = probe_class.borrow().name.clone();
+        assert!(
+            probe_name.ends_with("ObjectKey") && !probe_name.ends_with("ObjectEntryKey"),
+            "ObjectKey probe must keep its ClassDef, got {probe_name}"
+        );
+        assert!(
+            !Rc::ptr_eq(&probe_class, &root_classdef),
+            "ObjectKey probe must not alias PyObject"
+        );
     }
 
     #[test]
@@ -13420,7 +13533,7 @@ mod tests {
         assert!(
             !struct_root_is_gcarray_item(
                 fields.as_ref(),
-                "rordereddict_entries::Entry<dictmultiobject::ObjectKey, ()>"
+                "rordereddict_entries::Entry<dictmultiobject::ObjectEntryKey, ()>"
             ),
             "a monomorph keeps its ClassDef"
         );

@@ -1,8 +1,9 @@
 //! Concrete generic instantiations get distinct graphs.
 //!
 //! `RDict::get` for a `String` key must reach `<str as PartialEq>::eq`.
-//! The `ObjectKey` instantiation must reach `ObjectKey::eq`. The two
-//! graphs do not share a key.
+//! The object-key instantiation probes with `ObjectKey` against stored
+//! `ObjectEntryKey` and reaches `dict_keys_equal`. The two graphs do
+//! not share a key.
 
 mod common;
 
@@ -49,22 +50,22 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
     );
 
     let string_eq = specialized.iter().any(|f| graph_calls_str_eq(f.graph()));
-    let object_eq = specialized
-        .iter()
-        .any(|f| graph_calls_object_key_eq(f.graph()));
+    let object_eq = specialized.iter().any(|f| {
+        graph_calls_leaf(f.graph(), "equivalent") || graph_calls_leaf(f.graph(), "dict_keys_equal")
+    });
     assert!(
         string_eq,
         "String-key instantiation did not reach <str as PartialEq>::eq"
     );
     assert!(
         object_eq,
-        "ObjectKey instantiation did not reach ObjectKey::eq; graphs: {names:?}"
+        "Object-key instantiation did not reach equivalent/dict_keys_equal; graphs: {names:?}"
     );
     assert!(
         specialized
             .iter()
             .filter(|f| graph_calls_str_eq(f.graph()))
-            .all(|f| !graph_calls_object_key_eq(f.graph()))
+            .all(|f| !graph_calls_leaf(f.graph(), "dict_keys_equal"))
     );
 }
 
@@ -337,7 +338,7 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
     }
 }
 
-/// `w_set` storage is `RDict<ObjectKey, ()>`. Its `entries_item_ptr`
+/// `w_set` storage is `RDict<ObjectEntryKey, ()>`. Its `entries_item_ptr`
 /// spec is still `direct_arrayitems` (`lltype.py`): the items offset as
 /// `cast_int_to_ptr`. A leftover `__cast_instance_intrinsic` onto
 /// unsuffixed `GcEntries` then getattr `items` is the annotator skip
@@ -357,11 +358,11 @@ fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
     let unit_ptrs: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("entries_item_ptr__spec_ObjectKey____"))
+        .filter(|f| f.name.contains("entries_item_ptr__spec_ObjectEntryKey____"))
         .collect();
     assert!(
         !unit_ptrs.is_empty(),
-        "expected ObjectKey+() entries_item_ptr spec, got {names:?}"
+        "expected ObjectEntryKey+() entries_item_ptr spec, got {names:?}"
     );
     for spec in &unit_ptrs {
         assert!(
@@ -433,8 +434,8 @@ fn identitykey_get_slot_does_not_cast_objectkey_entry() {
             op_kinds(spec.graph())
         );
         assert!(
-            !graph_calls_spec_leaf(spec.graph(), "entries_item_ptr__spec_ObjectKey"),
-            "{} must not bind ObjectKey entries_item_ptr, ops {:?}",
+            !graph_calls_spec_leaf(spec.graph(), "entries_item_ptr__spec_ObjectEntryKey"),
+            "{} must not bind ObjectEntryKey entries_item_ptr, ops {:?}",
             spec.name,
             op_kinds(spec.graph())
         );
@@ -1763,43 +1764,6 @@ fn malloc_typed_fixture_llbc() -> String {
         }
     });
     file.to_string()
-}
-
-fn path_is_object_key_eq(segments: &[String]) -> bool {
-    segments.iter().any(|segment| segment == "ObjectKey")
-        && segments.last().map(String::as_str) == Some("eq")
-}
-
-fn graph_calls_object_key_eq(graph: &majit_translate::model::FunctionGraph) -> bool {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .any(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => path_is_object_key_eq(segments),
-            OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        name,
-                        receiver_root,
-                        resolved_path,
-                        ..
-                    },
-                ..
-            } => {
-                resolved_path
-                    .as_ref()
-                    .is_some_and(|path| path_is_object_key_eq(&path.segments))
-                    || (name == "eq"
-                        && receiver_root
-                            .as_deref()
-                            .is_some_and(|root| root.contains("ObjectKey")))
-            }
-            _ => false,
-        })
 }
 
 /// `ll_slice_getitem_fast_i` returns the unsigned helper word. A signed

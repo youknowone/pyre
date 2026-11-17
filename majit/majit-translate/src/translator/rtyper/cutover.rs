@@ -9794,8 +9794,8 @@ fn reconcile_elided_phi_inputargs(
 /// also a registry key intern's that host — `ensure_session` already
 /// projected it; intern of the leaf would mint a FORCE-only ClassDef
 /// whose pass-2 is skipped. An unregistered alias (`PyObjectRef`,
-/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`) is resolved
-/// through `Bookkeeper::project_struct_field_type`. A registered
+/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`, `ObjectEntryKey`)
+/// is resolved through `Bookkeeper::project_struct_field_type`. A registered
 /// classdef is `getinstancerepr`; `Impossible` / a classdef-less
 /// instance is `llmemory.GCREF`, never `OBJECTPTR`.
 /// `getuniqueclassdef_for_struct_root` is not called on an unknown name

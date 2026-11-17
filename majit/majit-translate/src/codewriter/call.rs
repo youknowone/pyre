@@ -5765,6 +5765,11 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
+        // `rordereddict.py` `DICTKEY` is a one-word pointer (`W_Root` /
+        // STR). `interiorfielddescrof` has no descr for FLAG_STRUCT
+        // (`UnsupportedFieldExc`); `key_at` of these wrappers is
+        // `getinteriorfield_gc_r`.
+        || crate::annotator::bookkeeper::is_dict_key_word_spelling(type_name)
     {
         return false;
     }
@@ -20487,6 +20492,63 @@ mod tests {
         assert_eq!(layout.fields[0].size, 8);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
         assert_eq!(layout.size, 8);
+    }
+
+    /// `DICTENTRY.key` for object-eq tables is a one-word pointer
+    /// (`rordereddict.py` `get_ll_dict`). The wrapper TypeDecl stays in
+    /// `known_struct_names`; the field is still FLAG_POINTER so
+    /// `interiorfielddescrof` can mint `getinteriorfield_gc_r`.
+    #[test]
+    fn from_type_strings_object_entry_key_is_flag_pointer_word() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let mut known = std::collections::HashSet::new();
+        known.insert("ObjectEntryKey".to_string());
+        known.insert("IdentityKey".to_string());
+        known.insert("ObjectKey".to_string());
+        let sizes = std::collections::HashMap::from([
+            ("ObjectEntryKey".to_string(), word),
+            ("IdentityKey".to_string(), word),
+            ("ObjectKey".to_string(), 2 * word),
+        ]);
+        let aligns = std::collections::HashMap::from([
+            ("ObjectEntryKey".to_string(), word),
+            ("IdentityKey".to_string(), word),
+            ("ObjectKey".to_string(), word),
+        ]);
+        let empty_ranks = std::collections::HashMap::new();
+        let empty_raw = HashSet::new();
+        let stored = StructLayout::from_type_strings(
+            &[("key".into(), "ObjectEntryKey".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        assert_eq!(stored.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(stored.fields[0].size, word);
+        let ident = StructLayout::from_type_strings(
+            &[("key".into(), "IdentityKey".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        assert_eq!(ident.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(ident.fields[0].size, word);
+        let probe = StructLayout::from_type_strings(
+            &[("key".into(), "ObjectKey".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        assert_eq!(probe.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(probe.fields[0].size, 2 * word);
     }
 
     /// A pointer-typed field of a known struct pointee is FLAG_POINTER /
