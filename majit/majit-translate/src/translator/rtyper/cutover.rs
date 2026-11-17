@@ -2504,12 +2504,19 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     // `malloc`, `malloc_typed`, `malloc_typed_managed`,
     // `malloc_typed_stable`, or `malloc_typed_young_nonmoving` call instead of
     // emitting an executable symbolic fnaddr.
-    if canonical_strip == ["lltype", "malloc"]
-        || canonical_strip == ["lltype", "malloc_typed"]
-        || canonical_strip == ["lltype", "malloc_typed_managed"]
-        || canonical_strip == ["lltype", "malloc_typed_stable"]
-        || canonical_strip == ["lltype", "malloc_typed_young_nonmoving"]
-    {
+    if matches!(
+        canonical_strip,
+        [module, leaf]
+            if module == "lltype"
+                && matches!(
+                    crate::front::clause_spec::template_callable_leaf(leaf),
+                    "malloc"
+                        | "malloc_typed"
+                        | "malloc_typed_managed"
+                        | "malloc_typed_stable"
+                        | "malloc_typed_young_nonmoving"
+                )
+    ) {
         return Some("skip-malloc-typed-intrinsic");
     }
     // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
@@ -2534,8 +2541,7 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     // `canonical_dedup_key` strips only the crate root, so a generic
     // instantiation is `["lltype", "malloc_varsize_clear::<ItemsBlock>"]`.
     // `template_callable_leaf` is the declaration leaf `registration_decline`
-    // keys (`clause_spec.rs`). `malloc_typed::<T>` is fused by the frontend
-    // (`fuse_boxing_alloc`) so its exact-name arm does not need this strip.
+    // keys (`clause_spec.rs`).
     if matches!(
         canonical_strip,
         [module, leaf]

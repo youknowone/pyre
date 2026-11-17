@@ -14748,7 +14748,8 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
     let mut found = 0usize;
     let mut saw_enter = 0usize;
     let mut hits: Vec<String> = Vec::new();
-    let mut portal_calls_resume = 0usize;
+    let mut portal_inline_resume = 0usize;
+    let mut portal_residual_resume = 0usize;
     let config = crate::codewriter::jtransform::GraphTransformConfig::default();
     for f in &program.functions {
         let leaf = crate::front::clause_spec::unspecialized_leaf(
@@ -14788,25 +14789,41 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
             graph.hints,
         );
         if leaf == "execute_frame_portal" {
-            portal_calls_resume += xf
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter())
-                .filter(|op| match &op.kind {
-                    crate::model::OpKind::InlineCall { jitcode, .. } => {
-                        jitcode.name.contains("eval_frame_with_resume")
+            for op in xf.blocks.iter().flat_map(|b| b.operations.iter()) {
+                match &op.kind {
+                    crate::model::OpKind::InlineCall { jitcode, .. }
+                        if jitcode.name.contains("eval_frame_with_resume") =>
+                    {
+                        portal_inline_resume += 1;
                     }
-                    crate::model::OpKind::CallResidual { funcptr, .. } => match funcptr {
-                        crate::model::CallFuncPtr::Target(
-                            crate::model::CallTarget::FunctionPath { segments, .. },
-                        ) => segments
-                            .iter()
-                            .any(|s| s.contains("eval_frame_with_resume")),
-                        _ => false,
-                    },
-                    _ => false,
-                })
-                .count();
+                    crate::model::OpKind::CallResidual { funcptr, .. } => {
+                        let residual = match funcptr {
+                            crate::model::CallFuncPtr::Target(
+                                crate::model::CallTarget::FunctionPath { segments, .. },
+                            ) => segments
+                                .iter()
+                                .any(|s| s.contains("eval_frame_with_resume")),
+                            crate::model::CallFuncPtr::Target(
+                                crate::model::CallTarget::Method { name, .. },
+                            ) => name.contains("eval_frame_with_resume"),
+                            _ => false,
+                        };
+                        if residual {
+                            portal_residual_resume += 1;
+                        }
+                    }
+                    crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments
+                        .iter()
+                        .any(|s| s.contains("eval_frame_with_resume")) =>
+                    {
+                        portal_residual_resume += 1;
+                    }
+                    _ => {}
+                }
+            }
         }
         if leaf != "eval_frame_with_resume" {
             continue;
@@ -14920,7 +14937,7 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
         }
     }
     eprintln!(
-        "resume_paths={resume_paths:?} portal_paths={portal_paths:?} portal_calls_resume={portal_calls_resume}"
+        "resume_paths={resume_paths:?} portal_paths={portal_paths:?} portal_inline_resume={portal_inline_resume} portal_residual_resume={portal_residual_resume}"
     );
     assert!(
         found >= 1,
@@ -14941,8 +14958,184 @@ fn harvested_eval_frame_with_resume_releases_recursive_frame() {
         "eval_frame_with_resume must be a find_all_graphs candidate from execute_frame_portal"
     );
     assert!(
-        portal_calls_resume >= 1,
-        "execute_frame_portal must look inside eval_frame_with_resume"
+        portal_inline_resume >= 1,
+        "execute_frame_portal must InlineCall eval_frame_with_resume"
+    );
+    assert_eq!(
+        portal_residual_resume, 0,
+        "execute_frame_portal must not residual-call eval_frame_with_resume"
+    );
+}
+
+/// Unique look-inside of `eval_frame_with_resume` folds `we_are_jitted()`
+/// onto `eval_frame_after_enter`. That body is `pyframe.py execute_frame`
+/// after `ec.enter`; it is not `dont_look_inside`. A leftover residual of
+/// the Call is an unbound `symbolic_fnaddr_for_path` and aborts the walk.
+#[test]
+fn harvested_eval_frame_with_resume_inline_calls_eval_frame_after_enter() {
+    let rlib = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let object = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let interpreter = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let rlib = crate::test_support::load_ullbc(rlib);
+    let object = crate::test_support::load_ullbc(object);
+    let interpreter = crate::test_support::load_ullbc(interpreter);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[rlib, object, interpreter],
+        crate::HostStaticAddrs::default(),
+        &["eval", "pyframe"],
+        &[
+            "eval_frame_with_resume",
+            "eval_frame_after_enter",
+            "execute_frame_portal",
+        ],
+    )
+    .expect("harvest eval_frame_after_enter");
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
+    let (resume_paths, after_paths, portal_paths, mut cc) =
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = crate::codewriter::call::CallControl::new();
+            cc.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+            cc.set_known_struct_names(program.known_struct_names.clone());
+            cc.set_struct_fields(program.struct_fields.clone());
+            let mut resume_paths = Vec::new();
+            let mut after_paths = Vec::new();
+            let mut portal_paths = Vec::new();
+            for func in &program.functions {
+                let leaf = crate::front::clause_spec::unspecialized_leaf(
+                    func.name.rsplit("::").next().unwrap_or(func.name.as_str()),
+                );
+                let Some(g) = func.lazy_graph().get() else {
+                    continue;
+                };
+                for path in crate::free_function_alias_paths(
+                    &func.name,
+                    &func.module_path,
+                    &program.struct_fields.foreign_callables,
+                ) {
+                    if leaf == "eval_frame_with_resume" {
+                        resume_paths.push(path.clone());
+                    }
+                    if leaf == "eval_frame_after_enter" {
+                        after_paths.push(path.clone());
+                    }
+                    if leaf == "execute_frame_portal" {
+                        portal_paths.push(path.clone());
+                    }
+                    cc.register_function_graph(path, g.clone());
+                }
+            }
+            let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+            if let Some(root) = portal_paths.first() {
+                cc.find_helper_graphs(&mut policy, std::slice::from_ref(root));
+            }
+            (resume_paths, after_paths, portal_paths, cc)
+        });
+    let mut policy = crate::codewriter::policy::DefaultJitPolicy::new();
+    let mut after_look = Vec::new();
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "eval_frame_after_enter" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        let unsupported =
+            crate::codewriter::policy::contains_unsupported_variable_type(graph, true, true, true);
+        let look = crate::codewriter::policy::JitPolicy::look_inside_graph(&mut policy, graph);
+        after_look.push(format!(
+            "{} look={look} unsupported={unsupported} jit_look_inside={:?} elidable={} module={:?} hints={:?}",
+            f.name,
+            graph.func.jit_look_inside,
+            graph.func.elidable,
+            graph.func.module,
+            graph.hints,
+        ));
+    }
+    eprintln!(
+        "after_paths={after_paths:?} after_candidates={:?} after_look={after_look:?}",
+        after_paths
+            .iter()
+            .map(|p| (p.clone(), cc.is_candidate(p)))
+            .collect::<Vec<_>>(),
+    );
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let mut inline_after = 0usize;
+    let mut residual_after = 0usize;
+    let mut leftover_after = Vec::new();
+    for f in &program.functions {
+        let leaf = crate::front::clause_spec::unspecialized_leaf(
+            f.name.rsplit("::").next().unwrap_or(f.name.as_str()),
+        );
+        if leaf != "eval_frame_with_resume" {
+            continue;
+        }
+        let Some(graph) = f.lazy_graph().get() else {
+            continue;
+        };
+        leftover_after = leftover_call_summaries(graph)
+            .into_iter()
+            .filter(|s| s.contains("eval_frame_after_enter"))
+            .collect();
+        let xf = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+            .graph;
+        for op in xf.blocks.iter().flat_map(|b| b.operations.iter()) {
+            match &op.kind {
+                crate::model::OpKind::InlineCall { jitcode, .. }
+                    if jitcode.name.contains("eval_frame_after_enter") =>
+                {
+                    inline_after += 1;
+                }
+                crate::model::OpKind::CallResidual { funcptr, .. } => {
+                    let residual = match funcptr {
+                        crate::model::CallFuncPtr::Target(
+                            crate::model::CallTarget::FunctionPath { segments, .. },
+                        ) => segments
+                            .iter()
+                            .any(|s| s.contains("eval_frame_after_enter")),
+                        crate::model::CallFuncPtr::Target(crate::model::CallTarget::Method {
+                            name,
+                            ..
+                        }) => name.contains("eval_frame_after_enter"),
+                        _ => false,
+                    };
+                    if residual {
+                        residual_after += 1;
+                    }
+                }
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments
+                    .iter()
+                    .any(|s| s.contains("eval_frame_after_enter")) =>
+                {
+                    residual_after += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    eprintln!(
+        "resume_paths={resume_paths:?} portal_paths={portal_paths:?} leftover_after={leftover_after:?} inline_after={inline_after} residual_after={residual_after}"
+    );
+    assert!(!after_paths.is_empty(), "harvested eval_frame_after_enter");
+    assert!(
+        after_paths.iter().any(|path| cc.is_candidate(path)),
+        "eval_frame_after_enter must be a find_all_graphs candidate from execute_frame_portal: look={after_look:?}"
+    );
+    assert!(
+        inline_after >= 1,
+        "eval_frame_with_resume must InlineCall eval_frame_after_enter; leftover={leftover_after:?} residual={residual_after} look={after_look:?}"
+    );
+    assert_eq!(
+        residual_after, 0,
+        "eval_frame_with_resume must not residual-call eval_frame_after_enter; look={after_look:?}"
     );
 }
 

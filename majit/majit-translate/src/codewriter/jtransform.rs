@@ -12198,6 +12198,42 @@ impl<'a> Transformer<'a> {
             {
                 return result;
             }
+            // `rewrite_op_malloc` → `new` / `new_with_vtable`. The
+            // `malloc_typed*` template is `dont_look_inside`
+            // (`deferred_malloc_template_with_a_clause_size_is_not_look_inside`);
+            // `guess_call_kind` would residualize that callee. The call
+            // site is the malloc op: fire this arm before residualization,
+            // matching `malloc_varsize_clear` above. `fuse_boxing_alloc`
+            // already rewrote the boxing cluster when it could; a
+            // survivor still takes this rewrite.
+            if crate::codewriter::call::is_lltype_malloc_target(target)
+                && !crate::codewriter::call::is_lltype_malloc_varsize_clear_target(target)
+                && let ValueType::Ref(Some(owner)) = result_ty
+                && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
+            {
+                if self.flavor_raw_ref_is_int_banked(result_ty) {
+                    return self.rewrite_raw_malloc_fixedsize_owner(
+                        op,
+                        graph_name,
+                        graph,
+                        &alloc_owner,
+                        false,
+                        false,
+                        true,
+                    );
+                }
+                let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
+                    crate::codewriter::heaptracker::callcontrol_has_vtable(cc, &alloc_owner)
+                });
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    op.result.clone(),
+                    alloc_owner,
+                    has_vtable,
+                    Vec::new(),
+                );
+            }
             // `rewrite_op_same_as` / `rewrite_op_cast_pointer` /
             // `rewrite_op_cast_opaque_ptr`: one operand alias, no jitcode
             // op. `current_gc_ref` is the residual stand-in for the GC

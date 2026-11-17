@@ -1192,7 +1192,25 @@ impl<'a> Lowering<'a> {
                 // (`rffi.py` `_get_structcopy_fn`): each Charon field offset,
                 // not one residual copy. A `__deref_write` call has no bound
                 // address.
-                if let Some(place) = self.bare_deref_place(&slot) {
+                //
+                // A nullable-GCREF `Option` is that pointer word
+                // (`model.py` `SomeObject.noneify`): exchange the slot
+                // pointer. `move_plan` still sees Charon's multi-word
+                // enum layout and would `getfield` the box.
+                if let Some(place) = self.bare_deref_place(&slot)
+                    && self.option_value_is_nullable_gcref(&place.ty)
+                {
+                    let Some(old) = self.exchange_nullable_gcref_option(
+                        mir_bb,
+                        &place,
+                        args[1].clone(),
+                        address,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                } else if let Some(place) = self.bare_deref_place(&slot) {
                     let old = if let Some(old) =
                         self.exchange_deref_word(mir_bb, &place, args[1].clone())?
                     {
@@ -1303,6 +1321,22 @@ impl<'a> Lowering<'a> {
                     };
                     let address = arg_address(self, 0);
                     if let Some(place) = self.bare_deref_place(&slot)
+                        && self.option_value_is_nullable_gcref(&place.ty)
+                    {
+                        // The Option word is the nullable pointer:
+                        // read it, store None, return it. No `getfield`
+                        // of the box (`execute_and_record` of a null
+                        // struct when the Option is None).
+                        let Some(fresh) = self.emit_option_none(mir_bb, &place.ty)? else {
+                            return Ok(false);
+                        };
+                        let Some(old) =
+                            self.exchange_nullable_gcref_option(mir_bb, &place, fresh, address)?
+                        else {
+                            return Ok(false);
+                        };
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    } else if let Some(place) = self.bare_deref_place(&slot)
                         && self.move_plan(&place.ty).is_some()
                     {
                         let fresh = if option_take {
@@ -1376,6 +1410,87 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `Option<T>` whose rtyper value is a nullable GCREF
+    /// (`model.py` `SomeObject.noneify`). A scalar payload (`Option<u64>`)
+    /// stays the tagged inline enum: its payload bank is not `Ref`.
+    fn option_value_is_nullable_gcref(&self, ty: &TyRef) -> bool {
+        let dest = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        if !crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+            return false;
+        }
+        matches!(self.value_type_of(&dest), ValueType::Ref(_))
+            && matches!(
+                self.tyref_option_payload_value_type(&dest),
+                Some(ValueType::Ref(_))
+            )
+    }
+
+    /// Read the Option slot as a pointer, store `new_value`, return the
+    /// old pointer. The box is not loaded (`getfield` of a null struct).
+    fn exchange_nullable_gcref_option(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        new_value: Variable,
+        address: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        if let Some(old) = self.exchange_deref_word(mir_bb, place, new_value.clone())? {
+            return Ok(Some(old));
+        }
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            return Ok(None);
+        };
+        let base = if let PlaceKind::Local(i) = &inner.kind
+            && self
+                .local_var
+                .get(*i as usize)
+                .and_then(|var| var.as_ref())
+                .is_none()
+            && let Some(address) = address
+        {
+            address
+        } else {
+            self.resolve_place(mir_bb, (**inner).clone())?
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let itemsize = crate::layout::target_word_size();
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let old = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let item_ty = self.value_type_of(&place.ty);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(old.clone()),
+            kind: OpKind::RawLoad {
+                base: base.clone(),
+                offset: offset.clone(),
+                item_ty: item_ty.clone(),
+                itemsize,
+                is_item_signed: false,
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base,
+                offset,
+                value: new_value,
+                item_ty,
+                itemsize,
+                is_item_signed: false,
+            },
+        });
+        Ok(Some(old))
     }
 
     /// `None` of `dest_ty` as `Lowering::build_rvalue` builds an MIR

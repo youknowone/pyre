@@ -403,19 +403,5 @@ pub(in crate::front::mir) fn ref_load_root(
 /// stable, and young-nonmoving flavors — the boxing-cluster allocator
 /// `fuse_boxing_alloc` keys on.
 pub(in crate::front::mir) fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
-    let CallTarget::FunctionPath { segments, .. } = target else {
-        return false;
-    };
-    let [.., parent, leaf] = segments.as_slice() else {
-        return false;
-    };
-    parent == "lltype"
-        && matches!(
-            leaf.as_str(),
-            "malloc"
-                | "malloc_typed"
-                | "malloc_typed_managed"
-                | "malloc_typed_stable"
-                | "malloc_typed_young_nonmoving"
-        )
+    crate::model::lltype_fixed_malloc_flavor(target).is_some()
 }

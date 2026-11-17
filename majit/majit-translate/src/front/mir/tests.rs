@@ -46802,6 +46802,120 @@ fn option_take_on_field_lowers_to_read_and_none_store() {
     );
 }
 
+/// `Option::take` of a boxed (nullable-GCREF) Option is a pointer
+/// exchange: read the slot, store None, return the pointer. Charon's
+/// multi-word enum layout must not `getfield` the box
+/// (`__discriminant` / payload) when the Option is None.
+#[test]
+fn option_take_of_boxed_gcref_is_pointer_exchange() {
+    use crate::model::{CallTarget, OpKind};
+
+    let payload_ty = interior_adt(1);
+    let ptr_ty = interior_mut_ref(payload_ty.clone());
+    let mut option = option_enum(0);
+    option["kind"]["Enum"][1]["fields"][0]["ty"] = ptr_ty.clone();
+    option["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [8]}
+            ],
+            "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U64"}}},
+            "repr": {"transparent": false}
+        }
+    }]);
+    let opt_ty = option_adt_node(0, ptr_ty.clone());
+    let opt_mut = interior_mut_ref(opt_ty.clone());
+    let payload = interior_struct(
+        1,
+        &["fixture", "Payload"],
+        &[("head", interior_usize()), ("tail", interior_usize())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let take = interior_opaque(
+        1,
+        &["core", "option", "<Impl>", "take"],
+        vec![opt_mut.clone()],
+        opt_ty.clone(),
+    );
+    let reborrow = serde_json::json!({
+        "Ref": {
+            "place": interior_deref(1, &opt_mut, &opt_ty),
+            "kind": "Mut",
+            "ptr_metadata": null
+        }
+    });
+    let caller = interior_caller(
+        "take_boxed",
+        1,
+        vec![opt_mut.clone()],
+        opt_ty.clone(),
+        vec![
+            interior_local(0, None, &opt_ty),
+            interior_local(1, Some("slot"), &opt_mut),
+            interior_local(2, Some("reborrow"), &opt_mut),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(interior_place(2, &opt_mut), reborrow)],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &opt_mut))],
+                    interior_place(0, &opt_ty),
+                    1,
+                    2,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+            interior_bb(vec![], interior_unwind()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![option, payload], vec![caller, take]);
+    let graph = super::lower_function(&llbc, "take_boxed")
+        .unwrap_or_else(|err| panic!("lower take_boxed: {err:?}"));
+    let ops = graph_ops(&graph);
+    let has_take = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == "take",
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf == "take"),
+        _ => false,
+    });
+    assert!(
+        !has_take,
+        "take_boxed residualized Option::take: {}",
+        graph.dump()
+    );
+    let box_field = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } => {
+            field.name == "__discriminant" || field.name == "__pos_0" || field.name == "head"
+        }
+        _ => false,
+    });
+    assert!(
+        !box_field,
+        "take of a nullable-GCREF Option must not getfield the box: {}",
+        graph.dump()
+    );
+    let pointer_exchange = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::RawLoad { .. } | OpKind::RawStore { .. }));
+    assert!(
+        pointer_exchange,
+        "take of a nullable-GCREF Option is a pointer load/store: {}",
+        graph.dump()
+    );
+}
+
 /// `self.state = v` through `&mut Wrapper` (`#[repr(transparent)]` one-u32
 /// word). `IntegerRepr` has no field, so the write is the whole word through
 /// that pointer — the pointer local is not replaced by the integer.

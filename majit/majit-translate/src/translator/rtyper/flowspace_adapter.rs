@@ -4546,14 +4546,10 @@ pub fn translate_op(
                     // `malloc_typed` registration skip).
                     if segments.len() >= 2
                         && segments[segments.len() - 2] == "lltype"
-                        && matches!(
-                            segments[segments.len() - 1].as_str(),
-                            "malloc"
-                                | "malloc_typed"
-                                | "malloc_typed_managed"
-                                | "malloc_typed_stable"
-                                | "malloc_typed_young_nonmoving"
-                        )
+                        && crate::model::lltype_fixed_malloc_flavor(&CallTarget::function_path(
+                            segments.iter().map(String::as_str),
+                        ))
+                        .is_some()
                     {
                         return Err(TyperError::message(
                             "`lltype::malloc[_typed/_managed/_stable]` survived fuse_boxing_alloc unfused; \

@@ -76,6 +76,26 @@ pub(crate) fn is_access_directly_path(path: &CallPath) -> bool {
     path.specialization == GraphSpecialization::AccessDirect
 }
 
+/// Template spelling of a specialized residual CallPath.
+///
+/// `FunctionDesc.cachedgraph` names a copy `leaf__spec_<hash>`;
+/// `residual_generic_fun_segments` uses `leaf__inst_<types>`; Charon may
+/// leave `leaf::<A>` on the ident. The host `pa*!` row binds the generic
+/// ident to the trampoline that *is* that monomorph (`getfunctionptr` of
+/// the instance the pointer names). Residual lookup of the specialized
+/// ident must resolve to the same address; `template_callable_leaf` is
+/// that ident.
+fn template_fnaddr_path(path: &CallPath) -> Option<CallPath> {
+    let leaf = path.last_segment()?;
+    let template = crate::front::clause_spec::template_callable_leaf(leaf);
+    if template == leaf {
+        return None;
+    }
+    let mut segments = path.segments.clone();
+    *segments.last_mut()? = template.to_string();
+    Some(path.with_segments(segments))
+}
+
 /// The Regular origin of an AccessDirect path, or `None` when `path` is
 /// not an AccessDirect copy (`description.py FunctionDesc.cachedgraph`).
 /// The name is display-only; identity is `path.specialization`.
@@ -11631,18 +11651,8 @@ impl CallControl {
     /// canonical seed name follows that key rather than a second runtime
     /// table entry.
     fn resolved_function_fnaddr(&self, path: &CallPath) -> Option<(CallPath, i64)> {
-        if let Some(bound) = self.function_fnaddrs.get(path).copied() {
-            return Some((path.clone(), bound.addr));
-        }
-        for alias in self.function_graphs.alias_paths(path) {
-            if alias == *path {
-                continue;
-            }
-            if let Some(bound) = self.function_fnaddrs.get(&alias).copied() {
-                return Some((alias, bound.addr));
-            }
-        }
-        None
+        self.resolved_bound_fnaddr(path)
+            .map(|(resolved, bound)| (resolved, bound.addr))
     }
 
     fn resolved_bound_fnaddr(&self, path: &CallPath) -> Option<(CallPath, BoundFnAddr)> {
@@ -11657,7 +11667,11 @@ impl CallControl {
                 return Some((alias, bound));
             }
         }
-        None
+        // Specialized ident of a generic whose trampoline is bound under
+        // the template leaf (`FunctionDesc.cachedgraph` / `spec_leaf`).
+        // One lookup, not one `function_fnaddrs` row per hash.
+        let template = template_fnaddr_path(path)?;
+        self.resolved_bound_fnaddr(&template)
     }
 
     /// Registry hit whose trampoline ABI matches the calldescr, or `None`
@@ -14356,7 +14370,7 @@ fn lltype_malloc_leaf(target: &CallTarget) -> Option<&str> {
     .then_some(leaf)
 }
 
-fn is_lltype_malloc_target(target: &CallTarget) -> bool {
+pub(crate) fn is_lltype_malloc_target(target: &CallTarget) -> bool {
     lltype_malloc_leaf(target).is_some()
 }
 
@@ -25514,6 +25528,37 @@ mod tests {
         assert_eq!(cc.lookup_function_fnaddr(&source), Some(0x22));
         assert_eq!(cc.lookup_function_fnaddr(&alias), Some(0x22));
         assert!(cc.has_function_fnaddr(&alias));
+    }
+
+    /// A leftover residual of `opcode_build_tuple__spec_PyFrame_<hash>` is
+    /// the same monomorph the generic `pa2!` trampoline names
+    /// (`opcode_build_tuple::<PyFrame>`). Lookup strips `spec_leaf` and
+    /// hits the template row; a different leaf does not.
+    #[test]
+    fn spec_leaf_fnaddr_resolves_template_binding() {
+        let mut cc = CallControl::new();
+        let generic = CallPath::from_segments(["shared_opcode", "opcode_build_tuple"]);
+        cc.register_function_fnaddr(generic.clone(), 0x1111);
+        let spec = CallPath::from_segments([
+            "shared_opcode",
+            "opcode_build_tuple__spec_PyFrame_f627d2bdde33f696",
+        ]);
+        let inst = CallPath::from_segments(["shared_opcode", "opcode_build_tuple__inst_PyFrame"]);
+        assert_eq!(cc.lookup_function_fnaddr(&generic), Some(0x1111));
+        assert_eq!(cc.lookup_function_fnaddr(&spec), Some(0x1111));
+        assert_eq!(cc.lookup_function_fnaddr(&inst), Some(0x1111));
+        let other = CallPath::from_segments([
+            "shared_opcode",
+            "opcode_build_map__spec_PyFrame_f627d2bdde33f696",
+        ]);
+        assert_eq!(cc.lookup_function_fnaddr(&other), None);
+        let binding = cc.fnaddr_binding_for_target(&CallTarget::function_path([
+            "shared_opcode",
+            "opcode_build_tuple__spec_PyFrame_f627d2bdde33f696",
+        ]));
+        assert!(!binding.symbolic);
+        assert_eq!(binding.addr, 0x1111);
+        assert_eq!(binding.path, generic.canonical_key());
     }
 
     /// Two aliases of one graph with distinct `function_fnaddrs` entries:

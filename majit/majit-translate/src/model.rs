@@ -5167,35 +5167,39 @@ pub(crate) fn lower_struct_ptr_writes_with(
 /// descriptors (`rewrite_op_getsubstruct`). The typeptr leaf stays;
 /// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops it
 /// on a vtable object.
+/// Leaf of `lltype::malloc` / `malloc_typed*` (`rewrite_op_malloc`).
+/// `template_callable_leaf` sees `__spec_`, `__inst_`, and `::<T>` as the
+/// same allocator (`is_lltype_malloc_target`).
+pub(crate) fn lltype_fixed_malloc_flavor(target: &CallTarget) -> Option<&str> {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return None;
+    };
+    if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
+        return None;
+    }
+    let leaf = crate::front::clause_spec::template_callable_leaf(&segments[segments.len() - 1]);
+    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+    matches!(
+        leaf,
+        "malloc"
+            | "malloc_typed"
+            | "malloc_typed_managed"
+            | "malloc_typed_stable"
+            | "malloc_typed_young_nonmoving"
+    )
+    .then_some(leaf)
+}
+
 pub(crate) fn typed_malloc_arg_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
     graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
         .filter_map(|op| {
-            let OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                args,
-                ..
-            } = &op.kind
-            else {
+            let OpKind::Call { target, args, .. } = &op.kind else {
                 return None;
             };
-            if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
-                return None;
-            }
-            let flavor =
-                crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]);
-            if !matches!(
-                flavor,
-                "malloc"
-                    | "malloc_typed"
-                    | "malloc_typed_managed"
-                    | "malloc_typed_stable"
-                    | "malloc_typed_young_nonmoving"
-            ) {
-                return None;
-            }
+            lltype_fixed_malloc_flavor(target)?;
             Some(args.iter().filter_map(LinkArg::as_variable))
         })
         .flatten()
@@ -5410,21 +5414,7 @@ pub(crate) fn fuse_boxing_alloc_with(
     // `nonmovable` hint raises `UnsupportedMallocFlags`, because the op it
     // would emit IS a nursery bump and nothing in the op can say otherwise.
     fn gc_malloc_flavor(target: &CallTarget) -> Option<&str> {
-        let CallTarget::FunctionPath { segments, .. } = target else {
-            return None;
-        };
-        if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
-            return None;
-        }
-        // A specialized copy is the same allocator.
-        match crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]) {
-            flavor @ ("malloc"
-            | "malloc_typed"
-            | "malloc_typed_managed"
-            | "malloc_typed_stable"
-            | "malloc_typed_young_nonmoving") => Some(flavor),
-            _ => None,
-        }
+        lltype_fixed_malloc_flavor(target)
     }
     // Whether the cluster's allocator hands back an object the collector may
     // move.  `malloc_typed_stable` and `malloc_typed_young_nonmoving` are
@@ -22369,7 +22359,7 @@ mod tests {
         /// `Some(None)` expects a plain `New`; `Some(Some(addr))` expects a
         /// `NewWithVtable` carrying that address; `None` expects no fusion.
         type Expected = Option<Option<i64>>;
-        let rows: [(&str, ObType, &str, Expected); 8] = [
+        let rows: [(&str, ObType, &str, Expected); 10] = [
             (
                 "a constant type word rides on the allocation",
                 ObType::Constant,
@@ -22405,6 +22395,18 @@ mod tests {
                 ObType::Unstored,
                 "malloc_typed",
                 None,
+            ),
+            (
+                "a non-moving allocator with a constant type word takes new_with_vtable",
+                ObType::Constant,
+                "malloc_typed_stable",
+                Some(Some(CLASS_ADDR)),
+            ),
+            (
+                "a generic-args malloc_typed_stable leaf is the same allocator",
+                ObType::Constant,
+                "malloc_typed_stable::<W_IntObject>",
+                Some(Some(CLASS_ADDR)),
             ),
             (
                 "a type word that is present but not constant never lowers",
