@@ -6355,7 +6355,8 @@ pub(in crate::front::mir) fn struct_field_vec_index_trace(
     })
 }
 
-/// Locals `d` for which this block has a `(*d).field` value use.
+/// Locals `d` for which this block has a `(*d).field` value use,
+/// including identity-word `&(*d).field` / `&raw (*d).field`.
 pub(in crate::front::mir) fn struct_field_value_dests_in_block(
     llbc: &Llbc,
     bb: &BasicBlock,
@@ -6431,13 +6432,13 @@ pub(in crate::front::mir) fn collect_struct_field_dests_from_rvalue(
                 collect_struct_field_dest_from_operand(op, dests);
             }
         }
-        // Address-of, length, and discriminant are not value field uses.
-        Rvalue::Ref { .. }
-        | Rvalue::RawPtr { .. }
-        | Rvalue::Len(_)
-        | Rvalue::Discriminant(_)
-        | Rvalue::NullaryOp(_, _)
-        | Rvalue::Unknown => {}
+        // Identity-word `&(*d).field` is `ll_getitem_fast` (`scan_rvalue_struct_field`).
+        // Length and discriminant are not field uses, even when the place
+        // is exactly `(*d).field`.
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            collect_struct_field_dest_from_place(place, dests);
+        }
+        Rvalue::Len(_) | Rvalue::Discriminant(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
 

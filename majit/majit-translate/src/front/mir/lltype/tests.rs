@@ -14362,6 +14362,115 @@ fn entry_instantiation_splits_key_class() {
 }
 
 #[test]
+fn entry_and_gc_entries_suffix_on_void_value() {
+    // `get_ll_dict` one DICTENTRYARRAY per (K,V). `()` is Void and still
+    // an instantiation (`type_arg_is_concrete`); variant deferrals on
+    // `split_struct_instantiation_suffix` do not apply.
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            code_struct(0, &["pyre_object", "rordereddict_entries", "Entry"]),
+            code_struct(1, &["pyre_object", "rordereddict_entries", "GcEntries"]),
+            code_struct(2, &["pyre_object", "ObjectKey"]),
+        ],
+        vec![],
+    );
+    let object_key = named_adt(2, vec![]);
+    let unit = serde_json::json!({"Tuple": []});
+    let tomb = std::collections::HashSet::new();
+    let entry_node = named_adt(0, vec![object_key.clone(), unit.clone()]);
+    let entries_node = named_adt(1, vec![object_key, unit]);
+    assert_eq!(
+        super::adt_node_class_root_with(&entry_node, &llbc, &tomb).as_deref(),
+        Some("rordereddict_entries::Entry<ObjectKey,()>")
+    );
+    assert_eq!(
+        super::adt_node_class_root_with(&entries_node, &llbc, &tomb).as_deref(),
+        Some("rordereddict_entries::GcEntries<ObjectKey,()>")
+    );
+    let entry_adt = entry_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .expect("Adt");
+    assert_eq!(
+        super::entry_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::Entry",
+            entry_adt,
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
+    );
+    let entries_adt = entries_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .expect("Adt");
+    assert_eq!(
+        super::gc_entries_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::GcEntries",
+            entries_adt,
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
+    );
+}
+
+#[test]
+fn gcarray_of_set_entry_keeps_objectkey_struct_and_void_value() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+
+    let mut reg = crate::front::semantic::StructFieldRegistry::default();
+    reg.fields.insert(
+        "ObjectKey".to_string(),
+        vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("obj".to_string(), "*mut u8".to_string()),
+        ],
+    );
+    reg.fields.insert(
+        "rordereddict_entries::Entry".to_string(),
+        vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let item = "rordereddict_entries::Entry<ObjectKey,()>";
+    reg.fields.insert(
+        item.to_string(),
+        vec![
+            ("key".to_string(), "ObjectKey".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "()".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let arr = super::gcarray_of_bound_struct_item(&reg, item).expect("ARRAY");
+    assert_eq!(arr._gckind, GcKind::Gc);
+    let LowLevelType::Struct(st) = arr.OF else {
+        panic!("ARRAY.OF must be DICTENTRY, got {:?}", arr.OF);
+    };
+    assert_eq!(st._name, item);
+    let LowLevelType::Struct(key) = st._flds.get("key").expect("key") else {
+        panic!(
+            "set key is the by-value ObjectKey struct, got {:?}",
+            st._flds.get("key")
+        );
+    };
+    assert_eq!(key._name, "ObjectKey");
+    assert!(matches!(st._flds.get("value"), Some(LowLevelType::Void)));
+    assert!(matches!(st._flds.get("f_valid"), Some(LowLevelType::Bool)));
+    assert!(matches!(
+        st._flds.get("f_hash"),
+        Some(LowLevelType::Unsigned)
+    ));
+}
+
+#[test]
 fn gc_entries_instantiation_splits_key_class() {
     let llbc = llbc_with_types(
         "pyre_object",

@@ -10013,8 +10013,25 @@ pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
     entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
 }
 
+/// `<…>` of fully substituted type arguments ([`type_arg_is_concrete`]).
+/// `get_ll_dict` mints one `DICTENTRYARRAY` per concrete `(DICTKEY, DICTVALUE)`,
+/// a Void key or value included. Variant deferrals (`()` / `f32`) stay on
+/// [`split_struct_instantiation_suffix`].
+fn concrete_type_args_suffix(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    if type_args.is_empty() || !type_args.iter().all(|arg| type_arg_is_concrete(arg)) {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
+}
+
 /// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
 /// serves every monomorphization; the bare `Entry` class would union `key`.
+/// The suffix is [`type_arg_is_concrete`], including Void (`()`).
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10024,12 +10041,12 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     if !entry_family_is_entry_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    concrete_type_args_suffix(adt, llbc, tombstoned)
 }
 
 /// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The entries array
 /// header is `DICTENTRYARRAY` of `get_ll_dict`, one per `(DICTKEY, DICTVALUE)`;
-/// the bare class would share one ARRAY across key types.
+/// the bare class would share one ARRAY across key types, a Void value included.
 pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10039,7 +10056,7 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    concrete_type_args_suffix(adt, llbc, tombstoned)
 }
 
 /// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
@@ -10151,11 +10168,7 @@ pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
     if !type_decl_holds_entry_family_typevar(td, llbc) {
         return None;
     }
-    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
-    if type_args.is_empty() || !type_args.iter().all(|arg| type_arg_is_concrete(arg)) {
-        return None;
-    }
-    Some(format!("<{}>", type_args.join(",")))
+    concrete_type_args_suffix(adt, llbc, tombstoned)
 }
 
 /// Template fields name an entry-family holder parametrized by this
