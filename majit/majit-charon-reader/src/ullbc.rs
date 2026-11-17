@@ -3876,7 +3876,7 @@ impl Statement {
 
     /// Replace the raw statement kind, forgetting the projection of the
     /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
-    fn set_kind(&mut self, kind: Value) {
+    pub fn set_kind(&mut self, kind: Value) {
         self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
         self.value_cache = OnceLock::from(Box::new(kind));
         self.stmt_cache = OnceLock::new();
