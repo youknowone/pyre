@@ -1719,11 +1719,20 @@ where
         }
     }
 
+    /// `ll_dict_getitem` (rordereddict.py) — `d.keyhash(key)` then
+    /// [`Self::get_with_hash`].
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.hash_of(key);
+        self.get_with_hash(self.hash_of(key), key)
+    }
+
+    /// `ll_dict_getitem_with_hash` (rordereddict.py).
+    pub fn get_with_hash<Q>(&self, hash: u64, key: &Q) -> Option<&V>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         let slot = self.lookup(hash, key)?;
         // A callback that reshaped the dict mid-probe leaves `slot` stale;
         // `callback_free_dict_op!` discards this answer, so the read only
@@ -1746,20 +1755,37 @@ where
         Some(&mut self.entry_at_mut(slot).value)
     }
 
+    /// `ll_dict_contains` (rordereddict.py) — `d.keyhash(key)` then
+    /// [`Self::contains_with_hash`].
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.hash_of(key);
+        self.contains_with_hash(self.hash_of(key), key)
+    }
+
+    /// `ll_dict_contains_with_hash` (rordereddict.py).
+    pub fn contains_with_hash<Q>(&self, hash: u64, key: &Q) -> bool
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         ll_dict_contains(self, hash, key)
     }
 
     /// The slot holding `key`; see the module docs on slots versus positions.
+    /// `ll_dict_lookup(d, key, d.keyhash(key), FLAG_LOOKUP)` (rordereddict.py).
     pub fn index_of<Q>(&self, key: &Q) -> Option<usize>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.hash_of(key);
+        self.index_of_with_hash(self.hash_of(key), key)
+    }
+
+    /// `ll_dict_lookup(d, key, hash, FLAG_LOOKUP)` (rordereddict.py).
+    pub fn index_of_with_hash<Q>(&self, hash: u64, key: &Q) -> Option<usize>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
         self.lookup(hash, key)
     }
 
@@ -1776,9 +1802,20 @@ where
         }
     }
 
+    /// `ll_dict_setitem` (rordereddict.py) — `d.keyhash(key)` then
+    /// [`Self::insert_with_hash`].
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>
+    where
+        K: GcRefOffsets,
+        V: GcRefOffsets,
+    {
+        let hash = self.hash_of(&key);
+        self.insert_with_hash(hash, key, value)
+    }
+
     /// `ll_dict_setitem_with_hash` (rordereddict.py) — probe, then hand the
     /// probe's answer to [`Self::setitem_lookup_done`].
-    pub fn insert(&mut self, key: K, value: V) -> Option<V>
+    pub fn insert_with_hash(&mut self, hash: u64, key: K, value: V) -> Option<V>
     where
         K: GcRefOffsets,
         V: GcRefOffsets,
@@ -1789,7 +1826,6 @@ where
         let value_slot = pin_gcrefs(&_roots, &value);
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
-        let hash = self.hash_of(&key);
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return None;
         }
@@ -1875,15 +1911,24 @@ where
         self.set_index_at(i, DELETED);
     }
 
-    /// `ll_dict_pop` (rordereddict.py).  Order-preserving and O(1): the
-    /// name says `remove` and not `shift_remove` because nothing shifts.
+    /// `ll_dict_delitem` (rordereddict.py) — `d.keyhash(key)` then
+    /// [`Self::remove_with_hash`].
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: EntryDummy,
         V: EntryDummy,
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let hash = self.hash_of(key);
+        self.remove_with_hash(self.hash_of(key), key)
+    }
+
+    /// `ll_dict_delitem_with_hash` (rordereddict.py).
+    pub fn remove_with_hash<Q>(&mut self, hash: u64, key: &Q) -> Option<V>
+    where
+        K: EntryDummy,
+        V: EntryDummy,
+        Q: Equivalent<K> + ?Sized,
+    {
         let slot = self.lookup(hash, key)?;
         let value = self.take_slot(hash, slot).1;
         Some(value)
@@ -2604,6 +2649,61 @@ mod tests {
         check_invariants(&d);
         let got: Vec<u64> = d.keys().copied().collect();
         assert_eq!(got, (0..100).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn hashed_insert_get_remove_agree_with_unhashed() {
+        let mut hashed: RDict<u64, u64> = RDict::new();
+        let mut plain: RDict<u64, u64> = RDict::new();
+        for i in 0..32u64 {
+            let digest = hashed.hash_of(&i);
+            assert_eq!(hashed.insert_with_hash(digest, i, i * 10), None);
+            assert_eq!(plain.insert(i, i * 10), None);
+            assert_eq!(hashed.get_with_hash(digest, &i), plain.get(&i));
+            assert_eq!(hashed.get(&i), plain.get(&i));
+            assert_eq!(
+                hashed.contains_with_hash(digest, &i),
+                plain.contains_key(&i)
+            );
+            assert_eq!(hashed.index_of_with_hash(digest, &i), plain.index_of(&i));
+        }
+        for i in 0..32u64 {
+            let digest = hashed.hash_of(&i);
+            if i % 2 == 0 {
+                assert_eq!(hashed.remove_with_hash(digest, &i), plain.remove(&i));
+                assert_eq!(hashed.get(&i), None);
+            } else {
+                assert_eq!(hashed.get_with_hash(digest, &i), plain.get(&i));
+            }
+        }
+        check_invariants(&hashed);
+        check_invariants(&plain);
+    }
+
+    #[test]
+    fn object_strategy_hashed_insert_probe_round_trip() {
+        let mut entries = crate::dictmultiobject::object_dict_storage_new();
+        let key = crate::intobject::w_int_new(7);
+        let value = crate::intobject::w_int_new(11);
+        let hash = 123i64;
+        unsafe {
+            assert_eq!(
+                crate::dictmultiobject::dict_entries_insert_hashed(&mut entries, hash, key, value),
+                None
+            );
+            assert_eq!(
+                crate::dictmultiobject::dict_entries_probe_hashed(&entries, hash, key),
+                Some(value)
+            );
+            assert_eq!(
+                crate::dictmultiobject::dict_entries_probe_hashed(
+                    &entries,
+                    hash.wrapping_add(1),
+                    key
+                ),
+                None
+            );
+        }
     }
 
     #[test]

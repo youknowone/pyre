@@ -231,7 +231,11 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+        new_map.insert_with_hash(
+            hash as u64,
+            crate::dictmultiobject::ObjectKey { hash, obj },
+            value,
+        );
     }
     crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }

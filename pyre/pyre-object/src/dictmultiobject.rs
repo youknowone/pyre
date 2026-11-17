@@ -378,7 +378,9 @@ pub unsafe fn dict_entries_probe_str(
     hash: i64,
     key: &str,
 ) -> Option<PyObjectRef> {
-    entries.get(&StrLookupKey { hash, key }).copied()
+    entries
+        .get_with_hash(hash as u64, &StrLookupKey { hash, key })
+        .copied()
 }
 
 /// The owned-key probe [`dict_entries_get_str`]'s no-hook arm runs — the same
@@ -400,7 +402,10 @@ pub unsafe fn dict_entries_probe_object(
     entries: &ObjectDictStorage,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.get(&object_key_for(key)).copied()
+    let object_key = object_key_for(key);
+    entries
+        .get_with_hash(object_key.hash as u64, &object_key)
+        .copied()
 }
 
 /// The object-keyed remove side of the same table — `dictmultiobject.py delitem
@@ -423,7 +428,10 @@ pub unsafe fn dict_entries_remove_object(
     entries: &mut ObjectDictStorage,
     key: PyObjectRef,
 ) -> bool {
-    entries.remove(&object_key_for(key)).is_some()
+    let object_key = object_key_for(key);
+    entries
+        .remove_with_hash(object_key.hash as u64, &object_key)
+        .is_some()
 }
 
 /// [`dict_entries_probe_object`] for a caller that already ran
@@ -453,7 +461,9 @@ pub unsafe fn dict_entries_probe_hashed(
     hash: i64,
     obj: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.get(&ObjectKey { hash, obj }).copied()
+    entries
+        .get_with_hash(hash as u64, &ObjectKey { hash, obj })
+        .copied()
 }
 
 /// The store side of [`dict_entries_probe_hashed`] —
@@ -486,7 +496,7 @@ pub unsafe fn dict_entries_insert_hashed(
     obj: PyObjectRef,
     value: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.insert(ObjectKey { hash, obj }, value)
+    entries.insert_with_hash(hash as u64, ObjectKey { hash, obj }, value)
 }
 
 /// Read the value stored at an entry index the caller already settled on —
@@ -548,7 +558,7 @@ pub unsafe fn dict_entries_insert_object(
     let value_slot = roots.base();
     let _ = roots.pin_root(value);
     let object_key = object_key_for(key);
-    entries.insert(object_key, roots.get(value_slot));
+    entries.insert_with_hash(object_key.hash as u64, object_key, roots.get(value_slot));
 }
 
 /// The stored key's object word at an entry index, `None` once the walk has
@@ -682,7 +692,10 @@ unsafe fn dict_entries_get_str(
 unsafe fn dict_entries_index_of_str_or_absent(entries: &ObjectDictStorage, key: &str) -> isize {
     if crate::dict_eq_hook::has_hash_str_hook() {
         let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes());
-        entries.index_or_absent(&StrLookupKey { hash, key })
+        match entries.index_of_with_hash(hash as u64, &StrLookupKey { hash, key }) {
+            Some(slot) => slot as isize,
+            None => -1,
+        }
     } else {
         entries.index_or_absent(&object_key_for(crate::w_str_new(key)))
     }
@@ -729,7 +742,7 @@ pub unsafe fn dict_entries_index_of_str_hashed(
     hash: i64,
     key: &str,
 ) -> Option<usize> {
-    entries.index_of(&StrLookupKey { hash, key })
+    entries.index_of_with_hash(hash as u64, &StrLookupKey { hash, key })
 }
 
 /// The owned-key membership probe [`dict_entries_index_of_str`]'s no-hook arm
@@ -748,7 +761,8 @@ pub unsafe fn dict_entries_index_of_object(
     entries: &ObjectDictStorage,
     key: PyObjectRef,
 ) -> Option<usize> {
-    entries.index_of(&object_key_for(key))
+    let object_key = object_key_for(key);
+    entries.index_of_with_hash(object_key.hash as u64, &object_key)
 }
 
 /// Build the persistent exact-str key for a new `setitem_str` entry.
@@ -2405,7 +2419,8 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     );
     let new_map = &mut *new_storage;
     for (i, &hash) in hashes.iter().enumerate() {
-        new_map.insert(
+        new_map.insert_with_hash(
+            hash as u64,
             ObjectKey {
                 hash,
                 obj: roots.get(pairs_base + 2 * i),
@@ -2831,7 +2846,8 @@ unsafe fn w_module_dict_delitem_str_internal(obj: PyObjectRef, key: &str) -> Opt
         // / `w_module_dict_getitem_str` (Item 2.2).
         let w_key = crate::w_str_new(key);
         let entries = w_module_dict_object_storage_mut(obj);
-        if let Some(removed) = entries.remove(&object_key_for(w_key)) {
+        let object_key = object_key_for(w_key);
+        if let Some(removed) = entries.remove_with_hash(object_key.hash as u64, &object_key) {
             w_dict_bump_keys_version(obj);
             return Some(removed);
         }
@@ -3435,7 +3451,10 @@ pub unsafe fn w_module_dict_lookup_object_entries(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     let entries = w_module_dict_object_storage(obj)?;
-    entries.get(&object_key_for(key)).copied()
+    let object_key = object_key_for(key);
+    entries
+        .get_with_hash(object_key.hash as u64, &object_key)
+        .copied()
 }
 
 /// # Safety
@@ -3699,7 +3718,7 @@ pub unsafe fn w_dict_setdefault_checked(
         if let Some(result) = callback_free_dict_op!({
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-            let index = entries.index_of(&object_key);
+            let index = entries.index_of_with_hash(object_key.hash as u64, &object_key);
             if crate::dict_eq_hook::callback_free_probe_broken() {
                 None
             } else {
@@ -3850,7 +3869,7 @@ pub unsafe fn w_dict_pop_checked(
             if let Some(result) = callback_free_dict_op!({
                 let dict = &mut *(obj as *mut W_DictObject);
                 let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-                let index = entries.index_of(&object_key);
+                let index = entries.index_of_with_hash(object_key.hash as u64, &object_key);
                 if crate::dict_eq_hook::callback_free_probe_broken() {
                     None
                 } else {
@@ -3967,7 +3986,7 @@ pub unsafe fn w_dict_object_setitem_callback_free(
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-        let index = entries.index_of(&object_key);
+        let index = entries.index_of_with_hash(object_key.hash as u64, &object_key);
         if !crate::dict_eq_hook::callback_free_probe_broken() {
             dict_write_barrier(obj);
             match index {
@@ -4574,7 +4593,10 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         let entries = w_module_dict_object_storage_mut(obj);
         let _roots = crate::gc_roots::push_roots();
         let w_key = crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
-        let removed = entries.remove(&object_key_for(w_key)).is_some();
+        let object_key = object_key_for(w_key);
+        let removed = entries
+            .remove_with_hash(object_key.hash as u64, &object_key)
+            .is_some();
         if removed {
             w_dict_bump_keys_version(obj);
         }
@@ -4612,7 +4634,10 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-    let removed = entries.remove(&object_key_for(w_key)).is_some();
+    let object_key = object_key_for(w_key);
+    let removed = entries
+        .remove_with_hash(object_key.hash as u64, &object_key)
+        .is_some();
     if removed {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
@@ -4743,7 +4768,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         let object_key = crate::with_roots!(obj, value => object_key_for_checked(key))?;
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
-            match entries.index_of(&object_key) {
+            match entries.index_of_with_hash(object_key.hash as u64, &object_key) {
                 Some(index)
                     if entries
                         .get_slot(index)
@@ -4798,7 +4823,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-        match entries.index_of(&object_key) {
+        match entries.index_of_with_hash(object_key.hash as u64, &object_key) {
             Some(index)
                 if entries
                     .get_slot(index)
@@ -4913,7 +4938,7 @@ pub unsafe fn w_dict_move_to_end_checked(
         let obj = _dict_guard.root(0);
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
-            match entries.index_of(&object_key) {
+            match entries.index_of_with_hash(object_key.hash as u64, &object_key) {
                 Some(index) => {
                     // A key already at the wanted end does not move, and the
                     // move answers so; skip the version bump then, so a live
@@ -5000,7 +5025,7 @@ pub unsafe fn w_dict_move_to_end_checked(
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-        match entries.index_of(&object_key) {
+        match entries.index_of_with_hash(object_key.hash as u64, &object_key) {
             Some(index) => {
                 if entries.move_slot_to_end(index, last) {
                     dict.keys_version = dict.keys_version.wrapping_add(1);
@@ -5059,7 +5084,7 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-        let index = entries.index_of(&object_key);
+        let index = entries.index_of_with_hash(object_key.hash as u64, &object_key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             false
         } else {
@@ -5142,7 +5167,9 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
         let object_key = object_key_for_checked(key)?;
         let obj = _module_guard.root(0);
         let entries = w_module_dict_object_storage_mut(obj);
-        let removed = entries.remove(&object_key).is_some();
+        let removed = entries
+            .remove_with_hash(object_key.hash as u64, &object_key)
+            .is_some();
         if take_dict_key_error() {
             return Err(DictKeyError);
         }
@@ -5163,7 +5190,9 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
     let object_key = object_key_for_checked(_module_guard.root(1))?;
     let obj = _module_guard.root(0);
     let entries = w_module_dict_object_storage_mut(obj);
-    let removed = entries.remove(&object_key).is_some();
+    let removed = entries
+        .remove_with_hash(object_key.hash as u64, &object_key)
+        .is_some();
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
@@ -5790,7 +5819,8 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) -> bool 
     while i < hashes.len() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(
+        new_map.insert_with_hash(
+            *hash_p.add(i) as u64,
             ObjectKey {
                 hash: *hash_p.add(i),
                 obj,
@@ -5998,7 +6028,8 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) -> boo
     while i < hashes.len() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(
+        new_map.insert_with_hash(
+            *hash_p.add(i) as u64,
             ObjectKey {
                 hash: *hash_p.add(i),
                 obj,
@@ -6102,7 +6133,7 @@ pub unsafe fn w_dict_unicode_lookup_index(
     let dict = &*(w_dict as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
     crate::dict_eq_hook::begin_callback_free_probe();
-    let found = entries.index_of(&ObjectKey { hash, obj: w_key });
+    let found = entries.index_of_with_hash(hash as u64, &ObjectKey { hash, obj: w_key });
     let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
     match found {
         Some(i) if !probe_needed_user_code => i as i64,
