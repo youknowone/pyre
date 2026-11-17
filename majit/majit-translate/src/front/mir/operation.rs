@@ -6952,6 +6952,81 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// True when `var` is already `rffi.py` `CCHARP`: a stamped
+    /// `Ptr(Array(Char))`, an Input whose `class_root` is `CCHARP`, a
+    /// fat-window `FatData` word, or `rffi.get_raw_address_of_string`.
+    /// `cast_int_to_ptr` / `rffi.cast` results carry that stamp on the
+    /// producer; `ann_cast_int_to_ptr` of an already-`SomePtr` cell is
+    /// rejected, so those producers must not be recast.
+    pub(in crate::front::mir) fn var_already_ccharp(&self, var: &Variable) -> bool {
+        if var.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return true;
+        }
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|result| result.concretetype().as_ref().is_some_and(lltype_is_ccharp))
+        {
+            return true;
+        }
+        match &op.kind {
+            OpKind::Input {
+                class_root: Some(root),
+                ..
+            } if root == "CCHARP" => true,
+            OpKind::FieldRead { field, .. }
+                if field.vec_part == Some(crate::model::VecFieldPart::FatData) =>
+            {
+                true
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => matches!(
+                segments.last().map(String::as_str),
+                Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                    | Some(crate::codewriter::get_raw_address::LL_GET_RAW_ADDRESS_OF_STRING)
+            ),
+            _ => false,
+        }
+    }
+
+    /// An int-kind Input is already the address word: stamp `CCHARP`
+    /// (`raw_ptr_annotation_incoming`) so the same variable stays the
+    /// `*u8` actual. A Call (`cast_ptr_to_int`) / FieldRead / Const /
+    /// BinOp / a phi with no single producer stays a bare Integer until
+    /// `cast_int_to_ptr` at this producer (`rffi.cast`).
+    pub(in crate::front::mir) fn var_producer_can_carry_ccharp_stamp(
+        &self,
+        var: &Variable,
+    ) -> bool {
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        matches!(&op.kind, OpKind::Input { .. })
+    }
+
     /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
     /// would `RawLoad` a primitive.
     ///

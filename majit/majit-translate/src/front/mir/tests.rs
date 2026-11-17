@@ -34096,6 +34096,7 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             result_ty,
+            args,
             ..
         } = &op.kind
         else {
@@ -34120,6 +34121,15 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
                 dest.concretetype().as_ref(),
                 Some(&*STRPTR),
                 "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            let cp = args[0].as_variable().expect("ll_charpsize2str cp");
+            assert!(
+                cp.concretetype()
+                    .as_ref()
+                    .is_some_and(super::lltype_is_ccharp),
+                "ll_charpsize2str slot 0 is CCHARP; ct={:?} graph={}",
+                cp.concretetype(),
                 graph.dump()
             );
             str_copies += 1;
@@ -34149,6 +34159,135 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         cp,
         Some("CCHARP"),
         "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
+        helper.dump()
+    );
+}
+
+/// Integer address word used as `charpsize2str` `cp` is `rffi.cast` /
+/// `cast_int_to_ptr(CCHARP, int)` at the producer (`rffi.py` `CCHARP`).
+/// `from_raw_parts(usize, usize)` then `from_utf8_unchecked` is the
+/// Integer-for-`cp` call shape: helper slot 0 is `SomePtr` of `CCHARP`.
+#[test]
+fn integer_cp_to_ll_charpsize2str_is_ccharp() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let from_raw = window_opaque_fun(
+        1,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![n.clone(), n.clone()],
+        shared.clone(),
+    );
+    let from_utf8 = window_opaque_fun(
+        2,
+        &["core", "str", "converts", "from_utf8_unchecked"],
+        vec![shared.clone()],
+        str_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "integer_cp_charpsize2str"], true),
+        "signature": {"is_unsafe": true, "inputs": [n, n], "output": str_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &str_ty),
+                window_local(1, &n),
+                window_local(2, &n),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, from_raw, from_utf8]);
+    let graph = crate::test_support::lower_function(&llbc, "integer_cp_charpsize2str")
+        .expect("lower Integer-for-cp from_raw_parts + from_utf8_unchecked");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_int_to_ptr"),
+        "Integer address is cast_int_to_ptr(CCHARP); leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let mut copies = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        copies += 1;
+        assert_eq!(
+            args.len(),
+            2,
+            "charpsize2str(cp, size); graph={}",
+            graph.dump()
+        );
+        let cp = match &args[0] {
+            LinkArg::Value(v) => v,
+            other => panic!("cp is a Variable, got {other:?}; graph={}", graph.dump()),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "helper slot 0 is CCHARP SomePtr; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        copies >= 1,
+        "from_utf8_unchecked of an Integer window copies via ll_charpsize2str; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp_root = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp_root.as_deref(),
+        Some("CCHARP"),
+        "ll_charpsize2str slot 0 Input is CCHARP; helper={}",
         helper.dump()
     );
 }

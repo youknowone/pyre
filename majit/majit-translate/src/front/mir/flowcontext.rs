@@ -1012,6 +1012,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             }
             None => (ty, class_root),
         };
+        if class_root.as_deref() == Some("CCHARP") {
+            stamp_as_ccharp(&var);
+        }
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -1896,6 +1899,9 @@ impl<'a> Lowering<'a> {
                 }
                 None => (ty, class_root),
             };
+            if class_root.as_deref() == Some("CCHARP") {
+                stamp_as_ccharp(&var);
+            }
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
