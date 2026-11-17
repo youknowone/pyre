@@ -732,6 +732,23 @@ impl HelperReturn {
             Self::CallResult | Self::Converted => Self::CallResult,
         }
     }
+
+    /// Tag for an orthodox helper descent from the Python opcode.
+    ///
+    /// When the helper's return is written to the CALL dest, that return
+    /// *is* the CALL's result (`_setup_return_value_*` in `blackhole.py`),
+    /// so the helper is [`Self::CallResult`] and a guard numbers its
+    /// section. A `'v'` boxed descent (`orthodox_helper_boxed`, newutf8
+    /// restamp) hands the return back while the walk is still inside the
+    /// CALL, so it stays [`Self::Converted`] until that converting caller
+    /// (`getitem_list`, `execute_frame`) is itself a frame.
+    pub(crate) fn for_orthodox_descent(boxed_out: bool, dst_bank: char) -> Self {
+        if boxed_out && dst_bank == 'v' {
+            Self::Converted
+        } else {
+            Self::CallResult
+        }
+    }
 }
 
 /// The shape of the transparent helper levels above the innermost Python

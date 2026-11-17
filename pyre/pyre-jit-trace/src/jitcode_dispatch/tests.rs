@@ -4099,6 +4099,26 @@ fn call_entry_helper_does_not_latch_abort_blackhole() {
         HelperReturn::CallResult,
         "a Converted helper's child starts from CallResult"
     );
+    assert_eq!(
+        HelperReturn::for_orthodox_descent(false, 'r'),
+        HelperReturn::CallResult,
+        "dest-writing orthodox descent is the CALL's result"
+    );
+    assert_eq!(
+        HelperReturn::for_orthodox_descent(true, 'r'),
+        HelperReturn::CallResult,
+        "boxed dest-writing orthodox descent still writes the CALL dest"
+    );
+    assert_eq!(
+        HelperReturn::for_orthodox_descent(true, 'v'),
+        HelperReturn::Converted,
+        "a 'v' boxed descent hands the return back inside the CALL"
+    );
+    assert_eq!(
+        HelperReturn::for_orthodox_descent(false, 'v'),
+        HelperReturn::CallResult,
+        "void dest with no boxed_out is still a CALL-result helper"
+    );
     let (converted_latched, converted_too_long) =
         try_latch(HelperReturn::Converted, HelperOnStack::None, false);
     assert!(
