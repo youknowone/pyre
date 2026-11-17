@@ -2449,9 +2449,7 @@ fn prepare_frame_resume(
 pub fn prepare_frame_resume_for_dispatch(
     frame: &mut PyFrame,
     w_arg_or_err: PyObjectRef,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let _ = throw_args;
     let frame_anchor = FrameAnchor::new(frame);
     match prepare_frame_resume(unsafe { &mut *frame_anchor.live() }, w_arg_or_err)? {
         FrameResume::Yielded(value) => Ok(Some(value)),
@@ -2555,9 +2553,11 @@ pub(crate) fn eval_frame_with_resume(
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
             if ec.is_null() {
                 if resume.is_some() {
-                    let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
+                    // `pyframe.py execute_frame` seeds from `w_arg_or_err`
+                    // only. Original `throw()` args stay on
+                    // `SApplicationException` (`s_application_exception_throw_args`).
                     let prepared = pyre_object::with_roots!(w_arg_or_err =>
-                        prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+                        prepare_frame_resume_for_dispatch(frame, w_arg_or_err));
                     w_arg_or_err = pyre_object::PY_NULL;
                     let prepared = match prepared {
                         Ok(value) => value,
@@ -2602,12 +2602,10 @@ fn eval_frame_with_resume_pinned(
         let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
         if ec.is_null() {
             if resume.is_some() {
-                let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
                 let prepared = pyre_object::with_roots!(w_arg_or_err =>
                 prepare_frame_resume_for_dispatch(
                     unsafe { &mut *frame_anchor.live() },
                     w_arg_or_err,
-                    throw_args,
                 ));
                 w_arg_or_err = pyre_object::PY_NULL;
                 let prepared = match prepared {
@@ -2663,12 +2661,10 @@ fn eval_frame_after_enter_pinned(
         Ok(()) => {
             let mut inner_result: PyResult = 'inner: {
                 if resume.is_some() {
-                    let throw_args = resume.as_deref_mut().and_then(|r| r.throw_args.take());
                     let prepared = pyre_object::with_roots!(w_arg_or_err =>
                     prepare_frame_resume_for_dispatch(
                         unsafe { &mut *frame_anchor.live() },
                         w_arg_or_err,
-                        throw_args,
                     ));
                     w_arg_or_err = pyre_object::PY_NULL;
                     if let Some(value) = match prepared {
@@ -2784,11 +2780,8 @@ fn eval_frame_after_enter(
             Ok(()) => {
                 let mut inner_result: PyResult = 'inner: {
                     if resume.is_some() {
-                        let throw_args = resume
-                            .as_deref_mut()
-                            .and_then(|resume| resume.throw_args.take());
                         let prepared = pyre_object::with_roots!(w_arg_or_err =>
-                            prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+                            prepare_frame_resume_for_dispatch(frame, w_arg_or_err));
                         w_arg_or_err = pyre_object::PY_NULL;
                         if let Some(value) = match prepared {
                             Ok(v) => v,

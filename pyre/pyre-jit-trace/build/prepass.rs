@@ -1304,14 +1304,29 @@ fn real_main() {
                     "eval",
                     "_get_adapted_tick_counter",
                 ]),
+                // Unique look-inside of `eval_frame_with_resume` folds
+                // `we_are_jitted()` true onto leftover
+                // `eval_frame_after_enter` (`pyframe.py execute_frame`
+                // after `ec.enter`). That body is not `dont_look_inside`;
+                // a leftover residual is an unbound
+                // `symbolic_fnaddr_for_path`. Isolated harvest from
+                // `execute_frame_portal` InlineCalls it once it is a
+                // candidate (`handle_regular_call`). Seed it like
+                // `call_trace` (`call.py` `inline_calls_to` /
+                // `register_helper_graph`). This is a BFS candidate, not
+                // a rustc inline of the Result body into the caller.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "eval_frame_after_enter",
+                ]),
                 // `pyframe.py execute_frame` calls `ec.call_trace` after
                 // `enter`. Unique look-inside of the portal folds
                 // `we_are_jitted()` true onto leftover
                 // `eval_frame_after_enter`, so `find_all_graphs` never
-                // reaches the method. Naming it on `eval_frame_with_resume`
-                // residualizes that graph (`Result` return shell around
-                // `release_recursive_frame`). The inline walker still
-                // walks this body (`walker_walk_call_trace` /
+                // reaches the method unless that leftover is a candidate
+                // (seed above). The inline walker still walks this body
+                // (`walker_walk_call_trace` /
                 // `pyjitpl.py _opimpl_inline_call1`), so seed it like
                 // the other walker-descended helpers.
                 majit_translate::CallPath::from_segments([

@@ -5770,6 +5770,8 @@ impl PyFrame {
 
     /// [`Self::execute_frame_plain`] whose `dispatch` is the jd0 portal runner
     /// (`pyframe.py execute_frame` calling `interp_jit.py PyFrame.dispatch`).
+    // pyframe.py PyFrame.run._always_inline_ = True
+    #[majit_macros::always_inline]
     #[inline]
     pub fn execute_frame_portal(
         &mut self,

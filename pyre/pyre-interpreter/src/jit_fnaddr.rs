@@ -66,6 +66,8 @@ impl ResidualSlot for crate::objspace::descroperation::BinopDunder {}
 impl ResidualSlot for crate::objspace::descroperation::UnaryDunder {}
 impl ResidualSlot for crate::objspace::descroperation::SeqBase {}
 impl ResidualSlot for crate::objspace::descroperation::RepeatDunder {}
+/// `eval.rs ContextSource` is a fieldless enum (`tyref_is_fieldless_enum_free`).
+impl ResidualSlot for crate::eval::ContextSource {}
 
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
@@ -805,6 +807,15 @@ override_call_stub!(sequence_numeric_slot_is_null_call_stub, sequence_numeric_sl
     a => a as pyre_object::PyObjectRef, op => binop_dunder_arg(op));
 override_call_stub!(seq_repeat_override_call_stub, seq_repeat_override,
     a => a as pyre_object::PyObjectRef, op => repeat_dunder_arg(op));
+/// wasm32 `WordAbi` for `ContextSource` (`publish_pa4` leftover of
+/// `handle_exception_with_context`). Native publishes the raw function.
+#[cfg(target_arch = "wasm32")]
+override_enum_arg!(
+    context_source_arg,
+    crate::eval::ContextSource,
+    GeneratorChain,
+    ResumedFrameOnly
+);
 
 /// wasm32 publication shim. `descr.py` `CallDescr.create_call_stub`
 /// rebuilds `lltype.FuncType` from the calldescr and calls that pointer.
@@ -1049,6 +1060,16 @@ pub mod word_publish {
         }
         fn into_reg(self) -> i64 {
             self.as_raw() as usize as i64
+        }
+    }
+    impl WordAbi for crate::eval::ContextSource {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            super::context_source_arg(reg)
+        }
+        fn into_reg(self) -> i64 {
+            self as i64
         }
     }
     impl WordAbi for crate::call::RecursionDepthGuard {
@@ -6185,6 +6206,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::set_current_exception",
         crate::eval::set_current_exception,
     );
+    // `pyframe.py handle_exception` / `handle_exception_with_context`.
+    // `dont_look_inside`; inlining `execute_frame` into `sortkey` reaches
+    // this residual. Unbound, the codewriter leaves a
+    // `symbolic_fnaddr_for_path` hash and the tracer aborts.
+    pa4!(
+        &mut entries,
+        "eval::handle_exception_with_context",
+        "pyre_interpreter::eval::handle_exception_with_context",
+        crate::eval::handle_exception_with_context,
+    );
 
     // `w_type` / `w_object` — the `type` / `object` typeobject accessors
     // read the space's `w_type` / `w_object` attributes set once at
@@ -9317,6 +9348,19 @@ mod tests {
             ("pyre_interpreter::call::release_recursive_frame", release),
         ] {
             assert_occupied_binding(&bindings, path, fallback);
+        }
+    }
+
+    #[test]
+    fn handle_exception_with_context_residual_is_the_native_function() {
+        let bindings: std::collections::HashMap<&'static str, i64> =
+            jit_trace_fnaddrs().into_iter().collect();
+        let handle = crate::eval::handle_exception_with_context as *const () as usize as i64;
+        for path in [
+            "eval::handle_exception_with_context",
+            "pyre_interpreter::eval::handle_exception_with_context",
+        ] {
+            assert_occupied_binding(&bindings, path, handle);
         }
     }
 

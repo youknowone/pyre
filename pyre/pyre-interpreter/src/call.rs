@@ -171,6 +171,14 @@ impl FrameResumeArgs {
         self.w_arg_or_err = PY_NULL;
         word
     }
+
+    /// Consume `throw_args`.
+    ///
+    /// `pyframe.py execute_frame` seeds from `w_arg_or_err` only; this
+    /// field is not on the traced `execute_frame` path.
+    pub fn take_throw_args(&mut self) -> Option<([PyObjectRef; 3], usize)> {
+        self.throw_args.take()
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +210,18 @@ mod frame_resume_args_tests {
         assert_eq!(with_err.take_w_arg_or_err(), raw);
         assert!(with_err.w_arg_or_err.is_null());
         assert_eq!(with_err.take_w_arg_or_err(), PY_NULL);
+    }
+
+    #[test]
+    fn take_throw_args_none_is_none() {
+        let mut empty = FrameResumeArgs::from_parts(None, None, None);
+        assert!(empty.take_throw_args().is_none());
+        assert!(empty.throw_args.is_none());
+        let args = ([PY_NULL, PY_NULL, PY_NULL], 0usize);
+        empty.throw_args = Some(args);
+        assert_eq!(empty.take_throw_args(), Some(args));
+        assert!(empty.throw_args.is_none());
+        assert!(empty.take_throw_args().is_none());
     }
 }
 
