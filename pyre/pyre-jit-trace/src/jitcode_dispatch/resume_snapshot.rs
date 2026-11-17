@@ -775,6 +775,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // / `CalleePrologue`, or a boxed `'v'` `call_entry_helper_chain`) still
         // collapses to that CALL entry, as `helper_subwalk_level` does: no
         // MIFrame holds the conversion.
+        // The non-exception arm passes `call_entry_parent=false`:
+        // `_setup_return_value_*` writes the helper's return into a Python caller
+        // paused after the CALL (`get_list_of_active_boxes(in_a_call=True)`),
+        // never into a CALL-entry image.
         let exception_guard = matches!(
             ctx.trace_ctx.last_guard_opcode(),
             Some(OpCode::GuardNoException | OpCode::GuardException)
@@ -786,6 +790,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 after_residual_call,
                 &scope,
                 parent_frames.clone(),
+                true,
             )?;
             return walker_capture_transparent_helper_snapshot(
                 ctx,
@@ -802,6 +807,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     after_residual_call,
                     &scope,
                     parent_frames.clone(),
+                    false,
                 );
                 let helper_sections_ok = match &frames {
                     Ok(frames) => frames.iter().all(|f| {
@@ -3420,12 +3426,20 @@ fn python_resume_frame(frame: &InlineParentFrame) -> bool {
 /// left unpublished (`Ok(None)` under a portal) still sit on the sub-walk
 /// driver; they are numbered between the Python caller and the innermost
 /// section the way `capture_resumedata` numbers every `MIFrame`.
+///
+/// `call_entry_parent` is whether a missing Python parent may fall back to
+/// `compute_inline_helper_call_entry_frame` (the caller at the CALL entry).
+/// A normal return writes into `registers[code[position-1]]` of a caller
+/// paused after the CALL (`blackhole.py _setup_return_value_*`,
+/// `pyjitpl.py MIFrame.get_list_of_active_boxes(in_a_call=True)`), so that
+/// fallback is only for exception-guard numbering.
 fn looked_inside_helper_resume_frames<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
     scope: &GuardCaptureScope,
     parent_frames: Vec<InlineParentFrame>,
+    call_entry_parent: bool,
 ) -> Result<Vec<InlineParentFrame>, DispatchError> {
     let live_after_jit_pc = ctx.live_after_jit_pc;
     let innermost =
@@ -3443,9 +3457,13 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
                 .outer_resume_marker_jit_pc
                 .ok_or(DispatchError::callee_inline_unsupported(op_pc))?,
         };
-        let python = compute_inline_caller_frame(ctx, call_jit_pc)
-            .or_else(|_| compute_inline_helper_call_entry_frame(ctx, call_jit_pc))
-            .map_err(|_| DispatchError::callee_inline_unsupported(op_pc))?;
+        let caller = compute_inline_caller_frame(ctx, call_jit_pc);
+        let caller = if call_entry_parent {
+            caller.or_else(|_| compute_inline_helper_call_entry_frame(ctx, call_jit_pc))
+        } else {
+            caller
+        };
+        let python = caller.map_err(|_| DispatchError::callee_inline_unsupported(op_pc))?;
         let mut frames = vec![python];
         frames.extend(parent_frames);
         frames
