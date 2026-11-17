@@ -786,10 +786,13 @@ impl<K, V, S> RDict<K, V, S> {
         unsafe { (*self.entry_ptr().add(slot)).f_valid }
     }
 
-    /// `ll_dict_getitem`'s `d.entries[index].value`: one interior-field read
-    /// of the entries array.
+    /// `ll_dict_getitem`'s `d.entries[index].value`: one interior-field read.
+    ///
+    /// # Safety
+    /// `slot` must be below `num_ever_used_items`, `entries` must be allocated
+    /// for it, and the slot must be live (`f_valid`).
     #[inline]
-    pub fn value_at(&self, slot: usize) -> V
+    pub(crate) unsafe fn value_at(&self, slot: usize) -> V
     where
         V: Copy,
     {
@@ -1945,7 +1948,8 @@ where
         V: EntryDummy,
     {
         let key = self.key_at(slot);
-        let value = self.value_at(slot);
+        // SAFETY: the caller settled a live slot (`f_valid`) below `num_ever_used_items`.
+        let value = unsafe { self.value_at(slot) };
         ll_dict_del(self, hash, slot);
         (key, value)
     }
@@ -2010,7 +2014,8 @@ where
             let mut rest = Vec::with_capacity(self.num_live_items);
             for i in 0..self.num_ever_used_items {
                 if self.entry_valid(i) {
-                    let (k, v) = (self.key_at(i), self.value_at(i));
+                    // SAFETY: `entry_valid(i)` just established this slot is live.
+                    let (k, v) = (self.key_at(i), unsafe { self.value_at(i) });
                     Self::pin_gcrefs_of(k);
                     Self::pin_gcrefs_of(v);
                     rest.push((k, v));

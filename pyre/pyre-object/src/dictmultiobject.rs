@@ -501,7 +501,8 @@ pub unsafe fn dict_entries_insert_hashed(
 /// Same as [`dict_entries_probe_hashed`]; `index` must be a live entry index.
 pub unsafe fn dict_entries_value_at(entries: &ObjectDictStorage, index: usize) -> PyObjectRef {
     debug_assert!(entries.get_slot(index).is_some());
-    entries.value_at(index)
+    // SAFETY: live-index contract of `dict_entries_value_at`.
+    unsafe { entries.value_at(index) }
 }
 
 /// Overwrite the value at an entry index the caller already settled on —
