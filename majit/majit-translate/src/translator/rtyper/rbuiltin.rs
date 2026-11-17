@@ -5667,8 +5667,11 @@ pub fn rtype_force_cast(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 /// for the `r_ins1.classdef is None` (classdef-less → concrete) arm, run
 /// in one direction by the narrow and the other by the erasure.
 /// `args[0]` is the pointer operand; the narrow's `args[1]` is the
-/// constant root name (read by the annotator, unused here — it carries
-/// no runtime value).
+/// constant root name. The annotator peels a pointer
+/// `#[repr(transparent)]` wrapper
+/// (`Bookkeeper::peel_transparent_cast_root`); dest lltype is
+/// `hop.r_result` (`rclass.py` `ll_cast_to_object` / `lltype.py`
+/// `cast_pointer` of the same pointer).
 pub fn rtype_cast_instance_intrinsic(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
@@ -5676,10 +5679,7 @@ pub fn rtype_cast_instance_intrinsic(
     use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::GenopResult;
 
-    let r_result =
-        hop.r_result.borrow().as_ref().cloned().ok_or_else(|| {
-            TyperError::message("rtype_cast_instance_intrinsic: missing r_result")
-        })?;
+    let r_result = rtype_cast_instance_dest_repr(hop)?;
     let result_lltype = r_result.lowleveltype().clone();
     // Validated operand extraction: a malformed call (wrong arity)
     // surfaces a `TyperError` here instead of panicking on a raw
@@ -5841,6 +5841,20 @@ pub fn rtype_cast_instance_intrinsic(
         "cast_pointer"
     };
     Ok(hop.genop(opname, vec![v_ptr], GenopResult::LLType(result_lltype)))
+}
+
+/// Dest repr of `__cast_instance_intrinsic`.
+///
+/// `hop.r_result` is the annotator's intern. The analyser peels a
+/// pointer `#[repr(transparent)]` wrapper
+/// (`Bookkeeper::peel_transparent_cast_root`) before ClassDef lookup,
+/// so this is already the inner (`rclass.py` `ll_cast_to_object`).
+fn rtype_cast_instance_dest_repr(hop: &HighLevelOp) -> Result<Arc<dyn Repr>, TyperError> {
+    hop.r_result
+        .borrow()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_cast_instance_intrinsic: missing r_result"))
 }
 
 #[cfg(test)]

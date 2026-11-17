@@ -2555,6 +2555,37 @@ impl Bookkeeper {
             .transparent_inner_field(class_root)
     }
 
+    /// Dest class-root of `__cast_instance_intrinsic` onto `root`.
+    ///
+    /// A by-value `#[repr(transparent)]` wrapper whose unique non-ZST
+    /// field (`transparent_inner_field`) is a pointer `*mut X` /
+    /// `GCREF` / `PyObjectRef` is the cast onto `X` (`rclass.py`
+    /// `ll_cast_to_object` / `lltype.py` `cast_pointer` of the same
+    /// pointer). Nested by-value wrappers walk until that pointer.
+    /// The wrapper itself has no ClassDef
+    /// ([`Self::getuniqueclassdef_for_struct_root`]).
+    ///
+    /// A scalar inner (`TypeIdCell` → `AtomicU32`) keeps the named
+    /// root: that dest has a ClassDef, and peeling it to the integer
+    /// cell would retarget `GcType::type_id`'s CAST.
+    pub fn peel_transparent_cast_root(&self, root: &str) -> String {
+        let named = root.trim().to_string();
+        let mut current = named.clone();
+        for _ in 0..8 {
+            let Some(inner) = self.transparent_inner_field(&current) else {
+                return named;
+            };
+            if inner == current {
+                return named;
+            }
+            if is_pointer_cast_inner(&inner) {
+                return peel_pointer_cast_inner(&inner);
+            }
+            current = inner;
+        }
+        named
+    }
+
     /// `getrepr` of a declared-Gc MiniMark container `Ptr` (`rptr.py` `PtrRepr`).
     pub fn gc_struct_ptr_lltype(
         &self,
@@ -8685,6 +8716,30 @@ fn transparent_pointer_wrapper_root(reg: &crate::front::StructFieldRegistry, roo
             && (crate::front::typestr::peel_pointer_prefix(&inner).is_some()
                 || is_gcref_type_spelling(&inner))
     })
+}
+
+/// Pointer / `GCREF` / `PyObjectRef` payload of a transparent wrapper.
+fn is_pointer_cast_inner(inner: &str) -> bool {
+    crate::front::typestr::peel_pointer_prefix(inner).is_some()
+        || is_gcref_type_spelling(inner)
+        || inner == "PyObjectRef"
+        || inner.ends_with("::PyObjectRef")
+}
+
+/// Pointee of a transparent pointer inner (`*mut X` / `PyObjectRef` /
+/// `GCREF`). `__cast_instance_intrinsic` dest is that class, not the
+/// wrapper (`rclass.py` `ll_cast_to_object`).
+fn peel_pointer_cast_inner(inner: &str) -> String {
+    if is_gcref_type_spelling(inner) {
+        return inner.to_string();
+    }
+    let pointee = crate::front::typestr::peel_pointer_prefix(inner)
+        .unwrap_or(inner)
+        .trim();
+    if pointee == "PyObjectRef" || pointee.ends_with("::PyObjectRef") {
+        return "pyobject::PyObject".to_string();
+    }
+    pointee.to_string()
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -17191,6 +17246,28 @@ mod tests {
             bk.getuniqueclassdef_for_struct_root("identitydict::IdentityKey")
                 .is_err(),
             "pointer wrapper has no ClassDef"
+        );
+        for wrapper in ["identitydict::IdentityKey", "dictmultiobject::ObjectKey"] {
+            let mut keyed = StructFieldRegistry::default();
+            keyed
+                .note_transparent_inner(wrapper.to_string(), "*mut pyobject::PyObject".to_string());
+            bk.set_struct_fields(Rc::new(keyed));
+            assert_eq!(
+                bk.peel_transparent_cast_root(wrapper),
+                "pyobject::PyObject",
+                "{wrapper} cast dest is the pointee"
+            );
+        }
+        let mut scalar = StructFieldRegistry::default();
+        scalar.note_transparent_inner(
+            "lltype::TypeIdCell".to_string(),
+            "core::sync::atomic::AtomicU32".to_string(),
+        );
+        bk.set_struct_fields(Rc::new(scalar));
+        assert_eq!(
+            bk.peel_transparent_cast_root("lltype::TypeIdCell"),
+            "lltype::TypeIdCell",
+            "scalar wrapper dest stays the named ClassDef"
         );
     }
 

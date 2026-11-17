@@ -21545,7 +21545,9 @@ fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
 
 /// A `Result<ObjectKey, E>` sum shell intern's `Ok.__pos_0` as one GC
 /// pointer (`rtuple.py TupleRepr` / `rclass.py InstanceRepr` lowleveltype
-/// `Ptr(GcStruct)`). The field descr is FLAG_POINTER, one word, parent
+/// `Ptr(GcStruct)`). `ObjectKey` is `repr(transparent)` over `PyObjectRef`
+/// (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR); the digest lives
+/// in `Entry.f_hash`. The field descr is FLAG_POINTER, one word, parent
 /// size two words (tag + payload).
 #[test]
 fn sum_shell_instance_payload_is_one_gc_pointer() {
@@ -21556,22 +21558,16 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
     let object_key = interior_struct(
         1,
         &["pyre_object", "dictmultiobject", "ObjectKey"],
-        &[
-            (
-                "hash",
-                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
-            ),
-            (
-                "obj",
-                serde_json::json!({"RawPtr": [
-                    {"Scalar": {"Integer": {"Unsigned": "U8"}}},
-                    "Mut"
-                ]}),
-            ),
-        ],
-        16,
-        &[0, 8],
-        false,
+        &[(
+            "__pos_0",
+            serde_json::json!({"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]}),
+        )],
+        8,
+        &[0],
+        true,
     );
     let err = interior_struct(
         2,
@@ -21607,9 +21603,10 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         "Ok.__pos_0 intern is Ptr(GcStruct); keys={keys:?}"
     );
     let payload = payload.unwrap();
+    let word = crate::layout::target_word_size();
     let known_structs: HashSet<String> = HashSet::from(["dictmultiobject::ObjectKey".to_string()]);
     let known_sizes: HashMap<String, usize> =
-        HashMap::from([("dictmultiobject::ObjectKey".to_string(), 16)]);
+        HashMap::from([("dictmultiobject::ObjectKey".to_string(), word)]);
     let layout = StructLayout::from_type_strings(
         &[
             ("__discriminant".to_string(), "i64".to_string()),
@@ -21621,7 +21618,6 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         &HashMap::new(),
         &HashSet::new(),
     );
-    let word = crate::layout::target_word_size();
     let pos0 = layout
         .fields
         .iter()

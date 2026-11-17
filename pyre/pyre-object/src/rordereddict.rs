@@ -962,6 +962,14 @@ impl<K, V, S> RDict<K, V, S> {
         Some(&self.entry_at(slot).key)
     }
 
+    /// `entries.entry_hash(d, i)` / `ll_hash_from_cache` (`rordereddict.py`).
+    pub fn slot_hash(&self, slot: usize) -> Option<u64> {
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
+            return None;
+        }
+        Some(self.entry_at(slot).f_hash)
+    }
+
     #[inline]
     pub fn get_slot_mut(&mut self, slot: usize) -> Option<(&K, &mut V)> {
         if slot >= self.num_ever_used_items {
@@ -1492,6 +1500,58 @@ fn reload_gcrefs<T: GcRefOffsets>(roots: &crate::gc_roots::RootScope, val: &mut 
 
 impl<K, V, S> RDict<K, V, S>
 where
+    K: Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
+    (K, V): GcEntriesType,
+{
+    /// `rordereddict.py::ll_dict_store_clean` — probe for a [`FREE`]
+    /// slot only, valid when no key can already be present. Uses
+    /// `entries.entry_hash` (`ll_hash_from_cache`), not `d.keyhash`.
+    fn insert_clean(&mut self, hash: u64, slot: u32) {
+        let mask = self.index_len() - 1;
+        let mut i = (hash as usize) & mask;
+        let mut perturb = hash;
+        while self.index_at(i) != FREE {
+            i = Self::probe_next(i, perturb, mask);
+            perturb >>= PERTURB_SHIFT;
+        }
+        self.set_index_at(i, slot + VALID_OFFSET);
+    }
+
+    /// `ll_clear_indexes` (rordereddict.py). Zero the existing probe table
+    /// in place so `ll_dict_reindex` can reuse a same-sized block.
+    fn clear_indexes(&mut self) {
+        let n = self.index_len();
+        for i in 0..n {
+            self.set_index_at(i, FREE);
+        }
+    }
+
+    /// `ll_dict_reindex` (rordereddict.py). Rebuilds the probe table from
+    /// `Entry.f_hash` (`ll_hash_from_cache`); does not call `keyhash`.
+    fn reindex(&mut self, new_size: usize) -> bool {
+        debug_assert!(new_size.is_power_of_two());
+        if !self.indexes.is_null() && self.index_len() == new_size {
+            self.clear_indexes();
+        } else if !self.install_index_block(new_size) {
+            return false;
+        }
+        self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
+        let mut slot = 0usize;
+        while slot < self.num_ever_used_items {
+            if self.entry_valid(slot) {
+                let hash = self.entry_at(slot).f_hash;
+                self.insert_clean(hash, slot as u32);
+            }
+            slot += 1;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+}
+
+impl<K, V, S> RDict<K, V, S>
+where
     K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
@@ -1581,49 +1641,6 @@ where
             i = Self::probe_next(i, perturb, mask);
             perturb >>= PERTURB_SHIFT;
         }
-    }
-
-    /// `rordereddict.py::ll_dict_store_clean` — probe for a [`FREE`]
-    /// slot only, valid when no key can already be present.
-    fn insert_clean(&mut self, hash: u64, slot: u32) {
-        let mask = self.index_len() - 1;
-        let mut i = (hash as usize) & mask;
-        let mut perturb = hash;
-        while self.index_at(i) != FREE {
-            i = Self::probe_next(i, perturb, mask);
-            perturb >>= PERTURB_SHIFT;
-        }
-        self.set_index_at(i, slot + VALID_OFFSET);
-    }
-
-    /// `ll_clear_indexes` (rordereddict.py). Zero the existing probe table
-    /// in place so `ll_dict_reindex` can reuse a same-sized block.
-    fn clear_indexes(&mut self) {
-        let n = self.index_len();
-        for i in 0..n {
-            self.set_index_at(i, FREE);
-        }
-    }
-
-    /// `ll_dict_reindex` (rordereddict.py).
-    fn reindex(&mut self, new_size: usize) -> bool {
-        debug_assert!(new_size.is_power_of_two());
-        if !self.indexes.is_null() && self.index_len() == new_size {
-            self.clear_indexes();
-        } else if !self.install_index_block(new_size) {
-            return false;
-        }
-        self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
-        let mut slot = 0usize;
-        while slot < self.num_ever_used_items {
-            if self.entry_valid(slot) {
-                let hash = self.entry_at(slot).f_hash;
-                self.insert_clean(hash, slot as u32);
-            }
-            slot += 1;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        true
     }
 
     /// `rpython/rtyper/lltypesystem/rordereddict.py::ll_dict_remove_deleted_items`
@@ -1874,6 +1891,8 @@ where
         K: GcRefOffsets,
         V: GcRefOffsets,
     {
+        // Same `gct_direct_call` livevars as `ll_dict_setitem`: `key` /
+        // `value` / the table stay rooted across `d.keyhash`.
         let _roots = crate::gc_roots::push_roots();
         let mut key = key;
         let mut value = value;
@@ -1881,6 +1900,24 @@ where
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
         let hash = self.hash_of(&key);
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
+        self.insert_known_absent_with_hash(hash, key, value);
+    }
+
+    /// `insert_known_absent` with a caller-held digest (`ll_dict_setitem_with_hash`
+    /// then the `i < 0` arm of `_ll_dict_setitem_lookup_done`).
+    pub fn insert_known_absent_with_hash(&mut self, hash: u64, key: K, value: V)
+    where
+        K: GcRefOffsets,
+        V: GcRefOffsets,
+    {
+        let _roots = crate::gc_roots::push_roots();
+        let mut key = key;
+        let mut value = value;
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        self.pin_table_and_entries();
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return;
         }
@@ -2038,7 +2075,7 @@ where
             let (k, v) = self.take_slot(hash, slot);
             Self::pin_gcrefs_of(k);
             Self::pin_gcrefs_of(v);
-            self.insert(k, v);
+            self.insert_with_hash(hash, k, v);
         } else {
             if self.next_valid_slot(0) == Some(slot) {
                 return false;
@@ -2054,7 +2091,7 @@ where
                     let e = self.entry_at(i);
                     Self::pin_gcrefs_of(e.key);
                     Self::pin_gcrefs_of(e.value);
-                    rest.push((e.key, e.value));
+                    rest.push((e.f_hash, e.key, e.value));
                 }
             }
             // The old array is left to the collector, as `ll_dict_clear` does.
@@ -2064,9 +2101,9 @@ where
             self.num_live_items = 0;
             self.resize_counter = 0;
             self.generation = self.generation.wrapping_add(1);
-            self.insert(k, v);
-            for (k, v) in rest {
-                self.insert(k, v);
+            self.insert_with_hash(hash, k, v);
+            for (h, k, v) in rest {
+                self.insert_with_hash(h, k, v);
             }
         }
         true
@@ -2096,14 +2133,19 @@ where
     /// `num_ever_used_items`; `keys[i]` is the image of a live slot `i` and is
     /// ignored for a tombstone. The index is `ll_dict_reindex` on the new
     /// keys' hashes, not a copy of the old probe table.
-    pub fn map_keys_preserving_layout<K2, S2>(&self, keys: &[K2]) -> RDict<K2, V, S2>
+    pub fn map_keys_preserving_layout<K2, S2>(
+        &self,
+        keys: &[K2],
+        hashes: &[u64],
+    ) -> RDict<K2, V, S2>
     where
-        K2: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+        K2: Eq + Copy + EntryDummy + GcRefOffsets,
         S2: BuildHasher + Default,
         (K2, V): GcEntriesType,
     {
         let n = self.num_ever_used_items;
         debug_assert_eq!(keys.len(), n);
+        debug_assert_eq!(hashes.len(), n);
         if n == 0 {
             return RDict::with_hasher(S2::default());
         }
@@ -2131,11 +2173,7 @@ where
                 continue;
             }
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
-            // `hash_of` can run a user `__hash__` and collect, so the key,
-            // the source value and both arrays are read back from their
-            // slots after it.
-            let hash = dst.hash_of(&key);
-            let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
+            let hash = hashes[slot];
             let value =
                 unsafe { &*entries_item_ptr(pinned_entries::<K, V>(entries_slot)).add(slot) }.value;
             dst.entries = pinned_entries::<K2, V>(new_slot);
@@ -2179,15 +2217,16 @@ where
     /// `_ll_malloc_entries` may collect. Each key's GC refs are pinned before
     /// that malloc and reloaded afterwards, the same `push_roots` / pop-roots
     /// reread `try_grow_list_items_block_gc` uses for the old items block.
-    pub fn from_preserved_slots(keys: &[K], live: &[bool], index_len: usize) -> Self
+    pub fn from_preserved_slots(keys: &[K], hashes: &[u64], live: &[bool], index_len: usize) -> Self
     where
-        K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+        K: Eq + Copy + EntryDummy + GcRefOffsets,
         V: Copy + EntryDummy,
         S: BuildHasher + Default,
         (K, V): GcEntriesType,
     {
         let n = keys.len();
         debug_assert_eq!(live.len(), n);
+        debug_assert_eq!(hashes.len(), n);
         if n == 0 {
             return Self::with_hasher(S::default());
         }
@@ -2211,7 +2250,7 @@ where
                 continue;
             }
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
-            let hash = dst.hash_of(&key);
+            let hash = hashes[slot];
             dst.barrier_entries();
             unsafe {
                 std::ptr::write(
