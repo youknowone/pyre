@@ -829,9 +829,11 @@ impl RewriteState {
             return;
         }
         for i in 0..op.num_args() {
-            if let Some(Value::Ref(gcref)) = op.arg(i).const_value()
-                && !gcref.is_null()
-            {
+            let gcref = match op.arg_ref(i).const_value() {
+                Some(Value::Ref(gcref)) if !gcref.is_null() => Some(gcref),
+                _ => None,
+            };
+            if let Some(gcref) = gcref {
                 let load = self.remove_constptr(gcref);
                 op.setarg(i, load);
             }
@@ -906,30 +908,45 @@ impl RewriteState {
     fn replace_args_in_place(&mut self, out: &OpRc, keep_constptrs: bool) -> bool {
         let mut replaced = false;
         for i in 0..out.num_args() {
-            let mut arg = self.get_box_replacement(out.arg_ref(i));
-            if !keep_constptrs
-                && let Some(Value::Ref(gcref)) = arg.const_value()
-                && !gcref.is_null()
-            {
-                arg = self.remove_constptr(gcref);
-            }
-            if arg != *out.arg_ref(i) {
-                // The op IS the box (resoperation.py). setarg writes the
-                // replacement on this ResOperation; a second cls() would
-                // only mint an identical identity for get_box_replacement
-                // to find via _forwarded.
-                out.setarg(i, arg);
+            // Intern a non-null ConstPtr terminal before the packed-identity
+            // check (`rewrite.py` emit_op `not_const=False` walk). Copy the
+            // gcref out so `arg_ref` is not held across `setarg`.
+            let intern_gcref = if keep_constptrs {
+                None
+            } else {
+                let src = out.arg_ref(i);
+                src.with_box_replacement(|r| match r.const_value() {
+                    Some(Value::Ref(g)) if !g.is_null() => Some(g),
+                    _ => None,
+                })
+            };
+            if let Some(g) = intern_gcref {
+                out.setarg(i, self.remove_constptr(g));
                 replaced = true;
+            } else {
+                let replacement = {
+                    let src = out.arg_ref(i);
+                    src.with_box_replacement(|r| (r != src).then(|| r.clone()))
+                };
+                if let Some(resolved) = replacement {
+                    // The op IS the box (resoperation.py). setarg writes the
+                    // replacement on this ResOperation; a second cls() would
+                    // only mint an identical identity for get_box_replacement
+                    // to find via _forwarded.
+                    out.setarg(i, resolved);
+                    replaced = true;
+                }
             }
         }
         if out.opcode.is_guard() {
-            let failargs_changed = out
-                .guard_fail_args()
-                .is_some_and(|fa| fa.iter().any(|a| self.get_box_replacement(a) != *a));
+            let mut failargs_changed = false;
+            out.map_failargs_in_place(|a| {
+                if let Some(r) = a.with_box_replacement(|r| (*r != *a).then(|| r.clone())) {
+                    *a = r;
+                    failargs_changed = true;
+                }
+            });
             if failargs_changed {
-                out.map_failargs_in_place(|a| {
-                    *a = self.get_box_replacement(a);
-                });
                 replaced = true;
             }
         }

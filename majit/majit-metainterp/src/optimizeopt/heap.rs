@@ -1325,7 +1325,13 @@ impl OptHeapState {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
+            let replaced = {
+                let arg = op.arg_ref(i);
+                ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+            };
+            if let Some(resolved) = replaced {
+                op.setarg(i, resolved);
+            }
         }
         // heap.py: emit_extra(op, emit=False) → next_optimization.
         // `_lazy_set` already holds this ResOperation; do not cls() again.
@@ -2011,7 +2017,13 @@ impl OptHeapState {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
+                let replaced = {
+                    let arg = pending_op.arg_ref(i);
+                    ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+                };
+                if let Some(resolved) = replaced {
+                    pending_op.setarg(i, resolved);
+                }
             }
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(1);
@@ -2044,7 +2056,13 @@ impl OptHeapState {
         for (descr_idx, index, _obj, pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
+                let replaced = {
+                    let arg = pending_op.arg_ref(i);
+                    ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+                };
+                if let Some(resolved) = replaced {
+                    pending_op.setarg(i, resolved);
+                }
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
