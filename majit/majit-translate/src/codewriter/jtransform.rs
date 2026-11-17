@@ -20625,6 +20625,7 @@ fn describe_v_inst_producer(graph: &FunctionGraph, v_inst: &LinkArg) -> String {
                     name,
                     ty,
                     class_root,
+                    ..
                 } => format!(
                     "Input {name} ty={ty:?} class_root={class_root:?} dest_ct={:?}",
                     var.concretetype()
@@ -22269,6 +22270,7 @@ mod tests {
                     name: "entries".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
             });
         graph
@@ -22280,6 +22282,7 @@ mod tests {
                     name: "i".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             });
         graph
@@ -22291,6 +22294,7 @@ mod tests {
                     name: "v".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             });
         graph
@@ -22408,6 +22412,7 @@ mod tests {
                     name: "owner".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
             });
         graph
@@ -22547,6 +22552,7 @@ mod tests {
                     name: "frame".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -22708,6 +22714,7 @@ mod tests {
                     name: "map".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -22930,6 +22937,7 @@ mod tests {
                         name: "s".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -23083,6 +23091,7 @@ mod tests {
                     name: "cell".into(),
                     ty: ValueType::Ref(Some(cell_owner.into())),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -23096,6 +23105,7 @@ mod tests {
                     name: "cond".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -23333,6 +23343,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -23487,6 +23498,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Ref(Some(owner.into())),
                     class_root: Some(owner.into()),
+                    param: None,
                 },
                 true,
             )
@@ -23607,6 +23619,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -24699,6 +24712,7 @@ mod tests {
                         name: "s".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -24907,6 +24921,7 @@ mod tests {
                         name: "self".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -25049,6 +25064,7 @@ mod tests {
                     name: "s".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25061,6 +25077,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25856,6 +25873,7 @@ mod tests {
                     name: "flag".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -25930,6 +25948,7 @@ mod tests {
                     name: "flag".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26012,6 +26031,7 @@ mod tests {
                     name: "flag".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26086,6 +26106,7 @@ mod tests {
                     name: "flag".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26393,6 +26414,7 @@ mod tests {
                         name: "a".into(),
                         ty,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -26447,6 +26469,7 @@ mod tests {
                         name: "p".into(),
                         ty,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -26535,6 +26558,7 @@ mod tests {
                         name: "p".into(),
                         ty,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -26600,6 +26624,7 @@ mod tests {
                         name: "p".into(),
                         ty,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -26654,6 +26679,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26786,6 +26812,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26831,6 +26858,7 @@ mod tests {
                     name: "c".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -26916,6 +26944,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27006,6 +27035,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27064,6 +27094,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27133,6 +27164,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27306,6 +27338,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27397,6 +27430,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27528,6 +27562,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27620,6 +27655,7 @@ mod tests {
                     name: "strategy".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27686,6 +27722,7 @@ mod tests {
                     name: "buf".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27725,6 +27762,7 @@ mod tests {
                     name: "receiver".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27781,6 +27819,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27792,6 +27831,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27857,6 +27897,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27868,6 +27909,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27933,6 +27975,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -27944,6 +27987,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28028,6 +28072,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28093,6 +28138,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28171,6 +28217,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28279,6 +28326,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28318,6 +28366,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28379,6 +28428,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28546,6 +28596,7 @@ mod tests {
                     name: "count".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28627,6 +28678,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28716,6 +28768,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28815,6 +28868,7 @@ mod tests {
                     name: "s".into(),
                     ty: ValueType::Ref(Some("String".into())),
                     class_root: Some("String".into()),
+                    param: None,
                 },
                 true,
             )
@@ -28938,6 +28992,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28949,6 +29004,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28985,6 +29041,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -28996,6 +29053,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -29070,6 +29128,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -29165,6 +29224,7 @@ mod tests {
                         name: name.into(),
                         ty: ValueType::Str,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -29379,6 +29439,7 @@ mod tests {
                         name: "s".into(),
                         ty: ValueType::Str,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -29461,6 +29522,7 @@ mod tests {
                     name: "haystack".into(),
                     ty: ValueType::Ref(Some("String".into())),
                     class_root: Some("String".into()),
+                    param: None,
                 },
                 true,
             )
@@ -29472,6 +29534,7 @@ mod tests {
                     name: "needle".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -30989,6 +31052,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31000,6 +31064,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31079,6 +31144,7 @@ mod tests {
                         name: "lhs".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -31090,6 +31156,7 @@ mod tests {
                         name: "rhs".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -31170,6 +31237,7 @@ mod tests {
                     name: "lhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31181,6 +31249,7 @@ mod tests {
                     name: "rhs".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31260,6 +31329,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31329,6 +31399,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31502,6 +31573,7 @@ mod tests {
                     name: "p_object".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31514,6 +31586,7 @@ mod tests {
                     name: "p_gcref".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31686,6 +31759,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31768,6 +31842,7 @@ mod tests {
                     name: "arg".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31818,6 +31893,7 @@ mod tests {
                     name: "arg".into(),
                     ty: arg_ty.clone(),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -31994,6 +32070,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32008,6 +32085,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32233,6 +32311,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32257,6 +32336,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32344,6 +32424,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32356,6 +32437,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32432,6 +32514,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32444,6 +32527,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32502,6 +32586,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32514,6 +32599,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32592,6 +32678,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32604,6 +32691,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32675,6 +32763,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32687,6 +32776,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32776,6 +32866,7 @@ mod tests {
                     name: "arg".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32852,6 +32943,7 @@ mod tests {
                     name: "arg".into(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -33025,6 +33117,7 @@ mod tests {
                     name: "node".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -33831,6 +33924,7 @@ mod tests {
                     name: "func".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -33843,6 +33937,7 @@ mod tests {
                     name: "code".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -33930,6 +34025,7 @@ mod tests {
                     name: "w_type".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -33942,6 +34038,7 @@ mod tests {
                     name: "status".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -34028,6 +34125,7 @@ mod tests {
                     name: "func".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -34039,6 +34137,7 @@ mod tests {
                     name: "name".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -34050,6 +34149,7 @@ mod tests {
                     name: "w_name".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -34123,6 +34223,7 @@ mod tests {
                     name: "owner".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -34138,6 +34239,7 @@ mod tests {
                     name: "code".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -35754,6 +35856,7 @@ mod tests {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -35827,6 +35930,7 @@ mod tests {
                     name: "p".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -35898,6 +36002,7 @@ mod tests {
                     name: "holder".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -35909,6 +36014,7 @@ mod tests {
                     name: "i".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -35992,6 +36098,7 @@ mod tests {
                     name: "list".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -36003,6 +36110,7 @@ mod tests {
                     name: "i".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -36075,6 +36183,7 @@ mod tests {
                     name: "arr".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -36086,6 +36195,7 @@ mod tests {
                     name: "i".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -36159,6 +36269,7 @@ mod tests {
                     name: "i".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -41658,6 +41769,7 @@ mod tests {
                         name: "opt".into(),
                         ty: ValueType::Int,
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -44879,6 +44991,7 @@ mod tests {
                     name: "p".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -45137,6 +45250,7 @@ mod tests {
                 name: "self".to_string(),
                 ty: ValueType::Ref(Some("PyFrame".to_string())),
                 class_root: Some("PyFrame".to_string()),
+                param: None,
             },
             recv,
         );
@@ -45202,6 +45316,7 @@ mod tests {
                     name: "code".into(),
                     ty: ValueType::Ref(Some("CodeObject".into())),
                     class_root: Some("CodeObject".into()),
+                    param: None,
                 },
                 true,
             )
@@ -46384,6 +46499,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -46958,6 +47074,7 @@ mod tests {
                     name: "s1".into(),
                     ty: ValueType::Str,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -47197,6 +47314,7 @@ mod tests {
                     name: "result".into(),
                     ty: result_ty.clone(),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -47405,6 +47523,7 @@ mod tests {
                     name: "result".into(),
                     ty: result_ty.clone(),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -47491,6 +47610,7 @@ mod tests {
                     name: "result".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -48117,6 +48237,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -48141,6 +48262,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Void,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -48152,6 +48274,7 @@ mod tests {
                     name: "a".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -48163,6 +48286,7 @@ mod tests {
                     name: "b".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -48348,6 +48472,7 @@ mod tests {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
                     class_root: field.owner_root.clone(),
+                    param: None,
                 },
                 true,
             )
@@ -48363,6 +48488,7 @@ mod tests {
                         ValueType::Str
                     },
                     class_root: rust_heap.then(|| "String".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -48965,6 +49091,7 @@ mod tests {
                     name: "handler".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49059,6 +49186,7 @@ mod tests {
                     name: "handler".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49145,6 +49273,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49156,6 +49285,7 @@ mod tests {
                         name: format!("a{i}"),
                         ty: ty.clone(),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -49204,6 +49334,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49218,6 +49349,7 @@ mod tests {
                             name: format!("a{i}"),
                             ty: ty.clone(),
                             class_root: None,
+                            param: None,
                         },
                         true,
                     )
@@ -49376,6 +49508,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49387,6 +49520,7 @@ mod tests {
                         name: format!("a{i}"),
                         ty: ty.clone(),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -49433,6 +49567,7 @@ mod tests {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -49447,6 +49582,7 @@ mod tests {
                             name: format!("a{i}"),
                             ty: ty.clone(),
                             class_root: None,
+                            param: None,
                         },
                         true,
                     )
@@ -52903,6 +53039,7 @@ mod tests {
                         name: "x".into(),
                         ty: input_ty,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53102,6 +53239,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53160,6 +53298,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53331,6 +53470,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53342,6 +53482,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53391,6 +53532,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53402,6 +53544,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53453,6 +53596,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53464,6 +53608,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53540,6 +53685,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53579,6 +53725,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53590,6 +53737,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53622,6 +53770,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53688,6 +53837,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53749,6 +53899,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53760,6 +53911,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53800,6 +53952,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53811,6 +53964,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53849,6 +54003,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53860,6 +54015,7 @@ mod tests {
                         name: "b".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53895,6 +54051,7 @@ mod tests {
                         name: "a".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -53931,6 +54088,7 @@ mod tests {
                         name: "x".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )

@@ -3716,8 +3716,9 @@ impl<'a> Lowering<'a> {
 
     /// Window data word is `CCHARP` (int-kind address) on every link.
     /// A GC fat box is split; a GC header is `rffi.cast(CCHARP, p)`;
-    /// a Signed address is `cast_int_to_ptr(CCHARP, int)` (`lltype.py`
-    /// `ann_cast_int_to_ptr`) so merge does not union `Ptr(Array)` with
+    /// a Signed / unstamped Integer address is `cast_int_to_ptr(CCHARP, int)`
+    /// (`lltype.py` `ann_cast_int_to_ptr`, `rffi.py` `rffi.cast`) so
+    /// `rffi.py` `charpsize2str` merge does not union `Ptr(Array)` with
     /// `Integer`.
     pub(in crate::front::mir) fn ensure_window_ccharp(
         &mut self,
@@ -3729,11 +3730,46 @@ impl<'a> Lowering<'a> {
         {
             return data;
         }
-        if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+        let bb_id = self.emit_bb(mir_bb);
+        self.coerce_ccharp_in_block(bb_id, ptr)
+    }
+
+    /// Stamp or wrap `ptr` as `rffi.py` `CCHARP` in `bb_id`.
+    /// Already-`CCHARP` producers (`str2charp` / `get_nonmovingbuffer` /
+    /// `cast_int_to_ptr`) alias. An Input is classified from its declared
+    /// type: a raw `*u8` is already `CCHARP`; a raw pointer to any other
+    /// pointee is one `rffi.cast` (`ll2ctypes.py` `ForceCastEntry`); a
+    /// declared integer or a reference to one is `cast_int_to_ptr`
+    /// (`lltype.py` `ann_cast_int_to_ptr`). A Call (`cast_ptr_to_int`) /
+    /// Const / BinOp address word is `cast_int_to_ptr` at this producer.
+    pub(in crate::front::mir) fn coerce_ccharp_in_block(
+        &mut self,
+        bb_id: BlockId,
+        ptr: Variable,
+    ) -> Variable {
+        if self.var_already_ccharp(&ptr) {
+            stamp_as_ccharp(&ptr);
             return ptr;
         }
+        match self.input_ccharp_kind(&ptr) {
+            Some(InputCcharpKind::AlreadyCcharp) => {
+                stamp_as_ccharp(&ptr);
+                return ptr;
+            }
+            Some(InputCcharpKind::ForceCast) => {
+                return emit_rffi_cast(
+                    &mut self.graph,
+                    bb_id,
+                    ptr,
+                    (*crate::translator::rtyper::lltypesystem::rffi::CCHARP).clone(),
+                );
+            }
+            Some(InputCcharpKind::CastIntToPtr) => {
+                return emit_cast_int_to_ccharp(&mut self.graph, bb_id, ptr);
+            }
+            None => {}
+        }
         if self.var_is_gc_ref_value(&ptr) {
-            let bb_id = self.emit_bb(mir_bb);
             return emit_rffi_cast_to_carray_ptr(
                 &mut self.graph,
                 bb_id,
@@ -3741,11 +3777,7 @@ impl<'a> Lowering<'a> {
                 &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
             );
         }
-        let kind = ptr.concretetype().as_ref().map(crate::model::getkind);
-        if matches!(kind, Some(crate::model::ConcreteType::Signed))
-            && !ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp)
-        {
-            let bb_id = self.emit_bb(mir_bb);
+        if self.var_is_int_kind(&ptr) {
             emit_cast_int_to_ccharp(&mut self.graph, bb_id, ptr)
         } else {
             ptr
@@ -3818,6 +3850,11 @@ impl<'a> Lowering<'a> {
         ptr: Variable,
         len: Variable,
     ) -> Variable {
+        let ptr = {
+            let coerced = self.ensure_window_ccharp(mir_bb, ptr);
+            stamp_as_ccharp(&coerced);
+            coerced
+        };
         let bb_id = self.emit_bb(mir_bb);
         self.push_charpsize2str(bb_id, ptr, len)
     }
@@ -3828,6 +3865,10 @@ impl<'a> Lowering<'a> {
         ptr: Variable,
         len: Variable,
     ) -> Variable {
+        // `rffi.py` `charpsize2str(cp, size)`: `cp` is `CCHARP`. A diamond
+        // Ok-arm extra is a fresh phi; coerce in this block so a raw
+        // address word is `rffi.cast` / `cast_int_to_ptr` at the producer.
+        let ptr = self.coerce_ccharp_in_block(bb_id, ptr);
         let header = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -3940,9 +3981,15 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             // Stamp only an int-kind source (`rffi.py` `CCHARP`). A
-            // Ref-banked actual (`*c_char` / GC start) `rffi.cast`s,
-            // even if a CCHARP stamp was applied without converting.
-            if self.var_is_int_kind(&args[i]) {
+            // declared raw pointer that is not `*u8` is one `rffi.cast`
+            // (`ll2ctypes.py` `ForceCastEntry`). A Ref-banked GC start
+            // still `rffi.cast`s via `cast_ptr_to_int`.
+            if self.var_is_int_kind(&args[i])
+                || matches!(
+                    self.input_ccharp_kind(&args[i]),
+                    Some(InputCcharpKind::ForceCast)
+                )
+            {
                 let coerced = self.ensure_window_ccharp(mir_bb, args[i].clone());
                 stamp_as_ccharp(&coerced);
                 args[i] = coerced;
@@ -4194,6 +4241,7 @@ impl<'a> Lowering<'a> {
                 pure: false,
             },
         });
+        stamp_as_ccharp(&data);
         let len = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -5197,16 +5245,25 @@ impl<'a> Lowering<'a> {
             true_extras
                 .iter()
                 .map(|v| {
-                    crate::front::option_variant::map_source(&true_sources, &true_inputs, v)
-                        .expect("true-arm extra threaded")
+                    let mapped =
+                        crate::front::option_variant::map_source(&true_sources, &true_inputs, v)
+                            .expect("true-arm extra threaded");
+                    // `Variable.copy` (`flowspace/model.py`) keeps
+                    // `concretetype`. A CCHARP extra must keep that stamp
+                    // so the Ok arm does not recast `SomePtr`.
+                    copy_concretetype(v, &mapped);
+                    mapped
                 })
                 .collect()
         };
         let false_mapped: Vec<Variable> = false_extras
             .iter()
             .map(|v| {
-                crate::front::option_variant::map_source(&false_sources, &false_inputs, v)
-                    .expect("false-arm extra threaded")
+                let mapped =
+                    crate::front::option_variant::map_source(&false_sources, &false_inputs, v)
+                        .expect("false-arm extra threaded");
+                copy_concretetype(v, &mapped);
+                mapped
             })
             .collect();
 

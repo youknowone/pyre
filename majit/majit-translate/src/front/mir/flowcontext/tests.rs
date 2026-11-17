@@ -327,6 +327,7 @@ fn inline_vec_field_part_uses_ssi_local_as_field_read_base() {
                 name: "holder".into(),
                 ty: ValueType::Ref(Some("Holder".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -389,6 +390,7 @@ fn dyn_receiver_data_word_uses_ssi_local_as_field_read_base() {
                 name: "strategy".into(),
                 ty: ValueType::Ref(Some("Strategy".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -4990,6 +4992,7 @@ fn single_arg_display_fmt_fixture_spill(
                 name: "ctx".to_string(),
                 ty: ValueType::Ref(Some(root.to_string())),
                 class_root: Some(root.to_string()),
+                param: None,
             },
         });
     }
@@ -5236,6 +5239,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
             name: "n".into(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -5778,6 +5782,7 @@ fn single_arg_lower_hex_fmt_graph(
             name: "n".into(),
             ty: value_ty.clone(),
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -6022,6 +6027,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_function_scope_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(b0).operations.push(SpaceOperation {
@@ -6115,6 +6121,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_join_phi_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(alloc_bb).operations.push(SpaceOperation {
@@ -6220,6 +6227,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_loop_carried_cell() {
             name: "n".to_string(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     graph.block_mut(alloc_bb).operations.push(SpaceOperation {
@@ -6373,6 +6381,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
             name: "n".into(),
             ty: ValueType::Int,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -6979,6 +6988,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
             name: "ctx".into(),
             ty: ValueType::Str,
             class_root: None,
+            param: None,
         },
     });
     let tuple = Variable::new();
@@ -8852,6 +8862,7 @@ fn module_dict_strategy_getitem_str_self_names_class_root() {
                     name,
                     ty,
                     class_root,
+                    ..
                 } => Some((name.clone(), ty.clone(), class_root.clone())),
                 _ => None,
             })
@@ -9902,6 +9913,7 @@ fn closure_env_upvar_read_annotates_through_function_path() {
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -10553,6 +10565,7 @@ fn vec_index_retargets_each_receiver_shape() {
                     name: name.into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -10664,6 +10677,7 @@ fn vec_set_len_write_keeps_the_struct_owner() {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10701,6 +10715,7 @@ fn vec_set_len_write_keeps_the_struct_owner() {
                 name: "v".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10726,6 +10741,7 @@ fn shared_inline_vec_len_and_index_keep_the_field_read() {
                 name: "frame".into(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -10818,6 +10834,7 @@ fn gcref_field_cast_to_tuple_graph_annotates_sometuple_and_pos0_list() {
                 name: "dstorage".to_string(),
                 ty: ValueType::Ref(None),
                 class_root: Some("GCREF".to_string()),
+                param: None,
             },
             true,
         )
@@ -13785,6 +13802,7 @@ fn frame_anchor_live_input_is_the_frame_ref() {
                 name,
                 ty,
                 class_root,
+                ..
             } if name == "self" => Some((ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -14847,6 +14865,7 @@ fn melt_abort_fixture_input(
                 name: name.into(),
                 ty: ValueType::Ref(Some("Obj".into())),
                 class_root: None,
+                param: None,
             },
             true,
         )

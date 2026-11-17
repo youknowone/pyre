@@ -10846,6 +10846,43 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
         == Some("u8")
 }
 
+/// `*const u8` / `*mut u8` after `type T = U` (`TypeDeclKind::Alias`) on
+/// the pointer and on the pointee. `rffi.py` `CCHARP`.
+pub(in crate::front::mir) fn tyref_is_raw_u8_ptr_through_aliases(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_peel_one_raw_ptr_through_aliases(ty, llbc)
+        .and_then(|pointee| json_ty_scalar_element_spelling(pointee, llbc))
+        .as_deref()
+        == Some("u8")
+}
+
+/// Declared integer (`usize`, `i64`, `u8`, …) or one `&` / `&mut` of an
+/// integer, after `type T = U`. A raw pointer is not a reference.
+pub(in crate::front::mir) fn tyref_is_integer_or_ref_to_integer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc)) else {
+        return false;
+    };
+    if node_is_integer_scalar(node, llbc) {
+        return true;
+    }
+    let Some(pointee) = node
+        .as_object()
+        .and_then(|obj| obj.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .and_then(|p| type_node_peel_aliases(p, llbc))
+    else {
+        return false;
+    };
+    node_is_integer_scalar(pointee, llbc)
+}
+
+fn node_is_integer_scalar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    strip_ty_indirections(node, llbc)
+        .and_then(|n| n.as_object()?.get("Scalar"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scalar| scalar.contains_key("Integer"))
+}
+
 /// `*mut` / `*const` whose pointee is `c_void` (`rffi.py` `VOIDP`).
 /// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
 /// is the same VOIDP word. A `type T = *mut c_void` dest names the

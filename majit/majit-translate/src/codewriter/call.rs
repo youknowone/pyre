@@ -18199,6 +18199,7 @@ pub(crate) fn effect_graph_from_rtyped_helper(
                 name,
                 ty,
                 class_root: None,
+                param: None,
             },
             var,
         );
@@ -26744,6 +26745,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             arg,
         );
@@ -27200,6 +27202,7 @@ mod tests {
                     name: name.to_string(),
                     ty,
                     class_root: None,
+                    param: None,
                 },
                 var,
             );
@@ -27231,6 +27234,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             formal,
         );
@@ -27266,6 +27270,7 @@ mod tests {
                 name: "code".to_string(),
                 ty: ValueType::Ref(Some("CodeObject".to_string())),
                 class_root: Some("CodeObject".to_string()),
+                param: None,
             },
             arg,
         );
@@ -27318,6 +27323,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             arg,
         );
@@ -28907,6 +28913,7 @@ mod tests {
                 name: "frame".to_string(),
                 ty: ValueType::Ref(None),
                 class_root: None,
+                param: None,
             },
             frame_var.clone(),
         );
@@ -33562,6 +33569,7 @@ mod tests {
                     name: "base".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 base.clone(),
             );

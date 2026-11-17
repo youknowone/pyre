@@ -22970,6 +22970,7 @@ fn map_or_niche_raw_struct_is_operands_agree() {
                 name: "self".into(),
                 ty: ValueType::Int,
                 class_root: Some("OwnedFd".into()),
+                param: None,
             },
             true,
         )
@@ -25948,6 +25949,7 @@ fn invert_of_int_as_branch_keeps_op_and_exit_order() {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -26028,6 +26030,7 @@ fn eq_int_const_bool_false_as_branch_is_not_peeled() {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
             true,
         )
@@ -26124,6 +26127,7 @@ fn const_none_niche_switch_fuses_ptr_iszero_without_residual() {
                 name: "opt".into(),
                 ty: ValueType::Ref(Some("FrameDebugData".into())),
                 class_root: Some("FrameDebugData".into()),
+                param: None,
             },
             true,
         )
@@ -27937,6 +27941,7 @@ fn mut_ref_cell_try_dispatch_binary_special() {
             name,
             ty,
             class_root,
+            ..
         } = &op.kind
         else {
             continue;
@@ -27978,6 +27983,7 @@ fn normalize_exception_self_input_is_mut_ref_cell() {
             name,
             ty,
             class_root,
+            ..
         } = &op.kind
         else {
             continue;
@@ -34774,6 +34780,7 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             result_ty,
+            args,
             ..
         } = &op.kind
         else {
@@ -34798,6 +34805,15 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
                 dest.concretetype().as_ref(),
                 Some(&*STRPTR),
                 "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            let cp = args[0].as_variable().expect("ll_charpsize2str cp");
+            assert!(
+                cp.concretetype()
+                    .as_ref()
+                    .is_some_and(super::lltype_is_ccharp),
+                "ll_charpsize2str slot 0 is CCHARP; ct={:?} graph={}",
+                cp.concretetype(),
                 graph.dump()
             );
             str_copies += 1;
@@ -34828,6 +34844,624 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         Some("CCHARP"),
         "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
         helper.dump()
+    );
+}
+
+/// Integer address word used as `charpsize2str` `cp` is `rffi.cast` /
+/// `cast_int_to_ptr(CCHARP, int)` at the producer (`rffi.py` `CCHARP`).
+/// `from_raw_parts(usize, usize)` then `from_utf8_unchecked` is the
+/// Integer-for-`cp` call shape: helper slot 0 is `SomePtr` of `CCHARP`.
+#[test]
+fn integer_cp_to_ll_charpsize2str_is_ccharp() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let from_raw = window_opaque_fun(
+        1,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![n.clone(), n.clone()],
+        shared.clone(),
+    );
+    let from_utf8 = window_opaque_fun(
+        2,
+        &["core", "str", "converts", "from_utf8_unchecked"],
+        vec![shared.clone()],
+        str_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "integer_cp_charpsize2str"], true),
+        "signature": {"is_unsafe": true, "inputs": [n, n], "output": str_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &str_ty),
+                window_local(1, &n),
+                window_local(2, &n),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, from_raw, from_utf8]);
+    let graph = crate::test_support::lower_function(&llbc, "integer_cp_charpsize2str")
+        .expect("lower Integer-for-cp from_raw_parts + from_utf8_unchecked");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_int_to_ptr"),
+        "Integer address is cast_int_to_ptr(CCHARP); leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let mut copies = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        copies += 1;
+        assert_eq!(
+            args.len(),
+            2,
+            "charpsize2str(cp, size); graph={}",
+            graph.dump()
+        );
+        let cp = match &args[0] {
+            LinkArg::Value(v) => v,
+            other => panic!("cp is a Variable, got {other:?}; graph={}", graph.dump()),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "helper slot 0 is CCHARP SomePtr; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        copies >= 1,
+        "from_utf8_unchecked of an Integer window copies via ll_charpsize2str; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp_root = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp_root.as_deref(),
+        Some("CCHARP"),
+        "ll_charpsize2str slot 0 Input is CCHARP; helper={}",
+        helper.dump()
+    );
+}
+
+fn charpsize2str_vec_ty(vec_id: u64) -> serde_json::Value {
+    let u8_ty = window_u8();
+    serde_json::json!({
+        "Adt": {
+            "id": vec_id,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [u8_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn charpsize2str_vec_decl(vec_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": vec_id,
+        "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
+        "kind": {"Struct": []}
+    })
+}
+
+fn window_const_i8_ptr() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [i8_ty(), "Const"]})
+}
+
+fn named_window_local(i: u64, name: &str, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"index": i, "name": name, "span": window_span(), "ty": ty})
+}
+
+fn lower_cp_arg_to_charpsize2str(
+    name: &str,
+    cp_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    vec_id: u64,
+) -> crate::model::FunctionGraph {
+    let n = window_usize();
+    let vec_ty = charpsize2str_vec_ty(vec_id);
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let callee = window_opaque_fun(
+        1,
+        &["majit_rlib", "rffi", "buffer", "charpsize2str"],
+        vec![window_mut_u8_ptr(), n.clone()],
+        vec_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": true, "inputs": [cp_ty, n], "output": vec_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &vec_ty),
+                named_window_local(1, "cp", &cp_ty),
+                named_window_local(2, "n", &n)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &cp_ty)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let mut types = type_decls;
+    types.push(charpsize2str_vec_decl(vec_id));
+    let llbc = window_llbc(types, vec![caller, callee]);
+    crate::test_support::lower_function(&llbc, name)
+        .unwrap_or_else(|err| panic!("lower {name}: {err:?}"))
+}
+
+fn charpsize2str_call_cp(graph: &crate::model::FunctionGraph) -> crate::flowspace::model::Variable {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let leaf = segments.last().map(String::as_str);
+        if leaf != Some("charpsize2str") && leaf != Some(crate::front::join_chars::LL_CHARPSIZE2STR)
+        {
+            continue;
+        }
+        return match args.first() {
+            Some(LinkArg::Value(v)) => v.clone(),
+            other => panic!(
+                "charpsize2str cp is a Variable, got {other:?}; graph={}",
+                graph.dump()
+            ),
+        };
+    }
+    panic!(
+        "expected a charpsize2str call; leafs={:?} graph={}",
+        window_call_leafs(graph),
+        graph.dump()
+    )
+}
+
+fn graph_input_named<'a>(
+    graph: &'a crate::model::FunctionGraph,
+    want: &str,
+) -> &'a crate::flowspace::model::Variable {
+    use crate::model::OpKind;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if let OpKind::Input { name, .. } = &op.kind
+            && name == want
+        {
+            return op
+                .result
+                .as_ref()
+                .unwrap_or_else(|| panic!("Input {want} has a result; graph={}", graph.dump()));
+        }
+    }
+    panic!("expected Input {want}; graph={}", graph.dump())
+}
+
+fn call_producer_leaf(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<Vec<String>> {
+    use crate::model::{CallTarget, OpKind};
+    let (block_id, idx) = super::resolve_to_producer_op(graph, var)?;
+    let op = graph
+        .blocks
+        .iter()
+        .find(|block| block.id == block_id)
+        .and_then(|block| block.operations.get(idx))?;
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => Some(segments.clone()),
+        _ => None,
+    }
+}
+
+/// `fn f(cp: usize, n: usize)` passed as `charpsize2str`'s char pointer:
+/// `cast_int_to_ptr` result reaches the call; the Input stays an integer.
+#[test]
+fn usize_cp_to_charpsize2str_is_cast_int_to_ptr() {
+    let graph = lower_cp_arg_to_charpsize2str("usize_cp_charpsize2str", window_usize(), vec![], 0);
+    let input = graph_input_named(&graph, "cp");
+    assert!(
+        !input
+            .concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "usize Input is not stamped CCHARP; ct={:?} graph={}",
+        input.concretetype(),
+        graph.dump()
+    );
+    let cp = charpsize2str_call_cp(&graph);
+    assert_ne!(
+        cp,
+        *input,
+        "cast_int_to_ptr result reaches the call, not the Input; graph={}",
+        graph.dump()
+    );
+    assert!(
+        cp.concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "call cp is CCHARP; ct={:?} graph={}",
+        cp.concretetype(),
+        graph.dump()
+    );
+    let producer = call_producer_leaf(&graph, &cp);
+    assert_eq!(
+        producer.as_ref().and_then(|s| s.last()).map(String::as_str),
+        Some("cast_int_to_ptr"),
+        "cp producer is cast_int_to_ptr; producer={producer:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(cp: *const u8, n: usize)`: the Input is already CCHARP and
+/// reaches `charpsize2str` with no cast.
+#[test]
+fn raw_u8_cp_to_charpsize2str_is_the_input() {
+    let graph =
+        lower_cp_arg_to_charpsize2str("raw_u8_cp_charpsize2str", window_const_u8_ptr(), vec![], 0);
+    let input = graph_input_named(&graph, "cp");
+    assert!(
+        input
+            .concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "*const u8 Input is CCHARP; ct={:?} graph={}",
+        input.concretetype(),
+        graph.dump()
+    );
+    let cp = charpsize2str_call_cp(&graph);
+    assert_eq!(
+        cp,
+        *input,
+        "*const u8 Input reaches the call; graph={}",
+        graph.dump()
+    );
+    let producer = call_producer_leaf(&graph, &cp);
+    let producer_leaf = producer.as_ref().and_then(|s| s.last()).map(String::as_str);
+    assert!(
+        producer_leaf != Some("cast_int_to_ptr") && producer_leaf != Some("cast"),
+        "*const u8 Input is not recast; producer={producer_leaf:?} graph={}",
+        graph.dump()
+    );
+}
+
+fn i8_alias_decl() -> serde_json::Value {
+    type_decl_alias(0, &["fixture", "I8Alias"], i8_ty())
+}
+
+fn raw_const_i8_alias_ptr() -> serde_json::Value {
+    serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "generics": window_empty_generics()}
+        }, "Const"]
+    })
+}
+
+fn charpsize2str_i8_cp_call_leafs(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+    use crate::model::{CallTarget, OpKind};
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `fn f(cp: *const i8)` and `fn f(cp: *const I8Alias)` (`type I8Alias = i8`)
+/// emit the same ops: one `rffi.cast` (`ForceCastEntry`), not a stamp.
+#[test]
+fn raw_i8_cp_to_charpsize2str_is_rffi_cast_same_as_alias() {
+    let direct =
+        lower_cp_arg_to_charpsize2str("raw_i8_cp_charpsize2str", window_const_i8_ptr(), vec![], 0);
+    let aliased = lower_cp_arg_to_charpsize2str(
+        "raw_i8_alias_cp_charpsize2str",
+        raw_const_i8_alias_ptr(),
+        vec![i8_alias_decl()],
+        1,
+    );
+    for (label, graph) in [("direct *const i8", &direct), ("*const I8Alias", &aliased)] {
+        let input = graph_input_named(graph, "cp");
+        assert!(
+            !input
+                .concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{label} Input is not stamped CCHARP; ct={:?} graph={}",
+            input.concretetype(),
+            graph.dump()
+        );
+        let cp = charpsize2str_call_cp(graph);
+        assert_ne!(
+            cp,
+            *input,
+            "{label} rffi.cast result reaches the call; graph={}",
+            graph.dump()
+        );
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{label} call cp is CCHARP; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+        let producer = call_producer_leaf(graph, &cp)
+            .unwrap_or_else(|| panic!("{label} cp has a Call producer; graph={}", graph.dump()));
+        assert_eq!(
+            producer.as_slice(),
+            ["rpython", "rtyper", "lltypesystem", "rffi", "cast"],
+            "{label} is one rffi.cast; producer={producer:?} graph={}",
+            graph.dump()
+        );
+        let leafs = window_call_leafs(graph);
+        assert!(
+            !leafs.iter().any(|leaf| leaf.as_str() == "cast_ptr_to_int"),
+            "{label} is not cast_ptr_to_int + cast_int_to_ptr; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            !leafs.iter().any(|leaf| leaf.as_str() == "cast_int_to_ptr"),
+            "{label} is not cast_int_to_ptr; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+    assert_eq!(
+        charpsize2str_i8_cp_call_leafs(&direct),
+        charpsize2str_i8_cp_call_leafs(&aliased),
+        "direct *const i8 and *const I8Alias emit the same Call sequence; \
+         direct={} aliased={}",
+        direct.dump(),
+        aliased.dump()
+    );
+}
+
+/// First Call whose path leaf is `leaf`, as Variables. Two CCHARP
+/// actuals live in one startblock Call so SSI renaming does not hide
+/// the Input producer (`resolve_to_producer_op` walks links that exist
+/// only after the predecessor terminator is emitted).
+fn call_args_for_leaf(
+    graph: &crate::model::FunctionGraph,
+    leaf: &str,
+) -> Vec<crate::flowspace::model::Variable> {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some(leaf) {
+            continue;
+        }
+        return args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Value(v) => v.clone(),
+                other => panic!(
+                    "{leaf} arg is a Variable, got {other:?}; graph={}",
+                    graph.dump()
+                ),
+            })
+            .collect();
+    }
+    panic!(
+        "{leaf} is called; leafs={:?} graph={}",
+        window_call_leafs(graph),
+        graph.dump()
+    );
+}
+
+/// `fn f(cp: &[u8], cp_len: *const i8)`: the generated length Input of
+/// `cp` is named `cp_len`, the same as the real pointer parameter.
+/// Classification uses the Input's recorded parameter position
+/// (`HighLevelOp.inputarg` / `args_v[arg]`), so the length word is
+/// `cast_int_to_ptr` and the pointer is one `rffi.cast`. Both uses are
+/// actuals of one startblock Call: a later-block Call would rename the
+/// Input onto a block inputarg before the predecessor Link exists.
+#[test]
+fn slice_cp_len_name_collision_classifies_by_position() {
+    use crate::model::{InputParam, OpKind};
+
+    let shared = window_shared_slice();
+    let cp_len_ty = window_const_i8_ptr();
+    let usize_ty = window_usize();
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let sink = window_opaque_fun(
+        1,
+        &["fixture", "sink"],
+        vec![window_mut_u8_ptr(), window_mut_u8_ptr()],
+        i64_ty.clone(),
+    );
+    let cp_place = window_place(serde_json::json!({"Local": 1}), &shared);
+    let len_place = window_place(
+        serde_json::json!({"Projection": [cp_place, "PtrMetadata"]}),
+        &usize_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "slice_cp_len_collision"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [shared, cp_len_ty],
+            "output": i64_ty
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &i64_ty),
+                named_window_local(1, "cp", &shared),
+                named_window_local(2, "cp_len", &cp_len_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": len_place},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &cp_len_ty)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, sink]);
+    let graph = crate::test_support::lower_function(&llbc, "slice_cp_len_collision")
+        .unwrap_or_else(|err| panic!("lower slice_cp_len_collision: {err:?}"));
+
+    let start_inputs: Vec<_> = graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { name, param, .. } => Some((name.as_str(), *param, op.result.as_ref()?)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        start_inputs
+            .iter()
+            .map(|(name, param, _)| (*name, *param))
+            .collect::<Vec<_>>(),
+        vec![
+            ("cp", Some(InputParam::Data(1))),
+            ("cp_len", Some(InputParam::Length(1))),
+            ("cp_len", Some(InputParam::Whole(2))),
+        ],
+        "Inputs record parameter position, not name; graph={}",
+        graph.dump()
+    );
+    let length_word = start_inputs[1].2;
+    let real_cp_len = start_inputs[2].2;
+
+    let args = call_args_for_leaf(&graph, "sink");
+    assert_eq!(
+        args.len(),
+        2,
+        "sink takes two CCHARP actuals; leafs={:?} graph={}",
+        window_call_leafs(&graph),
+        graph.dump()
+    );
+    assert_ne!(
+        args[0],
+        *length_word,
+        "length word goes through cast_int_to_ptr, not in place; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        call_producer_leaf(&graph, &args[0])
+            .as_ref()
+            .and_then(|s| s.last())
+            .map(String::as_str),
+        Some("cast_int_to_ptr"),
+        "slice length used as CCHARP is cast_int_to_ptr; producer={:?} graph={}",
+        call_producer_leaf(&graph, &args[0]),
+        graph.dump()
+    );
+    assert_ne!(
+        args[1],
+        *real_cp_len,
+        "real cp_len goes through rffi.cast, not in place; graph={}",
+        graph.dump()
+    );
+    let real_producer = call_producer_leaf(&graph, &args[1])
+        .unwrap_or_else(|| panic!("real cp_len has a Call producer; graph={}", graph.dump()));
+    assert_eq!(
+        real_producer.as_slice(),
+        ["rpython", "rtyper", "lltypesystem", "rffi", "cast"],
+        "real *const i8 cp_len is one rffi.cast; producer={real_producer:?} graph={}",
+        graph.dump()
     );
 }
 
@@ -50583,6 +51217,7 @@ fn w_str_from_storage_payload_len_is_strlen() {
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), format!("{ty:?}"), class_root.clone())),
             _ => None,
         })

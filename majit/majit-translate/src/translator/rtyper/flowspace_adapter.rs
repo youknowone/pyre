@@ -7723,6 +7723,7 @@ fn function_graph_to_flowspace_inner(
                     name,
                     ty: _,
                     class_root: _,
+                    param: None,
                 },
             ) = (legacy_op.result.as_ref(), &legacy_op.kind)
                 && legacy_block.inputargs.contains(result_var)
@@ -7786,6 +7787,7 @@ fn function_graph_to_flowspace_inner(
                     name,
                     ty: _,
                     class_root: _,
+                    param: None,
                 },
             ) = (legacy_op.result.as_ref(), &legacy_op.kind)
             {
@@ -8527,6 +8529,7 @@ mod tests {
                         name: "x".to_string(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                 },
                 // Rebind: result is fresh; same name → alias to vars[1]'s Variable.
@@ -8536,6 +8539,7 @@ mod tests {
                         name: "x".to_string(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                 },
             ],
@@ -8625,6 +8629,7 @@ mod tests {
                 name: "x".to_string(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             },
         };
         let result = translate_op(&op, &value_map, &empty_call_registry())
@@ -8647,6 +8652,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("header::GCREFOpaque".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -8701,6 +8707,7 @@ mod tests {
                         name: "s".to_string(),
                         ty,
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -8765,6 +8772,7 @@ mod tests {
                         name: "s".to_string(),
                         ty,
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -8829,6 +8837,7 @@ mod tests {
                         name: "s".to_string(),
                         ty,
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -8861,6 +8870,7 @@ mod tests {
                     name: "opt".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("Option<&pyobject::PyObject>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -8911,6 +8921,7 @@ mod tests {
                         name: "opt".to_string(),
                         ty,
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -8965,6 +8976,7 @@ mod tests {
                         name: "obj".to_string(),
                         ty: ValueType::Ref(None),
                         class_root,
+                        param: None,
                     },
                     true,
                 )
@@ -8999,6 +9011,7 @@ mod tests {
                         name: "obj".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: Some(class_root.to_string()),
+                        param: None,
                     },
                     true,
                 )
@@ -9031,6 +9044,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("pyobject::PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9058,6 +9072,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -9069,6 +9084,7 @@ mod tests {
                     name: "y".to_string(),
                     ty: ValueType::Float,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -9080,6 +9096,7 @@ mod tests {
                     name: "z".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -9119,6 +9136,7 @@ mod tests {
                     name: "func".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9146,6 +9164,7 @@ mod tests {
                     name: "data".to_string(),
                     ty: ValueType::Unsigned,
                     class_root: Some("CCHARP".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9173,6 +9192,7 @@ mod tests {
                     name: "root".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("header::GCREFOpaque".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9200,6 +9220,7 @@ mod tests {
                     name: "cp".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("CCHARP".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9236,6 +9257,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9304,6 +9326,7 @@ mod tests {
                     name: "anchor".to_string(),
                     ty: ValueType::Int,
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9339,6 +9362,7 @@ mod tests {
                     name: "func".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("Option<fn>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9367,6 +9391,7 @@ mod tests {
                         name: "func".to_string(),
                         ty: ValueType::Int,
                         class_root: Some(class_root.to_string()),
+                        param: None,
                     },
                     true,
                 )
@@ -9393,6 +9418,7 @@ mod tests {
                     name: "value".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9440,6 +9466,7 @@ mod tests {
                         name: "frame".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: Some("PyFrame".to_string()),
+                        param: None,
                     },
                     true,
                 )
@@ -9492,6 +9519,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("RangeInclusive<i64>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9548,6 +9576,7 @@ mod tests {
                     name: "start".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("char".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9577,6 +9606,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("Foo<i64>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9617,6 +9647,7 @@ mod tests {
                     name: "s".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("pyre_object::unicodeobject::Utf8Str".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9654,6 +9685,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("celldict::ModuleDictStrategy".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9702,6 +9734,7 @@ mod tests {
                     name: "args".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("Tuple<i64,f64>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9750,6 +9783,7 @@ mod tests {
                     name: "scope".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9814,6 +9848,7 @@ mod tests {
                     name: "block".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9865,6 +9900,7 @@ mod tests {
                     name: "block".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(class_root.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9918,6 +9954,7 @@ mod tests {
                     name: "entries".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(class_root.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -9995,6 +10032,7 @@ mod tests {
                     name: "block".to_string(),
                     ty: ValueType::Ref(Some(owner.to_string())),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -10077,6 +10115,7 @@ mod tests {
                     name: "ec".to_string(),
                     ty: ValueType::Ref(Some(owner.to_string())),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -10147,6 +10186,7 @@ mod tests {
                     name: "args_w".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("[PyObjectRef]".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -10173,6 +10213,7 @@ mod tests {
                     name: "args".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("Slice<PyObjectRef>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -10203,6 +10244,7 @@ mod tests {
                     name: "value".to_string(),
                     ty: ValueType::Ref(Some("UnregisteredRoot".to_string())),
                     class_root: Some("UnregisteredRoot".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -10246,6 +10288,7 @@ mod tests {
                     name: "u".to_string(),
                     ty: ValueType::Unknown,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -10275,6 +10318,7 @@ mod tests {
                         name: format!("a{i}"),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                     true,
                 )
@@ -10364,6 +10408,7 @@ mod tests {
                         name: "obj".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: Some("PyObject".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -10576,6 +10621,7 @@ mod tests {
                         name: "obj".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: Some("PyObject".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -10683,6 +10729,7 @@ mod tests {
                         name: "obj".to_string(),
                         ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
                         class_root: Some("W_UnicodeObject".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -10830,6 +10877,7 @@ mod tests {
                             name: "obj".to_string(),
                             ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
                             class_root: Some("W_UnicodeObject".to_string()),
+                            param: None,
                         },
                     },
                     SpaceOperation {
@@ -10938,6 +10986,7 @@ mod tests {
                             name: "obj".to_string(),
                             ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
                             class_root: Some("W_UnicodeObject".to_string()),
+                            param: None,
                         },
                     },
                     SpaceOperation {
@@ -10996,6 +11045,7 @@ mod tests {
                         name: "other".to_string(),
                         ty: ValueType::Int,
                         class_root: None,
+                        param: None,
                     },
                 }],
                 exitswitch: None,
@@ -12629,6 +12679,7 @@ mod tests {
                     name: "v".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("Vec<i64>".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -12640,6 +12691,7 @@ mod tests {
                     name: "i".to_string(),
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -12769,6 +12821,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(Some("Function".to_string())),
                     class_root: Some("Function".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -12905,6 +12958,7 @@ mod tests {
                     name: "p".to_string(),
                     ty: ValueType::Str,
                     class_root: Some("*mut unicodeobject::Utf8Str".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -12992,6 +13046,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some("*mut pyobject::PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -13132,6 +13187,7 @@ mod tests {
                     name: "p".to_string(),
                     ty: ValueType::Str,
                     class_root: Some("*mut unicodeobject::Utf8Str".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -13307,6 +13363,7 @@ mod tests {
                     name: "func".to_string(),
                     ty: ValueType::Ref(Some("Function".to_string())),
                     class_root: Some("Function".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -13326,6 +13383,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(Some("PyObject".to_string())),
                     class_root: Some("PyObject".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -14415,6 +14473,7 @@ mod tests {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(Some(name.to_string())),
                     class_root: Some(name.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -14485,6 +14544,7 @@ mod tests {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(Some(name.to_string())),
                     class_root: Some(name.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -14528,6 +14588,7 @@ mod tests {
                     name: "self".to_string(),
                     ty: ValueType::Ref(Some(name.to_string())),
                     class_root: Some(name.to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -14573,6 +14634,7 @@ mod tests {
                     name: "operr".to_string(),
                     ty: ValueType::Ref(Some(name.to_string())),
                     class_root: Some(format!("Option<{name}>")),
+                    param: None,
                 },
                 true,
             )
@@ -15935,6 +15997,7 @@ mod tests {
                     name: "getclass".to_string(),
                     ty: ValueType::Int,
                     class_root: Some("fn(i64) -> bool".to_string()),
+                    param: None,
                 },
                 true,
             )
@@ -15946,6 +16009,7 @@ mod tests {
                     name: "obj".to_string(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -17851,6 +17915,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
                         class_root: Some("FmtArg::Bytes".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -17959,6 +18024,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("borrow::Cow<[u8]>::Borrowed".to_string())),
                         class_root: Some("borrow::Cow<[u8]>::Borrowed".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -18053,6 +18119,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("Holder".to_string())),
                         class_root: Some("Holder".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -18165,6 +18232,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
                         class_root: Some("FmtArg::Bytes".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -18311,6 +18379,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
                         class_root: Some("FmtArg::Bytes".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -18414,6 +18483,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
                         class_root: Some("FmtArg::Bytes".to_string()),
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -18530,6 +18600,7 @@ mod tests {
                             name: "base".to_string(),
                             ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
                             class_root: Some("FmtArg::Bytes".to_string()),
+                            param: None,
                         },
                     },
                     SpaceOperation {
@@ -18582,6 +18653,7 @@ mod tests {
                         name: "base".to_string(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                 },
                 SpaceOperation {
@@ -19278,6 +19350,7 @@ mod tests {
                 name: "x".into(),
                 ty: ValueType::Int,
                 class_root: None,
+                param: None,
             }),
             "Input"
         );
@@ -19914,6 +19987,7 @@ mod tests {
                     name: "e".to_string(),
                     ty: ValueType::Ref(Some("E".to_string())),
                     class_root: Some("E".to_string()),
+                    param: None,
                 },
                 true,
             )

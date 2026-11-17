@@ -4106,6 +4106,7 @@ fn function_get_qualname_obj_force_receiver_is_function_cast() {
                     name,
                     ty,
                     class_root,
+                    ..
                 } => dump.push(format!("Input {name} ty={ty:?} class_root={class_root:?}")),
                 OpKind::Call {
                     target,

@@ -11491,6 +11491,7 @@ mod tests {
                         name: "value".into(),
                         ty: ValueType::Ref(None),
                         class_root: Some("GCREF".into()),
+                        param: None,
                     },
                 },
                 crate::model::SpaceOperation {
@@ -11499,6 +11500,7 @@ mod tests {
                         name: "arg".into(),
                         ty: ValueType::Ref(None),
                         class_root: None,
+                        param: None,
                     },
                 },
                 crate::model::SpaceOperation {
@@ -12394,6 +12396,7 @@ mod tests {
                     name: "x".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
             }],
             exitswitch: None,
@@ -12709,6 +12712,7 @@ mod tests {
                     name: "c".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -13072,6 +13076,7 @@ mod tests {
                     name: "c".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -18005,6 +18010,7 @@ mod tests {
                     name: "switch".into(),
                     ty: ValueType::Bool,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -20430,6 +20436,7 @@ mod tests {
                     name: "s".into(),
                     ty: ValueType::Int,
                     class_root: Some(outer.into()),
+                    param: None,
                 },
                 true,
             )
@@ -22779,6 +22786,7 @@ mod tests {
                     name: "conn".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -23353,6 +23361,7 @@ mod tests {
                     name: "block".to_string(),
                     ty: ValueType::Ref(None),
                     class_root: Some(owner.to_string()),
+                    param: None,
                 },
                 true,
             )

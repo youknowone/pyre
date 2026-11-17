@@ -1053,12 +1053,21 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             }
             None => (ty, class_root),
         };
+        if class_root.as_deref() == Some("CCHARP") {
+            stamp_as_ccharp(&var);
+        }
+        let param = if len_slot.is_some() {
+            crate::model::InputParam::Data(i)
+        } else {
+            crate::model::InputParam::Whole(i)
+        };
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
                 name: name.clone(),
                 ty,
                 class_root,
+                param: Some(param),
             },
         });
         startblock_args.push(var);
@@ -1072,6 +1081,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                     name: len_name,
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: Some(crate::model::InputParam::Length(i)),
                 },
             });
             startblock_args.push(len_var);
@@ -1087,6 +1097,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 name,
                 ty: ValueType::Unsigned,
                 class_root: None,
+                param: None,
             },
         });
         startblock_args.push(var);
@@ -1959,12 +1970,21 @@ impl<'a> Lowering<'a> {
                 }
                 None => (ty, class_root),
             };
+            if class_root.as_deref() == Some("CCHARP") {
+                stamp_as_ccharp(&var);
+            }
+            let param = if len_slot.is_some() {
+                crate::model::InputParam::Data(i)
+            } else {
+                crate::model::InputParam::Whole(i)
+            };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
                     name: name.clone(),
                     ty,
                     class_root,
+                    param: Some(param),
                 },
             });
             startblock_args.push(var);
@@ -1978,6 +1998,7 @@ impl<'a> Lowering<'a> {
                         name: len_name,
                         ty: ValueType::Unsigned,
                         class_root: None,
+                        param: Some(crate::model::InputParam::Length(i)),
                     },
                 });
                 startblock_args.push(len_var.clone());
@@ -1994,6 +2015,7 @@ impl<'a> Lowering<'a> {
                     name,
                     ty: ValueType::Unsigned,
                     class_root: None,
+                    param: None,
                 },
             });
             startblock_args.push(var.clone());

@@ -15,6 +15,21 @@ pub(in crate::front::mir) enum BorrowAddress {
     RawEnumField,
 }
 
+/// How a function `Input` becomes `rffi.py` `CCHARP`, from the declared
+/// type of the MIR parameter it was built from (`lltype.py`
+/// `ann_cast_int_to_ptr` / `ll2ctypes.py` `ForceCastEntry`). An expanded
+/// length word is always an integer; a `u8` slice data word is already
+/// `CCHARP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::front::mir) enum InputCcharpKind {
+    /// Declared raw `*u8`: the value already is `Ptr(Array(Char))`.
+    AlreadyCcharp,
+    /// Declared raw pointer to another pointee: one `rffi.cast`.
+    ForceCast,
+    /// Declared integer or a reference to one: `cast_int_to_ptr`.
+    CastIntToPtr,
+}
+
 impl<'a> Lowering<'a> {
     /// `ptr::add` consumed only as `(*dest).field` on a struct pointee.
     ///
@@ -7145,6 +7160,113 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some(clone_place(inner))
+    }
+
+    /// True when `var` is already `rffi.py` `CCHARP`: a stamped
+    /// `Ptr(Array(Char))`, an Input whose `class_root` is `CCHARP`, a
+    /// fat-window `FatData` word, or `rffi.get_raw_address_of_string`.
+    /// `cast_int_to_ptr` / `rffi.cast` results carry that stamp on the
+    /// producer; `ann_cast_int_to_ptr` of an already-`SomePtr` cell is
+    /// rejected, so those producers must not be recast.
+    pub(in crate::front::mir) fn var_already_ccharp(&self, var: &Variable) -> bool {
+        if var.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return true;
+        }
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|result| result.concretetype().as_ref().is_some_and(lltype_is_ccharp))
+        {
+            return true;
+        }
+        match &op.kind {
+            OpKind::Input {
+                class_root: Some(root),
+                ..
+            } if root == "CCHARP" => true,
+            OpKind::FieldRead { field, .. }
+                if field.vec_part == Some(crate::model::VecFieldPart::FatData) =>
+            {
+                true
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => matches!(
+                segments.last().map(String::as_str),
+                Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                    | Some(crate::codewriter::get_raw_address::LL_GET_RAW_ADDRESS_OF_STRING)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Parameter local and expanded part recorded on the producer `Input`
+    /// (`HighLevelOp.inputarg` reads `args_v[arg]` by position).
+    fn input_param_origin(&self, var: &Variable) -> Option<crate::model::InputParam> {
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return None;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return None;
+        };
+        match &op.kind {
+            OpKind::Input { param, .. } => *param,
+            _ => None,
+        }
+    }
+
+    /// How an `Input` becomes `rffi.py` `CCHARP`, from the declared type
+    /// of the MIR parameter it was built from. A raw `*u8` is already
+    /// `CCHARP`; any other raw pointer is one `rffi.cast`
+    /// (`ll2ctypes.py` `ForceCastEntry`); a declared integer or a
+    /// reference to one is `cast_int_to_ptr` (`lltype.py`
+    /// `ann_cast_int_to_ptr`, `rbuiltin.py` `rtype_cast_int_to_ptr`).
+    /// An expanded length word is always an integer. An expanded data
+    /// word of a `u8` slice is already `CCHARP`.
+    pub(in crate::front::mir) fn input_ccharp_kind(
+        &self,
+        var: &Variable,
+    ) -> Option<InputCcharpKind> {
+        match self.input_param_origin(var)? {
+            crate::model::InputParam::Length(_) => Some(InputCcharpKind::CastIntToPtr),
+            crate::model::InputParam::Data(local) => {
+                let ty = clone_tyref(&self.body.locals.locals.get(local)?.ty);
+                tyref_slice_elem_is_u8(&ty, self.llbc).then_some(InputCcharpKind::AlreadyCcharp)
+            }
+            crate::model::InputParam::Whole(local) => {
+                let ty = clone_tyref(&self.body.locals.locals.get(local)?.ty);
+                self.ccharp_kind_of_declared_ty(&ty)
+            }
+        }
+    }
+
+    fn ccharp_kind_of_declared_ty(&self, ty: &TyRef) -> Option<InputCcharpKind> {
+        if tyref_peel_one_raw_ptr_through_aliases(ty, self.llbc).is_some() {
+            if tyref_is_raw_u8_ptr_through_aliases(ty, self.llbc) {
+                return Some(InputCcharpKind::AlreadyCcharp);
+            }
+            return Some(InputCcharpKind::ForceCast);
+        }
+        tyref_is_integer_or_ref_to_integer(ty, self.llbc).then_some(InputCcharpKind::CastIntToPtr)
     }
 
     /// Inner place of `&raw const *p` / `&raw mut *p` when that deref

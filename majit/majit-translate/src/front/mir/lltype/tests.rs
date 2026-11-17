@@ -4747,6 +4747,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
                 name,
                 ty,
                 class_root,
+                ..
             } if name == "subject" => Some((ty.clone(), class_root.clone())),
             _ => None,
         })
@@ -17971,6 +17972,7 @@ fn stamp_option_method_inputs(
                 name,
                 ty,
                 class_root,
+                ..
             } => Some((name.clone(), ty.clone(), class_root.clone())),
             _ => None,
         })
