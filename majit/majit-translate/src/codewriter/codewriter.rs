@@ -1277,15 +1277,30 @@ impl CodeWriter {
                 callcontrol.mark_oopspec_argnames(path, argnames);
             }
         }
-        let lowered = {
+        let (mut lowered, belongs_bk) = {
             let registry = self.dual_gate_registry(callcontrol);
             let tp = registry.two_phase();
-            crate::codewriter::jtransform_opname::lower_graph_with_callees(flow_graph, &|g| {
-                tp.subject_paths
-                    .get(&crate::flowspace::model::GraphKey::of(g))
-                    .cloned()
-            })
+            let carrier = registry.bookkeeper().exception_carrier_class();
+            let belongs_bk = registry.bookkeeper().clone();
+            let lowered = crate::codewriter::jtransform_opname::lower_graph_with_callees(
+                flow_graph,
+                &|g| {
+                    tp.subject_paths
+                        .get(&crate::flowspace::model::GraphKey::of(g))
+                        .cloned()
+                },
+                carrier.as_ref(),
+            );
+            (lowered, belongs_bk)
         };
+        // Spine A (`transform_graph_to_jitcode`) rewrites `except <carrier>`
+        // into a catch-all landing on `from_exc_object(last_exc_value)`
+        // before jtransform. Same arguments, after `lower_graph`.
+        crate::codewriter::error_carrier_edges::lower_error_carrier_edges(
+            &mut lowered,
+            &callcontrol.error_carrier().clone(),
+            &|name| belongs_bk.exception_class_name_belongs(name),
+        );
         // `lower_graph` leaves `direct_call` as `OpKind::Call`. Assembler
         // encodes a leftover Call as `direct_call_*`; there is no such
         // opcode in a jitcode (`jtransform.py rewrite_op_direct_call`).
@@ -2071,9 +2086,9 @@ mod opname_spine_prejit_tests {
     use crate::flatten::{FlatOp, SSARepr};
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
-        Variable,
+        Variable, c_last_exception,
     };
-    use crate::model::{CallTarget, OpKind};
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
         FuncType, GCREF, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
@@ -2584,7 +2599,7 @@ mod opname_spine_prejit_tests {
         let concat_funcs = direct_call_funcobjs(&concat_caller);
         assert_eq!(concat_funcs.len(), 1);
         let published = callpath_from_func_name(&concat_funcs[0]._name);
-        let lowered = lower_graph_with_callees(&concat_caller, &|_| None);
+        let lowered = lower_graph_with_callees(&concat_caller, &|_| None, None);
         let call_targets: Vec<_> = lowered
             .blocks
             .iter()
@@ -2851,6 +2866,111 @@ mod opname_spine_prejit_tests {
         assert!(
             dump.contains("unaryop") || dump.contains("cast_ptr_to_int"),
             "assembled jitcode dumps UnaryOp as unaryop; dump:\n{dump}"
+        );
+    }
+
+    /// Spine B `transform_opname_graph_to_jitcode` runs `lower_error_carrier_edges`
+    /// after `lower_graph`, with the same arguments Spine A passes: a carrier
+    /// catch becomes catch-all landing on `from_exc_object(last_exc_value)`.
+    #[test]
+    fn opname_spine_carrier_catch_becomes_catch_all_with_from_exc_object() {
+        let mut callcontrol = CallControl::new();
+        callcontrol.set_error_carrier(crate::OwnedErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError".into(),
+            carrier_class: String::new(),
+            carrier_wrappers: Vec::new(),
+            to_exc_object: Some(vec![
+                "pyre_interpreter".into(),
+                "error".into(),
+                "pyerror_to_exc_object".into(),
+            ]),
+            from_exc_object: Some(("PyError".into(), "from_exc_object".into())),
+        });
+        let writer = CodeWriter::new();
+        let registry = writer.dual_gate_registry(&callcontrol);
+        let carrier = registry
+            .bookkeeper()
+            .exception_carrier_class()
+            .expect("carrier class");
+        let belongs_bk = registry.bookkeeper().clone();
+
+        let etype = variable_with_lltype("etype", CLASSTYPE.clone());
+        let evalue = variable_with_lltype("evalue", OBJECTPTR.clone());
+        let out = variable_with_lltype("out", OBJECTPTR.clone());
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::with_return_var(
+            "carrier_catch",
+            start.clone(),
+            Hlvalue::Variable(out.clone()),
+        );
+        let handler = Block::shared(vec![
+            Hlvalue::Variable(etype.clone()),
+            Hlvalue::Variable(evalue.clone()),
+        ]);
+        handler.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(evalue.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        start.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let mut exc = Link::new(
+            vec![
+                Hlvalue::Variable(etype.clone()),
+                Hlvalue::Variable(evalue.clone()),
+            ],
+            Some(handler),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                carrier.clone(),
+            )))),
+        );
+        exc.extravars(
+            Some(Hlvalue::Variable(etype)),
+            Some(Hlvalue::Variable(evalue)),
+        );
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+            exc.into_ref(),
+        ]);
+
+        let mut lowered = lower_graph_with_callees(&graph, &|_| None, Some(&carrier));
+        crate::codewriter::error_carrier_edges::lower_error_carrier_edges(
+            &mut lowered,
+            &callcontrol.error_carrier().clone(),
+            &|name| belongs_bk.exception_class_name_belongs(name),
+        );
+
+        let start = lowered.block(lowered.startblock);
+        assert!(matches!(start.exitswitch, Some(ExitSwitch::LastException)));
+        let link = start
+            .exits
+            .iter()
+            .find(|l| l.exitcase.is_some())
+            .expect("carrier exception exit");
+        assert!(link.catches_all_exceptions());
+        let landing = lowered.block(link.target);
+        assert_eq!(landing.operations.len(), 1);
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &landing.operations[0].kind
+        else {
+            panic!(
+                "carrier landing must call from_exc_object, got {:?}",
+                landing.operations[0].kind
+            );
+        };
+        assert_eq!(
+            segments.join("::"),
+            "error::PyError::from_exc_object",
+            "except carrier lands on from_exc_object(last_exc_value)"
         );
     }
 }
