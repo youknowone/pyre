@@ -32311,6 +32311,83 @@ fn owned_buffer_borrowed_outside_append_stays_residual() {
     );
 }
 
+/// `descr_repr` walks `s[i]`. A leftover
+/// `core::slice::iter::<Impl>::into_iter` FunctionPath is the CallRegistry
+/// wall on `bytearray_repr_string.cachedgraph`.
+#[test]
+fn bytearray_repr_string_has_no_slice_into_iter() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "bytearray_repr_string")
+        .expect("lower bytearray_repr_string");
+    let leftover: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "into_iter") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "descr_repr's counted loop must not residualize into_iter; leftover={leftover:?} graph={}",
+        graph.dump()
+    );
+    let leftover_hex: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "HEX") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover_hex.is_empty(),
+        "nibble digits are getaddrstring arithmetic; leftover HEX={leftover_hex:?} graph={}",
+        graph.dump()
+    );
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        let cp = match args.first() {
+            Some(LinkArg::Value(v)) => v,
+            other => panic!(
+                "charpsize2str cp is a Variable, got {other:?}; graph={}",
+                graph.dump()
+            ),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "window copy slot 0 is CCHARP; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+}
+
 /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
 /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
 /// `String::push_str` and `String::push(char)` in one loop, so omitting the
