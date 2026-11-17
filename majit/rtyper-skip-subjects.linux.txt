@@ -70,6 +70,8 @@ two-phase-annotate-skipped	option::Option::<impl core::ops::try_trait::Try<core:
 two-phase-annotate-skipped	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_AbstractUnwrappedSetStrategy_____0___const_gener_e08c1bfed247f436
 two-phase-annotate-skipped	option::Option::and_then__spec_BuiltinModuleDef_PyError__closure_edf8d2aef40683c2
 two-phase-annotate-skipped	option::Option::and_then__spec_i64_i64_closure_0b4704fcfa272e74
+two-phase-annotate-skipped	option::Option::is_none__spec____e19df54c9bd1b0d6
+two-phase-annotate-skipped	option::Option::is_some__spec____b5bb59bb58fb9710
 two-phase-annotate-skipped	option::Option::is_some_and__spec_PyObject_closure_2_be71344a38e8b0c3
 two-phase-annotate-skipped	option::Option::is_some_and__spec_String__closure_6f7c33d9ef0ef3fd
 two-phase-annotate-skipped	option::Option::is_some_and__spec_Wtf8_closure_1_d4f58a8b9f3440b5
@@ -82,6 +84,8 @@ two-phase-annotate-skipped	option::Option::map_or__spec_MappedObj_i64_closure_1_
 two-phase-annotate-skipped	option::Option::map_or__spec_MappedObj_i64_closure_3_e7797111eb54278a
 two-phase-annotate-skipped	option::Option::unwrap_or_else__spec_PathBuf_closure_4_9adc168fa9a0a560
 two-phase-annotate-skipped	option::Option::unwrap_or_else__spec_PyObject_closure_879cc8d72ff4a04a
+two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::call_intrinsic_1__spec_PyFrame_762637a9b229c68d__AccessDirect_None
+two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::call_intrinsic_2__spec_PyFrame_d6cd588e4cf9ca80__AccessDirect_None
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::load_attr__spec_PyFrame_180215a970c56288__AccessDirect_None
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::store_attr__spec_PyFrame_74d517a49ae98f8a__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::_pypy_generic_alias::create_union
@@ -1681,6 +1685,7 @@ two-phase-annotate-skipped	pyre_object::module::w_module_new_managed
 two-phase-annotate-skipped	pyre_object::nestedscope::dummy_family
 two-phase-annotate-skipped	pyre_object::rordereddict::<Impl>::new
 two-phase-annotate-skipped	pyre_object::setobject::<Impl>::add
+two-phase-annotate-skipped	pyre_object::setobject::<Impl>::get_empty_storage
 two-phase-annotate-skipped	pyre_object::setobject::<Impl>::key_at
 two-phase-annotate-skipped	pyre_object::setobject::key_at_slot
 two-phase-annotate-skipped	pyre_object::setobject::set_insert_key_with_hash_unlocked
@@ -1700,6 +1705,7 @@ two-phase-annotate-skipped	rordereddict::RDict::<impl core::clone::Clone<pyre_ob
 two-phase-annotate-skipped	rordereddict::RDict::<impl core::clone::Clone<pyre_object::rordereddict::RDict<v0,v1,v2>>>::clone__spec_IdentityKey_PyObject_ObjectKeyHasher__f42bee199acc1b25
 two-phase-annotate-skipped	rordereddict::RDict::<impl core::clone::Clone<pyre_object::rordereddict::RDict<v0,v1,v2>>>::clone__spec_ObjectKey_PyObject_ObjectKeyHasher__f66e489a5de37f79
 two-phase-annotate-skipped	rordereddict::RDict::<impl core::clone::Clone<pyre_object::rordereddict::RDict<v0,v1,v2>>>::clone__spec_i64_PyObject_IntKeyHasher__490ce85e14217db5
+two-phase-annotate-skipped	rordereddict::RDict::<impl core::default::Default<pyre_object::rordereddict::RDict<v0,v1,v2>>>::default__spec_ObjectKey____ObjectKeyHasher__3a6fe6f759e21e8d
 two-phase-annotate-skipped	rordereddict::RDict::clone_to_young_box__spec_BytesKey_PyObject_ObjectKeyHasher__edbce1b090eca8b2
 two-phase-annotate-skipped	rordereddict::RDict::clone_to_young_box__spec_IdentityKey_PyObject_ObjectKeyHasher__db57418dbea2232c
 two-phase-annotate-skipped	rordereddict::RDict::clone_to_young_box__spec_ObjectKey_PyObject_ObjectKeyHasher__bec48e2a9e0c6e4c
@@ -1727,6 +1733,7 @@ two-phase-annotate-skipped	rordereddict::RDict::lookup__spec_IdentityKey_PyObjec
 two-phase-annotate-skipped	rordereddict::RDict::lookup__spec_ObjectKey_PyObject_ObjectKeyHasher__ObjectKey_5e009d89563e62de
 two-phase-annotate-skipped	rordereddict::RDict::lookup__spec_ObjectKey_PyObject_ObjectKeyHasher__StrLookupKey_2d19b779792c950d
 two-phase-annotate-skipped	rordereddict::RDict::lookup__spec_ObjectKey____ObjectKeyHasher__ObjectKey_7505718fddef47e4
+two-phase-annotate-skipped	rordereddict::RDict::new__spec_ObjectKey____ObjectKeyHasher__b24fa13580a584a0
 two-phase-annotate-skipped	rordereddict::RDict::remove__spec_IdentityKey_PyObject_ObjectKeyHasher__IdentityKe_129e367df67e7dd6
 two-phase-annotate-skipped	rordereddict::RDict::remove__spec_ObjectKey_PyObject_ObjectKeyHasher__ObjectKey_659c028a865e901c
 two-phase-annotate-skipped	rordereddict::RDict::replace_entries_array__spec_AbstractUnwrappedSetStrategy_____0___const_gener_0b38d777600c2746
@@ -1745,6 +1752,7 @@ two-phase-annotate-skipped	rordereddict::RDict::setitem_lookup_done__spec_Object
 two-phase-annotate-skipped	rordereddict::RDict::setitem_lookup_done__spec_StrKey_PyObject_StrKeyHasher__b0fcba65d387eb5d
 two-phase-annotate-skipped	rordereddict::RDict::setitem_lookup_done__spec_i64_PyObject_IntKeyHasher__10d4d8787ff7e76d
 two-phase-annotate-skipped	rordereddict::RDict::take_slot__spec_IdentityKey_PyObject_ObjectKeyHasher__a32e07c30a4c2e82
+two-phase-annotate-skipped	rordereddict::RDict::with_hasher__spec_ObjectKey____ObjectKeyHasher__394645b9d36d111b
 two-phase-annotate-skipped	rordereddict::ll_dict_del__spec_IdentityKey_PyObject_ObjectKeyHasher__cd63cfb958de3530
 two-phase-annotate-skipped	rordereddict::ll_dict_grow__spec_AbstractUnwrappedSetStrategy_____0___const_gener_0df926d3650baa72
 two-phase-annotate-skipped	rordereddict::ll_dict_grow__spec_AbstractUnwrappedSetStrategy_____0___const_gener_0eca2d112ceadbfe
@@ -1807,6 +1815,11 @@ two-phase-annotate-skipped	setobject::unwrapped_key_object__spec_AsciiSetStrateg
 two-phase-annotate-skipped	setobject::unwrapped_key_object__spec_BytesSetStrategy_11f2f86dc4b867ee
 two-phase-annotate-skipped	setobject::unwrapped_key_object__spec_IdentitySetStrategy_3df63a340f9a106a
 two-phase-annotate-skipped	setobject::unwrapped_key_object__spec_IntegerSetStrategy_15ecd4545cd17a66
+two-phase-annotate-skipped	setobject::unwrapped_store__spec_AsciiSetStrategy_17e2d1767e90eb58
+two-phase-annotate-skipped	setobject::unwrapped_store__spec_BytesSetStrategy_c733917331513a7a
+two-phase-annotate-skipped	setobject::unwrapped_store__spec_IdentitySetStrategy_6d75a0d7cb1a3966
+two-phase-annotate-skipped	setobject::unwrapped_store__spec_IntegerSetStrategy_241fb9dd456587b2
+two-phase-annotate-skipped	shared_opcode::SharedOpcodeHandler::set_function_typeparams__spec_PyFrame_ad590f76bd97bf19__AccessDirect_None
 two-phase-annotate-skipped	shared_opcode::opcode_load_attr__spec_PyFrame_bea5423a2f36110c__AccessDirect_None
 two-phase-annotate-skipped	shared_opcode::opcode_store_attr__spec_PyFrame_f994b4a4dbc39903__AccessDirect_None
 two-phase-annotate-skipped	tuple_hash_portal_portal
