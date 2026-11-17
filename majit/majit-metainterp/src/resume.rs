@@ -9202,9 +9202,11 @@ pub struct ResumeRefRootsScope {
 }
 
 impl ResumeRefRootsScope {
+    /// Enter a lexical resume-root scope; the captured depth is restored on drop.
     pub(crate) fn enter() -> Self {
         ResumeRefRootsScope {
-            _guard: majit_gc::shadow_stack::ResumeRefRootsDepthGuard::enter(),
+            // SAFETY: `ResumeRefRootsScope` is a lexical scope value.
+            _guard: unsafe { majit_gc::shadow_stack::ResumeRefRootsDepthGuard::enter() },
         }
     }
 }

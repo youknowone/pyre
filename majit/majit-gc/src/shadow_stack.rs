@@ -2200,6 +2200,7 @@ struct ResumeRefRootStack {
     entries: UnsafeCell<Vec<ResumeRefRoots>>,
 }
 
+#[derive(Clone, Copy)]
 struct ResumeRefRoots {
     ptr: *mut u8,
     len: usize,
@@ -2207,7 +2208,10 @@ struct ResumeRefRoots {
 }
 
 impl ResumeRefRoots {
-    unsafe fn walk(&self, visitor: &mut impl FnMut(&mut GcRef)) {
+    /// # Safety
+    /// `ptr` must address `len` slots of `stride` bytes, each a live `GcRef`,
+    /// for the duration of this call.
+    unsafe fn walk(self, visitor: &mut impl FnMut(&mut GcRef)) {
         for index in 0..self.len {
             visitor(unsafe { &mut *self.ptr.add(index * self.stride).cast::<GcRef>() });
         }
@@ -2313,12 +2317,18 @@ pub struct ResumeRefRootsDepthGuard {
 }
 
 impl ResumeRefRootsDepthGuard {
-    pub fn enter() -> Self {
+    /// Capture this thread's resume-root stack pointer and current depth.
+    ///
+    /// # Safety
+    /// The guard must be dropped before this thread's TLS destructors run:
+    /// hold it in a stack frame, never in a `thread_local!` or a value owned
+    /// by one.
+    pub unsafe fn enter() -> Self {
         RESUME_REF_ROOTS_STACK.with(|ss| {
             let stack = ss.entries.get();
             ResumeRefRootsDepthGuard {
                 stack,
-                // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+                // SAFETY: only this mutator thread writes the Vec.
                 base_depth: unsafe { (*stack).len() },
             }
         })
@@ -2327,7 +2337,9 @@ impl ResumeRefRootsDepthGuard {
 
 impl Drop for ResumeRefRootsDepthGuard {
     fn drop(&mut self) {
-        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
+        // SAFETY: `enter` requires this guard to drop before this thread's
+        // TLS destructors run, so `stack` still names the live Vec. Only
+        // this mutator thread writes it.
         unsafe { (*self.stack).truncate(self.base_depth) };
     }
 }
@@ -2339,10 +2351,15 @@ impl Drop for ResumeRefRootsDepthGuard {
 /// visitor's `copy_nursery_object` guard unchanged.
 pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
-        let entries = unsafe { &*ss.entries.get() };
-        for entry in entries.iter() {
+        let entries = ss.entries.get();
+        let mut i = 0;
+        // The visitor may push or pop on this stack: no reference into the
+        // Vec is held across it, and the length is re-read every step.
+        // SAFETY: only this mutator thread writes the Vec. `get(i).copied()`
+        // drops the `get` reference before `walk` invokes the visitor.
+        while let Some(entry) = unsafe { (&*entries).get(i).copied() } {
             unsafe { entry.walk(&mut visitor) };
+            i += 1;
         }
     });
 }
@@ -2388,10 +2405,18 @@ pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     );
     let registry = lock_mutator_registry();
     for mutator in registry.iter() {
-        // SAFETY: the stack is only touched by its own thread; other threads read it only with that mutator stopped.
-        let entries = unsafe { &*(*(*mutator.resume_ref_roots_stack).entries.get()) };
-        for entry in entries.iter() {
+        // SAFETY: gc_sync has quiesced every registered owner, so this
+        // pointer still names a live `ResumeRefRootStack`.
+        let entries = unsafe { (*mutator.resume_ref_roots_stack).entries.get() };
+        let mut i = 0;
+        // The visitor may push or pop on this stack: no reference into the
+        // Vec is held across it, and the length is re-read every step.
+        // SAFETY: the owning mutator is stopped. `get(i).copied()` holds
+        // no reference across the visitor, including when this entry is
+        // the collecting thread's own stack.
+        while let Some(entry) = unsafe { (&*entries).get(i).copied() } {
             unsafe { entry.walk(&mut visitor) };
+            i += 1;
         }
     }
 }
