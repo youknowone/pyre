@@ -2176,6 +2176,16 @@ pub struct JitDriverStaticData {
     /// the only account of them: `reds` holds what was declared, which for
     /// `reds='auto'` is nothing.
     pub red_args_types: Vec<majit_ir::Type>,
+    /// For each detected red, the index `k` of the marker call's explicit
+    /// red operand that is that variable. `None` until the merge-point rewrite,
+    /// and `None` when a detected red is not a marker operand.
+    /// The marker's explicit red operands are this port's declaration of
+    /// which live variable is which (`jtransform.py`
+    /// `autodetect_jit_markers_redvars`, `warmspot.py`
+    /// `make_args_specification`). `Some` is injective: an undetected operand
+    /// is a red that is dead across the merge point. Explicit-red drivers
+    /// store `Some([0, 1, …])`.
+    pub red_marker_positions: Option<Vec<u32>>,
     /// RPython: `jitdriver.autoreds` — true for `reds='auto'` drivers.
     pub autoreds: bool,
     /// RPython: `jitdriver.numreds` — fixed immediately for explicit reds,
@@ -8215,6 +8225,7 @@ impl CallControl {
             // graph in scope here to read them from.
             green_args_spec: Vec::new(),
             red_args_types: Vec::new(),
+            red_marker_positions: None,
             autoreds,
             virtualizables,
             red_types,

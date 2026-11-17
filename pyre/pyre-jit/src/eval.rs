@@ -9167,7 +9167,7 @@ fn unpack_merge_point_jit(
 fn sortkey_merge_point_jit(
     strategy_type: pyre_object::PyObjectRef,
     tp: pyre_object::PyObjectRef,
-    _i: i64,
+    i: i64,
     list_w: pyre_object::PyObjectRef,
     keys_w: pyre_object::PyObjectRef,
     w_callable: pyre_object::PyObjectRef,
@@ -9211,6 +9211,7 @@ fn sortkey_merge_point_jit(
             driver,
             jd_no,
             pyre_jit_trace::sortkey_state::sortkey_live_values(
+                i,
                 roots.get(base + 2),
                 roots.get(base + 3),
                 roots.get(base + 4),
@@ -9235,6 +9236,7 @@ fn sortkey_merge_point_jit(
         green_key,
         roots.get(base),
         roots.get(base + 1),
+        i,
         roots.get(base + 2),
         roots.get(base + 3),
         roots.get(base + 4),
@@ -10376,34 +10378,16 @@ fn drive_tuple_hash_trace(
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
     let w_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
     let mut green_args = [(majit_metainterp::JitArgKind::Ref, w_type as usize as i64)];
-    let mut red_args = [
-        (
-            majit_metainterp::JitArgKind::Int,
-            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-            len as i64,
-        ),
-        (
-            majit_metainterp::JitArgKind::Int,
-            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-            acc as i64,
-        ),
-        (
-            majit_metainterp::JitArgKind::Int,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
-            i as i64,
-        ),
-        (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
-            w_tuple as usize as i64,
-        ),
-    ];
-    let mut sym = pyre_jit_trace::tuplehash_state::TupleHashSym {
-        w_type,
-        len: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-        acc: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        i: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
-        obj: majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
+    let mut red_args = pyre_jit_trace::tuplehash_state::tuple_hash_trace_red_args(
+        len as i64, acc as i64, i as i64, w_tuple,
+    );
+    let mut sym = {
+        let trace_meta = pyre_jit_trace::tuplehash_state::TupleHashJitState { w_type }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        let mut sym =
+            pyre_jit_trace::tuplehash_state::TupleHashJitState::create_sym(&trace_meta, 0);
+        sym.w_type = w_type;
+        sym
     };
     let header_pc = {
         use majit_metainterp::JitCodeSym;
@@ -10530,25 +10514,15 @@ fn drive_tuple_hash_trace(
                     if let Some(ctx) = meta.trace_ctx() {
                         ctx.resume_walk_after_close();
                     }
-                    if let Some(
-                        [
-                            majit_ir::Value::Int(len),
-                            majit_ir::Value::Int(acc),
-                            majit_ir::Value::Int(i),
-                            majit_ir::Value::Ref(majit_ir::GcRef(obj)),
-                        ],
-                    ) = close_live.as_deref()
-                    {
+                    if let Some(live) = close_live.as_deref() {
                         green_args = [(
                             majit_metainterp::JitArgKind::Ref,
                             pyre_object::gc_roots::shadow_stack_get(type_slot) as usize as i64,
                         )];
-                        red_args = [
-                            (majit_metainterp::JitArgKind::Int, sym.len, *len),
-                            (majit_metainterp::JitArgKind::Int, sym.acc, *acc),
-                            (majit_metainterp::JitArgKind::Int, sym.i, *i),
-                            (majit_metainterp::JitArgKind::Ref, sym.obj, *obj as i64),
-                        ];
+                        red_args =
+                            pyre_jit_trace::tuplehash_state::tuple_hash_trace_red_args_from_sym(
+                                &sym, live,
+                            );
                     }
                     continue;
                 }
@@ -10665,43 +10639,52 @@ fn tuple_hash_result_from_blackhole(
         }),
         JitException::ContinueRunningNormally(args) => {
             let w_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-            let len = args.red_int.first().copied().unwrap_or(0) as usize;
-            let acc = args.red_int.get(1).copied().unwrap_or(0) as u64;
-            let i = args.red_int.get(2).copied().unwrap_or(0) as usize;
-            let w_tuple = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-            unsafe { pyre_interpreter::tuple_hash_portal(w_type, w_tuple, len, acc, i) }
+            let live = pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+                pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+                &args.red_int,
+                &args.red_ref,
+            );
+            let (len, acc, i, w_tuple) =
+                tuple_hash_continue_reds(&live).expect("tuple.hash ContinueRunningNormally reds");
+            unsafe {
+                pyre_interpreter::tuple_hash_portal(
+                    w_type,
+                    w_tuple,
+                    len as usize,
+                    acc as u64,
+                    i as usize,
+                )
+            }
         }
         other => panic!("incomplete tuple.hash blackhole continuation: {other:?}"),
     }
 }
 
-/// Reds (`len`, `acc`, `i`, `obj`) of a tuple.hash `ContinueRunningNormally`
-/// payload, for `run_compiled_tuple_hash` re-entry.
+/// Reds of a tuple.hash `ContinueRunningNormally` payload, mapped by
+/// marker-operand identity, for `run_compiled_tuple_hash` re-entry.
 fn tuple_hash_continue_reds(
     live_args: &[majit_ir::Value],
 ) -> Option<(i64, i64, i64, pyre_object::PyObjectRef)> {
-    fn ref_word(value: &majit_ir::Value) -> Option<pyre_object::PyObjectRef> {
-        match value {
-            majit_ir::Value::Ref(majit_ir::GcRef(ptr)) if *ptr != 0 => {
-                Some(*ptr as pyre_object::PyObjectRef)
-            }
-            _ => None,
-        }
-    }
-    match live_args {
+    let driver = pyre_jit_trace::jitcode_runtime::compiled_jit_driver_for_key(
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+    )?;
+    let n = driver.red_marker_positions.as_ref()?.len();
+    let reds = if live_args.len() >= n {
+        &live_args[live_args.len() - n..]
+    } else {
+        return None;
+    };
+    let marker = pyre_jit_trace::jitcode_runtime::marker_reds_from_recorded(
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+        reds,
+    );
+    match marker.as_slice() {
         [
-            majit_ir::Value::Int(len),
-            majit_ir::Value::Int(acc),
-            majit_ir::Value::Int(i),
-            obj,
-        ] => Some((*len, *acc, *i, ref_word(obj)?)),
-        [
-            majit_ir::Value::Ref(_),
-            majit_ir::Value::Int(len),
-            majit_ir::Value::Int(acc),
-            majit_ir::Value::Int(i),
-            obj,
-        ] => Some((*len, *acc, *i, ref_word(obj)?)),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(obj))),
+            Some(majit_ir::Value::Int(len)),
+            Some(majit_ir::Value::Int(acc)),
+            Some(majit_ir::Value::Int(i)),
+        ] if *obj != 0 => Some((*len, *acc, *i, *obj as pyre_object::PyObjectRef)),
         _ => None,
     }
 }
@@ -10771,17 +10754,15 @@ fn run_compiled_tuple_hash(
     }
 }
 
-fn tuple_hash_raw_from_live(live: &[majit_ir::Value]) -> [i64; 4] {
-    let mut raw = [0i64; 4];
-    for (dst, src) in raw.iter_mut().zip(live.iter()) {
-        *dst = match src {
+fn tuple_hash_raw_from_live(live: &[majit_ir::Value]) -> Vec<i64> {
+    live.iter()
+        .map(|src| match src {
             majit_ir::Value::Int(v) => *v,
             majit_ir::Value::Ref(gc) => gc.0 as i64,
             majit_ir::Value::Float(f) => f.to_bits() as i64,
             majit_ir::Value::Void => 0,
-        };
-    }
-    raw
+        })
+        .collect()
 }
 
 fn run_compiled_tuple_hash_from_frame(
@@ -10793,7 +10774,7 @@ fn run_compiled_tuple_hash_from_frame(
     // `warmstate.py execute_assembler` reuses the reds from
     // `EnterJitAssembler`. Heap-copy them only on a guard-fail
     // `ContinueRunningNormally` that rebuilds the bank.
-    let mut live_buf: Option<[majit_ir::Value; 4]> = None;
+    let mut live_buf: Option<Vec<majit_ir::Value>> = None;
     let mut pending_frame = Some(frame);
     loop {
         let extracted = {
@@ -10952,10 +10933,14 @@ fn run_compiled_tuple_hash_from_frame(
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!("[tuple.hash] run_compiled continue");
                 }
-                if red_int.len() >= 3 && !red_ref.is_empty() {
-                    live_buf = Some(pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
-                        red_int[0], red_int[1], red_int[2], red_ref[0],
-                    ));
+                if !red_int.is_empty() && !red_ref.is_empty() {
+                    live_buf = Some(
+                        pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+                            pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+                            &red_int,
+                            &red_ref.iter().map(|&p| p as i64).collect::<Vec<_>>(),
+                        ),
+                    );
                 }
                 continue;
             }
@@ -11540,6 +11525,7 @@ fn drive_sortkey_trace(
     green_key: u64,
     strategy_type: pyre_object::PyObjectRef,
     tp: pyre_object::PyObjectRef,
+    i: i64,
     list_w: pyre_object::PyObjectRef,
     keys_w: pyre_object::PyObjectRef,
     w_callable: pyre_object::PyObjectRef,
@@ -11601,7 +11587,7 @@ fn drive_sortkey_trace(
         let w_callable = roots.get(base + 4);
         let gk = pyre_jit_trace::sortkey_state::sortkey_green_key(strategy_type, tp);
         let live_values =
-            pyre_jit_trace::sortkey_state::sortkey_live_values(list_w, keys_w, w_callable);
+            pyre_jit_trace::sortkey_state::sortkey_live_values(i, list_w, keys_w, w_callable);
         // Two Ref greens: `live_clone` walks consecutive shadow-stack slots.
         let pin = majit_metainterp::GreenRefPin::pin(&gk);
         meta.force_start_tracing(
@@ -11626,6 +11612,7 @@ fn drive_sortkey_trace(
         // compiled runner re-acquires `driver_pair()`.
         drop(driver);
         let live_values = pyre_jit_trace::sortkey_state::sortkey_live_values(
+            i,
             roots.get(base + 2),
             roots.get(base + 3),
             roots.get(base + 4),
@@ -11656,29 +11643,13 @@ fn drive_sortkey_trace(
         ),
         (majit_metainterp::JitArgKind::Ref, tp as usize as i64),
     ];
-    // Extracted banks `red_r=[2, 3, 4]`: list_w, keys_w, w_callable. `i` is
-    // dead at the marker (`i = w_list_len(keys_w)`).
-    let red_args = [
-        (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-            list_w as usize as i64,
-        ),
-        (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
-            keys_w as usize as i64,
-        ),
-        (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            w_callable as usize as i64,
-        ),
-    ];
-    let mut sym = pyre_jit_trace::sortkey_state::SortkeySym {
-        list_w: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-        keys_w: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
-        w_callable: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+    // Marker extras permuted through `red_marker_positions`.
+    let red_args =
+        pyre_jit_trace::sortkey_state::sortkey_trace_red_args(i, list_w, keys_w, w_callable);
+    let mut sym = {
+        let trace_meta = pyre_jit_trace::sortkey_state::SortkeyJitState { strategy_type, tp }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        pyre_jit_trace::sortkey_state::SortkeyJitState::create_sym(&trace_meta, 0)
     };
     let header_pc = {
         use majit_metainterp::JitCodeSym;
@@ -11821,10 +11792,10 @@ fn run_compiled_sortkey(green_key: u64, mut live_values: Vec<majit_ir::Value>) {
         );
         match bh {
             crate::call_jit::BlackholeResult::ContinueRunningNormally { red_ref, .. } => {
-                live_values = pyre_jit_trace::sortkey_state::sortkey_live_values(
-                    red_ref.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    red_ref.get(1).copied().unwrap_or(pyre_object::PY_NULL),
-                    red_ref.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+                live_values = pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+                    pyre_jit_trace::sortkey_state::SORTKEY_PORTAL_KEY,
+                    &[],
+                    &red_ref.iter().map(|&p| p as i64).collect::<Vec<_>>(),
                 );
                 continue;
             }
@@ -13095,8 +13066,9 @@ fn generatorentry_portal_runner(
 
 /// `warmspot.py ll_portal_runner` for `hash_driver`.
 ///
-/// Argument order is the portal calldescr: greens then reds in
-/// `JitDriverStaticData.vars` (`w_type`, `len`, `acc`, `i`, `obj`).
+/// Semantic arguments are `w_type`, `w_tuple`, `len`, `acc`, `i`.
+/// The portal calldescr follows the rewritten red list
+/// (`warmspot.py` `make_args_specification`).
 ///
 /// `maybe_compile_and_run(state.increment_function_threshold, *args)`
 /// then `portal_ptr(*args)`. The in-portal merge point ticks
@@ -13126,15 +13098,24 @@ fn tuple_hash_ll_portal_runner(
 /// C ABI of [`tuple_hash_ll_portal_runner`].
 ///
 /// `build_portal_calldescr` lays args out as greens then reds in
-/// descriptor order: `w_type`, `len`, `acc`, `i`, `obj`.
+/// rewritten merge-point order (`make_args_specification`). Auto-red
+/// kinds are Int then Ref (`sort_vars`), so the type layout is
+/// `w_type`, three Ints, `obj`.
 #[majit_macros::jit_may_force]
 pub extern "C" fn ll_tuple_hash_portal_runner_shim(
     w_type: pyre_object::PyObjectRef,
-    len: i64,
-    acc: i64,
-    i: i64,
-    w_tuple: pyre_object::PyObjectRef,
+    red0: i64,
+    red1: i64,
+    red2: i64,
+    red_obj: pyre_object::PyObjectRef,
 ) -> i64 {
+    let live = pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+        &[red0, red1, red2],
+        &[red_obj as i64],
+    );
+    let (len, acc, i, w_tuple) =
+        tuple_hash_continue_reds(&live).expect("tuple.hash portal runner shim reds");
     match tuple_hash_ll_portal_runner(w_type, w_tuple, len as usize, acc as u64, i as usize) {
         Ok(result) => {
             // `compile_tmp_callback` is `CALL` + `GUARD_NO_EXCEPTION` +
@@ -13172,14 +13153,23 @@ fn tuple_hash_portal_runner(
 
     match exc {
         JitException::ContinueRunningNormally(args) => {
-            // Descriptor banks: green_ref[0] `w_type`; red_int `len`,`acc`,`i`;
-            // red_ref[0] `obj`.
             let w_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-            let len = args.red_int.first().copied().unwrap_or(0) as usize;
-            let acc = args.red_int.get(1).copied().unwrap_or(0) as u64;
-            let i = args.red_int.get(2).copied().unwrap_or(0) as usize;
-            let w_tuple = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-            match unsafe { pyre_interpreter::tuple_hash_portal(w_type, w_tuple, len, acc, i) } {
+            let live = pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+                pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+                &args.red_int,
+                &args.red_ref,
+            );
+            let (len, acc, i, w_tuple) =
+                tuple_hash_continue_reds(&live).expect("tuple.hash ContinueRunningNormally reds");
+            match unsafe {
+                pyre_interpreter::tuple_hash_portal(
+                    w_type,
+                    w_tuple,
+                    len as usize,
+                    acc as u64,
+                    i as usize,
+                )
+            } {
                 Ok(result) => Ok((BhReturnType::Int, result as i64)),
                 Err(mut err) => Err(PortalRunnerFailure::jit(
                     JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
@@ -13270,9 +13260,8 @@ pub extern "C" fn ll_sortkey_portal_runner_shim(
 
 /// `warmspot.py handle_jitexception` for `sortkey_jmp`.
 ///
-/// Extracted banks: greens `strategy_type`/`tp`, reds `list_w`/`keys_w`/
-/// `w_callable` (`red_r=[2, 3, 4]`). `i` is dead at the marker; reconstruct
-/// it from `w_list_len(keys_w)` when re-entering the interpreter portal.
+/// Marker extras: `i`, `list_w`, `keys_w`, `w_callable`.
+/// `red_marker_positions` maps the recorded CRN banks onto that order.
 fn sortkey_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<
@@ -13287,14 +13276,8 @@ fn sortkey_portal_runner(
     };
     let strategy_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
     let tp = args.green_ref.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let list_w = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let keys_w = args.red_ref.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let w_callable = args.red_ref.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let i = if keys_w.is_null() {
-        0
-    } else {
-        (unsafe { pyre_object::listobject::w_list_len(keys_w) }) as i64
-    };
+    let (i, list_w, keys_w, w_callable) =
+        pyre_jit_trace::sortkey_state::sortkey_portal_refs(&args.red_int, &args.red_ref);
     match pyre_interpreter::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable) {
         Ok(()) => Ok((BhReturnType::Void, 0)),
         Err(mut err) => Err(PortalRunnerFailure::jit(

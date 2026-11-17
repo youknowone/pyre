@@ -2657,6 +2657,76 @@ fn prefix_unsigned_binop(
     }
 }
 
+/// Map each autodetected red onto its index in the marker call's explicit
+/// red operands (`user_args[num_greens + k]`).
+///
+/// The marker's explicit red operands are this port's declaration of which
+/// live variable is which. `jtransform.py` `autodetect_jit_markers_redvars`
+/// produces the rewritten order `warmspot.py` `make_args_specification`
+/// consumes; `red_marker_positions[i] = k` means detected red `i` is
+/// explicit operand `k`. Compare after the same alias resolution the
+/// merge-point rewrite uses for greens. `Some(map)` when every detected
+/// red is a marker operand: the map is injective, not a permutation of
+/// `0..n` (an undetected operand is a red that is dead across the merge
+/// point). `None` when at least one detected red is not a marker operand.
+pub(crate) fn red_marker_positions_for(
+    driver_name: &str,
+    detected: &[crate::flowspace::model::Variable],
+    explicit_reds: &[crate::flowspace::model::Variable],
+    aliases: Option<
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        >,
+    >,
+) -> Option<Vec<u32>> {
+    use crate::flowspace::model::Variable;
+    use crate::model::FunctionGraph;
+
+    let resolve = |variable: &Variable| match aliases {
+        Some(map) => resolve_alias(variable, map),
+        None => variable.clone(),
+    };
+    let describe = |variable: &Variable| {
+        format!(
+            "id={} kind={:?} prefix={}",
+            variable.id(),
+            FunctionGraph::concretetype_of(variable),
+            variable.name_prefix()
+        )
+    };
+
+    let resolved_explicit: Vec<Variable> = explicit_reds.iter().map(resolve).collect();
+    let mut claimed = vec![false; explicit_reds.len()];
+    let mut positions = Vec::with_capacity(detected.len());
+    for red in detected {
+        let resolved = resolve(red);
+        let k = resolved_explicit
+            .iter()
+            .position(|candidate| *candidate == resolved);
+        match k {
+            Some(k) if !claimed[k] => {
+                claimed[k] = true;
+                positions.push(k as u32);
+            }
+            Some(k) => panic!(
+                "auto-red driver `{driver_name}`: detected red {} maps onto marker operand {k} twice\n\
+                 detected: [{}]\n\
+                 marker:   [{}]",
+                describe(red),
+                detected.iter().map(describe).collect::<Vec<_>>().join(", "),
+                explicit_reds
+                    .iter()
+                    .map(describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => return None,
+        }
+    }
+    Some(positions)
+}
+
 /// RPython: `support.autodetect_jit_markers_redvars` (support.py).
 /// Compute the Variables live across the portal's `jit_merge_point`, remove
 /// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
@@ -16966,17 +17036,30 @@ impl<'a> Transformer<'a> {
                     &green_kinds,
                     &red_kinds,
                 );
-                // warmspot.py:663-664 `jd._green_args_spec` / `jd.red_args_types`
-                // are read off the marker's own operands, not off the
-                // declaration. Record them here for the same reason upstream
-                // does it here: this is where the marker operands exist. A
+                // `warmspot.py` `make_args_specification` reads
+                // `jd._green_args_spec` / `jd.red_args_types` off the marker's
+                // own operands, not off the declaration. Record them here for
+                // the same reason: this is where the marker operands exist. A
                 // consumer that builds the run-time driver then works from the
                 // graph's answer instead of re-typing the declaration, which is
                 // what makes the two unable to disagree. For an auto-red driver
                 // these describe the reds `autodetect_jit_markers_redvars` just
-                // found, which nothing else records.
+                // found. The marker's explicit red operands are this port's
+                // declaration of which live variable is which;
+                // `red_marker_positions` is the injective map onto the
+                // rewritten list (`split_graph_and_record_jitdriver`).
                 let green_args_spec = self.marker_operand_kinds(greens_raw);
                 let red_args_types = self.marker_operand_kinds(reds_raw);
+                let computed_positions = if autoreds {
+                    red_marker_positions_for(
+                        &driver_name,
+                        reds_raw,
+                        &user_args[num_greens..],
+                        Some(&self.aliases),
+                    )
+                } else {
+                    Some((0..reds_raw.len() as u32).collect())
+                };
                 {
                     let jd = self
                         .callcontrol
@@ -16984,6 +17067,16 @@ impl<'a> Transformer<'a> {
                         .jitdriver_sd_from_jitdriver_mut(jitdriver_index)?;
                     jd.green_args_spec = green_args_spec;
                     jd.red_args_types = red_args_types;
+                    // `find_portals` rewrites the marker to autodetect order
+                    // before this transform runs on the split copy. Keep the
+                    // map recorded against the source operands when this
+                    // later rewrite would only see the identity.
+                    let identity: Vec<u32> = (0..reds_raw.len() as u32).collect();
+                    if jd.red_marker_positions.is_none()
+                        || computed_positions.as_deref() != Some(identity.as_slice())
+                    {
+                        jd.red_marker_positions = computed_positions;
+                    }
                 }
                 if autoreds {
                     let jd = self
@@ -36006,7 +36099,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36174,7 +36267,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36279,7 +36372,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36505,7 +36598,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36730,7 +36823,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36905,7 +36998,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37080,7 +37173,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37236,7 +37329,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37903,6 +37996,7 @@ mod tests {
             jd.red_args_types,
             vec![majit_ir::Type::Ref, majit_ir::Type::Int],
         );
+        assert_eq!(jd.red_marker_positions, Some(vec![0, 1]));
     }
 
     #[test]

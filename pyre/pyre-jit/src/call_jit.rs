@@ -6260,28 +6260,21 @@ fn tuple_hash_finish_int(finish_args: &[majit_ir::OpRef]) -> i64 {
 }
 
 fn live_tuple_hash_args(jump_args: &[majit_ir::OpRef]) -> Option<Vec<majit_ir::Value>> {
-    if jump_args.len() < 4 {
+    let n = pyre_jit_trace::jitcode_runtime::compiled_jit_driver_for_key(
+        pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+    )?
+    .red_marker_positions
+    .as_ref()?
+    .len();
+    if jump_args.len() < n {
         return None;
     }
     let (driver, _) = crate::eval::driver_pair();
     let ctx = driver.meta_interp_mut().trace_ctx()?;
-    let len = match ctx.concrete_of_opref(jump_args[0]) {
-        Some(majit_ir::Value::Int(v)) => v,
-        _ => return None,
-    };
-    let acc = match ctx.concrete_of_opref(jump_args[1]) {
-        Some(majit_ir::Value::Int(v)) => v,
-        _ => return None,
-    };
-    let i = match ctx.concrete_of_opref(jump_args[2]) {
-        Some(majit_ir::Value::Int(v)) => v,
-        _ => return None,
-    };
-    let obj = match ctx.concrete_of_opref(jump_args[3]) {
-        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if ptr != 0 => ptr as PyObjectRef,
-        _ => return None,
-    };
-    Some(pyre_jit_trace::tuplehash_state::tuple_hash_live_values(len, acc, i, obj).to_vec())
+    jump_args[..n]
+        .iter()
+        .map(|op| ctx.concrete_of_opref(*op))
+        .collect()
 }
 
 /// `pyjitpl.py MetaInterp.reached_loop_header` for a `hash_driver` bridge
@@ -6588,14 +6581,14 @@ fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> Bridg
 fn cancel_tuple_hash_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> BridgeResolution {
     cancel_novable_bridge_walk_with(stb, |args| {
         // `warmspot.py handle_jitexception`: `hash_driver` restarts
-        // `portal_ptr(w_type, len, acc, i, obj)` from the merge point the
-        // blackhole reached.
-        let len = args.red_int.first().copied().unwrap_or(0);
-        let acc = args.red_int.get(1).copied().unwrap_or(0);
-        let i = args.red_int.get(2).copied().unwrap_or(0);
-        let obj = args.red_ref.first().copied().unwrap_or(0) as PyObjectRef;
+        // `portal_ptr` from the merge point the blackhole reached.
+        // I/R banks are flattened through the rewritten red list.
         BridgeResolution::CompiledContinueLive(
-            pyre_jit_trace::tuplehash_state::tuple_hash_live_values(len, acc, i, obj).to_vec(),
+            pyre_jit_trace::jitcode_runtime::compiled_red_values_from_kind_banks(
+                pyre_jit_trace::tuplehash_state::TUPLEHASH_PORTAL_KEY,
+                &args.red_int,
+                &args.red_ref,
+            ),
         )
     })
 }

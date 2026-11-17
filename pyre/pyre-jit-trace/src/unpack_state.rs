@@ -114,6 +114,7 @@ impl UnpackJitState {
     /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`. The extracted
     /// body names `save_point`, `root_base`, and `items_slot`.
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
+        // The three reds are locals of the portal, not marker operands, so the order is the detected one and is asserted by the unit test only by kind.
         let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
             vec![
