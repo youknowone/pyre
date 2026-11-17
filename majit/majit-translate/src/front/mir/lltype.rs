@@ -17130,6 +17130,29 @@ pub(crate) fn gcarray_item_struct_ptr_lltype(
     })))
 }
 
+/// `direct_arrayitems` (`lltype.py`) of a non-GC `GcArray` ITEM
+/// (`rordereddict.py` `DICTENTRY`). `_subarray._makeptr` builds
+/// `Ptr(FixedSizeArray(ITEM, 1))`.
+pub(crate) fn gcarray_item_direct_arrayitems_ptr_lltype(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        FixedSizeArray, LowLevelType, Ptr, PtrTarget,
+    };
+
+    let LowLevelType::Ptr(p) = gcarray_item_struct_ptr_lltype(reg, item)? else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = p.TO else {
+        return None;
+    };
+    let arr = FixedSizeArray::new(LowLevelType::Struct(Box::new(st)), 1);
+    Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::FixedSizeArray(arr),
+    })))
+}
+
 /// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
 /// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
 /// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.

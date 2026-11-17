@@ -2287,6 +2287,24 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // `entry_at(slot).field` / `entry_at_mut(slot).field` is
+                // the same `getinteriorfield` (`rewrite_op_getinteriorfield`).
+                // The reference does not escape, so the call is not
+                // residual. A copied or returned `&Entry` falls through.
+                if args.len() == 2
+                    && self.try_lower_struct_field_entry_at(
+                        mir_bb,
+                        &reg,
+                        &args,
+                        &arg_locals,
+                        first_arg_ty.as_ref(),
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
                 // Copy-struct `<[T]>::get(s, i)` used only as `get(i)?.field`
                 // is `ll_getitem_nonneg` + `getinteriorfield`. The Option
                 // dest stays a bounds bool, never a tagged aggregate.
@@ -4044,7 +4062,9 @@ impl<'a> Lowering<'a> {
                     // offset, then `cast_int_to_ptr`. An inlined non-GC
                     // item (`rordereddict.py` `DICTENTRY`, `lltype.py`
                     // `Struct`) is the 2-arg form whose constant is
-                    // `Ptr(ITEM)` (`ann_cast_int_to_ptr`). `direct_ptradd`
+                    // `Ptr(FixedSizeArray(ITEM, 1))` (`direct_arrayitems`,
+                    // `_subarray._makeptr`, `ann_cast_int_to_ptr`).
+                    // `direct_ptradd`
                     // is the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
@@ -4105,7 +4125,8 @@ impl<'a> Lowering<'a> {
                         // `addr_of_mut!((*header).items).cast()` is
                         // `direct_arrayitems` (`lltype.py`). The inlined
                         // ITEM (`rordereddict.py` `DICTENTRY`) is
-                        // `Ptr(ITEM)` via the 2-arg `ann_cast_int_to_ptr`,
+                        // `Ptr(FixedSizeArray(ITEM, 1))` via the 2-arg
+                        // `ann_cast_int_to_ptr` (`_subarray._makeptr`),
                         // even when `instance_narrow_for_type` declines
                         // the classdef recast. A same-root `.cast()` used
                         // to alias the FieldRead and leave getattr

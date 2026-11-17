@@ -9697,18 +9697,21 @@ pub use self::gcroot::{
     harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
     scope_owner_identity,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::gcarray_item_struct_ptr_lltype;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
-    fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
-    host_rthread_threadlocalref_llop, impl_method_owner_for_fundecl, impl_owner_from_item_meta,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    fnptr_indirect_enabled, gcarray_item_direct_arrayitems_ptr_lltype,
+    gcarray_item_struct_ptr_annotation, host_rthread_threadlocalref_llop,
+    impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
+    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
