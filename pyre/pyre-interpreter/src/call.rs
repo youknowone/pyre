@@ -7077,20 +7077,22 @@ fn update_bases(
                         "__mro_entries__ must return a tuple",
                     ));
                 }
-                let w_new_base = pyre_object::gc_roots::pin_root(w_new_base);
+                // Reading the tuple's items does not allocate, so take them all
+                // while `w_new_base` is current and publish them in one run;
+                // the tuple itself is not read again.
+                let items: Vec<PyObjectRef> = unsafe {
+                    (0..pyre_object::w_tuple_len(w_new_base))
+                        .filter_map(|j| pyre_object::w_tuple_getitem(w_new_base, j as i64))
+                        .collect()
+                };
                 if new_slots.is_none() {
                     new_slots = Some((0..i).map(|k| args_base + k).collect());
                 }
-                let nb = new_slots.as_mut().unwrap();
-                let n = unsafe { pyre_object::w_tuple_len(w_new_base) };
-                for j in 0..n {
-                    if let Some(item) =
-                        unsafe { pyre_object::w_tuple_getitem(w_new_base, j as i64) }
-                    {
-                        nb.push(pyre_object::gc_roots::shadow_stack_len());
-                        let _ = pyre_object::gc_roots::pin_root(item);
-                    }
-                }
+                let items_base = pyre_object::gc_roots::pin_roots(&items);
+                new_slots
+                    .as_mut()
+                    .unwrap()
+                    .extend(items_base..items_base + items.len());
             }
         }
     }
