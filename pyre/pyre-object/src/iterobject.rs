@@ -70,32 +70,36 @@ pub static BYTEARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytearray_
 pub static MEMORY_ITER_TYPE: PyType = crate::pyobject::new_pytype("memory_iterator");
 pub static ARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("array.arrayiterator");
 
-/// The Python-visible iterator type for a sequence iterator over `seq`.
-///
-/// 3.14 splits str iteration by storage: an all-ASCII str yields
-/// `str_ascii_iterator`, anything wider yields `str_iterator`.  Producers with
-/// no specialized type keep the shared `sequenceiterator`.
-fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
-    unsafe {
-        if crate::is_str(seq) {
-            if crate::unicodeobject::w_str_is_ascii(seq) {
-                &STR_ASCII_ITER_TYPE
-            } else {
-                &STR_ITER_TYPE
-            }
-        } else if crate::bytesobject::is_bytes(seq) {
-            &BYTES_ITER_TYPE
-        } else if crate::bytearrayobject::is_bytearray(seq) {
-            &BYTEARRAY_ITER_TYPE
-        } else if crate::memoryview::is_w_memoryview(seq) {
-            &MEMORY_ITER_TYPE
-        } else if crate::interp_array::is_array(seq) {
-            &ARRAY_ITER_TYPE
-        } else {
-            &SEQ_ITER_TYPE
+/// Own graph so `fuse_boxing_alloc` rewrites the `malloc_typed_stable`
+/// cluster to `new_with_vtable` + payload `setfield` (`newfloat`).
+/// The type word is a constant `&T` in this graph: a runtime selector
+/// leaves `ob_type-not-a-constant-address` and residualizes the
+/// `dont_look_inside` allocator.
+macro_rules! seq_iter_new_typed {
+    ($name:ident, $tp:expr, $empty_kind:expr) => {
+        #[inline(never)]
+        fn $name(seq: PyObjectRef, length: usize) -> PyObjectRef {
+            crate::lltype::malloc_typed_stable(W_SeqIterObject {
+                ob: PyObject {
+                    ob_type: $tp as *const PyType,
+                    w_class: crate::pyobject::get_instantiate($tp),
+                },
+                seq,
+                index: 0,
+                length: length as i64,
+                empty_kind: $empty_kind,
+            }) as PyObjectRef
         }
-    }
+    };
 }
+
+seq_iter_new_typed!(seq_iter_new_str_ascii, &STR_ASCII_ITER_TYPE, 1);
+seq_iter_new_typed!(seq_iter_new_str, &STR_ITER_TYPE, 1);
+seq_iter_new_typed!(seq_iter_new_bytes, &BYTES_ITER_TYPE, 0);
+seq_iter_new_typed!(seq_iter_new_bytearray, &BYTEARRAY_ITER_TYPE, 0);
+seq_iter_new_typed!(seq_iter_new_memory, &MEMORY_ITER_TYPE, 0);
+seq_iter_new_typed!(seq_iter_new_array, &ARRAY_ITER_TYPE, 0);
+seq_iter_new_typed!(seq_iter_new_seq, &SEQ_ITER_TYPE, 0);
 
 /// `space.int_w` into a cursor: `Signed` is a machine word, so a Python int
 /// wider than `isize` does not fit.
@@ -114,18 +118,25 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let seq = crate::gc_roots::pin_root(seq);
-    let tp = seq_iter_type_for(seq);
-    let value = W_SeqIterObject {
-        ob: PyObject {
-            ob_type: tp as *const PyType,
-            w_class: crate::pyobject::get_instantiate(tp),
-        },
-        seq,
-        index: 0,
-        length: length as i64,
-        empty_kind: unsafe { if crate::is_str(seq) { 1 } else { 0 } },
-    };
-    crate::lltype::malloc_typed_stable(value) as PyObjectRef
+    unsafe {
+        if crate::is_str(seq) {
+            if crate::unicodeobject::w_str_is_ascii(seq) {
+                seq_iter_new_str_ascii(seq, length)
+            } else {
+                seq_iter_new_str(seq, length)
+            }
+        } else if crate::bytesobject::is_bytes(seq) {
+            seq_iter_new_bytes(seq, length)
+        } else if crate::bytearrayobject::is_bytearray(seq) {
+            seq_iter_new_bytearray(seq, length)
+        } else if crate::memoryview::is_w_memoryview(seq) {
+            seq_iter_new_memory(seq, length)
+        } else if crate::interp_array::is_array(seq) {
+            seq_iter_new_array(seq, length)
+        } else {
+            seq_iter_new_seq(seq, length)
+        }
+    }
 }
 
 pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
@@ -180,7 +191,7 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
-    // Every producer-specific identity minted by `seq_iter_type_for` carries
+    // Every producer-specific identity minted by `w_seq_iter_new` carries
     // the same `W_SeqIterObject` payload, so all of them answer yes here.
     let tp = unsafe { (*obj).ob_type };
     std::ptr::eq(tp, &SEQ_ITER_TYPE)

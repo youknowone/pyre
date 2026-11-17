@@ -20782,16 +20782,14 @@ pub(crate) fn seq_iter_descr_next(obj: PyObjectRef) -> PyResult {
                 None
             }
         } else if is_str(seq) {
-            // Box the idx-th code point as a one-character str,
-            // reading the WTF-8 view so a lone surrogate is yielded
-            // instead of panicking.
+            // `W_SeqIterObject.descr_next` (`iterobject.py`) →
+            // `_getitem_result` (`unicodeobject.py`).
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, seq]);
-            let item = pyre_object::w_str_codepoint_at(
+            let item = pyre_object::w_str_getitem(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
-                idx as usize,
-            )
-            .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()));
+                pyre_object::seq_index_to_i64(idx),
+            );
             if let Some(v) = item {
                 let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
                     as *mut pyre_object::W_SeqIterObject;
