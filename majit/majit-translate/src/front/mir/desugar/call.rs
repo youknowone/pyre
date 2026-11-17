@@ -7406,12 +7406,14 @@ impl<'a> Lowering<'a> {
                 let mut args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
                     // `SetStrategy::{add,remove,has_key}` take
-                    // `(&self, w_set, ObjectKey)`. The flow graph drops the
-                    // ZST `&self` and leaves `ObjectKey` as one pointer, so
-                    // the residual words are `(w_set, &ObjectKey)`. The vtable
-                    // slot is the rustc method, which reads those words as
-                    // `self` and `w_set`. Call the word trampoline that
-                    // matches the residual instead. Do not recast the
+                    // `(&self, w_set, ObjectKey, hash)`. The flow graph drops
+                    // the ZST `&self`. `ObjectKey` is one pointer
+                    // (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR);
+                    // the digest is the third residual word (`ll_hash_from_cache`).
+                    // The residual words are `(w_set, ObjectKey, hash)`. The
+                    // vtable slot is the rustc method, which would read those
+                    // words as `self` and `w_set`. Call the word trampoline
+                    // that matches the residual instead. Do not recast the
                     // receiver before this trampoline. Inside the trampoline
                     // the vtable call is the operation itself, so it stays
                     // an `indirect_call` for the effect analysis (the
@@ -7430,13 +7432,13 @@ impl<'a> Lowering<'a> {
                         .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
-                        && (args.len() == 2 || args.len() == 3)
+                        && (args.len() == 3 || args.len() == 4)
                         && current_fn != trampoline_path
                     {
-                        let key_args = if args.len() == 3 {
-                            vec![args[1].clone(), args[2].clone()]
+                        let key_args = if args.len() == 4 {
+                            vec![args[1].clone(), args[2].clone(), args[3].clone()]
                         } else {
-                            vec![args[0].clone(), args[1].clone()]
+                            vec![args[0].clone(), args[1].clone(), args[2].clone()]
                         };
                         OpKind::Call {
                             target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
