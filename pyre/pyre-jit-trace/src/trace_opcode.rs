@@ -186,9 +186,9 @@ use crate::descr::{float_floatval_descr, int_intval_descr, w_float_size_descr, w
 /// `rpython/jit/metainterp/opencoder.py
 /// _list_of_boxes_virtualizable(boxes)` with no fallback heap source.
 /// Pyre matches that single-source model in spirit for the two
-/// per-opcode-advancing fields: `last_instr` / `valuestackdepth` are
-/// rewritten in `s.vable_*` to their pre-opcode value at `orgpc - 1`
-/// before the snapshot is built. The other three scalars (`pycode`,
+/// per-opcode-advancing fields: `last_instr` stays the
+/// `setfield_vable_i` box (`dispatch_bytecode`); `valuestackdepth` is
+/// published at the resume py_pc before the snapshot is built. The other three scalars (`pycode`,
 /// `debugdata`, `w_globals`) keep whatever OpRef
 /// `init_vable_indices` seeded at trace start because the tracer
 /// never reaches their mutators under pyre's 3.14 bytecode
@@ -240,6 +240,27 @@ pub(crate) fn mirror_vable_static_to_boxes(
         // flushes every array item from `box_value` copies after `const_int`
         // may have collected.
         ctx.synchronize_virtualizable_at(idx);
+    }
+}
+
+/// Snapshot-only write of a STANDARD static: update the boxes the snapshot
+/// copies, and do not write the live `PyFrame`. `pyjitpl.py`
+/// `capture_resumedata` overrides `frame.pc` for the snapshot and restores
+/// it; the heap `pushvalue`/`popvalue` depth stays the walk's.
+pub(crate) fn mirror_vable_static_to_boxes_nosync(
+    ctx: &mut TraceCtx,
+    static_field_name: &str,
+    opref: OpRef,
+    concrete: Value,
+) {
+    if !ctx.has_virtualizable_shadow() {
+        return;
+    }
+    let idx = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(static_field_name));
+    if let Some(idx) = idx {
+        ctx.set_virtualizable_entry_at(idx, opref, concrete);
     }
 }
 
@@ -892,7 +913,7 @@ impl MIFrame {
             let s = self.sym();
             let (metadata_stack_depth, pcdep_entries, has_color_map) =
                 match payload_for_pcdep.as_deref() {
-                    None => (None, &[] as &[(u8, u16, u16)], false),
+                    None => (None, Vec::new(), false),
                     Some(payload) => {
                         let has_color_map = payload.metadata.has_color_map;
                         match resume_jit_pc {
@@ -900,10 +921,10 @@ impl MIFrame {
                                 payload
                                     .depth_for_jitcode_pc_pred(jit_pc)
                                     .map(|d| d as usize),
-                                payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or(&[]),
+                                payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default(),
                                 has_color_map,
                             ),
-                            None => (None, &[] as &[(u8, u16, u16)], has_color_map),
+                            None => (None, Vec::new(), has_color_map),
                         }
                     }
                 };
@@ -921,7 +942,7 @@ impl MIFrame {
             )
         };
         let pcdep_opt: Option<&[(u8, u16, u16)]> =
-            (!pcdep_entries.is_empty()).then_some(pcdep_entries);
+            (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in

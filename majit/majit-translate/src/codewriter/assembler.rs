@@ -5715,6 +5715,22 @@ fn describe_v_inst_from_base(
     }
 }
 
+/// Minted (flag, offset, size) for `field`, same Parent-then-Layout walk
+/// `fielddescrof` uses (`bh_field_lookup`). `None` when that walk has no
+/// leaf. A non-`FLAG_STRUCT` leaf is an ordinary one-word field
+/// (`descr.py get_type_flag`); `jtransform.py rewrite_op_getsubstruct`
+/// is only for an inline Struct.
+pub(crate) fn minted_field_layout(
+    cc: &CallControl,
+    field: &crate::model::FieldDescriptor,
+) -> Option<(majit_ir::descr::ArrayFlag, usize, usize)> {
+    match bh_field_lookup(cc, field) {
+        BhFieldLookup::Parent(spec) => Some((spec.field_flag, spec.offset, spec.field_size)),
+        BhFieldLookup::Layout(row) => Some((row.flag, row.offset, row.size)),
+        BhFieldLookup::Missing => None,
+    }
+}
+
 /// Offset and size of a by-value substructure (`getsubstruct`).
 ///
 /// `descr.py` `get_type_flag` → `FLAG_STRUCT` is that shape: a nested
@@ -5841,6 +5857,23 @@ fn is_explicit_shell_variant_owner(owner: &str) -> bool {
     STRIPPED.contains(&name)
         || SHELLED.contains(&name)
         || matches!(name, "Result::Ok" | "Result::Err" | "Option::Some")
+}
+
+/// True when intern rows for `owner` carry the tag or leave its first-word
+/// slot free. A payload-only niche layout with a row at offset 0 is not a
+/// shell: the writer stored the payload there.
+fn explicit_shell_leaves_tag_slot(cc: &CallControl, owner: &str) -> bool {
+    cc.struct_layout_for(owner).is_none_or(|layout| {
+        layout.fields.is_empty()
+            || layout
+                .fields
+                .iter()
+                .any(|field| field.name == "__discriminant")
+            || layout
+                .fields
+                .iter()
+                .all(|field| field.offset >= crate::layout::target_word_size())
+    })
 }
 
 /// `BhSizeSpec.type_id` for one owner spelling.
@@ -6350,18 +6383,18 @@ fn bh_size_spec_for(
     // blackhole must reconstruct the same inherited tag slot or the payload
     // takes slot 0 here while living at byte 8 there.  `None` carries no
     // payload row, so it needs no reconstruction.
+    //
+    // A concrete variant is rebuilt as the explicit shell (tag @0 + one
+    // word per payload seat) only when the writer leaves the tag slot in
+    // front of the payload. The shell is rebuilt when the intern rows
+    // carry the tag or leave its slot free. The shell's payload seats
+    // are one word each (`descr.py get_type_flag`). A concrete
+    // `Result<T>::Ok` intern can be payload-only FLAG_STRUCT 16 with the
+    // tag on the enum base; skipping reconstruction then lets
+    // `heaptracker.py all_fielddescrs` recurse into T's leaves and name a
+    // pointer past the 16-byte parent instead of the seat the writer stores.
     let result_variant = is_explicit_shell_variant_owner(template_owner)
-        && cc.struct_layout_for(owner).is_none_or(|layout| {
-            // An empty TypeVar-template layout still needs the shell
-            // reconstructed (`enum_variant_field_occupies_storage` left
-            // no occupying rows). A payload-only instantiation keeps
-            // its own rows and is not this case.
-            layout.fields.is_empty()
-                || layout
-                    .fields
-                    .iter()
-                    .any(|field| field.name == "__discriminant")
-        });
+        && explicit_shell_leaves_tag_slot(cc, owner);
     // Fields of an explicit Result/Option shell come from `instance_layout`
     // when that STRUCT is registered. Size must come from the same row: a
     // `Vec<u8>` payload is three words, and the template shell is still
@@ -6757,37 +6790,58 @@ fn bh_all_field_specs_for_struct_into(
             {
                 continue;
             }
-            if fl.flag == majit_ir::descr::ArrayFlag::Struct {
+            let inner_ty = entries
+                .iter()
+                .find(|row| row.name == fl.name)
+                .map(|row| row.ty.as_str());
+            // Explicit-shell payload seats are one word
+            // (`descr.py get_type_flag`). Intern FLAG_STRUCT is rustc's
+            // layout of T; `heaptracker.py all_fielddescrs` lists the
+            // seat the writer stores (`setfield_gc_r`), not T's leaves.
+            // A `Vec` / fat-pointer seat stays FLAG_STRUCT and is still
+            // the getsubstruct shape.
+            let shell_seat = if fl.flag == majit_ir::descr::ArrayFlag::Struct
+                && is_explicit_shell_variant_owner(root_owner)
+                && explicit_shell_leaves_tag_slot(cc, root_owner)
+                && let Some(inner_ty) = inner_ty
+            {
+                let (flag, ty, size) = type_flag_from_str(inner_ty, &cc.raw_alloc_flavor_structs);
+                (flag != majit_ir::descr::ArrayFlag::Struct).then_some((flag, ty, size))
+            } else {
+                None
+            };
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct
+                && shell_seat.is_none()
+                && let Some(inner_owner) = inner_ty
+                && bh_nested_struct_to_flatten(cc, inner_owner)
+            {
                 // `heaptracker.py:68-69 isinstance(FIELD, lltype.Struct):
                 //  all_fielddescrs(gccache, FIELD, only_gc, res, get_field_descr)`.
                 // Inline Vec is FLAG_STRUCT for the three-word aggregate
                 // and stays one leaf, the same row `from_type_strings`
                 // keeps for a plain struct field of type `Vec<u8>`.
-                if let Some(inner_owner) = entries
-                    .iter()
-                    .find(|row| row.name == fl.name)
-                    .map(|row| row.ty.as_str())
-                    && bh_nested_struct_to_flatten(cc, inner_owner)
-                {
-                    let nested_prefix = format!("{field_prefix}{}.", fl.name);
-                    bh_all_field_specs_for_struct_into(
-                        cc,
-                        root_owner,
-                        inner_owner,
-                        &nested_prefix,
-                        base_offset + fl.offset,
-                        specs,
-                        None,
-                    );
-                    continue;
-                }
+                let nested_prefix = format!("{field_prefix}{}.", fl.name);
+                bh_all_field_specs_for_struct_into(
+                    cc,
+                    root_owner,
+                    inner_owner,
+                    &nested_prefix,
+                    base_offset + fl.offset,
+                    specs,
+                    None,
+                );
+                continue;
             }
+            let (field_size, intern_type, intern_flag) = match shell_seat {
+                Some((flag, ty, size)) => (size, ty, flag),
+                None => (fl.size, fl.field_type, fl.flag),
+            };
             let index_in_parent = specs.len();
             let (field_type, field_flag, is_immutable) = vtable_method_slot_layout(
                 owner,
                 &fl.name,
-                fl.field_type,
-                fl.flag,
+                intern_type,
+                intern_flag,
                 fl.is_immutable(),
             );
             let is_atomic = entries
@@ -6798,7 +6852,7 @@ fn bh_all_field_specs_for_struct_into(
                 root_owner,
                 &field_key,
                 base_offset + fl.offset,
-                fl.size,
+                field_size,
                 field_type,
                 field_flag,
                 is_immutable,
@@ -10038,6 +10092,132 @@ mod tests {
         assert!(is_explicit_shell_variant_owner(
             "core::option::Option::Some"
         ));
+    }
+
+    /// A concrete shelled variant whose intern rows are payload-only:
+    /// FLAG_STRUCT 16 `__pos_0` and no `__discriminant` (the tag lives on
+    /// the enum base / template). Reconstruction still mints the shell:
+    /// tag @0 and a one-word POINTER seat at +8 (`descr.py get_type_flag`).
+    /// `heaptracker.py all_fielddescrs` must list that seat, not recurse
+    /// into `__pos_0.hash` / `__pos_0.obj` past the 16-byte parent.
+    #[test]
+    fn concrete_shell_variant_without_tag_row_mints_one_word_payload_seat() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let template = "core::result::Result::Ok";
+        let owner = "core::result::Result<payload_seat::Key, payload_seat::Err>::Ok";
+        let key = "payload_seat::Key";
+        let template_id = majit_ir::descr::StructId::from_canonical(template);
+        let owner_id = template_id.instantiate("<payload_seat::Key, payload_seat::Err>");
+        let key_id = majit_ir::descr::StructId::from_canonical(key);
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(key.to_string(), Some(key_id));
+        let _registry = register_struct_ids_serialized(ids);
+
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), key.to_string())],
+        );
+        struct_fields.fields.insert(
+            key.to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".into(),
+                    offset: 8,
+                    size: 16,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            key_id,
+            StructLayout {
+                size: 16,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "hash".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "obj".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let intern = cc.struct_layout_for(owner).expect("intern layout");
+        assert!(
+            intern
+                .fields
+                .iter()
+                .all(|field| field.name != "__discriminant"),
+            "subject is intern without a tag row"
+        );
+        assert_eq!(intern.fields[0].name, "__pos_0");
+        assert_eq!(intern.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(intern.fields[0].size, 16);
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("concrete shelled variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(
+            spec.all_fielddescrs[0].field_flag,
+            majit_ir::descr::ArrayFlag::Signed
+        );
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+        assert_eq!(spec.all_fielddescrs[1].field_size, 8);
+        assert_eq!(
+            spec.all_fielddescrs[1].field_flag,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
+        let keys: Vec<&str> = spec
+            .all_fielddescrs
+            .iter()
+            .map(|field| field.field_key())
+            .collect();
+        assert!(
+            !keys.iter().any(|key| key.contains('.')),
+            "shell seat is not intern FLAG_STRUCT leaves; got {keys:?}"
+        );
     }
 
     #[test]
