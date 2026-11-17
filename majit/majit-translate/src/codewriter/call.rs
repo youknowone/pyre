@@ -10647,9 +10647,16 @@ impl CallControl {
     /// `'i'` for `f32`; the call descr stores `'S'`.
     pub(crate) fn declared_result_argclass(&self, path: &CallPath) -> Option<char> {
         let graph = self.function_graphs.get(path)?;
-        let s = graph.return_type.as_ref()?.trim();
+        // FUNC.RESULT (`getfunctionptr(graph)`) is the residual token when
+        // the front end left `return_type` unstamped.
+        let s = graph
+            .return_type
+            .as_deref()
+            .or(graph.residual_return_type.as_deref())?
+            .trim();
+        let declared = s.to_string();
         if map_type_string_to_argclass(s) == 'r'
-            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+            && self.declared_graph_result_type_of(&graph, &declared) == Some(Type::Int)
         {
             return Some('i');
         }
@@ -10673,6 +10680,14 @@ impl CallControl {
     /// to distinguish a raw Struct pointer from a GC reference.
     fn declared_graph_result_type(&self, graph: &FunctionGraph) -> Option<Type> {
         let declared = graph.return_type.as_ref()?;
+        self.declared_graph_result_type_of(graph, declared)
+    }
+
+    fn declared_graph_result_type_of(
+        &self,
+        graph: &FunctionGraph,
+        declared: &String,
+    ) -> Option<Type> {
         let effective = crate::front::typestr::transparent_result_ok_type(declared)
             .map(|s| s.to_string())
             .unwrap_or_else(|| declared.clone());
@@ -26680,6 +26695,36 @@ mod tests {
             FunctionGraph::concretetype_of(&result),
             crate::model::ConcreteType::Signed
         );
+    }
+
+    #[test]
+    fn declared_result_argclass_uses_residual_func_result_when_return_type_unstamped() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["str_repeat"]);
+        let mut graph = FunctionGraph::new("str_repeat");
+        for name in ["a", "b"] {
+            let arg = graph.alloc_value_var();
+            graph.push_inputarg_var(graph.startblock, arg.clone());
+            graph.push_op_with_result_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                arg,
+            );
+        }
+        graph.set_return(graph.startblock, None);
+        graph.residual_return_type = Some("ref".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_argclass(&path), Some('r'));
+        assert_eq!(cc.calldescr_abi_for_path(&path), Some("ww>w".into()));
+
+        let none_path = CallPath::from_segments(["unstamped_no_result"]);
+        cc.register_function_graph(none_path.clone(), simple_graph("unstamped_no_result"));
+        assert_eq!(cc.declared_result_argclass(&none_path), None);
+        assert_eq!(cc.calldescr_abi_for_path(&none_path), None);
     }
 
     #[test]
