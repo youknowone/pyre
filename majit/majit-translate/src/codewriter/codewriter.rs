@@ -2091,7 +2091,8 @@ mod opname_spine_prejit_tests {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, GCREF, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
+        _ptr, _ptr_obj, FuncType, GCREF, LowLevelType, Ptr, PtrTarget, functionptr,
+        functionptr_for_graph_with_type,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, build_ll_append_char_helper_graph,
@@ -2456,6 +2457,75 @@ mod opname_spine_prejit_tests {
             .clone()
             .expect("link arg");
         assert_eq!(link_arg, Hlvalue::Variable(x));
+    }
+
+    /// A `w_none`-shaped rtyped graph: refs-row `OnceLock<usize>` GCREF
+    /// constant, `__cast_instance_intrinsic` as `cast_pointer` onto
+    /// `OBJECTPTR`, then return. Spine B must flatten to
+    /// `constrefaddr` + `ref_return` with no kind panic
+    /// (`assert_rtyped_link_constant_kind` sees ref == ref), the same
+    /// opcodes Spine A emits for `w_none`.
+    #[test]
+    fn singleton_accessor_returns_a_ref_constant_on_the_opname_spine() {
+        let addr = 0x1234_5678i64;
+        let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+            panic!("GCREF must be a Ptr lowleveltype");
+        };
+        let p = _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(addr))), true);
+        let gcref_const = constant_with_lltype(ConstValue::LLPtr(Box::new(p)), GCREF.clone());
+        let result = variable_with_lltype("w_none", OBJECTPTR.clone());
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::with_return_var(
+            "w_none",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_pointer",
+            vec![gcref_const],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let path = CallPath::from_segments(["w_none"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("constrefaddr"),
+            "singleton accessor must emit constrefaddr; dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("ref_return"),
+            "singleton accessor must flatten to ref_return of that constant; dump:\n{dump}"
+        );
+        assert!(
+            !dump.contains("int_return"),
+            "must not int_return the refs-row word; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let ref_returns: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::RefReturn(_) => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ref_returns.len(),
+            1,
+            "exactly one ref_return; dump:\n{dump}"
+        );
     }
 
     /// Spine B `direct_call` of a stringbuilder helper resolves by the
