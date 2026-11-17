@@ -3144,24 +3144,10 @@ fn dispatch_head_has_catch_sites(code: &CodeObject, catch_for_pc: &[Option<u16>]
     })
 }
 
-/// Catch label for a dispatch green `py_pc`. Prefer
-/// `dispatch_last_instr_pc` so the lookup matches
-/// `PyFrame.handle_operation_error`'s `lookup_exceptiontable(self.last_instr)`.
-fn catch_label_for_dispatch_pc(
-    code: &CodeObject,
-    catch_for_pc: &[Option<u16>],
-    py_pc: usize,
-) -> Option<u16> {
-    let lasti = dispatch_last_instr_pc(code, py_pc);
-    catch_for_pc
-        .get(lasti)
-        .copied()
-        .flatten()
-        .or_else(|| catch_for_pc.get(py_pc).copied().flatten())
-}
-
 /// `PyFrame.handle_operation_error` unrolls `lookup_exceptiontable` as a
 /// switch on `last_instr` read from the frame after the hook raised.
+/// Cases are keyed by both the instruction start (where `fset_f_lineno`
+/// puts `last_instr`) and the post-`EXTENDED_ARG` opcode pc.
 /// `tr_armed` stays the canraise block; `dispatch_x` is a Value switch
 /// (not canraise). Each case links into the shared unwind landing;
 /// the default raises out (`graph.exceptblock`).
@@ -3243,62 +3229,69 @@ fn emit_trace_arm_exception_dispatch(
         if !is_python_instruction_start(code, py_pc) {
             continue;
         }
-        // `last_instr` holds the opcode pc after EXTENDED_ARG.
-        let key_pc = dispatch_last_instr_pc(code, py_pc);
-        if keyed.contains(&key_pc) {
-            continue;
+        let opcode_pc = dispatch_last_instr_pc(code, py_pc);
+        // `last_instr` is the opcode pc after EXTENDED_ARG on the normal
+        // path, but `fset_f_lineno` stores an instruction's start, which is
+        // its first prefix; both are keys `lookup_exceptiontable` may see.
+        for key_pc in [py_pc, opcode_pc] {
+            if keyed.contains(&key_pc) {
+                continue;
+            }
+            // `lookup_exceptiontable(self.last_instr)`.
+            let Some(catch_label) = catch_for_pc.get(key_pc).copied().flatten() else {
+                continue;
+            };
+            let Some(site) = catch_sites
+                .iter()
+                .find(|site| site.landing_label == catch_label)
+                .cloned()
+            else {
+                continue;
+            };
+            keyed.push(key_pc);
+            let mut catch_source = x_state.clone();
+            // Handler entry is reached by `goto`, not through the `next_instr`
+            // switch, so the catch edge carries no `next_instr` green
+            // (opcode-case catch edges carry none either, and
+            // `FrameState::union` would not merge Some with None).
+            catch_source.dispatch_next_instr = None;
+            let depth_p = depth_at_pc
+                .get(opcode_pc)
+                .copied()
+                .unwrap_or(site.stack_depth);
+            sync_stack_state(graph, &mut catch_source, depth_p);
+            // `handle_operation_error` unwinds to the handler's depth, pushes
+            // the exception and continues at the handler: a plain link into
+            // the shared unwind landing, carrying X's exception pair.
+            let edge_state = handler_entry_state_from_catch_site(code, graph, &catch_source, &site);
+            let raising_depth = (catch_source.stack.len() as u16).max(depth_p);
+            let (landing, lasti_int) = lookup_or_create_shared_unwind(
+                graph,
+                unwind_memo,
+                &site,
+                &edge_state,
+                &site.landing,
+                raising_depth,
+            );
+            update_catch_landing_state(graph, &landing, &edge_state);
+            let Some(target_state) = landing.framestate() else {
+                continue;
+            };
+            let mut args = edge_state.getoutputargs(&target_state);
+            if lasti_int.is_some() {
+                // lasti=True pushes `space.newint(self.last_instr)`, the key itself.
+                args.push(super::flow::Constant::signed(key_pc as i64).into());
+            }
+            let case_key: super::flow::FlowValue =
+                super::flow::Constant::signed(key_pc as i64).into();
+            let link = super::flow::Link::new(args, Some(landing.block()), Some(case_key.clone()))
+                .with_llexitcase(case_key)
+                .into_ref();
+            append_exit(&dispatch_x.block(), link.clone());
+            // `update_catch_landing_state` rewrites the args of every
+            // registered incoming link when a later edge widens the landing.
+            landing.add_incoming_exception_link(link);
         }
-        let Some(catch_label) = catch_label_for_dispatch_pc(code, catch_for_pc, py_pc) else {
-            continue;
-        };
-        let Some(site) = catch_sites
-            .iter()
-            .find(|site| site.landing_label == catch_label)
-            .cloned()
-        else {
-            continue;
-        };
-        keyed.push(key_pc);
-        let mut catch_source = x_state.clone();
-        // Handler entry is reached by `goto`, not through the `next_instr`
-        // switch, so the catch edge carries no `next_instr` green
-        // (opcode-case catch edges carry none either, and
-        // `FrameState::union` would not merge Some with None).
-        catch_source.dispatch_next_instr = None;
-        let depth_p = depth_at_pc
-            .get(site.lasti_py_pc)
-            .copied()
-            .unwrap_or(site.stack_depth);
-        sync_stack_state(graph, &mut catch_source, depth_p);
-        // `handle_operation_error` unwinds to the handler's depth, pushes
-        // the exception and continues at the handler: a plain link into
-        // the shared unwind landing, carrying X's exception pair.
-        let edge_state = handler_entry_state_from_catch_site(code, graph, &catch_source, &site);
-        let raising_depth = (catch_source.stack.len() as u16).max(depth_p);
-        let (landing, lasti_int) = lookup_or_create_shared_unwind(
-            graph,
-            unwind_memo,
-            &site,
-            &edge_state,
-            &site.landing,
-            raising_depth,
-        );
-        update_catch_landing_state(graph, &landing, &edge_state);
-        let Some(target_state) = landing.framestate() else {
-            continue;
-        };
-        let mut args = edge_state.getoutputargs(&target_state);
-        if lasti_int.is_some() {
-            args.push(super::flow::Constant::signed(site.lasti_py_pc as i64).into());
-        }
-        let case_key: super::flow::FlowValue = super::flow::Constant::signed(key_pc as i64).into();
-        let link = super::flow::Link::new(args, Some(landing.block()), Some(case_key.clone()))
-            .with_llexitcase(case_key)
-            .into_ref();
-        append_exit(&dispatch_x.block(), link.clone());
-        // `update_catch_landing_state` rewrites the args of every
-        // registered incoming link when a later edge widens the landing.
-        landing.add_incoming_exception_link(link);
     }
 
     if dispatch_x.block().borrow().exits.is_empty() {
@@ -22978,6 +22971,95 @@ def f(x):
             ops.get(second_switch.saturating_sub(3)..second_switch)
                 .map(|window| window.iter().map(|op| op.opname).collect::<Vec<_>>()),
         );
+    }
+
+    #[test]
+    fn armed_trace_hook_catch_covers_extended_arg_prefix() {
+        // `fset_f_lineno` stores `last_instr` at an instruction's first
+        // EXTENDED_ARG; `handle_operation_error` looks that key up.
+        // One local plus a jump whose offset needs a prefix: 256 locals
+        // would overflow the jitcode ref-register file.
+        let mut source = String::from("def f(x):\n    try:\n        if x:\n");
+        for _ in 0..160 {
+            source.push_str("            x = 1\n");
+        }
+        source.push_str("        return x\n    except Exception:\n        return 0\n");
+        let code = first_nested_function_code(&source);
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(!entries.is_empty());
+        let try_ranges: Vec<(usize, usize)> = entries
+            .iter()
+            .map(|entry| (entry.start as usize / 2, entry.end as usize / 2))
+            .collect();
+        let mut prefix_and_opcode: Vec<(usize, usize)> = Vec::new();
+        for py_pc in 0..code.instructions.len() {
+            if !is_python_instruction_start(&code, py_pc) {
+                continue;
+            }
+            if !matches!(code.instructions[py_pc].op, Instruction::ExtendedArg) {
+                continue;
+            }
+            let in_try = try_ranges
+                .iter()
+                .any(|&(start, end)| py_pc >= start && py_pc < end);
+            if !in_try {
+                continue;
+            }
+            prefix_and_opcode.push((py_pc, dispatch_last_instr_pc(&code, py_pc)));
+        }
+        assert!(
+            !prefix_and_opcode.is_empty(),
+            "try range {try_ranges:?} must contain Instruction::ExtendedArg"
+        );
+
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("try/except with EXTENDED_ARG must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let arm_pc = ops
+            .iter()
+            .find(|op| op.opname == "inline_call_r_r")
+            .map(|op| op.pc)
+            .expect("bytecode_only_trace arm");
+        let arm_idx = ops.iter().position(|op| op.pc == arm_pc).unwrap();
+        let dispatch_switch = ops[arm_idx + 1..]
+            .iter()
+            .find(|op| op.opname.starts_with("switch"))
+            .expect("exception dispatch switch after the armed inline_call");
+        let descr_idx = decoded_descr_u16(&pyjit.jitcode.code, dispatch_switch.pc, 2);
+        let keys: Vec<i64> = pyjit
+            .jitcode
+            .descr_at(descr_idx)
+            .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_bh_descr)
+            .and_then(|descr| match descr {
+                majit_jitcode::jitcode::BhDescr::Switch {
+                    const_keys_in_order,
+                    ..
+                } => Some(const_keys_in_order.clone()),
+                _ => None,
+            })
+            .expect("exception dispatch switch must carry SwitchDictDescr keys");
+        for &(prefix_pc, opcode_pc) in &prefix_and_opcode {
+            assert!(
+                keys.contains(&(prefix_pc as i64)),
+                "dispatch must case on EXTENDED_ARG prefix {prefix_pc}, keys={keys:?}"
+            );
+            assert!(
+                keys.contains(&(opcode_pc as i64)),
+                "dispatch must case on opcode pc {opcode_pc}, keys={keys:?}"
+            );
+        }
     }
 
     #[test]
