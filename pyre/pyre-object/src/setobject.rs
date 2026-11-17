@@ -3747,7 +3747,7 @@ unsafe fn w_set_insert_key_into(
     // set's size.
     if let Some(result) = callback_free_set_op(|| {
         let entries = &mut *items;
-        let index = entries.index_of(&key);
+        let index = entries.index_of_with_hash(key.hash as u64, &key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return false;
         }
@@ -3759,7 +3759,7 @@ unsafe fn w_set_insert_key_into(
         // comparisons and cannot break either.
         let mut live_key = key;
         live_key.obj = crate::gc_roots::shadow_stack_get(key_slot);
-        entries.insert(live_key, ());
+        entries.insert_with_hash(live_key.hash as u64, live_key, ());
         true
     }) {
         if result.map_err(SetUpdateError::Key)? {
@@ -3843,7 +3843,7 @@ unsafe fn w_set_contains_key_for_update(
         if s.strategy.kind == SetStrategyKind::Empty {
             return false;
         }
-        (*object_set_storage_ptr(s)).contains_key(&key)
+        (*object_set_storage_ptr(s)).contains_with_hash(key.hash as u64, &key)
     }) {
         return result.map_err(SetUpdateError::Key);
     }
@@ -3944,7 +3944,7 @@ unsafe fn w_set_remove_key_for_update(
             return false;
         }
         let items = object_set_storage_ptr(set);
-        let index = (*items).index_of(&key);
+        let index = (*items).index_of_with_hash(key.hash as u64, &key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return false;
         }
@@ -4424,7 +4424,7 @@ impl SetStrategy for ObjectSetStrategy {
                 let s = &*(obj as *const W_SetObject);
                 object_set_storage_ptr(s)
             };
-            let index = (*items).index_of(&key);
+            let index = (*items).index_of_with_hash(key.hash as u64, &key);
             if crate::dict_eq_hook::callback_free_probe_broken() {
                 return false;
             }
@@ -4468,7 +4468,7 @@ impl SetStrategy for ObjectSetStrategy {
         };
         if let Some(result) = callback_free_set_op(|| {
             let s = &*(obj as *const W_SetObject);
-            (*object_set_storage_ptr(s)).contains_key(&key)
+            (*object_set_storage_ptr(s)).contains_with_hash(key.hash as u64, &key)
         }) {
             return result;
         }
