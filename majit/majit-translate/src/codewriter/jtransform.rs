@@ -10636,7 +10636,6 @@ impl<'a> Transformer<'a> {
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
 
-
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
         // raw_store through it keeps that int base (`_gckind == 'raw'`).
