@@ -6338,7 +6338,7 @@ impl CallControl {
         });
         let elem_name = self.array_of_elem_spelling(
             interned_of_struct.as_deref(),
-            dump_array_type_id.as_deref(),
+            array_type_id.as_deref(),
             None,
         );
         let elem_ref = elem_name.as_deref();
@@ -7363,6 +7363,9 @@ impl CallControl {
                     continue;
                 }
                 if fl.name == field_name {
+                    if fl.flag == majit_ir::descr::ArrayFlag::Struct {
+                        return None;
+                    }
                     found_leaf = Some((fl.offset, fl.size, fl.flag, fl.field_type));
                     break;
                 }
@@ -19460,6 +19463,52 @@ mod tests {
         assert!(!ad.is_item_signed());
     }
 
+    /// Interned ARRAY.OF is a signed one-byte Number (`rffi.SIGNEDCHAR`).
+    /// `get_array_descr` takes `get_type_flag(ARRAY_INSIDE.OF)` from that
+    /// interned spelling even when the caller dump is absent.
+    #[test]
+    fn arraydescrof_interned_signed_byte_without_dump_is_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cc = CallControl::new();
+        let arr = Array::gc((*rffi::SIGNEDCHAR).clone());
+        let descr = cc.arraydescrof_for_op(
+            &crate::model::ValueType::Int,
+            &None,
+            &Some(arr),
+            majit_ir::value::Type::Int,
+            Some(0),
+        );
+        let ad = descr
+            .as_array_descr()
+            .expect("arraydescrof of interned SIGNEDCHAR ARRAY");
+        assert_eq!(ad.item_size(), 1);
+        assert!(ad.is_item_signed());
+    }
+
+    /// Unsigned one-byte companion of
+    /// [`arraydescrof_interned_signed_byte_without_dump_is_signed`]: interned
+    /// `rffi.UCHAR` with no dump is FLAG_UNSIGNED at item size 1.
+    #[test]
+    fn arraydescrof_interned_unsigned_byte_without_dump_is_unsigned() {
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cc = CallControl::new();
+        let arr = Array::gc((*rffi::UCHAR).clone());
+        let descr = cc.arraydescrof_for_op(
+            &crate::model::ValueType::Int,
+            &None,
+            &Some(arr),
+            majit_ir::value::Type::Int,
+            Some(0),
+        );
+        let ad = descr
+            .as_array_descr()
+            .expect("arraydescrof of interned UCHAR ARRAY");
+        assert_eq!(ad.item_size(), 1);
+        assert!(!ad.is_item_signed());
+    }
+
     /// `rffi.UCHAR` / `USHORT` spell as `u8` / `u16`. `rffi.UINT` spells
     /// as `u32` when it is a distinct `Number`; when
     /// `lltype.build_number` intern (`lltype.py` `_numbertypes`) makes
@@ -25460,6 +25509,83 @@ mod tests {
         );
     }
 
+    /// `heaptracker.py all_interiorfielddescrs` raises `UnsupportedFieldExc`
+    /// for `array(struct(struct))`. The keyed layout walk returns `None`
+    /// for the inline Struct leaf (`Entry.key`).
+    #[test]
+    fn interiorfielddescrof_keyed_rejects_inline_struct_leaf_with_layout() {
+        let key_ty = "inline_struct_leaf::InlineKey";
+        let elem = "inline_struct_leaf::Entry";
+        let atid = format!("GcArray<{elem}>");
+        let elem_sid = majit_ir::descr::StructId::from_canonical(elem);
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (elem.to_string(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let key_rows = [("hash".into(), "i64".into())];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("value".into(), "*mut PyObject".into()),
+        ];
+        let names = std::collections::HashSet::from([elem.to_string(), key_ty.to_string()]);
+        let key_layout = StructLayout::from_type_strings(
+            &key_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), key_layout.size)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), key_layout.align)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            inst_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "key")
+                .expect("key field")
+                .flag,
+            majit_ir::descr::ArrayFlag::Struct
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(key_ty.to_string(), key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(key_sid, key_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            let key = Struct::new(key_ty, vec![("hash".into(), LowLevelType::Signed)]);
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    ("key".into(), LowLevelType::Struct(Box::new(key))),
+                    ("value".into(), GCREF.clone()),
+                ],
+            ))))
+        };
+        assert!(
+            cc.interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "key", None, None)
+                .is_none(),
+            "inline Struct leaf must not mint an interiorfield descr"
+        );
+    }
+
     /// `heaptracker.py get_fielddescr_index_in` numbers flattened non-Void
     /// leaves. A two-leaf nested key (`hash`, `obj`) consumes 0 and 1, so
     /// `f_valid`, `value`, `f_hash` are 2, 3, 4.
@@ -25555,6 +25681,18 @@ mod tests {
                 "{name}"
             );
         }
+        assert!(
+            cc.interiorfielddescrof_keyed(
+                1,
+                &Some(atid.clone()),
+                &Some(arr.clone()),
+                "key",
+                None,
+                None,
+            )
+            .is_none(),
+            "whole nested key field is array(struct(struct))"
+        );
         for (name, want) in [("hash", 0usize), ("obj", 1)] {
             if let Some((descr, _)) = cc.interiorfielddescrof_keyed(
                 1,
