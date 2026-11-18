@@ -144,6 +144,30 @@ mod reachable_mask_tests {
         let succs = successor_blocks(&llbc, &body, 0, false);
         assert_eq!(succs, vec![1]);
     }
+
+    /// A second scan of the same Unstructured reuses the CFG cache. A
+    /// clone starts empty and still walks the copied terminators.
+    #[test]
+    fn forward_reachable_mask_is_cached_on_the_body() {
+        let (llbc, body) = body_of(vec![
+            bb(json!({"Goto": {"target": 1}}), false),
+            bb(json!("Return"), false),
+        ]);
+        let first = forward_reachable_mask(&llbc, &body);
+        let second = forward_reachable_mask(&llbc, &body);
+        assert_eq!(first, vec![true, true]);
+        assert_eq!(second, first);
+        let cloned = body.clone();
+        assert_eq!(forward_reachable_mask(&llbc, &cloned), first);
+        let mut rewritten = body;
+        rewritten.body[0].set_terminator_kind(json!("Return"));
+        rewritten.clear_cfg_cache();
+        assert_eq!(
+            forward_reachable_mask(&llbc, &rewritten),
+            vec![true, false],
+            "after Goto becomes Return, bb1 is no longer reached"
+        );
+    }
 }
 
 /// The unsubstituted generic `entries_item_ptr` has TypeVars and no

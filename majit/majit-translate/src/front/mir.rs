@@ -11250,7 +11250,8 @@ fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool)
 /// this set: a panic-abort block can still assign a local, and an
 /// `on_unwind` cleanup block cannot.
 pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
-    reachable_mask(llbc, body, true)
+    body.cached_forward_reachable(|| reachable_mask(llbc, body, true))
+        .to_vec()
 }
 
 /// Empty every block outside [`forward_reachable_mask`]: its statements are
@@ -11266,11 +11267,13 @@ pub(crate) fn clear_unreachable_blocks(llbc: &Llbc, body: &mut Unstructured) {
             block.set_terminator_kind(serde_json::Value::String("UnwindResume".into()));
         }
     }
+    body.clear_cfg_cache();
 }
 
 /// Blocks reachable from bb0 along the edges the lowering emits.
 fn lowered_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
-    reachable_mask(llbc, body, false)
+    body.cached_lowered_reachable(|| reachable_mask(llbc, body, false))
+        .to_vec()
 }
 
 /// Resolve a `Variable` used as a call argument back to the operation

@@ -7416,6 +7416,7 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
     for (bb_idx, kind) in rewrites {
         body.body[bb_idx].set_terminator_kind(kind);
     }
+    body.clear_cfg_cache();
 }
 
 pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
@@ -7734,6 +7735,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
     for (bb_idx, kind) in rewrites {
         body.body[bb_idx].set_terminator_kind(kind);
     }
+    body.clear_cfg_cache();
 }
 
 /// The MIR locals this body moves out of.
