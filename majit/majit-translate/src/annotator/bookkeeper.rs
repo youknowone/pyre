@@ -10282,7 +10282,7 @@ mod tests {
     }
 
     #[test]
-    fn object_entry_key_projects_as_nullable_pyobject_like_identity_key() {
+    fn object_entry_key_projects_as_nullable_like_identity_key() {
         use super::super::model::SomeValue;
         use crate::front::StructFieldRegistry;
 
