@@ -474,8 +474,7 @@ fn callee_stays_residual(
     if !fd.has_unstructured_body() {
         return true;
     }
-    let path = super::strip_crate_prefix(&fd.item_meta.name_path());
-    dont_look_inside.contains(&path)
+    dont_look_inside.contains(fd.item_meta.name_path_stripped())
 }
 
 /// `is_some` / `is_none` on `Option<FrameAnchor>` call the core
