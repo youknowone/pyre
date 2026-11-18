@@ -2171,6 +2171,9 @@ pub struct ItemMeta {
     /// [`ItemMeta::name_path`], rendered on first query.
     #[serde(skip)]
     name_path: OnceLock<String>,
+    /// [`ItemMeta::name_path_stripped`], rendered on first query.
+    #[serde(skip)]
+    name_path_stripped: OnceLock<String>,
 }
 
 impl ItemMeta {
@@ -2214,6 +2217,19 @@ impl ItemMeta {
     /// [`Self::name_path`] without the copy.
     pub fn name_path_str(&self) -> &str {
         self.name_path.get_or_init(|| self.render_name_path())
+    }
+
+    /// [`Self::name_path_str`] without the leading crate segment
+    /// (`crate::module::item` → `module::item`). A single-segment path
+    /// is unchanged.
+    pub fn name_path_stripped(&self) -> &str {
+        self.name_path_stripped.get_or_init(|| {
+            let full = self.name_path_str();
+            match full.split_once("::") {
+                Some((_, rest)) => rest.to_string(),
+                None => full.to_string(),
+            }
+        })
     }
 
     fn render_name_path(&self) -> String {
@@ -4570,6 +4586,9 @@ mod tests {
             {"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}
         ]));
         assert_eq!(mono.name_path_str(), "core::ptr::null");
+        let stripped = mono.name_path_stripped();
+        assert_eq!(stripped, "ptr::null");
+        assert!(std::ptr::eq(stripped, mono.name_path_stripped()));
         assert_eq!(mono.instantiation(), Some(&args));
         assert!(matches!(
             mono.template_name().last(),

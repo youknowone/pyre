@@ -603,8 +603,7 @@ fn callee_stays_residual(
     if fd.unstructured().is_none() {
         return true;
     }
-    let path = super::strip_crate_prefix(fd.item_meta.name_path_str());
-    dont_look_inside.contains(&path)
+    dont_look_inside.contains(fd.item_meta.name_path_stripped())
 }
 
 /// A handle is reachable from this call, but [`erased_value_ty`] cannot

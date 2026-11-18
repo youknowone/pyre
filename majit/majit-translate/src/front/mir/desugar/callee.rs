@@ -564,7 +564,7 @@ pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String
 /// with the field name. Shared by harvest, `fnptr_struct_field_target`,
 /// and `register_fnptr_field_family_path`.
 pub(in crate::front::mir) fn fnptr_field_family_struct_key(td: &TypeDecl) -> String {
-    strip_crate_prefix(&td.item_meta.name_path())
+    td.item_meta.name_path_stripped().to_string()
 }
 
 fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, String)> {
@@ -4505,7 +4505,7 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
             }
             return crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, leaf).segments;
         }
-        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let stripped = fd.item_meta.name_path_stripped().to_string();
         let module = stripped
             .rsplit_once("::")
             .map(|(module, _)| module)
@@ -4534,7 +4534,7 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
         }
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
     }
-    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     let module = stripped
         .rsplit_once("::")
         .map(|(module, _)| module)
@@ -4594,7 +4594,7 @@ pub(in crate::front::mir) fn inherent_impl_callee_identity(
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     let (module, path_leaf) = stripped.rsplit_once("::")?;
     if module.is_empty() || path_leaf != leaf {
         return None;

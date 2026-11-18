@@ -215,7 +215,7 @@ pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> &std::collections:
 fn collect_oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for gd in llbc.iter_global_decls() {
-        let path = strip_crate_prefix(gd.item_meta.name_path_str());
+        let path = gd.item_meta.name_path_stripped().to_string();
         let Some((module, leaf)) = path.rsplit_once("::") else {
             continue;
         };
@@ -257,7 +257,7 @@ impl<'a> OopspecFns<'a> {
 }
 
 fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &OopspecFns<'_>) -> bool {
-    oopspec_fns.contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
+    oopspec_fns.contains(fd.item_meta.name_path_stripped())
 }
 
 fn call_substituted_inputs(
