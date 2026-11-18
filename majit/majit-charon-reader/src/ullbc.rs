@@ -589,6 +589,7 @@ impl FunDecl {
             };
             body.body[i].set_terminator_kind(new_term);
         }
+        body.clear_cfg_cache();
         if consumed.is_empty() {
             return;
         }
@@ -638,6 +639,7 @@ impl FunDecl {
             }
         }
         body.body = kept;
+        body.clear_cfg_cache();
     }
 }
 
@@ -681,6 +683,7 @@ pub fn duplicate_return(body: &mut Unstructured) {
         body.body[i].statements.extend_from_slice(stmts);
         body.body[i].set_terminator_kind(serde_json::Value::String("Return".into()));
     }
+    body.clear_cfg_cache();
 }
 
 /// The variant name of a raw enum value: `"Return"` -> `Return`,
@@ -2703,11 +2706,52 @@ impl TyRef {
 
 // Bodies
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default)]
+struct CfgCache {
+    forward_reachable: OnceLock<Vec<bool>>,
+    lowered_reachable: OnceLock<Vec<bool>>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
     pub span: SpanRef,
+    /// Forward / lowered reachability of this block list. A clone and
+    /// any terminator rewrite start empty.
+    #[serde(skip)]
+    cfg: CfgCache,
+}
+
+impl Clone for Unstructured {
+    /// Copies locals, blocks and span; CFG caches start empty, as after a parse.
+    fn clone(&self) -> Self {
+        Unstructured {
+            locals: self.locals.clone(),
+            body: self.body.clone(),
+            span: self.span.clone(),
+            cfg: CfgCache::default(),
+        }
+    }
+}
+
+impl Unstructured {
+    /// Drop cached reachability. Block-list and terminator rewrites
+    /// call this so the next scan walks the new CFG.
+    pub fn clear_cfg_cache(&mut self) {
+        self.cfg = CfgCache::default();
+    }
+
+    /// Blocks reachable from bb0 along every normal edge, including a
+    /// SwitchInt panic default.
+    pub fn cached_forward_reachable(&self, compute: impl FnOnce() -> Vec<bool>) -> &[bool] {
+        self.cfg.forward_reachable.get_or_init(compute)
+    }
+
+    /// Blocks reachable from bb0 along the edges lowering emits.
+    pub fn cached_lowered_reachable(&self, compute: impl FnOnce() -> Vec<bool>) -> &[bool] {
+        self.cfg.lowered_reachable.get_or_init(compute)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2887,6 +2931,7 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
         term_cache: OnceLock::new(),
     });
     body.body = kept;
+    body.clear_cfg_cache();
     body
 }
 
@@ -3185,6 +3230,7 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedRead>]
     if !str_rewrites.is_empty() {
         forward_str_literal_temps(body, &str_rewrites);
     }
+    body.clear_cfg_cache();
 }
 
 fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {

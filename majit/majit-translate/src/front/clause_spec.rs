@@ -628,6 +628,7 @@ fn subst_unstructured(
             block.set_terminator_kind(kind);
         }
     }
+    u.clear_cfg_cache();
 }
 
 fn subst_kind_value(
