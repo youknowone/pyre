@@ -2136,17 +2136,26 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// `core::option::<Impl>::is_some` / `is_none` on a niche `Option<fn>`.
+    /// `core::option::<Impl>::is_some` / `is_none` on a one-word niche
+    /// `Option`.
     ///
-    /// `rnone.py` `rtype_is_None` compares the word with `lltype.nullptr`
-    /// of its `FuncType` (`null_fn`). `is_none` is `flowcontext.py`
-    /// `cmp_is`: the `is_` op left as a value. `is_some` is `cmp_is_not`,
-    /// which is `not_` of that `is_`. `not_` runs `guessbool` on the
-    /// `is_` result, so the result is this block's exitswitch and each
-    /// exit continues with a constant (`False` on the is-None exit,
-    /// `True` on the other). Nothing computes `not` as a value. A
-    /// non-fn niche stays a call: `Option<PyObjectRef>::is_some` is
-    /// still the tagged discriminant (`callable_w`).
+    /// `Option<fn>`: `rnone.py` `rtype_is_None` compares the word with
+    /// `lltype.nullptr` of its `FuncType` (`null_fn`). `is_none` is
+    /// `flowcontext.py` `cmp_is`: the `is_` op left as a value.
+    /// `is_some` is `cmp_is_not`, which is `not_` of that `is_`.
+    /// `not_` runs `guessbool` on the `is_` result, so the result is
+    /// this block's exitswitch and each exit continues with a constant
+    /// (`False` on the is-None exit, `True` on the other). Nothing
+    /// computes `not` as a value.
+    ///
+    /// Instance / GCREF niche (`Option<PyObjectRef>`, `Option<&T>` of
+    /// a thin ADT): the same null test `Rvalue::Discriminant` emits
+    /// (`push_niche_is_some` / `bool(self)`). The helper graph of
+    /// `Option::is_some` still reads a tagged `__discriminant`; walking
+    /// that body against the one-word overlay aborts
+    /// (`OrthodoxSubWalkTraceUnsupported`) after earlier residuals, so
+    /// the call is lowered here. A tagged (non-niche) Option stays a
+    /// call.
     pub(in crate::front::mir) fn lower_fn_niche_option_predicate(
         &mut self,
         mir_bb: usize,
@@ -2180,43 +2189,153 @@ impl<'a> Lowering<'a> {
         };
         let owned = tyref_shared_borrow_option_pointee(arg_ty, self.llbc);
         let option_ty = owned.as_ref().unwrap_or(arg_ty);
-        if !tyref_option_payload_is_fn_ptr(option_ty, self.llbc) {
-            return Ok(false);
+        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc) {
+            let Some(int_null) = self.option_niche_int_null(option_ty) else {
+                return Ok(false);
+            };
+            if !matches!(int_null, crate::model::NicheIntNull::FnPtr(_)) {
+                return Ok(false);
+            }
+            let recv = self.resolve_operand(mir_bb, call.args[0].clone())?;
+            let bb_id = self.emit_bb(mir_bb);
+            let nullc = int_null.push(&mut self.graph, bb_id);
+            let v_is = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(v_is.clone()),
+                kind: OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: recv,
+                    rhs: nullc,
+                    result_ty: ValueType::Int,
+                },
+            });
+            if is_some {
+                // `cmp_is_not` / `not_` / `guessbool`: the `is_` is the
+                // exitswitch. The True exit (word is None) carries
+                // `Const(false)`; the False exit carries `Const(true)`.
+                self.close_fn_niche_is_some_fork(mir_bb, bb_id, dest_local, target, v_is)?;
+            } else {
+                // `cmp_is`: the `is_` itself is the value that flows out.
+                self.close_niche_option_predicate_goto(mir_bb, bb_id, dest_local, target, v_is)?;
+            }
+            return Ok(true);
         }
-        let Some(int_null) = self.option_niche_int_null(option_ty) else {
-            return Ok(false);
-        };
-        if !matches!(int_null, crate::model::NicheIntNull::FnPtr(_)) {
+        self.lower_instance_niche_option_predicate(
+            mir_bb, call, dest_local, target, option_ty, is_some,
+        )
+    }
+
+    /// GCREF payload of a niche `Option`: Discriminant is `bool(self)`
+    /// (`lltype.py` `SomePtr.bool`). `is_(SomePtr, ConstNone)` folds
+    /// because `SomePtr.can_be_none` is False.
+    fn option_payload_is_gcref(&self, option_ty: &TyRef) -> bool {
+        crate::front::result_exc::tyref_option_payload(option_ty, self.llbc).is_some_and(
+            |payload| {
+                tyref_is_gcref_spelling(&payload, self.llbc)
+                    || crate::annotator::bookkeeper::is_gcref_type_spelling(&tyref_to_ast_string(
+                        &payload, self.llbc,
+                    ))
+            },
+        )
+    }
+
+    /// Instance-pointer niche `Option::is_some` / `is_none`: the same
+    /// null test `Rvalue::Discriminant` emits. Int-bank non-fn niches
+    /// (raw Address) stay a call; their Discriminant recasts through
+    /// `push_niche_null_ptr` before `is_`.
+    fn lower_instance_niche_option_predicate(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        option_ty: &TyRef,
+        is_some: bool,
+    ) -> Result<bool, LowerError> {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
             return Ok(false);
         }
         let recv = self.resolve_operand(mir_bb, call.args[0].clone())?;
         let bb_id = self.emit_bb(mir_bb);
-        let nullc = int_null.push(&mut self.graph, bb_id);
-        let v_is = self
+        let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(v_is.clone()),
-            kind: OpKind::BinOp {
-                op: "is_".to_string(),
-                lhs: recv,
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        if self.option_payload_is_gcref(option_ty) {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "bool".to_string(),
+                    operand: recv,
+                    result_ty: ValueType::Bool,
+                },
+            });
+            if is_some {
+                self.close_niche_option_predicate_goto(mir_bb, bb_id, dest_local, target, res)?;
+            } else {
+                let false_var = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let is_none = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(false_var.clone()),
+                    kind: OpKind::ConstBool(false),
+                });
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(is_none.clone()),
+                    kind: OpKind::BinOp {
+                        op: "eq".to_string(),
+                        lhs: res,
+                        rhs: false_var,
+                        result_ty: ValueType::Int,
+                    },
+                });
+                self.close_niche_option_predicate_goto(mir_bb, bb_id, dest_local, target, is_none)?;
+            }
+            return Ok(true);
+        }
+        let null_cast = self.option_niche_null_cast(option_ty);
+        if self.option_niche_int_null(option_ty).is_some()
+            || !crate::model::niche_is_none_uses_const_none(null_cast.as_ref())
+        {
+            return Ok(false);
+        }
         if is_some {
-            // `cmp_is_not` / `not_` / `guessbool`: the `is_` is the
-            // exitswitch. The True exit (word is None) carries
-            // `Const(false)`; the False exit carries `Const(true)`.
-            self.close_fn_niche_is_some_fork(mir_bb, bb_id, dest_local, target, v_is)?;
+            self.graph
+                .push_niche_is_some(bb_id, recv, None, null_cast.as_ref(), res.clone());
+            self.close_niche_option_predicate_goto(mir_bb, bb_id, dest_local, target, res)?;
         } else {
-            // `cmp_is`: the `is_` itself is the value that flows out.
-            self.local_var[dest_local] = Some(LocalValue::One(v_is));
-            let target_bb = self.block_id[target];
-            let link_args = self.edge_args(mir_bb, target)?;
-            self.graph.set_goto(bb_id, target_bb, link_args);
+            let nullc = self.graph.push_const_none(bb_id);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: recv,
+                    rhs: nullc,
+                    result_ty: ValueType::Int,
+                },
+            });
+            self.close_niche_option_predicate_goto(mir_bb, bb_id, dest_local, target, res)?;
         }
         Ok(true)
+    }
+
+    fn close_niche_option_predicate_goto(
+        &mut self,
+        mir_bb: usize,
+        bb_id: crate::model::BlockId,
+        dest_local: usize,
+        target: usize,
+        value: Variable,
+    ) -> Result<(), LowerError> {
+        self.local_var[dest_local] = Some(LocalValue::One(value));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// `Constant(bool, lltype.Bool)` for one `is_some` link slot.

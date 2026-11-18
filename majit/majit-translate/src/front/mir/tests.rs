@@ -3151,10 +3151,11 @@ fn vec_extend_retargets_only_concrete_vec_sources() {
 /// `callable_w` — `lookup_in_type(t, "__call__").is_some()`.  The
 /// receiver is an owned `Option<PyObjectRef>` that Rust auto-refs to
 /// `&Option` at the call, so the receiver type arrives as `Ref(Option)`;
-/// the `_ref` guard + `tyref_ref_adt_def_id` peel it (the by-value
-/// `tyref_is_option` would see the `Ref` and miss).  After the fold no
-/// residual `is_some` Method call survives and a `__discriminant` read is
-/// present.  Ignored by default (loads the real LLBC).
+/// `tyref_shared_borrow_option_pointee` peels it.  After the fold no
+/// residual `is_some` call survives.  `Option<*mut PyObject>` is the
+/// one-word instance niche, so the predicate is `rnone.py`
+/// `rtype_is_None` (`is_(p, None)` / `bool(self)`), not a tagged
+/// `__discriminant` field.  Ignored by default (loads the real LLBC).
 #[test]
 #[ignore]
 fn is_some_fold_real_callable_w() {
@@ -3164,34 +3165,45 @@ fn is_some_fold_real_callable_w() {
     let llbc = crate::test_support::load_ullbc(path);
     let graph = crate::test_support::lower_function(llbc, "callable_w").expect("lower callable_w");
 
-    let method_calls = |leaf: &str| {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                        if name == leaf
-                )
-            })
-            .count()
-    };
+    let is_some_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "is_some" => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(|s| s.as_str()) == Some("is_some") => true,
+            _ => false,
+        })
+        .count();
     assert_eq!(
-        method_calls("is_some"),
-        0,
-        "residual &Option::is_some Method call removed by the fold"
+        is_some_calls, 0,
+        "residual Option::is_some call removed by the fold"
     );
-    let disc_reads = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
-            })
-            .count();
-    assert!(disc_reads >= 1, "the fold reads the Option __discriminant");
+    let null_tests = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "is_"
+            ) || matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "bool"
+            ) || matches!(&op.kind, OpKind::ConstNone)
+        })
+        .count();
+    assert!(
+        null_tests >= 1,
+        "the fold is rnone.py rtype_is_None (is_/bool/ConstNone); graph={}",
+        graph.dump()
+    );
 }
 
 /// Anchor `Option::or_else` to the real lowered IR of `space_int` —
