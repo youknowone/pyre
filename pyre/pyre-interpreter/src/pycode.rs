@@ -6167,7 +6167,10 @@ mod tests {
     #[test]
     fn w_code_new_owned_releases_caches_when_wrapper_malloc_fails() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // GIL then installer lock. `PyExecutionContext::new` registers this
+        // thread and the MemoryError class `fetch_memory_error` maps through.
+        let _ctx = crate::PyExecutionContext::default();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         static PENDING: AtomicBool = AtomicBool::new(false);
         fn raise() {
             PENDING.store(true, Ordering::SeqCst);
@@ -6220,6 +6223,64 @@ mod tests {
         let w_code =
             box_code_object(compile_exec("answer = 42\n").expect("compile failed")).unwrap();
         assert!(!w_code.is_null());
+    }
+
+    /// libtest parallel: a sibling that already holds the GIL
+    /// (`install_hash_hook`) and then waits on the installer lock deadlocks
+    /// if this thread takes that lock and then compiles (`compile_exec`
+    /// registers via `ensure_runtime_thread`).
+    ///
+    /// Fresh process so a prior `#[test]` cannot already hold either lock.
+    #[test]
+    fn hook_test_guard_does_not_deadlock_against_a_gil_holder() {
+        if std::env::var_os("PYRE_HOOK_TEST_GUARD_DEADLOCK_CHILD").is_none() {
+            let exe = std::env::current_exe().expect("test harness path");
+            let mut child = std::process::Command::new(exe)
+                .arg("pycode::tests::hook_test_guard_does_not_deadlock_against_a_gil_holder")
+                .arg("--exact")
+                .env("PYRE_HOOK_TEST_GUARD_DEADLOCK_CHILD", "1")
+                .env("RUST_TEST_THREADS", "1")
+                .spawn()
+                .expect("spawn deadlock-scenario child");
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait().expect("wait deadlock-scenario child") {
+                    Some(status) => {
+                        assert!(
+                            status.success(),
+                            "child hook_test_guard deadlock scenario failed: {status}"
+                        );
+                        return;
+                    }
+                    None if start.elapsed() > std::time::Duration::from_secs(30) => {
+                        let _ = child.kill();
+                        panic!(
+                            "hook_test_guard deadlocked against a GIL-holding waiter \
+                             (compile_exec registered while holding the installer lock)"
+                        );
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+
+        // Take the installer lock first, then compile, while a sibling that
+        // already saw that lock is held takes the GIL and waits on the lock.
+        // `test_hooks::hook_test_guard` must acquire the GIL before the lock
+        // so this cannot invert.
+        let (lock_held, wait_for_lock) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _hook_lock = crate::test_hooks::hook_test_guard();
+                lock_held.send(()).expect("gil-holder still waiting");
+                compile_exec("answer = 42\n").expect("compile failed");
+            });
+            scope.spawn(move || {
+                wait_for_lock.recv().expect("installer lock holder started");
+                crate::test_hooks::install_hash_hook();
+                let _hook_lock = crate::test_hooks::hook_test_guard();
+            });
+        });
     }
 
     #[test]

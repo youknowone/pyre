@@ -250,6 +250,18 @@ pub mod test_hooks {
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
         pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }
+
+    /// Take [`pyre_object::gc_hook::hook_test_guard`] after this thread is a
+    /// runtime mutator.
+    ///
+    /// `gc_sync::register_thread` acquires the GIL (`rgil.acquire_maybe_in_new_thread`).
+    /// The installer lock is a second mutex. A sibling that already holds the
+    /// GIL (`install_hash_hook`) and then waits on the installer lock deadlocks
+    /// if this thread holds that lock and then calls `register_thread`.
+    pub fn hook_test_guard() -> pyre_object::gc_hook::HookTestGuard {
+        crate::module::thread::ensure_runtime_thread();
+        pyre_object::gc_hook::hook_test_guard()
+    }
 }
 
 // ── Declarative builtin-module registration ──

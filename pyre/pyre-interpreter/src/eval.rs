@@ -7506,7 +7506,7 @@ result = (
         use majit_gc::trace::TypeInfo;
         use std::sync::atomic::Ordering;
 
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         // A collector requesting STW must hold the GIL.
@@ -7562,7 +7562,7 @@ result = (
         use majit_gc::trace::TypeInfo;
         use std::sync::atomic::Ordering;
 
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         // A collector requesting STW must hold the GIL.
@@ -7641,7 +7641,7 @@ result = (
         use pyre_object::gc_roots::RootedItems;
         use std::sync::atomic::Ordering;
 
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         crate::module::thread::ensure_runtime_thread();
         let _restore = restore_declaration_test_state();
 
@@ -7843,7 +7843,7 @@ result = (
         use pyre_object::rweakvaldict::{WeakDict, WeakDictEntries, WeakDictEntry};
         use rustpython_wtf8::Wtf8;
 
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         crate::module::thread::ensure_runtime_thread();
 
         let mut gc = MiniMarkGC::with_config(GcConfig {
@@ -8043,7 +8043,7 @@ result = (
         use majit_gc::trace::TypeInfo;
         use std::sync::atomic::Ordering;
 
-        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _hook_lock = crate::test_hooks::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         crate::module::thread::ensure_runtime_thread();
