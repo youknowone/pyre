@@ -3840,9 +3840,11 @@ pub enum DispatchError {
     /// gives the trace up instead.  Sibling of
     /// [`Self::KwonlyDefaultsMappingRacedRecord`].
     FunctionCodeRacedRecord { pc: usize },
-    /// Record-time construction of a concrete shadow object failed after the
-    /// specialization had emitted IR. Falling through to the generic residual
-    /// would retain that partial prologue, so abort the whole walk.
+    /// Record-time construction of a concrete shadow object failed.  Allocation
+    /// sites which mirror `MetaInterp.execute_and_record` raise this before
+    /// appending their allocation op; later shadow allocations may use it after a
+    /// specialization prologue.  In either case the walk aborts rather than
+    /// recording or residualizing an execution which failed.
     ConcreteShadowAllocationFailed { pc: usize },
     /// `abort_permanent/` (BC_ABORT_PERMANENT) reached. pyre's codegen
     /// emits this for fail-paths that must always terminate the frame

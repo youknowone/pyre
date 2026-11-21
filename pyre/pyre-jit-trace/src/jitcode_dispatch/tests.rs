@@ -23315,11 +23315,80 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
     reset_single_frame_blackhole();
 }
 
+/// Test-local collecting-rooted / owns-object hooks for wrapper-args
+/// `alloc_cleared_ref_items_block_gc`. Shape of `headered_young_alloc_rooted`
+/// / `young_frame_alloc_is_owned` / `ClearYoungFrameHooks`.
+thread_local! {
+    static WRAPPER_ARGS_GC_ALLOCS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn headered_wrapper_args_alloc(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+    let header = majit_gc::header::GcHeader::SIZE;
+    let align = majit_gc::header::GcHeader::ALIGN
+        .max(std::mem::align_of::<pyre_object::object_array::ItemsBlock>());
+    let layout = std::alloc::Layout::from_size_align(header + payload_size.max(1), align)
+        .expect("wrapper args layout");
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (raw as *mut majit_gc::header::GcHeader).write(majit_gc::header::GcHeader::new(type_id));
+    }
+    let payload = unsafe { raw.add(header) };
+    WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow_mut().push(payload as usize));
+    payload as pyre_object::gc_hook::GCREF
+}
+
+unsafe fn headered_wrapper_args_alloc_rooted(
+    type_id: u32,
+    payload_size: usize,
+    _root: *mut pyre_object::gc_hook::GCREF,
+    needs_write_barrier: *mut bool,
+) -> pyre_object::gc_hook::GCREF {
+    unsafe { *needs_write_barrier = false };
+    headered_wrapper_args_alloc(type_id, payload_size)
+}
+
+fn wrapper_args_alloc_is_owned(addr: usize) -> bool {
+    WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+}
+
+struct WrapperArgsGcHooks {
+    _hook_lock: pyre_object::gc_hook::HookTestGuard,
+}
+
+impl WrapperArgsGcHooks {
+    fn install() -> Self {
+        let hook_lock = pyre_object::gc_hook::hook_test_guard();
+        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(
+            headered_wrapper_args_alloc_rooted,
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(wrapper_args_alloc_is_owned);
+        Self {
+            _hook_lock: hook_lock,
+        }
+    }
+}
+
+impl Drop for WrapperArgsGcHooks {
+    fn drop(&mut self) {
+        pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+        pyre_object::gc_hook::clear_gc_owns_object_hook();
+        WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow_mut().clear());
+    }
+}
+
 /// No-driver `walk_translated_builtin_wrapper` dest-write is `finishframe`
 /// then `_interpret` / `blackhole_if_trace_too_long`. Parked-completed is
 /// false (the nested guard has dropped).
 #[test]
 fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
+    let _gc_hooks = WrapperArgsGcHooks::install();
+    let ref_guard = *insns_opname_to_byte()
+        .get("ref_guard_value/r")
+        .unwrap_or_else(|| panic!("`ref_guard_value/r` must be in insns table"));
     let int_add = *insns_opname_to_byte()
         .get("int_add/ii>i")
         .expect("`int_add/ii>i` must be in insns table");
@@ -23327,9 +23396,12 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
         .get("ref_return/r")
         .expect("`ref_return/r` must be in insns table");
     let constants_i: &'static [i64] = Box::leak(Box::new([1i64, 2]));
-    // i1/i2 are constants; i0 is the add dest. r0 is the wrapper args array.
+    // r0 is the wrapper args array; its ref_guard_value is the op that
+    // crosses the budget. The second ref_guard_value pads the 4-byte
+    // int_add slot so the remaining constant int_adds stay in place.
     let child_code: &'static [u8] = Box::leak(Box::new([
-        int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, ref_ret, 0,
+        ref_guard, 0, ref_guard, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, ref_ret,
+        0,
     ]));
     let child_index = install_named_helper_jitcode(
         "no_driver_wrapper_child_helper",
@@ -23364,7 +23436,8 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     let ops_at_entry = tc.num_recorded_ops();
     let mut concrete_i = [ConcreteValue::Int(0)];
     let regs_i = [dummy_int_add_box(&mut tc)];
-    tc.set_trace_limit(ops_at_entry + 1);
+    let wrapper_args_ops = 2; // NEW_ARRAY_CLEAR + one SETARRAYITEM_GC (record_wrapper_args_array)
+    tc.set_trace_limit(ops_at_entry + wrapper_args_ops + 1);
     assert!(
         !tc.is_too_long(),
         "the parent must enter under budget so the child ordinary steps cut"
@@ -32771,6 +32844,7 @@ fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
     use majit_ir::Value;
     use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
 
+    let _gc_hooks = WrapperArgsGcHooks::install();
     const NLOCALS: usize = 0;
     const BOX_VSD: i64 = 0;
     const BOX_LAST_INSTR: i64 = 174;

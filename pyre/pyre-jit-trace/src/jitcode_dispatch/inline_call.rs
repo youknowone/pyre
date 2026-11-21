@@ -8656,26 +8656,36 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
 /// array; `opimpl_setarrayitem_gc` stores into it. The block is stamped as
 /// the `NewArrayClear` op's value (GC-rooted through the op), and each store
 /// fills it through `walker_fill_materialized_array`.
-fn record_wrapper_args_array<Sym: WalkSym>(
+fn record_wrapper_args_array_with<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     wrapper_items: &[OpRef],
-) -> OpRef {
+    allocate: impl FnOnce(usize) -> Option<*mut pyre_object::object_array::ItemsBlock>,
+) -> Result<OpRef, DispatchError> {
+    // `MetaInterp.execute_and_record`: execute first.  The allocation result
+    // is an ordinary live GC value across `_record_helper`; pin it because
+    // appending the trace op may allocate and minor-collect.
+    let roots = pyre_object::gc_roots::push_roots();
+    let Some(block) = allocate(wrapper_items.len()) else {
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+    };
+    let block_slot = roots.base();
+    let _ = roots.pin_root(block as pyre_object::PyObjectRef);
+
     let array_descr = crate::state::pyobject_gcarray_descr();
     let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
     let args_array =
         ctx.trace_ctx
             .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    let block = roots.get(block_slot) as *mut pyre_object::object_array::ItemsBlock;
+    ctx.trace_ctx.set_opref_concrete(
+        args_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+    );
     ctx.trace_ctx
         .heap_cache_mut()
         .new_array(args_array, len, true);
-    if let Some(block) =
-        unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(wrapper_items.len()) }
-    {
-        ctx.trace_ctx.try_set_opref_concrete(
-            args_array,
-            majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
-        );
-    }
+
     for (index, &item) in wrapper_items.iter().enumerate() {
         let index = ctx.trace_ctx.const_int(index as i64);
         ctx.trace_ctx.record_op_with_descr(
@@ -8683,13 +8693,140 @@ fn record_wrapper_args_array<Sym: WalkSym>(
             &[args_array, index, item],
             array_descr.clone(),
         );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
         ctx.trace_ctx
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
         walker_fill_materialized_array(ctx, args_array, index, item);
     }
-    args_array
+    Ok(args_array)
+}
+
+fn record_wrapper_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    wrapper_items: &[OpRef],
+) -> Result<OpRef, DispatchError> {
+    record_wrapper_args_array_with(ctx, op_pc, wrapper_items, |len| unsafe {
+        pyre_object::object_array::alloc_cleared_ref_items_block_gc(len)
+    })
+}
+
+#[cfg(test)]
+mod record_wrapper_args_array_tests {
+    use super::*;
+
+    /// Existing WalkContext fixture shape from sibling dispatcher tests.
+    fn wrapper_args_test_context<R>(
+        run: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>, OpRef) -> R,
+    ) -> R {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let null = tc.const_null();
+        let item = tc.record_op(OpCode::PtrEq, &[null, null]);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs_r = RegisterBank::default();
+        let regs_i = RegisterBank::default();
+        let regs_f = RegisterBank::default();
+        let mut concrete_i: [ConcreteValue; 0] = [];
+        let mut ctx = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode::default(),
+            session: &session,
+            registers_r: &regs_r,
+            registers_i: &regs_i,
+            registers_f: &regs_f,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &|_| None,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        run(&mut ctx, item)
+    }
+
+    #[test]
+    fn wrapper_args_allocation_failure_records_nothing() {
+        wrapper_args_test_context(|ctx, item| {
+            let before = ctx.trace_ctx.get_trace_position();
+            let ops_before = ctx.trace_ctx.opcode_at_len();
+            let unescaped_before = ctx.trace_ctx.heap_cache().is_unescaped(item);
+            let saw_before = ctx.trace_ctx.heap_cache().saw_allocation(item);
+
+            let err = record_wrapper_args_array_with(ctx, 17, &[item], |_| None)
+                .expect_err("allocation failure aborts before recording");
+
+            assert!(matches!(
+                err,
+                DispatchError::ConcreteShadowAllocationFailed { pc: 17 }
+            ));
+            assert_eq!(ctx.trace_ctx.get_trace_position(), before);
+            assert_eq!(ctx.trace_ctx.opcode_at_len(), ops_before);
+            assert_eq!(
+                ctx.trace_ctx.heap_cache().is_unescaped(item),
+                unescaped_before
+            );
+            assert_eq!(ctx.trace_ctx.heap_cache().saw_allocation(item), saw_before);
+            assert!(
+                !(0..ctx.trace_ctx.opcode_at_len()).any(|i| matches!(
+                    ctx.trace_ctx.opcode_at(i),
+                    Some(OpCode::NewArrayClear | OpCode::SetarrayitemGc)
+                )),
+                "allocation failure must not append NEW_ARRAY_CLEAR or SETARRAYITEM_GC"
+            );
+        });
+    }
+
+    #[test]
+    fn wrapper_args_allocation_precedes_new_array_record() {
+        // Recorder has no append hook.  The allocation closure runs first:
+        // failure records nothing (sibling test); success stamps the
+        // allocated block onto NEW_ARRAY_CLEAR, which precedes every
+        // SETARRAYITEM_GC.
+        wrapper_args_test_context(|ctx, item| {
+            let mut events = Vec::new();
+            let block = 0x1000usize as *mut pyre_object::object_array::ItemsBlock;
+            let args_array = record_wrapper_args_array_with(ctx, 3, &[item], |_| {
+                events.push("allocate");
+                Some(block)
+            })
+            .expect("allocation succeeds");
+
+            assert_eq!(events, ["allocate"]);
+            assert_eq!(
+                ctx.trace_ctx.opcode_of(args_array),
+                Some(OpCode::NewArrayClear)
+            );
+            assert_eq!(
+                ctx.trace_ctx.box_value(args_array),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(block as usize)))
+            );
+
+            let mut new_pos = None;
+            let mut first_set_pos = None;
+            for i in 0..ctx.trace_ctx.opcode_at_len() {
+                match ctx.trace_ctx.opcode_at(i) {
+                    Some(OpCode::NewArrayClear) if new_pos.is_none() => new_pos = Some(i),
+                    Some(OpCode::SetarrayitemGc) if first_set_pos.is_none() => {
+                        first_set_pos = Some(i)
+                    }
+                    _ => {}
+                }
+            }
+            let new_pos = new_pos.expect("NEW_ARRAY_CLEAR recorded");
+            let first_set_pos = first_set_pos.expect("SETARRAYITEM_GC recorded");
+            assert!(
+                new_pos < first_set_pos,
+                "NEW_ARRAY_CLEAR must precede every SETARRAYITEM_GC"
+            );
+        });
+    }
 }
 
 /// Stamp wrapper arguments, walk the generated body, restore the caller
@@ -8743,7 +8880,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let args_array = record_wrapper_args_array(ctx, wrapper_items);
+    let args_array = record_wrapper_args_array(ctx, op.pc, wrapper_items)?;
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -9265,7 +9402,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let args_array = record_wrapper_args_array(ctx, &wrapper_items);
+    let args_array = record_wrapper_args_array(ctx, op.pc, &wrapper_items)?;
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
