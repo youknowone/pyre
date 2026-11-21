@@ -1510,6 +1510,57 @@ fn substitute_field_type(
     tyref_to_ast_string(ty, llbc)
 }
 
+/// Entry-row spelling of one `DICTENTRY` field.
+///
+/// [`substitute_field_type`] renders the type argument. When that
+/// argument's `TypeDecl` is `#[repr(transparent)]` and its unique
+/// non-ZST field is a `RawPtr`, the field is that pointer
+/// ([`transparent_rawptr_field_spelling`]). The struct's own name keeps
+/// [`render_adt_type_args`]. `rmodel.py` `externalvsinternal`
+/// (`gcref=False`): an instance key's internal repr is its object
+/// pointer. `rordereddict.py` `DICTENTRY` stores `key` as `DICTKEY`,
+/// one field.
+fn entry_substituted_field_type(
+    ty: &TyRef,
+    args: &[String],
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
+    if let Some(spelling) = entry_typevar_transparent_rawptr_spelling(ty, subst, llbc) {
+        return spelling;
+    }
+    substitute_field_type(
+        ty,
+        args,
+        llbc,
+        gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    )
+}
+
+/// `*mut` / `*const` spelling of a type-variable field whose argument is
+/// a transparent single-`RawPtr` wrapper. A type argument that is already
+/// a `RawPtr` (or an alias of one) stays with [`substitute_field_type`].
+fn entry_typevar_transparent_rawptr_spelling(
+    ty: &TyRef,
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let (prefixes, inner) = pointer_wrapper_spelling_prefixes(node, llbc);
+    let idx = typevar_bound_index(inner)? as usize;
+    let arg = subst.get(idx)?;
+    let arg = strip_ty_indirections(arg, llbc)?;
+    let arg = type_node_peel_aliases(arg, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(arg)?)?;
+    let mut spelling = transparent_rawptr_field_spelling(decl, arg, llbc)?;
+    for prefix in prefixes.iter().rev() {
+        spelling = format!("{prefix}{spelling}");
+    }
+    Some(spelling)
+}
+
 /// Whether a rendered payload type is an unboxed scalar rather than a
 /// one-GC-word heap reference.  The textual descr path resolves a scalar's
 /// bank/width from the row type string via `type_flag_from_str`
@@ -2943,13 +2994,8 @@ fn register_ordereddict_entry_rows(
         let mut concrete = true;
         for (index, field) in fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            let concrete_ty = substitute_field_type(
-                &field.ty,
-                &args,
-                llbc,
-                gc_struct_ids,
-                &std::collections::HashSet::<String>::new(),
-            );
+            let concrete_ty =
+                entry_substituted_field_type(&field.ty, &args, &subst, llbc, gc_struct_ids);
             if concrete_ty.contains("??") {
                 concrete = false;
                 break;
@@ -9651,23 +9697,26 @@ pub use self::gcroot::{
     harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
     scope_owner_identity,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::gcarray_item_struct_ptr_lltype;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
-    fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
-    host_rthread_threadlocalref_llop, impl_method_owner_for_fundecl, impl_owner_from_item_meta,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    fnptr_indirect_enabled, gcarray_item_direct_arrayitems_ptr_lltype,
+    gcarray_item_struct_ptr_annotation, host_rthread_threadlocalref_llop,
+    impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
+    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    struct_item_flexible_gcarray_block_annotation, type_arg_is_concrete, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

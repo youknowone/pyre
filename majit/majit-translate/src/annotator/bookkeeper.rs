@@ -4318,26 +4318,10 @@ impl Bookkeeper {
             return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
         }
         let registry = self.struct_fields.borrow().clone();
-        // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
-        // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
-        // `SomePtr(GCREF)` and raises (`llannotation.py`
-        // `pairtype(SomePtr, SomeObject).union`).
-        if is_gcref_type_spelling(root) {
-            return Err(AnnotatorError::new(format!(
-                "lltype.GcOpaqueType has no ClassDef: {root}"
-            )));
-        }
-        if struct_root_refuses_classdef_new(root, registry.as_deref()) {
-            return Err(AnnotatorError::new(format!(
-                "struct root {root} is not a ClassDef intern"
-            )));
-        }
-        // rlist.py ListRepr / listdef.py ListDef: a list is not a
-        // class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
-        if crate::front::semantic::is_list_family_spelling(root) {
-            return Err(AnnotatorError::new(format!(
-                "listdef.py ListDef has no ClassDef: {root}"
-            )));
+        // `is_identity_key_spelling` above redirects; it is not a refusal.
+        // The three refusals live in `struct_root_has_no_classdef`.
+        if let Some(why) = struct_root_has_no_classdef(root, registry.as_deref()) {
+            return Err(AnnotatorError::new(why.message(root)));
         }
 
         let determinism_trace = crate::determinism_trace_enabled();
@@ -4374,10 +4358,7 @@ impl Bookkeeper {
             if graph.contains(&n) {
                 continue;
             }
-            if struct_root_refuses_classdef_new(&n, registry.as_deref()) {
-                continue;
-            }
-            if crate::front::semantic::is_list_family_spelling(&n) {
+            if struct_root_has_no_classdef(&n, registry.as_deref()).is_some() {
                 continue;
             }
             // Register the node's identity ClassDef in `descs` (RPython's
@@ -6759,18 +6740,22 @@ impl Bookkeeper {
         //
         // A struct whose template field names the split entry family
         // parametrized by its own type variables is one class per
-        // instantiation (`get_ll_dict` builds one `DICT` per key/value
-        // holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
-        // `getuniqueclassdef`). Keep the substituted spelling so the
-        // field resolves to that classdef. Every other registered
-        // struct still interns the bare template.
-        let class_spelling = if stripped.contains('<')
+        // instantiation (`rordereddict.py` `get_ll_dict` builds one
+        // `DICT` per concrete `(DICTKEY, DICTVALUE)`, a Void key
+        // included, holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
+        // `getuniqueclassdef`). Keep the substituted spelling when every
+        // type argument is fully substituted (`type_arg_is_concrete`),
+        // including `()` and `f32`. An unresolved parameter stays the
+        // bare template. Every other registered struct still interns
+        // that template.
+        let keep_instantiation = stripped.contains('<')
             && self
                 .struct_fields
                 .borrow()
                 .as_ref()
                 .is_some_and(|reg| reg.template_holds_split_entry_family(stripped))
-        {
+            && instantiation_args_all_concrete(stripped);
+        let class_spelling = if keep_instantiation {
             std::borrow::Cow::Borrowed(stripped)
         } else {
             named_root
@@ -8242,6 +8227,21 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
+/// Every type argument of `spelling` is fully substituted.
+///
+/// Same gate as `entry_family_holder_struct_instantiation_suffix`:
+/// [`crate::front::mir::type_arg_is_concrete`]. An empty argument list
+/// is not an instantiation (`bookkeeper.py` `getuniqueclassdef`).
+/// `()` and `f32` are concrete (`rordereddict.py` `get_ll_dict` keeps
+/// a Void key and a single-float value as their own `DICT`).
+fn instantiation_args_all_concrete(spelling: &str) -> bool {
+    let args = crate::front::semantic::instantiation_type_args(spelling);
+    !args.is_empty()
+        && args
+            .iter()
+            .all(|arg| crate::front::mir::type_arg_is_concrete(arg))
+}
+
 /// `identitydict.py IdentityKey`: `repr(transparent)` over `PyObjectRef`.
 /// The key cell is the object (`rclass.py` identity hash); a sibling
 /// ClassDef has no common base with `PyObject`.
@@ -8645,6 +8645,60 @@ fn struct_root_refuses_classdef_new(
         || struct_root_is_core_option_or_result_template(root, registry)
         || struct_root_is_gcarray_ptr_wrapper(root, registry)
         || registry.is_some_and(|reg| struct_root_is_gcarray_item(reg, root))
+}
+
+/// Which check of [`struct_root_has_no_classdef`] fired.
+///
+/// These are the refusals [`Bookkeeper::getuniqueclassdef_for_struct_root`]
+/// applies before interning, in that order. `is_identity_key_spelling`
+/// redirects to `pyobject::PyObject` and is not an arm.
+pub(crate) enum StructRootNoClassdef {
+    /// `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
+    /// `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
+    /// `SomePtr(GCREF)` and raises (`llannotation.py`
+    /// `pairtype(SomePtr, SomeObject).union`).
+    GcOpaque,
+    /// [`struct_root_refuses_classdef_new`], including
+    /// [`struct_root_is_core_option_or_result_template`].
+    NotIntern,
+    /// rlist.py `ListRepr` / listdef.py `ListDef`: a list is not a
+    /// class (`bookkeeper.py` `getdesc` / `getuniqueclassdef`).
+    ListDef,
+}
+
+impl StructRootNoClassdef {
+    fn message(self, root: &str) -> String {
+        match self {
+            Self::GcOpaque => format!("lltype.GcOpaqueType has no ClassDef: {root}"),
+            Self::NotIntern => format!("struct root {root} is not a ClassDef intern"),
+            Self::ListDef => format!("listdef.py ListDef has no ClassDef: {root}"),
+        }
+    }
+}
+
+/// Registry-only pre-intern refusal of
+/// [`Bookkeeper::getuniqueclassdef_for_struct_root`].
+///
+/// One sequence: [`is_gcref_type_spelling`], then
+/// [`struct_root_refuses_classdef_new`], then
+/// [`crate::front::semantic::is_list_family_spelling`]. Option/Result
+/// templates are the [`struct_root_is_core_option_or_result_template`]
+/// arm of [`struct_root_refuses_classdef_new`] (`tyref_is_option` /
+/// `tyref_is_result`, intern key without `<…>`).
+pub(crate) fn struct_root_has_no_classdef(
+    root: &str,
+    registry: Option<&crate::front::StructFieldRegistry>,
+) -> Option<StructRootNoClassdef> {
+    if is_gcref_type_spelling(root) {
+        return Some(StructRootNoClassdef::GcOpaque);
+    }
+    if struct_root_refuses_classdef_new(root, registry) {
+        return Some(StructRootNoClassdef::NotIntern);
+    }
+    if crate::front::semantic::is_list_family_spelling(root) {
+        return Some(StructRootNoClassdef::ListDef);
+    }
+    None
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -12703,7 +12757,8 @@ mod tests {
             "fixture::Table".to_string(),
             vec![(
                 "entries".to_string(),
-                "*mut GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+                "*mut pyre_object::rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>"
+                    .to_string(),
             )],
         );
         reg.fields.insert(
@@ -12745,6 +12800,88 @@ mod tests {
             "got {}",
             foo_a.borrow().name
         );
+    }
+
+    #[test]
+    fn entry_family_holder_projection_suffix_follows_concrete_args() {
+        // `rordereddict.py` `get_ll_dict` is one `DICT` per concrete
+        // `(DICTKEY, DICTVALUE)`, a Void key included.
+        // `bookkeeper.py` `getuniqueclassdef` is one class per class
+        // object. Field projection keeps the instantiated spelling when
+        // every argument is fully substituted (`type_arg_is_concrete`),
+        // including `()` and `f32`. An unresolved parameter stays bare.
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyre_object::rordereddict_entries::GcEntries".to_string(),
+            vec![(
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "fixture::Holder".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut pyre_object::rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>"
+                    .to_string(),
+            )],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let classdef = |spelling: &str| {
+            let value = bk.project_struct_field_type(spelling);
+            let SomeValue::Instance(inst) = &value else {
+                panic!("{spelling} must project to Instance, got {value:?}");
+            };
+            inst.classdef
+                .clone()
+                .unwrap_or_else(|| panic!("{spelling} has no classdef"))
+        };
+        let bare = classdef("fixture::Holder");
+        let open = classdef("fixture::Holder<??TypeVar#0,X>");
+        assert!(
+            Rc::ptr_eq(&bare, &open),
+            "an unresolved parameter stays the unsuffixed class, got {}",
+            open.borrow().name
+        );
+        assert!(
+            !open.borrow().name.contains('<'),
+            "fixture::Holder<??TypeVar#0,X> got {}",
+            open.borrow().name
+        );
+        let kept = [
+            "fixture::Holder<f32,i64>",
+            "fixture::Holder<(),X>",
+            "fixture::Holder<(),i64>",
+            "fixture::Holder<i64,*mut PyObject>",
+        ];
+        let projected: Vec<_> = kept.iter().copied().map(classdef).collect();
+        for (spelling, class) in kept.iter().zip(&projected) {
+            assert!(
+                !Rc::ptr_eq(&bare, class),
+                "{spelling} must keep a suffixed class, got {}",
+                class.borrow().name
+            );
+            let suffix = spelling.trim_start_matches("fixture::Holder");
+            assert!(
+                class.borrow().name.contains(suffix),
+                "{spelling} got {}",
+                class.borrow().name
+            );
+        }
+        for i in 0..projected.len() {
+            for j in (i + 1)..projected.len() {
+                assert!(
+                    !Rc::ptr_eq(&projected[i], &projected[j]),
+                    "{} and {} must not share one class",
+                    kept[i],
+                    kept[j]
+                );
+            }
+        }
     }
 
     #[test]

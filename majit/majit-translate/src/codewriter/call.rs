@@ -7208,12 +7208,13 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
-            if self.is_known_struct(fty) {
+            // `get_fielddescr_index_in` steps past a by-value nested
+            // struct's bytes and recurses for the position. Mirrors the
+            // `fielddescrof_concrete` walk. `rdict.py` `recast_key` reads
+            // that nested struct as one item field (`getinteriorfield` of
+            // `key`), so a name match is the interior descr of the ADT,
+            // not a skip to its leaves.
+            if self.is_known_struct(fty) && fname != field_name {
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
@@ -24895,7 +24896,7 @@ mod tests {
         cc.set_struct_layout(elem_sid, inst_layout);
 
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid), &None, "f_valid")
+            .interiorfielddescrof_keyed(1, &Some(atid.clone()), &None, "f_valid")
             .expect("dump interior field descr");
         let offset = descr
             .as_interior_field_descr()
@@ -24904,6 +24905,14 @@ mod tests {
             .offset();
         assert_eq!(offset, inst_valid);
         assert_ne!(offset, template_valid);
+        let (key_descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &None, "key")
+            .expect("by-value key is an interior field of the item");
+        let key = key_descr
+            .as_interior_field_descr()
+            .expect("InteriorFieldDescr");
+        assert_eq!(key.field_descr().offset(), 0);
+        assert_eq!(key.field_descr().field_size(), 16);
     }
 
     /// `get_ll_dict` one DICTENTRYARRAY per DICTKEY: interned ARRAY.OF
@@ -31018,6 +31027,9 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "p", 0), 3);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
+        // `rdict.py` `recast_key`: the nested ADT itself is one interior
+        // field. Flattened leaf indices above stay put.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "hdr", 0), 0);
         // `heaptracker.py` `-cur_index - 1` over the 5 leaves above.
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
         // The dotted spelling names one flattened leaf of `hdr`.

@@ -282,12 +282,13 @@ fn monomorphic_caller_specializes_by_value_type_only_generic() {
 }
 
 /// `dict_entries_value_set_at` is monomorphic (`ObjectDictStorage`) and
-/// calls type-only `set_slot_value<K,V,S>`. The call binds a spec copy
-/// so `entries_item_ptr` sees concrete `K, V` and recovers the items
-/// offset (`array_items_base`). The unsubstituted generic
-/// `entries_item_ptr` still LowerErrors (no offset guess).
+/// calls type-only `set_slot_value<K,V,S>`. The spec copy writes
+/// `entries[slot].value` with `setinteriorfield`
+/// (`rewrite_op_setinteriorfield`; `gct_setinteriorfield` is
+/// `gct_setfield`). It does not call `entries_item_ptr`: that helper
+/// is `direct_arrayitems` only when the item pointer itself escapes.
 #[test]
-fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
+fn dict_entries_value_set_at_setinteriorfield_skips_entries_item_ptr() {
     let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
@@ -313,24 +314,39 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
         op_kinds(setter.graph())
     );
 
-    let item_ptrs: Vec<_> = program
+    let setters: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("entries_item_ptr__spec_"))
+        .filter(|f| f.name.contains("set_slot_value__spec_"))
         .collect();
     assert!(
-        !item_ptrs.is_empty(),
-        "expected entries_item_ptr__spec_ graphs, got {:?}",
+        !setters.is_empty(),
+        "expected set_slot_value__spec_ graphs, got {:?}",
         program
             .functions
             .iter()
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
     );
-    for spec in &item_ptrs {
+    for spec in &setters {
         assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+            spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+                |op| matches!(&op.kind, OpKind::InteriorFieldWrite { field, .. }
+                if field.name == "value"
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner.rsplit("::").next().is_some_and(|leaf| {
+                            leaf == "Entry" || leaf.starts_with("Entry<")
+                        })
+                    })),
+            ),
+            "{} must setinteriorfield value of Entry, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            !graph_calls_leaf(spec.graph(), "entries_item_ptr")
+                && !graph_calls_spec_leaf(spec.graph(), "entries_item_ptr__spec_"),
+            "{} must not call entries_item_ptr, ops {:?}",
             spec.name,
             op_kinds(spec.graph())
         );
@@ -444,8 +460,11 @@ fn identitykey_get_slot_does_not_cast_objectkey_entry() {
 /// `rordereddict.py` `_ll_dict_setitem_lookup_done` binds
 /// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY` (`lltype.py`
 /// `Struct` in `GcArray`). A classdef recast onto `Entry<K, V>` is
-/// `mergeinputargs` UnionError of two monomorph ClassDefs at
-/// `RDict::entry_at`.
+/// `mergeinputargs` UnionError of two monomorph ClassDefs.
+/// IdentityKey `get_slot` reads the key with `getinteriorfield`, so
+/// this closure does not build `entry_at__spec_IdentityKey`.
+/// `entries_item_ptr` (via `entry_valid` / `entry_ptr`) still must not
+/// recast the ITEM.
 #[test]
 fn identitykey_entry_at_does_not_recast_monomorph_entry() {
     use majit_translate::model::cast_instance_root;
@@ -460,19 +479,25 @@ fn identitykey_entry_at_does_not_recast_monomorph_entry() {
     .expect("lower identitydict nth_item");
 
     let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.contains("entry_at__spec_IdentityKey")),
+        "field-only get_slot must not build entry_at__spec_IdentityKey, got {names:?}"
+    );
     let specs: Vec<_> = program
         .functions
         .iter()
         .filter(|f| {
-            f.name.contains("entry_at__spec_IdentityKey")
+            f.name.contains("get_slot__spec_IdentityKey")
                 || f.name.contains("entries_item_ptr__spec_IdentityKey")
         })
         .collect();
     assert!(
         specs
             .iter()
-            .any(|f| f.name.contains("entry_at__spec_IdentityKey")),
-        "expected IdentityKey entry_at spec, got {names:?}"
+            .any(|f| f.name.contains("entries_item_ptr__spec_IdentityKey")),
+        "expected IdentityKey entries_item_ptr spec, got {names:?}"
     );
     for spec in &specs {
         let entry_casts: Vec<_> = spec
@@ -493,10 +518,13 @@ fn identitykey_entry_at_does_not_recast_monomorph_entry() {
             spec.return_class_root,
             op_kinds(spec.graph())
         );
-        if spec.name.contains("entry_at__spec_IdentityKey") {
+        if spec.name.contains("entries_item_ptr__spec_IdentityKey") {
             assert!(
                 spec.return_class_root.as_deref().is_some_and(|root| {
-                    !root.contains('<') && !root.contains("*mut") && !root.contains("*const")
+                    !root.contains('<')
+                        && !root.contains("*mut")
+                        && !root.contains("*const")
+                        && !root.contains("FixedSizeArray")
                 }),
                 "{} return_class_root is the unsuffixed DICTENTRY ITEM, got {:?}",
                 spec.name,

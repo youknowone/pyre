@@ -7234,6 +7234,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ) {
         return None;
     }
+    // A pointer-shaped transparent field is one word even when
+    // `gc_ref_pointer` is false (`ValueType::Str`, `rstr.STRPTR`).
+    // `heaptracker.py` `all_fielddescrs` recurses only into
+    // `lltype.Struct`. `rordereddict.py` `_ll_dict_del_entry` stores
+    // `entry.key` as one field.
+    if transparent_rawptr_field_spelling(td, node, llbc).is_some() {
+        return None;
+    }
     // One integer word is not an inlined STRUCT. `getcalldescr` reads
     // that lltype off the value (`call.py`); leaf-copy would GETFIELD
     // `__pos_0` with the Int as the base (`VersionTag(u64)`).
@@ -8403,6 +8411,34 @@ pub(in crate::front::mir) fn transparent_nonzst_field(
         return None;
     }
     unique_nonzst_field(decl, llbc)
+}
+
+/// `*mut` / `*const` spelling when `decl` is `#[repr(transparent)]` and
+/// its unique non-ZST field is a `RawPtr`.
+///
+/// [`transparent_nonzst_field`] is that unique-field test.
+/// [`transparent_by_value_inner_fields`] returns None for the `RawPtr`,
+/// so the wrapper keeps one field. `rmodel.py` `externalvsinternal`
+/// (`gcref=False`): an instance key's internal repr is its object
+/// pointer. `rordereddict.py` `DICTENTRY` stores `key` as `DICTKEY`,
+/// one field. `heaptracker.py` `all_fielddescrs` recurses only into
+/// `lltype.Struct`.
+pub(in crate::front::mir) fn transparent_rawptr_field_spelling(
+    decl: &TypeDecl,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let (index, _) = transparent_nonzst_field(decl, llbc)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    let concrete =
+        substitute_spill_typevars(&field.ty, owner, llbc).unwrap_or_else(|| clone_tyref(&field.ty));
+    let node = tyref_node(&concrete, llbc)?;
+    let peeled = type_node_peel_aliases(node, llbc).unwrap_or(node);
+    type_node_raw_ptr_pointee(peeled, llbc)?;
+    Some(charon_type_value_to_ast_string(peeled, llbc, 0))
 }
 
 /// Payload field of a transparent-scalar ADT: the unique sized field, or
@@ -9741,6 +9777,12 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
     let def_id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(def_id)?;
     // Pointer-shaped payloads stay on the wrapper (`PyError`).
+    // A by-value holder keeps this struct: `get_ll_dict` builds one
+    // `DICT` per key/value and `bookkeeper.py` `getuniqueclassdef` is
+    // that class object. Following the declared field drops the
+    // use-site arguments, so construction would name the unsuffixed
+    // inner template while flattened rows (`derive_program_metadata`)
+    // name this wrapper.
     if transparent_by_value_inner_fields(td, llbc).is_some()
         && let Some((index, _)) = transparent_nonzst_field(td, llbc)
         && let TypeDeclKind::Struct(fields) = &td.kind
@@ -9748,6 +9790,7 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
         && let Some(field_node) =
             tyref_node(&field.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
         && adt_node_def_id(field_node) != Some(def_id)
+        && !type_decl_holds_entry_family_typevar(td, llbc)
     {
         return adt_node_class_root_with(field_node, llbc, tombstoned);
     }
@@ -9970,8 +10013,25 @@ pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
     entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
 }
 
+/// `<…>` of fully substituted type arguments ([`type_arg_is_concrete`]).
+/// `get_ll_dict` mints one `DICTENTRYARRAY` per concrete `(DICTKEY, DICTVALUE)`,
+/// a Void key or value included. Variant deferrals (`()` / `f32`) stay on
+/// [`split_struct_instantiation_suffix`].
+fn concrete_type_args_suffix(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    if type_args.is_empty() || !type_args.iter().all(|arg| type_arg_is_concrete(arg)) {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
+}
+
 /// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
 /// serves every monomorphization; the bare `Entry` class would union `key`.
+/// The suffix is [`type_arg_is_concrete`], including Void (`()`).
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -9981,12 +10041,12 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     if !entry_family_is_entry_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    concrete_type_args_suffix(adt, llbc, tombstoned)
 }
 
 /// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The entries array
 /// header is `DICTENTRYARRAY` of `get_ll_dict`, one per `(DICTKEY, DICTVALUE)`;
-/// the bare class would share one ARRAY across key types.
+/// the bare class would share one ARRAY across key types, a Void value included.
 pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -9996,7 +10056,7 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    concrete_type_args_suffix(adt, llbc, tombstoned)
 }
 
 /// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
@@ -10088,10 +10148,15 @@ pub(in crate::front::mir) fn foreign_body_generic_struct_instantiation_suffix(
 /// entry family (`DICTENTRY` / `DICTENTRYARRAY`) parametrized by that
 /// struct's own type variables.
 ///
-/// `get_ll_dict` builds one `DICT` per key/value, and that struct holds
+/// `rordereddict.py` `get_ll_dict` builds one `DICT` per concrete
+/// `(DICTKEY, DICTVALUE)`, a Void key included, and that struct holds
 /// `("entries", Ptr(DICTENTRYARRAY))`. `bookkeeper.py` `getuniqueclassdef`
 /// is one class object per such struct. The predicate is those template
-/// field types, not the struct's name.
+/// field types, not the struct's name. The suffix is the rendered
+/// arguments when every one is fully substituted
+/// ([`type_arg_is_concrete`]), including `()` and `f32`. The variant
+/// deferrals in [`type_arg_splits_per_instantiation`] stay on
+/// [`split_struct_instantiation_suffix`] and do not apply here.
 pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10100,23 +10165,47 @@ pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
 ) -> Option<String> {
     let _ = name_path;
     let td = llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return None;
-    };
-    if !fields
-        .iter()
-        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
-    {
+    if !type_decl_holds_entry_family_typevar(td, llbc) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    concrete_type_args_suffix(adt, llbc, tombstoned)
+}
+
+/// Template fields name an entry-family holder parametrized by this
+/// struct's own type variables (`field_ty_names_entry_family_typevar`).
+fn type_decl_holds_entry_family_typevar(td: &TypeDecl, llbc: &Llbc) -> bool {
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
 }
 
 /// Pointer / `Box` / `NonNull` / by-value field whose pointee ADT is the
-/// entry family and whose type arguments mention a type variable.
-/// Arrays and slices stay out: `DICTENTRYARRAY` is the array of
-/// `DICTENTRY`, not another struct that holds one.
+/// entry family and whose type arguments mention a type variable, or a
+/// struct that itself holds such a field.
+///
+/// `rordereddict.py` `get_ll_dict` builds one `DICT` per key/value, and
+/// that struct holds `Ptr(DICTENTRYARRAY)`. `bookkeeper.py`
+/// `getuniqueclassdef` is one class object for that struct, whichever
+/// way the translator reaches it. A transparent wrapper's declared field
+/// names the inner holder; `derive_program_metadata` flattens those rows
+/// onto the wrapper, so this walk follows the same by-value or pointer
+/// field. Arrays and slices stay out: `DICTENTRYARRAY` is the array of
+/// `DICTENTRY`, not another struct that holds one. A declaration already
+/// on this path is not another class (`bookkeeper.py` `getdesc` keys one
+/// descriptor per class object).
 fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    field_ty_names_entry_family_holder(ty, llbc, &mut visited)
+}
+
+fn field_ty_names_entry_family_holder(
+    ty: &TyRef,
+    llbc: &Llbc,
+    visited: &mut std::collections::HashSet<u64>,
+) -> bool {
     let Some(mut node) = tyref_node(ty, llbc) else {
         return false;
     };
@@ -10140,9 +10229,48 @@ fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
             node = pointee;
             continue;
         }
-        return adt_node_is_entry_family_of_typevar(peeled, llbc);
+        return adt_node_is_entry_family_holder(peeled, llbc, visited);
     }
     false
+}
+
+/// Entry family parametrized by a type variable, or a struct whose own
+/// type arguments are type variables and one of whose fields is that
+/// holder (`field_ty_names_entry_family_typevar`).
+///
+/// `visited` is the TypeDecl ids on the current path (`bookkeeper.py`
+/// `getdesc`). A revisited declaration is not a further holder.
+fn adt_node_is_entry_family_holder(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    visited: &mut std::collections::HashSet<u64>,
+) -> bool {
+    if adt_node_is_entry_family_of_typevar(node, llbc) {
+        return true;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    if !adt_node_type_subst(node, llbc)
+        .iter()
+        .any(|arg| super::json_mentions_typevar(arg, llbc, 0))
+    {
+        return false;
+    }
+    if !visited.insert(def_id) {
+        return false;
+    }
+    let holds = fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_holder(&field.ty, llbc, visited));
+    visited.remove(&def_id);
+    holds
 }
 
 fn type_node_is_array_or_slice(node: &serde_json::Value) -> bool {
@@ -16343,7 +16471,7 @@ pub(in crate::front::mir) fn enum_payload_instance_class_root(
 ///     (`native_result` `map_err`, `exceptiontransform.py` unit_ok).
 ///   - `""` — a degenerate/absent type-arg that would render a malformed
 ///     `<>` suffix.
-pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> bool {
+pub(crate) fn type_arg_splits_per_instantiation(arg: &str) -> bool {
     const DEFERRED: &[&str] = &["f32", "()", ""];
     if DEFERRED.contains(&arg) {
         return false;
@@ -16360,7 +16488,10 @@ pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> boo
 /// True when `arg` names a fully substituted type: no `TypeVar` / `??`
 /// anywhere, nested arguments included. Distinct from
 /// [`type_arg_splits_per_instantiation`]: `()` and `f32` are concrete
-/// (`Bookkeeper.getuniqueclassdef`) and still do not split.
+/// (`bookkeeper.py` `getuniqueclassdef`) and still do not split a
+/// variant payload. An entry-family holder (`rordereddict.py`
+/// `get_ll_dict`) suffixes on this predicate, so a Void key and `f32`
+/// stay distinct classes.
 ///
 /// Charon's Never / Infallible JSON is a non-object type node and
 /// renders as `??scalar`. That is a fully substituted uninhabited
@@ -16369,7 +16500,7 @@ pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> boo
 /// (`bookkeeper.py` `getuniqueclassdef`). Nested unresolved
 /// (`Option<??scalar>`) and other `??` spellings (`??TypeVar`,
 /// `??adt#N`) stay non-concrete.
-pub(in crate::front::mir) fn type_arg_is_concrete(arg: &str) -> bool {
+pub(crate) fn type_arg_is_concrete(arg: &str) -> bool {
     if arg == "??scalar" {
         return true;
     }
@@ -17012,6 +17143,29 @@ pub(crate) fn gcarray_item_struct_ptr_lltype(
     })))
 }
 
+/// `direct_arrayitems` (`lltype.py`) of a non-GC `GcArray` ITEM
+/// (`rordereddict.py` `DICTENTRY`). `_subarray._makeptr` builds
+/// `Ptr(FixedSizeArray(ITEM, 1))`.
+pub(crate) fn gcarray_item_direct_arrayitems_ptr_lltype(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        FixedSizeArray, LowLevelType, Ptr, PtrTarget,
+    };
+
+    let LowLevelType::Ptr(p) = gcarray_item_struct_ptr_lltype(reg, item)? else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = p.TO else {
+        return None;
+    };
+    let arr = FixedSizeArray::new(LowLevelType::Struct(Box::new(st)), 1);
+    Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::FixedSizeArray(arr),
+    })))
+}
+
 /// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
 /// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
 /// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
@@ -17050,11 +17204,20 @@ fn raw_struct_array_item_lltype_inner(
     // ARRAY.OF is the instantiation's own Struct: `get_ll_dict` mints one
     // `DICTENTRY` per `(DICTKEY, DICTVALUE)`. `cpu.interiorfielddescrof` /
     // `get_interiorfield_descr` / `get_field_descr` /
-    // `symbolic.get_field_token` read that Struct's offsets. Row lookup
-    // still uses the stripped template (`resolved_owner_key` /
-    // `field_rows`); interned `_name` keeps the balanced `<…>` span.
-    // A span that still names an unbound type variable (`??TypeVar#N`) is
-    // not an instantiation, so the Struct keeps the template name.
+    // `symbolic.get_field_token` read that Struct's offsets. Interned
+    // `_name` keeps the balanced `<…>` span on the template identity
+    // (`resolved_owner_key`). A span that still names an unbound type
+    // variable (`??TypeVar#N`) is not an instantiation, so the Struct
+    // keeps the template name.
+    //
+    // Rows are the monomorph `register_ordereddict_entry_rows` published
+    // under that suffixed key. `intern_field_rows` prefers the exact key,
+    // the same preference `project_struct_rows` uses. The template row is
+    // `??TypeVar`; substituting the struct name's arguments would put the
+    // external key spelling back into a field whose internal repr is the
+    // object pointer (`rmodel.py` `externalvsinternal`, `gcref=False`).
+    // `field_rows` strips `<…>` and is the fallback inside
+    // `intern_field_rows` when no suffixed key was published.
     let intern_name = match majit_ir::descr::generic_args_span(item) {
         Some(span) if !span.contains("??") => format!("{name}{span}"),
         _ => name.clone(),
@@ -17063,7 +17226,7 @@ fn raw_struct_array_item_lltype_inner(
         return None;
     }
     let out = (|| {
-        let rows = reg.field_rows(item)?;
+        let rows = reg.intern_field_rows(item)?;
         if rows.is_empty() {
             return None;
         }
@@ -17124,6 +17287,17 @@ fn field_row_lltype(
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
         }
+        // A declared-GC pointee is one `llmemory.GCREF`
+        // (`rmodel.py` `externalvsinternal`, the `gcref=True` arm,
+        // `GCRefRepr`). A class-identity pointee that is not
+        // declared-GC is `rclass.OBJECTPTR`
+        // (`getinstancerepr(rtyper, None)`, the `gcref=False` arm)
+        // on the later arm. `rordereddict.py` `_setup_repr` stores
+        // that internal lowleveltype in `DICTENTRY`. Declared-GC is
+        // reached first, so `*mut` of a declared-GC class root is
+        // `GCREF`, not `OBJECTPTR`. `rdict.py`
+        // `AbstractDictRepr.recast_key` / `recast_value` recovers the
+        // external repr from the declared row.
         if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
             return Some((*GCREF).clone());
         }

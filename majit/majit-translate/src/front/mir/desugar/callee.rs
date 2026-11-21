@@ -5691,6 +5691,15 @@ pub(in crate::front::mir) fn path_is_rordereddict_entry_ptr(path: &str) -> bool 
     path.split("::").any(|seg| seg == "rordereddict") && path_leaf_is(path, "entry_ptr")
 }
 
+/// `entry_at` / `entry_at_mut` on `rordereddict` (`get_ll_dict`).
+///
+/// Same path test as [`path_is_rordereddict_entry_ptr`]: a segment
+/// `rordereddict` and the leaf, not a table of spellings.
+pub(in crate::front::mir) fn path_is_rordereddict_entry_at(path: &str) -> bool {
+    path.split("::").any(|seg| seg == "rordereddict")
+        && (path_leaf_is(path, "entry_at") || path_leaf_is(path, "entry_at_mut"))
+}
+
 pub(in crate::front::mir) fn tyref_is_raw_ptr_value(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
@@ -6231,6 +6240,66 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     })
 }
 
+/// Shared gate for the extra-live pass and the `entry_at` intercept.
+///
+/// `get_ll_dict` reads `entries[i].field` as `getinteriorfield`
+/// (`rewrite_op_getinteriorfield`). `entry_at` / `entry_at_mut` return
+/// `&*entry_ptr().add(slot)` (`direct_arrayitems`, then `direct_ptradd`).
+/// When that reference is only `(*dest).field`, the caller emits the
+/// interior op off the receiver's `entries` field — the header
+/// `entry_ptr` recovers. The array identity is the `&Entry` dest
+/// (`GcArray<Entry<K,V>>`), not the `FixedSizeArray` wrapper around the
+/// item pointer. A copy of the reference, a returned reference, or a
+/// dest that is not a ref to the item struct stays the call.
+/// `gct_setinteriorfield` is `gct_setfield`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::front::mir) fn struct_field_entry_at_trace(
+    reg: &RegularCall,
+    args_len: usize,
+    recv_local: Option<usize>,
+    recv_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    dest_ty: Option<&TyRef>,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldPtrAdd> {
+    if args_len != 2 {
+        return None;
+    }
+    let path = regular_call_name_path(reg, llbc)?;
+    if !path_is_rordereddict_entry_at(&path) {
+        return None;
+    }
+    let recv_local = recv_local?;
+    let recv_ty = recv_ty?;
+    let index_local = index_local?;
+    if struct_field_index_named(recv_ty, llbc, "entries").is_none() {
+        return None;
+    }
+    let array_type_id = struct_ref_pointee_array_type_id(dest_ty?, llbc, tombstoned)?;
+    if !add_dest_used_only_as_struct_field(llbc, body, dest_local) {
+        return None;
+    }
+    if !captured_local_reaches_field_uses(llbc, body, dest_local, index_local) {
+        return None;
+    }
+    if recv_local != index_local
+        && !captured_local_reaches_field_uses(llbc, body, dest_local, recv_local)
+    {
+        return None;
+    }
+    Some(StructFieldPtrAdd {
+        header: TracedPtrAddHeader::EntryPtr {
+            recv_local,
+            recv_ty: clone_tyref(recv_ty),
+        },
+        index_local,
+        array_type_id,
+    })
+}
+
 pub(in crate::front::mir) struct StructFieldVecIndex {
     pub(in crate::front::mir) header_local: usize,
     pub(in crate::front::mir) index_local: usize,
@@ -6286,7 +6355,8 @@ pub(in crate::front::mir) fn struct_field_vec_index_trace(
     })
 }
 
-/// Locals `d` for which this block has a `(*d).field` value use.
+/// Locals `d` for which this block has a `(*d).field` value use,
+/// including identity-word `&(*d).field` / `&raw (*d).field`.
 pub(in crate::front::mir) fn struct_field_value_dests_in_block(
     llbc: &Llbc,
     bb: &BasicBlock,
@@ -6362,13 +6432,13 @@ pub(in crate::front::mir) fn collect_struct_field_dests_from_rvalue(
                 collect_struct_field_dest_from_operand(op, dests);
             }
         }
-        // Address-of, length, and discriminant are not value field uses.
-        Rvalue::Ref { .. }
-        | Rvalue::RawPtr { .. }
-        | Rvalue::Len(_)
-        | Rvalue::Discriminant(_)
-        | Rvalue::NullaryOp(_, _)
-        | Rvalue::Unknown => {}
+        // Identity-word `&(*d).field` is `ll_getitem_fast` (`scan_rvalue_struct_field`).
+        // Length and discriminant are not field uses, even when the place
+        // is exactly `(*d).field`.
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            collect_struct_field_dest_from_place(place, dests);
+        }
+        Rvalue::Len(_) | Rvalue::Discriminant(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
 

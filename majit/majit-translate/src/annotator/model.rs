@@ -5048,7 +5048,7 @@ mod tests {
     }
 
     #[test]
-    fn someptr_call_rejects_classdef_less_instance_as_objectptr_arg() {
+    fn someptr_call_accepts_classdef_less_instance_as_objectptr_arg() {
         use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
         use crate::translator::rtyper::rclass::OBJECTPTR;
 
@@ -5065,15 +5065,9 @@ mod tests {
         });
         let args =
             super::super::argument::ArgumentsForTranslation::new(vec![Some(s_inst)], None, None);
-        let err = s_ptr
+        s_ptr
             .call(&args)
-            .expect_err("SomePtr.call has no instance arm");
-        assert!(
-            err.msg
-                .unwrap_or_default()
-                .contains("should return a low-level type"),
-            "annotation_to_lltype rejects a high-level instance"
-        );
+            .expect("classdef-less SomeInstance against OBJECTPTR is the instance pointer");
     }
 
     #[test]

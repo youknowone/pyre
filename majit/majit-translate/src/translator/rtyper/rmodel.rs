@@ -257,6 +257,42 @@ fn ptrrepr_getattr_from_field_type(
     ))
 }
 
+/// `Ptr(ITEM)` of index 0 of `Ptr(FixedSizeArray(ITEM, 1))` when ITEM
+/// is a raw Struct. `direct_arrayitems` / `_subarray._makeptr` builds
+/// the array pointer. `_ptr._expose` of a raw container in a raw parent
+/// is `_ptr(Ptr(ITEM))`. `FixedSizeArray._first_struct` is `(None, None)`,
+/// so the step is `getarraysubstruct`, not `cast_pointer`.
+fn fixed_size_array_struct_item_ptr(ptr: &lltype::Ptr) -> Option<lltype::Ptr> {
+    let lltype::PtrTarget::FixedSizeArray(arr) = &ptr.TO else {
+        return None;
+    };
+    let LowLevelType::Struct(st) = &arr.OF else {
+        return None;
+    };
+    Some(lltype::Ptr {
+        TO: lltype::PtrTarget::Struct(st.as_ref().clone()),
+    })
+}
+
+/// `op_getarraysubstruct` (`opimpl.py`) of item 0.
+/// `PtrRepr.rtype_getitem` emits `getarraysubstruct` when the item is a
+/// container. The result lltype is `Ptr(ITEM)`.
+fn emit_getarraysubstruct_item0(
+    hop: &HighLevelOp,
+    v_array: Hlvalue,
+    item_ptr: &lltype::Ptr,
+) -> Result<Hlvalue, TyperError> {
+    let zero = inputconst_from_lltype(&LowLevelType::Signed, &ConstValue::Int(0))?;
+    hop.genop(
+        "getarraysubstruct",
+        vec![v_array, Hlvalue::Constant(zero)],
+        GenopResult::LLType(LowLevelType::Ptr(Box::new(item_ptr.clone()))),
+    )
+    .ok_or_else(|| {
+        TyperError::message("getarraysubstruct of FixedSizeArray item 0 produced no result")
+    })
+}
+
 fn ptr_target_array_item_type(target: &lltype::PtrTarget) -> Option<LowLevelType> {
     match target {
         lltype::PtrTarget::Array(t) => Some(t.OF.clone()),
@@ -2091,6 +2127,31 @@ impl Repr for PtrRepr {
         if matches!(&*hop.s_result.borrow(), Some(SomeValue::BuiltinMethod(_))) {
             return hop.inputarg(self, 0).map(Some);
         }
+        // `direct_arrayitems` is `Ptr(FixedSizeArray(ITEM, 1))`.
+        // `(*p).field` is `getarraysubstruct(p, 0)` then the same
+        // `Struct._first_struct` walk `Ptr(ITEM)` uses
+        // (`PtrRepr.rtype_getitem`, `op_getarraysubstruct`).
+        // `FixedSizeArray._first_struct` is `(None, None)`.
+        if let Some(item_ptr) = fixed_size_array_struct_item_ptr(self.ptrtype())
+            && field_on_first_struct_chain(&item_ptr, &attr)
+        {
+            let void = LowLevelType::Void;
+            let vlist = hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
+            let v_item = emit_getarraysubstruct_item0(hop, vlist[0].clone(), &item_ptr)?;
+            let (vinst, current) = ptr_cast_along_first_struct(hop, v_item, item_ptr, &attr)?;
+            let nofield = current._nofield(&attr);
+            let field_type = ptr_target_field_type(&current.TO, &attr)
+                .ok_or_else(|| TyperError::message(nofield))?;
+            return ptrrepr_getattr_from_field_type(
+                hop,
+                vinst,
+                &current,
+                &attr,
+                &field_type,
+                r_result.as_ref(),
+                vlist[1].clone(),
+            );
+        }
         if self.ptrtype()._example()._lookup_adtmeth(&attr).is_ok() {
             let value = hop
                 .s_result
@@ -2147,6 +2208,39 @@ impl Repr for PtrRepr {
 
     fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let attr = hop_arg_const_string(hop, 1)?;
+        // Same item pointer as `rtype_getattr`: `getarraysubstruct`
+        // then `Struct._first_struct` and `setfield` on `Ptr(ITEM)`.
+        if let Some(item_ptr) = fixed_size_array_struct_item_ptr(self.ptrtype())
+            && field_on_first_struct_chain(&item_ptr, &attr)
+        {
+            let r_value = {
+                hop.args_r
+                    .borrow()
+                    .get(2)
+                    .and_then(|slot| slot.clone())
+                    .ok_or_else(|| {
+                        TyperError::message("PtrRepr.rtype_setattr missing value repr")
+                    })?
+            };
+            let void = LowLevelType::Void;
+            let vlist = hop.inputargs(vec![
+                ConvertedTo::from(self),
+                ConvertedTo::from(&void),
+                ConvertedTo::from(&r_value),
+            ])?;
+            let v_item = emit_getarraysubstruct_item0(hop, vlist[0].clone(), &item_ptr)?;
+            let (vinst, current) = ptr_cast_along_first_struct(hop, v_item, item_ptr, &attr)?;
+            let nofield = current._nofield(&attr);
+            let field_type = ptr_target_field_type(&current.TO, &attr)
+                .ok_or_else(|| TyperError::message(nofield))?;
+            assert!(!field_type.is_container_type());
+            hop.genop(
+                "setfield",
+                vec![vinst, vlist[1].clone(), vlist[2].clone()],
+                GenopResult::Void,
+            );
+            return Ok(None);
+        }
         let field_type = if let Some(t) = ptr_target_field_type(&self.ptrtype().TO, &attr) {
             t
         } else if field_on_first_struct_chain(self.ptrtype(), &attr) {
@@ -4269,6 +4363,188 @@ mod tests {
         let ops = hop.llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "setarrayitem");
+    }
+
+    /// `direct_arrayitems` is `Ptr(FixedSizeArray(ITEM, 1))`.
+    /// `(*p).x` is `getarraysubstruct(p, 0)` then `getfield`
+    /// (`PtrRepr.rtype_getitem`, `op_getarraysubstruct`). The substruct
+    /// result is `Ptr(ITEM)`.
+    #[test]
+    fn ptrrepr_getattr_fixed_size_array_struct_item_emits_getarraysubstruct() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, Ptr, PtrTarget, Struct,
+        };
+
+        let item = Struct::new("Item", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let r_void: Arc<dyn Repr> = Arc::new(VoidRepr::new());
+        let hop = empty_hop(&rtyper, "getattr");
+        let v_array = Variable::new();
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("x"),
+                LowLevelType::Void,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            const_string_annotation("x"),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_void)]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "getarraysubstruct");
+        assert_eq!(ops.ops[1].opname, "getfield");
+        let Hlvalue::Variable(item_v) = &ops.ops[0].result else {
+            panic!("getarraysubstruct result is a Variable");
+        };
+        let ct = item_v.concretetype().expect("Ptr(ITEM)");
+        let LowLevelType::Ptr(p) = &ct else {
+            panic!("getarraysubstruct result is Ptr(ITEM), got {ct:?}");
+        };
+        let PtrTarget::Struct(st) = &p.TO else {
+            panic!("ITEM is a Struct, got {:?}", p.TO);
+        };
+        assert_eq!(st._name, "Item");
+    }
+
+    /// Store half of `ptrrepr_getattr_fixed_size_array_struct_item_emits_getarraysubstruct`:
+    /// `getarraysubstruct` then `setfield`.
+    #[test]
+    fn ptrrepr_setattr_fixed_size_array_struct_item_emits_getarraysubstruct() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, Ptr, PtrTarget, Struct,
+        };
+
+        let item = Struct::new("Item", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let r_void: Arc<dyn Repr> = Arc::new(VoidRepr::new());
+        let hop = empty_hop(&rtyper, "setattr");
+        let v_array = Variable::new();
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("x"),
+                LowLevelType::Void,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(9),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            const_string_annotation("x"),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_void), Some(r_signed)]);
+
+        assert!(r_ptr.rtype_setattr(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "getarraysubstruct");
+        assert_eq!(ops.ops[1].opname, "setfield");
+        let Hlvalue::Variable(item_v) = &ops.ops[0].result else {
+            panic!("getarraysubstruct result is a Variable");
+        };
+        let ct = item_v.concretetype().expect("Ptr(ITEM)");
+        let LowLevelType::Ptr(p) = &ct else {
+            panic!("getarraysubstruct result is Ptr(ITEM), got {ct:?}");
+        };
+        assert!(matches!(&p.TO, PtrTarget::Struct(st) if st._name == "Item"));
+    }
+
+    /// `hash` is a field of the offset-0 inlined struct
+    /// (`Struct._first_struct`), not of the FixedSizeArray.
+    /// `setfield` follows `getarraysubstruct` and `cast_pointer`.
+    #[test]
+    fn ptrrepr_setattr_fixed_size_array_first_struct_field_casts_item() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, Ptr, PtrTarget, Struct,
+        };
+
+        let key = Struct::new("Key", vec![("hash".into(), LowLevelType::Signed)]);
+        let item = Struct::new(
+            "Item",
+            vec![("key".into(), LowLevelType::Struct(Box::new(key)))],
+        );
+        let ptr = Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let r_void: Arc<dyn Repr> = Arc::new(VoidRepr::new());
+        let hop = empty_hop(&rtyper, "setattr");
+        let v_array = Variable::new();
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("hash"),
+                LowLevelType::Void,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(9),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            const_string_annotation("hash"),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_void), Some(r_signed)]);
+
+        assert!(r_ptr.rtype_setattr(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 3);
+        assert_eq!(ops.ops[0].opname, "getarraysubstruct");
+        assert_eq!(ops.ops[1].opname, "cast_pointer");
+        assert_eq!(ops.ops[2].opname, "setfield");
+        let Hlvalue::Variable(cast_v) = &ops.ops[1].result else {
+            panic!("cast_pointer result is a Variable");
+        };
+        let ct = cast_v.concretetype().expect("Ptr(Key)");
+        let LowLevelType::Ptr(p) = &ct else {
+            panic!("cast_pointer result is Ptr(Key), got {ct:?}");
+        };
+        assert!(matches!(&p.TO, PtrTarget::Struct(st) if st._name == "Key"));
     }
 
     #[test]

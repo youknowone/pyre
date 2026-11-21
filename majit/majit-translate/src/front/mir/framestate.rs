@@ -338,16 +338,18 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
     extra
 }
 
-/// Per-block extra-live MIR locals for a struct-field `ptr::add` or
-/// `Vec::index_mut`.
+/// Per-block extra-live MIR locals for a struct-field `ptr::add`,
+/// `entry_at` / `entry_at_mut`, or `Vec::index_mut`.
 ///
-/// `(*p.add(i)).field` and `storage[current].field` lower to
+/// `(*p.add(i)).field`, `entry_at(i).field`, `storage[current].field`,
+/// and identity-word `&mut entry_at(i).field` (`replace_value`) lower to
 /// `getinteriorfield` (`rewrite_op_getinteriorfield`) whose base is the
 /// GcArray / list header and whose index is `i`. The field block never
 /// spells those operands, so plain liveness drops them before the use.
 /// The header is the add base, `entries_item_ptr`'s argument,
-/// `entry_ptr`'s receiver, or the Vec `index_mut` peels from `&mut
-/// storage` — the same recovery the intercept records on the alias.
+/// `entry_ptr`'s / `entry_at`'s receiver, or the Vec `index_mut` peels
+/// from `&mut storage` — the same recovery the intercept records on the
+/// alias.
 pub(in crate::front::mir) fn compute_interior_field_extra_live(
     body: &Unstructured,
     llbc: &Llbc,
@@ -390,7 +392,21 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
             body,
             llbc,
             tombstoned,
-        ) {
+        )
+        .or_else(|| {
+            struct_field_entry_at_trace(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                dest,
+                Some(&call.dest.ty),
+                body,
+                llbc,
+                tombstoned,
+            )
+        }) {
             let header_local = match traced.header {
                 TracedPtrAddHeader::EntriesItem { local } => local,
                 TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,

@@ -3613,8 +3613,15 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
 /// no resume marker, or when a marked section can reach such a residual
 /// ([`helper_resume_reaches_blocker`]). Collapse is refused once a
 /// heap-writing residual or a journaled live-heap effect has executed
-/// since the level was entered, and so is a blocker section then (the
-/// guard is refused).
+/// since the level was entered.
+///
+/// A remaining-body scan that flags an *ancestor* as a blocker is a
+/// static over-approx (a miss-path switch the success-path guard does
+/// not take). PyPy still numbers every frame. When the innermost
+/// section itself is blocker-free, refusing the guard aborts a walk
+/// that already residualized malloc/`ll_dict_del_trampoline`
+/// (`fbw_rolled_back_with_effects`). Collapse cannot re-run that
+/// residual, so the frames are numbered instead.
 pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3661,7 +3668,25 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         }
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
+    let innermost_blocker_free =
+        parent_frames
+            .last()
+            .is_some_and(|frame| match frame.resume_marker_jit_pc {
+                Some(pc) => !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None),
+                None => false,
+            });
     if heap_moved || journal_delta != 0 {
+        // `capture_resumedata` numbers the helper MIFrame at this guard.
+        // Collapse would re-run the residual that already wrote the heap.
+        if innermost_blocker_free {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[numbered-helper-guard] frames-after-heap op_pc={op_pc} \
+                     heap_moved={heap_moved} journal_delta={journal_delta}"
+                );
+            }
+            return Ok(NumberedHelperGuard::Frames(parent_frames));
+        }
         if fbw_debug_abort_enabled() {
             for (i, frame) in parent_frames.iter().enumerate() {
                 let blocker = frame.resume_marker_jit_pc.map(|pc| {
