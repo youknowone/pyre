@@ -4239,6 +4239,12 @@ impl<'a> Lowering<'a> {
         let PlaceKind::Local(local) = src.kind else {
             return None;
         };
+        // A const byte-string is one `Ptr(STR)` word (`rstr.py`
+        // `ll_stritem_nonneg`). Splitting it into `{array, N}` would
+        // emit `cast_ptr_to_int`.
+        if self.string_byte_view_locals.contains(&(local as usize)) {
+            return None;
+        }
         let array_ty = ref_pointee_ty(&src.ty, self.llbc).unwrap_or_else(|| clone_tyref(&src.ty));
         let (item, len) = tyref_raw_array_parts(&array_ty, self.llbc)?;
         if json_ty_scalar_element_spelling(item, self.llbc).as_deref() != Some("u8") {

@@ -32355,7 +32355,7 @@ fn bytearray_repr_string_has_no_slice_into_iter() {
         .collect();
     assert!(
         leftover_hex.is_empty(),
-        "nibble digits are getaddrstring arithmetic; leftover HEX={leftover_hex:?} graph={}",
+        "digit table is a constant string index; leftover HEX={leftover_hex:?} graph={}",
         graph.dump()
     );
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {
@@ -32386,6 +32386,153 @@ fn bytearray_repr_string_has_no_slice_into_iter() {
             graph.dump()
         );
     }
+}
+
+/// `b"0123"[i as usize]` is `rstr.py` `AbstractStringRepr.rtype_getitem` /
+/// `ll_stritem_nonneg` on a Constant string: `__str_const` plus
+/// `__string_byte_getitem`, not a residual slice index or Array ctor.
+#[test]
+fn const_byte_str_literal_index_is_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let shared = window_shared_slice();
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]});
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 4}), &shared),
+            {"Index": {
+                "offset": {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_index"], true),
+        "signature": {"is_unsafe": false, "inputs": [n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &n),
+                window_local(2, &array_ty),
+                window_local(3, &array_ref),
+                window_local(4, &shared)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                                [byte("48"), byte("49"), byte("50"), byte("51")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ref),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 2}), &array_ty),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 4}), &shared),
+                            {"UnaryOp": [
+                                {"Cast": {"Unsize": [
+                                    array_ref.clone(),
+                                    shared.clone(),
+                                    {"Length": usize_lit}
+                                ]}},
+                                {"Move": window_place(serde_json::json!({"Local": 3}), &array_ref)}
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_index")
+        .expect("lower b\"0123\"[i as usize]");
+    let mut has_str_const = false;
+    let mut has_getitem = false;
+    let mut residual = Vec::new();
+    for op in window_graph_ops(&graph) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                if segments.first().map(String::as_str) == Some("__str_const")
+                    && segments.get(1).map(String::as_str) == Some("0123")
+                {
+                    has_str_const = true;
+                } else if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                    has_getitem = true;
+                } else {
+                    residual.push(segments.clone());
+                }
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {
+                residual.push(vec![name.clone()]);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        has_str_const,
+        "digit table is __str_const \"0123\"; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_getitem,
+        "b\"0123\"[i] is __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+    assert!(
+        residual.is_empty(),
+        "const byte-string index must not residualize a call; leftover={residual:?} graph={}",
+        graph.dump()
+    );
 }
 
 /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
