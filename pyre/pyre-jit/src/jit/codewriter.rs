@@ -234,9 +234,12 @@ fn dispatch_case_pc(code: &CodeObject, mut py_pc: usize) -> usize {
     py_pc
 }
 
-/// `f_lasti` stored on a dispatch-loop continue: the opcode pc after an
-/// `EXTENDED_ARG` prefix (`pyopcode.py dispatch_bytecode` EXTENDED_ARG
-/// loop / `eval.rs` `set_last_instr_from_next_instr(opcode_pc + 1)`). The
+/// Post-prefix opcode pc a prefixed dispatch case stores at entry
+/// (`pyopcode.py dispatch_bytecode` EXTENDED_ARG loop /
+/// `eval.rs` `set_last_instr_from_next_instr(opcode_pc + 1)`). Continues
+/// do not store this value: the loop head writes the instruction start
+/// (`dispatch_bytecode` `self.last_instr = intmask(next_instr)`), and
+/// `jump_absolute` writes `dispatch_case_pc` of the target. The
 /// `next_instr` green stays the instruction start so prefixed cases
 /// still accumulate EXTENDED_ARG. Resume / Nop stay their own greens
 /// (`dispatch_bytecode` executes them).
@@ -1660,6 +1663,13 @@ fn dispatch_link_args(source: &FrameState, target: &FrameState) -> Vec<super::fl
     result
 }
 
+/// Continue the dispatch `while True` (`interp_jit.py PyFrame.dispatch`)
+/// with `next_instr` equal to the target's instruction start
+/// (`dispatch_case_pc`). A continue does not store `last_instr`; the
+/// loop head writes the `next_instr` green after `jit_merge_point`
+/// (`pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`),
+/// and `jump_absolute` writes the target's instruction start before
+/// `bytecode_trace`.
 fn dispatch_continue_to_loop_head(
     code: &CodeObject,
     current_block: &SpamBlockRef,
@@ -1672,15 +1682,27 @@ fn dispatch_continue_to_loop_head(
     } else {
         dispatch_case_pc(code, target_py_pc)
     };
-    // `next_instr` is the instruction start so the switch hits the
-    // prefix case (`interp_jit.py PyFrame.dispatch`). `last_instr` is
-    // stored at the loop head after `jit_merge_point`
-    // (`pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`
-    // then the EXTENDED_ARG walk), not on this continue: a predecessor
-    // store is the merge-point vable box and `bytecode_only_trace` after
-    // the merge would not see the opcode pc.
+    dispatch_continue_to_loop_head_with_next_instr(
+        current_block,
+        current_state,
+        dispatch,
+        super::flow::Constant::signed(case_pc as i64).into(),
+    );
+}
+
+/// Continue the dispatch `while True` with an explicit `next_instr`
+/// green. `interp_jit.py jump_absolute` does
+/// `jumpto = r_uint(self.last_instr)` after `bytecode_trace`; the tick
+/// path passes that vable read. Other continues pass
+/// `Constant(dispatch_case_pc)`.
+fn dispatch_continue_to_loop_head_with_next_instr(
+    current_block: &SpamBlockRef,
+    current_state: &FrameState,
+    dispatch: &DispatchLoop,
+    next_instr: super::flow::FlowValue,
+) {
     let mut source = current_state.clone();
-    source.dispatch_next_instr = Some(super::flow::Constant::signed(case_pc as i64).into());
+    source.dispatch_next_instr = Some(next_instr);
     // `interp_jit.py PyFrame.dispatch` re-reads
     // `is_being_profiled = self.get_is_being_profiled()` after every
     // `handle_bytecode`; the continue re-enters the head's diamond.
@@ -2815,6 +2837,69 @@ fn emit_vable_getfield_int(
     emit_vable_getfield(graph, block, frame_var, field_idx, Kind::Int, offset)
 }
 
+/// Reload register-held locals and operand-stack slots from the
+/// virtualizable array after a call that can run a trace hook.
+///
+/// Dispatch jitcode keeps those values in flow-graph Variables that
+/// mirror `locals_cells_stack_w` (every push/pop/store also writes the
+/// vable slot; pops write NULL). A hook may pop the stack
+/// (`pyframe.py PyFrame.fset_f_lineno`) or write locals through
+/// `f_locals` (`executioncontext.py _trace` `locals2fast`). Upstream
+/// keeps the value stack in the frame, so nothing is reloaded there;
+/// `pyopcode.py PyFrame.dispatch_bytecode` continues at
+/// `next_instr = r_uint(self.last_instr)` and
+/// `pypyjit/interp_jit.py jump_absolute` at
+/// `jumpto = r_uint(self.last_instr)`. After the hook the registers
+/// must be refreshed from the vable before continuing.
+fn emit_vable_reload_frame_slots(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    state: &FrameState,
+    frame_var: super::flow::Variable,
+    code: &CodeObject,
+    offset: i64,
+) -> FrameState {
+    let stack_base_absolute = RegisterLayout::compute(code).stack_base_absolute;
+    let mut reloaded = state.clone();
+    for (i, slot) in reloaded.locals_w.iter_mut().enumerate() {
+        match slot {
+            Some(super::flow::FlowValue::Variable(v)) if v.kind == Some(Kind::Ref) => {}
+            _ => continue,
+        }
+        let loaded = emit_graph_op_with_result(
+            graph,
+            block,
+            "getarrayitem_vable_r",
+            vable_getarrayitem_ref_graph_args(
+                frame_var.into(),
+                super::flow::Constant::signed(local_to_vable_slot(i) as i64).into(),
+            ),
+            Kind::Ref,
+            offset,
+        );
+        *slot = Some(loaded.into());
+    }
+    for (d, slot) in reloaded.stack.iter_mut().enumerate() {
+        match slot {
+            super::flow::FlowValue::Variable(v) if v.kind == Some(Kind::Ref) => {}
+            _ => continue,
+        }
+        let loaded = emit_graph_op_with_result(
+            graph,
+            block,
+            "getarrayitem_vable_r",
+            vable_getarrayitem_ref_graph_args(
+                frame_var.into(),
+                super::flow::Constant::signed((stack_base_absolute + d) as i64).into(),
+            ),
+            Kind::Ref,
+            offset,
+        );
+        *slot = loaded.into();
+    }
+    reloaded
+}
+
 /// `jtransform.py rewrite_op_hint` promote: `-live-` then
 /// `{kind}_guard_value`.
 fn emit_do_promote(
@@ -3062,19 +3147,6 @@ fn emit_ptr_iszero_split(
     set_last_bool_exitcase(&current_block.block(), false);
 
     (nonnull_arm, ptr_in)
-}
-
-fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
-    let source_state = source
-        .framestate()
-        .expect("dispatch_bytecode arm carries a FrameState");
-    let join_state = join
-        .framestate()
-        .expect("dispatch_bytecode join carries a FrameState");
-    append_exit(
-        &source.block(),
-        output_link(&source_state, &join_state, join.block()),
-    );
 }
 
 /// True when any instruction-start pc is covered by the exception table.
@@ -3392,8 +3464,8 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         .expect("ptr_iszero armed arm carries a FrameState");
     // Identity split after the raising call: same `next_offset` / blocklist
     // as `make_next_block`, without enqueueing the successor on
-    // `pendingblocks` — the `last_instr` reload is emitted here, then
-    // `link_to_join`.
+    // `pendingblocks` — the `last_instr` and frame-slot reloads are
+    // emitted here, then the join.
     let mut next_state = {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         armed_state.copy(&mut fresh)
@@ -3438,14 +3510,22 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         offset,
     );
     // `dispatch_bytecode`: `next_instr = r_uint(self.last_instr)` after
-    // `ec.bytecode_only_trace(self)`. last_instr is the opcode pc after
-    // EXTENDED_ARG; the switch green is the instruction start. Reloading
-    // the vable into the green would miss the prefix case. The getfield
-    // still records a tracer that writes last_instr (`run_trace_func`).
-    // Do not inject the Int into `dispatch_next_instr` (`flatten.py
-    // insert_renamings` would emit `ref_copy` of an Int).
-    let _ = next_instr;
-    link_to_join(&next_block, &join);
+    // `ec.bytecode_only_trace(self)`. The head stores the instruction
+    // start, and `fset_f_lineno` stores an instruction start, so the
+    // reloaded value is always a key of the `next_instr` switch.
+    let mut reloaded_state = emit_vable_reload_frame_slots(
+        graph,
+        &next_block.block(),
+        &next_state,
+        frame_var,
+        code,
+        offset,
+    );
+    reloaded_state.dispatch_next_instr = Some(next_instr.into());
+    append_exit(
+        &next_block.block(),
+        output_link(&reloaded_state, &join_state, join.block()),
+    );
 
     join
 }
@@ -3741,16 +3821,28 @@ fn emit_jump_absolute_slow_residual(
             depth_at_pc,
         );
     }
+    // The residual call is canraise (`flatten.py insert_exits`); reload
+    // the hook-updated stack/locals on the normal successor.
+    let (after, after_state) =
+        copy_spam_block_at_pc(code, graph, &slow_state, py_pc, all_walker_blocks);
     append_exit(
         &slow.block(),
-        super::flow::Link::new(
-            slow_state.getoutputargs(dest_state),
-            Some(dest.block()),
-            None,
-        )
-        .into_ref(),
+        output_link(&slow_state, &after_state, after.block()),
     );
     restore_canraise_exit_order(&slow.block());
+    let reloaded = emit_vable_reload_frame_slots(
+        graph,
+        &after.block(),
+        &after_state,
+        frame_var,
+        code,
+        py_pc as i64,
+    );
+    append_exit(
+        &after.block(),
+        super::flow::Link::new(reloaded.getoutputargs(dest_state), Some(dest.block()), None)
+            .into_ref(),
+    );
     (slow, slow_state)
 }
 
@@ -3973,7 +4065,14 @@ fn emit_jump_absolute_tick(
         );
 
         // `interp_jit.py jump_absolute`: `self.last_instr = intmask(jumpto)`.
-        emit_setfield_last_instr(&tick_block.block(), frame_var, target_py_pc, py_pc as i64);
+        // `jumpto` is the target's instruction start (`dispatch_case_pc`);
+        // `target_py_pc` may point at trivia the switch skips.
+        emit_setfield_last_instr(
+            &tick_block.block(),
+            frame_var,
+            dispatch_case_pc(code, target_py_pc),
+            py_pc as i64,
+        );
 
         let poll_block = if let Some((ticker_addr, ready_idx, adapted_idx)) = ticker_helpers {
             let ready =
@@ -4090,7 +4189,26 @@ fn emit_jump_absolute_tick(
     } else {
         current_state.clone()
     };
-    dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
+    if emit_ticker || emit_breaker {
+        // `interp_jit.py jump_absolute` `jumpto = r_uint(self.last_instr)`.
+        // During tracing the read returns the box the tick stored, so
+        // traces do not change.
+        let next_instr = emit_vable_getfield_int(
+            graph,
+            &goto_block.block(),
+            frame_var,
+            VABLE_LAST_INSTR_FIELD_IDX,
+            py_pc as i64,
+        );
+        dispatch_continue_to_loop_head_with_next_instr(
+            &goto_block,
+            &goto_state,
+            dispatch,
+            next_instr.into(),
+        );
+    } else {
+        dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
+    }
 }
 
 fn emit_frontend_neg(
@@ -10173,9 +10291,11 @@ impl CodeWriter {
         //
         // `getfield_vable_i` production sites call `emit_vable_getfield_int`:
         // the promoted `valuestackdepth` after `jit_merge_point`
-        // (`interp_jit.py PyFrame.dispatch`) and the `last_instr` reload after
+        // (`interp_jit.py PyFrame.dispatch`), the `last_instr` reload after
         // `bytecode_only_trace` (`dispatch_bytecode`
-        // `next_instr = r_uint(self.last_instr)`).
+        // `next_instr = r_uint(self.last_instr)`), and the `last_instr`
+        // reload after `bytecode_trace` (`interp_jit.py jump_absolute`
+        // `jumpto = r_uint(self.last_instr)`).
         // The remaining vable scalar variants (`getfield_vable_f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
         // production emit site today; those arms already require the same
@@ -21633,6 +21753,65 @@ mod tests {
         assert!(
             opnames.contains(&"getfield_vable_i"),
             "armed arm reloads last_instr after bytecode_only_trace, got {opnames:?}"
+        );
+        let decoded: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let is_reload_block_terminator = |name: &str| {
+            name == "goto"
+                || name.starts_with("goto_if_")
+                || name.starts_with("switch")
+                || name.ends_with("_return")
+                || name == "raise"
+                || name == "reraise"
+        };
+        let last_instr_getfield_tails: Vec<Vec<&str>> = decoded
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                op.opname == "getfield_vable_i"
+                    && vable_field_index(
+                        &*pyjit.jitcode,
+                        decoded_descr_u16(&pyjit.jitcode.code, op.pc, 2),
+                    ) == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            })
+            .map(|(i, _)| {
+                decoded[i + 1..]
+                    .iter()
+                    .map(|next| next.opname)
+                    .take_while(|name| !is_reload_block_terminator(name))
+                    .collect()
+            })
+            .collect();
+        let reload_then_array = last_instr_getfield_tails.iter().any(|after| {
+            after.iter().all(|name| {
+                matches!(
+                    *name,
+                    "live" | "getarrayitem_vable_r" | "int_copy" | "ref_copy"
+                )
+            }) && after.contains(&"getarrayitem_vable_r")
+        });
+        if !reload_then_array {
+            eprintln!(
+                "last_instr getfield tails (ops until goto/goto_if_*/switch*/*_return/raise/reraise): {last_instr_getfield_tails:?}"
+            );
+        }
+        assert!(
+            reload_then_array,
+            "trace-arm last_instr reload must be a reload block of live/getarrayitem_vable_r/int_copy/ref_copy with at least one getarrayitem_vable_r; last_instr getfield tails={last_instr_getfield_tails:?}, opnames={opnames:?}"
+        );
+        let last_instr_reloads = decoded
+            .iter()
+            .filter(|op| {
+                op.opname == "getfield_vable_i"
+                    && vable_field_index(
+                        &*pyjit.jitcode,
+                        decoded_descr_u16(&pyjit.jitcode.code, op.pc, 2),
+                    ) == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            })
+            .count();
+        assert!(
+            last_instr_reloads >= 2,
+            "armed arm and jump tick must each reload last_instr, got {last_instr_reloads} in {opnames:?}"
         );
         let residual_void = opnames
             .iter()
