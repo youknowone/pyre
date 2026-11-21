@@ -589,6 +589,7 @@ impl FunDecl {
             };
             body.body[i].set_terminator_kind(new_term);
         }
+        body.clear_cfg_cache();
         if consumed.is_empty() {
             return;
         }
@@ -638,6 +639,7 @@ impl FunDecl {
             }
         }
         body.body = kept;
+        body.clear_cfg_cache();
     }
 }
 
@@ -681,6 +683,7 @@ pub fn duplicate_return(body: &mut Unstructured) {
         body.body[i].statements.extend_from_slice(stmts);
         body.body[i].set_terminator_kind(serde_json::Value::String("Return".into()));
     }
+    body.clear_cfg_cache();
 }
 
 /// The variant name of a raw enum value: `"Return"` -> `Return`,
@@ -2168,6 +2171,9 @@ pub struct ItemMeta {
     /// [`ItemMeta::name_path`], rendered on first query.
     #[serde(skip)]
     name_path: OnceLock<String>,
+    /// [`ItemMeta::name_path_stripped`], rendered on first query.
+    #[serde(skip)]
+    name_path_stripped: OnceLock<String>,
 }
 
 impl ItemMeta {
@@ -2211,6 +2217,19 @@ impl ItemMeta {
     /// [`Self::name_path`] without the copy.
     pub fn name_path_str(&self) -> &str {
         self.name_path.get_or_init(|| self.render_name_path())
+    }
+
+    /// [`Self::name_path_str`] without the leading crate segment
+    /// (`crate::module::item` → `module::item`). A single-segment path
+    /// is unchanged.
+    pub fn name_path_stripped(&self) -> &str {
+        self.name_path_stripped.get_or_init(|| {
+            let full = self.name_path_str();
+            match full.split_once("::") {
+                Some((_, rest)) => rest.to_string(),
+                None => full.to_string(),
+            }
+        })
     }
 
     fn render_name_path(&self) -> String {
@@ -2703,11 +2722,52 @@ impl TyRef {
 
 // Bodies
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default)]
+struct CfgCache {
+    forward_reachable: OnceLock<Vec<bool>>,
+    lowered_reachable: OnceLock<Vec<bool>>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
     pub span: SpanRef,
+    /// Forward / lowered reachability of this block list. A clone and
+    /// any terminator rewrite start empty.
+    #[serde(skip)]
+    cfg: CfgCache,
+}
+
+impl Clone for Unstructured {
+    /// Copies locals, blocks and span; CFG caches start empty, as after a parse.
+    fn clone(&self) -> Self {
+        Unstructured {
+            locals: self.locals.clone(),
+            body: self.body.clone(),
+            span: self.span.clone(),
+            cfg: CfgCache::default(),
+        }
+    }
+}
+
+impl Unstructured {
+    /// Drop cached reachability. Block-list and terminator rewrites
+    /// call this so the next scan walks the new CFG.
+    pub fn clear_cfg_cache(&mut self) {
+        self.cfg = CfgCache::default();
+    }
+
+    /// Blocks reachable from bb0 along every normal edge, including a
+    /// SwitchInt panic default.
+    pub fn cached_forward_reachable(&self, compute: impl FnOnce() -> Vec<bool>) -> &[bool] {
+        self.cfg.forward_reachable.get_or_init(compute)
+    }
+
+    /// Blocks reachable from bb0 along the edges lowering emits.
+    pub fn cached_lowered_reachable(&self, compute: impl FnOnce() -> Vec<bool>) -> &[bool] {
+        self.cfg.lowered_reachable.get_or_init(compute)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2887,6 +2947,7 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
         term_cache: OnceLock::new(),
     });
     body.body = kept;
+    body.clear_cfg_cache();
     body
 }
 
@@ -3185,6 +3246,7 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedRead>]
     if !str_rewrites.is_empty() {
         forward_str_literal_temps(body, &str_rewrites);
     }
+    body.clear_cfg_cache();
 }
 
 fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
@@ -3876,7 +3938,7 @@ impl Statement {
 
     /// Replace the raw statement kind, forgetting the projection of the
     /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
-    fn set_kind(&mut self, kind: Value) {
+    pub fn set_kind(&mut self, kind: Value) {
         self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
         self.value_cache = OnceLock::from(Box::new(kind));
         self.stmt_cache = OnceLock::new();
@@ -4524,6 +4586,9 @@ mod tests {
             {"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}
         ]));
         assert_eq!(mono.name_path_str(), "core::ptr::null");
+        let stripped = mono.name_path_stripped();
+        assert_eq!(stripped, "ptr::null");
+        assert!(std::ptr::eq(stripped, mono.name_path_stripped()));
         assert_eq!(mono.instantiation(), Some(&args));
         assert!(matches!(
             mono.template_name().last(),
