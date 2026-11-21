@@ -578,15 +578,32 @@ fn symbolic_fnaddr_targets_from(
                 .get(&call_path)
                 .map(|graph| graph.exceptiontransformed)
                 .unwrap_or(false);
-            let decl = match decls.binary_search_by(|(p, _)| p.as_str().cmp(path.as_str())) {
-                Ok(i) => Some(decls[i].1.clone()),
-                Err(_) => None,
+            // `getfunctionptr(graph)`: the graph's own FunDecl. A path the
+            // local-crate alias stripped is looked up under each local root;
+            // it binds only when exactly one root has it.
+            let found: Vec<usize> =
+                match decls.binary_search_by(|(p, _)| p.as_str().cmp(path.as_str())) {
+                    Ok(i) => vec![i],
+                    Err(_) => crate::local_crates::local_crate_roots()
+                        .iter()
+                        .filter_map(|root| {
+                            let candidate = format!("{root}::{path}");
+                            decls
+                                .binary_search_by(|(p, _)| p.as_str().cmp(candidate.as_str()))
+                                .ok()
+                        })
+                        .collect(),
+                };
+            let (decl_path, decl) = match found.as_slice() {
+                [i] => (Some(decls[*i].0.clone()), Some(decls[*i].1.clone())),
+                _ => (None, None),
             };
             pipeline::SymbolicFnaddrTarget {
                 path: path.clone(),
                 abi,
                 exception_transformed,
                 decl,
+                decl_path,
             }
         })
         .collect()
@@ -597,13 +614,47 @@ fn collect_symbolic_target_decls(
     llbc: &majit_charon_reader::Llbc,
     out: &mut Vec<(String, pipeline::SymbolicTargetDecl, bool)>,
 ) {
+    // Owner `TypeDecl` public flags, keyed by `name_path`. Inherent methods
+    // on a private type cannot be named as `Type::method` from another crate.
+    let mut type_public: Vec<(String, bool)> = llbc
+        .iter_type_decls()
+        .map(|td| (td.item_meta.name_path(), td.item_meta.attr_info.public))
+        .collect();
+    type_public.sort_by(|a, b| a.0.cmp(&b.0));
     for fd in llbc.iter_fun_decls() {
+        let path = inherent_method_decl_path(llbc, fd, &type_public)
+            .unwrap_or_else(|| fd.item_meta.name_path());
         out.push((
-            fd.item_meta.name_path(),
+            path,
             symbolic_target_decl_from(fd, llbc),
             fd.item_meta.is_local,
         ));
     }
+}
+
+/// Crate-qualified `Type::method` path when the owner ADT is public.
+/// `name_path` renders the Impl segment as `<Impl>`; graphs and adapters
+/// spell `Owner::leaf` (`CallPath::for_impl_method`, `getfunctionptr(graph)`).
+#[cfg(feature = "mir-frontend")]
+fn inherent_method_decl_path(
+    llbc: &majit_charon_reader::Llbc,
+    fd: &majit_charon_reader::FunDecl,
+    type_public: &[(String, bool)],
+) -> Option<String> {
+    let (owner, leaf) = crate::front::mir::impl_method_owner_for_fundecl(llbc, fd)?;
+    let root = match fd.item_meta.name.first() {
+        Some(majit_charon_reader::ullbc::NameSeg::Ident { ident: (root, _) }) => root.as_str(),
+        _ => return None,
+    };
+    let type_path = format!("{root}::{owner}");
+    let public = match type_public.binary_search_by(|(p, _)| p.as_str().cmp(type_path.as_str())) {
+        Ok(i) => type_public[i].1,
+        Err(_) => false,
+    };
+    if !public {
+        return None;
+    }
+    Some(format!("{root}::{owner}::{leaf}"))
 }
 
 #[cfg(feature = "mir-frontend")]

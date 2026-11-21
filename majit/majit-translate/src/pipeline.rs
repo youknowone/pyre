@@ -162,9 +162,14 @@ pub struct SymbolicFnaddrTarget {
     pub abi: Option<String>,
     /// The graph's `exceptiontransformed`: its `Result<T, E>` return was peeled to `T`.
     pub exception_transformed: bool,
-    /// The LLBC function declaration whose `item_meta.name_path()` equals `path`
-    /// exactly (no suffix / prefix matching). `None` when there is none or more than one.
+    /// The LLBC function declaration whose name path equals `path`,
+    /// or `<local crate>::<path>` for exactly one local crate root. `None` when there is none or more than one.
     pub decl: Option<SymbolicTargetDecl>,
+    /// The declaration's own `item_meta.name_path()` when it differs from
+    /// `path` only by the local crate prefix `path` was stripped of; the
+    /// Rust spelling an adapter calls. `None` when `decl` is `None`.
+    #[serde(default)]
+    pub decl_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -27,7 +27,6 @@ const SKIP_REASONS: &[&str] = &[
     "not-public",
     "not-local",
     "generic",
-    "method",
     "crate",
     "arity",
     "arg-shape",
@@ -170,7 +169,7 @@ fn shape_fits_abi_arg(ty: &TyShape, abi: char) -> bool {
 fn shape_fits_abi_ret(ty: &TyShape, abi: char) -> bool {
     match abi {
         'v' => matches!(ty, TyShape::Unit),
-        'w' => shape_fits_word(ty),
+        'w' => shape_fits_word(ty) || is_pyerror_adt(ty),
         'f' => matches!(ty, TyShape::Float { bits: 64 }),
         _ => false,
     }
@@ -246,10 +245,8 @@ fn select_target<'a>(
     if decl.is_generic {
         return Err("generic");
     }
-    if decl.is_method {
-        return Err("method");
-    }
-    let Some(head) = crate_head(&target.path) else {
+    let rust_decl_path = target.decl_path.as_deref().unwrap_or(&target.path);
+    let Some(head) = crate_head(rust_decl_path) else {
         return Err("crate");
     };
     if !ALLOWED_CRATES.contains(&head) {
@@ -266,7 +263,7 @@ fn select_target<'a>(
     if !ret_shape_ok(decl, target.exception_transformed, result_abi) {
         return Err("ret-shape");
     }
-    let Some(rust_path) = rust_path_from_canonical(&target.path) else {
+    let Some(rust_path) = rust_path_from_canonical(rust_decl_path) else {
         return Err("path");
     };
     Ok(SelectedAdapter {

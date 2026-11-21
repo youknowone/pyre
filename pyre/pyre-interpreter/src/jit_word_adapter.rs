@@ -176,6 +176,15 @@ impl JitWordRet for () {
     fn into_reg(self) -> Self::Reg {}
 }
 
+/// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>`: one word.
+impl JitWordRet for crate::PyError {
+    type Reg = i64;
+
+    fn into_reg(self) -> Self::Reg {
+        self.0.as_ptr() as usize as i64
+    }
+}
+
 /// The calldescr marks the call can-raise; `GUARD_NO_EXCEPTION` tells a
 /// published error from a zero result — same contract as
 /// `is_true_lookup_jit_abi`.
