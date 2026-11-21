@@ -4525,13 +4525,13 @@ fn py_null_global_narrows_to_w_root_class() {
     );
 }
 
-/// `&ObjectKey` field reads must narrow onto the dict-key class before `__pos_0`.
+/// `&ObjectKey` field reads project `__pos_0` without a class-root recast.
 ///
 /// `ObjectKey` is `repr(transparent)` over `PyObjectRef` (`rordereddict.py
 /// get_ll_dict` DICTKEY = OBJECTPTR). The digest lives in `Entry.f_hash`
 /// (`ll_hash_from_cache`), not on the key.
 #[test]
-fn object_key_field_read_narrows_to_object_key_class() {
+fn object_key_pos0_is_field_read_without_class_narrow() {
     use majit_translate::model::OpKind;
 
     let span = class_root_probe_span();
@@ -4601,22 +4601,28 @@ fn object_key_field_read_narrows_to_object_key_class() {
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("ObjectKey fixture parses");
     let graph = lower_function(&llbc, "read_pos0").expect("read_pos0 lowers");
-    let narrowed = graph.blocks.iter().any(|block| {
-        block.operations.windows(2).any(|ops| {
-            majit_translate::model::cast_instance_root(&ops[0].kind)
+    let has_object_key_cast = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            majit_translate::model::cast_instance_root(&op.kind)
                 == Some("dictmultiobject::ObjectKey")
-                && matches!(
-                    &ops[1].kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.name == "__pos_0"
-                            && field.owner_root.as_deref()
-                                == Some("dictmultiobject::ObjectKey")
-                )
         })
     });
     assert!(
-        narrowed,
-        "ObjectKey.__pos_0 must narrow onto dictmultiobject::ObjectKey; graph={}",
+        !has_object_key_cast,
+        "ObjectKey must not recast onto dictmultiobject::ObjectKey; graph={}",
+        graph.dump()
+    );
+    let has_pos0 = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+            )
+        })
+    });
+    assert!(
+        has_pos0,
+        "ObjectKey.__pos_0 must remain a field read; graph={}",
         graph.dump()
     );
 }

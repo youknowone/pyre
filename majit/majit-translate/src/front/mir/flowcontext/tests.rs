@@ -26,11 +26,11 @@ use crate::front::mir::tests::{
     calls_leaf, code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site,
     empty_llbc, empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops,
     i64_field, ident_path, interior_bb, interior_caller, interior_i64, interior_local,
-    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_usize,
-    leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape,
-    option_adt_node, option_enum, option_int_arg, option_ok_or_else_site, push_fn_const,
-    replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count, some_ctor_ops,
-    some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
+    interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_struct,
+    interior_usize, leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt,
+    ok_ctor_shape, option_adt_node, option_enum, option_int_arg, option_ok_or_else_site,
+    push_fn_const, replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count,
+    some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
     type_decl_struct, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
     window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
     window_place, window_shared_slice, window_slice, window_span, window_u8,
@@ -6883,10 +6883,6 @@ fn class_identity_spelling_of_string_family_and_object_roots() {
         super::W_ROOT_CLASS_ROOT
     );
     assert_eq!(
-        super::class_identity_spelling("pyre_object::dictmultiobject::ObjectKey", &empty),
-        super::OBJECT_KEY_CLASS_ROOT
-    );
-    assert_eq!(
         super::class_identity_spelling("pyre_object::unicodeobject::Utf8Str", &empty),
         "unicodeobject::Utf8Str"
     );
@@ -6920,6 +6916,45 @@ fn class_identity_spelling_of_string_family_and_object_roots() {
     assert_eq!(
         super::class_identity_spelling("rustpython_wtf8::Wtf8Buf", &empty),
         "Wtf8Buf"
+    );
+}
+
+/// `ObjectKey` is `repr(transparent)` over the object pointer
+/// (`rordereddict.py` `get_ll_dict` DICTKEY = OBJECTPTR). Harvest records
+/// that inner; there is no class-root recast onto the wrapper.
+#[test]
+fn object_key_transparent_inner_field_is_the_pointer() {
+    let raw_object = serde_json::json!({"RawPtr": [adt_node(0), "Mut"]});
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            type_decl_struct(0, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            interior_struct(
+                1,
+                &["pyre_object", "dictmultiobject", "ObjectKey"],
+                &[("__pos_0", raw_object)],
+                8,
+                &[0],
+                true,
+            ),
+        ],
+        vec![],
+    );
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let inner = fields
+        .transparent_inner_field("dictmultiobject::ObjectKey")
+        .or_else(|| fields.transparent_inner_field("ObjectKey"))
+        .expect("ObjectKey records its transparent inner");
+    assert!(
+        crate::front::typestr::peel_pointer_prefix(&inner)
+            .is_some_and(|pointee| pointee.contains("PyObject")),
+        "ObjectKey inner is the object pointer, got {inner}"
     );
 }
 

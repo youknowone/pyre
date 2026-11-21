@@ -7928,19 +7928,6 @@ impl<'a> Lowering<'a> {
                                             root,
                                         )
                                     })
-                                    .or_else(|| {
-                                        let root = adt_node_class_root_with(
-                                            n,
-                                            self.llbc,
-                                            self.tombstoned_leaves,
-                                        )?;
-                                        // `&ObjectKey` is the dict key the
-                                        // `eq` body reads `.hash` from. Other
-                                        // structs stay uncast: a blanket
-                                        // narrow paints `Tuple` onto values
-                                        // that are already tuples.
-                                        (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
-                                    })
                                 })
                             })
                     }
