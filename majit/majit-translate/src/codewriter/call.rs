@@ -8163,12 +8163,12 @@ impl CallControl {
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
         }
-        // `get_interiorfield_descr` does `get_field_descr(REALARRAY.OF, name)`
-        // of the same STRUCT `fielddescrof_concrete` keys on.
-        let registry_struct_id = owner_root
-            .and_then(majit_ir::descr::struct_id_for_name)
-            .or_else(|| majit_ir::descr::struct_id_for_name(&elem_name));
-        let sid = owner_id.or(registry_struct_id);
+        // `get_interiorfield_descr` reads `REALARRAY.OF`: the element struct
+        // of the concrete array decides; the field's own owner and
+        // `owner_root` only stand in when ARRAY.OF has no registered id.
+        let sid = majit_ir::descr::struct_id_for_name(&elem_name)
+            .or(owner_id)
+            .or_else(|| owner_root.and_then(majit_ir::descr::struct_id_for_name));
         let of_sid = sid.map(|id| id.as_u64()).unwrap_or(0);
         // Interned ARRAY.OF Struct is `cpu.arraydescrof(ARRAY)` identity.
         // Key by OF StructId so a template intern does not return an
@@ -26822,6 +26822,93 @@ mod tests {
             ifd.array_descr().cache_key(),
             majit_ir::descr::path_hash(&dump_atid),
         );
+    }
+
+    /// `get_interiorfield_descr` reads `REALARRAY.OF`. An interned
+    /// concrete array whose OF is registered struct S keeps S as the
+    /// inner field owner even when `owner_id` names a different struct.
+    #[test]
+    fn interiorfielddescrof_keyed_array_of_wins_over_owner_id() {
+        let elem = "array_of_owner_id::Entry";
+        let other = "array_of_owner_id::Other";
+        let atid = format!("GcArray<{elem}>");
+        let sid = majit_ir::descr::StructId::from_canonical(elem);
+        let other_sid = majit_ir::descr::StructId::from_canonical(other);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (elem.to_string(), Some(sid)),
+                (other.to_string(), Some(other_sid)),
+            ]));
+        let rows = [
+            ("key".into(), "i64".into()),
+            ("value".into(), "*mut Inst".into()),
+        ];
+        let other_rows = [("x".into(), "i64".into())];
+        let names = std::collections::HashSet::from([elem.to_string(), other.to_string()]);
+        let layout = StructLayout::from_type_strings(
+            &rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let other_layout = StructLayout::from_type_strings(
+            &other_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(elem.to_string(), rows.to_vec());
+        fields.fields.insert(other.to_string(), other_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(sid, layout);
+        cc.set_struct_layout(other_sid, other_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    ("key".into(), LowLevelType::Signed),
+                    ("value".into(), GCREF.clone()),
+                ],
+            ))))
+        };
+        let mint = |name: &str, owner_id: Option<majit_ir::descr::StructId>| {
+            cc.interiorfielddescrof_keyed(
+                1,
+                &Some(atid.clone()),
+                &Some(arr.clone()),
+                name,
+                owner_id,
+                None,
+            )
+            .expect(name)
+            .0
+        };
+        let key_descr = mint("key", None);
+        let value_descr = mint("value", Some(other_sid));
+        let inner_parent = |descr: &majit_ir::descr::DescrRef| {
+            descr
+                .as_interior_field_descr()
+                .expect("InteriorFieldDescr")
+                .field_descr()
+                .get_parent_descr()
+                .and_then(|parent| parent.as_size_descr().map(|sd| sd.cache_key()))
+        };
+        let key_parent = inner_parent(&key_descr);
+        let value_parent = inner_parent(&value_descr);
+        assert_eq!(key_parent, value_parent);
+        assert_eq!(value_parent, Some(sid.as_u64()));
+        assert_ne!(value_parent, Some(other_sid.as_u64()));
     }
 
     /// `heaptracker.py all_interiorfielddescrs` raises `UnsupportedFieldExc`
