@@ -1250,15 +1250,20 @@ impl OwnerRootGuard {
     pub fn get(&self) -> GcRef {
         // SAFETY: `roots` is this thread's own `OWNER_ROOTS` cell, alive for
         // as long as the guard (which cannot leave the thread), and the slot
-        // stays acquired until `Drop`.
-        unsafe { (*self.roots).borrow()[self.index].expect("inactive owner-root guard") }
+        // stays acquired until `Drop`. The slot is read through the cell's
+        // raw view, the way a translated function reads its root-stack slot
+        // by fixed offset (`shadowstack.py` `push_roots`): no reference into
+        // the vector is held across this statement, so a collector walk or
+        // an `acquire_owner_root` on this thread cannot observe one.
+        unsafe { (&*(*self.roots).as_ptr())[self.index].expect("inactive owner-root guard") }
     }
 
     #[inline]
     pub fn set(&self, root: GcRef) {
-        // SAFETY: same cell and slot lifetime as [`Self::get`].
+        // SAFETY: same cell and slot lifetime as [`Self::get`]. The slot is
+        // written through the same raw view.
         unsafe {
-            (*self.roots).borrow_mut()[self.index] = Some(root);
+            (&mut *(*self.roots).as_ptr())[self.index] = Some(root);
         }
     }
 }
