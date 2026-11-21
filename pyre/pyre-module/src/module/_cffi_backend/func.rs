@@ -485,48 +485,38 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         Some(w) => pyre_interpreter::baseobjspace::int_w(w)? != 0,
         None => false,
     };
-    // `func.py from_buffer`: `_fetch_as_write_buffer` / `_fetch_as_read_buffer`
-    // first, then `isinstance_w(w_x, space.w_bytes)` picks
-    // `get_raw_address_of_string` vs `buf.get_raw_address()`. Length is
-    // `buf.getlength()` of the acquired buffer.
-    let (fetched_ptr, buffersize, fetched_owner) = if require_writable {
-        let (data, owner, _) =
-            unsafe { pyre_interpreter::builtins::fileio_writebuf(roots.get(object_slot)) }?;
-        (data.as_mut_ptr(), data.len() as i64, owner)
+    // `_fetch_as_write_buffer` / `_fetch_as_read_buffer`: `space.buffer_w`
+    // with `BUF_WRITABLE` / `BUF_SIMPLE`.  The returned view is stored on
+    // `W_CDataFromBuffer` (`self.view`) and released in `_finalize_` /
+    // `enter_exit`.  Drop of this lease covers the length / address errors
+    // below; success `disarm`s it onto the cdata.
+    let flags = if require_writable {
+        pyre_interpreter::builtins::BUF_WRITABLE
     } else {
-        let buf = unsafe { pyre_interpreter::builtins::acquire_readbuf(roots.get(object_slot)) }?;
-        (
-            buf.as_ptr() as *mut u8,
-            buf.len() as i64,
-            roots.get(object_slot),
-        )
+        0
     };
+    let mut acquired = unsafe {
+        pyre_interpreter::builtins::ReadableBuffer::acquire_buffer_w(roots.get(object_slot), flags)
+    }?;
+    let buffersize = unsafe { acquired.len()? } as i64;
     let bytes_type =
         pyre_interpreter::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
-    let (ptr, buffersize, owner) = if unsafe {
+    let ptr = if unsafe {
         pyre_interpreter::baseobjspace::isinstance_w(roots.get(object_slot), bytes_type)
     } {
-        let ptr = unsafe { get_raw_address_of_string(roots.get(object_slot)) }?;
-        (ptr, buffersize, roots.get(object_slot))
-    } else if require_writable {
-        (fetched_ptr, buffersize, fetched_owner)
+        // `get_raw_address_of_string`: a moving STR is copied into
+        // `RawBytesCache`; an immovable STR hands out the interior pointer.
+        unsafe { get_raw_address_of_string(roots.get(object_slot))? }
     } else {
-        let (ptr, _len) = unsafe {
-            pyre_interpreter::builtins::acquire_readbuf_raw_address(roots.get(object_slot))
-        }?;
-        (ptr, buffersize, roots.get(object_slot))
+        let (ptr, _len) =
+            unsafe { pyre_interpreter::builtins::acquire_readbuf_raw_address(acquired.owner()) }?;
+        ptr
     };
-    let owner_slot = object_slot + 2;
-    let _ = roots.pin_root(owner);
-    let held = unsafe { pyre_interpreter::builtins::buffer_export_incref(roots.get(owner_slot)) };
 
     let arraylength = if ct.kind != ctypeobj::KIND_ARRAY {
         buffersize
     } else if ct.length >= 0 {
         if buffersize < ct.size {
-            if held {
-                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
-            }
             return Err(PyError::value_error(format!(
                 "buffer is too small ({buffersize} bytes) for '{}' ({} bytes)",
                 ct.name(),
@@ -541,9 +531,6 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         } else if itemsize > 0 {
             buffersize / itemsize
         } else {
-            if held {
-                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
-            }
             return Err(PyError::new(
                 pyre_interpreter::PyErrorKind::ZeroDivisionError,
                 format!(
@@ -553,6 +540,11 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ));
         }
     };
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(acquired.owner());
+    let held = acquired.is_held();
+    let made_view = acquired.made_view();
+    acquired.disarm();
     Ok(cdataobj::new_cdata_from_buffer(
         ptr as usize,
         arraylength,
@@ -560,6 +552,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         roots.get(object_slot),
         roots.get(owner_slot),
         held,
+        made_view,
     ))
 }
 

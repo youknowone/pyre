@@ -25802,6 +25802,9 @@ fn bytes_like_required(obj: PyObjectRef) -> crate::PyError {
     ))
 }
 
+/// `ObjSpace.BUF_WRITABLE` (`baseobjspace.py`).
+pub const BUF_WRITABLE: i32 = 0x0001;
+
 /// One `space.acquire_py_buffer(w_obj, space.BUF_SIMPLE)` export.
 ///
 /// Pins the exporter (or the memoryview `acquire_py_buffer` built) onto
@@ -25815,6 +25818,51 @@ pub struct ReadableBuffer {
     owner_slot: usize,
     held: bool,
     made_view: bool,
+}
+
+unsafe fn is_c_or_ctypes_buffer_exporter(obj: PyObjectRef) -> bool {
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    let c_exporter = crate::cpyext::buffer::exports_buffer(obj);
+    #[cfg(not(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    )))]
+    let c_exporter = false;
+    let ctypes = crate::importing::optional_module_hooks()
+        .and_then(|hooks| (hooks.ctypes_buffer_view)(obj))
+        .is_some();
+    c_exporter || ctypes
+}
+
+/// `check_buf_flags` / `W_BytesObject.buffer_w`: a writable request against
+/// read-only storage is `BufferError: Object is not writable.`
+unsafe fn native_buffer_readonly(obj: PyObjectRef) -> bool {
+    unsafe {
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            return pyre_object::memoryview::w_memoryview_readonly(obj);
+        }
+        if pyre_object::bytesobject::is_bytes(obj)
+            || crate::baseobjspace::isinstance_w(
+                obj,
+                crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+            )
+        {
+            return true;
+        }
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            return match view {
+                Ok((_, _, readonly)) => readonly,
+                Err(_) => true,
+            };
+        }
+        false
+    }
 }
 
 impl ReadableBuffer {
@@ -25837,27 +25885,59 @@ impl ReadableBuffer {
                 });
             }
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            #[cfg(all(
-                feature = "cpyext",
-                not(feature = "sandbox"),
-                any(target_os = "macos", target_os = "linux")
-            ))]
-            let c_exporter = crate::cpyext::buffer::exports_buffer(r_obj);
-            #[cfg(not(all(
-                feature = "cpyext",
-                not(feature = "sandbox"),
-                any(target_os = "macos", target_os = "linux")
-            )))]
-            let c_exporter = false;
-            let ctypes = crate::importing::optional_module_hooks()
-                .and_then(|hooks| (hooks.ctypes_buffer_view)(r_obj))
-                .is_some();
-            if !c_exporter && !ctypes {
+            if !is_c_or_ctypes_buffer_exporter(r_obj) {
                 return Err(bytes_like_required(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 ));
             }
             Self::acquire_made_view(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0)
+        }
+    }
+
+    /// `ObjSpace.buffer_w(w_obj, flags)` — the lease `W_CDataFromBuffer` holds.
+    ///
+    /// `W_BytearrayObject.buffer_w` increments `_exports`.
+    /// `W_MemoryView.buffer_w` returns `NonOwningReleaseView` (no extra
+    /// export: the memoryview already owns one).
+    /// `W_Root.__buffer_w` calls Python `__buffer__` and then
+    /// `W_MemoryView.buffer_w` on that result; here that is
+    /// [`Self::acquire_made_view`].
+    pub unsafe fn acquire_buffer_w(obj: PyObjectRef, flags: i32) -> Result<Self, crate::PyError> {
+        unsafe {
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let want_write = flags & BUF_WRITABLE == BUF_WRITABLE;
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if memoryview_python_buffer_descr(r_obj).is_some() {
+                return Self::acquire_made_view(r_obj, flags);
+            }
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if try_acquire_readbuf(r_obj)?.is_some() {
+                let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                if want_write && native_buffer_readonly(r_obj) {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::BufferError,
+                        "Object is not writable.",
+                    ));
+                }
+                let held = if pyre_object::memoryview::is_w_memoryview(r_obj) {
+                    false
+                } else {
+                    buffer_export_incref(r_obj)
+                };
+                return Ok(Self {
+                    owner_slot: obj_slot,
+                    held,
+                    made_view: false,
+                });
+            }
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if !is_c_or_ctypes_buffer_exporter(r_obj) {
+                return Err(bytes_like_required(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                ));
+            }
+            Self::acquire_made_view(pyre_object::gc_roots::shadow_stack_get(obj_slot), flags)
         }
     }
 
@@ -25915,22 +25995,35 @@ impl ReadableBuffer {
 
 impl Drop for ReadableBuffer {
     fn drop(&mut self) {
-        if self.held {
-            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
-            unsafe { buffer_export_decref(owner) };
+        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+        unsafe { release_buffer_w_lease(owner, self.held, self.made_view) };
+    }
+}
+
+/// `BufferView.releasebuffer` / `space.release_py_buffer` for a lease
+/// [`ReadableBuffer::disarm`] handed to a longer-lived owner.
+///
+/// `made_view` is the memoryview `acquire_py_buffer` / `__buffer_w` built;
+/// `held` is the matching native `_exports` increment.  A `made_view` release
+/// error is unraisable (`do_unpack` / `W_UnpackIter._finalize_`).
+///
+/// # Safety
+/// `owner` is the object [`ReadableBuffer::owner`] named, still live, and
+/// this pair is released exactly once.
+pub unsafe fn release_buffer_w_lease(owner: PyObjectRef, held: bool, made_view: bool) {
+    if made_view {
+        let mut view = owner;
+        if let Err(mut error) = pyre_object::with_roots!(view => memoryview_release(&[view])) {
+            error.write_unraisable_with_traceback(
+                pyre_object::w_none(),
+                Wtf8::new("in __release_buffer__"),
+                view,
+                true,
+                Wtf8::new(""),
+            );
         }
-        if self.made_view {
-            let mut view = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
-            if let Err(mut error) = pyre_object::with_roots!(view => memoryview_release(&[view])) {
-                error.write_unraisable_with_traceback(
-                    pyre_object::w_none(),
-                    Wtf8::new("in __release_buffer__"),
-                    view,
-                    true,
-                    Wtf8::new(""),
-                );
-            }
-        }
+    } else if held {
+        unsafe { buffer_export_decref(owner) };
     }
 }
 

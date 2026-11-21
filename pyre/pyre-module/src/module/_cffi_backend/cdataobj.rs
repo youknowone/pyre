@@ -61,8 +61,9 @@ pub struct W_CData {
     /// address for `W_CDataCallback`.  -1 when none applies.
     pub length: i64,
     /// `W_CDataNewStd.datasize`, which becomes -1 once the memory is freed.
-    /// A `W_CDataFromBuffer` keeps no size here and uses the slot for whether
-    /// it still holds the export it must decref, which `release` clears.
+    /// A `W_CDataFromBuffer` keeps no size here and uses the slot for the
+    /// `self.view` lease: 0 none/released, 1 native `_exports`
+    /// (`W_BytearrayObject.buffer_w`), 2 a memoryview `__buffer_w` built.
     pub datasize: i64,
     /// Whatever the cdata must keep alive: `W_CDataPtrToStructOrUnion`'s
     /// `structobj`, `W_CDataFromBuffer`'s `w_keepalive`, `W_CDataGCP`'s
@@ -312,23 +313,24 @@ pub fn new_cdata_from_buffer(
     w_keepalive: PyObjectRef,
     w_export_owner: PyObjectRef,
     export_held: bool,
+    made_view: bool,
 ) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let owner_slot = roots.base();
     let _ = roots.pin_root(w_export_owner);
-    let obj = new_cdata_full(
-        ptr,
-        w_ctype,
-        FLAVOR_FROM_BUFFER,
-        length,
-        i64::from(export_held),
-        w_keepalive,
-    );
+    let lease = if made_view {
+        2
+    } else if export_held {
+        1
+    } else {
+        0
+    };
+    let obj = new_cdata_full(ptr, w_ctype, FLAVOR_FROM_BUFFER, length, lease, w_keepalive);
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(owner_slot);
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
-    if export_held {
+    if lease != 0 {
         pyre_interpreter::executioncontext::register_finalizer(obj);
     }
     obj
@@ -664,16 +666,32 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
     Ok(())
 }
 
-/// `W_CDataFromBuffer.enter_exit`'s export release.
-fn release_buffer_export(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
-    let cdata = pyre_object::with_roots!(w_cdata => cdata_arg(w_cdata))?;
-    if cdata.datasize != 0 && !cdata.w_destructor.is_null() {
-        unsafe { pyre_interpreter::builtins::buffer_export_decref(cdata.w_destructor) };
-        cdata.datasize = 0;
-    }
+/// `W_CDataFromBuffer.enter_exit` / `_finalize_`: drop `self.view` then
+/// `view.releasebuffer()`.  The lease is cleared first so a re-entrant
+/// release is a no-op.
+fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cdata_slot = roots.base();
+    let _ = roots.pin_root(w_cdata);
+    let cdata = cdata_arg(roots.get(cdata_slot))?;
+    let lease = cdata.datasize;
+    let owner_slot = cdata_slot + 1;
+    let _ = roots.pin_root(cdata.w_destructor);
+    cdata.datasize = 0;
     cdata.w_keepalive = pyre_object::PY_NULL;
     cdata.w_destructor = pyre_object::PY_NULL;
-    pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata as pyre_object::gc_hook::GCREF);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(cdata_slot) as pyre_object::gc_hook::GCREF
+    );
+    if lease == 1 || lease == 2 {
+        unsafe {
+            pyre_interpreter::builtins::release_buffer_w_lease(
+                roots.get(owner_slot),
+                lease == 1,
+                lease == 2,
+            )
+        };
+    }
     Ok(())
 }
 
