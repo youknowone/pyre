@@ -278,144 +278,63 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata(ptr, a[0]))
 }
 
-/// `func.py RawBytes` — a `str2charp` copy of a movable bytes STR, freed
-/// when the weak-key entry is dropped (`RawBytes.__del__`).
-struct RawBytesEntry {
-    /// `WEAKDICTENTRY.key` — `GcWeakrefBox` to the bytes object.
-    key: usize,
-    /// `RawBytes.ptr`.
-    ptr: usize,
-}
+/// `WEAKDICT` pointer. The table is a prebuilt GC object (`ll_new_weakdict`).
+struct WeakKeyDictPtr(*mut pyre_object::rweakkeydict::WeakKeyDict);
+unsafe impl Send for WeakKeyDictPtr {}
 
 /// `func.py RawBytesCache` — `space.fromcache(RawBytesCache)`.
 /// `self.wdict` is `RWeakKeyDictionary(W_Root, RawBytes)`.
-///
-/// The map is keyed by `gc_identity_hash` of the live bytes object
-/// (`ll_get` / `compute_identity_hash`). That hash is stable across a
-/// moving GC; a HashMap keyed by the box's target address is not (the
-/// target can move). Identity is confirmed with `w_gc_weakref_box_deref`.
 struct RawBytesCache {
-    wdict: parking_lot::Mutex<std::collections::HashMap<usize, Vec<RawBytesEntry>>>,
+    wdict: parking_lot::Mutex<WeakKeyDictPtr>,
 }
 
-/// Process-wide `space.fromcache(RawBytesCache)` singleton (`_pickle`
-/// `PICKLE_STATE` AtomicPtr / `OnceLock` shape). `HashMap::new` is not
-/// `const` here, so the map is built on first use. Weak-box keys are
-/// forwarded by [`walk_raw_bytes_cache_gc`] from `walk_prebuilt_slots`.
+/// Process-wide `space.fromcache(RawBytesCache)` singleton.
+/// `space.fromcache(X)` makes one per space, and the product has one space,
+/// the process-wide `baseobjspace::OBJECT_SPACE`, so this static is its
+/// `RawBytesCache` (`errorbox.rs` `TEXT_P`, `_pickle` `PICKLE_STATE`).
+/// The dict is `ll_new_weakdict` (`alloc_raw` + `GCFLAG_NO_HEAP_PTRS` +
+/// write barrier) and is reached from `prebuilt_root_objects`; there is no
+/// extra-root walk (`baseobjspace.py interned_strings`).
 static RAW_BYTES_CACHE: std::sync::OnceLock<RawBytesCache> = std::sync::OnceLock::new();
 
 fn raw_bytes_cache() -> &'static RawBytesCache {
     RAW_BYTES_CACHE.get_or_init(|| RawBytesCache {
-        wdict: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        wdict: parking_lot::Mutex::new(WeakKeyDictPtr(std::ptr::null_mut())),
     })
 }
 
-impl RawBytesCache {
-    fn walk_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
-        let mut wdict = self.wdict.lock();
-        for bucket in wdict.values_mut() {
-            for entry in bucket.iter_mut() {
-                if entry.key != 0 {
-                    let mut key = entry.key as PyObjectRef;
-                    forward(&mut key);
-                    entry.key = key as usize;
-                }
-            }
-        }
-    }
-
-    fn prune(wdict: &mut std::collections::HashMap<usize, Vec<RawBytesEntry>>) {
-        wdict.retain(|_, bucket| {
-            bucket.retain(|entry| {
-                let target = unsafe {
-                    pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef)
-                };
-                if target.is_null() {
-                    if entry.ptr != 0 {
-                        unsafe {
-                            majit_rlib::rffi::free_charp(entry.ptr as *mut u8, false);
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            !bucket.is_empty()
-        });
-    }
-
-    fn lookup(
-        wdict: &std::collections::HashMap<usize, Vec<RawBytesEntry>>,
-        w_x: PyObjectRef,
-    ) -> Option<*mut u8> {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_x);
-        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-            x_slot,
-        ) as usize);
-        let bucket = wdict.get(&hash)?;
-        for entry in bucket {
-            let target =
-                unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(x_slot)) {
-                return Some(entry.ptr as *mut u8);
-            }
-        }
-        None
-    }
-
-    fn insert(
-        wdict: &mut std::collections::HashMap<usize, Vec<RawBytesEntry>>,
-        w_x: PyObjectRef,
-        key: PyObjectRef,
-        ptr: *mut u8,
-    ) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let pair = pyre_object::gc_roots::pin_roots(&[w_x, key]);
-        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-            pair,
-        ) as usize);
-        let bucket = wdict.entry(hash).or_default();
-        // `ll_set_nonnull` replaces a matching live key.
-        for entry in bucket.iter_mut() {
-            let target =
-                unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(pair)) {
-                if entry.ptr != 0 && entry.ptr != ptr as usize {
-                    unsafe {
-                        majit_rlib::rffi::free_charp(entry.ptr as *mut u8, false);
-                    }
-                }
-                entry.key = pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize;
-                entry.ptr = ptr as usize;
-                return;
-            }
-        }
-        bucket.push(RawBytesEntry {
-            key: pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize,
-            ptr: ptr as usize,
-        });
-    }
-}
-
-/// Forward `RawBytesCache.wdict` weak-box keys (`WEAKDICTENTRY.key`).
-pub(crate) fn walk_raw_bytes_cache_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    if let Some(cache) = RAW_BYTES_CACHE.get() {
-        cache.walk_roots(visitor);
-    }
-}
-
 /// `func.py get_raw_address_of_string` — CFFI `ffi.from_buffer` on a bytes
-/// object. Movable STRs are copied into a cached raw block; immovable STRs
+/// object. Movable STRs are copied into a cached `RawBytes`; immovable STRs
 /// hand out the interior pointer (`rgc.can_move`). Two calls with the same
 /// live bytes object return the same pointer.
 #[majit_macros::dont_look_inside]
 unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let x_slot = _roots.pin_roots(&[w_x]);
-    let w_x = _roots.get(x_slot);
+    let cache = raw_bytes_cache();
+    // Lookup and insert stay in one critical section: two threads must get
+    // the same pointer for the same live bytes (`func.py
+    // get_raw_address_of_string` docstring). MiniMark STW means a collection
+    // inside `set` / resize does not re-enter this mutex.
+    let mut wdict_guard = cache.wdict.lock();
+    if wdict_guard.0.is_null() {
+        let d = pyre_object::rweakkeydict::ll_new_weakdict();
+        if d.is_null() {
+            return Err(PyError::memory_error(""));
+        }
+        *wdict_guard = WeakKeyDictPtr(d);
+    }
+    let d = wdict_guard.0;
+    pyre_object::rweakkeydict::barrier_weakkeydict(d);
+    if pyre_object::gc_hook::try_gc_owns_object(d as pyre_object::gc_hook::GCREF) {
+        let _ = pyre_object::gc_roots::pin_root(d as PyObjectRef);
+    }
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
+    let existing = unsafe { (*d).ll_get(w_x) };
+    if !existing.is_null() {
+        return Ok(unsafe { (*(existing as *mut pyre_object::rweakkeydict::RawBytes)).ptr });
+    }
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
     let block = unsafe { pyre_object::bytesobject::w_bytes_block(w_x) };
     // MiniMark: `rgc.must_split_gc_address_space()` is False.
     if !majit_gc::can_move(majit_ir::GcRef(block as usize)) {
@@ -426,40 +345,25 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
         }
         return Ok(ptr);
     }
-    // Allocate the weakref box and the `str2charp` copy before the lock
-    // (`ll_set_nonnull` creates the weakref before lookup). Collection is
-    // forbidden while `wdict` is held.
-    let key = pyre_object::weakref::w_gc_weakref_box_new(_roots.get(x_slot));
-    if key.is_null() {
+    // `w_bytes_data` is a slice into the STR; drop it before the
+    // `RawBytes` malloc, which may collect (`framework.py` `push_roots`).
+    let charp = {
+        let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_x) };
+        majit_rlib::rffi::str2charp(data, false).map_err(|_| PyError::memory_error(""))?
+    };
+    let rawbytes = pyre_object::rweakkeydict::rawbytes_from_charp(charp);
+    if rawbytes.is_null() {
         return Err(PyError::memory_error(""));
     }
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = _roots.pin_root(key);
-    let data = unsafe { pyre_object::bytesobject::w_bytes_data(_roots.get(x_slot)) };
-    let ptr = majit_rlib::rffi::str2charp(data, false).map_err(|_| PyError::memory_error(""))?;
-    let mut drop_copy = false;
-    let result = {
-        let mut wdict = raw_bytes_cache().wdict.lock();
-        RawBytesCache::prune(&mut wdict);
-        if let Some(existing) = RawBytesCache::lookup(&wdict, _roots.get(x_slot)) {
-            drop_copy = true;
-            existing
-        } else {
-            RawBytesCache::insert(
-                &mut wdict,
-                _roots.get(x_slot),
-                pyre_object::gc_roots::shadow_stack_get(key_slot),
-                ptr,
-            );
-            ptr
-        }
-    };
-    if drop_copy {
-        unsafe {
-            majit_rlib::rffi::free_charp(ptr, false);
-        }
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(rawbytes as PyObjectRef);
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
+    let rawbytes = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    if !unsafe { (*d).ll_set(w_x, rawbytes) } {
+        return Err(PyError::memory_error(""));
     }
-    Ok(result)
+    let rawbytes = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    Ok(unsafe { (*(rawbytes as *mut pyre_object::rweakkeydict::RawBytes)).ptr })
 }
 
 /// `func.py from_buffer`.

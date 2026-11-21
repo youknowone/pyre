@@ -113,3 +113,37 @@ assert CountBuf.releases == 0, CountBuf.releases
 B.release(c_pep)
 assert CountBuf.acquires == 1, CountBuf.acquires
 assert CountBuf.releases == 1, CountBuf.releases
+
+# `func.py get_raw_address_of_string` / `RawBytesCache.wdict`: two calls on
+# the same live bytes object return the same pointer.
+intptr = B.new_primitive_type("intptr_t")
+
+def _buf_addr(cdata):
+    return int(B.cast(intptr, cdata))
+
+b_same = bytes(range(8))
+c_same_1 = B.from_buffer(BCharA, b_same)
+c_same_2 = B.from_buffer(BCharA, b_same)
+assert _buf_addr(c_same_1) == _buf_addr(c_same_2)
+
+# Distinct equal bytes objects are distinct keys (`ll_keyeq` is identity).
+b_eq_1 = bytes([101, 113, 117, 97, 108, 45, 99, 111, 110, 116, 101, 110, 116])
+b_eq_2 = bytes([101, 113, 117, 97, 108, 45, 99, 111, 110, 116, 101, 110, 116])
+assert b_eq_1 == b_eq_2 and b_eq_1 is not b_eq_2
+c_eq_1 = B.from_buffer(BCharA, b_eq_1)
+c_eq_2 = B.from_buffer(BCharA, b_eq_2)
+assert _buf_addr(c_eq_1) != _buf_addr(c_eq_2)
+
+# Dead keys drop their `RawBytes` on collect; a still-live key keeps a
+# consistent pointer across `gc.collect()`.
+kept_bytes = None
+kept_addr = None
+for i in range(32):
+    x = bytes([i, i, i, i, i, i, i, i])
+    c = B.from_buffer(BCharA, x)
+    p = _buf_addr(c)
+    assert _buf_addr(B.from_buffer(BCharA, x)) == p
+    kept_bytes, kept_addr = x, p
+    del c
+    gc.collect()
+assert _buf_addr(B.from_buffer(BCharA, kept_bytes)) == kept_addr
