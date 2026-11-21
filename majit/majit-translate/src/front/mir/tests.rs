@@ -11476,6 +11476,95 @@ fn ptr_add_of_i64_scales_count_then_direct_ptradd() {
     );
 }
 
+/// Generic `repr(C)` `Entry` whose TypeDecl layout is OffsetOf, plus a
+/// concrete 8-byte pointer-shaped `ObjectKey` (`json_ty_byte_size` /
+/// `instantiated_field_size_align`).
+fn generic_repr_c_entry_type_decls() -> Vec<serde_json::Value> {
+    let key_ty = interior_adt(1);
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let thin_ptr = serde_json::json!({"RawPtr": [{"Tuple": []}, "Mut"]});
+    let hash_ty = scalar_ty("U64");
+    let entry = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["rordereddict_entries", "Entry"], true),
+        "kind": {"Struct": [
+            {"name": "key", "ty": key_ty, "attr_info": null},
+            {"name": "f_valid", "ty": bool_ty, "attr_info": null},
+            {"name": "value", "ty": thin_ptr, "attr_info": null},
+            {"name": "f_hash", "ty": hash_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": null,
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let key = interior_c_struct(
+        1,
+        &["fixture", "ObjectKey"],
+        &[("ptr", serde_json::json!({"RawPtr": [{"Tuple": []}, "Mut"]}))],
+        8,
+        &[0],
+        false,
+    );
+    vec![entry, key]
+}
+
+fn generic_repr_c_entry_adt_node() -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": [{"Adt": {"id": 1}}]}}
+    })
+}
+
+#[test]
+fn json_ty_byte_size_generic_repr_c_entry_after_subst() {
+    let llbc = llbc_with_types("fixture", generic_repr_c_entry_type_decls(), vec![]);
+    let node = generic_repr_c_entry_adt_node();
+    assert_eq!(super::json_ty_byte_size(&node, &llbc), Some(32));
+}
+
+#[test]
+fn ptr_add_of_generic_repr_c_struct_is_direct_ptradd() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [generic_repr_c_entry_adt_node(), "Mut"]
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let llbc = std_extern_call_fixture_with_types(
+        "add_entry",
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        &[ptr_ty.clone(), usize_ty],
+        ptr_ty,
+        generic_repr_c_entry_type_decls(),
+    );
+    let graph =
+        crate::test_support::lower_function(&llbc, "add_entry").expect("lower *mut Entry::add");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "*mut Entry::add must become direct_ptradd; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
+        "*mut Entry::add must not residualize; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("add")
+        )),
+        "*mut Entry::add must not remain a Call to add; ops={ops:?}"
+    );
+}
+
 #[test]
 fn ptr_add_of_i64_emits_unscaled_count() {
     let ptr_ty = serde_json::json!({
@@ -44442,11 +44531,59 @@ fn interior_field_entry_valid_real() {
             array_type_id,
             array: _,
             ..
-        } if field.name == "f_valid" => Some((base, array_type_id)),
+        } if field.name == "f_valid" => Some((base, field, array_type_id)),
+        _ => None,
+    });
+    let Some((base, field, array_type_id)) = read else {
+        panic!("entry_valid must read f_valid via getinteriorfield; ops={ops:?}");
+    };
+    assert!(
+        array_type_id
+            .as_deref()
+            .is_some_and(|id| id.contains("Entry")),
+        "array id {array_type_id:?}"
+    );
+    // The generic `RDict<K, V>::entry_valid` template: ARRAY.OF is the
+    // `Entry` STRUCT (`rordereddict.py` `get_ll_dict` DICTENTRY); the
+    // per-(K, V) instantiation layout is picked at descr-mint time from
+    // the caller's owner (`interiorfielddescrof_keyed` tests in call.rs).
+    assert!(
+        field
+            .owner_root
+            .as_deref()
+            .is_some_and(|root| root.contains("Entry")),
+        "f_valid owner_root {:?}",
+        field.owner_root
+    );
+    let header = ops.iter().find(|op| op.result.as_ref() == Some(base));
+    match header.map(|op| &op.kind) {
+        Some(OpKind::FieldRead { field, .. }) => assert_eq!(field.name, "entries"),
+        other => panic!("f_valid base must be FieldRead entries, got {other:?}"),
+    }
+}
+
+/// `value_at` on a real artefact: `(*entry_ptr(self).add(slot)).value`
+/// (`RDict::value_at`). Ignored by default (loads the object ullbc).
+/// `cargo test -p majit-translate --lib interior_field_entry_value_real -- --ignored`
+#[test]
+#[ignore]
+fn interior_field_entry_value_real() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "value_at").expect("lower value_at");
+    let ops = graph_ops(&graph);
+    let read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::InteriorFieldRead {
+            base,
+            field,
+            array_type_id,
+            array: _,
+            ..
+        } if field.name == "value" => Some((base, array_type_id)),
         _ => None,
     });
     let Some((base, array_type_id)) = read else {
-        panic!("entry_valid must read f_valid via getinteriorfield; ops={ops:?}");
+        panic!("value_at must read value via getinteriorfield; ops={ops:?}");
     };
     assert!(
         array_type_id
@@ -44457,7 +44594,7 @@ fn interior_field_entry_valid_real() {
     let header = ops.iter().find(|op| op.result.as_ref() == Some(base));
     match header.map(|op| &op.kind) {
         Some(OpKind::FieldRead { field, .. }) => assert_eq!(field.name, "entries"),
-        other => panic!("f_valid base must be FieldRead entries, got {other:?}"),
+        other => panic!("value base must be FieldRead entries, got {other:?}"),
     }
 }
 

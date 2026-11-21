@@ -983,8 +983,8 @@ unsafe fn bytes_dict_storage_custom_trace(
 }
 
 /// `rordereddict.py` `GcStruct("dicttable")` for a set: every live
-/// `ObjectKey.obj`. `ObjectKey.hash` is identity-stable across a move, so
-/// rewriting `obj` keeps the bucket index. The set body only forwards the
+/// `ObjectEntryKey`. `f_hash` is identity-stable across a move, so
+/// rewriting the pointer keeps the bucket index. The set body only forwards the
 /// `items` pointer; a box `clear` has detached stays reachable from the
 /// shadow stack and from the remembered set (`set_items_write_barrier`).
 unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -5469,7 +5469,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::celldict::set_module_dict_storage_gc_type_id,
     );
     // `d.entries`: `GcArray(DICTENTRY)` (`get_ll_dict`), one varsize type per pair.
-    register_dict_entries::<pyre_object::dictmultiobject::ObjectKey, pyre_object::PyObjectRef>(
+    register_dict_entries::<pyre_object::dictmultiobject::ObjectEntryKey, pyre_object::PyObjectRef>(
         &mut gc,
         &pyre_object::rordereddict_entries::OBJECT_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
         pyre_object::rordereddict::set_object_key_pyobject_entries_gc_type_id,
@@ -5484,7 +5484,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::rordereddict_entries::BYTES_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
         pyre_object::rordereddict::set_bytes_key_pyobject_entries_gc_type_id,
     );
-    register_dict_entries::<pyre_object::dictmultiobject::ObjectKey, ()>(
+    register_dict_entries::<pyre_object::dictmultiobject::ObjectEntryKey, ()>(
         &mut gc,
         &pyre_object::rordereddict_entries::OBJECT_KEY_UNIT_ENTRIES_GC_TYPE_ID_CELL,
         pyre_object::rordereddict::set_object_key_unit_entries_gc_type_id,

@@ -205,6 +205,7 @@ fn build_semantic_program_via_active_frontend(
     Vec<String>,
     std::collections::HashSet<majit_ir::descr::StructId>,
     std::collections::HashSet<majit_ir::descr::StructId>,
+    Vec<(String, pipeline::SymbolicTargetDecl)>,
 ) {
     #[cfg(feature = "mir-frontend")]
     {
@@ -421,6 +422,8 @@ fn build_semantic_program_via_active_frontend(
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
+            let mut symbolic_decl_rows: Vec<(String, pipeline::SymbolicTargetDecl, bool)> =
+                Vec::new();
             let gc_struct_ids = declared_gc.gc_struct_ids();
             let field0_parents = declared_gc.field0_parent_ids().clone();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
@@ -475,6 +478,7 @@ fn build_semantic_program_via_active_frontend(
                 ));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
+                collect_symbolic_target_decls(&llbc, &mut symbolic_decl_rows);
                 let prog = graph_bodies.lower_prelinked_crate(
                     llbc,
                     module_paths,
@@ -529,6 +533,7 @@ fn build_semantic_program_via_active_frontend(
                 eval_override_graphs,
                 repr_transparent,
                 field0_parents,
+                unique_symbolic_target_decls(symbolic_decl_rows),
             );
         }
     }
@@ -552,6 +557,658 @@ fn build_semantic_program_via_active_frontend(
          `MAJIT_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
+}
+
+fn symbolic_fnaddr_targets_from(
+    paths: &[(i64, String)],
+    call_control: &call::CallControl,
+    decls: &[(String, pipeline::SymbolicTargetDecl)],
+) -> Vec<pipeline::SymbolicFnaddrTarget> {
+    paths
+        .iter()
+        .map(|(_, path)| {
+            let call_path = crate::parse::CallPath::from_segments(path.split("::"));
+            let abi = call_control.calldescr_abi_for_path(&call_path).or_else(|| {
+                let jitcode = call_control.jitcodes().get(&call_path)?;
+                let calldescr = jitcode.calldescr.get()?;
+                Some(call::calldescr_abi_string(
+                    &calldescr.arg_classes,
+                    calldescr.result_type,
+                ))
+            });
+            let exception_transformed = call_control
+                .function_graphs()
+                .get(&call_path)
+                .map(|graph| graph.exceptiontransformed)
+                .unwrap_or(false);
+            let decl = match decls.binary_search_by(|(p, _)| p.as_str().cmp(path.as_str())) {
+                Ok(i) => Some(decls[i].1.clone()),
+                Err(_) => None,
+            };
+            pipeline::SymbolicFnaddrTarget {
+                path: path.clone(),
+                abi,
+                exception_transformed,
+                decl,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "mir-frontend")]
+fn collect_symbolic_target_decls(
+    llbc: &majit_charon_reader::Llbc,
+    out: &mut Vec<(String, pipeline::SymbolicTargetDecl, bool)>,
+) {
+    for fd in llbc.iter_fun_decls() {
+        out.push((
+            fd.item_meta.name_path(),
+            symbolic_target_decl_from(fd, llbc),
+            fd.item_meta.is_local,
+        ));
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn unique_symbolic_target_decls(
+    mut rows: Vec<(String, pipeline::SymbolicTargetDecl, bool)>,
+) -> Vec<(String, pipeline::SymbolicTargetDecl)> {
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    let mut rest = rows.into_iter().peekable();
+    while let Some((path, decl, is_local)) = rest.next() {
+        let mut group = vec![(decl, is_local)];
+        while rest.peek().is_some_and(|(p, _, _)| *p == path) {
+            let (_, next_decl, next_local) = rest.next().expect("peeked");
+            group.push((next_decl, next_local));
+        }
+        if group.len() == 1 {
+            let (decl, _) = group.pop().expect("one row");
+            out.push((path, decl));
+            continue;
+        }
+        let mut locals = group.into_iter().filter(|(_, local)| *local);
+        if let Some((local_decl, _)) = locals.next()
+            && locals.next().is_none()
+        {
+            out.push((path, local_decl));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "mir-frontend")]
+fn symbolic_target_decl_from(
+    fd: &majit_charon_reader::FunDecl,
+    llbc: &majit_charon_reader::Llbc,
+) -> pipeline::SymbolicTargetDecl {
+    let mut name_rev = fd.item_meta.template_name().rev();
+    let _leaf = name_rev.next();
+    let is_method = name_rev.next().is_some_and(|seg| seg.is_impl());
+    pipeline::SymbolicTargetDecl {
+        public: fd.item_meta.attr_info.public,
+        is_local: fd.item_meta.is_local,
+        is_generic: crate::front::clause_spec::decl_is_generic(fd),
+        is_method,
+        is_unsafe: fd.signature.is_unsafe,
+        inputs: fd
+            .signature
+            .inputs
+            .iter()
+            .map(|ty| ty_shape_of(ty, llbc))
+            .collect(),
+        output: ty_shape_of(&fd.signature.output, llbc),
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_of(
+    ty: &majit_charon_reader::ullbc::TyRef,
+    llbc: &majit_charon_reader::Llbc,
+) -> pipeline::TyShape {
+    ty_shape_from_json(tyref_json(ty, llbc), llbc, 0)
+}
+
+#[cfg(feature = "mir-frontend")]
+fn tyref_json<'a>(
+    ty: &'a majit_charon_reader::ullbc::TyRef,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    match ty {
+        majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => Some(v),
+        majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
+        majit_charon_reader::ullbc::TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_json(
+    value: Option<&serde_json::Value>,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> pipeline::TyShape {
+    let Some(value) = value else {
+        return pipeline::TyShape::Other;
+    };
+    if depth > 24 {
+        return pipeline::TyShape::Other;
+    }
+    if let Some(atom) = value.as_str() {
+        return ty_shape_from_literal(atom, llbc);
+    }
+    let Some(obj) = value.as_object() else {
+        return pipeline::TyShape::Other;
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return ty_shape_from_json(llbc.dedup_body(id), llbc, depth + 1);
+    }
+    if let Some(arr) = obj
+        .get("Value")
+        .or_else(|| obj.get("HashConsedValue"))
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return ty_shape_from_json(Some(&arr[1]), llbc, depth + 1);
+    }
+    if let Some(scalar) = obj.get("Scalar").or_else(|| obj.get("Literal")) {
+        return ty_shape_from_scalar(scalar, llbc);
+    }
+    if let Some(r) = obj.get("Ref") {
+        return ty_shape_from_ref(r, llbc, depth);
+    }
+    if let Some(rp) = obj.get("RawPtr") {
+        return ty_shape_from_raw_ptr(rp, llbc, depth);
+    }
+    if let Some(items) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
+        return if items.is_empty() {
+            pipeline::TyShape::Unit
+        } else {
+            pipeline::TyShape::Other
+        };
+    }
+    if obj.contains_key("Array")
+        || obj.contains_key("Slice")
+        || obj.contains_key("FnPtr")
+        || obj.contains_key("DynTrait")
+        || obj.contains_key("TraitType")
+    {
+        return pipeline::TyShape::Other;
+    }
+    if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
+        return ty_shape_from_adt(adt, llbc, depth);
+    }
+    pipeline::TyShape::Other
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_scalar(
+    scalar: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+) -> pipeline::TyShape {
+    if let Some(atom) = scalar.as_str() {
+        return ty_shape_from_literal(atom, llbc);
+    }
+    let Some(obj) = scalar.as_object() else {
+        return pipeline::TyShape::Other;
+    };
+    if let Some(int) = obj.get("Integer").and_then(serde_json::Value::as_object) {
+        if let Some(kind) = int.get("Signed").and_then(serde_json::Value::as_str) {
+            return int_shape(kind, true, pointer_bits(llbc));
+        }
+        if let Some(kind) = int.get("Unsigned").and_then(serde_json::Value::as_str) {
+            return int_shape(kind, false, pointer_bits(llbc));
+        }
+    }
+    if let Some(float) = obj.get("Float").and_then(serde_json::Value::as_str) {
+        return float_shape(float);
+    }
+    pipeline::TyShape::Other
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_literal(atom: &str, llbc: &majit_charon_reader::Llbc) -> pipeline::TyShape {
+    match atom {
+        "Bool" => pipeline::TyShape::Bool,
+        "Char" => pipeline::TyShape::Char,
+        other => {
+            let int = int_shape(other, true, pointer_bits(llbc));
+            if matches!(int, pipeline::TyShape::Other) {
+                float_shape(other)
+            } else {
+                int
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn int_shape(kind: &str, signed_hint: bool, ptr_bits: u32) -> pipeline::TyShape {
+    let lower = kind.to_ascii_lowercase();
+    let (signed, width) = if let Some(rest) = lower.strip_prefix('i') {
+        (true, rest)
+    } else if let Some(rest) = lower.strip_prefix('u') {
+        (false, rest)
+    } else {
+        (signed_hint, lower.as_str())
+    };
+    let bits = if width == "size" {
+        ptr_bits
+    } else if let Ok(n) = width.parse::<u32>() {
+        n
+    } else {
+        return pipeline::TyShape::Other;
+    };
+    pipeline::TyShape::Int { signed, bits }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn float_shape(kind: &str) -> pipeline::TyShape {
+    let bits = match kind {
+        "F16" | "f16" => 16,
+        "F32" | "f32" => 32,
+        "F64" | "f64" => 64,
+        "F128" | "f128" => 128,
+        _ => return pipeline::TyShape::Other,
+    };
+    pipeline::TyShape::Float { bits }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn pointer_bits(llbc: &majit_charon_reader::Llbc) -> u32 {
+    llbc.target_pointer_size()
+        .map(|bytes| u32::from(bytes) * 8)
+        .unwrap_or(8 * std::mem::size_of::<usize>() as u32)
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_ref(
+    r: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> pipeline::TyShape {
+    let Some(arr) = r.as_array() else {
+        return pipeline::TyShape::Other;
+    };
+    let Some(inner) = arr.get(1) else {
+        return pipeline::TyShape::Other;
+    };
+    let mutable = arr
+        .get(2)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
+    let sized = !json_ty_is_unsized(inner, llbc, depth + 1);
+    pipeline::TyShape::Ref { mutable, sized }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_raw_ptr(
+    rp: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> pipeline::TyShape {
+    let Some(arr) = rp.as_array() else {
+        return pipeline::TyShape::Other;
+    };
+    let Some(inner) = arr.get(0) else {
+        return pipeline::TyShape::Other;
+    };
+    let mutable = arr
+        .get(1)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
+    let sized = !json_ty_is_unsized(inner, llbc, depth + 1);
+    pipeline::TyShape::RawPtr { mutable, sized }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn json_ty_is_unsized(
+    value: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> bool {
+    if depth > 24 {
+        return false;
+    }
+    if let Some(id) = value
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return llbc
+            .dedup_body(id)
+            .is_some_and(|body| json_ty_is_unsized(body, llbc, depth + 1));
+    }
+    if let Some(arr) = value
+        .get("Value")
+        .or_else(|| value.get("HashConsedValue"))
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return json_ty_is_unsized(&arr[1], llbc, depth + 1);
+    }
+    if value.get("Slice").is_some() || value.get("DynTrait").is_some() {
+        return true;
+    }
+    let Some(adt) = value.get("Adt").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if adt
+        .get("builtin")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|builtin| builtin == "Str" || builtin == "Slice")
+    {
+        return true;
+    }
+    // Nominal ADT: Charon `TypeDecl.ptr_metadata`. `"None"` (or a missing
+    // key, deserialized as Null) is a thin pointer; `"Length"`, `{VTable}`,
+    // `{InheritFrom}` is a DST. `Wtf8` is a Length newtype around `[u8]`.
+    let Some(id) = adt.get("id").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|decl| adt_ptr_metadata_is_unsized(&decl.ptr_metadata))
+}
+
+#[cfg(feature = "mir-frontend")]
+fn adt_ptr_metadata_is_unsized(meta: &serde_json::Value) -> bool {
+    match meta {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) if s == "None" => false,
+        _ => true,
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn ty_shape_from_adt(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> pipeline::TyShape {
+    let args = adt_type_args(adt, llbc, depth);
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        Some("Tuple") => {
+            return if args.is_empty() {
+                pipeline::TyShape::Unit
+            } else {
+                pipeline::TyShape::Other
+            };
+        }
+        Some(_) => return pipeline::TyShape::Other,
+        None => {}
+    }
+    // A TypeDecl whose `ptr_metadata` is not `None` is a DST; a one-word
+    // adapter cannot carry that metadata (`lltype.py` `getfunctionptr`).
+    if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64)
+        && llbc
+            .type_by_id(def_id)
+            .is_some_and(|td| adt_ptr_metadata_is_unsized(&td.ptr_metadata))
+    {
+        return pipeline::TyShape::Other;
+    }
+    let path = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        llbc.type_by_id(def_id).map(|td| td.item_meta.name_path())
+    } else if let Some(path) = adt
+        .get("id")
+        .and_then(|id| id.get("Path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(path.to_string())
+    } else {
+        None
+    };
+    match path {
+        Some(path) => pipeline::TyShape::Adt { path, args },
+        None => pipeline::TyShape::Other,
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn adt_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &majit_charon_reader::Llbc,
+    depth: usize,
+) -> Vec<pipeline::TyShape> {
+    let map_types = |types: &[serde_json::Value]| {
+        types
+            .iter()
+            .map(|ty| ty_shape_from_json(Some(ty), llbc, depth + 1))
+            .collect()
+    };
+    if let Some(types) = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        && !types.is_empty()
+    {
+        return map_types(types);
+    }
+    if let Some(types) = adt
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| llbc.type_by_id(id))
+        .and_then(|td| td.item_meta.instantiation())
+        .and_then(|inst| inst.get("types"))
+        .and_then(serde_json::Value::as_array)
+    {
+        return map_types(types);
+    }
+    Vec::new()
+}
+
+#[cfg(all(test, feature = "mir-frontend"))]
+mod ty_shape_tests {
+    use super::ty_shape_from_json;
+    use crate::pipeline::TyShape;
+    use serde_json::{Value, json};
+
+    const NONNULL: &str = "core::ptr::non_null::NonNull";
+    const OPTION: &str = "core::option::Option";
+
+    fn llbc_from_json(v: Value) -> majit_charon_reader::Llbc {
+        let bytes = serde_json::to_vec(&v).expect("fixture serializes");
+        majit_charon_reader::Llbc::from_slice(&bytes).expect("fixture parses")
+    }
+
+    fn empty_llbc() -> majit_charon_reader::Llbc {
+        llbc_from_json(json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": { "crate_name": "c", "fun_decls": [] }
+        }))
+    }
+
+    fn type_decl(id: u64, name: &str, ptr_metadata: Value) -> Value {
+        json!({
+            "def_id": id,
+            "item_meta": {
+                "name": [{"Ident": [name, 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }},
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": []},
+            "ptr_metadata": ptr_metadata
+        })
+    }
+
+    fn llbc_with_decl(id: u64, name: &str, ptr_metadata: Value) -> majit_charon_reader::Llbc {
+        llbc_from_json(json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [],
+                "type_decls": [type_decl(id, name, ptr_metadata)]
+            }
+        }))
+    }
+
+    fn shape_of(ty: Value) -> TyShape {
+        ty_shape_from_json(Some(&ty), &empty_llbc(), 0)
+    }
+
+    fn int_ty(signed: bool, kind: &str) -> Value {
+        if signed {
+            json!({"Scalar": {"Integer": {"Signed": kind}}})
+        } else {
+            json!({"Scalar": {"Integer": {"Unsigned": kind}}})
+        }
+    }
+
+    fn raw_ptr(pointee: Value) -> Value {
+        json!({"RawPtr": [pointee, "Shared"]})
+    }
+
+    fn path_adt(path: &str, args: Vec<Value>) -> Value {
+        json!({"Adt": {"id": {"Path": path}, "generics": {"types": args}}})
+    }
+
+    #[test]
+    fn ty_shape_int_widths_include_i64_and_128() {
+        assert!(matches!(
+            shape_of(int_ty(true, "I64")),
+            TyShape::Int {
+                signed: true,
+                bits: 64
+            }
+        ));
+        assert!(matches!(
+            shape_of(int_ty(true, "I128")),
+            TyShape::Int {
+                signed: true,
+                bits: 128
+            }
+        ));
+        assert!(matches!(
+            shape_of(int_ty(false, "U128")),
+            TyShape::Int {
+                signed: false,
+                bits: 128
+            }
+        ));
+    }
+
+    #[test]
+    fn ty_shape_from_raw_ptr_records_pointee_sizedness() {
+        assert!(matches!(
+            shape_of(raw_ptr(int_ty(false, "U8"))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: true
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"Slice": [int_ty(false, "U8")]}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"Adt": {"builtin": "Str"}}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+        assert!(matches!(
+            shape_of(raw_ptr(json!({"DynTrait": {}}))),
+            TyShape::RawPtr {
+                mutable: false,
+                sized: false
+            }
+        ));
+    }
+
+    #[test]
+    fn ty_shape_from_adt_maps_a_nominal_dst_to_other() {
+        let dst = llbc_with_decl(0, "Dst", json!("Length"));
+        let thin = llbc_with_decl(0, "Thin", json!("None"));
+        assert!(matches!(
+            ty_shape_from_json(Some(&json!({"Adt": {"id": 0}})), &dst, 0),
+            TyShape::Other
+        ));
+        assert!(matches!(
+            ty_shape_from_json(Some(&json!({"Adt": {"id": 0}})), &thin, 0),
+            TyShape::Adt { path, args }
+                if path == "Thin" && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ty_shape_nonnull_and_option_args_preserve_pointee_shape() {
+        let sized = path_adt(NONNULL, vec![int_ty(false, "U8")]);
+        assert!(matches!(
+            shape_of(sized.clone()),
+            TyShape::Adt { path, args }
+                if path == NONNULL
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Int {
+                            signed: false,
+                            bits: 8
+                        }]
+                    )
+        ));
+        assert!(matches!(
+            shape_of(path_adt(OPTION, vec![sized])),
+            TyShape::Adt { path, args }
+                if path == OPTION
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Adt { path: inner, args: inner_args }]
+                            if inner == NONNULL
+                                && matches!(
+                                    inner_args.as_slice(),
+                                    [TyShape::Int {
+                                        signed: false,
+                                        bits: 8
+                                    }]
+                                )
+                    )
+        ));
+
+        let slice = json!({"Slice": [int_ty(false, "U8")]});
+        let unsized_nn = path_adt(NONNULL, vec![slice.clone()]);
+        assert!(matches!(
+            shape_of(unsized_nn.clone()),
+            TyShape::Adt { path, args }
+                if path == NONNULL && matches!(args.as_slice(), [TyShape::Other])
+        ));
+        assert!(matches!(
+            shape_of(path_adt(OPTION, vec![unsized_nn])),
+            TyShape::Adt { path, args }
+                if path == OPTION
+                    && matches!(
+                        args.as_slice(),
+                        [TyShape::Adt { path: inner, args: inner_args }]
+                            if inner == NONNULL
+                                && matches!(inner_args.as_slice(), [TyShape::Other])
+                    )
+        ));
+
+        let dst = llbc_with_decl(0, "Dst", json!("Length"));
+        let nn_dst = json!({
+            "Adt": {
+                "id": {"Path": NONNULL},
+                "generics": {"types": [{"Adt": {"id": 0}}]}
+            }
+        });
+        assert!(matches!(
+            ty_shape_from_json(Some(&nn_dst), &dst, 0),
+            TyShape::Adt { path, args }
+                if path == NONNULL && matches!(args.as_slice(), [TyShape::Other])
+        ));
+    }
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
@@ -1643,17 +2300,23 @@ fn analyze_pipeline_from_module_paths(
         .filter(|spec| spec.split_portal && spec.portal_runner.is_some())
         .map(|spec| spec.portal.canonical_key())
         .collect();
-    let (mut program, declared_gc, eval_override_graphs, repr_transparent, field0_parents) =
-        build_semantic_program_via_active_frontend(
-            module_paths,
-            static_addrs,
-            &config.pipeline.transform.jitdriver_receiver_roots,
-            &rewritten_origportals,
-            explicit_llbc_paths,
-            &funcobj_declarations,
-            &lowering_skips,
-            &mut prof,
-        );
+    let (
+        mut program,
+        declared_gc,
+        eval_override_graphs,
+        repr_transparent,
+        field0_parents,
+        symbolic_target_decl_index,
+    ) = build_semantic_program_via_active_frontend(
+        module_paths,
+        static_addrs,
+        &config.pipeline.transform.jitdriver_receiver_roots,
+        &rewritten_origportals,
+        explicit_llbc_paths,
+        &funcobj_declarations,
+        &lowering_skips,
+        &mut prof,
+    );
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `codewriter` `canonical_struct_name` `path_hash` sites
@@ -3242,6 +3905,7 @@ fn analyze_pipeline_from_module_paths(
         jit_drivers: Vec::new(),
         jitcodes: Vec::new(),
         symbolic_fnaddr_paths: Vec::new(),
+        symbolic_fnaddr_targets: Vec::new(),
         indirectcalltarget_indices: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
         insns: indexmap::IndexMap::new(),
@@ -3320,6 +3984,11 @@ fn analyze_pipeline_from_module_paths(
         .collect();
     pipeline.jitcodes = jitcodes;
     pipeline.symbolic_fnaddr_paths = call::symbolic_fnaddr_paths_snapshot();
+    pipeline.symbolic_fnaddr_targets = symbolic_fnaddr_targets_from(
+        &pipeline.symbolic_fnaddr_paths,
+        &call_control,
+        &symbolic_target_decl_index,
+    );
     pipeline.indirectcalltarget_indices = indirectcalltarget_indices;
     // Mirror of `CallControl::jitcodes` (RPython `call.py self.jitcodes`)
     // captured before `call_control` is dropped. Needed because consumers

@@ -465,7 +465,7 @@ impl DictDef {
     }
 }
 
-/// `StrLookupKey` is `Equivalent<ObjectKey>` (`rordereddict.rs`
+/// `StrLookupKey` is `Equivalent<ObjectEntryKey>` (`rordereddict.rs`
 /// `RDict::get`). The stored key cell stays `K`.
 fn is_equivalent_lookup_probe(s_key: &SomeValue) -> bool {
     let SomeValue::Instance(inst) = s_key else {
@@ -581,7 +581,7 @@ mod tests {
         use super::super::classdesc::ClassDef;
         use super::super::model::SomeInstance;
 
-        let object_key = ClassDef::new_standalone("dictmultiobject::ObjectKey", None);
+        let object_key = ClassDef::new_standalone("dictmultiobject::ObjectEntryKey", None);
         let probe = ClassDef::new_standalone("dictmultiobject::StrLookupKey", None);
         let dd = DictDef::new(
             None,
@@ -607,16 +607,16 @@ mod tests {
             SomeValue::Instance(inst) => {
                 let name = inst
                     .classdef
-                    .expect("stored key keeps ObjectKey")
+                    .expect("stored key keeps ObjectEntryKey")
                     .borrow()
                     .name
                     .clone();
                 assert!(
-                    name.ends_with("ObjectKey"),
-                    "stored key must stay ObjectKey, got {name}"
+                    name.ends_with("ObjectEntryKey"),
+                    "stored key must stay ObjectEntryKey, got {name}"
                 );
             }
-            other => panic!("stored key must stay ObjectKey instance, got {other:?}"),
+            other => panic!("stored key must stay ObjectEntryKey instance, got {other:?}"),
         }
     }
 

@@ -165,6 +165,7 @@ pub mod async_operation;
 pub mod codec_engine;
 pub mod jit_builtin_folds;
 pub mod jit_fnaddr;
+pub mod jit_word_adapter;
 pub mod launch_env;
 pub mod lazyimport;
 pub mod listobject;

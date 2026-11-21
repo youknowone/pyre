@@ -39,6 +39,19 @@ use majit_jitcode::jitcode::{
     ConstIRelocKind, JitCode, StrConstDescriptor, StrConstKind, unicode_const_cells,
 };
 
+mod generated_fnaddr_adapters {
+    include!(concat!(env!("OUT_DIR"), "/generated_fnaddr_adapters.rs"));
+}
+
+/// Mirrors `pyre-module`'s `#[::ctor::ctor] register_on_load`, which
+/// installs `set_optional_module_hooks` before any `jit_trace_fnaddrs` call.
+#[::ctor::ctor(unsafe)]
+fn register_generated_fnaddr_rows_on_load() {
+    pyre_interpreter::set_generated_fnaddr_rows(
+        generated_fnaddr_adapters::generated_fnaddr_adapters,
+    );
+}
+
 /// Path recorded for a `symbolic_fnaddr_for_path` / `symbolic_fnaddr_for_target`
 /// hash. The codewriter's registry lives in the build-script process; this is
 /// that snapshot (`pipeline.symbolic_fnaddr_paths`).
