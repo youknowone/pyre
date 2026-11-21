@@ -1000,6 +1000,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
     "TupleHashJitDriver",
+    "SortkeyJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -2656,6 +2657,76 @@ fn prefix_unsigned_binop(
     }
 }
 
+/// Map each autodetected red onto its index in the marker call's explicit
+/// red operands (`user_args[num_greens + k]`).
+///
+/// The marker's explicit red operands are this port's declaration of which
+/// live variable is which. `jtransform.py` `autodetect_jit_markers_redvars`
+/// produces the rewritten order `warmspot.py` `make_args_specification`
+/// consumes; `red_marker_positions[i] = k` means detected red `i` is
+/// explicit operand `k`. Compare after the same alias resolution the
+/// merge-point rewrite uses for greens. `Some(map)` when every detected
+/// red is a marker operand: the map is injective, not a permutation of
+/// `0..n` (an undetected operand is a red that is dead across the merge
+/// point). `None` when at least one detected red is not a marker operand.
+pub(crate) fn red_marker_positions_for(
+    driver_name: &str,
+    detected: &[crate::flowspace::model::Variable],
+    explicit_reds: &[crate::flowspace::model::Variable],
+    aliases: Option<
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        >,
+    >,
+) -> Option<Vec<u32>> {
+    use crate::flowspace::model::Variable;
+    use crate::model::FunctionGraph;
+
+    let resolve = |variable: &Variable| match aliases {
+        Some(map) => resolve_alias(variable, map),
+        None => variable.clone(),
+    };
+    let describe = |variable: &Variable| {
+        format!(
+            "id={} kind={:?} prefix={}",
+            variable.id(),
+            FunctionGraph::concretetype_of(variable),
+            variable.name_prefix()
+        )
+    };
+
+    let resolved_explicit: Vec<Variable> = explicit_reds.iter().map(resolve).collect();
+    let mut claimed = vec![false; explicit_reds.len()];
+    let mut positions = Vec::with_capacity(detected.len());
+    for red in detected {
+        let resolved = resolve(red);
+        let k = resolved_explicit
+            .iter()
+            .position(|candidate| *candidate == resolved);
+        match k {
+            Some(k) if !claimed[k] => {
+                claimed[k] = true;
+                positions.push(k as u32);
+            }
+            Some(k) => panic!(
+                "auto-red driver `{driver_name}`: detected red {} maps onto marker operand {k} twice\n\
+                 detected: [{}]\n\
+                 marker:   [{}]",
+                describe(red),
+                detected.iter().map(describe).collect::<Vec<_>>().join(", "),
+                explicit_reds
+                    .iter()
+                    .map(describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => return None,
+        }
+    }
+    Some(positions)
+}
+
 /// RPython: `support.autodetect_jit_markers_redvars` (support.py).
 /// Compute the Variables live across the portal's `jit_merge_point`, remove
 /// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
@@ -3604,7 +3675,14 @@ fn raw_field_layout_offset(
     descr.as_field_descr().map(|fd| fd.offset())
 }
 
-/// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
+/// `Rvalue::Ref` / `RawPtr` borrow of a field (`rewrite_op_getsubstruct`).
+///
+/// A wide inline aggregate (`inline_vec` / `FLAG_STRUCT` larger than a
+/// word) is the usual case. A one-word row still has an address: `&s.f`
+/// is `int_add(ptr, offsetof)` on a raw owner even when the layout flag
+/// is a scalar (`bytecode::CodeObject.obj_name` as a `String` / `RustVec`
+/// header). `jtransform.py rewrite_op_getfield` raises for a leftover
+/// non-pure `getfield_raw_r`.
 fn wide_inline_borrow_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
@@ -3612,7 +3690,51 @@ fn wide_inline_borrow_offset(
     if !field.taken_by_address {
         return None;
     }
-    inline_aggregate_offset(field, cc)
+    if let Some(offset) = inline_aggregate_offset(field, cc) {
+        return Some(offset);
+    }
+    if field.vec_part.is_some() {
+        return None;
+    }
+    // `jtransform.py rewrite_op_getsubstruct` is raw-only. A GC owner's
+    // one-word Pointer/Unsigned borrow is a value load; folding it into
+    // getsubstruct then aborting because the owner is GC emits `abort/>i`.
+    if crate::codewriter::type_state::field_owner_is_gc(field, cc) {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let row = cc
+        .and_then(|cc| cc.struct_layout_for(owner))
+        .and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|row| row.name == field.name)
+                .cloned()
+        });
+    // `FLAG_SIGNED` / `FLAG_FLOAT` wide scalars stay a value load
+    // (`wide_scalar_borrow_is_not_a_substruct_address`). A pointer or
+    // unsigned word is the address of that slot.
+    if let Some(row) = row {
+        match row.flag {
+            majit_ir::descr::ArrayFlag::Pointer | majit_ir::descr::ArrayFlag::Unsigned => {
+                return Some(Ok(row.offset));
+            }
+            _ => {}
+        }
+    }
+    // Charon leaves `bytecode::CodeObject` offsets unresolved;
+    // `codeobject_layout` is the host `offset_of` table.
+    Some(Ok(exact_codeobject_field_offset(field)?))
+}
+
+fn exact_codeobject_field_offset(field: &FieldDescriptor) -> Option<usize> {
+    let owner = field.owner_root.as_deref()?;
+    crate::codeobject_layout::exact_layout_for(owner)?
+        .field_offsets
+        .get(&field.name)
+        .copied()
+        .map(|off| off as usize)
 }
 
 /// Offset of any field of a raw owner for `rewrite_op_getsubstruct`.
@@ -12076,6 +12198,42 @@ impl<'a> Transformer<'a> {
             {
                 return result;
             }
+            // `rewrite_op_malloc` → `new` / `new_with_vtable`. The
+            // `malloc_typed*` template is `dont_look_inside`
+            // (`deferred_malloc_template_with_a_clause_size_is_not_look_inside`);
+            // `guess_call_kind` would residualize that callee. The call
+            // site is the malloc op: fire this arm before residualization,
+            // matching `malloc_varsize_clear` above. `fuse_boxing_alloc`
+            // already rewrote the boxing cluster when it could; a
+            // survivor still takes this rewrite.
+            if crate::codewriter::call::is_lltype_malloc_target(target)
+                && !crate::codewriter::call::is_lltype_malloc_varsize_clear_target(target)
+                && let ValueType::Ref(Some(owner)) = result_ty
+                && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
+            {
+                if self.flavor_raw_ref_is_int_banked(result_ty) {
+                    return self.rewrite_raw_malloc_fixedsize_owner(
+                        op,
+                        graph_name,
+                        graph,
+                        &alloc_owner,
+                        false,
+                        false,
+                        true,
+                    );
+                }
+                let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
+                    crate::codewriter::heaptracker::callcontrol_has_vtable(cc, &alloc_owner)
+                });
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    op.result.clone(),
+                    alloc_owner,
+                    has_vtable,
+                    Vec::new(),
+                );
+            }
             // `rewrite_op_same_as` / `rewrite_op_cast_pointer` /
             // `rewrite_op_cast_opaque_ptr`: one operand alias, no jitcode
             // op. `current_gc_ref` is the residual stand-in for the GC
@@ -16914,17 +17072,30 @@ impl<'a> Transformer<'a> {
                     &green_kinds,
                     &red_kinds,
                 );
-                // warmspot.py:663-664 `jd._green_args_spec` / `jd.red_args_types`
-                // are read off the marker's own operands, not off the
-                // declaration. Record them here for the same reason upstream
-                // does it here: this is where the marker operands exist. A
+                // `warmspot.py` `make_args_specification` reads
+                // `jd._green_args_spec` / `jd.red_args_types` off the marker's
+                // own operands, not off the declaration. Record them here for
+                // the same reason: this is where the marker operands exist. A
                 // consumer that builds the run-time driver then works from the
                 // graph's answer instead of re-typing the declaration, which is
                 // what makes the two unable to disagree. For an auto-red driver
                 // these describe the reds `autodetect_jit_markers_redvars` just
-                // found, which nothing else records.
+                // found. The marker's explicit red operands are this port's
+                // declaration of which live variable is which;
+                // `red_marker_positions` is the injective map onto the
+                // rewritten list (`split_graph_and_record_jitdriver`).
                 let green_args_spec = self.marker_operand_kinds(greens_raw);
                 let red_args_types = self.marker_operand_kinds(reds_raw);
+                let computed_positions = if autoreds {
+                    red_marker_positions_for(
+                        &driver_name,
+                        reds_raw,
+                        &user_args[num_greens..],
+                        Some(&self.aliases),
+                    )
+                } else {
+                    Some((0..reds_raw.len() as u32).collect())
+                };
                 {
                     let jd = self
                         .callcontrol
@@ -16932,6 +17103,16 @@ impl<'a> Transformer<'a> {
                         .jitdriver_sd_from_jitdriver_mut(jitdriver_index)?;
                     jd.green_args_spec = green_args_spec;
                     jd.red_args_types = red_args_types;
+                    // `find_portals` rewrites the marker to autodetect order
+                    // before this transform runs on the split copy. Keep the
+                    // map recorded against the source operands when this
+                    // later rewrite would only see the identity.
+                    let identity: Vec<u32> = (0..reds_raw.len() as u32).collect();
+                    if jd.red_marker_positions.is_none()
+                        || computed_positions.as_deref() != Some(identity.as_slice())
+                    {
+                        jd.red_marker_positions = computed_positions;
+                    }
                 }
                 if autoreds {
                     let jd = self
@@ -21749,7 +21930,7 @@ mod tests {
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
-    fn register_codeobject_origin() -> parking_lot::MutexGuard<'static, ()> {
+    fn register_codeobject_origin() -> crate::test_support::StructRegistryTestGuard {
         crate::test_support::register_struct_origins_serialized(std::collections::HashMap::from([
             ("CodeObject".to_string(), "bytecode".to_string()),
         ]))
@@ -23832,6 +24013,94 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "flavor-raw Pointer borrow must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `rewrite_op_getsubstruct` is raw-only (`jtransform.py` raises
+    /// `only supported for gckind=raw`). A GC owner's one-word Pointer
+    /// borrow is a value load; folding it into getsubstruct then aborting
+    /// because the owner is GC emits `abort/>i` into unique look-inside.
+    #[test]
+    fn gc_pointer_borrow_is_not_getsubstruct_abort() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "objectmodel::W_Root";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "w_class".into(),
+                    offset: word,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let field = FieldDescriptor::new("w_class", Some(owner.into()))
+            .with_taken_by_address(true)
+            .with_owner_declared_gc(Some(true));
+        assert_eq!(
+            wide_inline_borrow_offset(&field, Some(&cc)),
+            None,
+            "GC Pointer borrow is not rewrite_op_getsubstruct"
+        );
+
+        let mut graph = FunctionGraph::new("gc_pointer_borrow");
+        let obj =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, obj.clone());
+        let w_class = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: obj,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(w_class));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter().cloned())
+            .collect();
+        let aborted = ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. }));
+        assert!(
+            !aborted,
+            "GC Pointer borrow must not emit abort/>i; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_class"
+            )),
+            "GC Pointer borrow stays a value getfield; ops={ops:?}"
         );
     }
 
@@ -29786,7 +30055,7 @@ mod tests {
     /// `FieldRead`.  Tracking it would drop the op — the array is only
     /// materialised at an array access — and leave the consumer that
     /// wanted the address with an undefined operand.
-    /// `pyframe::FrameLocalsRoot::new` is the shape: it hands the slot
+    /// `pyframe::FrameLocalsRoot::register` is the shape: it hands the slot
     /// address to `try_gc_add_root`.
     #[test]
     fn address_of_a_vable_array_field_is_not_tracked() {
@@ -35572,6 +35841,11 @@ mod tests {
             jit_marker_key_from_target(&tuplehash_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
+        let sortkey_merge = CallTarget::method("jit_merge_point", Some("SortkeyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&sortkey_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
 
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
@@ -35861,7 +36135,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36029,7 +36303,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36134,7 +36408,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36360,7 +36634,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36585,7 +36859,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36760,7 +37034,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36935,7 +37209,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37091,7 +37365,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37758,6 +38032,7 @@ mod tests {
             jd.red_args_types,
             vec![majit_ir::Type::Ref, majit_ir::Type::Int],
         );
+        assert_eq!(jd.red_marker_positions, Some(vec![0, 1]));
     }
 
     #[test]

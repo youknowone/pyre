@@ -288,7 +288,7 @@ fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
 /// `GenericAlias.__hash__` (`_pypy_generic_alias.py`).
 fn ga_hash(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
-    Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
+    Ok(w_int_new(crate::builtins::generic_alias_hash_value(self_)?))
 }
 
 /// `GenericAlias.__call__` (`_pypy_generic_alias.py`).

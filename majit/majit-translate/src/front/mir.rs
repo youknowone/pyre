@@ -473,8 +473,17 @@ pub(crate) fn absorb_semantic_program(
                     acc.known_trait_names.insert(n);
                 }
             }
+            // One STRUCT per key (`descr.py get_field_descr` caches on the
+            // STRUCT object); a crate that cannot see a payload's TypeDecl
+            // contributes a partial view, so views are merged, not first-wins.
             for (key, fields) in prog.struct_fields.fields {
-                acc.struct_fields.fields.entry(key).or_insert(fields);
+                let existing = acc.struct_fields.fields.entry(key).or_insert(Vec::new());
+                for row in fields {
+                    if existing.iter().any(|have| have.name == row.name) {
+                        continue;
+                    }
+                    existing.push(row);
+                }
             }
             acc.struct_fields
                 .raw_word_owners
@@ -512,8 +521,22 @@ pub(crate) fn absorb_semantic_program(
             for (key, rows) in prog.struct_field_attrs {
                 acc.struct_field_attrs.entry(key).or_insert(rows);
             }
+            // One STRUCT per key (`descr.py get_field_descr` caches on the
+            // STRUCT object); a crate that cannot see a payload's TypeDecl
+            // contributes a partial view, so views are merged, not last-wins.
             for (key, layout) in prog.exact_layouts {
-                acc.exact_layouts.insert(key, layout);
+                if let Some(dest) = acc.exact_layouts.get_mut(&key) {
+                    for (name, offset) in layout.field_offsets {
+                        dest.field_offsets.entry(name).or_insert(offset);
+                    }
+                    dest.size = dest.size.or(layout.size);
+                    dest.align = dest.align.or(layout.align);
+                    if dest.host.is_none() {
+                        dest.host = layout.host;
+                    }
+                } else {
+                    acc.exact_layouts.insert(key, layout);
+                }
             }
             for (key, id) in prog.struct_ids {
                 acc.struct_ids
@@ -873,12 +896,30 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 ///
 /// Ordered by `(name_path, suffix, args, def_id)` so intern registration
 /// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Identity is `(def_id, suffix)` (the name path and rendered arguments follow
+/// from them) so equality does not depend on the retained [`TyRef`].
+/// `tyref_by_value_struct_decl` reads `instantiated` when a variant payload is
+/// an inlined STRUCT (`heaptracker.all_fielddescrs`).
+#[derive(Clone)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+    instantiated: TyRef,
+}
+
+impl PartialEq for RefEnumInst {
+    fn eq(&self, other: &Self) -> bool {
+        self.def_id == other.def_id && self.suffix == other.suffix
+    }
+}
+impl Eq for RefEnumInst {}
+impl std::hash::Hash for RefEnumInst {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.def_id.hash(state);
+        self.suffix.hash(state);
+    }
 }
 
 impl PartialOrd for RefEnumInst {
@@ -1000,6 +1041,7 @@ fn ref_enum_instantiation_of_adt(
         name_path,
         args,
         suffix,
+        instantiated: TyRef::Other(serde_json::json!({"Adt": adt.clone()}).into()),
     })
 }
 
@@ -1550,6 +1592,127 @@ fn is_inline_array_or_slice_type(s: &str) -> bool {
     s.trim().starts_with('[')
 }
 
+/// Physical dotted leaves of a by-value `lltype.Struct` variant payload
+/// (`lltypesystem/lltype.py` Struct inlined substructure /
+/// `heaptracker.all_fielddescrs`).
+///
+/// The logical `fname` row is registry/annotation only: it has no
+/// ExactLayout offset. Exact descrs are `fname.<leaf>`. Intern still
+/// puts the logical row in the FieldRow list so `from_type_strings`
+/// keeps it for `getattr(STRUCT, fname)`.
+struct InlineByValueVariantLayout {
+    logical_row: crate::front::semantic::FieldRow,
+    /// Dotted leaf rows in intern `dotted_rows` order, each with its
+    /// ExactLayout offset (`heaptracker.all_fielddescrs`). Parallel
+    /// name lookup is not used: intern and the stamper walk this vec.
+    dotted: Vec<(crate::front::semantic::FieldRow, u64)>,
+    size: u64,
+    align: u64,
+    field: lltype::InlineVariantField,
+}
+
+/// Eligibility plus row/offset construction shared by intern
+/// (`register_ref_enum_instantiation_rows`) and runtime stamping
+/// (`ensure_enum_variant_instance_layout`).
+enum InlineByValueVariantLayoutResult {
+    /// Pointer, scalar, pair, GcStruct, or a struct with a GC-pointer leaf.
+    NotByValueStruct,
+    /// Eligible payload whose `expand_inline_field` did not finish.
+    ExpansionFailed,
+    Ready(InlineByValueVariantLayout),
+}
+
+/// The variant payload sits past the discriminant word. A GcStruct
+/// inlines only as the first field (`lltype.GcStruct` / `rclass`
+/// `super`). A by-value struct whose leaves include a GC pointer is
+/// that GcStruct: `backendopt/malloc.py` materializes it when the
+/// pointer is a call argument.
+fn inline_by_value_variant_layout(
+    payload_ty: &TyRef,
+    fname: &str,
+    owner: &str,
+    field_index: usize,
+    field: &FieldDecl,
+    concrete: &str,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> InlineByValueVariantLayoutResult {
+    let Some(nested) = tyref_by_value_struct_decl(
+        payload_ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) else {
+        return InlineByValueVariantLayoutResult::NotByValueStruct;
+    };
+    if gc_struct_ids.contains(&struct_id_for_type_decl(nested))
+        || lltype::by_value_struct_has_gc_pointer_leaf(
+            payload_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    {
+        return InlineByValueVariantLayoutResult::NotByValueStruct;
+    }
+    // `heaptracker.all_fielddescrs` emits the payload's non-Struct
+    // leaves. The logical `fname` row stays in `struct_fields` without
+    // an ExactLayout offset (`GcStructLayout::apply_exact_layout`).
+    let spec = lltype::InlineVariantField {
+        owner: owner.to_string(),
+        owner_is_gc: true,
+        field: fname.to_string(),
+        payload_offset: 8,
+        payload_ty: clone_tyref(payload_ty),
+    };
+    let Some(expansion) = lltype::expand_inline_field(
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        std::slice::from_ref(&spec),
+        owner,
+        fname,
+    ) else {
+        return InlineByValueVariantLayoutResult::ExpansionFailed;
+    };
+    let mut dotted: Vec<(crate::front::semantic::FieldRow, u64)> = Vec::new();
+    for leaf in &expansion.leaves {
+        let dotted_name = format!("{}.{}{}", fname, leaf.super_path, leaf.field.name);
+        if dotted.iter().any(|(row, _)| row.name == dotted_name) {
+            continue;
+        }
+        let row_ty = tyref_to_field_layout_string(
+            &leaf.source_ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+        dotted.push((
+            crate::front::semantic::FieldRow::named(dotted_name, row_ty),
+            expansion.offset + leaf.offset,
+        ));
+    }
+    let align = 8.max(expansion.align);
+    let extent = expansion
+        .leaves
+        .iter()
+        .map(|leaf| expansion.offset + leaf.offset + leaf.size)
+        .max()
+        .unwrap_or(8);
+    InlineByValueVariantLayoutResult::Ready(InlineByValueVariantLayout {
+        logical_row: field_row_from_decl(field_index, field, concrete, llbc),
+        dotted,
+        size: (extent + align - 1) & !(align - 1),
+        align,
+        field: spec,
+    })
+}
+
 /// Register per-instantiation SUFFIXED variant payload rows for the
 /// discovered reference-payload enum instantiations (#312 C4).
 ///
@@ -1597,6 +1760,13 @@ fn register_ref_enum_instantiation_rows(
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    inline_variant_fields: &mut Vec<lltype::InlineVariantField>,
+    tombstoned: &std::collections::HashSet<String>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     for inst in insts {
         let Some(td) = llbc.type_by_id(inst.def_id) else {
@@ -1640,9 +1810,16 @@ fn register_ref_enum_instantiation_rows(
             let mut rows: Vec<crate::front::semantic::FieldRow> =
                 Vec::with_capacity(v.fields.len());
             let mut registrable = true;
+            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
+            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
+            let instantiated_node =
+                tyref_node(&inst.instantiated, llbc).and_then(|node| strip_ty_wrappers(node, llbc));
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
-                let concrete = intern_payload_registry_spelling(
+                let payload_ty = instantiated_node
+                    .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
+                    .unwrap_or_else(|| clone_tyref(&f.ty));
+                let mut concrete = intern_payload_registry_spelling(
                     llbc,
                     &substitute_field_type(
                         &f.ty,
@@ -1653,6 +1830,73 @@ fn register_ref_enum_instantiation_rows(
                     ),
                     struct_fields,
                 );
+                if let Some(ptr) = lltype::malloc_ptr_field_spelling(
+                    &payload_ty,
+                    &concrete,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ) {
+                    concrete = ptr;
+                }
+                match inline_by_value_variant_layout(
+                    &payload_ty,
+                    &fname,
+                    &identity,
+                    i,
+                    f,
+                    &concrete,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ) {
+                    InlineByValueVariantLayoutResult::ExpansionFailed => {
+                        registrable = false;
+                        break;
+                    }
+                    InlineByValueVariantLayoutResult::Ready(layout) => {
+                        // `explicit_sum_shell` records `__discriminant` as the
+                        // variant's first FieldRow. ExactLayout already has that
+                        // tag at byte 0; without the FieldRow,
+                        // `GcStructLayout::apply_exact_layout` omits it,
+                        // `result_variant` is false, and
+                        // `bh_all_field_specs_for_struct_into` lists both the
+                        // logical `__pos_0` leaves and these dotted rows
+                        // (`heaptracker.all_fielddescrs`).
+                        if !rows.iter().any(|row| row.name == "__discriminant") {
+                            rows.push(crate::front::semantic::FieldRow::named(
+                                "__discriminant",
+                                "i64",
+                            ));
+                        }
+                        rows.push(layout.logical_row);
+                        let exact = exact_layouts.entry(sid).or_default();
+                        exact.align = Some(layout.align);
+                        exact.field_offsets.insert("__discriminant".into(), 0);
+                        for (row, off) in layout.dotted {
+                            if rows.iter().any(|existing| existing.name == row.name) {
+                                continue;
+                            }
+                            exact.field_offsets.insert(row.name.clone(), off);
+                            rows.push(row);
+                        }
+                        exact.size = Some(layout.size);
+                        for base in &bases {
+                            let key = format!("{base}{}::{}", inst.suffix, v.name);
+                            inline_variant_fields.push(lltype::InlineVariantField {
+                                owner: key,
+                                owner_is_gc: layout.field.owner_is_gc,
+                                field: fname.clone(),
+                                payload_offset: layout.field.payload_offset,
+                                payload_ty: clone_tyref(&layout.field.payload_ty),
+                            });
+                        }
+                        continue;
+                    }
+                    InlineByValueVariantLayoutResult::NotByValueStruct => {}
+                }
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
                 // under the same rule as a sole scalar.
@@ -1726,8 +1970,6 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
-            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
-            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
             for base in &bases {
                 let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
@@ -2325,6 +2567,44 @@ fn enum_instantiation_type_args_are_concrete(
         .all(|ty| type_arg_node_is_concrete(ty, llbc, 0))
 }
 
+/// Type-argument `Ref` wrappers intern already peeled for the vsid.
+/// `render_adt_type_args` strips `&T` except raw storage, so
+/// `Option<&T>` shares intern's `Option<T>` identity.
+/// `ref_enum_instantiation_of_adt` sees the ref-wrapped head as a
+/// niche (`tyref_is_niche_option`) and returns `None`. Recover intern's
+/// harvested ADT by peeling those wrappers.
+fn peel_adt_type_arg_refs(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let generics = type_decl_ref_generics(adt, llbc)?.as_object()?;
+    let types = generics.get("types")?.as_array()?;
+    let mut peeled_types: Vec<serde_json::Value> = Vec::with_capacity(types.len());
+    let mut changed = false;
+    for t in types {
+        match strip_ty_wrappers(t, llbc) {
+            Some(peeled) if peeled != t => {
+                changed = true;
+                peeled_types.push(peeled.clone());
+            }
+            Some(peeled) => peeled_types.push(peeled.clone()),
+            None => peeled_types.push(t.clone()),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = adt.clone();
+    let mut g = out
+        .get("generics")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| generics.clone());
+    g.insert("types".to_string(), serde_json::Value::Array(peeled_types));
+    out.insert("generics".to_string(), serde_json::Value::Object(g));
+    Some(out)
+}
+
 /// Register the instance variant STRUCT the first time lowering stamps its
 /// id (`rclass.py` `getinstancerepr` / `descr.py` `get_size_descr`).
 ///
@@ -2345,6 +2625,7 @@ fn ensure_enum_variant_instance_layout(
     vidx: usize,
     inst_args: &[String],
     inst_adt: Option<&serde_json::Map<String, serde_json::Value>>,
+    instantiated: Option<&TyRef>,
     vsid: majit_ir::descr::StructId,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -2381,7 +2662,53 @@ fn ensure_enum_variant_instance_layout(
     let explicit_sum_shell =
         enum_uses_explicit_sum_shell(&name, variants, enum_layout.as_ref(), base_has_discriminant);
     let single_field = variant.fields.len() == 1;
+    let spelling = format!(
+        "{}::{}",
+        decl_path_for_tombstone(&name, tombstoned),
+        variant.name
+    );
+    // Intern substitutes from `{"Adt": harvested}` (`RefEnumInst.instantiated`)
+    // after `tyref_node` + `strip_ty_wrappers`, dotted-expands only when
+    // `ref_enum_instantiation_of_adt` is Some, and owns the variant as
+    // `{canon}{suffix}::{variant}`. A caller that still has `Option<&T>`
+    // in `inst_adt` fails that gate (niche) while `concrete_adt_struct_id`
+    // has already peeled the `&` onto intern's `Option<T>` vsid.
+    let peeled_adt = inst_adt.and_then(|adt| peel_adt_type_arg_refs(adt, llbc));
+    let intern_inst = inst_adt
+        .and_then(|adt| ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids, tombstoned))
+        .or_else(|| {
+            instantiated
+                .and_then(|ty| tyref_adt_map(ty, llbc))
+                .and_then(|adt| ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids, tombstoned))
+        })
+        .or_else(|| {
+            let peeled = peeled_adt.as_ref()?;
+            let inst = ref_enum_instantiation_of_adt(peeled, llbc, gc_struct_ids, tombstoned)?;
+            let identity = format!(
+                "{}{}::{}",
+                strip_crate_prefix(&td.item_meta.name_path_str()),
+                inst.suffix,
+                variant.name
+            );
+            let intern_sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
+            (intern_sid == vsid).then_some(inst)
+        });
+    let intern_owner_node = intern_inst.as_ref().and_then(|inst| {
+        tyref_node(&inst.instantiated, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+    });
+    let helper_owner = match intern_inst.as_ref() {
+        Some(inst) => format!(
+            "{}{}::{}",
+            strip_crate_prefix(&td.item_meta.name_path_str()),
+            inst.suffix,
+            variant.name
+        ),
+        None => spelling.clone(),
+    };
     let mut occupying: Vec<crate::front::semantic::FieldRow> = Vec::new();
+    let mut inline_logical: Vec<String> = Vec::new();
+    let mut inline_offsets: Vec<(String, u64)> = Vec::new();
+    let mut inline_size_align: Option<(u64, u64)> = None;
     for (i, field) in variant.fields.iter().enumerate() {
         if tyref_pair_field_kind(&field.ty, llbc).is_some() {
             if !single_field {
@@ -2407,6 +2734,46 @@ fn ensure_enum_variant_instance_layout(
                 raw_alloc_flavor_structs,
             )
         };
+        // Intern dotted-expands only RefEnumInst rows. A non-generic
+        // variant still getattr `__pos_0` (`BuiltinEncoder::Utf16Or32`).
+        if intern_inst.is_some() {
+            let payload_ty = intern_owner_node
+                .and_then(|owner| substitute_spill_typevars(&field.ty, owner, llbc))
+                .unwrap_or_else(|| clone_tyref(&field.ty));
+            let fname = field_decl_name(i, field);
+            match inline_by_value_variant_layout(
+                &payload_ty,
+                &fname,
+                &helper_owner,
+                i,
+                field,
+                &concrete,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ) {
+                InlineByValueVariantLayoutResult::Ready(layout) => {
+                    // Intern's FieldRow list is the logical `fname` plus
+                    // the dotted leaves (`register_ref_enum_instantiation_rows`).
+                    // ExactLayout omits `fname`; `from_type_strings` still
+                    // lists it so residual `getattr(STRUCT, fname)` hits the
+                    // layout (`from_type_strings_keeps_nested_struct_field_rows`).
+                    // Dotted names are the `heaptracker.all_fielddescrs`
+                    // leaves of the inlined `lltypesystem/lltype.py` Struct.
+                    inline_logical.push(layout.logical_row.name.clone());
+                    occupying.push(layout.logical_row);
+                    for (row, off) in layout.dotted {
+                        inline_offsets.push((row.name.clone(), off));
+                        occupying.push(row);
+                    }
+                    inline_size_align = Some((layout.size, layout.align));
+                    continue;
+                }
+                InlineByValueVariantLayoutResult::NotByValueStruct
+                | InlineByValueVariantLayoutResult::ExpansionFailed => {}
+            }
+        }
         if !enum_variant_row_occupies_storage(&concrete) {
             // Sole unresolved associated-type projection is one GC word
             // (`InstanceRepr`), the same intern rows publish
@@ -2439,7 +2806,7 @@ fn ensure_enum_variant_instance_layout(
             .and_then(|layout| layout.discriminant_offset())
             .unwrap_or(0)
     };
-    let field_offsets = if occupying.is_empty() {
+    let mut field_offsets = if occupying.is_empty() {
         let mut offsets = std::collections::HashMap::new();
         offsets.insert("__discriminant".to_string(), tag_off);
         offsets
@@ -2453,8 +2820,14 @@ fn ensure_enum_variant_instance_layout(
             llbc,
         )
     };
+    for name in &inline_logical {
+        field_offsets.remove(name);
+    }
+    for (name, off) in inline_offsets {
+        field_offsets.insert(name, off);
+    }
     let enum_size = enum_layout.as_ref().and_then(|layout| layout.size);
-    let (size, align) = if occupying.is_empty() {
+    let (mut size, mut align) = if occupying.is_empty() {
         (
             enum_size.or_else(|| Some(sum_shell_size(&field_offsets))),
             enum_layout
@@ -2484,6 +2857,10 @@ fn ensure_enum_variant_instance_layout(
             Some(8),
         )
     };
+    if let Some((inline_size, inline_align)) = inline_size_align {
+        size = Some(inline_size);
+        align = Some(inline_align);
+    }
     let mut rows = occupying;
     rows.insert(
         0,
@@ -2522,11 +2899,6 @@ fn ensure_enum_variant_instance_layout(
         let align = layout.align.max(1);
         layout.size = (field_end + align - 1) & !(align - 1);
     }
-    let spelling = format!(
-        "{}::{}",
-        decl_path_for_tombstone(&name, tombstoned),
-        variant.name
-    );
     layout.gckind = if struct_id_is_declared_gc(gc_struct_ids, vsid, &spelling) {
         crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
     } else {
@@ -2586,6 +2958,7 @@ fn stamp_enum_variant_instance_layout(
         vidx,
         &inst_args,
         Some(inst_adt),
+        Some(ty),
         vsid,
         tombstoned,
         gc_struct_ids,
@@ -3215,6 +3588,9 @@ pub(crate) struct CrateLoweringState {
     tombstoned_leaves: std::collections::HashSet<String>,
     /// Gc structs and enums visible to every body of this artefact.
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Declaration-ordered inlined variant-payload records. Exact-key lookup
+    /// is sufficient (`tyref_by_value_struct_decl`); not a semantic side table.
+    inline_variant_fields: Vec<lltype::InlineVariantField>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -3422,6 +3798,7 @@ impl CrateLoweringState {
         // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
         // narrowing-only reference-payload receiver its concrete payload type
         // so the suffixed variant classdef does not stay `Impossible` → Skip.
+        let mut inline_variant_fields = Vec::new();
         register_ref_enum_instantiation_rows(
             llbc,
             &ref_enum_insts,
@@ -3430,6 +3807,10 @@ impl CrateLoweringState {
             &mut struct_ids,
             gc_struct_ids,
             program_exception_class_hints,
+            &mut exact_layouts,
+            &mut inline_variant_fields,
+            &tombstoned_leaves,
+            &raw_alloc_flavor_structs,
         );
         // Concrete `Entry<K,V>` rows and `repr(C)` layouts. The generic
         // decl's `key` is a type variable; `get_ll_dict` mints one
@@ -3549,6 +3930,7 @@ impl CrateLoweringState {
             }),
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
+            inline_variant_fields,
             raw_alloc_flavor_structs,
             value_type_by_id: std::cell::RefCell::new(Vec::new()),
             exception_class_hints,
@@ -3997,6 +4379,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             value_type_by_id,
+            inline_variant_fields,
             dont_look_inside,
             oopspec_fns,
             spec,
@@ -4044,6 +4427,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -4306,6 +4690,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             value_type_by_id,
+            inline_variant_fields,
             dont_look_inside,
             oopspec_fns,
             spec: spec_queue,
@@ -4340,6 +4725,7 @@ impl<'l> CrateLowering<'l> {
             gc_struct_ids,
             immutable_fields,
             raw_alloc_flavor_structs,
+            inline_variant_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -9155,6 +9541,9 @@ pub struct LowerContext<'a> {
     /// Structs and enums declared Gc across this one artefact.
     /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Declaration-ordered inlined variant-payload records. Exact-key lookup
+    /// is sufficient (`tyref_by_value_struct_decl`); not a semantic side table.
+    inline_variant_fields: Vec<lltype::InlineVariantField>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -9197,12 +9586,39 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, mut struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
+        let exception_class_hints = llbc_exception_class_hints(llbc);
+        let (
+            _,
+            _,
+            mut struct_fields,
+            enum_variant_by_discriminant,
+            _,
+            struct_field_attrs,
+            mut exact_layouts,
+            mut struct_ids,
+        ) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            llbc_exception_class_hints(llbc),
+            exception_class_hints,
+        );
+        let tombstoned_leaves = tombstoned_leaves_of(llbc);
+        let ref_enum_insts =
+            collect_ref_enum_instantiations(llbc, &gc_struct_ids, None, None, &tombstoned_leaves);
+        let mut inline_variant_fields = Vec::new();
+        register_ref_enum_instantiation_rows(
+            llbc,
+            &ref_enum_insts,
+            &enum_variant_by_discriminant,
+            &mut struct_fields,
+            &mut struct_ids,
+            &gc_struct_ids,
+            exception_class_hints,
+            &mut exact_layouts,
+            &mut inline_variant_fields,
+            &tombstoned_leaves,
+            &raw_alloc_flavor_structs,
         );
         // Same harvest `CrateLoweringState::new` runs, so a stand-alone
         // lowering sees this artefact's bodies before
@@ -9219,8 +9635,9 @@ impl<'a> LowerContext<'a> {
             func_hints: crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(
                 llbc,
             )),
-            tombstoned_leaves: tombstoned_leaves_of(llbc).clone(),
+            tombstoned_leaves: tombstoned_leaves.clone(),
             gc_struct_ids,
+            inline_variant_fields,
             raw_alloc_flavor_structs,
             immutable_fields,
             gc_root_effects: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -9337,6 +9754,7 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            &context.inline_variant_fields,
             root_stack_state,
             &context.gc_root_effects,
             &context.func_hints,
@@ -9414,6 +9832,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
     root_stack_state: &RootStackState,
     gc_root_effects: &gc_root_registration::EffectMemo,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
@@ -9444,6 +9863,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         gc_struct_ids,
         immutable_fields,
         raw_alloc_flavor_structs,
+        inline_variant_fields,
         builder_mode,
         &accum,
         &RootStackAnalyzer::new(llbc, root_stack_state),
@@ -9478,6 +9898,7 @@ fn lower_fat_dyn_callee(
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
+    inline_variant_fields: &[lltype::InlineVariantField],
 ) -> Option<FunctionGraph> {
     if crate::front::dyn_fat::splice_in_progress(def_id) {
         return None;
@@ -9504,6 +9925,7 @@ fn lower_fat_dyn_callee(
         gc_struct_ids,
         immutable_fields,
         raw_alloc_flavor_structs,
+        inline_variant_fields,
         &RootStackState::new(llbc),
         &gc_root_effects,
         func_hints,
@@ -9529,6 +9951,7 @@ fn splice_recorded_fat_dyn_returns(
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
+    inline_variant_fields: &[lltype::InlineVariantField],
 ) {
     let dyn_results = lo.dyn_return_calls.clone();
     let cache =
@@ -9554,6 +9977,7 @@ fn splice_recorded_fat_dyn_returns(
             immutable_fields,
             raw_alloc_flavor_structs,
             func_hints,
+            inline_variant_fields,
         );
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
@@ -9869,6 +10293,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    inline_variant_fields: &[lltype::InlineVariantField],
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -9955,14 +10380,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             static_addrs.error_carrier,
             gc_struct_ids,
         );
-        let expand_inline_struct = |owner: &str, field: &str| {
-            inline_struct_field_leaves(
+        let expand_inline_field = |owner: &str, field: &str| {
+            lltype::expand_inline_field(
                 llbc,
                 tombstoned_leaves,
                 gc_struct_ids,
+                raw_alloc_flavor_structs,
+                inline_variant_fields,
                 owner,
                 field,
-                raw_alloc_flavor_structs,
             )
         };
         // MIR framestate argument threading must finish before adding native
@@ -10102,7 +10528,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 struct_field_attrs,
                 false,
                 &guard_words,
-                &expand_inline_struct,
+                false,
+                &expand_inline_field,
                 func_hints,
             )?;
         }
@@ -10678,7 +11105,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             struct_field_attrs,
             true,
             &guard_words,
-            &expand_inline_struct,
+            true,
+            &expand_inline_field,
             func_hints,
         )?;
         // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
@@ -10750,7 +11178,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 struct_field_attrs,
                 true,
                 &guard_words,
-                &expand_inline_struct,
+                true,
+                &expand_inline_field,
                 func_hints,
             )?;
         }
@@ -10768,6 +11197,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             immutable_fields,
             raw_alloc_flavor_structs,
             func_hints,
+            inline_variant_fields,
         );
         // Field reads emitted while blocks were still being closed name a
         // base defined only in a predecessor. Thread once every edge exists.

@@ -1913,14 +1913,10 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
                 .ok_or_else(|| PyError::index_error("list index out of range"));
         }
         if is_str(seq) {
-            // Read the code point through the WTF-8 view so a surrogate-bearing
-            // string yields its lone surrogate instead of panicking.
-            return pyre_object::w_str_codepoint_at(seq, index)
-                .map(|c| {
-                    let mut one = Wtf8Buf::new();
-                    one.push(c);
-                    pyre_object::w_str_from_wtf8_managed(one)
-                })
+            // `_getitem_result` (`unicodeobject.py`): `_index_to_byte` +
+            // `next_codepoint_pos_dont_look_inside` + a one-code-point
+            // `W_UnicodeObject`. The slice keeps a lone surrogate.
+            return pyre_object::w_str_getitem(seq, index as i64)
                 .ok_or_else(|| PyError::index_error("string index out of range"));
         }
         // Try getitem for instances
@@ -2316,18 +2312,12 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             } else if is_tuple(si.seq) {
                 w_tuple_getitem(si.seq, idx_i64)
             } else if is_str(si.seq) {
-                // Box the idx-th code point as a one-character str, reading
-                // the WTF-8 view so a lone surrogate is yielded instead of
-                // panicking. Only `iter(str)` through the builtin reaches here
-                // with a str payload (the GET_ITER opcode materialises a char
-                // list); without this arm `seq_iter_current_len` would say
-                // "more" while this helper returned PY_NULL forever, hanging
-                // the loop. Mirrors baseobjspace::next.
-                pyre_object::w_str_codepoint_at(si.seq, idx as usize).map(|cp| {
-                    let mut one = Wtf8Buf::new();
-                    one.push(cp);
-                    pyre_object::w_str_from_wtf8_managed(one)
-                })
+                // `W_SeqIterObject.descr_next` (`iterobject.py`) via
+                // `_getitem_result`. `iter(str)` through the builtin lands a
+                // seq-iter here (`space.iter`); without this arm
+                // `seq_iter_current_len` would say "more" while this helper
+                // returned PY_NULL forever, hanging the loop.
+                pyre_object::w_str_getitem(si.seq, idx_i64)
             } else if pyre_object::bytesobject::is_bytes_like(si.seq) {
                 // Each item is the byte's ordinal, read from the live buffer so
                 // a bytearray resized mid-iteration is observed.

@@ -1666,6 +1666,24 @@ unsafe fn traced_codepoint_position_at_index(
     unsafe { crate::rutf8::codepoint_position_at_index(utf8_payload_wtf8(utf8), &*storage, index) }
 }
 
+/// `rutf8.codepoint_at_index` (`rutf8.py`) as the non-ASCII read of
+/// `w_str_codepoint_at` records it. Same one-word-arg wrapper as
+/// [`traced_codepoint_position_at_index`]: `@jit.elidable`
+/// (`policy.py` `_reject_function`), and the `&Wtf8` / `&[Utf8LocElem]`
+/// spelling has no funcptr for the codewriter to bind.
+///
+/// # Safety
+/// `utf8` must be a live `STR`, `storage` the index table built for that
+/// string, and `index` must be below the code point count.
+#[majit_macros::elidable]
+unsafe fn traced_codepoint_at_index(
+    utf8: *mut Utf8Str,
+    storage: *mut crate::rutf8::Utf8IndexStorage,
+    index: usize,
+) -> i64 {
+    unsafe { crate::rutf8::codepoint_at_index(utf8_payload_wtf8(utf8), &*storage, index) }
+}
+
 /// `rutf8.codepoint_index_at_byte_position` (`rutf8.py`) as `_byte_to_index`
 /// records it. Same one-word-arg wrapper as
 /// [`traced_codepoint_position_at_index`]: `@jit.elidable`, and the
@@ -1763,19 +1781,20 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
         if index >= w_str_len(obj) {
             return None;
         }
-        let value = utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value);
         if w_str_is_ascii(obj) {
             // `unicodeobject.py` `_index_to_byte` on ASCII: the code-point
             // index is the byte offset. Read that byte; do not `slice::get`
             // a one-byte window and walk `code_points()`.
+            let value = utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value);
             let bytes = value.as_bytes();
             return Some(CodePoint::from_u32_unchecked(
                 *bytes.as_ptr().add(index) as u32
             ));
         }
         let storage = w_str_get_index_storage(obj);
+        let utf8 = (*(obj as *const W_UnicodeObject)).value;
         Some(CodePoint::from_u32_unchecked(
-            crate::rutf8::codepoint_at_index(value, &*storage, index) as u32,
+            traced_codepoint_at_index(utf8, storage, index) as u32,
         ))
     }
 }

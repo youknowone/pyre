@@ -366,13 +366,29 @@ pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: 
 /// `codepoint_at_index` (`rutf8.py`) — the code point at code point
 /// `index`, which must be below the string's code point count.
 ///
-/// Upstream fuses the position lookup with the decode so the JIT sees one
-/// elidable call; both spellings walk to the same byte offset, so this is the
-/// composition of the two.
+/// One elidable body: the index-table byte offset and the decode share
+/// this function, as they do upstream. The JIT residual is the one-word
+/// wrapper `unicodeobject::traced_codepoint_at_index` (`STR` plus
+/// `UTF8_INDEX_STORAGE`); this `&Wtf8` / `&[Utf8LocElem]` spelling has
+/// no funcptr for the codewriter to bind.
 #[inline]
 #[majit_macros::elidable]
 pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> i64 {
-    codepoint_at_pos(utf8, codepoint_position_at_index(utf8, storage, index))
+    let current = index >> 6;
+    let ofs = storage[current].ofs[(index >> 2) & 0x0F] as usize;
+    let mut bytepos = storage[current].baseindex as usize + ofs;
+    let mut index = index & 0x3;
+    if index == 0 {
+        return codepoint_before_pos(utf8, bytepos);
+    }
+    if index == 3 {
+        bytepos = next_codepoint_pos(utf8, bytepos);
+        index = 2;
+    }
+    if index == 2 {
+        bytepos = next_codepoint_pos(utf8, bytepos);
+    }
+    codepoint_at_pos(utf8, bytepos)
 }
 
 /// `codepoint_index_at_byte_position` (`rutf8.py`) — the code point index

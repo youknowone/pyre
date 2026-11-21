@@ -883,7 +883,7 @@ fn err_ctor_payload(graph: &FunctionGraph, block: usize, shell: &Variable) -> Op
         })
 }
 
-/// Raise a merged-continue `return Err`. Replay RootScope closes, then
+/// Raise a merged-continue `return Err`. Replay finally-cleanups, then
 /// `flowcontext.py` `exc_from_raise`.
 fn raise_merged_err_ctor(
     graph: &mut FunctionGraph,
@@ -894,11 +894,11 @@ fn raise_merged_err_ctor(
     let payload = err_ctor_payload(graph, block, shell).ok_or_else(|| {
         format!("{name}: merged continue Err ctor in block {block} has no __pos_0 payload")
     })?;
-    let closes = root_scope_closes_to_returnblock(graph, block, shell).map_err(|e| {
+    let finally_cleanups = finally_cleanups_to_returnblock(graph, block, shell).map_err(|e| {
         format!("{name}: merged continue Err in block {block} cannot replay closes ({e})")
     })?;
     let block_id = BlockId(block);
-    for close in closes {
+    for close in finally_cleanups {
         push_bracket_close(graph, block_id, close);
     }
     // The merged-continue payload's class is not known at this site.
@@ -2262,7 +2262,7 @@ fn sum_from_residual_forwards(graph: &FunctionGraph, result: &Variable) -> bool 
     let Some(block) = producer_block_index(graph, result) else {
         return false;
     };
-    root_scope_closes_to_returnblock(graph, block, result).is_ok()
+    finally_cleanups_to_returnblock(graph, block, result).is_ok()
 }
 
 struct ResidualRaisePlan {
@@ -2713,11 +2713,12 @@ fn lower_result_exc_returns_inner(
         // be dropped and the JIT would raise earlier than the interpreter.
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
-        // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close_word` residual) are re-emitted at the raise site
+        // call otherwise. Finally-cleanups (`drop_in_place`, the named
+        // `root_scope_close_word` residual, `release_recursive_frame` of
+        // pyframe.py `execute_frame`) are re-emitted at the raise site
         // rather than left in a tail the rewrite bypasses.
-        let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
-            match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
+        let (forward_err, finally_cleanups): (Option<String>, Vec<OpKind>) = if is_err {
+            match finally_cleanups_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
                 Err(e) => (Some(format!("Err shell: {e}")), Vec::new()),
             }
@@ -2842,7 +2843,7 @@ fn lower_result_exc_returns_inner(
             // (`codewriter::error_carrier_edges`).
             //
             // Before the raise: the order the guard's destructor runs in.
-            for close in root_scope_closes {
+            for close in finally_cleanups {
                 push_bracket_close(graph, block_id, close);
             }
             if let Some(class_name) = raised_class.as_deref() {
@@ -5873,7 +5874,7 @@ fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool
     // Frame-exit cleanups between the call and `returnblock` belong to this
     // tail. The strict empty-block walk misses them, and the caller rule
     // then remints the call to the `Ok` payload.
-    is_from_residual_call(kind) && root_scope_closes_to_returnblock(graph, block, r).is_ok()
+    is_from_residual_call(kind) && finally_cleanups_to_returnblock(graph, block, r).is_ok()
 }
 
 /// `return Result::from_residual(residual)` raises. `FromResidual::from_residual`
@@ -5889,8 +5890,9 @@ fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool
 /// the same way (`exceptiontransform.py` `create_exception_handling`).
 ///
 /// Frame-exit cleanups on that tail (root-bracket closes,
-/// `ll_slice_buffer_free`) are replayed in the producer before the raise.
-/// `set_raise_values` drops the forwarding blocks that held them.
+/// `ll_slice_buffer_free`, `release_recursive_frame`) are replayed in the
+/// producer before the raise. `set_raise_values` drops the forwarding
+/// blocks that held them.
 fn raise_returned_from_residual(
     graph: &mut FunctionGraph,
     r: &Variable,
@@ -5908,7 +5910,7 @@ fn raise_returned_from_residual(
     }
     // Same walker as the deferral above. A non-cleanup hop is some other
     // consumer, left for the caller rule.
-    let Ok(closes) = root_scope_closes_to_returnblock(graph, block, r) else {
+    let Ok(finally_cleanups) = finally_cleanups_to_returnblock(graph, block, r) else {
         return Ok(());
     };
     let op_idx = graph.blocks[block]
@@ -5975,7 +5977,7 @@ fn raise_returned_from_residual(
             value
         };
         let block_id = crate::model::BlockId(block);
-        for close in closes {
+        for close in finally_cleanups {
             graph.push_op_var(block_id, close, true);
         }
         let raised = if let Some(class_name) = class_name.as_deref() {
@@ -6023,7 +6025,7 @@ fn raise_returned_from_residual(
     // `return from_residual(e)` → `raise e`. The codewriter converts
     // the raised carrier (`codewriter::error_carrier_edges`). Closes on
     // the tail run at the raise, the same way an `Err` shell does.
-    for close in closes {
+    for close in finally_cleanups {
         push_bracket_close(graph, block_id, close);
     }
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
@@ -6249,7 +6251,7 @@ fn rewire_one_option_ok_or_else_try_site(
         .last()
         .is_some_and(|op| op.result.as_ref() == Some(&site.result_var));
     if forwards_to_returnblock(graph, a, &site.result_var).is_ok()
-        || (call_ends_block && root_scope_closes_to_returnblock(graph, a, &site.result_var).is_ok())
+        || (call_ends_block && finally_cleanups_to_returnblock(graph, a, &site.result_var).is_ok())
     {
         return Err(format!(
             "{name}: ok_or_else result is not consumed by an immediate `?` diamond"
@@ -8547,6 +8549,9 @@ fn clone_result_hops(
     let mut pending: Option<(crate::model::BlockId, Vec<LinkArg>)> = None;
     for (index, hop) in hops.iter().enumerate() {
         let (id, inputs) = graph.create_block_with_arg_vars(hop.inputargs.len());
+        for (from, to) in hop.inputargs.iter().zip(inputs.iter()) {
+            copy_concretetype(from, to);
+        }
         if first.is_none() {
             first = Some(id);
         }
@@ -8566,6 +8571,7 @@ fn clone_result_hops(
             };
             let result = op.result.as_ref().map(|_| graph.alloc_value_var());
             if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                copy_concretetype(old, fresh);
                 map.push((old.clone(), fresh.clone()));
             }
             graph.blocks[id.0]
@@ -9005,10 +9011,17 @@ fn rewire_one_call_site(
         .operations
         .last()
         .is_some_and(|op| op.result.as_ref() == Some(r));
-    let tail_closes = if forwards_to_returnblock(graph, a, r).is_ok() {
+    // Prefer the finally-cleanup walk over a bare `forwards_to_returnblock`
+    // success: the latter skips the producer block's own ops, so a same-block
+    // `release_recursive_frame` after the call (`pyframe.py execute_frame`
+    // try/finally) would otherwise become an empty exception edge
+    // (`exceptiontransform.py` `create_exception_handling`).
+    let tail_closes = if let Ok(closes) = finally_cleanups_to_returnblock(graph, a, r) {
+        Some(closes)
+    } else if forwards_to_returnblock(graph, a, r).is_ok() {
         Some(Vec::new())
     } else if call_ends_block {
-        root_scope_closes_to_returnblock(graph, a, r).ok()
+        None
     } else {
         None
     };
@@ -9414,7 +9427,7 @@ fn break_arm_closes(
             "{name}: break arm {e_block} has no from_residual result to rebuild bracket closes"
         ));
     };
-    let closes = root_scope_closes_to_returnblock(graph, e_block, &residual_result)?;
+    let closes = finally_cleanups_to_returnblock(graph, e_block, &residual_result)?;
     if closes.is_empty() {
         return Ok(closes);
     }
@@ -12683,7 +12696,7 @@ fn verify_drain_reraise_returns_err_payload(
     // back for the caller to re-emit at the substituted raise rather than left
     // in a tail nothing reaches.  Anything else still fails here.
     closes.extend(
-        root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|e| {
+        finally_cleanups_to_returnblock(graph, reraise_target, &outer).map_err(|e| {
             format!(
                 "{name}: reraise arm block {reraise_target} does not forward the Err shell \
                  unconditionally to returnblock: {e}"
@@ -14146,13 +14159,69 @@ fn forwards_to_returnblock(
     forwards_to_returnblock_inner(graph, block, var, false).map(|_| ())
 }
 
-/// Return the RootScope closes that an exceptional rewrite must preserve.
-fn root_scope_closes_to_returnblock(
+/// Return the exceptional finally-cleanups that a rewrite must preserve
+/// (`guessexception` / translator exception transform; pyframe.py
+/// `execute_frame`).
+fn finally_cleanups_to_returnblock(
     graph: &FunctionGraph,
     block: usize,
     var: &Variable,
 ) -> Result<Vec<OpKind>, String> {
     forwards_to_returnblock_inner(graph, block, var, true)
+}
+
+/// Shadow-stack bracket close, or the `execute_frame` finally that leaves
+/// the recursion-depth charge (`release_recursive_frame`). Recasts, root
+/// reloads, keepalives, `ConstNone`, and `RawFree` stay accepted beside it.
+fn is_exception_tail_cleanup(kind: &OpKind) -> bool {
+    crate::front::mir::is_shadow_stack_bracket_close(kind)
+        || matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("release_recursive_frame")
+        )
+}
+
+/// `std::mem::forget` after an explicit `release_recursive_frame`
+/// (`eval.rs` `eval_frame_with_resume`). The token is an INT leftover;
+/// forget only suppresses the native Drop of `RecursionDepthGuard`.
+fn is_mem_forget(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.last().map(String::as_str) == Some("forget")
+            && segments.iter().any(|segment| segment == "mem")
+    )
+}
+
+/// Discriminant Constant plus `__pos_0` / `__discriminant` FieldWrites
+/// of `tracked` (`rclass.py` `getinstancerepr`). A Constant that is not
+/// the value of a later FieldWrite of the shell is not ctor rest
+/// (`got_exception = true` is a separate local).
+fn is_result_shell_ctor_rest(ops: &[SpaceOperation], idx: usize, tracked: &Variable) -> bool {
+    match &ops[idx].kind {
+        OpKind::FieldWrite { base, .. } if *base == *tracked => true,
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) => {
+            let Some(result) = ops[idx].result.as_ref() else {
+                return false;
+            };
+            ops[idx + 1..].iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite {
+                        base,
+                        value: LinkArg::Value(v),
+                        ..
+                    } if *base == *tracked && v == result
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 fn forwards_to_returnblock_inner(
@@ -14170,18 +14239,76 @@ fn forwards_to_returnblock_inner(
         // after the producer `block`; an intermediate block with
         // operations or a conditional exit inspects the value and is not
         // a tail forward.
+        let is_keepalive_or_nop = |op: &SpaceOperation| {
+            op_is_keepalive_until_here(&op.kind)
+                || matches!(op.kind, OpKind::ConstNone | OpKind::RawFree { .. })
+                || is_mem_forget(&op.kind)
+        };
+        // Same-block trailing finally after the Result producer
+        // (`eval_frame_with_resume`: leftover `release_recursive_frame`
+        // after `eval_frame_after_enter`). Subsequent hops skip the
+        // producer (`current != block`); collect those ops here so the
+        // raise edge still runs them (`exceptiontransform.py`
+        // `create_exception_handling`).
+        if current == block && past_bracket_closes {
+            let b = &graph.blocks[current];
+            if let Some(prod_idx) = b
+                .operations
+                .iter()
+                .rposition(|op| op.result.as_ref() == Some(&tracked))
+            {
+                // The Result ctor's result is the shell; `__pos_0` /
+                // `__discriminant` FieldWrites against that shell, and the
+                // discriminant Constant those writes read (`rclass.py`
+                // `getinstancerepr`), are the rest of the producer.
+                // Trailing finally starts after those stores.
+                let mut producer_end = prod_idx + 1;
+                while producer_end < b.operations.len()
+                    && is_result_shell_ctor_rest(&b.operations, producer_end, &tracked)
+                {
+                    producer_end += 1;
+                }
+                let trailing = &b.operations[producer_end..];
+                if !trailing.iter().all(|op| {
+                    is_exception_tail_cleanup(&op.kind)
+                        || is_recast_narrow(&op.kind)
+                        || is_gc_root_reload(&op.kind)
+                        || is_keepalive_or_nop(op)
+                }) {
+                    return Err(format!(
+                        "producer block {current} trailing {} operation(s) after the Result, \
+                         first {:?}",
+                        trailing.len(),
+                        truncated_kind(&trailing[0].kind),
+                    ));
+                }
+                for op in trailing {
+                    if matches!(op.kind, OpKind::ConstNone) || is_mem_forget(&op.kind) {
+                        continue;
+                    }
+                    if is_recast_narrow(&op.kind)
+                        || is_gc_root_reload(&op.kind)
+                        || op_is_keepalive_until_here(&op.kind)
+                    {
+                        continue;
+                    }
+                    closes.push(remap_root_scope_close_through_links(
+                        graph,
+                        &op.kind,
+                        &[],
+                        "return close",
+                    )?);
+                }
+            }
+        }
         if current != block {
             let b = &graph.blocks[current];
             // `keepalive_until_here` is `objectmodel.keepalive_until_here`:
             // the Ok path keeps the forwarding block, the Err path re-emits
-            // it at the raise with the RootScope closes.
-            let is_keepalive_or_nop = |op: &SpaceOperation| {
-                op_is_keepalive_until_here(&op.kind)
-                    || matches!(op.kind, OpKind::ConstNone | OpKind::RawFree { .. })
-            };
+            // it at the raise with the finally-cleanups.
             let carries_work = if past_bracket_closes {
                 !b.operations.iter().all(|op| {
-                    crate::front::mir::is_shadow_stack_bracket_close(&op.kind)
+                    is_exception_tail_cleanup(&op.kind)
                         || is_recast_narrow(&op.kind)
                         || is_gc_root_reload(&op.kind)
                         || is_keepalive_or_nop(op)
@@ -19302,6 +19429,311 @@ mod tail_forward_close_tests {
         assert!(exc.last_exception.is_some());
         assert!(exc.last_exc_value.is_some());
     }
+
+    /// `token = enter(); r = f(); release(token); return r` — the release
+    /// sits in the producer block after the call (`eval_frame_with_resume`).
+    /// The raise edge must still run it (`pyframe.py execute_frame` finally).
+    #[test]
+    fn a_same_block_release_recursive_frame_replays_on_the_raise_edge() {
+        let mut graph = FunctionGraph::new("tail_same_block_release");
+        let start = graph.startblock;
+        let token = graph
+            .push_op_var(start, OpKind::ConstInt(1), true)
+            .expect("token");
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        graph.push_op_var(
+            start,
+            OpKind::Call {
+                target: CallTarget::function_path(["call", "release_recursive_frame"]),
+                args: crate::model::call_args(vec![token.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_goto(start, graph.returnblock, vec![r.clone()]);
+
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            None,
+            None,
+            true,
+            true,
+            &[ResultExcCall::new(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("tail forward");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert_eq!(normal.target, graph.returnblock);
+        let raise = &graph.blocks[exc.target.0];
+        assert!(
+            raise.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("release_recursive_frame")
+            )),
+            "the raise edge releases the recursion-depth charge"
+        );
+        assert!(
+            exc.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == &token)),
+            "the raise edge threads the leftover token"
+        );
+        assert_eq!(raise.exits[0].target, graph.exceptblock);
+    }
+}
+
+#[cfg(test)]
+mod exception_tail_cleanup_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor};
+
+    fn is_release_recursive_frame(kind: &OpKind) -> bool {
+        matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("release_recursive_frame")
+        )
+    }
+
+    fn is_type_of_call(kind: &OpKind) -> bool {
+        matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("type")
+        )
+    }
+
+    fn count_releases_from(graph: &FunctionGraph, mut block: usize) -> (usize, bool) {
+        let mut releases = 0usize;
+        let mut seen: Vec<usize> = Vec::new();
+        loop {
+            if seen.iter().any(|&b| b == block) {
+                break;
+            }
+            seen.push(block);
+            let body = &graph.blocks[block];
+            releases += body
+                .operations
+                .iter()
+                .filter(|op| is_release_recursive_frame(&op.kind))
+                .count();
+            if block == graph.returnblock.0 {
+                return (releases, false);
+            }
+            if block == graph.exceptblock.0 {
+                return (releases, true);
+            }
+            match body.exits.as_slice() {
+                [link] => block = link.target.0,
+                [normal, _] if matches!(body.exitswitch, Some(ExitSwitch::LastException)) => {
+                    block = normal.target.0;
+                }
+                _ => break,
+            }
+        }
+        (releases, false)
+    }
+
+    fn push_result_shell(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        variant: &str,
+        payload: Variable,
+    ) -> Variable {
+        let result_owner = "core::result::Result<i64,PyError>";
+        let owner = format!("{result_owner}::{variant}");
+        let shell = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        variant,
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.clone())),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(block, OpKind::ConstInt(i64::from(variant == "Err")), true)
+            .expect("tag");
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new("__discriminant", Some(result_owner.into())),
+                value: LinkArg::Value(disc),
+                ty: ValueType::Int,
+            },
+        });
+        graph.push_op_var(
+            block,
+            OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new("__pos_0", Some(owner)),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        shell
+    }
+
+    /// Err ctor: New, ConstInt(1), FieldWrite `__discriminant`, FieldWrite
+    /// `__pos_0`. The Constant is `rclass.py` `getinstancerepr`, not finally.
+    #[test]
+    fn err_shell_discriminant_const_is_producer_rest() {
+        let mut graph = FunctionGraph::new("err_shell_const_disc");
+        let entry = graph.startblock;
+        let payload = graph.alloc_value_var();
+        let shell = push_result_shell(&mut graph, entry, "Err", payload);
+        graph.set_goto(entry, graph.returnblock, vec![shell.clone()]);
+        let closes = finally_cleanups_to_returnblock(&graph, entry.0, &shell)
+            .expect("discriminant ConstInt is ctor rest");
+        assert!(
+            closes.is_empty(),
+            "no finally beside the Err ctor: {closes:?}"
+        );
+    }
+
+    /// `return Err(e)` / `return Ok(v)` both run `release_recursive_frame(token)`
+    /// (`guessexception` / pyframe.py `execute_frame` finally). Each path
+    /// releases once; the exceptional path releases before raising.
+    #[test]
+    fn return_err_through_release_recursive_frame_replays_cleanup_once_per_path() {
+        let mut graph = FunctionGraph::new("err_through_release_recursive_frame");
+        let start = graph.startblock;
+        let token = graph
+            .push_op_var(start, OpKind::ConstInt(1), true)
+            .expect("token");
+        let cond = graph
+            .push_op_var(start, OpKind::ConstInt(0), true)
+            .expect("cond");
+        let (ok_arm, ok_ins) = graph.create_block_with_arg_vars(1);
+        let (err_arm, err_ins) = graph.create_block_with_arg_vars(1);
+        let (merge, merge_ins) = graph.create_block_with_arg_vars(2);
+
+        let ok_payload = graph
+            .push_op_var(ok_arm, OpKind::ConstInt(41), true)
+            .expect("ok payload");
+        let ok_shell = push_result_shell(&mut graph, ok_arm, "Ok", ok_payload);
+        graph.set_goto(ok_arm, merge, vec![ok_shell, ok_ins[0].clone()]);
+
+        let err_payload = graph.alloc_value_var();
+        let err_shell = push_result_shell(&mut graph, err_arm, "Err", err_payload);
+        graph.set_goto(err_arm, merge, vec![err_shell, err_ins[0].clone()]);
+
+        graph.push_op_var(
+            merge,
+            OpKind::Call {
+                target: CallTarget::function_path(["call", "release_recursive_frame"]),
+                args: crate::model::call_args(vec![merge_ins[1].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(merge, Some(merge_ins[0].clone()));
+
+        graph.block_mut(start).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.block_mut(start).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(token.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(token)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+
+        assert_eq!(
+            lower_result_exc_returns_for_sum(
+                &mut graph,
+                0,
+                crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("Err through release_recursive_frame lowers"),
+            2
+        );
+
+        let (ok_releases, ok_raised) = count_releases_from(&graph, ok_arm.0);
+        let (err_releases, err_raised) = count_releases_from(&graph, err_arm.0);
+        assert_eq!(ok_releases, 1, "normal path releases exactly once");
+        assert!(!ok_raised, "normal path returns");
+        assert_eq!(err_releases, 1, "exceptional path releases exactly once");
+        assert!(err_raised, "exceptional path raises");
+
+        let err_ops = &graph.blocks[err_arm.0].operations;
+        let release_at = err_ops
+            .iter()
+            .position(|op| is_release_recursive_frame(&op.kind))
+            .expect("exceptional path replays release_recursive_frame");
+        let type_at = err_ops
+            .iter()
+            .position(|op| is_type_of_call(&op.kind))
+            .expect("raise uses type(e)");
+        assert!(
+            release_at < type_at,
+            "exceptional path releases before raising"
+        );
+        assert_eq!(
+            graph.blocks[err_arm.0].exits[0].target, graph.exceptblock,
+            "exceptional path closes toward exceptblock"
+        );
+        assert!(
+            graph.blocks[merge.0]
+                .operations
+                .iter()
+                .any(|op| is_release_recursive_frame(&op.kind)),
+            "normal path keeps the original release"
+        );
+        assert!(
+            graph.blocks[ok_arm.0]
+                .operations
+                .iter()
+                .all(|op| !is_release_recursive_frame(&op.kind)),
+            "Ok arm does not replay the release"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tail_forward_close_recast_tests {
+    use super::*;
 
     /// `tyref_to_value_type` paints split-eligible Result as
     /// `Ref(Some(root))`, so `lower_call` recasts the call result

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
-use majit_ir::{DescrRef, ExtraEffect};
+use majit_ir::{DescrRef, ExtraEffect, GcRef, Type, Value};
 use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
@@ -608,6 +608,145 @@ pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitC
 pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {
     let idx = compute_portal_jitcode_index_for_key(key)?;
     get_jitcode_by_index(idx)
+}
+
+/// Compiled driver metadata for the portal graph with canonical key `key`.
+///
+/// `warmspot.py` `split_graph_and_record_jitdriver` / `make_args_specification`
+/// keep one `JitDriverStaticData` per portal; this is that record after
+/// codewriting.
+pub fn compiled_jit_driver_for_key(key: &str) -> Option<&'static CompiledJitDriver> {
+    COMPILED_JIT_DRIVERS
+        .iter()
+        .find(|driver| driver.portal.canonical_key() == key)
+}
+
+fn required_red_marker_positions<'a>(driver: &'a CompiledJitDriver, key: &str) -> &'a [u32] {
+    driver
+        .red_marker_positions
+        .as_deref()
+        .unwrap_or_else(|| panic!("compiled JIT driver `{key}` requires red_marker_positions"))
+}
+
+/// Select and permute a marker-operand-order slice into rewritten merge-point
+/// red order.
+///
+/// Linear scan: a driver has at most four reds. The marker's explicit red
+/// operands are this port's declaration of which live variable is which;
+/// `jtransform.py` `autodetect_jit_markers_redvars` / `warmspot.py`
+/// `make_args_specification` consume the rewritten list, and
+/// `red_marker_positions[i]` is the marker index of recorded slot `i`.
+/// An operand that no slot names is not seeded. Requires `Some` on the
+/// compiled driver: a portal whose reds are not marker operands does not
+/// seed through this helper.
+pub fn permute_marker_reds<T: Clone>(key: &str, marker_order: &[T]) -> Vec<T> {
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    let positions = required_red_marker_positions(driver, key);
+    assert_eq!(
+        positions.len(),
+        driver.red_args_types.len(),
+        "compiled JIT driver `{key}` red_marker_positions/types length"
+    );
+    positions
+        .iter()
+        .map(|&k| {
+            marker_order.get(k as usize).cloned().unwrap_or_else(|| {
+                panic!(
+                    "compiled JIT driver `{key}` marker position {k} is out of range (marker len {})",
+                    marker_order.len()
+                )
+            })
+        })
+        .collect()
+}
+
+/// Inverse of [`permute_marker_reds`]: recorded-order values back into
+/// marker-operand order. `red_marker_positions` is injective; an undetected
+/// operand (dead across the merge point) is `None`.
+pub fn marker_reds_from_recorded<T: Clone>(key: &str, recorded: &[T]) -> Vec<Option<T>> {
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    let positions = required_red_marker_positions(driver, key);
+    let n = positions.len();
+    assert_eq!(
+        recorded.len(),
+        n,
+        "compiled JIT driver `{key}` recorded red count, got {}",
+        recorded.len()
+    );
+    let bound = positions.iter().map(|&k| k as usize + 1).max().unwrap_or(0);
+    let mut out: Vec<Option<T>> = vec![None; bound];
+    for (slot, &k) in positions.iter().enumerate() {
+        let idx = k as usize;
+        assert!(
+            out[idx].is_none(),
+            "compiled JIT driver `{key}` red_marker_positions is not injective: {:?}",
+            positions
+        );
+        out[idx] = Some(recorded[slot].clone());
+    }
+    out
+}
+
+/// `unspecialize_value` word of one recorded red.
+pub fn red_value_word(value: &Value) -> i64 {
+    match value {
+        Value::Int(v) => *v,
+        Value::Ref(gc) => gc.0 as i64,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Void => 0,
+    }
+}
+
+/// Generated `(name, type)` pairs in rewritten merge-point red order.
+///
+/// `marker_reds` is the state module's one declaration, in marker-operand
+/// order; the helper permutes it through `red_marker_positions`.
+pub fn compiled_reds(key: &str, marker_reds: &[(&'static str, Type)]) -> Vec<(&'static str, Type)> {
+    let permuted = permute_marker_reds(key, marker_reds);
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    let types: Vec<Type> = permuted.iter().map(|(_, ty)| *ty).collect();
+    assert_eq!(
+        types, driver.red_args_types,
+        "compiled JIT driver `{key}` marker red types after permute"
+    );
+    permuted
+}
+
+/// Rebuild red live values from I/R kind banks in rewritten list order.
+///
+/// `ContinueRunningNormally` carries I/R/F banks (`jitexc.py`); walking
+/// `red_args_types` pulls each bank in the same order `make_args_specification`
+/// flattened the marker list.
+pub fn compiled_red_values_from_kind_banks(key: &str, ints: &[i64], refs: &[i64]) -> Vec<Value> {
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    assert_eq!(
+        required_red_marker_positions(driver, key).len(),
+        driver.red_args_types.len()
+    );
+    let mut int_i = 0usize;
+    let mut ref_i = 0usize;
+    driver
+        .red_args_types
+        .iter()
+        .map(|ty| match ty {
+            Type::Int => {
+                let value = ints.get(int_i).copied().unwrap_or(0);
+                int_i += 1;
+                Value::Int(value)
+            }
+            Type::Ref => {
+                let value = refs.get(ref_i).copied().unwrap_or(0);
+                ref_i += 1;
+                Value::Ref(GcRef(value as usize))
+            }
+            Type::Float => panic!("compiled JIT driver `{key}` has a float red"),
+            Type::Void => Value::Void,
+        })
+        .collect()
 }
 
 // Cached index of the charon-extracted `w_list_append` body within
@@ -3153,17 +3292,14 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
     // `setup_insns(asm.insns)`: keys the production builder already pins at
-    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
-    // emitted byte is a no-op when it matches; a mismatch is the overlay
-    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
-    // the curated list; keep it here so a build that emitted it before the
-    // pin still binds.
-    // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
-    // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
-    // (`blackhole.py bhimpl_getfield_raw_r`).
-    // `record_quasiimmut_field/idd` is the headerless twin of `/rdd`
-    // (int-bank base, same no-op skip).
-    // `_get_adapted_tick_counter` (`interp_jit.py`) emits
+    // `BC_*` in `wellknown_bh_insns()` (`recursive_call_*`,
+    // `getfield_raw_r/id>r`, `record_quasiimmut_field/idd`) may still appear
+    // in this build's `asm.insns`; this curated builder omits them, so they
+    // ride the overlay at those reserved bytes. Overlaying the emitted byte
+    // is a no-op when it matches; a mismatch is the overlay assert in
+    // `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in the curated
+    // list; keep it here so a build that emitted it before the pin still
+    // binds. `_get_adapted_tick_counter` (`interp_jit.py`) emits
     // `current_trace_length/>i`; no BC_* pin, assembler get_opnum.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
@@ -7052,5 +7188,199 @@ mod tests {
             majit_metainterp::blackhole::BhReturnType::Ref,
             "ref_return must set return_type = Ref",
         );
+    }
+
+    /// Portal rewrite is the only red ABI: `jtransform.py`
+    /// `autodetect_jit_markers_redvars` produces the list, `warmspot.py`
+    /// `make_args_specification` / `split_graph_and_record_jitdriver`
+    /// consume it. The marker's explicit red operands declare which live
+    /// variable is which; `red_marker_positions` is `Some` injective map
+    /// detected-slot → marker-operand index when every detected red is a
+    /// marker operand, and `None` when at least one detected red is not.
+    #[test]
+    fn compiled_driver_red_layout_matches_portal_banks_and_runtime_seeders() {
+        use crate::genentry_state::GENENTRY_PORTAL_KEY;
+        use crate::pypyjit_driver_layout::PYPYJIT_PORTAL_KEY;
+        use crate::sortkey_state::{
+            SORTKEY_MARKER_REDS, SORTKEY_PORTAL_KEY, SortkeyJitState, sortkey_live_values,
+        };
+        use crate::state::PyreJitState;
+        use crate::tuplehash_state::{
+            TUPLEHASH_MARKER_REDS, TUPLEHASH_PORTAL_KEY, TupleHashJitState, tuple_hash_live_values,
+        };
+        use crate::unpack_state::UnpackJitState;
+        use majit_ir::{GcRef, Type, Value};
+        use majit_metainterp::decode_jit_merge_point_banks;
+        use pyre_object::PyObjectRef;
+
+        fn flattened_red_kinds(banks: &majit_metainterp::MergePointBanks) -> Vec<Type> {
+            let mut kinds = Vec::new();
+            kinds.extend(std::iter::repeat(Type::Int).take(banks.red_i.len()));
+            kinds.extend(std::iter::repeat(Type::Ref).take(banks.red_r.len()));
+            kinds.extend(std::iter::repeat(Type::Float).take(banks.red_f.len()));
+            kinds
+        }
+
+        fn is_identity(positions: &[u32]) -> bool {
+            positions.iter().enumerate().all(|(i, k)| *k as usize == i)
+        }
+
+        fn assert_injective_kinds(
+            key: &str,
+            positions: &[u32],
+            types: &[Type],
+            declared: &[(&str, Type)],
+        ) {
+            assert_eq!(
+                positions.len(),
+                types.len(),
+                "`{key}` red_marker_positions/types length"
+            );
+            let mut seen = vec![false; declared.len()];
+            for (slot, &kpos) in positions.iter().enumerate() {
+                let idx = kpos as usize;
+                assert!(
+                    idx < declared.len() && !seen[idx],
+                    "`{key}` red_marker_positions is not injective into 0..{}: {:?}",
+                    declared.len(),
+                    positions
+                );
+                seen[idx] = true;
+                assert_eq!(
+                    declared[idx].1, types[slot],
+                    "`{key}` marker operand {idx} kind vs recorded slot {slot}"
+                );
+            }
+        }
+
+        let keys: Vec<String> = COMPILED_JIT_DRIVERS
+            .iter()
+            .map(|driver| driver.portal.canonical_key())
+            .collect();
+        assert_eq!(keys.len(), 5, "five configured drivers, got {keys:?}");
+
+        for driver in COMPILED_JIT_DRIVERS.iter() {
+            let key = driver.portal.canonical_key();
+            let portal = portal_jitcode_for_key(&key)
+                .unwrap_or_else(|| panic!("portal jitcode for `{key}`"));
+            let merge_points: Vec<_> = decoded_ops(&portal.code)
+                .filter(|op| op.opname == "jit_merge_point")
+                .collect();
+            assert_eq!(
+                merge_points.len(),
+                1,
+                "`{key}` portal must have one jit_merge_point"
+            );
+            let banks = decode_jit_merge_point_banks(&portal.code, merge_points[0].pc);
+            assert_eq!(
+                flattened_red_kinds(&banks),
+                driver.red_args_types,
+                "`{key}` merge-point I/R/F kinds vs red_args_types"
+            );
+
+            let descriptor = match key.as_str() {
+                k if k == PYPYJIT_PORTAL_KEY => PyreJitState::pypyjit_driver_descriptor(),
+                "baseobjspace::unpackiterable_portal" => {
+                    UnpackJitState::unpackiterable_driver_descriptor()
+                }
+                k if k == GENENTRY_PORTAL_KEY => PyreJitState::generatorentry_driver_descriptor(),
+                k if k == TUPLEHASH_PORTAL_KEY => TupleHashJitState::tuple_hash_driver_descriptor(),
+                k if k == SORTKEY_PORTAL_KEY => SortkeyJitState::sortkey_driver_descriptor(),
+                other => panic!("unexpected compiled driver `{other}`"),
+            };
+            let runtime_types: Vec<Type> = descriptor.reds().iter().map(|var| var.tp).collect();
+            assert_eq!(
+                runtime_types, driver.red_args_types,
+                "`{key}` descriptor.reds() types vs recorded"
+            );
+
+            match key.as_str() {
+                k if k == PYPYJIT_PORTAL_KEY => {
+                    let positions = driver
+                        .red_marker_positions
+                        .as_ref()
+                        .expect("jd0 explicit reds store Some(identity)");
+                    assert!(
+                        is_identity(positions),
+                        "jd0 explicit reds are the identity, got {:?}",
+                        driver.red_marker_positions
+                    );
+                    assert_eq!(positions.len(), driver.red_args_types.len());
+                }
+                k if k == GENENTRY_PORTAL_KEY => {
+                    let positions = driver
+                        .red_marker_positions
+                        .as_ref()
+                        .expect("jd2 explicit reds store Some(identity)");
+                    assert!(
+                        is_identity(positions),
+                        "jd2 explicit reds are the identity, got {:?}",
+                        driver.red_marker_positions
+                    );
+                    assert_eq!(positions.len(), driver.red_args_types.len());
+                }
+                "baseobjspace::unpackiterable_portal" => {
+                    assert!(
+                        driver.red_marker_positions.is_none(),
+                        "jd1 reds are portal locals, not marker operands, got {:?}",
+                        driver.red_marker_positions
+                    );
+                }
+                k if k == TUPLEHASH_PORTAL_KEY => {
+                    let positions = driver
+                        .red_marker_positions
+                        .as_ref()
+                        .expect("jd3 requires red_marker_positions");
+                    assert_injective_kinds(
+                        &key,
+                        positions,
+                        &driver.red_args_types,
+                        &TUPLEHASH_MARKER_REDS,
+                    );
+                    const LEN: i64 = 11;
+                    const ACC: i64 = 22;
+                    const I: i64 = 33;
+                    let obj = 0x44 as PyObjectRef;
+                    let live = tuple_hash_live_values(LEN, ACC, I, obj);
+                    assert_eq!(live.len(), positions.len());
+                    let marker = [
+                        Value::Ref(GcRef(obj as usize)),
+                        Value::Int(LEN),
+                        Value::Int(ACC),
+                        Value::Int(I),
+                    ];
+                    for (slot, &kpos) in positions.iter().enumerate() {
+                        assert_eq!(live[slot], marker[kpos as usize]);
+                    }
+                }
+                k if k == SORTKEY_PORTAL_KEY => {
+                    let positions = driver
+                        .red_marker_positions
+                        .as_ref()
+                        .expect("jd4 requires red_marker_positions");
+                    assert_injective_kinds(
+                        &key,
+                        positions,
+                        &driver.red_args_types,
+                        &SORTKEY_MARKER_REDS,
+                    );
+                    let list_w = 0x100 as PyObjectRef;
+                    let keys_w = 0x200 as PyObjectRef;
+                    let w_callable = 0x300 as PyObjectRef;
+                    let live = sortkey_live_values(0, list_w, keys_w, w_callable);
+                    assert_eq!(live.len(), positions.len());
+                    let marker = [
+                        Value::Int(0),
+                        Value::Ref(GcRef(list_w as usize)),
+                        Value::Ref(GcRef(keys_w as usize)),
+                        Value::Ref(GcRef(w_callable as usize)),
+                    ];
+                    for (slot, &kpos) in positions.iter().enumerate() {
+                        assert_eq!(live[slot], marker[kpos as usize]);
+                    }
+                }
+                other => panic!("unexpected compiled driver `{other}`"),
+            }
+        }
     }
 }

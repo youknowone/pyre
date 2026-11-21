@@ -49,6 +49,7 @@ where
         table[jitcode::insns::BC_GETFIELD_GC_F_PURE as usize] = Self::opimpl_getfield_gc_f;
         table[jitcode::insns::BC_GETFIELD_RAW_I as usize] = Self::opimpl_getfield_raw_i;
         table[jitcode::insns::BC_GETFIELD_RAW_F as usize] = Self::opimpl_getfield_raw_f;
+        table[jitcode::insns::BC_GETFIELD_RAW_R as usize] = Self::opimpl_getfield_raw_r;
         table[jitcode::insns::BC_SETFIELD_VABLE_I_IMM as usize] = Self::opimpl_setfield_vable_i_imm;
         table[jitcode::insns::BC_SETFIELD_VABLE_I as usize] = Self::opimpl_setfield_vable_i;
         table[jitcode::insns::BC_SETFIELD_VABLE_R as usize] = Self::opimpl_setfield_vable_r;
@@ -81,6 +82,8 @@ where
             Self::opimpl_hint_force_virtualizable;
         table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
             Self::opimpl_record_quasiimmut_field;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD_I as usize] =
+            Self::opimpl_record_quasiimmut_field_i;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE as usize] =
             Self::opimpl_jit_force_quasi_immutable;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I as usize] =
@@ -1461,6 +1464,54 @@ where
             Some(Value::Float(f64::from_bits(loaded_bits as u64))),
         );
         self.set_float_reg(ctx, dest, Some(op), Some(loaded_bits));
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getfield_raw_r(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `opimpl_getfield_raw_r`:
+        // `execute_with_descr(rop.GETFIELD_RAW_R, fielddescr, box)`.
+        // `blackhole.py bhimpl_getfield_raw_r` (`id>r`, pure only).
+        let (struct_reg, descr_idx, dest) = {
+            let frame = self.frames.current_mut();
+            frame.read_getfield_gc()
+        };
+        let (offset, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_GETFIELD_RAW_R: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_R");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        let loaded = if struct_ptr == 0 {
+            0
+        } else {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            unsafe { core::ptr::read_unaligned(addr as *const i64) }
+        };
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::RECORDED_OPS);
+        let op = ctx.record_op_with_descr_value(
+            OpCode::GetfieldRawR,
+            &[struct_opref],
+            fielddescr,
+            Some(Value::Ref(majit_ir::GcRef(loaded as usize))),
+        );
+        self.set_ref_reg(ctx, dest, Some(op), Some(loaded));
         TraceAction::Continue
     }
 
@@ -2852,13 +2903,38 @@ where
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        _runtime: &R,
+        runtime: &R,
         bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_record_quasiimmut_field_kind(ctx, sym, runtime, bytecode, false)
+    }
+
+    #[inline(never)]
+    fn opimpl_record_quasiimmut_field_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_record_quasiimmut_field_kind(ctx, sym, runtime, bytecode, true)
+    }
+
+    fn opimpl_record_quasiimmut_field_kind(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        _bytecode: u8,
+        owner_is_raw: bool,
     ) -> TraceAction {
         // pyjitpl.py opimpl_record_quasiimmut_field:
         //   @arguments("box", "descr", "descr", "orgpc")
         // last_opcode_position is orgpc: execute_one_instruction saved
         // the cursor before consuming the opcode byte.
+        // `/idd` is the headerless twin (`jtransform.py rewrite_op_getfield`):
+        // the owner lives in the int bank, same pattern as
+        // `jit_force_quasi_immutable/id`.
         let opcode_pc = self.frames.current_mut().last_opcode_position;
         let (struct_reg, field_idx, mutate_idx) = {
             let frame = self.frames.current_mut();
@@ -2885,7 +2961,11 @@ where
                 });
             (fielddescr, mutate_bh)
         };
-        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
+        let (struct_opref, struct_ptr) = if owner_is_raw {
+            self.read_int_reg(ctx, struct_reg)
+        } else {
+            self.read_ref_reg(ctx, struct_reg)
+        };
         if ctx
             .heap_cache()
             .is_quasi_immut_known(fielddescr.index(), struct_opref)

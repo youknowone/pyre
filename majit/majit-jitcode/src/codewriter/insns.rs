@@ -74,16 +74,17 @@ pub const BC_NEW: u8 = 217;
 pub const BC_NEW_ARRAY: u8 = 218;
 pub const BC_NEW_WITH_VTABLE: u8 = 219;
 
-// Recursive-portal call (`blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`,
-// `pyjitpl.py` `opimpl_recursive_call_{i,r,f,v}`). Siblings of the
-// `BC_CALL_ASSEMBLER_*` family (bytes 50-53): the depth-exceeded branch of a
-// recursive call records one of these as an assembler call into the same
-// green-key loop, while the depth-bounded branch inline-traces the callee
-// (`should_inline_core`). Bytes continue the above-high-water sequence
-// (223-226, above the `setfield_gc_i/rcd` C-form byte 222) so existing
-// serialised byte assignments are undisturbed. Keys live in
-// `wellknown_bh_insns()`; `assembler.py` `setdefault` must not hand them a
-// dynamic gap (byte 38 was the first freed `call_may_force_*` slot).
+// Recursive-portal call (`#[jit_interp]` mainloop calling itself, e.g.
+// `interp(code, pc+offset)`). Siblings of the `BC_CALL_ASSEMBLER_*` family
+// (bytes 50-53): the depth-exceeded branch of a recursive call records one of
+// these as an assembler call into the same green-key loop, while the
+// depth-bounded branch inline-traces the callee (`should_inline_core`). Bytes
+// continue the above-high-water sequence (223-226, above the `setfield_gc_i/rcd`
+// C-form byte 222) so existing serialised byte assignments stay put.
+// Flatten `OpKind::RecursiveCall` and
+// `blackhole.py bhimpl_recursive_call_{i,r,f,v}` share these keys; they join
+// `wellknown_bh_insns()` so `get_opnum` pins the bytes
+// (`is_reserved_opcode_byte`) instead of assigning the lowest hole.
 pub const BC_RECURSIVE_CALL_INT: u8 = 223;
 pub const BC_RECURSIVE_CALL_REF: u8 = 224;
 pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
@@ -117,6 +118,11 @@ pub const BC_INT_SIGNEXT: u8 = 248;
 pub const BC_SETFIELD_RAW_I: u8 = 252;
 pub const BC_SETFIELD_RAW_F: u8 = 250;
 pub const BC_GETFIELD_RAW_F: u8 = 251;
+/// `blackhole.py` `bhimpl_getfield_raw_r` (`@arguments("cpu", "i", "d",
+/// returns="r")`). Pure-only sibling of [`BC_GETFIELD_RAW_I`]. Slot 44 is
+/// the next unused byte after [`BC_JIT_FORCE_QUASI_IMMUTABLE_I`] (42) and
+/// the absent `BC_CALL_RELEASE_GIL_REF` hole (43).
+pub const BC_GETFIELD_RAW_R: u8 = 44;
 /// `blackhole.py` `bhimpl_int_force_ge_zero(i)`: `0` if `i < 0` else `i`.
 /// `pyjitpl.py` generates `opimpl_int_force_ge_zero` beside `int_neg`.
 /// `rlist.py ll_alloc_and_set` clamps `count` with this unary.
@@ -685,6 +691,12 @@ pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 // `QUASIIMMUT_FIELD` guard before the corresponding `getfield_gc_*`.
 // Argcodes: `rdd` (struct ref + fielddescr + mutatefielddescr).
 pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
+/// `record_quasiimmut_field/idd` — headerless twin of
+/// [`BC_RECORD_QUASIIMMUT_FIELD`]: the owner is a raw address in the int
+/// bank (`jtransform.py rewrite_op_getfield`, same pattern as
+/// `jit_force_quasi_immutable/id`). Slot 45 continues the unused run
+/// after [`BC_GETFIELD_RAW_R`].
+pub const BC_RECORD_QUASIIMMUT_FIELD_I: u8 = 45;
 
 // `jit_force_quasi_immutable/rd` — RPython `blackhole.py
 // bhimpl_jit_force_quasi_immutable`.  Argcodes `rd`: struct ref +
@@ -1135,6 +1147,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `blackhole.py bhimpl_getfield_raw_i`: raw struct field, int base.
     m.insert("getfield_raw_i/id>i", BC_GETFIELD_RAW_I);
     m.insert("getfield_raw_f/id>f", BC_GETFIELD_RAW_F);
+    m.insert("getfield_raw_r/id>r", BC_GETFIELD_RAW_R);
     // `blackhole.py bhimpl_setfield_raw_{i,f}`: int-bank store, not in
     // USE_C_FORM (`assembler.py`).
     m.insert("setfield_raw_i/iid", BC_SETFIELD_RAW_I);
@@ -1222,6 +1235,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
+    m.insert("record_quasiimmut_field/idd", BC_RECORD_QUASIIMMUT_FIELD_I);
     m.insert("jit_force_quasi_immutable/rd", BC_JIT_FORCE_QUASI_IMMUTABLE);
     m.insert(
         "jit_force_quasi_immutable/id",
@@ -1594,12 +1608,12 @@ mod tests {
 mod recursive_call_byte_tests {
     use super::*;
 
-    /// The `BC_RECURSIVE_CALL_*` bytes (223-226) are the canonical
-    /// `recursive_call_{i,r,f,v}/iIRFIRF{>X,}` keys (`blackhole.py`
-    /// `bhimpl_recursive_call_*`). They must be mutually distinct, sit above
-    /// the prior high-water (`BC_NEW_WITH_VTABLE` = 219), and match
-    /// `wellknown_bh_insns()` so `get_opnum` does not land them on a freed
-    /// gap (`assembler.py` `setdefault`).
+    /// Flatten `OpKind::RecursiveCall` keys join `wellknown_bh_insns` at
+    /// `BC_RECURSIVE_CALL_*` (223-226). The bytes stay mutually distinct,
+    /// sit above the prior high-water (`BC_NEW_WITH_VTABLE` = 219), and
+    /// `extension_insns` must not steal them. `getfield_raw_r/id>r` and
+    /// `record_quasiimmut_field/idd` pin the same way so they do not land
+    /// on the lowest hole once recursive_call is reserved.
     #[test]
     fn recursive_call_bytes_reserved_without_collision() {
         let keys = [
@@ -1628,15 +1642,40 @@ mod recursive_call_byte_tests {
         }
 
         let wellknown = wellknown_bh_insns();
-        for (key, byte) in keys {
-            assert_eq!(
-                wellknown.get(key).copied(),
-                Some(byte),
-                "{key} must be the wellknown_bh_insns key for byte {byte}"
-            );
+        assert_eq!(
+            wellknown.get("recursive_call_i/iIRFIRF>i"),
+            Some(&BC_RECURSIVE_CALL_INT)
+        );
+        assert_eq!(
+            wellknown.get("recursive_call_r/iIRFIRF>r"),
+            Some(&BC_RECURSIVE_CALL_REF)
+        );
+        assert_eq!(
+            wellknown.get("recursive_call_f/iIRFIRF>f"),
+            Some(&BC_RECURSIVE_CALL_FLOAT)
+        );
+        assert_eq!(
+            wellknown.get("recursive_call_v/iIRFIRF"),
+            Some(&BC_RECURSIVE_CALL_VOID)
+        );
+        assert_eq!(
+            wellknown.get("getfield_raw_r/id>r"),
+            Some(&BC_GETFIELD_RAW_R)
+        );
+        assert_eq!(
+            wellknown.get("record_quasiimmut_field/idd"),
+            Some(&BC_RECORD_QUASIIMMUT_FIELD_I)
+        );
+
+        let extension: Vec<u8> = extension_insns().values().copied().collect();
+        for b in reserved
+            .iter()
+            .copied()
+            .chain([BC_GETFIELD_RAW_R, BC_RECORD_QUASIIMMUT_FIELD_I])
+        {
             assert!(
-                extension_insns().values().all(|&b| b != byte),
-                "recursive_call byte {byte} collides with an extension insn"
+                !extension.contains(&b),
+                "byte {b} collides with an extension insn"
             );
         }
     }

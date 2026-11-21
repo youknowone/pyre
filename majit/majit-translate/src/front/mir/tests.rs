@@ -15757,6 +15757,192 @@ fn registered_transparent_scalar_union_lowers_to_integer_ops() {
     }
 }
 
+/// A residual `get(&Word)` of a linked transparent scalar is refused by
+/// `refuse_borrowed_transparent_scalar_residual`: the borrow is the word,
+/// not an address.
+#[test]
+fn linked_transparent_scalar_residual_borrow_is_refused() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path
+                .iter()
+                .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                .collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let word_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let word_ref = serde_json::json!({"Ref": ["_", word_adt.clone(), "Shared"]});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let word_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "Word"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "pass_word"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_adt.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "word", "span": span(), "ty": word_adt.clone()},
+                        {"index": 2, "name": null, "span": span(), "ty": word_ref.clone()}
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span(),
+                            "kind": {"Assign": [
+                                place(2, &word_ref),
+                                {"Ref": {
+                                    "place": place(1, &word_adt),
+                                    "kind": "Shared",
+                                    "ptr_metadata": null
+                                }}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": {
+                                                    "regions": [],
+                                                    "types": [],
+                                                    "const_generics": [],
+                                                    "trait_refs": []
+                                                }
+                                            }
+                                        },
+                                        "args": [{
+                                            "Move": place(2, &word_ref)
+                                        }]
+                                    },
+                                    "dest": place(0, &unit),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let callee = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "get"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_ref.clone()],
+            "output": unit.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                        {"index": 1, "name": "self", "span": span(), "ty": word_ref}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span(), "kind": "Return"}
+                }]
+            }
+        }
+    });
+    let marker = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", "_jit_look_inside_get"], true),
+        "global_kind": "NamedConst",
+        "ty": {"Scalar": "Bool"},
+        "value": [{"Bool": false}, {"Scalar": "Bool"}]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [word_decl],
+            "fun_decls": [caller, callee],
+            "global_decls": [marker],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Word".to_string(),
+        majit_charon_reader::TransparentScalarKind::Signed,
+    )]);
+    let refused = crate::test_support::lower_function(&llbc, "pass_word")
+        .expect_err("a residual callee cannot take &Word");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("repr(transparent) scalar"),
+        "refusal must name the scalar borrow, got {refused}"
+    );
+}
+
 pub(in crate::front::mir) fn ptr_ty() -> serde_json::Value {
     serde_json::json!({"RawPtr": [usize_ty(), "Const"]})
 }
@@ -33653,21 +33839,25 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
     let interpreter =
         crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
     let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
-    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[interpreter, object],
-        crate::HostStaticAddrs {
-            error_carrier: crate::ErrorCarrierSpec {
-                carrier_path: "pyre_interpreter::error::PyError",
-                carrier_class: "",
-                carrier_wrappers: &[],
-                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-                from_exc_object: Some(("PyError", "from_exc_object")),
+    let program = crate::test_support::with_shared_link_write([interpreter, object], || {
+        let touching = crate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[interpreter, object],
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_class: "",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        },
-        &["error"],
-        &["oefmt"],
-    )
+            &["error"],
+            &["oefmt"],
+        )
+    })
     .expect("lower oefmt");
     let graph = program
         .functions
@@ -43348,6 +43538,92 @@ fn one_word_handle_by_value_struct_decl_is_none() {
     );
 }
 
+/// A by-value named struct whose leaves include a GC pointer is still
+/// walked (`tyref_by_value_struct_decl` is `Some`). The variant-payload
+/// path spells it as Ptr (`malloc_ptr_field_spelling`).
+#[test]
+fn by_value_struct_with_gc_pointer_leaf_is_still_walked() {
+    let i64_ty = interior_i64();
+    let obj = interior_struct(0, &["fixture", "Obj"], &[], 0, &[], false);
+    let items = interior_struct(
+        1,
+        &["fixture", "Items"],
+        &[
+            ("block", interior_raw_mut(interior_adt(0))),
+            ("len", i64_ty.clone()),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let items_ty = TyRef::Other(interior_adt(1).into());
+    let pair = interior_struct(
+        2,
+        &["fixture", "Pair"],
+        &[("a", i64_ty.clone()), ("b", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let pair_ty = TyRef::Other(interior_adt(2).into());
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false),
+        "methods": []
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [0, interior_adt(0)]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![obj, items, pair],
+        vec![],
+        vec![gctype],
+        vec![gctype_impl],
+    );
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(&items_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "a by-value named struct inlines even with a GC-pointer leaf"
+    );
+    assert!(
+        super::by_value_struct_has_gc_pointer_leaf(
+            &items_ty,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc
+        ),
+        "Items.block is a GC pointer"
+    );
+    let spelling =
+        super::tyref_to_field_layout_string(&items_ty, &llbc, &gc_struct_ids, &raw_alloc);
+    assert_eq!(
+        super::malloc_ptr_field_spelling(
+            &items_ty,
+            &spelling,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .as_deref(),
+        Some(format!("*mut {spelling}").as_str()),
+        "variant-payload spelling is Ptr; spelling={spelling}"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
+    );
+}
+
 /// An outer struct whose field is a `repr(transparent)` generic wrapper
 /// instantiated at a two-word struct. The wrapper's unique non-ZST
 /// field is itself that struct (`heaptracker.all_fielddescrs` walks the
@@ -46522,6 +46798,120 @@ fn option_take_on_field_lowers_to_read_and_none_store() {
     assert!(
         saw_none_store,
         "current_context take must store emit_option_none's None (null_raw for this niche), not a scalar zero: {}",
+        graph.dump()
+    );
+}
+
+/// `Option::take` of a boxed (nullable-GCREF) Option is a pointer
+/// exchange: read the slot, store None, return the pointer. Charon's
+/// multi-word enum layout must not `getfield` the box
+/// (`__discriminant` / payload) when the Option is None.
+#[test]
+fn option_take_of_boxed_gcref_is_pointer_exchange() {
+    use crate::model::{CallTarget, OpKind};
+
+    let payload_ty = interior_adt(1);
+    let ptr_ty = interior_mut_ref(payload_ty.clone());
+    let mut option = option_enum(0);
+    option["kind"]["Enum"][1]["fields"][0]["ty"] = ptr_ty.clone();
+    option["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [8]}
+            ],
+            "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U64"}}},
+            "repr": {"transparent": false}
+        }
+    }]);
+    let opt_ty = option_adt_node(0, ptr_ty.clone());
+    let opt_mut = interior_mut_ref(opt_ty.clone());
+    let payload = interior_struct(
+        1,
+        &["fixture", "Payload"],
+        &[("head", interior_usize()), ("tail", interior_usize())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let take = interior_opaque(
+        1,
+        &["core", "option", "<Impl>", "take"],
+        vec![opt_mut.clone()],
+        opt_ty.clone(),
+    );
+    let reborrow = serde_json::json!({
+        "Ref": {
+            "place": interior_deref(1, &opt_mut, &opt_ty),
+            "kind": "Mut",
+            "ptr_metadata": null
+        }
+    });
+    let caller = interior_caller(
+        "take_boxed",
+        1,
+        vec![opt_mut.clone()],
+        opt_ty.clone(),
+        vec![
+            interior_local(0, None, &opt_ty),
+            interior_local(1, Some("slot"), &opt_mut),
+            interior_local(2, Some("reborrow"), &opt_mut),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(interior_place(2, &opt_mut), reborrow)],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &opt_mut))],
+                    interior_place(0, &opt_ty),
+                    1,
+                    2,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+            interior_bb(vec![], interior_unwind()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![option, payload], vec![caller, take]);
+    let graph = super::lower_function(&llbc, "take_boxed")
+        .unwrap_or_else(|err| panic!("lower take_boxed: {err:?}"));
+    let ops = graph_ops(&graph);
+    let has_take = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == "take",
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf == "take"),
+        _ => false,
+    });
+    assert!(
+        !has_take,
+        "take_boxed residualized Option::take: {}",
+        graph.dump()
+    );
+    let box_field = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } => {
+            field.name == "__discriminant" || field.name == "__pos_0" || field.name == "head"
+        }
+        _ => false,
+    });
+    assert!(
+        !box_field,
+        "take of a nullable-GCREF Option must not getfield the box: {}",
+        graph.dump()
+    );
+    let pointer_exchange = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::RawLoad { .. } | OpKind::RawStore { .. }));
+    assert!(
+        pointer_exchange,
+        "take of a nullable-GCREF Option is a pointer load/store: {}",
         graph.dump()
     );
 }

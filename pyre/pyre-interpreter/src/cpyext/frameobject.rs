@@ -222,7 +222,6 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     // whatever the code object's own counts ask for.
     let frame = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         roots.get(base) as *const (),
-        &[],
         roots.get(base + 1),
         crate::call::take_last_exec_ctx(),
         PY_NULL,

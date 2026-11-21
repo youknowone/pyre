@@ -405,6 +405,15 @@ pub mod loop_census {
         KEYS.with(|keys| keys.borrow_mut().insert(green_key, line));
     }
 
+    /// Remember an already-formatted printable for a green key that is not
+    /// pypyjit-shaped (`sortkey_jmp` greens `strategy_type`, `tp`).
+    pub fn note_formatted(green_key: u64, line: String) {
+        if !enabled() {
+            return;
+        }
+        KEYS.with(|keys| keys.borrow_mut().insert(green_key, line));
+    }
+
     /// The printable location for *green_key*, or `None` when the key was
     /// never seeded.
     ///
