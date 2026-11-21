@@ -1008,7 +1008,9 @@ fn snapshot_maps_from_ctx(
     if ctx.recorder.has_byte_buffer() {
         return snapshot_map_from_byte_recorder(&ctx.recorder);
     }
-    snapshot_map_from_trace_snapshots(ctx.snapshots())
+    ctx.ensure_snapshots_materialized();
+    let reminted = ctx.recorder.snapshots_for_optimizer(&ctx.snapshots);
+    snapshot_map_from_trace_snapshots(&reminted)
 }
 
 /// `ResumeDataLoopMemo.number` source for an optimizer that walks the
@@ -1087,8 +1089,9 @@ fn snapshot_map_from_byte_recorder(
     let mut vref_map = Vec::with_capacity(n);
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
     frame_pcs_map.reserve_frames(frame_count);
-    let tagged_to_box =
-        |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
+    let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
+        snapshot_tagged_to_box(&recorder.snapshot_tagged_for_optimizer(t))
+    };
     recorder.for_each_captured_snapshot_arrays(|offset, it| {
         let n_boxes: usize = it
             .framestack
@@ -1179,7 +1182,8 @@ mod byte_snapshot_map_tests {
         }
         let decoded = rec.decode_captured_snapshots().unwrap();
         let actual = snapshot_map_from_byte_recorder(&rec);
-        let expected = snapshot_map_from_trace_snapshots(&decoded);
+        let reminted = rec.snapshots_for_optimizer(&decoded);
+        let expected = snapshot_map_from_trace_snapshots(&reminted);
         let values_at = |maps: &SnapshotBoxes, idx: usize| {
             maps.get(idx).and_then(|entry| {
                 entry
@@ -1201,16 +1205,17 @@ mod byte_snapshot_map_tests {
         // and consuming the byte recorder. Neither action may renumber the
         // input/result identities already present in resumedata.
         rec.close_loop(&[result]);
+        let result_pos = rec.opref_for_optimizer(result);
         let trace = rec.get_trace();
         assert_eq!(
             OpRef::input_arg_typed(trace.inputargs[0].index, trace.inputargs[0].tp.get()),
             input
         );
-        assert_eq!(trace.ops[0].pos().get(), result);
+        assert_eq!(trace.ops[0].pos().get(), result_pos);
         assert_eq!(offsets.len(), 2);
         let second = offsets[1];
         assert_eq!(actual.0[second].as_ref().unwrap()[0].opref, input);
-        assert_eq!(actual.0[second].as_ref().unwrap()[1].opref, result);
+        assert_eq!(actual.0[second].as_ref().unwrap()[1].opref, result_pos);
     }
 
     #[test]
@@ -1252,7 +1257,7 @@ mod byte_snapshot_map_tests {
         assert_eq!(void_op.ty(), Some(Type::Void));
         let value = rec.record_op(OpCode::IntAdd, &[input, OpRef::const_int(1)]);
         // Keepalive is void and does not bump `_index`; the add is TAGBOX 1.
-        assert_eq!(value.raw(), 1);
+        assert_eq!(rec.position_of(value), 1);
         rec.record_guard(OpCode::GuardTrue, &[value], None);
         let id0 = rec.encode_captured_snapshot(&Snapshot {
             resume_position: -1,
@@ -1396,7 +1401,8 @@ mod byte_snapshot_map_tests {
         );
 
         let decoded = rec.decode_captured_snapshots().expect("byte snapshots");
-        let maps = snapshot_map_from_trace_snapshots(&decoded);
+        let reminted = rec.snapshots_for_optimizer(&decoded);
+        let maps = snapshot_map_from_trace_snapshots(&reminted);
         let ops = rec.materialize_ops();
         let guards: Vec<_> = ops.iter().filter(|op| op.opcode.is_guard()).collect();
         assert_eq!(guards.len(), 3);
@@ -4028,14 +4034,14 @@ impl<M: Clone> MetaInterp<M> {
     /// `op.args[j]` or `op.fail_args[j]` traces its table index
     /// (`history.py` `ConstPtr.value`) through a minor collection.
     ///
-    /// history.py `RefFrontendOp` identity is `_index`. A `Vec<bool>` sized
-    /// by the recorder marks a box already in the live worklist so `_heapc_deps`
-    /// is followed transitively without an OpRef-keyed side table.
+    /// history.py `RefFrontendOp` identity is the box object; `OpRef::raw()`
+    /// is the never-rewound box id. A `Vec<bool>` sized by the recorder marks
+    /// a box already in the live worklist so `_heapc_deps` is followed
+    /// transitively without an OpRef-keyed side table.
     fn push_frontend_live_box(op: OpRef, live: &mut Vec<OpRef>, visited: &mut Vec<bool>) {
-        if op.is_constant() || op.is_none() {
+        let Some(i) = crate::recorder::Trace::frontend_box_visited_index(op) else {
             return;
-        }
-        let i = op.raw() as usize;
+        };
         if i >= visited.len() {
             visited.resize(i + 1, false);
         }
@@ -9756,7 +9762,15 @@ impl<M: Clone> MetaInterp<M> {
                 self.orig_vable_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());
             let cross_loop_cut = cut_merge_point.map(|mp| {
                 (
-                    mp.green_boxes.clone(),
+                    mp.green_boxes
+                        .iter()
+                        .map(|gb| {
+                            crate::trace_ctx::GreenBox::new(
+                                ctx.recorder.opref_for_optimizer(gb.opref),
+                                gb.ty,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     crate::history::TreeLoopCutPosition::new(
                         mp.position.tree_loop_op_index(n_inputargs),
                     ),
@@ -9814,6 +9828,12 @@ impl<M: Clone> MetaInterp<M> {
         self.capture_interpret_abort_values();
         let ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
+        // JUMP args / merge-point boxes are front-end identities. Compile
+        // and `cut_trace_from` see `_index` (`FrontendOp.get_position`).
+        let runtime_boxes: Vec<Operand> = jump_args
+            .iter()
+            .map(|b| recorder.operand_for_optimizer(b))
+            .collect();
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
         // An uncut byte trace keeps its recorder until optimize has numbered
         // every guard; `snapshot_recorder` is not moved again, so the
@@ -9888,8 +9908,12 @@ impl<M: Clone> MetaInterp<M> {
         // `compile_tracing` no longer names these ops. Preamble setup and
         // snapshot lowering allocate before `publish_ops_span`.
         let _trace_roots = self.publish_tree_loop(&mut trace);
-        let preamble_data =
-            compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, &enable_opts);
+        let preamble_data = compile::PreambleCompileData::new(
+            &trace,
+            &runtime_boxes,
+            &call_pure_results,
+            &enable_opts,
+        );
         let trace_snapshots = preamble_data.base.snapshots();
 
         // unroll.py `optimize_preamble(trace.get_iter())` mints a fresh
@@ -11664,6 +11688,7 @@ impl<M: Clone> MetaInterp<M> {
             phase2_input_ops_seed,
             mut ctx,
             jump_cut,
+            runtime_boxes,
         ) = {
             let driver_descriptor = self
                 .compile_tracing
@@ -11718,7 +11743,15 @@ impl<M: Clone> MetaInterp<M> {
                 let n_inputargs = ctx.num_inputargs();
                 let retrace_cut = retrace_merge_point.map(|mp| {
                     (
-                        mp.green_boxes.clone(),
+                        mp.green_boxes
+                            .iter()
+                            .map(|gb| {
+                                crate::trace_ctx::GreenBox::new(
+                                    ctx.recorder.opref_for_optimizer(gb.opref),
+                                    gb.ty,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
                         crate::history::TreeLoopCutPosition::new(
                             mp.position.tree_loop_op_index(n_inputargs),
                         ),
@@ -11747,6 +11780,10 @@ impl<M: Clone> MetaInterp<M> {
             // `walk_active_trace_refs` still forwards this recorder.
             let parked_trace = self.compile_tracing.as_mut().unwrap().snapshot_tree_loop();
             let ctx = self.compile_tracing.take().unwrap();
+            let runtime_boxes: Vec<Operand> = jump_args
+                .iter()
+                .map(|b| ctx.recorder.operand_for_optimizer(b))
+                .collect();
             let mut trace = parked_trace;
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 let _cut_src = self.publish_tree_loop(&mut trace);
@@ -11803,6 +11840,7 @@ impl<M: Clone> MetaInterp<M> {
                 phase2_input_ops_seed,
                 ctx,
                 jump_cut,
+                runtime_boxes,
             )
         };
 
@@ -11951,7 +11989,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             trace.inputargs.len(),
             vable_config,
-            jump_args,
+            &runtime_boxes,
         );
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
@@ -15905,9 +15943,19 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py `BridgeCompileData` / unroll.py `optimize_bridge`:
         // runtime_boxes are passed separately from the trace iterator and
-        // stay as the original live boxes from the closing JUMP.
+        // stay as the original live boxes from the closing JUMP, reminted
+        // to `_index` (`FrontendOp.get_position`) so the iterator cache
+        // keyed by recording position hits.
         let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
-            jump_args.to_vec()
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.ensure_ops_materialized();
+                jump_args
+                    .iter()
+                    .map(|b| ctx.recorder.operand_for_optimizer(b))
+                    .collect()
+            } else {
+                jump_args.to_vec()
+            }
         } else {
             Self::closing_jump_runtime_boxes(bridge_ops)
         };
@@ -16499,7 +16547,15 @@ impl<M: Clone> MetaInterp<M> {
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
         let bridge_runtime_boxes: Vec<Operand> = if !jump_args.is_empty() {
-            jump_args.to_vec()
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.ensure_ops_materialized();
+                jump_args
+                    .iter()
+                    .map(|b| ctx.recorder.operand_for_optimizer(b))
+                    .collect()
+            } else {
+                jump_args.to_vec()
+            }
         } else {
             Self::closing_jump_runtime_boxes(&bridge_ops)
         };
@@ -26838,7 +26894,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos().get(), opref);
+        assert_eq!(op.pos().get(), ctx.recorder.opref_for_optimizer(opref));
     }
 
     extern "C" fn cond_call_void_helper(_cond: i64, _func_addr: i64) {}
@@ -28870,7 +28926,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos().get(), opref);
+        assert_eq!(op.pos().get(), ctx.recorder.opref_for_optimizer(opref));
     }
 
     #[test]
@@ -29060,7 +29116,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallMayForceI)
             .expect("CallMayForceI must be recorded");
-        assert_eq!(call_op.pos().get(), opref);
+        assert_eq!(call_op.pos().get(), ctx.recorder.opref_for_optimizer(opref));
         assert!(
             ctx.recorder
                 .ops()
@@ -29171,21 +29227,20 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
-        // Record producer ops at positions 1 and 2 (after one inputarg at
-        // position 0) so the int operands `OpRef::int_op(1)`/`int_op(2)`
-        // bind to those `Operand::Op` producers instead of minting a
-        // position-only `Operand::Box`. Their `to_opref()` still round-trips
-        // to `int_op(1)`/`int_op(2)`, preserving the arg-identity asserts.
-        {
+        // Record producer ops after one inputarg so the int operands bind
+        // to those `Operand::Op` producers. Capture the recorded box ids
+        // (`FrontendOp` identity) rather than assuming they equal `_index`.
+        let (add1, add2) = {
             let rec = &mut meta.trace_ctx().expect("active trace").recorder;
             let i0 = rec.record_input_arg(majit_ir::Type::Int);
-            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(1));
-            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(2));
-        }
+            let add1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+            let add2 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+            (add1, add2)
+        };
         let argboxes = [
             funcbox,
-            (JitArgKind::Int, OpRef::int_op(1), 7),
-            (JitArgKind::Int, OpRef::int_op(2), 3),
+            (JitArgKind::Int, add1, 7),
+            (JitArgKind::Int, add2, 3),
         ];
         let result =
             meta.execute_and_record_varargs(OpCode::CallI, &argboxes, descr_ref, &descr_view);
@@ -29200,11 +29255,11 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos().get(), opref);
+        assert_eq!(op.pos().get().raw(), ctx.recorder.position_of(opref));
         assert_eq!(op.num_args(), 3);
         assert_eq!(op.arg(0).to_opref(), funcbox_ref);
-        assert_eq!(op.arg(1).to_opref(), OpRef::int_op(1));
-        assert_eq!(op.arg(2).to_opref(), OpRef::int_op(2));
+        assert_eq!(op.arg(1).to_opref().raw(), ctx.recorder.position_of(add1));
+        assert_eq!(op.arg(2).to_opref().raw(), ctx.recorder.position_of(add2));
     }
 
     #[test]
@@ -29479,7 +29534,11 @@ mod metainterp_static_data_tests {
         let last_exc_box = meta.last_exc_box.expect("last_exc_box");
         // pyjitpl.py:3389: when class is NOT const, last_exc_box is the
         // GUARD_EXCEPTION op itself (its trace position).
-        assert_eq!(last_exc_box, guard_pos);
+        let last_exc_pos = {
+            let ctx = meta.trace_ctx().expect("active trace");
+            ctx.recorder.opref_for_optimizer(last_exc_box)
+        };
+        assert_eq!(last_exc_pos, guard_pos);
     }
 
     #[test]
@@ -32458,6 +32517,7 @@ mod tests {
                 _index: 0,
                 snapshot_data_len: 0,
                 snapshot_array_data_len: 0,
+                _box_id: 0,
             },
             green_boxes: Vec::new(),
             header_pc: 0,
@@ -33532,7 +33592,8 @@ mod tests {
             live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
         );
-        let runtime_boxes = vec![rec.box_for_operand(add)];
+        let runtime_box = rec.box_for_operand(add);
+        let runtime_boxes = vec![rec.operand_for_optimizer(&runtime_box)];
         let prepared = prepare_bridge_from_byte_recorder(
             &rec,
             &live,
@@ -34225,7 +34286,7 @@ mod tests {
                     jitcode_index: 0,
                     pc: 123,
                     boxes: vec![crate::recorder::SnapshotTagged::Box(
-                        OpRef::int_op(0),
+                        OpRef::input_arg_int(0),
                         majit_ir::Type::Int,
                     )],
                 }],
@@ -34236,7 +34297,7 @@ mod tests {
         assert_eq!(snapshot_id, 0);
 
         let (trace, _) = meta
-            .finish_trace_for_parity(&[OpRef::int_op(0)])
+            .finish_trace_for_parity(&[OpRef::input_arg_int(0)])
             .expect("trace should finish");
         assert_eq!(trace.snapshots.len(), 1);
         assert_eq!(trace.snapshots[0].frames.len(), 1);

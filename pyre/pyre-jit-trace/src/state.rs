@@ -4081,7 +4081,7 @@ pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 /// that still go through that path (`str_len`, `dict_len`,
 /// `list_length`, typed list `int_items.len`).
 pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
-    if let Some(cached) = ctx.heap_cache().arraylen(array) {
+    if let Some(cached) = ctx.heapcache_arraylen(array) {
         // pyjitpl.py opimpl_getinteriorfield_gc_i `_opimpl_arraylen_gc` cache hit:
         //     if length is not None:
         //         self.metainterp.staticdata.profiler.count_ops(rop.ARRAYLEN_GC, Counters.HEAPCACHED_OPS)
@@ -13654,6 +13654,7 @@ mod tests {
                     _index: 0,
                     snapshot_data_len: 0,
                     snapshot_array_data_len: 0,
+                    _box_id: 0,
                 }
             }
             meta.push_portal_trace_position(idx1, Some((callee_hash, callee.clone())), pos(0));
@@ -13779,6 +13780,7 @@ mod tests {
                     _index: 0,
                     snapshot_data_len: 0,
                     snapshot_array_data_len: 0,
+                    _box_id: 0,
                 }
             }
             meta.push_portal_trace_position(idx0, Some((names_hash, names.clone())), pos(0));
@@ -14949,7 +14951,7 @@ mod tests {
         // `obj` is a Const (pyjitpl.py generate_guard const-skip), so no
         // guard is emitted at all.
         let payload_op = recorder
-            .get_op_by_pos(payload)
+            .get_op_by_pos(recorder.opref_for_optimizer(payload))
             .expect("payload op should be present");
         assert_eq!(payload_op.opcode, OpCode::GetfieldGcI);
         for pos in 1..(1 + recorder.num_ops() as u32) {

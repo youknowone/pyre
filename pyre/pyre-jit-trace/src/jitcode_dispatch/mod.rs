@@ -1003,12 +1003,12 @@ pub struct WalkSession {
     /// of the cache lower them, so an object since handed to something outside
     /// the region stops answering on its own. This position is only what tells
     /// an allocation of this region from one the walk made before it:
-    /// value-producing ops are numbered by opencoder `_index` (`OpRef::RefOp`
-    /// `raw()`), so an `OpRef` at or above this `_index` was minted inside the
-    /// region. `_count` also counts voids and is not that sequence. A
-    /// rewind taken inside the region cuts to a position the region itself
-    /// took and resets the heap cache with it, so a reused number answers as an
-    /// allocation again only once something re-allocates there.
+    /// value-producing ops carry a never-rewound box id (`OpRef::RefOp`
+    /// `raw()` / `Trace.next_box_id`), so an `OpRef` at or above this
+    /// watermark was minted inside the region. `_count` also counts voids
+    /// and is not that sequence. A rewind taken inside the region cuts
+    /// positions, not box ids, so a later op at a reused `_index` is still
+    /// a new object.
     ///
     /// `None` outside a region: set by the outermost
     /// [`fbw_state::BinopRewindInlineGuard`] and cleared when it unwinds, so it

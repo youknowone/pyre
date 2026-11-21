@@ -35,9 +35,10 @@ struct FrontendSlot {
     descr_pos: Option<usize>,
 }
 
-/// Dense value-producing FrontendOp table, indexed by `_index - n`
+/// Dense value-producing FrontendOp table, indexed by box id - prefix
 /// (`history.py` `IntFrontendOp` / `RefFrontendOp` / `FloatFrontendOp`).
-/// Concrete `_res*` lives here. The class of the FrontendOp is `ty`.
+/// Append-only: [`Trace::cut`] never truncates this vec. Concrete `_res*`
+/// lives here. The class of the FrontendOp is `ty`.
 #[derive(Clone, Debug)]
 struct ValueSlot {
     ty: Type,
@@ -49,6 +50,14 @@ struct ValueSlot {
     heapc: majit_trace::heapcache::HeapcRecord,
     /// The slot is on [`Trace::young_ref_slots`].
     young_listed: Cell<bool>,
+    /// `history.py` `FrontendOp.position_and_flags` — the TAGBOX `_index`
+    /// written into the byte stream. Rewound by a cut; a later live box
+    /// can reuse this number while this record keeps its box id.
+    position: u32,
+}
+
+fn value_slot_index(box_id: u32, prefix: u32) -> Option<usize> {
+    box_id.checked_sub(prefix).map(|i| i as usize)
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -63,7 +72,11 @@ struct ValueSlot {
 /// opencoder.py's split counters even though the legacy `Vec<Op>` recorder
 /// still assigns `OpRef` positions in total-op order. Snapshot lens come
 /// from the recorder-owned `snapshots` side table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `_box_id` is the front-end box-id watermark (`Trace.next_box_id`) at
+/// this cut point. [`Trace::cut`] ignores it: a cut rewinds `_index`
+/// (position) only, never the box-id counter.
+#[derive(Clone, Copy, Debug)]
 pub struct TracePosition {
     /// opencoder.py:475 `self._pos` — byte cursor for TRB, ops-Vec cursor
     /// for `recorder::Trace`.
@@ -77,7 +90,23 @@ pub struct TracePosition {
     pub snapshot_data_len: usize,
     /// opencoder.py `Trace.cut_point` `len(self._snapshot_array_data)`.
     pub snapshot_array_data_len: usize,
+    /// Front-end box-id watermark (`Trace.next_box_id`). `cut` ignores it.
+    pub _box_id: u32,
 }
+
+/// Cut-point equality is the opencoder 5-tuple. `_box_id` is a watermark
+/// [`Trace::cut`] does not restore, so it is not part of the identity.
+impl PartialEq for TracePosition {
+    fn eq(&self, other: &Self) -> bool {
+        self._pos == other._pos
+            && self._count == other._count
+            && self._index == other._index
+            && self.snapshot_data_len == other.snapshot_data_len
+            && self.snapshot_array_data_len == other.snapshot_array_data_len
+    }
+}
+
+impl Eq for TracePosition {}
 
 impl TracePosition {
     /// Recorded-op index into a materialized `TreeLoop.ops`.
@@ -266,9 +295,18 @@ pub struct Trace {
     max_num_inputargs: u32,
     /// Next OpRef index to assign.
     op_count: u32,
-    /// opencoder.py parity: count of box-yielding positions
-    /// (inputargs + non-void ops).
+    /// opencoder.py `Trace._index`: count of box-yielding positions
+    /// (inputargs + non-void ops). Rewound by [`Self::cut`].
     box_count: u32,
+    /// Front-end box id counter. Never rewound by [`Self::cut`].
+    /// Payload of a value-op `OpRef` (`IntOp` / `RefOp` / `FloatOp`).
+    /// Before the first cut this equals [`Self::box_count`].
+    next_box_id: u32,
+    /// Live box id at each value-op position: index = position - prefix.
+    /// Truncated by [`Self::cut`]. Needed because decoded ops are overlaid
+    /// with front-end concretes by position (`materialize_ops`); upstream
+    /// does not overlay.
+    live_boxes: Vec<u32>,
     /// ConstPtr indexes of the op `record_bytes` is encoding.
     ///
     /// The index is not in `slots` until that op returns, and
@@ -292,13 +330,14 @@ pub struct Trace {
     /// dummy buffer on the first `record_*`.
     trb: Option<Box<TraceRecordBuffer>>,
     slots: Vec<FrontendSlot>,
-    /// Value-producing FrontendOps, dense in `_index` after the inputarg
-    /// prefix. `OpRef.raw()` for a value op *is* that `_index`.
+    /// Value-producing FrontendOps, dense in box id after the inputarg
+    /// prefix. Append-only: index = box id - prefix. `OpRef.raw()` for a
+    /// front-end value op *is* that box id.
     value_slots: Box<Vec<ValueSlot>>,
     /// FrontendOp heapc records for inputargs at positions `0.._start`
     /// (`warmstate.py` `wrap` builds `RefFrontendOp(position, value)`).
     inputarg_heapc: Vec<majit_trace::heapcache::HeapcRecord>,
-    /// `value_slots` indices stamped with a `Value::Ref` since the last
+    /// Box ids of `value_slots` stamped with a `Value::Ref` since the last
     /// minor collection — the `young_objects_with_weakrefs` list of
     /// `incminimark.py`, which `invalidate_young_weakrefs` drains.
     /// Live boxes are forwarded by `walk_active_trace_refs` /
@@ -327,24 +366,31 @@ pub struct Trace {
     const_ptr_indexes: Box<RefCell<Vec<u32>>>,
 }
 
-/// TAGBOX index to the recording `OpRef`, without borrowing the whole
-/// recorder, so a `SnapshotIterator` can hold the snapshot bytes at the
-/// same time. The tagged value *is* `_index` (`opencoder.py` `_encode`
-/// `tag(TAGBOX, box.get_position())`).
+/// TAGBOX position to the live front-end `OpRef`, without borrowing the
+/// whole recorder, so a `SnapshotIterator` can hold the snapshot bytes at
+/// the same time. The tagged value *is* `_index` (`opencoder.py` `_encode`
+/// `tag(TAGBOX, box.get_position())`); the live box at that position is
+/// looked up through `live_boxes`.
 fn box_index_to_opref_parts(
     inputargs: &[InputArgRc],
     value_slots: &[ValueSlot],
+    live_boxes: &[u32],
     box_index: u32,
     max_num_inputargs: u32,
 ) -> OpRef {
     if let Some(ia) = inputarg_at_position(inputargs, box_index) {
         return OpRef::input_arg_typed(box_index, ia.tp.get());
     }
-    let vs = box_index
+    let live_i = box_index
         .checked_sub(max_num_inputargs)
-        .and_then(|i| value_slots.get(i as usize))
-        .unwrap_or_else(|| panic!("decode snapshot: TAGBOX({box_index}) has no value FrontendOp"));
-    OpRef::op_typed(box_index, vs.ty)
+        .and_then(|i| live_boxes.get(i as usize).copied())
+        .unwrap_or_else(|| panic!("decode snapshot: TAGBOX({box_index}) has no live box"));
+    let vs = value_slot_index(live_i, max_num_inputargs)
+        .and_then(|i| value_slots.get(i))
+        .unwrap_or_else(|| {
+            panic!("decode snapshot: TAGBOX({box_index}) live box {live_i} has no value FrontendOp")
+        });
+    OpRef::op_typed(live_i, vs.ty)
 }
 
 /// `opencoder.py` `AbstractResOpOrInputArg.get_position()` on the
@@ -365,6 +411,7 @@ fn inputarg_at_position(inputargs: &[InputArgRc], position: u32) -> Option<&Inpu
 fn untag_snapshot_pools(
     inputargs: &[InputArgRc],
     value_slots: &[ValueSlot],
+    live_boxes: &[u32],
     trb: &TraceRecordBuffer,
     tagged: i64,
 ) -> SnapshotTagged {
@@ -374,8 +421,13 @@ fn untag_snapshot_pools(
     match tag {
         TAGBOX => {
             debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
-            let opref =
-                box_index_to_opref_parts(inputargs, value_slots, v as u32, trb.max_num_inputargs);
+            let opref = box_index_to_opref_parts(
+                inputargs,
+                value_slots,
+                live_boxes,
+                v as u32,
+                trb.max_num_inputargs,
+            );
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
@@ -441,7 +493,7 @@ fn snapshot_box_from_tagged<'c>(
             None,
         );
     }
-    let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
+    let decoded = untag_snapshot_pools(inputargs, value_slots, &[], trb, tagged);
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded);
     (snap_box, None)
 }
@@ -534,6 +586,8 @@ impl Trace {
             max_num_inputargs: 0,
             op_count: 0,
             box_count: 0,
+            next_box_id: 0,
+            live_boxes: Vec::new(),
             live_const_indexes: Vec::new(),
             pending_quasi_descrs: Vec::new(),
             trb: None,
@@ -584,6 +638,7 @@ impl Trace {
                 recorder.max_num_inputargs += 1;
                 recorder.op_count += 1;
                 recorder.box_count += 1;
+                recorder.next_box_id += 1;
             }
         }
         recorder
@@ -724,8 +779,35 @@ impl Trace {
     }
 
     pub(crate) fn untag_snapshot(&self, tagged: i64) -> SnapshotTagged {
+        use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX};
+        let tag = (tagged & TAG_MASK as i64) as u8;
+        if tag == TAGBOX {
+            let v = tagged >> TAG_SHIFT;
+            debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
+            let opref = self.live_opref_at(v as u32);
+            return SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int));
+        }
         let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
-        untag_snapshot_pools(&self.inputargs, &self.value_slots, trb, tagged)
+        untag_snapshot_pools(
+            &self.inputargs,
+            &self.value_slots,
+            &self.live_boxes,
+            trb,
+            tagged,
+        )
+    }
+
+    /// Translate a decoded snapshot box into the optimizer's position
+    /// namespace (`FrontendOp.get_position`). InputArgs already carry
+    /// position; a value op is reminted as `op_typed(position, ty)`.
+    pub(crate) fn snapshot_tagged_for_optimizer(&self, tagged: SnapshotTagged) -> SnapshotTagged {
+        match tagged {
+            SnapshotTagged::Box(r, tp) if !r.is_none() && !r.is_constant() && !r.is_input_arg() => {
+                let pos = self.position_of(r);
+                SnapshotTagged::Box(OpRef::op_typed(pos, tp), tp)
+            }
+            other => other,
+        }
     }
 
     /// `ResumeDataLoopMemo.number` for one captured snapshot.
@@ -962,30 +1044,35 @@ impl Trace {
         // slot is the 0-placeholder `record_op(..., descr=None)` wrote.
         let last_is_guard = self.last_guard_has_descr_placeholder();
         // opencoder.py Trace.create_top_snapshot encodes the existing box
-        // lists directly. `OpRef.raw()` is already `_index`.
-        let num_inputs = self.max_num_inputargs as usize;
+        // lists directly. Front-end value OpRefs are translated to
+        // `_index` through `position_of` (`FrontendOp.get_position`).
+        let prefix = self.box_prefix();
+        let value_slots: &[ValueSlot] = &self.value_slots;
+        let live_boxes: &[u32] = &self.live_boxes;
         let vable = virtualizable_boxes
             .iter()
-            .map(|r| Self::arg_to_box_at(*r, num_inputs));
+            .map(|r| Self::arg_to_box_parts(value_slots, live_boxes, prefix, *r));
         let vref = virtualref_boxes
             .iter()
-            .map(|(r, _)| Self::arg_to_box_at(*r, num_inputs));
-        let offset = {
-            let trb = self
-                .trb
-                .as_mut()
-                .expect("capture_resumedata_from_framestack requires attach_byte_buffer");
-            trb.capture_resumedata_mapped(
-                framestack,
-                vable,
-                vref,
-                /* clear_result_register */ true,
-                op_live,
-                all_liveness,
-                after_residual_call,
-                last_is_guard,
-            )
-        };
+            .map(|(r, _)| Self::arg_to_box_parts(value_slots, live_boxes, prefix, *r));
+        let box_position = |r: OpRef| Self::position_of_parts(value_slots, live_boxes, prefix, r);
+        // The byte buffer stays in `self.trb` while it encodes: the GC walk
+        // reaches `_refs` through it.
+        let trb = self
+            .trb
+            .as_mut()
+            .expect("capture_resumedata_from_framestack requires attach_byte_buffer");
+        let offset = trb.capture_resumedata_mapped(
+            framestack,
+            vable,
+            vref,
+            /* clear_result_register */ true,
+            op_live,
+            all_liveness,
+            after_residual_call,
+            last_is_guard,
+            &box_position,
+        );
         offset as i32
     }
 
@@ -1052,12 +1139,17 @@ impl Trace {
     }
 
     fn arg_to_box(&self, r: OpRef) -> OcBox {
-        Self::arg_to_box_at(r, self.max_num_inputargs as usize)
+        Self::arg_to_box_parts(&self.value_slots, &self.live_boxes, self.box_prefix(), r)
     }
 
-    /// Encode a box for TAGBOX. `OpRef.raw()` of a value op *is* `_index`
-    /// (`opencoder.py` `_encode` `tag(TAGBOX, box.get_position())`).
-    fn arg_to_box_at(r: OpRef, _num_inputs: usize) -> OcBox {
+    /// [`Self::arg_to_box`] over the borrowed FrontendOp tables, so the
+    /// byte buffer can be borrowed mutably beside them.
+    fn arg_to_box_parts(
+        value_slots: &[ValueSlot],
+        live_boxes: &[u32],
+        prefix: u32,
+        r: OpRef,
+    ) -> OcBox {
         if r.is_constant() {
             let value = r
                 .inline_const_to_value()
@@ -1073,7 +1165,7 @@ impl Trace {
             r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)),
             "arg_to_box: void op {r:?} used as a value box"
         );
-        OcBox::ResOp(r.raw())
+        OcBox::ResOp(Self::position_of_parts(value_slots, live_boxes, prefix, r))
     }
 
     fn hold_const_indexes(&mut self, refs: &[OpRef]) -> usize {
@@ -1175,15 +1267,16 @@ impl Trace {
             .saturating_add(4)
             .saturating_add(args.len().saturating_mul(4))
             .saturating_add(4);
-        self.trb
-            .as_mut()
-            .expect("record_bytes requires attach_byte_buffer")
-            .reserve_ops_bytes(reserve);
-        let num_inputs = self.inputargs.len();
+        let prefix = self.box_prefix();
+        let value_slots: &[ValueSlot] = &self.value_slots;
+        let live_boxes: &[u32] = &self.live_boxes;
+        // The byte buffer stays in `self.trb` while it encodes: the GC walk
+        // reaches `_refs` through it.
         let trb = self
             .trb
             .as_mut()
             .expect("record_bytes requires attach_byte_buffer");
+        trb.reserve_ops_bytes(reserve);
         let void_seq = trb._count;
         // `pyjitpl.py` `generate_guard` records `descr=None`. The stream
         // descr slot is `rd_resume_position` (`opencoder.py`
@@ -1194,8 +1287,10 @@ impl Trace {
         } else {
             descr.as_ref()
         };
+        // Resolve each arg inside `_encode` so a ConstPtr reads the
+        // forwarded table slot after an earlier argument grew `_refs`.
         let box_index = trb.record_op_resolved(opcode, args.len(), stream_descr, |i| {
-            Self::arg_to_box_at(args[i], num_inputs)
+            Self::arg_to_box_parts(value_slots, live_boxes, prefix, args[i])
         });
         let ty = opcode.result_type();
         // Guard `record_op` writes a 2-byte 0 placeholder; later
@@ -1218,18 +1313,22 @@ impl Trace {
             None => value,
         };
         let opref = if ty != Type::Void {
+            let box_id = self.next_box_id;
+            self.next_box_id += 1;
             self.value_slots.push(ValueSlot {
                 ty,
                 concrete: Cell::new(value),
                 opcode,
                 heapc: majit_trace::heapcache::HeapcRecord::default(),
                 young_listed: Cell::new(false),
+                position: box_index,
             });
+            self.live_boxes.push(box_id);
             if let Some(v) = value {
-                self.note_concrete_ref(self.value_slots.len() - 1, v);
+                self.note_concrete_ref(box_id, v);
             }
             self.box_count += 1;
-            OpRef::op_typed(box_index, ty)
+            OpRef::op_typed(box_id, ty)
         } else {
             // `_count` is the all-ops sequence (inputargs + recorded ops),
             // the coordinate `TraceIterator._count` assigns to a void `cls()`.
@@ -1254,18 +1353,186 @@ impl Trace {
             .unwrap_or(self.max_num_inputargs)
     }
 
-    fn value_slot(&self, box_index: u32) -> Option<&ValueSlot> {
-        let n = self.box_prefix();
-        box_index
-            .checked_sub(n)
-            .and_then(|i| self.value_slots.get(i as usize))
+    fn value_slot(&self, box_id: u32) -> Option<&ValueSlot> {
+        value_slot_index(box_id, self.box_prefix()).and_then(|i| self.value_slots.get(i))
     }
 
-    fn value_slot_mut(&mut self, box_index: u32) -> Option<&mut ValueSlot> {
+    fn value_slot_mut(&mut self, box_id: u32) -> Option<&mut ValueSlot> {
+        value_slot_index(box_id, self.box_prefix()).and_then(|i| self.value_slots.get_mut(i))
+    }
+
+    /// Constants and InputArgs are always live. A recorded value box is live
+    /// iff it is the FrontendOp currently occupying its `_index`.
+    pub fn frontend_value_box_is_live(&self, opref: OpRef) -> bool {
+        if opref.is_none() || opref.is_constant() || opref.is_input_arg() {
+            return true;
+        }
+        if matches!(opref, OpRef::VoidOp(_)) {
+            return true;
+        }
+        match self.value_slot(opref.raw()) {
+            Some(vs) => self.live_box_id_at(vs.position) == Some(opref.raw()),
+            None => true,
+        }
+    }
+
+    fn live_box_id_at(&self, position: u32) -> Option<u32> {
         let n = self.box_prefix();
-        box_index
+        position
             .checked_sub(n)
-            .and_then(|i| self.value_slots.get_mut(i as usize))
+            .and_then(|i| self.live_boxes.get(i as usize).copied())
+    }
+
+    /// `history.py` `FrontendOp.get_position`. A front-end value `OpRef`
+    /// carries a box id; the byte stream and snapshots write `_index`.
+    /// Encoding a dead box (id whose slot is not the live box at its
+    /// position) panics: that is a front-end bug.
+    pub fn position_of(&self, opref: OpRef) -> u32 {
+        Self::position_of_parts(
+            &self.value_slots,
+            &self.live_boxes,
+            self.box_prefix(),
+            opref,
+        )
+    }
+
+    /// [`Self::position_of`] over the borrowed FrontendOp tables.
+    fn position_of_parts(
+        value_slots: &[ValueSlot],
+        live_boxes: &[u32],
+        prefix: u32,
+        opref: OpRef,
+    ) -> u32 {
+        if opref.is_constant() {
+            panic!("position_of: constant {opref:?} has no trace position");
+        }
+        if opref.is_input_arg() {
+            return opref.raw();
+        }
+        if matches!(opref, OpRef::VoidOp(_)) || opref.is_none() {
+            panic!("position_of: {opref:?} is not a value box");
+        }
+        let live_at = |position: u32| {
+            position
+                .checked_sub(prefix)
+                .and_then(|i| live_boxes.get(i as usize).copied())
+        };
+        let box_id = opref.raw();
+        match value_slot_index(box_id, prefix).and_then(|i| value_slots.get(i)) {
+            Some(vs) => {
+                let position = vs.position;
+                let live = live_at(position);
+                if live != Some(box_id) {
+                    panic!("encoding dead box {opref:?} at position {position} (live={live:?})");
+                }
+                position
+            }
+            None => {
+                // Already a recording `_index` (`FrontendOp.get_position`):
+                // `box_for_operand` after materialize, or a second remint.
+                if live_at(box_id).is_some() {
+                    box_id
+                } else {
+                    panic!("position_of: no FrontendOp for box {opref:?}")
+                }
+            }
+        }
+    }
+
+    /// Remint a front-end value box into the optimizer's position namespace
+    /// (`FrontendOp.get_position`). InputArgs already carry position; a
+    /// value-slot miss is already a position. A dead box panics through
+    /// [`Self::position_of`].
+    pub fn opref_for_optimizer(&self, r: OpRef) -> OpRef {
+        if r.is_none() || r.is_constant() || r.is_input_arg() || matches!(r, OpRef::VoidOp(_)) {
+            return r;
+        }
+        if self.value_slot(r.raw()).is_none() {
+            return r;
+        }
+        let ty = r
+            .ty()
+            .unwrap_or_else(|| panic!("opref_for_optimizer: {r:?} has no type"));
+        OpRef::op_typed(self.position_of(r), ty)
+    }
+
+    /// Bind a front-end operand to the materialized producer at its
+    /// recording `_index`. Already-position operands are left unchanged.
+    pub(crate) fn operand_for_optimizer(&self, op: &Operand) -> Operand {
+        if op.is_constant() || op.is_none() {
+            return op.clone();
+        }
+        let r = op.to_opref();
+        if r.is_input_arg() || r.is_constant() || r.is_none() || matches!(r, OpRef::VoidOp(_)) {
+            return op.clone();
+        }
+        // An operand bound to a materialized producer already names its
+        // `_index` (`opencoder.py` `TraceIterator._get`). Decide by the
+        // object, not by the number: after a cut a position can equal the
+        // box id of another FrontendOp.
+        if let Some(bound) = op.bound_op()
+            && self.ops.iter().any(|o| majit_ir::OpRc::ptr_eq(o, &bound))
+        {
+            return op.clone();
+        }
+        if self.value_slot(r.raw()).is_none() {
+            return op.clone();
+        }
+        let pos = self.position_of(r);
+        let ty = r
+            .ty()
+            .unwrap_or_else(|| panic!("operand_for_optimizer: {r:?} has no type"));
+        if let Some(prod) = self
+            .ops
+            .iter()
+            .find(|o| o.opcode.result_type() != Type::Void && o.pos().get().raw() == pos)
+        {
+            return Operand::from_bound_op(prod);
+        }
+        Operand::bound_from_opref(OpRef::op_typed(pos, ty))
+    }
+
+    /// Rewrite every TAGBOX in a decoded snapshot to the optimizer
+    /// position (`snapshot_tagged_for_optimizer`).
+    pub(crate) fn snapshot_for_optimizer(&self, mut snap: Snapshot) -> Snapshot {
+        let remint = |t: &mut SnapshotTagged| {
+            *t = self.snapshot_tagged_for_optimizer(*t);
+        };
+        for frame in &mut snap.frames {
+            for t in &mut frame.boxes {
+                remint(t);
+            }
+        }
+        for t in snap
+            .vable_boxes
+            .iter_mut()
+            .chain(snap.vref_boxes.iter_mut())
+        {
+            remint(t);
+        }
+        snap
+    }
+
+    pub(crate) fn snapshots_for_optimizer(&self, snaps: &[Snapshot]) -> Vec<Snapshot> {
+        snaps
+            .iter()
+            .cloned()
+            .map(|s| self.snapshot_for_optimizer(s))
+            .collect()
+    }
+
+    /// Position → live front-end box (`live_boxes`).
+    pub(crate) fn live_opref_at(&self, position: u32) -> OpRef {
+        if let Some(ia) = self.inputarg_at(position) {
+            return OpRef::input_arg_typed(position, ia.tp.get());
+        }
+        let box_id = self
+            .live_box_id_at(position)
+            .unwrap_or_else(|| panic!("live_opref_at: no live box at position {position}"));
+        let vs = self.value_slot(box_id).unwrap_or_else(|| {
+            panic!("live_opref_at: position {position} live box {box_id} has no FrontendOp")
+        });
+        OpRef::op_typed(box_id, vs.ty)
     }
 
     fn slot_by_seq(&self, seq: u32) -> Option<&FrontendSlot> {
@@ -1310,12 +1577,14 @@ impl Trace {
         // surviving `get_position()` (InputArg(2) vs IntAdd at compact 2).
         // Restore `FrontendOp.get_position()` = `_index` (`Trace._start`
         // plus the value-op ordinal), matching `opencoder.py` `cls()`.
+        // Overlay concrete from the live front-end box at that position.
         let mut orig = trb._start;
         for (i, op) in ops.iter().enumerate() {
             if op.opcode.result_type() != Type::Void {
                 let ty = op.opcode.result_type();
                 op.pos().set(OpRef::op_typed(orig, ty));
-                if let Some(vs) = self.value_slot(orig)
+                let live = self.live_opref_at(orig);
+                if let Some(vs) = self.value_slot(live.raw())
                     && let Some(v) = vs.concrete.get()
                 {
                     op.set_value(v);
@@ -1381,14 +1650,15 @@ impl Trace {
             }
         }
 
-        // Overlay FrontendOp concrete by original `_index`. Value slots
-        // are `_index - prefix`; `op.pos()` is the iterator's `_fresh`
-        // remint (`TraceIterator` `cls()`), so it is not the slot key.
+        // Overlay FrontendOp concrete by original `_index` through
+        // `live_boxes`. `op.pos()` is the iterator's `_fresh` remint
+        // (`TraceIterator` `cls()`), so it is not the slot key.
         // `opencoder.py` `TraceIterator._cache` is keyed by `_index`.
         let mut orig = trb._start;
         for (op, slot) in ops.iter().zip(self.slots.iter()) {
             if op.opcode.result_type() != Type::Void {
-                if let Some(vs) = self.value_slot(orig)
+                let live = self.live_opref_at(orig);
+                if let Some(vs) = self.value_slot(live.raw())
                     && let Some(v) = vs.concrete.get()
                 {
                     op.set_value(v);
@@ -1457,6 +1727,7 @@ impl Trace {
         };
         self.op_count += 1;
         self.box_count += 1;
+        self.next_box_id += 1;
         opref
     }
 
@@ -1516,17 +1787,19 @@ impl Trace {
             #[cfg(test)]
             return Operand::bound_from_opref(r);
         }
-        // ResOp operand: value-producing `OpRef.raw()` is `_index`
-        // (`history.py` `FrontendOp.get_position`). The FrontendOp lives
-        // at `value_slots[_index - _start]`. A materialized producer is
-        // the op whose result position is that `_index`
-        // (`opencoder.py` `TraceIterator._cache[_index]` / `get_op_by_pos`).
+        // ResOp operand: value-producing `OpRef.raw()` is the box id.
+        // The FrontendOp lives at `value_slots[box_id - _start]`. A
+        // materialized producer is the op whose result position is
+        // `ValueSlot.position` (`opencoder.py` `TraceIterator._cache[_index]`).
         if !r.is_none()
             && r.ty() != Some(Type::Void)
             && !matches!(r, OpRef::VoidOp(_))
-            && self.value_slot(r.raw()).is_some()
+            && let Some(vs) = self.value_slot(r.raw())
         {
-            if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
+            let position = vs.position;
+            if let Some(op) = self.ops.iter().find(|op| {
+                op.opcode.result_type() != Type::Void && op.pos().get().raw() == position
+            }) {
                 return Operand::from_bound_op(op);
             }
             if self.byte_mode() {
@@ -1856,11 +2129,20 @@ impl Trace {
     pub fn set_op_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
         self.materialize_into_ops();
         let boxed_fail_args = self.box_args(fail_args).iter().cloned().collect();
+        // Materialized `op.pos()` is `_index`; a front-end value box is a
+        // box id (`FrontendOp.get_position`).
+        let key = if matches!(opref, OpRef::VoidOp(_)) {
+            opref
+        } else if self.value_slot(opref.raw()).is_some() {
+            self.opref_for_optimizer(opref)
+        } else {
+            opref
+        };
         let op = self
             .ops
             .iter()
             .rev()
-            .find(|op| op.pos().get() == opref)
+            .find(|op| op.pos().get() == key)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
         op.setfailargs(boxed_fail_args);
     }
@@ -1963,6 +2245,7 @@ impl Trace {
                 _index: self.box_count,
                 snapshot_data_len: trb._snapshot_data.len(),
                 snapshot_array_data_len: trb._snapshot_array_data.len(),
+                _box_id: self.next_box_id,
             };
         }
         TracePosition {
@@ -1971,6 +2254,7 @@ impl Trace {
             _index: self.box_count,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
+            _box_id: self.next_box_id,
         }
     }
 
@@ -1981,6 +2265,10 @@ impl Trace {
     /// tentative JUMP after compile_trace succeeds or fails
     /// (pyjitpl.py finally: `self.history.cut(cut_at)`).
     pub fn cut(&mut self, pos: TracePosition) {
+        // `opencoder.py` `Trace.cut_at` rewinds `_pos` / `_count` / `_index`.
+        // Box ids and `value_slots` stay; a later op may reuse a position
+        // with a new object (`history.py` `History.cut` has no heap-cache
+        // purge).
         if let Some(trb) = self.trb.as_mut() {
             let n = self.max_num_inputargs;
             trb.cut_at(crate::recorder::TracePosition {
@@ -1989,11 +2277,13 @@ impl Trace {
                 _index: pos._index,
                 snapshot_data_len: 0,
                 snapshot_array_data_len: 0,
+                _box_id: 0,
             });
             let nops = pos._count.saturating_sub(n) as usize;
             self.slots.truncate(nops);
             let nvalues = pos._index.saturating_sub(n) as usize;
-            self.truncate_value_slots(nvalues);
+            self.kill_cut_value_slots(nvalues, pos._index);
+            self.live_boxes.truncate(nvalues);
             self.op_count = pos._count;
             self.box_count = pos._index;
             self.ops.clear();
@@ -2001,20 +2291,31 @@ impl Trace {
         }
         self.ops.truncate(pos._pos);
         let n = self.max_num_inputargs;
-        self.truncate_value_slots(pos._index.saturating_sub(n) as usize);
+        let nvalues = pos._index.saturating_sub(n) as usize;
+        self.kill_cut_value_slots(nvalues, pos._index);
+        self.live_boxes.truncate(nvalues);
         self.op_count = pos._count;
         self.box_count = pos._index;
     }
 
-    /// The value-slot half of `cut_at`: the recorder returns to the saved
-    /// position, so [`Self::young_ref_slots`] keeps only the slots that still
-    /// exist. A dropped index would otherwise name whatever box is recorded
-    /// at that position next, and list it a second time.
-    fn truncate_value_slots(&mut self, len: usize) {
-        self.value_slots.truncate(len);
-        self.young_ref_slots
-            .get_mut()
-            .retain(|&slot| (slot as usize) < len);
+    fn kill_cut_value_slots(&mut self, keep: usize, live_index: u32) {
+        let dead: Vec<u32> = self.live_boxes.get(keep..).unwrap_or(&[]).to_vec();
+        for box_id in &dead {
+            if let Some(vs) = self.value_slot_mut(*box_id) {
+                vs.concrete.set(None);
+                vs.heapc = majit_trace::heapcache::HeapcRecord::default();
+                vs.young_listed.set(false);
+            }
+        }
+        // Box ids only grow, so every id from the first cut box on is dead.
+        if let Some(&first_dead) = dead.first() {
+            self.young_ref_slots
+                .borrow_mut()
+                .retain(|&id| id < first_dead);
+        }
+        self.young_fallback_positions
+            .borrow_mut()
+            .retain(|&p| p < live_index);
     }
 
     /// history.py `History.length`: `self.trace._count - len(self.trace.inputargs)`.
@@ -2108,7 +2409,7 @@ impl Trace {
                 .get(count.saturating_sub(n) as usize)
                 .map(|op| op.opcode);
         }
-        // Value FrontendOp is `value_slots[_index - _start]`
+        // Value FrontendOp is `value_slots[box_id - _start]`
         // (`history.py` FrontendOp carries its opnum).
         if let Some(vs) = self.value_slot(opref.raw()) {
             return Some(vs.opcode);
@@ -2274,13 +2575,13 @@ impl Trace {
     }
 
     /// Stamp the concrete runtime value on the canonical frontend object
-    /// for `position` (`history.py *FrontendOp.setint` / `_make_op`).
-    /// `position` is the `_index` TAGBOX coordinate: live inputargs keep
-    /// their original `get_position()`, later indices are value-producing
-    /// ops. Void ops have no value slot. Returns `false` if `position` is
-    /// past the recorded range or a dead failarg hole.
+    /// for `box_id` (`history.py *FrontendOp.setint` / `_make_op`).
+    /// Inputargs keep their original `get_position()` as the payload;
+    /// value ops use the never-rewound box id. Void ops have no value
+    /// slot. Returns `false` if `box_id` is past the recorded range or a
+    /// dead failarg hole.
     #[track_caller]
-    pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
+    pub(crate) fn set_concrete_at(&self, box_id: u32, value: Value) -> bool {
         // Follow a forwarding stub before stamping (`minimark.py`
         // `id_or_identityhash`). Do not owner-root the slot: `_resref` is
         // traced only while the box is reachable.
@@ -2294,15 +2595,16 @@ impl Trace {
             }
             other => other,
         };
-        if let Some(ia) = self.inputarg_at(position) {
+        if let Some(ia) = self.inputarg_at(box_id) {
             ia.set_value(value);
-            Self::note_position_list(&self.young_inputarg_positions, position, value);
+            Self::note_position_list(&self.young_inputarg_positions, box_id, value);
             true
-        } else if position < self.max_num_inputargs {
+        } else if box_id < self.max_num_inputargs {
             false
-        } else if let Some(vs) = self.value_slot(position) {
+        } else if let Some(vs) = self.value_slot(box_id) {
+            let position = vs.position;
             vs.concrete.set(Some(value));
-            self.note_concrete_ref((position - self.box_prefix()) as usize, value);
+            self.note_concrete_ref(box_id, value);
             if let Some(op) = self
                 .ops
                 .iter()
@@ -2314,10 +2616,10 @@ impl Trace {
         } else if let Some(op) = self
             .ops
             .iter()
-            .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+            .find(|op| op.pos().get().raw() == box_id && op.result_type() != Type::Void)
         {
             op.set_value(value);
-            Self::note_position_list(&self.young_fallback_positions, position, value);
+            Self::note_position_list(&self.young_fallback_positions, box_id, value);
             true
         } else {
             false
@@ -2340,16 +2642,18 @@ impl Trace {
 
     /// Put a slot just stamped with a `Value::Ref` on
     /// [`Self::young_ref_slots`], once until the next minor collection.
-    fn note_concrete_ref(&self, slot: usize, value: Value) {
+    fn note_concrete_ref(&self, box_id: u32, value: Value) {
         let Value::Ref(gcref) = value else {
             return;
         };
         if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
             return;
         }
-        let vs = &self.value_slots[slot];
+        let Some(vs) = self.value_slot(box_id) else {
+            return;
+        };
         if !vs.young_listed.replace(true) {
-            self.young_ref_slots.borrow_mut().push(slot as u32);
+            self.young_ref_slots.borrow_mut().push(box_id);
         }
     }
 
@@ -2414,16 +2718,17 @@ impl Trace {
         in_nursery: &dyn Fn(usize) -> bool,
     ) {
         let young = std::mem::take(&mut *self.young_ref_slots.borrow_mut());
-        for slot in young {
-            // `Trace::cut` drops a listed slot together with the slot itself.
-            let vs = &self.value_slots[slot as usize];
+        for box_id in young {
+            let Some(vs) = self.value_slot(box_id) else {
+                continue;
+            };
             vs.young_listed.set(false);
             Self::settle_concrete_ref(vs, classify);
             if let Some(v) = vs.concrete.get()
                 && let Value::Ref(gcref) = v
                 && in_nursery(gcref.0)
             {
-                self.note_concrete_ref(slot as usize, v);
+                self.note_concrete_ref(box_id, v);
             }
         }
         let young_ia = std::mem::take(&mut *self.young_inputarg_positions.borrow_mut());
@@ -2526,14 +2831,23 @@ impl Trace {
     }
 
     /// Dense index space for a live-box visited bitset: inputargs plus
-    /// value-slot FrontendOps. `OpRef::raw()` is `_index`; a `Vec<bool>`
+    /// value-slot FrontendOps. Front-end `OpRef::raw()` is the box id
+    /// (InputArg payloads stay the reserved `_index` prefix). A `Vec<bool>`
     /// of this length is the recorder-sized marker, not an OpRef side table.
     pub(crate) fn frontend_visited_len(&self) -> usize {
-        let from_slots = (self.box_prefix() as usize).saturating_add(self.value_slots.len());
-        from_slots
+        (self.next_box_id as usize)
             .max(self.max_num_inputargs as usize)
             .max(self.inputarg_heapc.len())
             .saturating_add(1)
+    }
+
+    /// Visited-bitset slot for a front-end value box. `OpRef::raw()` is the
+    /// box id (or the InputArg position).
+    pub(crate) fn frontend_box_visited_index(op: OpRef) -> Option<usize> {
+        if op.is_constant() || op.is_none() || matches!(op, OpRef::VoidOp(_)) {
+            return None;
+        }
+        Some(op.raw() as usize)
     }
 
     /// history.py `RefFrontendOp._heapc_deps` — boxes stored on a live
@@ -2553,20 +2867,20 @@ impl Trace {
     }
 
     /// Read the concrete runtime value stamped on the canonical frontend
-    /// object for `position` (`history.py *FrontendOp.getint()`).
-    /// `position` is `_index`. `None` when never stamped, a dead failarg
-    /// hole, or out of range.
-    pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
-        if let Some(ia) = self.inputarg_at(position) {
+    /// object for `box_id` (`history.py *FrontendOp.getint()`).
+    /// Inputargs use `get_position()`; value ops use the box id. `None`
+    /// when never stamped, a dead failarg hole, or out of range.
+    pub(crate) fn concrete_at(&self, box_id: u32) -> Option<Value> {
+        if let Some(ia) = self.inputarg_at(box_id) {
             ia.get_value()
-        } else if position < self.max_num_inputargs {
+        } else if box_id < self.max_num_inputargs {
             None
-        } else if let Some(vs) = self.value_slot(position) {
+        } else if let Some(vs) = self.value_slot(box_id) {
             vs.concrete.get()
         } else {
             self.ops
                 .iter()
-                .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+                .find(|op| op.pos().get().raw() == box_id && op.result_type() != Type::Void)
                 .and_then(|op| op.get_value())
         }
     }
@@ -2687,6 +3001,10 @@ mod tests {
         OpRef::int_op(pos)
     }
 
+    fn opt(rec: &Trace, r: OpRef) -> OpRef {
+        rec.opref_for_optimizer(r)
+    }
+
     fn vop(pos: u32) -> OpRef {
         OpRef::void_op(pos)
     }
@@ -2768,8 +3086,7 @@ mod tests {
         assert!(rec.set_concrete_at(dropped.raw(), Value::Ref(young)));
         assert_eq!(rec.young_ref_slots.borrow().len(), 2);
         rec.cut(saved);
-        let kept_slot = (kept.raw() - rec.box_prefix()) as u32;
-        assert_eq!(*rec.young_ref_slots.borrow(), vec![kept_slot]);
+        assert_eq!(*rec.young_ref_slots.borrow(), vec![kept.raw()]);
     }
 
     /// A flag set on a box, then `cut` before it, then a new box at the
@@ -2786,9 +3103,11 @@ mod tests {
             view.new_object(first);
             assert!(view.is_unescaped(first));
         }
+        let first_pos = rec.position_of(first);
         rec.cut(saved);
         let second = rec.record_op(OpCode::New, &[]);
-        assert_eq!(first.raw(), second.raw());
+        assert_ne!(first, second);
+        assert_eq!(rec.position_of(second), first_pos);
         let view = majit_trace::heapcache::HeapCacheView::new(&cache, &rec);
         assert!(!view.is_unescaped(second));
         assert!(!view.is_class_known(second));
@@ -2828,7 +3147,11 @@ mod tests {
         let a = rec.box_for_operand(i1);
         let b = rec.box_for_operand(i1);
         assert_eq!(a, b, "same position must yield ptr_eq-equal Operands");
-        assert_eq!(a.to_opref(), i1, "Operand round-trips to its OpRef");
+        assert_eq!(
+            a.to_opref(),
+            opt(&rec, i1),
+            "Operand round-trips to the producer position"
+        );
 
         // InputArg position: same invariant.
         let ia_a = rec.box_for_operand(i0);
@@ -2923,17 +3246,17 @@ mod tests {
         assert_eq!(i0, iarg(0));
 
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        assert_eq!(i1, iop(1));
+        assert_eq!(rec.position_of(i1), 1);
 
         rec.close_loop(&[i1]);
-
+        let i1_pos = opt(&rec, i1);
         let trace = rec.get_trace();
         assert!(trace.is_loop());
         assert_eq!(trace.num_inputargs(), 1);
         assert_eq!(trace.num_ops(), 2); // IntAdd + Jump
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[1].opcode, OpCode::Jump);
-        assert_eq!(trace.ops[1].arg(0).to_opref(), i1);
+        assert_eq!(trace.ops[1].arg(0).to_opref(), i1_pos);
     }
 
     #[test]
@@ -3033,14 +3356,14 @@ mod tests {
         assert_eq!(i1, iarg(1));
 
         let i2 = rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        assert_eq!(i2, iop(2));
+        assert_eq!(rec.position_of(i2), 2);
 
         let descr = make_fail_descr(0);
         let g0 = rec.record_guard(OpCode::GuardTrue, &[i2], Some(descr));
         assert_eq!(g0, vop(3));
 
         let i3 = rec.record_op(OpCode::IntSub, &[i2, i0]);
-        assert_eq!(i3, iop(3));
+        assert_eq!(rec.position_of(i3), 3);
 
         rec.close_loop(&[i3, i1]);
         let trace = rec.get_trace();
@@ -3066,11 +3389,12 @@ mod tests {
         rec.set_last_op_resume_position(7);
         rec.close_loop(&[i2, i1]);
         assert_eq!(rec.num_ops(), 3);
+        let i2_pos = opt(&rec, i2);
         let (inputs, ops) = rec.into_parts();
         assert_eq!(inputs.len(), 2);
         assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(ops[0].pos().get(), i2);
+        assert_eq!(ops[0].pos().get(), i2_pos);
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
         assert_eq!(ops[1].pos().get(), g0);
         assert_eq!(ops[1].rd_resume_position(), 7);
@@ -3383,6 +3707,7 @@ mod tests {
             _index: 5,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
+            _box_id: 0,
         };
         assert!(pos.has_prefix_ops(2));
         assert_eq!(pos.tree_loop_op_index(2), 3);
@@ -3393,6 +3718,7 @@ mod tests {
                 _index: 2,
                 snapshot_data_len: 0,
                 snapshot_array_data_len: 0,
+                _box_id: 0,
             }
             .has_prefix_ops(2)
         );
@@ -3678,7 +4004,7 @@ mod tests {
         assert_eq!(rec.opcode_of(loaded), Some(OpCode::GetfieldGcR));
         assert_eq!(rec.concrete_at(loaded.raw()), Some(Value::Ref(GcRef(0x20))));
         let (descr, base) = rec
-            .getfield_gc_r_at(loaded.raw())
+            .getfield_gc_r_at(rec.position_of(loaded))
             .expect("GetfieldGcR args from the stream");
         assert!(std::sync::Arc::ptr_eq(&descr, &field));
         assert_eq!(base, obj);
@@ -3854,7 +4180,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(42);
         let i1 = rec.record_op_with_descr(OpCode::CallI, &[i0], descr);
-        assert_eq!(i1, iop(1));
+        assert_eq!(rec.position_of(i1), 1);
 
         rec.materialize_into_ops();
         assert!(rec.ops()[0].has_descr());
@@ -3899,6 +4225,7 @@ mod tests {
         let add1 = rec.record_op(OpCode::IntAdd, &[add0, i0]);
 
         rec.close_loop(&[add1, i1]);
+        let add0_pos = opt(&rec, add0);
         let trace = rec.get_trace();
 
         // Verify the trace has the correct number of ops (2 + Jump).
@@ -3912,7 +4239,7 @@ mod tests {
         assert_eq!(trace.ops[0].arg(1).to_opref(), i1);
 
         // Second add references the result of first add and i0.
-        assert_eq!(trace.ops[1].arg(0).to_opref(), add0);
+        assert_eq!(trace.ops[1].arg(0).to_opref(), add0_pos);
         assert_eq!(trace.ops[1].arg(1).to_opref(), i0);
     }
 
@@ -3924,8 +4251,8 @@ mod tests {
         let i1 = rec.record_input_arg(Type::Int);
         assert_eq!(rec.num_inputargs(), 2);
 
-        rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        let add = rec.record_op(OpCode::IntAdd, &[iop(2), i1]);
+        let first = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        let add = rec.record_op(OpCode::IntAdd, &[first, i1]);
         rec.close_loop(&[add, i1]);
 
         let trace = rec.get_trace();
@@ -3945,12 +4272,13 @@ mod tests {
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
 
         rec.close_loop(&[sub]);
+        let add_pos = opt(&rec, add);
         let trace = rec.get_trace();
 
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[0].pos().get(), iop(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
-        assert_eq!(trace.ops[1].arg(0).to_opref(), add); // references the add result
+        assert_eq!(trace.ops[1].arg(0).to_opref(), add_pos); // references the add result
         assert_eq!(trace.ops[1].arg(1).to_opref(), i0); // references the input arg
     }
 
@@ -3969,6 +4297,7 @@ mod tests {
         rec.close_loop(&[sub, i1]);
         rec.materialize_into_ops();
         rec.set_op_fail_args(guard, &[i0, i1, add]);
+        let add_pos = opt(&rec, add);
 
         let trace = rec.get_trace();
         // Find the guard op.
@@ -3979,7 +4308,7 @@ mod tests {
         assert_eq!(fail_args.len(), 3);
         assert_eq!(fail_args[0].to_opref(), i0);
         assert_eq!(fail_args[1].to_opref(), i1);
-        assert_eq!(fail_args[2].to_opref(), add);
+        assert_eq!(fail_args[2].to_opref(), add_pos);
     }
 
     #[test]
@@ -4002,6 +4331,7 @@ mod tests {
         rec.materialize_into_ops();
         rec.set_op_fail_args(g0, &[i0, i1]);
         rec.set_op_fail_args(g1, &[i0, add]);
+        let add_pos = opt(&rec, add);
 
         let trace = rec.get_trace();
         let guards: Vec<_> = trace.iter_guards().collect();
@@ -4019,7 +4349,7 @@ mod tests {
         let fa1 = guards[1].guard_fail_args().unwrap();
         assert_eq!(fa1.len(), 2);
         assert_eq!(fa1[0].to_opref(), i0);
-        assert_eq!(fa1[1].to_opref(), add);
+        assert_eq!(fa1[1].to_opref(), add_pos);
     }
 
     #[test]
@@ -4031,12 +4361,13 @@ mod tests {
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
+        let add_pos = opt(&rec, add);
 
         let trace = rec.get_trace();
         let jump = trace.ops.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(jump.num_args(), trace.num_inputargs());
-        assert_eq!(jump.arg(0).to_opref(), add);
+        assert_eq!(jump.arg(0).to_opref(), add_pos);
         assert_eq!(jump.arg(1).to_opref(), i1);
     }
 
@@ -4049,6 +4380,7 @@ mod tests {
 
         let descr = make_fail_descr(42);
         rec.finish(&[add], descr);
+        let add_pos = opt(&rec, add);
 
         let trace = rec.get_trace();
         assert!(trace.is_finished());
@@ -4057,7 +4389,7 @@ mod tests {
         let finish_op = trace.ops.last().unwrap();
         assert_eq!(finish_op.opcode, OpCode::Finish);
         assert_eq!(finish_op.num_args(), 1);
-        assert_eq!(finish_op.arg(0).to_opref(), add);
+        assert_eq!(finish_op.arg(0).to_opref(), add_pos);
         assert!(finish_op.has_descr());
     }
 
@@ -4068,17 +4400,17 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
         assert_eq!(rec.num_ops(), 0);
 
-        rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         assert_eq!(rec.num_ops(), 1);
 
-        rec.record_op(OpCode::IntSub, &[iop(1), i0]);
+        let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         assert_eq!(rec.num_ops(), 2);
 
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[iop(2)], Some(descr));
+        rec.record_guard(OpCode::GuardTrue, &[sub], Some(descr));
         assert_eq!(rec.num_ops(), 3);
 
-        rec.close_loop(&[iop(2)]);
+        rec.close_loop(&[sub]);
         // After close_loop, Jump is added.
         assert_eq!(rec.num_ops(), 4);
     }
@@ -4143,7 +4475,7 @@ mod tests {
             Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Int], &[true, false, true]);
         let result = rec.record_op(OpCode::IntAdd, &[iarg(0), iarg(2)]);
         assert_eq!(
-            result.raw(),
+            rec.position_of(result),
             3,
             "the hole remains reserved in trace positions"
         );
@@ -4192,7 +4524,7 @@ mod tests {
 
         // The input args consumed positions 0..2, so next op gets BoxInt(3).
         let add = rec.record_op(OpCode::IntAdd, &[iarg(0), iarg(1)]);
-        assert_eq!(add, iop(3));
+        assert_eq!(rec.position_of(add), 3);
 
         rec.close_loop(&[iarg(0), iarg(1), iarg(2)]);
         let trace = rec.get_trace();
@@ -4411,6 +4743,7 @@ mod tests {
         rec.close_loop(&inputs);
         rec.materialize_into_ops();
         rec.set_op_fail_args(guard, &fail_args);
+        let add_pos = opt(&rec, add);
         let trace = rec.get_trace();
 
         // Find the guard
@@ -4421,6 +4754,7 @@ mod tests {
 
         // Verify all fail_args match what we specified
         for (i, &expected) in fail_args.iter().enumerate() {
+            let expected = if expected == add { add_pos } else { expected };
             assert_eq!(fa[i].to_opref(), expected);
         }
     }
@@ -4538,9 +4872,11 @@ mod tests {
         assert_eq!(rec.num_ops(), 1);
         assert_eq!(rec.get_position(), pos1);
 
-        // Can record more ops after cut
+        // Can record more ops after cut. The new box reuses B's position
+        // with a fresh box id (`history.py` `History._make_op`).
         let d = rec.record_op(OpCode::IntNeg, &[iarg(0)]);
-        assert_eq!(d, iop(3)); // continues from pos1._count
+        assert_ne!(d, iop(3));
+        assert_eq!(rec.position_of(d), pos1._index);
         assert_eq!(rec.num_ops(), 2);
 
         // Cut back to pos0 — should discard everything
@@ -4553,16 +4889,122 @@ mod tests {
         let mut rec = Trace::with_num_inputs(1);
         let i0 = iarg(0);
 
-        let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         let pos_after_add = rec.get_position();
         assert_eq!(pos_after_add._count, 2);
         assert_eq!(pos_after_add._index, 2);
 
         let descr = make_fail_descr(1);
-        rec.record_guard(OpCode::GuardTrue, &[iop(1)], Some(descr));
+        rec.record_guard(OpCode::GuardTrue, &[add], Some(descr));
         let pos_after_guard = rec.get_position();
         assert!(pos_after_guard._pos > pos_after_add._pos);
         assert_eq!(pos_after_guard._count, 3);
         assert_eq!(pos_after_guard._index, 2);
+    }
+
+    /// `history.py` `History._make_op`: a box after `cut` is a new object
+    /// at the discarded op's `_index`.
+    #[test]
+    fn cut_reuses_position_with_a_fresh_box_id() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let a = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let pos_a = rec.position_of(a);
+        let saved = rec.get_position();
+        let b = rec.record_op(OpCode::IntSub, &[i0, i0]);
+        let pos_b = rec.position_of(b);
+        rec.cut(saved);
+        let c = rec.record_op(OpCode::IntMul, &[i0, i0]);
+        assert_ne!(c, b);
+        assert_eq!(rec.position_of(c), pos_b);
+        assert_eq!(rec.position_of(a), pos_a);
+    }
+
+    /// A materialized producer names its `_index`; after a cut that number
+    /// is also the box id of the discarded FrontendOp. Reminting the bound
+    /// operand must not read it as that box.
+    #[test]
+    fn operand_for_optimizer_keeps_a_materialized_producer_after_cut() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let saved = rec.get_position();
+        let a = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.cut(saved);
+        let b = rec.record_op(OpCode::IntSub, &[i0, i0]);
+        assert_ne!(a, b);
+        let pos_b = rec.position_of(b);
+        rec.materialize_into_ops();
+        let bound = rec.box_for_operand(b);
+        assert_eq!(bound.to_opref().raw(), pos_b);
+        let reminted = rec.operand_for_optimizer(&bound);
+        assert_eq!(reminted, bound);
+        assert_eq!(reminted.to_opref().raw(), pos_b);
+    }
+
+    /// Encoding a discarded FrontendOp is a front-end bug
+    /// (`FrontendOp.get_position` of a box that is not live at its `_index`).
+    #[test]
+    #[should_panic(expected = "encoding dead box")]
+    fn encoding_a_cut_box_panics() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let saved = rec.get_position();
+        let b = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.cut(saved);
+        let _ = rec.position_of(b);
+    }
+
+    struct IdentityOracle;
+
+    impl majit_trace::heapcache::SameConstantOracle for IdentityOracle {
+        fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+            a == b
+        }
+    }
+
+    /// Heap cache is keyed by FrontendOp identity. A field value cut away
+    /// must not be confused with a later box at the same `_index`.
+    #[test]
+    fn heapcache_field_lookup_does_not_return_a_reused_position() {
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        let saved = rec.get_position();
+        let b = rec.record_op(OpCode::New, &[]);
+        let mut cache = majit_trace::heapcache::HeapCache::new();
+        {
+            let mut view = majit_trace::heapcache::HeapCacheViewMut::new(&mut cache, &mut rec);
+            view.getfield_now_known(obj, 1, b, &IdentityOracle);
+            assert_eq!(view.getfield_cached(obj, 1, &IdentityOracle), Some(b));
+        }
+        rec.cut(saved);
+        let c = rec.record_op(OpCode::New, &[]);
+        let mut view = majit_trace::heapcache::HeapCacheViewMut::new(&mut cache, &mut rec);
+        assert_ne!(view.getfield_cached(obj, 1, &IdentityOracle), Some(c));
+        assert_eq!(view.getfield_cached(c, 1, &IdentityOracle), None);
+    }
+
+    /// `HeapcRecord.deps[0]` of a surviving array keeps the cut length
+    /// box. A later box at that `_index` must not be returned as `arraylen`.
+    /// Before this split the length OpRef was the position, so the lookup
+    /// returned the new box.
+    #[test]
+    fn heapcache_arraylen_deps_do_not_return_a_reused_position() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let array = rec.record_op(OpCode::New, &[]);
+        let after_array = rec.get_position();
+        let length = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let mut cache = majit_trace::heapcache::HeapCache::new();
+        {
+            let mut view = majit_trace::heapcache::HeapCacheViewMut::new(&mut cache, &mut rec);
+            view.new_array(array, length, false);
+            assert_eq!(view.arraylen(array), Some(length));
+        }
+        rec.cut(after_array);
+        let c = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let view = majit_trace::heapcache::HeapCacheView::new(&cache, &rec);
+        assert_ne!(view.arraylen(array), Some(c));
+        assert_eq!(view.arraylen(c), None);
     }
 }

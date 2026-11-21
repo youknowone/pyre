@@ -1917,7 +1917,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             is_being_profiled,
             false,
             guard_parents,
-            ctx.get_trace_position()._index,
+            ctx.get_trace_position()._box_id,
         ));
         parent_for_current = recipe_parent_frame_from_recipe(
             ctx,
@@ -2069,7 +2069,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             is_being_profiled,
             false,
             callee_parents,
-            sub_wc.trace_ctx.get_trace_position()._index,
+            sub_wc.trace_ctx.get_trace_position()._box_id,
         );
         // No `InlineConcreteFrameGuard` here.  A forward-inline sub-walk owns
         // the callee frame it publishes, so retargeting `last_instr` /

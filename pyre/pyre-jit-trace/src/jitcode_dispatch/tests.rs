@@ -855,7 +855,7 @@ fn send_ex_frame_nonnull_guard_records_unless_the_box_is_a_constant() {
     let last = tc.ops().last().expect("recorded op");
     assert_eq!(last.opcode, majit_ir::OpCode::GuardNonnull);
     assert_eq!(last.num_args(), 1);
-    assert_eq!((&*last.getarglist())[0].to_opref(), frame_box);
+    assert_eq!((&*last.getarglist())[0].to_opref(), opt(&tc, frame_box));
 
     let mut tc = fresh_trace_ctx();
     let frame_box = OpRef::const_ptr(majit_ir::GcRef(0xdead_beef));
@@ -2703,6 +2703,32 @@ fn fresh_trace_ctx() -> TraceCtx {
 fn dummy_int_add_box(tc: &mut TraceCtx) -> OpRef {
     let z = tc.const_int(0);
     tc.record_op(majit_ir::OpCode::IntAdd, &[z, z])
+}
+
+/// Front-end box → recording `_index` (`FrontendOp.get_position`).
+fn opt(tc: &TraceCtx, r: OpRef) -> OpRef {
+    tc.opref_for_optimizer(r)
+}
+
+fn opt_args(tc: &TraceCtx, args: impl IntoIterator<Item = OpRef>) -> Vec<OpRef> {
+    args.into_iter().map(|r| opt(tc, r)).collect()
+}
+
+fn last_recorded(
+    tc: &mut TraceCtx,
+) -> (
+    majit_ir::OpCode,
+    OpRef,
+    Vec<OpRef>,
+    Option<majit_ir::DescrRef>,
+) {
+    let last = tc.ops().last().expect("recorded op must exist");
+    (
+        last.opcode,
+        last.pos().get(),
+        last.getarglist().iter().map(|a| a.to_opref()).collect(),
+        last.getdescr(),
+    )
 }
 
 /// Recorded non-const box used as a Ref register. `PtrEq` is arity 2.
@@ -6547,12 +6573,13 @@ fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
     };
     let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
     let box_after = wc.trace_ctx.virtualizable_box_at(flat);
+    let value_pos = wc.trace_ctx.opref_for_optimizer(value);
     let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
         recorded.opcode == majit_ir::OpCode::SetarrayitemGc
             && recorded
                 .getarglist()
                 .get(2)
-                .is_some_and(|arg| arg.to_opref() == value)
+                .is_some_and(|arg| arg.to_opref() == value_pos)
     });
     let ops_after = wc.trace_ctx.num_ops();
     drop(wc);
@@ -6741,11 +6768,13 @@ fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
     };
     let result = setfield_vable_via_metainterp(&code, &op, &mut wc, 'i');
     let box_after = wc.trace_ctx.virtualizable_box_at(0);
+    let vable_pos = wc.trace_ctx.opref_for_optimizer(vable);
+    let value_pos = wc.trace_ctx.opref_for_optimizer(value);
     let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
         recorded.opcode == majit_ir::OpCode::SetfieldGc
             && recorded.getarglist().len() == 2
-            && recorded.getarglist()[0].to_opref() == vable
-            && recorded.getarglist()[1].to_opref() == value
+            && recorded.getarglist()[0].to_opref() == vable_pos
+            && recorded.getarglist()[1].to_opref() == value_pos
     });
     let ops_after = wc.trace_ctx.num_ops();
     drop(wc);
@@ -7332,6 +7361,7 @@ fn drive_int_add_jump_if_ovf(
     let guard_has_snapshot = ops[1].rd_resume_position() >= 0;
     let resume_pos = ops[1].rd_resume_position();
     let resbox = ops[0].pos().get();
+    let dst = opt(&tc, dst);
     let guard_resume_pc = tc
         .get_snapshot(resume_pos)
         .expect("overflow guard snapshot must exist")
@@ -7519,19 +7549,22 @@ fn drive_alloc_with_descr(
     let dst = wc.registers_r.get(0).expect("ref register in range");
     drop(wc);
 
-    let ops = tc.ops();
+    let (opcodes, first_num_args, first_pos) = {
+        let ops = tc.ops();
+        (
+            ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+            ops[0].num_args(),
+            ops[0].pos().get(),
+        )
+    };
+    assert_eq!(opcodes, vec![expected_opcode],);
     assert_eq!(
-        ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
-        vec![expected_opcode],
-    );
-    assert_eq!(
-        ops[0].num_args(),
-        0,
+        first_num_args, 0,
         "the allocation records the descr alone, with no box operands"
     );
     assert_eq!(
-        dst,
-        ops[0].pos().get(),
+        opt(&tc, dst),
+        first_pos,
         "the `>r` decorator writes the allocation into the ref bank"
     );
     assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
@@ -7950,7 +7983,7 @@ fn assert_not_none_records_when_the_operand_has_a_concrete() {
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
-        vec![operand],
+        opt_args(&tc, [operand]),
     );
 }
 
@@ -8565,19 +8598,16 @@ fn raw_load_i_records_the_load_against_the_descr() {
         next_pc, 6,
         "`iid>i` consumes 3 register bytes plus a 2B descr"
     );
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::RawLoadI);
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::RawLoadI);
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![base, offset],
+        last_args,
+        opt_args(&tc, [base, offset]),
         "raw loads record the address pair only; the descr rides alongside",
     );
     assert_eq!(
-        regs_i[2],
-        last.pos().get(),
+        opt(&tc, regs_i[2]),
+        last_pos,
         "the `>i` decorator writes the dst"
     );
 }
@@ -8879,19 +8909,16 @@ fn getarrayitem_raw_and_setarrayitem_raw_f_record_and_execute() {
             next_pc, 6,
             "`iid>f` consumes 3 register bytes plus a 2B descr"
         );
-        let last = tc.ops().last().expect("recorded op must exist");
-        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemRawF);
+        let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+        assert_eq!(last_opcode, majit_ir::OpCode::GetarrayitemRawF);
         assert_eq!(
-            last.getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![array, index],
+            last_args,
+            opt_args(&tc, [array, index]),
             "GetarrayitemRawF args must be [array, index]",
         );
         assert_eq!(
-            regs_f[0],
-            last.pos().get(),
+            opt(&tc, regs_f[0]),
+            last_pos,
             "the `>f` decorator writes the dst"
         );
         assert_eq!(
@@ -9047,7 +9074,7 @@ fn record_exact_class_records_the_hint_with_both_operands() {
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
-        vec![operand, cls],
+        opt_args(&tc, [operand, cls]),
     );
 }
 
@@ -9074,7 +9101,7 @@ fn record_exact_value_i_records_when_box_is_not_constant() {
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
-        vec![box_, const_box],
+        opt_args(&tc, [box_, const_box]),
     );
 }
 
@@ -9150,7 +9177,7 @@ fn record_exact_value_r_records_when_box_is_not_constant() {
             .iter()
             .map(|a| a.to_opref())
             .collect::<Vec<_>>(),
-        vec![box_, const_box],
+        opt_args(&tc, [box_, const_box]),
     );
 }
 
@@ -9466,18 +9493,15 @@ fn jit_force_quasi_immutable_declines_unobserved_mutate_value() {
     let mut regs_r = [OpRef::input_arg_ref(0)];
     let err = run_hint_step_with_descrs(&code, &mut tc, &mut regs_r, &mut [], &mut [], &descr_pool)
         .expect_err("unobserved mutate value must not assume null");
-    let last = tc
-        .ops()
-        .last()
-        .expect("GETFIELD_GC_R is recorded before the decline");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
-    assert_eq!(
-        err,
-        DispatchError::ForceQuasiImmutableValueNotConcrete {
-            pc: 0,
-            value: last.pos().get(),
+    let (last_opcode, last_pos, _, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldGcR);
+    match err {
+        DispatchError::ForceQuasiImmutableValueNotConcrete { pc, value } => {
+            assert_eq!(pc, 0);
+            assert_eq!(opt(&tc, value), last_pos);
         }
-    );
+        other => panic!("expected ForceQuasiImmutableValueNotConcrete, got {other:?}"),
+    }
 }
 
 #[test]
@@ -9501,18 +9525,15 @@ fn jit_force_quasi_immutable_int_kind_declines_unobserved_mutate_value() {
     let mut regs_r = [OpRef::input_arg_ref(0)];
     let err = run_hint_step_with_descrs(&code, &mut tc, &mut regs_r, &mut [], &mut [], &descr_pool)
         .expect_err("unobserved mutate value must not assume null");
-    let last = tc
-        .ops()
-        .last()
-        .expect("GETFIELD_GC_I is recorded before the decline");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
-    assert_eq!(
-        err,
-        DispatchError::ForceQuasiImmutableValueNotConcrete {
-            pc: 0,
-            value: last.pos().get(),
+    let (last_opcode, last_pos, _, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldGcI);
+    match err {
+        DispatchError::ForceQuasiImmutableValueNotConcrete { pc, value } => {
+            assert_eq!(pc, 0);
+            assert_eq!(opt(&tc, value), last_pos);
         }
-    );
+        other => panic!("expected ForceQuasiImmutableValueNotConcrete, got {other:?}"),
+    }
 }
 
 #[test]
@@ -9535,18 +9556,15 @@ fn jit_force_quasi_immutable_id_declines_unobserved_mutate_value() {
     let mut regs_i = [OpRef::input_arg_int(0)];
     let err = run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
         .expect_err("unobserved mutate value must not assume null");
-    let last = tc
-        .ops()
-        .last()
-        .expect("GETFIELD_RAW_R is recorded before the decline");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldRawR);
-    assert_eq!(
-        err,
-        DispatchError::ForceQuasiImmutableValueNotConcrete {
-            pc: 0,
-            value: last.pos().get(),
+    let (last_opcode, last_pos, _, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldRawR);
+    match err {
+        DispatchError::ForceQuasiImmutableValueNotConcrete { pc, value } => {
+            assert_eq!(pc, 0);
+            assert_eq!(opt(&tc, value), last_pos);
         }
-    );
+        other => panic!("expected ForceQuasiImmutableValueNotConcrete, got {other:?}"),
+    }
 }
 
 /// Production-like `sub_jitcode_lookup` that resolves `idx` against
@@ -14267,18 +14285,25 @@ fn step_through_int_return_records_finish_with_int_descr() {
     let (finish_value, finish_ty) =
         finish_payload_of(&outcome).expect("finish payload must be stashed");
     assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
-    let ops = tc.ops();
-    let new_box = &ops[ops.len() - 2];
-    assert_eq!(new_box.opcode, majit_ir::OpCode::NewWithVtable);
-    let setfield = ops.last().expect("recorded op must exist");
-    assert_eq!(setfield.opcode, majit_ir::OpCode::SetfieldGc);
+    let (new_opcode, setfield_opcode, setfield_args) = {
+        let ops = tc.ops();
+        let new_box = &ops[ops.len() - 2];
+        let setfield = ops.last().expect("recorded op must exist");
+        (
+            new_box.opcode,
+            setfield.opcode,
+            setfield
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(new_opcode, majit_ir::OpCode::NewWithVtable);
+    assert_eq!(setfield_opcode, majit_ir::OpCode::SetfieldGc);
     assert_eq!(
-        setfield
-            .getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![finish_value, expected_arg],
+        setfield_args,
+        opt_args(&tc, [finish_value, expected_arg]),
         "the re-boxed payload must store int_return's register into the new box",
     );
 }
@@ -16071,23 +16096,20 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         ops_before + 1,
         "`{opname}` must record exactly one op",
     );
-    let last = tc.ops().last().expect("recorded op must exist");
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
     assert_eq!(
-        last.opcode, expected_opcode,
+        last_opcode, expected_opcode,
         "`{opname}` must record `{:?}`",
         expected_opcode,
     );
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![arg0, arg1],
+        last_args,
+        opt_args(&tc, [arg0, arg1]),
         "`{opname}` args must be [registers_i[src1], registers_i[src2]] in source order",
     );
     assert_eq!(
-        dst_post,
-        last.pos().get(),
+        opt(&tc, dst_post),
+        last_pos,
         "`{opname}` dst must hold the recorder's result OpRef (op.pos().get())",
     );
 }
@@ -16362,16 +16384,10 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         ops_before + 1,
         "`{opname}` must record exactly one op",
     );
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, expected_opcode);
-    assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![arg0, arg1]
-    );
-    assert_eq!(dst_post, last.pos().get());
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, expected_opcode);
+    assert_eq!(last_args, opt_args(&tc, [arg0, arg1]));
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -16444,17 +16460,14 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, expected_opcode);
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, expected_opcode);
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![arg],
+        last_args,
+        opt_args(&tc, [arg]),
         "`{opname}` args must be [registers_f[src]]",
     );
-    assert_eq!(dst_post, last.pos().get());
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -16521,16 +16534,10 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, expected_opcode);
-    assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![arg]
-    );
-    assert_eq!(dst_post, last.pos().get());
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, expected_opcode);
+    assert_eq!(last_args, opt_args(&tc, [arg]));
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -16642,16 +16649,10 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, expected_opcode);
-    assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![arg0, arg1]
-    );
-    assert_eq!(dst_post, last.pos().get());
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, expected_opcode);
+    assert_eq!(last_args, opt_args(&tc, [arg0, arg1]));
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -17430,7 +17431,7 @@ fn newstr_strsetitem_copystrcontent_record_their_operands() {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, opcode, "{key}");
         let recorded: Vec<OpRef> = last.getarglist().iter().map(|a| a.to_opref()).collect();
-        assert_eq!(recorded, args, "{key}");
+        assert_eq!(recorded, opt_args(&tc, args), "{key}");
         if opcode == Newstr {
             assert_ne!(regs_r[0], r[0], "{key} writes its dst register");
         }
@@ -18024,7 +18025,10 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     };
     assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
     assert_eq!(last_args_len, 2);
-    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        last_args0.to_opref(),
+        wc.trace_ctx.opref_for_optimizer(value_opref)
+    );
     assert_eq!(
         wc.trace_ctx.const_value(last_args1.to_opref()),
         Some(concrete_ptr as i64),
@@ -18090,7 +18094,10 @@ fn walker_implement_guard_value_mints_const_ref_for_a_ref_box() {
         (last.opcode, args[0].clone(), args[1].clone())
     };
     assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
-    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        last_args0.to_opref(),
+        wc.trace_ctx.opref_for_optimizer(value_opref)
+    );
     assert_eq!(
         wc.trace_ctx.const_type(last_args1.to_opref()),
         Some(Type::Ref)
@@ -18149,7 +18156,10 @@ fn walker_implement_guard_value_mints_const_ref_for_a_null_ref_box() {
         (last.opcode, args[0].clone(), args[1].clone())
     };
     assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
-    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        last_args0.to_opref(),
+        wc.trace_ctx.opref_for_optimizer(value_opref)
+    );
     assert_eq!(
         wc.trace_ctx.const_type(last_args1.to_opref()),
         Some(Type::Ref)
@@ -18218,7 +18228,10 @@ fn ref_guard_value_records_guardvalue_for_a_null_ref() {
     };
     assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
     assert_eq!(last_args_len, 2);
-    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        last_args0.to_opref(),
+        wc.trace_ctx.opref_for_optimizer(value_opref)
+    );
     assert_eq!(
         wc.trace_ctx.const_value(last_args1.to_opref()),
         Some(0),
@@ -18304,7 +18317,10 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     };
     assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
     assert_eq!(last_args_len, 2);
-    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        last_args0.to_opref(),
+        wc.trace_ctx.opref_for_optimizer(value_opref)
+    );
     assert_eq!(wc.trace_ctx.const_value(last_args1.to_opref()), Some(42));
     assert_eq!(
         wc.trace_ctx.const_type(last_args1.to_opref()),
@@ -20845,7 +20861,8 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         .get();
     assert_ne!(regs_r[3], dst_pre, "dst must be overwritten");
     assert_eq!(
-        regs_r[3], call_pos,
+        opt(&tc, regs_r[3]),
+        call_pos,
         "registers_r[dst] must equal CallR's OpRef when GuardNoException is recorded",
     );
 }
@@ -20923,7 +20940,8 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         .get();
     assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
     assert_eq!(
-        regs_r[2], call_pos,
+        opt(&tc, regs_r[2]),
+        call_pos,
         "registers_r[dst] must equal CallR's OpRef when GuardNoException is recorded",
     );
 }
@@ -21142,22 +21160,28 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         ops_before + 2,
         "_r_i must record CallI + GuardNoException (no-effectinfo fallback)",
     );
-    let call_op = wc
-        .trace_ctx
-        .ops()
-        .iter()
-        .find(|o| o.opcode == majit_ir::OpCode::CallI)
-        .expect("CallI must be recorded for the int-dst kind");
-    assert_eq!(
-        call_op
-            .getarglist()
+    let (call_args, recorded_descr, call_pos) = {
+        let call_op = wc
+            .trace_ctx
+            .ops()
             .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
+            .find(|o| o.opcode == majit_ir::OpCode::CallI)
+            .expect("CallI must be recorded for the int-dst kind");
+        (
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            call_op.getdescr().expect("CallI must carry the calldescr"),
+            call_op.pos().get(),
+        )
+    };
+    assert_eq!(
+        call_args,
         vec![funcptr_expected, arg0_expected, arg1_expected],
         "CallI args must be [funcptr, ...args] from registers_i+registers_r",
     );
-    let recorded_descr = call_op.getdescr().expect("CallI must carry the calldescr");
     assert!(
         std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
         "CallI descr must be descr_refs[1] (not decoy at index 0)",
@@ -21169,8 +21193,8 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         "registers_i[dst] must change from its pre-call value",
     );
     assert_eq!(
-        dst_post,
-        call_op.pos().get(),
+        wc.trace_ctx.opref_for_optimizer(dst_post),
+        call_pos,
         "registers_i[dst] must be the recorded CallI's OpRef (op.pos().get())",
     );
 }
@@ -21340,18 +21364,25 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         ops_before + 2,
         "_ir_r must record CallR + GuardNoException (no-effectinfo fallback)",
     );
-    let call_op = wc
-        .trace_ctx
-        .ops()
-        .iter()
-        .find(|o| o.opcode == majit_ir::OpCode::CallR)
-        .expect("CallR must be recorded");
-    assert_eq!(
-        call_op
-            .getarglist()
+    let (call_args, recorded_descr, call_pos) = {
+        let call_op = wc
+            .trace_ctx
+            .ops()
             .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
+            .find(|o| o.opcode == majit_ir::OpCode::CallR)
+            .expect("CallR must be recorded");
+        (
+            call_op
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            call_op.getdescr().expect("CallR must carry the calldescr"),
+            call_op.pos().get(),
+        )
+    };
+    assert_eq!(
+        call_args,
         vec![
             funcptr_expected,
             iarg0_expected,
@@ -21362,7 +21393,6 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         "CallR args must be [funcptr, i0, i1, r0, r1] — identity \
              permutation when descr.arg_types=[Int, Int, Ref, Ref]",
     );
-    let recorded_descr = call_op.getdescr().expect("CallR must carry the calldescr");
     assert!(
         std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
         "CallR descr must be descr_refs[1] (not decoy at index 0)",
@@ -21370,8 +21400,8 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
     // dst writeback into registers_r[0].
     let dst_post = wc.registers_r.get(0).expect("ref register in range");
     assert_eq!(
-        dst_post,
-        call_op.pos().get(),
+        wc.trace_ctx.opref_for_optimizer(dst_post),
+        call_pos,
         "registers_r[dst] must be the recorded CallR's OpRef (op.pos().get())",
     );
 }
@@ -27438,24 +27468,19 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         ops_before + 1,
         "cache miss must record exactly one GetfieldGcI op",
     );
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
+    let (last_opcode, last_pos, last_args, last_descr) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldGcI);
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![obj],
+        last_args,
+        opt_args(&tc, [obj]),
         "GetfieldGcI args must be [obj] (the r-reg source)",
     );
-    let recorded_descr = last
-        .getdescr()
-        .expect("GetfieldGcI must carry the field descr");
+    let recorded_descr = last_descr.expect("GetfieldGcI must carry the field descr");
     assert!(
         std::sync::Arc::ptr_eq(&recorded_descr, &descr),
         "GetfieldGcI descr must be descr_refs[d] (the field descr)",
     );
-    assert_eq!(dst_post, last.pos().get());
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -27591,16 +27616,10 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
-    assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![obj]
-    );
-    assert_eq!(dst_post, last.pos().get());
+    let (last_opcode, last_pos, last_args, _) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldGcR);
+    assert_eq!(last_args, opt_args(&tc, [obj]));
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -27728,24 +27747,19 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         ops_before + 1,
         "nonstandard-vable fallback records exactly one GetfieldGcI op",
     );
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
+    let (last_opcode, last_pos, last_args, last_descr) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetfieldGcI);
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![obj],
+        last_args,
+        opt_args(&tc, [obj]),
         "GetfieldGcI args must be [obj] (the r-reg source)",
     );
-    let recorded_descr = last
-        .getdescr()
-        .expect("GetfieldGcI must carry the field descr");
+    let recorded_descr = last_descr.expect("GetfieldGcI must carry the field descr");
     assert!(
         std::sync::Arc::ptr_eq(&recorded_descr, &descr),
         "GetfieldGcI descr must be descr_refs[d] (the field descr)",
     );
-    assert_eq!(dst_post, last.pos().get());
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 #[test]
@@ -28103,21 +28117,18 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
-    let last = tc.ops().last().expect("recorded op must exist");
-    assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
+    let (last_opcode, last_pos, last_args, last_descr) = last_recorded(&mut tc);
+    assert_eq!(last_opcode, majit_ir::OpCode::GetarrayitemGcR);
     assert_eq!(
-        last.getarglist()
-            .iter()
-            .map(|a| a.to_opref())
-            .collect::<Vec<_>>(),
-        vec![array, index],
+        last_args,
+        opt_args(&tc, [array, index]),
         "GetarrayitemGcR args must be [array, index]",
     );
     assert!(std::sync::Arc::ptr_eq(
-        &last.getdescr().expect("must carry array descr"),
+        &last_descr.expect("must carry array descr"),
         &descr,
     ));
-    assert_eq!(dst_post, last.pos().get());
+    assert_eq!(opt(&tc, dst_post), last_pos);
 }
 
 /// Backend stub for the pure-getarrayitem bypass test: the required

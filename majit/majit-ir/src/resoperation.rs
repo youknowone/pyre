@@ -55,12 +55,15 @@ pub enum OpRef {
     InputArgFloat(u32),
     /// resoperation.py `InputArgRef` — `type = 'r'`.
     InputArgRef(u32),
-    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
-    /// result OpRef position.
+    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: front-end
+    /// box id (`Trace.next_box_id`) or optimizer position
+    /// (`FrontendOp.get_position` / `TraceIterator._fresh`).
     IntOp(u32),
-    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`.
+    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`. Payload: same
+    /// two-space number as [`Self::IntOp`].
     FloatOp(u32),
-    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
+    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`. Payload: same
+    /// two-space number as [`Self::IntOp`].
     RefOp(u32),
     /// `AbstractResOp` default — `type = 'v'` (resoperation.py).
     /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …) carry no result
@@ -657,12 +660,15 @@ pub enum AbstractValue {
     InputArgFloat(u32),
     /// resoperation.py `InputArgRef` — `type = 'r'`.
     InputArgRef(u32),
-    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
-    /// result OpRef position.
+    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: front-end
+    /// box id (`Trace.next_box_id`) or optimizer position
+    /// (`FrontendOp.get_position` / `TraceIterator._fresh`).
     IntOp(u32),
-    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`.
+    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`. Payload: same
+    /// two-space number as [`Self::IntOp`].
     FloatOp(u32),
-    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
+    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`. Payload: same
+    /// two-space number as [`Self::IntOp`].
     RefOp(u32),
     /// `AbstractResOp` default — `type = 'v'` (resoperation.py).
     /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …).

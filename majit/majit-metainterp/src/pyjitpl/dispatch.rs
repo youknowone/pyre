@@ -7971,6 +7971,7 @@ mod tests {
         // is the zeroed `stackpos`, not the caller's register.
         assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
 
+        let finish_pos = ctx.recorder.opref_for_optimizer(finish_args[0]);
         let recorder = ctx.into_recorder();
         let ops = recorder.ops();
         // One residual alloc (CallR) for the single virt array, ...
@@ -8011,7 +8012,7 @@ mod tests {
         // The call result (the op), not a marshalled input, is wired into the
         // caller's return register.
         assert_eq!(
-            finish_args[0],
+            finish_pos,
             call_op.pos().get(),
             "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
         );
@@ -8187,6 +8188,7 @@ mod tests {
         // The callee's concrete entry ran with the FRESH reds (zeroed stackpos).
         assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
 
+        let finish_pos = ctx.recorder.opref_for_optimizer(finish_args[0]);
         let recorder = ctx.into_recorder();
         let ops = recorder.ops();
         let call_ops: Vec<_> = ops
@@ -8208,7 +8210,7 @@ mod tests {
             .expect("CALL_ASSEMBLER[Ref] must record a GUARD_NOT_FORCED");
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
-            finish_args[0],
+            finish_pos,
             call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Ref] result must be wired into the caller's ref return register",
         );
@@ -8253,6 +8255,7 @@ mod tests {
         assert_eq!(finish_args.len(), 1);
         assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
 
+        let finish_pos = ctx.recorder.opref_for_optimizer(finish_args[0]);
         let recorder = ctx.into_recorder();
         let ops = recorder.ops();
         let call_ops: Vec<_> = ops
@@ -8274,7 +8277,7 @@ mod tests {
             .expect("CALL_ASSEMBLER[Float] must record a GUARD_NOT_FORCED");
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
-            finish_args[0],
+            finish_pos,
             call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Float] result must be wired into the caller's float return register",
         );
@@ -8641,7 +8644,9 @@ mod tests {
                 panic!("expected Finish[Int] from recursive-portal merge-point cut, got {other:?}")
             }
         };
+        assert_eq!(finish_args.len(), 1);
 
+        let finish_pos = ctx.recorder.opref_for_optimizer(finish_args[0]);
         let recorder = ctx.into_recorder();
         let ops = recorder.ops();
 
@@ -8695,9 +8700,8 @@ mod tests {
         // The portal tail after the merge point (`int_return`) produced no
         // inline return-derived ops: the sole finish value is the recursion's
         // CALL_ASSEMBLER result wired into the caller's return register.
-        assert_eq!(finish_args.len(), 1);
         assert_eq!(
-            finish_args[0],
+            finish_pos,
             ops[call].pos().get(),
             "the finish value must be the recursive CALL_ASSEMBLER result",
         );
@@ -10248,15 +10252,16 @@ mod tests {
         let live_pc = builder.current_pos();
         builder.live(&mut asm, &[0], &[], &[]);
         let jitcode = std::sync::Arc::new(builder.finish());
+        let mut recorder = crate::recorder::Trace::new();
+        let live_box = recorder.record_input_arg(majit_ir::Type::Int);
         let mut frame = MIFrame::new(jitcode, live_pc);
-        frame.int_regs[0] = Some(OpRef::int_op(50));
+        frame.int_regs[0] = Some(live_box);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
         staticdata.liveness_info.set(asm.all_liveness().to_vec());
-        let recorder = crate::recorder::Trace::new();
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
         let exc_class = ctx.const_int(0xc1a55);
         let mut machine =

@@ -6119,7 +6119,7 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     {
         // The cached length pins the arity: a count the callee cannot take
         // is a runtime TypeError the inline path does not model.
-        let len_op = ctx.trace_ctx.heap_cache().arraylen(block)?;
+        let len_op = ctx.trace_ctx.heapcache_arraylen(block)?;
         let npos = match len_op.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) if n >= 0 && arity_fits(n as usize) => n as usize,
             _ => return None,
@@ -7757,6 +7757,7 @@ mod portal_frame_chain_tests {
                 "an open pair at the loop header is a missing virtual_ref_finish",
             );
 
+            let vref_pos = ctx.opref_for_optimizer(vref);
             let tree_loop = ctx.into_tree_loop();
             let opcodes: Vec<OpCode> = tree_loop.ops.iter().map(|op| op.opcode).collect();
             assert_eq!(
@@ -7776,7 +7777,7 @@ mod portal_frame_chain_tests {
                 ],
             );
             let finish = tree_loop.ops.last().unwrap();
-            assert_eq!(finish.arg(0).to_opref(), vref);
+            assert_eq!(finish.arg(0).to_opref(), vref_pos);
             // `frame_vref()` ahead of the finish is the non-null second operand.
             assert_eq!(finish.arg(1).to_opref() == frame, got_exception);
         }
@@ -11601,7 +11602,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A declined inline discards them along with the callee body, so measure
     // its lifetime before emitting the frame rather than at body entry.
     let callee_entry_pos = ctx.trace_ctx.get_trace_position();
-    let callee_entry_trace_index = callee_entry_pos._index;
+    let callee_entry_trace_index = callee_entry_pos._box_id;
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
     // did-not-inline answer, which every caller follows to the ordinary
@@ -20010,7 +20011,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     parents.push(send_ex_tail);
     // CALL-site stamps before `enter`, matching `try_walker_inline_user_call`.
     let portal_site = python_portal_subwalk_site(ctx, op.pc, parent_inline_subwalk);
-    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._box_id;
     // `newframe(portal_code, greenkey)` (`pyjitpl.py`): greens are
     // `[next_instr, is_being_profiled, pycode]`. A function CALL
     // enters at bytecode 0; this resume enters at `resume_py_pc`.
@@ -20892,10 +20893,11 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
-    // Value-producing boxes are numbered by opencoder `_index` (`OpRef::RefOp`
-    // `raw()`); `_count` also counts voids, so a store into a region-fresh
-    // allocation would fail `obj.raw() >= from` and residualize the dunder.
-    let region_from = ctx.trace_ctx.get_trace_position()._index;
+    // Value-producing boxes are numbered by never-rewound box id
+    // (`Trace.next_box_id` / `OpRef::RefOp` `raw()`). `_index` is reused
+    // by a cut, so a store into a region-fresh allocation would fail
+    // `obj.raw() >= from` and residualize the dunder.
+    let region_from = ctx.trace_ctx.get_trace_position()._box_id;
     let session = ctx.session;
     // The last-arm decision stands on the other operand's type still resolving
     // no further `_invoke_binop` impl; only its version tag witnesses that, and
@@ -21256,10 +21258,11 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
-    // Value-producing boxes are numbered by opencoder `_index` (`OpRef::RefOp`
-    // `raw()`); `_count` also counts voids, so a store into a region-fresh
-    // allocation would fail `obj.raw() >= from` and residualize the dunder.
-    let region_from = ctx.trace_ctx.get_trace_position()._index;
+    // Value-producing boxes are numbered by never-rewound box id
+    // (`Trace.next_box_id` / `OpRef::RefOp` `raw()`). `_index` is reused
+    // by a cut, so a store into a region-fresh allocation would fail
+    // `obj.raw() >= from` and residualize the dunder.
+    let region_from = ctx.trace_ctx.get_trace_position()._box_id;
     let session = ctx.session;
     let rewind_guard = BinopRewindInlineGuard::enter(session, region_from);
     let descent = try_walker_inline_resolved_user_call(
@@ -23587,14 +23590,6 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             .expect("residual sub-walk missed the parent step boundary");
                         trace_ctx.cut_trace_with_snapshots(position);
                         *trace_ctx.heap_cache_mut() = heap_cache;
-                        // The clone is taken at suspend, after the residual
-                        // preamble recorded. `cut_trace_with_snapshots`
-                        // already dropped dead boxes on the pre-restore
-                        // cache; this clone still names those TAGBOX
-                        // indices (`history.cut` / unique `*FrontendOp`).
-                        trace_ctx
-                            .heap_cache_mut()
-                            .drop_dead_frontend_ops(position._index);
                     }
                     {
                         let frame = self
@@ -23966,7 +23961,7 @@ pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
 ) -> Option<InlineFrameGuard<'sess>> {
     let mut level = level?;
     super::resume_snapshot::refresh_helper_level(ctx, &mut level);
-    level.entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    level.entry_trace_index = ctx.trace_ctx.get_trace_position()._box_id;
     if subwalk_driver_is_active() {
         let mut session = ctx.session.borrow_mut();
         debug_assert!(
@@ -24778,6 +24773,7 @@ mod subwalk_checkpoint_tests {
             _index: 0,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
+            _box_id: 0,
         };
         let heap_cache = majit_metainterp::heapcache::HeapCache::new();
         for (opname, keeps_checkpoint) in [
@@ -24849,6 +24845,7 @@ mod subwalk_checkpoint_tests {
             _index: 0,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
+            _box_id: 0,
         };
         note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", 7, position);
         assert_eq!(exchange.completed_cursor, 0);
@@ -24908,6 +24905,7 @@ mod subwalk_checkpoint_tests {
                 _index: 3,
                 snapshot_data_len: 4,
                 snapshot_array_data_len: 5,
+                _box_id: 0,
             },
             promote_journal_before: 6,
             len_before: 9,

@@ -1768,7 +1768,9 @@ pub(crate) enum Box {
 }
 
 impl Box {
-    /// Convenience: `Box::ResOp(opref.raw())`.
+    /// Convenience: `Box::ResOp(opref.raw())`. Tests that mint OpRefs as
+    /// positions pass that payload; a live front-end box must go through
+    /// `Trace::position_of` (`FrontendOp.get_position`).
     #[inline]
     #[cfg(test)]
     pub(crate) fn of_op(op: majit_ir::OpRef) -> Self {
@@ -2186,6 +2188,7 @@ impl Trace {
             _index: self._index,
             snapshot_data_len: self._snapshot_data.len(),
             snapshot_array_data_len: self._snapshot_array_data.len(),
+            _box_id: 0,
         }
     }
 
@@ -2647,6 +2650,7 @@ impl Trace {
         after_residual_call: bool,
         is_last: bool,
         patch_guard_descr: bool,
+        box_position: &dyn Fn(majit_ir::OpRef) -> u32,
     ) -> i64 {
         self._total_snapshots += 1;
         // opencoder.py:769 frame.get_list_of_active_boxes(False, ...).
@@ -2659,6 +2663,7 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
+            box_position,
         );
         // opencoder.py:771-780 — write vable / vref arrays, then the
         // snapshot record. `s` captures the snapshot_data offset
@@ -2701,6 +2706,7 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         is_last: bool,
+        box_position: &dyn Fn(majit_ir::OpRef) -> u32,
     ) -> i64 {
         self._total_snapshots += 1;
         let array = frame.get_list_of_active_boxes(
@@ -2710,6 +2716,7 @@ impl Trace {
             op_live,
             all_liveness,
             /* after_residual_call */ false,
+            box_position,
         );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
@@ -2748,6 +2755,7 @@ impl Trace {
             all_liveness,
             after_residual_call,
             true,
+            &|r| r.raw(),
         )
     }
 
@@ -2765,6 +2773,7 @@ impl Trace {
         all_liveness: &[u8],
         after_residual_call: bool,
         patch_guard_descr: bool,
+        box_position: &dyn Fn(majit_ir::OpRef) -> u32,
     ) -> i64 {
         // opencoder.py `n = len(framestack) - 1`.
         let framestack_len = framestack.len();
@@ -2785,6 +2794,7 @@ impl Trace {
                     after_residual_call,
                     /* is_last */ n == 0,
                     patch_guard_descr,
+                    box_position,
                 )
             };
             // opencoder.py self._ensure_parent_resumedata(framestack, n).
@@ -2796,6 +2806,7 @@ impl Trace {
                 clear_result_register,
                 op_live,
                 all_liveness,
+                box_position,
             );
             result
         } else {
@@ -2827,6 +2838,7 @@ impl Trace {
         clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
+        box_position: &dyn Fn(majit_ir::OpRef) -> u32,
     ) {
         let mut n = n;
         while n > 0 {
@@ -2846,6 +2858,7 @@ impl Trace {
                     op_live,
                     all_liveness,
                     is_last,
+                    box_position,
                 )
             };
             // opencoder.py `target.parent_snapshot = s`.

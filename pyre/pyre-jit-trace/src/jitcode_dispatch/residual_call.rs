@@ -5246,7 +5246,7 @@ fn outermost_helper_entry_trace_index<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sy
 }
 
 /// Whether `opref` is a `new*` result recorded at or after `entry_index`
-/// (`opencoder.py Trace._index` / `OpRef::op_typed`).
+/// (`Trace.next_box_id` watermark / `FrontendOp` identity).
 pub(crate) fn opref_allocated_after(opref: OpRef, entry_index: u32) -> bool {
     match opref {
         OpRef::RefOp(pos) | OpRef::IntOp(pos) | OpRef::FloatOp(pos) => pos >= entry_index,
@@ -7385,7 +7385,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // subwalk declines, so it is not an effect the cut leaves behind.
         let rerun_safe_in_subwalk = !entered_frame
             && ctx.fbw_mode.subwalk_floor.is_some_and(|floor| {
-                residual_rerun_safe_after_floor(ctx, call_descr, func_ptr, allboxes, floor._index)
+                residual_rerun_safe_after_floor(ctx, call_descr, func_ptr, allboxes, floor._box_id)
             });
         if !rerun_safe_in_subwalk {
             fbw_bump_executed_effect("residual");

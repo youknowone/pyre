@@ -1184,6 +1184,13 @@ impl TraceCtx {
         HeapCacheView::new(&self.heap_cache, &self.recorder)
     }
 
+    /// `heapcache.py` `arraylen` whose result is still the live FrontendOp.
+    pub fn heapcache_arraylen(&self, array: OpRef) -> Option<OpRef> {
+        self.heap_cache()
+            .arraylen(array)
+            .filter(|&b| self.recorder.frontend_value_box_is_live(b))
+    }
+
     /// Mutable access to the tracing-time heap cache.
     pub fn heap_cache_mut(&mut self) -> HeapCacheViewMut<'_> {
         HeapCacheViewMut::new(&mut self.heap_cache, &mut self.recorder)
@@ -1710,8 +1717,10 @@ impl TraceCtx {
             _ => return None,
         };
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache_mut()
-            .getarrayitem_cache(array, index_value, descr, oracle)
+        let cached = self
+            .heap_cache_mut()
+            .getarrayitem_cache(array, index_value, descr, oracle);
+        cached.filter(|&b| self.recorder.frontend_value_box_is_live(b))
     }
 
     /// heapcache.py `setarrayitem` parity.  `None` index_value
@@ -1764,8 +1773,12 @@ impl TraceCtx {
             return None;
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache_mut()
-            .getfield_cached(obj, field_index, oracle)
+        let cached = self
+            .heap_cache_mut()
+            .getfield_cached(obj, field_index, oracle);
+        // HeapCache keeps the row across `cut` (`history.py` `History.cut`).
+        // A discarded FrontendOp is not a recording operand.
+        cached.filter(|&b| self.recorder.frontend_value_box_is_live(b))
     }
 
     /// heapcache.py `setfield` parity.  Same canonicalisation
@@ -3338,7 +3351,7 @@ impl TraceCtx {
                 }
             }
         } else {
-            OcBox::of_op(opref)
+            OcBox::ResOp(self.recorder.position_of(opref))
         }
     }
 
@@ -3455,7 +3468,7 @@ impl TraceCtx {
             return false;
         }
         // Byte-mode `ops` is empty until materialize. `opcode_of` reads
-        // FrontendSlots by `_index` / `_count` (`history.py getopnum`).
+        // the value FrontendOp by box id (`history.py getopnum`).
         self.recorder
             .opcode_of(r)
             .is_some_and(|op| op.result_type() == Type::Void)
@@ -5500,10 +5513,11 @@ impl TraceCtx {
     /// Byte-mode traces keep the producer in a frontend slot;
     /// `get_op_by_raw_pos` answers after the op has been materialized.
     pub fn ref_getfield_gc_r(&self, opref: OpRef) -> Option<(DescrRef, OpRef)> {
-        if let Some(pair) = self.recorder.getfield_gc_r_at(opref.raw()) {
+        let position = self.recorder.position_of(opref);
+        if let Some(pair) = self.recorder.getfield_gc_r_at(position) {
             return Some(pair);
         }
-        let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
+        let op = self.recorder.get_op_by_raw_pos(position)?;
         if op.opcode != OpCode::GetfieldGcR {
             return None;
         }
@@ -5522,10 +5536,11 @@ impl TraceCtx {
         if depth == 0 {
             return None;
         }
-        let (descr, obj) = if let Some(pair) = self.recorder.getfield_gc_r_at(opref.raw()) {
+        let position = self.recorder.position_of(opref);
+        let (descr, obj) = if let Some(pair) = self.recorder.getfield_gc_r_at(position) {
             pair
         } else {
-            let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
+            let op = self.recorder.get_op_by_raw_pos(position)?;
             if !matches!(op.opcode, OpCode::GetfieldGcR) {
                 return None;
             }
@@ -8131,7 +8146,7 @@ impl TraceCtx {
         concrete: Option<Value>,
         last_exc_value: i64,
     ) -> OpRef {
-        if let Some(cached_len) = self.heap_cache().arraylen(array_opref) {
+        if let Some(cached_len) = self.heapcache_arraylen(array_opref) {
             // pyjitpl.py:763 profiler.count_ops(rop.ARRAYLEN_GC, HEAPCACHED_OPS).
             self.profiler()
                 .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
@@ -8241,7 +8256,7 @@ impl TraceCtx {
             // and stamp the length it read. An unstamped `ArraylenGc`
             // leaves `goto_if_not` with no int (`GotoIfNotValueNotConcrete`).
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
-            let len_concrete = if self.heap_cache().arraylen(array_opref).is_some() {
+            let len_concrete = if self.heapcache_arraylen(array_opref).is_some() {
                 None
             } else {
                 self.executed_nonstandard_arraylen(
@@ -8626,7 +8641,7 @@ mod tests {
     }
 
     /// M1: non-constant OpRefs (inputargs + recorded op results) map
-    /// straight to Box::ResOp(opref.raw()).  No constant-pool lookup.
+    /// to Box::ResOp(`FrontendOp.get_position`).  No constant-pool lookup.
     #[test]
     fn test_opref_to_box_non_constant_m1() {
         let mut ctx = TraceCtx::for_test(2);
@@ -8635,7 +8650,10 @@ mod tests {
         let add = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
         assert_eq!(ctx.opref_to_box(i0), OcBox::ResOp(0));
         assert_eq!(ctx.opref_to_box(i1), OcBox::ResOp(1));
-        assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
+        assert_eq!(
+            ctx.opref_to_box(add),
+            OcBox::ResOp(ctx.recorder.position_of(add))
+        );
     }
 
     #[test]
@@ -10117,13 +10135,13 @@ mod tests {
         );
         ctx.emit_force_virtualizable(&fd, vable);
 
-        let tokenbox = OpRef::ref_op(1);
+        let tokenbox = ctx.recorder.live_opref_at(1);
         assert_eq!(ctx.opcode_of(tokenbox), Some(OpCode::GetfieldGcR));
         assert_eq!(
             ctx.box_value(tokenbox),
             Some(Value::Ref(majit_ir::GcRef(token))),
         );
-        let condbox = OpRef::int_op(2);
+        let condbox = ctx.recorder.live_opref_at(2);
         assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
         assert_eq!(ctx.box_value(condbox), Some(Value::Int(1)));
     }
@@ -10173,7 +10191,7 @@ mod tests {
             0xF0CED,
             "do_cond_call must invoke clear_vable_ptr when the token is non-null",
         );
-        let condbox = OpRef::int_op(2);
+        let condbox = ctx.recorder.live_opref_at(2);
         assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
         assert_eq!(ctx.box_value(condbox), Some(Value::Int(1)));
     }
@@ -10220,7 +10238,7 @@ mod tests {
             0,
             "do_cond_call must not invoke clear_vable_ptr when the token is null",
         );
-        let condbox = OpRef::int_op(2);
+        let condbox = ctx.recorder.live_opref_at(2);
         assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
         assert_eq!(ctx.box_value(condbox), Some(Value::Int(0)));
     }

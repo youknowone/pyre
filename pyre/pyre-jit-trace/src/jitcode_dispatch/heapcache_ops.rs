@@ -189,8 +189,8 @@ fn walker_execute_gc_store<Sym: WalkSym>(
 /// `heapcache.py` `HF_SEEN_ALLOCATION` / `new` marks a box this walk allocated.
 /// `FbwWalkMode::subwalk_floor` is the innermost re-run region's rewind
 /// (`cut_declined_subwalk` / `History.cut`).  An allocation whose
-/// `OpRef::RefOp` `raw()` is before that `_index`
-/// (`opencoder.py Trace._index` / [`residual_call::opref_allocated_after`])
+/// `OpRef::RefOp` `raw()` is before that `_box_id` watermark
+/// (`Trace.next_box_id` / [`residual_call::opref_allocated_after`])
 /// survives the cut, so the store is journaled like a pre-existing object's.
 fn store_into_pre_floor_allocation<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
@@ -198,7 +198,7 @@ fn store_into_pre_floor_allocation<Sym: WalkSym>(
 ) -> bool {
     ctx.fbw_mode
         .subwalk_floor
-        .is_some_and(|floor| !residual_call::opref_allocated_after(obj, floor._index))
+        .is_some_and(|floor| !residual_call::opref_allocated_after(obj, floor._box_id))
 }
 
 /// A recorded store — or a recorded `COND_CALL` whose condition held — the
