@@ -497,7 +497,7 @@ impl FunDecl {
         {
             return;
         }
-        if !body.body.iter().any(block_raw_has_global) {
+        if !body.body().iter().any(block_raw_has_global) {
             return;
         }
         splice_promoted_reads(body, table, true);
@@ -524,78 +524,81 @@ impl FunDecl {
             table_ids.sort_unstable();
         }
         let mut consumed: Vec<usize> = Vec::new();
-        for i in 0..body.body.len() {
-            let raw = body.body[i].terminator.kind.get();
-            if raw_variant_name(raw) != Some("Call") {
-                continue;
+        let body_span = body.span.clone();
+        {
+            let blocks = body.body_mut();
+            for i in 0..blocks.len() {
+                let raw = blocks[i].terminator.kind.get();
+                if raw_variant_name(raw) != Some("Call") {
+                    continue;
+                }
+                if !raw_fun_ids(raw.as_bytes())
+                    .any(|fun_id| table_ids.binary_search(&fun_id).is_ok())
+                {
+                    continue;
+                }
+                let kind = blocks[i].terminator.kind_value().clone();
+                let Some(call_term) = kind.get("Call") else {
+                    continue;
+                };
+                let Some(inner) = call_term.get("call") else {
+                    continue;
+                };
+                let Some(fun_id) = inner
+                    .get("func")
+                    .and_then(|f| f.get("Regular"))
+                    .and_then(|r| r.get("kind"))
+                    .and_then(|k| k.get("Fun"))
+                    .and_then(Value::as_u64)
+                else {
+                    continue;
+                };
+                let Some((_, op)) = table.iter().copied().find(|(id, _)| *id == fun_id) else {
+                    continue;
+                };
+                let Some(args) = inner.get("args").and_then(Value::as_array) else {
+                    continue;
+                };
+                if args.len() != 2 {
+                    continue;
+                }
+                let Some(dest) = call_term.get("dest") else {
+                    continue;
+                };
+                let Some(target) = call_term.get("target").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let dest = dest.clone();
+                let arg0 = args[0].clone();
+                let arg1 = args[1].clone();
+                let span = blocks[i]
+                    .terminator
+                    .span
+                    .clone()
+                    .unwrap_or_else(|| body_span.clone());
+                let assign = serde_json::json!({
+                    "Assign": [dest, {"BinaryOp": [op, arg0, arg1]}]
+                });
+                blocks[i].statements.push(statement_from_kind(assign, span));
+                let target_idx = target as usize;
+                let new_term = if target_idx < blocks.len()
+                    && blocks[target_idx].statements.is_empty()
+                    && raw_variant_name(blocks[target_idx].terminator.kind.get()) == Some("Assert")
+                {
+                    consumed.push(target_idx);
+                    blocks[target_idx].terminator.kind_value().clone()
+                } else {
+                    serde_json::json!({"Goto": {"target": target}})
+                };
+                blocks[i].set_terminator_kind(new_term);
             }
-            if !raw_fun_ids(raw.as_bytes()).any(|fun_id| table_ids.binary_search(&fun_id).is_ok()) {
-                continue;
-            }
-            let kind = body.body[i].terminator.kind_value().clone();
-            let Some(call_term) = kind.get("Call") else {
-                continue;
-            };
-            let Some(inner) = call_term.get("call") else {
-                continue;
-            };
-            let Some(fun_id) = inner
-                .get("func")
-                .and_then(|f| f.get("Regular"))
-                .and_then(|r| r.get("kind"))
-                .and_then(|k| k.get("Fun"))
-                .and_then(Value::as_u64)
-            else {
-                continue;
-            };
-            let Some((_, op)) = table.iter().copied().find(|(id, _)| *id == fun_id) else {
-                continue;
-            };
-            let Some(args) = inner.get("args").and_then(Value::as_array) else {
-                continue;
-            };
-            if args.len() != 2 {
-                continue;
-            }
-            let Some(dest) = call_term.get("dest") else {
-                continue;
-            };
-            let Some(target) = call_term.get("target").and_then(Value::as_u64) else {
-                continue;
-            };
-            let dest = dest.clone();
-            let arg0 = args[0].clone();
-            let arg1 = args[1].clone();
-            let span = body.body[i]
-                .terminator
-                .span
-                .clone()
-                .unwrap_or_else(|| body.span.clone());
-            let assign = serde_json::json!({
-                "Assign": [dest, {"BinaryOp": [op, arg0, arg1]}]
-            });
-            body.body[i]
-                .statements
-                .push(statement_from_kind(assign, span));
-            let target_idx = target as usize;
-            let new_term = if target_idx < body.body.len()
-                && body.body[target_idx].statements.is_empty()
-                && raw_variant_name(body.body[target_idx].terminator.kind.get()) == Some("Assert")
-            {
-                consumed.push(target_idx);
-                body.body[target_idx].terminator.kind_value().clone()
-            } else {
-                serde_json::json!({"Goto": {"target": target}})
-            };
-            body.body[i].set_terminator_kind(new_term);
         }
-        body.clear_cfg_cache();
         if consumed.is_empty() {
             return;
         }
-        let len = body.body.len();
+        let len = body.body().len();
         let mut preds = vec![0u32; len];
-        for bb in &body.body {
+        for bb in body.body() {
             let mut kind: Value = serde_json::from_str(bb.terminator.kind.get())
                 .expect("raw kind is a parsed JSON value");
             for_each_term_kind_block_index(&mut kind, &mut |slot| {
@@ -615,7 +618,7 @@ impl FunDecl {
         }
         let mut old_to_new = vec![None; len];
         let mut kept = Vec::with_capacity(len);
-        for (i, bb) in std::mem::take(&mut body.body).into_iter().enumerate() {
+        for (i, bb) in std::mem::take(body.body_mut()).into_iter().enumerate() {
             if removed[i] {
                 continue;
             }
@@ -638,8 +641,7 @@ impl FunDecl {
                 bb.set_terminator_kind_raw(&kind);
             }
         }
-        body.body = kept;
-        body.clear_cfg_cache();
+        *body.body_mut() = kept;
     }
 }
 
@@ -650,7 +652,7 @@ impl FunDecl {
 /// original return block stays and may become unreachable.
 pub fn duplicate_return(body: &mut Unstructured) {
     let return_stmts: Vec<Option<Vec<Statement>>> = body
-        .body
+        .body()
         .iter()
         .map(|bb| {
             if raw_variant_name(bb.terminator.kind.get()) == Some("Return") {
@@ -663,9 +665,10 @@ pub fn duplicate_return(body: &mut Unstructured) {
     if return_stmts.iter().all(Option::is_none) {
         return;
     }
-    for i in 0..body.body.len() {
+    let blocks = body.body_mut();
+    for i in 0..blocks.len() {
         let target = {
-            let raw = body.body[i].terminator.kind.get();
+            let raw = blocks[i].terminator.kind.get();
             if raw_variant_name(raw) != Some("Goto") {
                 continue;
             }
@@ -680,10 +683,9 @@ pub fn duplicate_return(body: &mut Unstructured) {
         let Some(stmts) = return_stmts.get(target as usize).and_then(|s| s.as_ref()) else {
             continue;
         };
-        body.body[i].statements.extend_from_slice(stmts);
-        body.body[i].set_terminator_kind(serde_json::Value::String("Return".into()));
+        blocks[i].statements.extend_from_slice(stmts);
+        blocks[i].set_terminator_kind(serde_json::Value::String("Return".into()));
     }
-    body.clear_cfg_cache();
 }
 
 /// The variant name of a raw enum value: `"Return"` -> `Return`,
@@ -2731,10 +2733,10 @@ struct CfgCache {
 #[derive(Debug, Deserialize)]
 pub struct Unstructured {
     pub locals: Locals,
-    pub body: Vec<BasicBlock>,
+    body: Vec<BasicBlock>,
     pub span: SpanRef,
-    /// Forward / lowered reachability of this block list. A clone and
-    /// any terminator rewrite start empty.
+    /// Forward / lowered reachability of this block list.
+    /// A clone starts empty and `body_mut` drops it.
     #[serde(skip)]
     cfg: CfgCache,
 }
@@ -2752,10 +2754,17 @@ impl Clone for Unstructured {
 }
 
 impl Unstructured {
-    /// Drop cached reachability. Block-list and terminator rewrites
-    /// call this so the next scan walks the new CFG.
-    pub fn clear_cfg_cache(&mut self) {
+    /// The block list.
+    pub fn body(&self) -> &[BasicBlock] {
+        &self.body
+    }
+
+    /// The block list for rewriting. Cached reachability is dropped here:
+    /// while the returned borrow lives no mask can be read, so the next
+    /// scan always walks the rewritten CFG.
+    pub fn body_mut(&mut self) -> &mut Vec<BasicBlock> {
         self.cfg = CfgCache::default();
+        &mut self.body
     }
 
     /// Blocks reachable from bb0 along every normal edge, including a
@@ -2903,17 +2912,17 @@ impl BasicBlock {
 /// original indices (`FunDecl::unstructured`) and walks
 /// `forward_reachable_mask` instead.
 pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
-    if !body.body.iter().any(|bb| bb.is_cleanup) {
+    if !body.body().iter().any(|bb| bb.is_cleanup) {
         return body;
     }
     // bb0 is the entry; a cleanup there would move another block to 0.
-    if body.body.first().is_some_and(|bb| bb.is_cleanup)
-        || kept_block_normal_successor_is_cleanup(&body.body)
+    if body.body().first().is_some_and(|bb| bb.is_cleanup)
+        || kept_block_normal_successor_is_cleanup(body.body())
     {
         return body;
     }
 
-    let blocks = std::mem::take(&mut body.body);
+    let blocks = std::mem::take(body.body_mut());
     let mut old_to_new = vec![None; blocks.len()];
     let mut kept = Vec::with_capacity(blocks.len());
     let mut first_cleanup_span = None;
@@ -2946,8 +2955,7 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
         is_cleanup: false,
         term_cache: OnceLock::new(),
     });
-    body.body = kept;
-    body.clear_cfg_cache();
+    *body.body_mut() = kept;
     body
 }
 
@@ -3103,10 +3111,10 @@ fn is_return_terminator(kind: &Value) -> bool {
 }
 
 fn promoted_init_from_body(u: &Unstructured) -> Option<PromotedInit> {
-    if u.body.len() != 1 {
+    if u.body().len() != 1 {
         return None;
     }
-    let bb = &u.body[0];
+    let bb = &u.body()[0];
     if !is_return_terminator(bb.terminator.kind_value()) {
         return None;
     }
@@ -3189,7 +3197,7 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedRead>]
     };
     let body_span = body.span.clone();
     let mut str_rewrites = Vec::new();
-    for bb in &mut body.body {
+    for bb in body.body_mut() {
         if !block_raw_has_global(bb) {
             continue;
         }
@@ -3246,7 +3254,6 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedRead>]
     if !str_rewrites.is_empty() {
         forward_str_literal_temps(body, &str_rewrites);
     }
-    body.clear_cfg_cache();
 }
 
 fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
@@ -3382,7 +3389,7 @@ fn forward_str_literal_temps(body: &mut Unstructured, rewrites: &[(u64, Value)])
         return;
     }
 
-    for (bi, bb) in body.body.iter().enumerate() {
+    for (bi, bb) in body.body().iter().enumerate() {
         for (si, st) in bb.statements.iter().enumerate() {
             record_raw_local_mentions(
                 st.kind.get(),
@@ -3434,7 +3441,7 @@ fn forward_str_literal_temps(body: &mut Unstructured, rewrites: &[(u64, Value)])
         });
     }
 
-    for (bi, bb) in body.body.iter_mut().enumerate() {
+    for (bi, bb) in body.body_mut().iter_mut().enumerate() {
         let mut i = 0;
         bb.statements.retain(|st| {
             let raw = st.kind.get();
@@ -3484,8 +3491,8 @@ fn local_id_at(bytes: &[u8], mut i: usize) -> Option<u64> {
 
 fn kind_at(body: &Unstructured, loc: KindLoc) -> &Value {
     match loc.stmt {
-        Some(i) => body.body[loc.block].statements[i].kind_value(),
-        None => body.body[loc.block].terminator.kind_value(),
+        Some(i) => body.body()[loc.block].statements[i].kind_value(),
+        None => body.body()[loc.block].terminator.kind_value(),
     }
 }
 
@@ -3512,7 +3519,7 @@ fn replace_str_temp_use_at(
 ) -> bool {
     match loc.stmt {
         Some(i) => {
-            let stmt = &mut body.body[loc.block].statements[i];
+            let stmt = &mut body.body_mut()[loc.block].statements[i];
             let mut kind = stmt.kind_value().clone();
             if !replace_move_or_copy_operand(&mut kind, n, const_operand) {
                 return false;
@@ -3521,7 +3528,7 @@ fn replace_str_temp_use_at(
             true
         }
         None => {
-            let bb = &mut body.body[loc.block];
+            let bb = &mut body.body_mut()[loc.block];
             let mut kind = bb.terminator.kind_value().clone();
             if !replace_move_or_copy_operand(&mut kind, n, const_operand) {
                 return false;
@@ -5438,27 +5445,27 @@ mod tests {
             bb(serde_json::json!("UnwindTerminate"), true, 0),
         ]);
         let body = decl.unstructured().expect("Unstructured body");
-        assert_eq!(body.body.len(), 7);
-        assert_eq!(call_edges(&body.body[0]), (1, 3));
-        assert_eq!(drop_edges(&body.body[1]), (2, 4));
+        assert_eq!(body.body().len(), 7);
+        assert_eq!(call_edges(&body.body()[0]), (1, 3));
+        assert_eq!(drop_edges(&body.body()[1]), (2, 4));
         assert_eq!(
-            body.body[2].terminator.kind_value(),
+            body.body()[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
-        assert!(body.body[3].is_cleanup);
-        assert_eq!(drop_edges(&body.body[3]), (5, 6));
+        assert!(body.body()[3].is_cleanup);
+        assert_eq!(drop_edges(&body.body()[3]), (5, 6));
         assert!(matches!(
-            body.body[3].terminator.span,
+            body.body()[3].terminator.span,
             Some(SpanRef::Deduplicated(7))
         ));
-        assert!(body.body[4].is_cleanup);
+        assert!(body.body()[4].is_cleanup);
         assert_eq!(
-            body.body[4].terminator.kind_value(),
+            body.body()[4].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
         );
-        assert!(body.body[5].is_cleanup);
+        assert!(body.body()[5].is_cleanup);
         assert_eq!(
-            body.body[6].terminator.kind_value(),
+            body.body()[6].terminator.kind_value(),
             &serde_json::json!("UnwindTerminate")
         );
     }
@@ -5577,27 +5584,29 @@ mod tests {
             .unwrap()
             .unstructured()
             .expect("subject body");
-        assert_eq!(body.body.len(), 4);
-        assert!(body.body[0].is_cleanup && body.body[1].is_cleanup && body.body[3].is_cleanup);
-        assert!(!body.body[2].is_cleanup);
+        assert_eq!(body.body().len(), 4);
+        assert!(
+            body.body()[0].is_cleanup && body.body()[1].is_cleanup && body.body()[3].is_cleanup
+        );
+        assert!(!body.body()[2].is_cleanup);
         assert_eq!(
-            body.body[0].terminator.kind_value(),
+            body.body()[0].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
         assert_eq!(
-            body.body[1].terminator.kind_value(),
+            body.body()[1].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
         );
         assert_eq!(
-            body.body[3].terminator.kind_value(),
+            body.body()[3].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
         assert!(
-            body.body[2].statements.len() > 1,
+            body.body()[2].statements.len() > 1,
             "promoted read should splice initializer statements"
         );
         assert!(
-            body.body[2]
+            body.body()[2]
                 .statements
                 .iter()
                 .all(|st| !st.kind.get().contains("\"Global\"")),
@@ -5757,8 +5766,8 @@ mod tests {
 
     fn assert_str_literal_const_assign(llbc: &crate::Llbc, body: &Unstructured) {
         assert!(llbc.global_by_id(0).is_none());
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(place, Rvalue::Aggregate(_, operands)) => {
                 assert!(matches!(place.kind, PlaceKind::Local(0)));
                 assert_eq!(operands.len(), 1);
@@ -5799,7 +5808,7 @@ mod tests {
             .expect("raw body");
         let mut u = serde_json::from_value::<Unstructured>(raw["Unstructured"].clone())
             .expect("unstructured");
-        match u.body[0].statements[1].stmt_kind().expect("typed") {
+        match u.body()[0].statements[1].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::Ref { .. }) => {}
             other => panic!("expected Assign(_, Ref {{ .. }}), got {other:?}"),
         }
@@ -5817,7 +5826,7 @@ mod tests {
             .expect("subject body");
         let mut saw_def = false;
         let mut saw_agg = false;
-        for stmt in &body.body[0].statements {
+        for stmt in &body.body()[0].statements {
             match stmt.stmt_kind().expect("typed") {
                 StmtKind::StorageLive(1) | StmtKind::StorageDead(1) => {}
                 StmtKind::Assign(place, Rvalue::Use(Operand::Const(expr), _)) => {
@@ -5856,8 +5865,8 @@ mod tests {
             .unwrap()
             .unstructured()
             .expect("subject body");
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(place, Rvalue::Aggregate(_, operands)) => {
                 assert!(matches!(place.kind, PlaceKind::Local(0)));
                 assert_eq!(operands.len(), 2);
@@ -5899,11 +5908,11 @@ mod tests {
             }),
         ]);
         let body = decl.unstructured().expect("Unstructured body");
-        assert_eq!(body.body.len(), 3);
-        assert_eq!(call_edges(&body.body[0]), (1, 2));
-        assert_eq!(drop_edges(&body.body[1]), (2, 2));
+        assert_eq!(body.body().len(), 3);
+        assert_eq!(call_edges(&body.body()[0]), (1, 2));
+        assert_eq!(drop_edges(&body.body()[1]), (2, 2));
         assert_eq!(
-            body.body[2].terminator.kind_value(),
+            body.body()[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
     }
@@ -5982,15 +5991,15 @@ mod tests {
         // FunDecl::unstructured keeps cleanup blocks. The public strip
         // still rewrites a Panic on_unwind onto the terminal resume.
         let body = strip_cleanup_blocks(decl.unstructured().expect("Unstructured body"));
-        assert_eq!(body.body.len(), 3);
-        let panic = body.body[0].terminator.kind_value().get("Panic").unwrap();
+        assert_eq!(body.body().len(), 3);
+        let panic = body.body()[0].terminator.kind_value().get("Panic").unwrap();
         assert_eq!(panic.get("on_unwind").and_then(Value::as_u64).unwrap(), 2);
         assert_eq!(
-            body.body[1].terminator.kind_value(),
+            body.body()[1].terminator.kind_value(),
             &serde_json::json!("Return")
         );
         assert_eq!(
-            body.body[2].terminator.kind_value(),
+            body.body()[2].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
         );
     }
@@ -6122,27 +6131,35 @@ mod tests {
         let mut body = decl.unstructured().expect("Unstructured body");
         decl.checked_binop_calls = Some(Arc::<[(u64, &'static str)]>::from([(7u64, "AddChecked")]));
         decl.rewrite_checked_binop_calls(&mut body);
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
                 assert_eq!(op, serde_json::json!("AddChecked"));
             }
             other => panic!("expected Assign(_, BinaryOp(AddChecked, ..)), got {other:?}"),
         }
         assert!(
-            body.body[0].terminator.kind_value().get("Assert").is_some(),
+            body.body()[0]
+                .terminator
+                .kind_value()
+                .get("Assert")
+                .is_some(),
             "bb0 terminator should be the target Assert"
         );
-        assert_eq!(body.body.len(), 3);
-        let assert = body.body[0].terminator.kind_value().get("Assert").unwrap();
+        assert_eq!(body.body().len(), 3);
+        let assert = body.body()[0]
+            .terminator
+            .kind_value()
+            .get("Assert")
+            .unwrap();
         assert_eq!(assert.get("target").and_then(Value::as_u64), Some(1));
         assert_eq!(assert.get("on_unwind").and_then(Value::as_u64), Some(2));
         assert_eq!(
-            body.body[1].terminator.kind_value(),
+            body.body()[1].terminator.kind_value(),
             &serde_json::json!("Return")
         );
         assert_eq!(
-            body.body[2].terminator.kind_value(),
+            body.body()[2].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
         );
     }
@@ -6161,36 +6178,40 @@ mod tests {
         let mut body = decl.unstructured().expect("Unstructured body");
         decl.checked_binop_calls = Some(Arc::<[(u64, &'static str)]>::from([(7u64, "AddChecked")]));
         decl.rewrite_checked_binop_calls(&mut body);
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
                 assert_eq!(op, serde_json::json!("AddChecked"));
             }
             other => panic!("expected Assign(_, BinaryOp(AddChecked, ..)), got {other:?}"),
         }
         assert_eq!(
-            body.body[0].terminator.kind_value(),
+            body.body()[0].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
-        assert_eq!(body.body[1].statements.len(), 1);
-        match body.body[1].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[1].statements.len(), 1);
+        match body.body()[1].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
                 assert_eq!(op, serde_json::json!("AddChecked"));
             }
             other => panic!("expected Assign(_, BinaryOp(AddChecked, ..)), got {other:?}"),
         }
         assert!(
-            body.body[1].terminator.kind_value().get("Assert").is_some(),
+            body.body()[1]
+                .terminator
+                .kind_value()
+                .get("Assert")
+                .is_some(),
             "bb1 terminator should be the target Assert"
         );
-        assert_eq!(body.body.len(), fixture_len - 1);
+        assert_eq!(body.body().len(), fixture_len - 1);
         let return_idx = body
-            .body
+            .body()
             .iter()
             .position(|bb| bb.terminator.kind_value() == &serde_json::json!("Return"))
             .expect("Return block");
         assert_eq!(
-            body.body[1]
+            body.body()[1]
                 .terminator
                 .kind_value()
                 .get("Assert")
@@ -6210,23 +6231,27 @@ mod tests {
             bb(serde_json::json!("UnwindResume"), true, 0),
         ]);
         let mut body = decl.unstructured().expect("Unstructured body");
-        let fixture_len = body.body.len();
+        let fixture_len = body.body().len();
         decl.checked_binop_calls = Some(Arc::<[(u64, &'static str)]>::from([(7u64, "AddChecked")]));
         decl.rewrite_checked_binop_calls(&mut body);
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
                 assert_eq!(op, serde_json::json!("AddChecked"));
             }
             other => panic!("expected Assign(_, BinaryOp(AddChecked, ..)), got {other:?}"),
         }
         assert!(
-            body.body[0].terminator.kind_value().get("Assert").is_some(),
+            body.body()[0]
+                .terminator
+                .kind_value()
+                .get("Assert")
+                .is_some(),
             "bb0 terminator should be a copy of the target Assert"
         );
-        assert_eq!(body.body.len(), fixture_len);
+        assert_eq!(body.body().len(), fixture_len);
         assert_eq!(
-            body.body[3].terminator.kind_value(),
+            body.body()[3].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 1}})
         );
     }
@@ -6266,8 +6291,8 @@ mod tests {
             (9u64, "MulChecked"),
         ]));
         decl.rewrite_checked_binop_calls(&mut body);
-        assert_eq!(body.body[0].statements.len(), 1);
-        match body.body[0].statements[0].stmt_kind().expect("typed") {
+        assert_eq!(body.body()[0].statements.len(), 1);
+        match body.body()[0].statements[0].stmt_kind().expect("typed") {
             StmtKind::Assign(_, Rvalue::BinaryOp(op, _, _)) => {
                 assert_eq!(op, serde_json::json!("MulChecked"));
             }
@@ -6308,18 +6333,18 @@ mod tests {
         let mut body = decl.unstructured().expect("Unstructured body");
         duplicate_return(&mut body);
         assert_eq!(
-            body.body[0].terminator.kind_value(),
+            body.body()[0].terminator.kind_value(),
             &serde_json::json!("Return")
         );
         assert_eq!(
-            body.body[1].terminator.kind_value(),
+            body.body()[1].terminator.kind_value(),
             &serde_json::json!({"Goto": {"target": 5}})
         );
         assert_eq!(
-            body.body[2].terminator.kind_value(),
+            body.body()[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
-        match body.body[2]
+        match body.body()[2]
             .statements
             .last()
             .expect("copied statement")
@@ -6330,9 +6355,9 @@ mod tests {
             other => panic!("expected copied StorageLive(0), got {other:?}"),
         }
         assert_eq!(
-            body.body[3].terminator.kind_value(),
+            body.body()[3].terminator.kind_value(),
             &serde_json::json!("Return")
         );
-        assert_eq!(body.body.len(), 6);
+        assert_eq!(body.body().len(), 6);
     }
 }

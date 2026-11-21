@@ -1266,7 +1266,7 @@ fn intern_enums_from_unstructured(
     // are not part of the lowered body. The local-type scan below still
     // sees an instantiation a normal block only reads.
     let forward_blocks = forward_reachable_mask(llbc, u);
-    for (bb_idx, bb) in u.body.iter().enumerate() {
+    for (bb_idx, bb) in u.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1334,7 +1334,7 @@ fn intern_enqueue_generic_calls(
     seen: &mut std::collections::HashSet<(u64, String)>,
 ) {
     let forward_blocks = forward_reachable_mask(llbc, u);
-    for (bb_idx, bb) in u.body.iter().enumerate() {
+    for (bb_idx, bb) in u.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -9486,7 +9486,7 @@ fn lower_fat_dyn_callee(
     if fun_decl_is_dont_look_inside(llbc, decl, dont_look_inside) || !decl.has_unstructured_body() {
         return None;
     }
-    let nblocks = decl.unstructured()?.body.len();
+    let nblocks = decl.unstructured()?.body().len();
     if nblocks == 0 {
         return None;
     }
@@ -9710,7 +9710,7 @@ pub fn residual_rbigint_gc_root_escapes(llbc: &Llbc) -> Vec<(String, String)> {
 fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
     let mut def_count = vec![0usize; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -11126,7 +11126,7 @@ impl std::ops::Index<usize> for MirBlockMap {
 
 fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool {
     matches!(
-        body.body
+        body.body()
             .get(bb as usize)
             .and_then(|block| block.term_ref(llbc).ok()),
         Some(
@@ -11157,8 +11157,8 @@ pub(in crate::front::mir) fn successor_blocks(
     mir_bb: usize,
     include_panic_default: bool,
 ) -> Vec<usize> {
-    let n = body.body.len();
-    let Ok(term) = body.body[mir_bb].term_ref(llbc) else {
+    let n = body.body().len();
+    let Ok(term) = body.body()[mir_bb].term_ref(llbc) else {
         return Vec::new();
     };
     let raw: Vec<u64> = match term {
@@ -11227,7 +11227,7 @@ fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(JsonVal, u64)]) -> b
 }
 
 fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool) -> Vec<bool> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut reached = vec![false; n];
     if n == 0 {
         return reached;
@@ -11261,13 +11261,12 @@ pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bo
 /// run before it from projecting their terminators.
 pub(crate) fn clear_unreachable_blocks(llbc: &Llbc, body: &mut Unstructured) {
     let forward = forward_reachable_mask(llbc, body);
-    for (block, reached) in body.body.iter_mut().zip(forward) {
+    for (block, reached) in body.body_mut().iter_mut().zip(forward) {
         if !reached {
             block.statements = Vec::new();
             block.set_terminator_kind(serde_json::Value::String("UnwindResume".into()));
         }
     }
-    body.clear_cfg_cache();
 }
 
 /// Blocks reachable from bb0 along the edges the lowering emits.

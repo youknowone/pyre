@@ -4969,7 +4969,7 @@ pub(in crate::front::mir) fn slice_next_iters(
     let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5009,7 +5009,7 @@ pub(in crate::front::mir) fn slice_next_iters(
         }
     }
     let mut out = vec![None; n];
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5068,7 +5068,7 @@ pub(in crate::front::mir) fn item_addr_locals(
     let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5560,7 +5560,7 @@ pub(in crate::front::mir) fn body_owner_view_locals(
     let mut w1_call_def = vec![false; n];
     let mut list_call_def = vec![false; n];
     let is_body_local = |dest: usize| dest < n && !(dest >= 1 && dest <= arg_count);
-    for bb in &body.body {
+    for bb in body.body() {
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let PlaceKind::Local(dest) = call.dest.kind
         {
@@ -5611,7 +5611,7 @@ pub(in crate::front::mir) fn body_owner_view_locals(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
                 && let PlaceKind::Local(dest) = call.dest.kind
             {
@@ -5978,7 +5978,7 @@ fn bytes_block_chars_view_locals_with(
     let mut view_prod = vec![false; n];
     let mut non_view = vec![false; n];
     let mut copies: Vec<(usize, usize)> = Vec::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6249,7 +6249,7 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
     // Whole-list `&mut vec` / `&mut vec[..]` is the header word, not a
     // `{ptr, len}` pair. `iter_mut` of that dest still walks the buffer.
     let mut whole_list_mut_dest = vec![false; n];
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -6281,7 +6281,7 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
@@ -6422,7 +6422,7 @@ fn dyn_impl_vtable_desc_strings(
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let n = body.locals.locals.len();
     let mut local_strs = vec![None; n];
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -6441,7 +6441,7 @@ fn dyn_impl_vtable_desc_strings(
             }
         }
     }
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind_ref()
             else {
@@ -6506,7 +6506,7 @@ pub(in crate::front::mir) fn dyn_unsize_src_trait_names(
 fn dyn_fat_pair_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut pair = vec![false; n];
-    for bb in &body.body {
+    for bb in body.body() {
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -6526,7 +6526,7 @@ fn dyn_fat_pair_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -6597,7 +6597,7 @@ fn unregistered_dyn_unsize_local_names(
 ) -> Vec<Option<(String, String)>> {
     let n = body.locals.locals.len();
     let mut names = vec![None; n];
-    for bb in &body.body {
+    for bb in body.body() {
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -6620,7 +6620,7 @@ fn unregistered_dyn_unsize_local_names(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -7022,7 +7022,7 @@ pub(in crate::front::mir) fn raw_array_roles(
     }
     let forward_blocks = forward_reachable_mask(llbc, body);
     let assigns = || {
-        body.body
+        body.body()
             .iter()
             .enumerate()
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
@@ -7127,7 +7127,7 @@ pub(in crate::front::mir) fn raw_array_roles(
         };
         let wanted = group_locals(&roles, storage);
         let mut ok = true;
-        'blocks: for (bb_idx, bb) in body.body.iter().enumerate() {
+        'blocks: for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -7274,7 +7274,7 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
     storage: usize,
 ) -> bool {
     let mut slices = bit_set::BitSet::with_capacity(body.locals.locals.len());
-    for (dest, _, rvalue) in body.body.iter().flat_map(|bb| {
+    for (dest, _, rvalue) in body.body().iter().flat_map(|bb| {
         bb.statements
             .iter()
             .filter_map(|stmt| match stmt.stmt_kind_ref() {
@@ -7305,7 +7305,7 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
     }
     loop {
         let mut changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Use(op, _))) = stmt.stmt_kind_ref() else {
                     continue;
@@ -7327,7 +7327,7 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
         }
     }
     let mut seen_push = false;
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             if mentions_local_outside_raw_array_items(bb.terminator.kind_value(), &slices, roles) {
                 return false;
@@ -7528,7 +7528,7 @@ pub(in crate::front::mir) fn local_is_rust_vec_deref(
     local: usize,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let forward_blocks = forward_reachable_mask(llbc, body);
-    body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+    body.body().iter().enumerate().find_map(|(bb_idx, bb)| {
         if !forward_blocks[bb_idx] {
             return None;
         }
@@ -7559,7 +7559,7 @@ pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(
     watched.insert(local);
     let mut reverses = 0;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -7679,7 +7679,7 @@ fn array_aggregate_operands(rvalue: &Rvalue) -> Option<&[Operand]> {
 fn vec_literal_box_aliases(llbc: &Llbc, body: &Unstructured, start: usize) -> Vec<usize> {
     let forward = forward_reachable_mask(llbc, body);
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward[bb_idx] {
             continue;
         }
@@ -7747,7 +7747,7 @@ pub(in crate::front::mir) fn vec_literal_cluster<'a>(
     let mut saw_new_uninit = false;
     let mut array_ops: Option<&[Operand]> = None;
     let mut into_vec_dest: Option<&TyRef> = None;
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward[bb_idx] {
             continue;
         }

@@ -3973,7 +3973,7 @@ pub(in crate::front::mir) fn const_eq_u8_in_unstructured(
     body: &Unstructured,
 ) -> Option<u8> {
     let mut found = None;
-    for bb in &body.body {
+    for bb in body.body() {
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(_, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind_ref()
             else {

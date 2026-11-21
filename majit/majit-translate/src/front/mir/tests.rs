@@ -160,8 +160,7 @@ mod reachable_mask_tests {
         let cloned = body.clone();
         assert_eq!(forward_reachable_mask(&llbc, &cloned), first);
         let mut rewritten = body;
-        rewritten.body[0].set_terminator_kind(json!("Return"));
-        rewritten.clear_cfg_cache();
+        rewritten.body_mut()[0].set_terminator_kind(json!("Return"));
         assert_eq!(
             forward_reachable_mask(&llbc, &rewritten),
             vec![true, false],
@@ -11036,7 +11035,7 @@ fn array_from_fn_first_call(llbc: &Llbc) -> majit_charon_reader::ullbc::CallPayl
         })
         .expect("from_fn caller");
     let body = fd.unstructured().expect("from_fn caller body");
-    match body.body[0].term(llbc).expect("from_fn terminator") {
+    match body.body()[0].term(llbc).expect("from_fn terminator") {
         TermKind::Call { call, .. } => call,
         other => panic!("expected Call, got {other:?}"),
     }
@@ -44393,7 +44392,7 @@ fn live_arcinner_misd_offsetof_and_subst() {
     let body = crate::front::clause_spec::substituted_unstructured(fd, llbc, &[], &types, &[])
         .expect("substituted deref body");
     let mut field_offs = Vec::new();
-    for bb in &body.body {
+    for bb in body.body() {
         for st in &bb.statements {
             let Ok(majit_charon_reader::ullbc::StmtKind::Assign(_, rv)) = st.stmt_kind() else {
                 continue;

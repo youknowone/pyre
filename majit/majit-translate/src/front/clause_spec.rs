@@ -610,7 +610,7 @@ fn subst_unstructured(
     for local in &mut u.locals.locals {
         local.ty = subst_tyref_with_clauses(&local.ty, llbc, trait_refs, types, const_generics);
     }
-    for block in &mut u.body {
+    for block in u.body_mut() {
         for stmt in &mut block.statements {
             if let Some(kind) =
                 subst_kind_value(stmt.kind.get(), llbc, trait_refs, types, const_generics)
@@ -628,7 +628,6 @@ fn subst_unstructured(
             block.set_terminator_kind(kind);
         }
     }
-    u.clear_cfg_cache();
 }
 
 fn subst_kind_value(
@@ -2674,7 +2673,7 @@ mod tests {
         let copied =
             substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
         let arm =
-            copied.body[0].terminator.kind_value()["Switch"]["data"]["branches"][0][0].clone();
+            copied.body()[0].terminator.kind_value()["Switch"]["data"]["branches"][0][0].clone();
         assert_ne!(arm, type_body, "switch arm resolved as the type body");
         assert!(
             arm == json!({"Deduplicated": 11}) || arm == const_body,
@@ -2684,7 +2683,7 @@ mod tests {
             !value_has_depth0_type_var(&arm),
             "type var leaked into switch arm: {arm}"
         );
-        copied.body[0]
+        copied.body()[0]
             .term(&llbc)
             .expect("switch arm const unresolved");
         assert_eq!(llbc.dedup_body(11), Some(&type_body));
@@ -2724,15 +2723,15 @@ mod tests {
         let u = identity_unstructured(&ty).expect("identity body");
         assert_eq!(u.locals.arg_count, 1);
         assert_eq!(u.locals.locals.len(), 2);
-        assert_eq!(u.body.len(), 1);
-        assert_eq!(u.body[0].statements.len(), 1);
-        let kind = u.body[0].statements[0].kind_value();
+        assert_eq!(u.body().len(), 1);
+        assert_eq!(u.body()[0].statements.len(), 1);
+        let kind = u.body()[0].statements[0].kind_value();
         assert!(
             kind.get("Assign").is_some(),
             "identity assigns the argument to the return local; kind={kind}"
         );
         assert_eq!(
-            u.body[0].terminator.kind.get(),
+            u.body()[0].terminator.kind.get(),
             "\"Return\"",
             "identity terminator is Return"
         );
@@ -2783,11 +2782,11 @@ mod tests {
         let template = fd.unstructured().expect("template");
         let copied =
             substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
-        assert_eq!(copied.body.len(), template.body.len());
-        assert_eq!(copied.body.len(), 2);
-        assert!(!copied.body[0].is_cleanup);
-        assert!(copied.body[1].is_cleanup);
-        assert!(template.body[1].is_cleanup);
+        assert_eq!(copied.body().len(), template.body().len());
+        assert_eq!(copied.body().len(), 2);
+        assert!(!copied.body()[0].is_cleanup);
+        assert!(copied.body()[1].is_cleanup);
+        assert!(template.body()[1].is_cleanup);
     }
 
     /// Type variables live on statement kinds as well as locals. A spec
@@ -2845,7 +2844,7 @@ mod tests {
         let fd = llbc.fn_by_id(0).expect("f");
         let copied = substituted_unstructured(fd, &llbc, &[], &[i64_ty.clone()], &[])
             .expect("substituted body");
-        let kind = copied.body[0].statements[0].kind_value();
+        let kind = copied.body()[0].statements[0].kind_value();
         assert_eq!(
             kind.pointer("/Assign/0/ty"),
             Some(&i64_ty),

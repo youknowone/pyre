@@ -1415,7 +1415,7 @@ pub(in crate::front::mir) fn explicit_drop_is_the_only_move(
     guard: usize,
 ) -> bool {
     let closes: Vec<&majit_charon_reader::ullbc::BasicBlock> = body
-        .body
+        .body()
         .iter()
         .filter(|bb| explicit_drop_guard_local(bb, llbc, name_of) == Some(guard))
         .collect();
@@ -1475,7 +1475,7 @@ pub(in crate::front::mir) fn explicit_drop_temp_of_owned_guard(
     opener: &std::collections::HashMap<usize, usize>,
 ) -> bool {
     let forward_blocks = forward_reachable_mask(llbc, body);
-    body.body.iter().enumerate().any(|(bb_idx, bb)| {
+    body.body().iter().enumerate().any(|(bb_idx, bb)| {
         if !forward_blocks[bb_idx] {
             return false;
         }
@@ -1534,10 +1534,10 @@ pub(in crate::front::mir) fn glue_call_drop_blocks(
     body: &Unstructured,
     llbc: &Llbc,
 ) -> bit_set::BitSet {
-    let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    let mut out = bit_set::BitSet::with_capacity(body.body().len());
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2176,7 +2176,7 @@ impl<'a> RootStackAnalyzer<'a> {
         });
         let covered = owned.covered_blocks(self.llbc, body, &name_of);
         let forward_blocks = forward_reachable_mask(self.llbc, body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -2376,7 +2376,7 @@ pub(in crate::front::mir) fn owned_root_scopes(
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2426,7 +2426,7 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
 ) -> bool {
     let forward_blocks = forward_reachable_mask(llbc, body);
     let mut moved_into_result = bit_set::BitSet::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2446,7 +2446,7 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
         }
     }
     let mut reaching = bit_set::BitSet::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2482,7 +2482,7 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
     // through a move also reaches it from the move's source.
     loop {
         let before = reaching.count();
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -2504,7 +2504,7 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
     if reaching.is_empty() {
         return false;
     }
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -2540,7 +2540,7 @@ impl OwnedRootScopes {
         let forward_blocks = forward_reachable_mask(llbc, body);
         for (&scope, &open_bb) in &self.opener {
             let drops: Vec<usize> = body
-                .body
+                .body()
                 .iter()
                 .enumerate()
                 .filter(|(bb_idx, bb)| {
@@ -2565,7 +2565,7 @@ impl OwnedRootScopes {
                 }
                 work.extend(block_successors(llbc, body, bb));
             }
-            for bb in 0..body.body.len() {
+            for bb in 0..body.body().len() {
                 if !forward_blocks[bb] {
                     continue;
                 }
@@ -2590,7 +2590,7 @@ pub(in crate::front::mir) fn block_successors(
     body: &Unstructured,
     bb: usize,
 ) -> Vec<usize> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut out = Vec::new();
     let mut push = |target: u64| {
         let target = target as usize;
@@ -2598,7 +2598,7 @@ pub(in crate::front::mir) fn block_successors(
             out.push(target);
         }
     };
-    match body.body[bb].term_ref(llbc) {
+    match body.body()[bb].term_ref(llbc) {
         Ok(TermKind::Goto { target }) => push(*target),
         Ok(TermKind::Switch { targets, .. }) => match targets {
             SwitchTargets::If(a, b) => {
@@ -2634,7 +2634,7 @@ pub(in crate::front::mir) fn block_dominators(
     llbc: &Llbc,
     body: &Unstructured,
 ) -> Vec<bit_set::BitSet> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     for bb in 0..n {
         for succ in block_successors(llbc, body, bb) {
@@ -2706,8 +2706,8 @@ pub(in crate::front::mir) fn root_bracket_entry(
     body: &Unstructured,
     opener: usize,
 ) -> Vec<usize> {
-    match body.body[opener].term_ref(llbc) {
-        Ok(TermKind::Call { target, .. }) if (*target as usize) < body.body.len() => {
+    match body.body()[opener].term_ref(llbc) {
+        Ok(TermKind::Call { target, .. }) if (*target as usize) < body.body().len() => {
             vec![*target as usize]
         }
         _ => block_successors(llbc, body, opener),
@@ -2730,7 +2730,7 @@ pub(in crate::front::mir) fn root_bracket_region(
         if bb == opener || !region.insert(bb) {
             continue;
         }
-        if body.body[bb]
+        if body.body()[bb]
             .term_ref(llbc)
             .ok()
             .and_then(|term| term_dropped_local(term, name_of))
@@ -2817,7 +2817,7 @@ pub(in crate::front::mir) fn root_pin_value_is_stable(
     let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
     let watched: bit_set::BitSet = std::iter::once(local).collect();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2862,7 +2862,7 @@ pub(in crate::front::mir) fn root_pin_value_is_stable_in_bracket(
         return true;
     }
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    let get_dest = |bb: usize| match body.body[bb].term_ref(llbc) {
+    let get_dest = |bb: usize| match body.body()[bb].term_ref(llbc) {
         Ok(TermKind::Call { call, .. }) => match call.dest.kind {
             PlaceKind::Local(dest) => Some(dest as usize),
             _ => None,
@@ -2871,7 +2871,7 @@ pub(in crate::front::mir) fn root_pin_value_is_stable_in_bracket(
     };
     let own_dests: bit_set::BitSet = own_gets.iter().filter_map(|&bb| get_dest(bb)).collect();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2943,7 +2943,7 @@ pub(in crate::front::mir) fn root_bracket_stack_effects_are_known(
         if !seen.insert(bb) {
             continue;
         }
-        for stmt in &body.body[bb].statements {
+        for stmt in &body.body()[bb].statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
                 }
@@ -2956,7 +2956,7 @@ pub(in crate::front::mir) fn root_bracket_stack_effects_are_known(
                 _ => return false,
             }
         }
-        match body.body[bb].term_ref(llbc) {
+        match body.body()[bb].term_ref(llbc) {
             Ok(term) if term_dropped_local(term, name_of) == Some(scope as u64) => {
                 continue;
             }
@@ -3073,7 +3073,7 @@ pub(in crate::front::mir) fn pin_roots_slice_values(
         if assigned.get(&local) != Some(&1) {
             return None;
         }
-        body.body
+        body.body()
             .iter()
             .enumerate()
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
@@ -3145,7 +3145,7 @@ pub(in crate::front::mir) fn pin_roots_incoming_slice(
         if assigned.get(&local) != Some(&1) {
             return None;
         }
-        body.body
+        body.body()
             .iter()
             .enumerate()
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
@@ -3212,7 +3212,7 @@ pub(in crate::front::mir) fn unique_assigned_rvalue(
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    body.body
+    body.body()
         .iter()
         .enumerate()
         .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
@@ -3491,7 +3491,7 @@ pub(in crate::front::mir) fn function_is_root_slot_getter(
         return None;
     }
     let body = fd.unstructured()?;
-    if body.body.len() > 8 || body.locals.arg_count != 2 {
+    if body.body().len() > 8 || body.locals.arg_count != 2 {
         return None;
     }
     classify_root_slot_getter_body(llbc, &body, name_of)
@@ -3507,7 +3507,7 @@ pub(in crate::front::mir) fn classify_root_slot_getter_body(
     let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3588,7 +3588,7 @@ pub(in crate::front::mir) fn getter_returns_follow_call(
     getter_bb: usize,
     normal_target: usize,
 ) -> bool {
-    let n = body.body.len();
+    let n = body.body().len();
     if normal_target >= n {
         return false;
     }
@@ -3615,7 +3615,7 @@ pub(in crate::front::mir) fn getter_returns_follow_call(
     }
     let mut saw_return = false;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -3862,7 +3862,7 @@ pub(in crate::front::mir) fn single_statement_rvalue(
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -4133,7 +4133,7 @@ pub(in crate::front::mir) fn capture_carriers_stay_inside(
     getter_bbs: &bit_set::BitSet,
     forward_blocks: &[bool],
 ) -> bool {
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -4196,7 +4196,7 @@ pub(in crate::front::mir) fn record_root_slot_getter_reads(
 ) -> RootGetterReads {
     let mut call_dests = bit_set::BitSet::new();
     let mut calls: Vec<(usize, CallPayload)> = Vec::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !index.forward_blocks[bb_idx] {
             continue;
         }
@@ -5340,7 +5340,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     let mut opener_block: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5373,7 +5373,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     }
     // (2) Borrow temporaries, so a receiver operand names its guard.
     let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5401,7 +5401,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     //     `_t` where `_t = copy _ob_slot`; without the closure below every
     //     read-back looks like an index this pass cannot name.
     let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5461,7 +5461,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
         std::collections::HashMap::new();
     // A destination two `shadow_stack_len` calls write names no one depth.
     let mut len_poison = bit_set::BitSet::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5596,7 +5596,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5636,7 +5636,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     changed = true;
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5687,7 +5687,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     let mut sums: std::collections::HashMap<usize, RootSlotSum> = std::collections::HashMap::new();
     let mut offsets: std::collections::HashMap<usize, RootSlotSum> =
         std::collections::HashMap::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5732,7 +5732,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
             };
         }
     }
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5763,7 +5763,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5843,7 +5843,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
     let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
     let mut gets: Vec<(usize, usize, usize, u64)> = reads.gets;
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5935,7 +5935,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                 retire_mentioned(stmt.kind_value(), &watched, &owner, &mut candidates);
             }
         }
-        let term_kind = body.body[bb_idx].terminator.kind_value();
+        let term_kind = body.body()[bb_idx].terminator.kind_value();
         match bb.term_ref(llbc) {
             Ok(term)
                 if term_dropped_local(term, &name_of)
@@ -6902,7 +6902,7 @@ pub(in crate::front::mir) fn analyze_owner_roots_with(
     let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -6944,7 +6944,7 @@ pub(in crate::front::mir) fn analyze_owner_roots_with(
     // Each borrow is read exactly once: by `Deref` or by a reborrow.
     let mut borrow_uses = vec![0usize; n_locals];
     let names_watched = |op: &Operand| operand_local(Some(op)).is_some_and(|l| watched.contains(l));
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -7100,7 +7100,7 @@ pub(in crate::front::mir) fn model_successors(
     llbc: &Llbc,
     bb: usize,
 ) -> Vec<usize> {
-    let Some(block) = body.body.get(bb) else {
+    let Some(block) = body.body().get(bb) else {
         return Vec::new();
     };
     let targets: Vec<u64> = match block.term_ref(llbc) {
@@ -7123,7 +7123,7 @@ pub(in crate::front::mir) fn model_successors(
     targets
         .into_iter()
         .map(|t| t as usize)
-        .filter(|&t| t < body.body.len())
+        .filter(|&t| t < body.body().len())
         .collect()
 }
 
@@ -7231,7 +7231,7 @@ pub(in crate::front::mir) fn block_dropped_locals(
 ) -> Vec<Option<u64>> {
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let forward = forward_reachable_mask(llbc, body);
-    body.body
+    body.body()
         .iter()
         .enumerate()
         .map(|(bb, block)| {
@@ -7295,7 +7295,7 @@ pub(in crate::front::mir) fn vec_local_entry_bits(
     local: usize,
     dropped: &[Option<u64>],
 ) -> Vec<u8> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut state = vec![0u8; n];
     if n == 0 {
         return state;
@@ -7312,7 +7312,7 @@ pub(in crate::front::mir) fn vec_local_entry_bits(
         let summary = match stmt_summary[bb] {
             Some(s) => s,
             None => {
-                let s = body.body[bb]
+                let s = body.body()[bb]
                     .statements
                     .iter()
                     .fold(0, |s, stmt| vec_transfer_stmt(s, stmt, local));
@@ -7323,7 +7323,7 @@ pub(in crate::front::mir) fn vec_local_entry_bits(
         // Folding from 0 is 0 when no statement changes the state, else the
         // constant VEC_INIT / VEC_UNINIT (both nonzero).
         let mut s = if summary == 0 { state[bb] } else { summary };
-        if let Ok(term) = body.body[bb].term_ref(llbc) {
+        if let Ok(term) = body.body()[bb].term_ref(llbc) {
             s = vec_transfer_term(s, term, local, dropped[bb]);
         }
         for succ in model_successors(body, llbc, bb) {
@@ -7343,7 +7343,7 @@ pub(in crate::front::mir) fn vec_init_bits_at_term(
     entry: u8,
 ) -> u8 {
     let mut s = entry;
-    for stmt in &body.body[bb].statements {
+    for stmt in &body.body()[bb].statements {
         s = vec_transfer_stmt(s, stmt, local);
     }
     s
@@ -7381,10 +7381,10 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
     }
     let dropped = block_dropped_locals(body, llbc);
     // `(block, dropped local, Drop/Call target)` for every block whose terminator drops a local.
-    let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body.len())
+    let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body().len())
         .filter_map(|bb_idx| {
             let dropped_local = dropped[bb_idx]?;
-            let term = body.body[bb_idx].term_ref(llbc).ok()?;
+            let term = body.body()[bb_idx].term_ref(llbc).ok()?;
             let target = match term {
                 TermKind::Drop { target, .. } | TermKind::Call { target, .. } => Some(*target),
                 _ => None,
@@ -7413,17 +7413,19 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
             rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
         }
     }
-    for (bb_idx, kind) in rewrites {
-        body.body[bb_idx].set_terminator_kind(kind);
+    {
+        let blocks = body.body_mut();
+        for (bb_idx, kind) in rewrites {
+            blocks[bb_idx].set_terminator_kind(kind);
+        }
     }
-    body.clear_cfg_cache();
 }
 
 pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
     body: &Unstructured,
     llbc: &Llbc,
 ) -> bit_set::BitSet {
-    let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    let mut out = bit_set::BitSet::with_capacity(body.body().len());
     let vec_locals: Vec<usize> = body
         .locals
         .locals
@@ -7435,7 +7437,7 @@ pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
         return out;
     }
     let dropped = block_dropped_locals(body, llbc);
-    let drop_sites: Vec<(usize, u64)> = (0..body.body.len())
+    let drop_sites: Vec<(usize, u64)> = (0..body.body().len())
         .filter_map(|bb_idx| Some((bb_idx, dropped[bb_idx]?)))
         .collect();
     for local in vec_locals {
@@ -7492,7 +7494,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
     }
     let mut closes: Vec<Close> = Vec::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -7550,7 +7552,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
     // Opener blocks per guard local.
     let mut openers: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -7612,7 +7614,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         let dests: bit_set::BitSet = mine.iter().map(|c| c.dest).collect();
         let mut private = temps.clone();
         private.union_with(&dests);
-        let mentioned_elsewhere = body.body.iter().enumerate().any(|(bb_idx, bb)| {
+        let mentioned_elsewhere = body.body().iter().enumerate().any(|(bb_idx, bb)| {
             if !forward_blocks[bb_idx] {
                 return false;
             }
@@ -7639,7 +7641,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         // in the forward set, recover the glue from the artefact's
         // `RootScope` `drop_in_place` declaration.
         let Some(template) = body
-            .body
+            .body()
             .iter()
             .enumerate()
             .find_map(|(bb_idx, bb)| {
@@ -7665,14 +7667,14 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         // Maybe-initialised / maybe-uninitialised at each block entry.
         const INIT: u8 = 1;
         const UNINIT: u8 = 2;
-        let n = body.body.len();
+        let n = body.body().len();
         let mut state = vec![0u8; n];
         state[0] = UNINIT;
         let mut work = vec![0usize];
         while let Some(bb) = work.pop() {
             let out = if opener_bbs.contains(&bb) {
                 INIT
-            } else if close_bbs.contains(bb) || drop_of(&body.body[bb]) == Some(guard) {
+            } else if close_bbs.contains(bb) || drop_of(&body.body()[bb]) == Some(guard) {
                 UNINIT
             } else {
                 state[bb]
@@ -7686,7 +7688,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         }
         let mut dead: Vec<usize> = Vec::new();
         let mut sound = mine.iter().all(|c| state[c.bb] == INIT);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -7705,7 +7707,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         for c in &mine {
             let Ok(TermKind::Call {
                 target, on_unwind, ..
-            }) = body.body[c.bb].term_ref(llbc)
+            }) = body.body()[c.bb].term_ref(llbc)
             else {
                 continue;
             };
@@ -7716,7 +7718,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
             rewrites.push((c.bb, close));
             removed_moves.push((c.bb, c.moves.clone()));
         }
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -7726,16 +7728,18 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
             }
         }
     }
-    for (bb_idx, mut moves) in removed_moves {
-        moves.sort_unstable_by(|a, b| b.cmp(a));
-        for i in moves {
-            body.body[bb_idx].statements.remove(i);
+    {
+        let blocks = body.body_mut();
+        for (bb_idx, mut moves) in removed_moves {
+            moves.sort_unstable_by(|a, b| b.cmp(a));
+            for i in moves {
+                blocks[bb_idx].statements.remove(i);
+            }
+        }
+        for (bb_idx, kind) in rewrites {
+            blocks[bb_idx].set_terminator_kind(kind);
         }
     }
-    for (bb_idx, kind) in rewrites {
-        body.body[bb_idx].set_terminator_kind(kind);
-    }
-    body.clear_cfg_cache();
 }
 
 /// The MIR locals this body moves out of.
@@ -7827,7 +7831,7 @@ pub(in crate::front::mir) fn local_move_counts(
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = std::collections::HashMap::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -7897,7 +7901,7 @@ pub(in crate::front::mir) fn root_scope_drop_sites(
     let mut sites = Vec::new();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

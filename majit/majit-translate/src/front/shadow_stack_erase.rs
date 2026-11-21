@@ -609,7 +609,7 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -
             *c = c.saturating_add(1);
         }
     };
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -698,7 +698,7 @@ fn local_assign_or_call_dest_counts(
             *c = c.saturating_add(1);
         }
     };
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -983,7 +983,7 @@ fn classify_capture_plus_const(
         return None;
     }
     let body = fd.unstructured()?;
-    if body.body.len() > 8 || body.locals.arg_count != 2 {
+    if body.body().len() > 8 || body.locals.arg_count != 2 {
         return None;
     }
     let mut defs: HashMap<usize, Rvalue> = HashMap::new();
@@ -991,7 +991,7 @@ fn classify_capture_plus_const(
     let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
     let forward_blocks = super::forward_reachable_mask(llbc, &body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1900,7 +1900,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
             WalkMode::Probe => cx.split_key_in.get(bb).copied().flatten().flatten(),
         };
         cx.incoming_hi = depth;
-        let block = &body.body[bb];
+        let block = &body.body()[bb];
         // Statements: the index, pair and alias definitions.
         for (si, stmt) in block.statements.iter().enumerate() {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
@@ -2887,11 +2887,11 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
 
 /// Build the rewrite, or say why this body keeps its bracket.
 fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
     let forward_blocks = super::forward_reachable_mask(llbc, body);
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -2917,7 +2917,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // caller drops, so it is not this body's slots. ParamSlots methods
     // of that dest read the nested bracket.
     let owned_scope_locals = owned_scope_receiver_locals(body, llbc, &forward_blocks);
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -2955,7 +2955,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let mut copy_range_slices: Vec<usize> = Vec::new();
     let mut stmt_assigned: HashMap<usize, usize> = HashMap::new();
     let mut call_dests = bit_set::BitSet::new();
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -3152,7 +3152,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         {
             return Err("capture-escapes");
         }
-        for (bb, block) in body.body.iter().enumerate() {
+        for (bb, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb] || !visited[bb] {
                 continue;
             }
@@ -3210,7 +3210,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 )
             })
             .collect();
-        for (bb, block) in body.body.iter().enumerate() {
+        for (bb, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb] {
                 continue;
             }
@@ -3244,7 +3244,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             watched.insert(*local);
         }
     }
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -3354,7 +3354,7 @@ fn block_rewinds_scope(
     ) {
         return true;
     }
-    match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
+    match body.body().get(bb).and_then(|b| b.term_ref(llbc).ok()) {
         Some(TermKind::Drop { place, .. }) => {
             matches!(
                 place_local(place).and_then(|l| specials.get(&l)),
@@ -3369,7 +3369,7 @@ fn block_rewinds_scope(
 /// Forward successors the erase walk follows: `on_unwind` is not a
 /// successor (`analyze` does not walk cleanup).
 fn erase_forward_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<u64> {
-    let Some(block) = body.body.get(bb) else {
+    let Some(block) = body.body().get(bb) else {
         return Vec::new();
     };
     match block.term_ref(llbc) {
@@ -3391,7 +3391,7 @@ fn erase_forward_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<
 
 fn is_erase_exit(body: &Unstructured, llbc: &Llbc, bb: usize) -> bool {
     matches!(
-        body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()),
+        body.body().get(bb).and_then(|b| b.term_ref(llbc).ok()),
         Some(
             TermKind::Return
                 | TermKind::UnwindResume
@@ -3410,7 +3410,7 @@ fn is_erase_exit(body: &Unstructured, llbc: &Llbc, bb: usize) -> bool {
 /// paths).
 fn is_erase_returning_exit(body: &Unstructured, llbc: &Llbc, bb: usize) -> bool {
     matches!(
-        body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()),
+        body.body().get(bb).and_then(|b| b.term_ref(llbc).ok()),
         Some(TermKind::Return | TermKind::UnwindResume)
     )
 }
@@ -3578,7 +3578,7 @@ fn unique_assign_stmt<'a>(
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks.get(bb).copied().unwrap_or(false) {
             continue;
         }
@@ -3730,7 +3730,7 @@ fn is_incoming_arg(local: usize, arg_count: usize) -> bool {
 fn forward_assign_counts(body: &Unstructured, forward_blocks: &[bool]) -> Vec<u32> {
     let n = body.locals.locals.len();
     let mut counts = vec![0u32; n];
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks.get(bb).copied().unwrap_or(false) {
             continue;
         }
@@ -3775,7 +3775,7 @@ fn incoming_slice_root(
             return None;
         }
         let mut next = None;
-        'blocks: for (bb, block) in body.body.iter().enumerate() {
+        'blocks: for (bb, block) in body.body().iter().enumerate() {
             if !forward_blocks.get(bb).copied().unwrap_or(false) {
                 continue;
             }
@@ -3880,7 +3880,7 @@ fn leftover_dummy_k_index(
             return None;
         }
         let mut found: Option<&Rvalue> = None;
-        for block in &body.body {
+        for block in body.body() {
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -3983,7 +3983,7 @@ fn unique_use_origins(
     let mut copy_src = vec![None; n];
     let mut const_of = vec![None; n];
     let mut call_dest = vec![false; n];
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks.get(bb).copied().unwrap_or(false) {
             continue;
         }
@@ -4246,7 +4246,7 @@ fn unique_linear_pred(
     visited: &[bool],
 ) -> Option<usize> {
     let mut found = None;
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks.get(bb).copied().unwrap_or(false) {
             continue;
         }
@@ -4295,7 +4295,7 @@ fn find_mirror_store(
     visited: &[bool],
 ) -> Option<(usize, usize)> {
     let scan = |bb: usize, reverse: bool, temps: &mut HashSet<usize>| -> MirrorScan {
-        let Some(block) = body.body.get(bb) else {
+        let Some(block) = body.body().get(bb) else {
             return MirrorScan::Miss;
         };
         scan_block_for_mirror(block, site, copy_src, const_of, llbc, reverse, temps)
@@ -4320,7 +4320,7 @@ fn find_mirror_store(
     let mut bb = site.succ;
     let mut temps = HashSet::new();
     for _ in 0..6 {
-        if bb >= body.body.len() {
+        if bb >= body.body().len() {
             break;
         }
         if !forward_blocks.get(bb).copied().unwrap_or(false) {
@@ -4331,7 +4331,7 @@ fn find_mirror_store(
             MirrorScan::Stop => return None,
             MirrorScan::Miss => {}
         }
-        match unique_goto_or_assert_succ(&body.body[bb], llbc) {
+        match unique_goto_or_assert_succ(&body.body()[bb], llbc) {
             Some(next) => bb = next,
             None => break,
         }
@@ -4496,7 +4496,7 @@ fn unstructured_json_from_body(body: &Unstructured) -> Value {
         })
         .collect();
     let blocks: Vec<Value> = body
-        .body
+        .body()
         .iter()
         .map(|bb| {
             let statements: Vec<Value> = bb
@@ -4932,7 +4932,7 @@ fn callee_effect_of(llbc: &Llbc, identity: &str) -> CalleeEffect {
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
     let forward_blocks = super::forward_reachable_mask(llbc, body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5010,7 +5010,7 @@ fn owned_scope_receiver_locals(
     forward_blocks: &[bool],
 ) -> HashSet<usize> {
     let mut owned = HashSet::new();
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
         }
@@ -5029,7 +5029,7 @@ fn owned_scope_receiver_locals(
     let mut changed = true;
     while changed {
         changed = false;
-        for (bb, block) in body.body.iter().enumerate() {
+        for (bb, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb] {
                 continue;
             }
@@ -5183,7 +5183,7 @@ fn stack_walk(
     llbc: &Llbc,
     effect: &dyn Fn(&str) -> CalleeEffect,
 ) -> StackWalk {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     if n_blocks == 0 {
         return StackWalk {
             why: None,
@@ -5240,7 +5240,7 @@ fn stack_walk(
             };
         }
         let mut depth = depth_in[bb].expect("queued blocks have a depth");
-        let block = &body.body[bb];
+        let block = &body.body()[bb];
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -5946,7 +5946,7 @@ fn discover_stack_effects(
             continue;
         };
         let forward_blocks = super::forward_reachable_mask(llbc, &body);
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -6446,13 +6446,13 @@ mod tests {
         let fd = llbc.fn_by_id(3).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         assert_eq!(
-            body.body.len(),
+            body.body().len(),
             4,
             "extracted blocks stay at their original indices"
         );
         assert!(
-            body.body[1].is_cleanup
-                && matches!(body.body[1].term_ref(&llbc), Ok(TermKind::UnwindResume)),
+            body.body()[1].is_cleanup
+                && matches!(body.body()[1].term_ref(&llbc), Ok(TermKind::UnwindResume)),
             "block 1 is the cleanup UnwindResume"
         );
         match erase_shadow_stack(fd, &body, &llbc) {
@@ -7028,7 +7028,7 @@ mod tests {
             Err(reason) => panic!("FrameAnchor ops are identities, got {reason}"),
         }
         for bb in 0..3 {
-            let Ok(TermKind::Call { call, .. }) = body.body[bb].term_ref(&llbc) else {
+            let Ok(TermKind::Call { call, .. }) = body.body()[bb].term_ref(&llbc) else {
                 panic!("expected Call");
             };
             assert!(
@@ -7158,7 +7158,7 @@ mod tests {
                 bb(json!("Return")),
             ],
         );
-        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+        let Ok(TermKind::Call { call, .. }) = body.body()[0].term_ref(&llbc) else {
             panic!("expected Call");
         };
         assert_eq!(mem_drop_scope_local(call, &llbc), None);
@@ -7181,7 +7181,7 @@ mod tests {
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
         llbc.mark_stack_sensitive_fns_complete();
         let body = body_of(1, vec![bb(call_fun(1, vec![], 0, 1)), bb(json!("Return"))]);
-        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+        let Ok(TermKind::Call { call, .. }) = body.body()[0].term_ref(&llbc) else {
             panic!("expected Call");
         };
         assert_eq!(classify_call(call, &llbc), None);
@@ -7208,7 +7208,7 @@ mod tests {
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
         llbc.mark_stack_sensitive_fns_complete();
         let body = body_of(1, vec![bb(call_fun(1, vec![], 0, 1)), bb(json!("Return"))]);
-        let Ok(TermKind::Call { call, .. }) = body.body[0].term_ref(&llbc) else {
+        let Ok(TermKind::Call { call, .. }) = body.body()[0].term_ref(&llbc) else {
             panic!("expected Call");
         };
         assert_eq!(classify_call(call, &llbc), None);
@@ -9097,7 +9097,7 @@ mod tests {
             Ok(None) => panic!("expected accepted erase, got no bracket"),
             Err(reason) => panic!("expected accepted erase, got {reason}"),
         };
-        let seeded: Vec<usize> = erased.body[0]
+        let seeded: Vec<usize> = erased.body()[0]
             .statements
             .iter()
             .filter_map(|stmt| match stmt.stmt_kind_ref() {
@@ -9277,7 +9277,7 @@ mod tests {
             Ok(None) => panic!("expected a bracket to erase"),
             Err(reason) => panic!("expected accepted erase, got {reason}"),
         };
-        for block in &erased.body {
+        for block in erased.body() {
             let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) else {
                 continue;
             };
@@ -9405,7 +9405,7 @@ mod tests {
     }
 
     fn assign_copies_local(body: &Unstructured, dest: u64, src: u64) -> bool {
-        body.body.iter().any(|bb| {
+        body.body().iter().any(|bb| {
             bb.statements.iter().any(|st| {
                 let assign = &st.kind_value()["Assign"];
                 assign[0]["kind"].get("Local") == Some(&json!(dest))
@@ -9418,7 +9418,7 @@ mod tests {
     }
 
     fn assign_uses_const_lit(body: &Unstructured, dest: u64, lit: &Value) -> bool {
-        body.body.iter().any(|bb| {
+        body.body().iter().any(|bb| {
             bb.statements.iter().any(|st| {
                 let assign = &st.kind_value()["Assign"];
                 assign[0]["kind"].get("Local") == Some(&json!(dest))
@@ -9428,7 +9428,7 @@ mod tests {
     }
 
     fn rooted_items_call_paths(body: &Unstructured, llbc: &Llbc) -> Vec<String> {
-        body.body
+        body.body()
             .iter()
             .filter_map(|bb| match bb.term_ref(llbc) {
                 Ok(TermKind::Call { call, .. }) => {
@@ -9713,7 +9713,7 @@ mod tests {
             assign_uses_const_lit(&erased, 3, &json!({ "Bool": true })),
             "is_empty dest should be true when the pin count is 0"
         );
-        let switches_on_flag = erased.body.iter().any(|bb| {
+        let switches_on_flag = erased.body().iter().any(|bb| {
             let kind = bb.terminator.kind_value();
             kind.get("Switch")
                 .and_then(|s| s.get("discr"))

@@ -384,7 +384,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
     let n_locals = body.locals.locals.len();
     let mut locals = bit_set::BitSet::with_capacity(n_locals);
     let mut descr = vec![None; n_locals];
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -484,7 +484,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
     // the parent must use the same Char-varsize cell (`rdtoa.py`
     // `strtod` `end_ptr`). A shared `&P` capture stays the peeled
     // scalar (`tyref_shared_borrow_primitive_value`).
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -521,7 +521,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
         }
     }
     let mut has_storage_live = bit_set::BitSet::with_capacity(n_locals);
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::StorageLive(local)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -635,7 +635,7 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
     cell_locals: &bit_set::BitSet,
 ) -> Vec<FunctionScopeCellPlan> {
     let mut out = Vec::new();
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -756,7 +756,7 @@ pub(in crate::front::mir) fn cell_scope_extra_live(
     plan: &CellScalarPlan,
     forward: &[bool],
 ) -> Vec<Vec<usize>> {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     let mut extra = vec![Vec::new(); n_blocks];
     for local in &plan.locals {
         if plan.has_storage_live.contains(local) {
@@ -782,7 +782,7 @@ fn cell_storage_scope_blocks(
 ) -> bit_set::BitSet {
     let mut lives = Vec::new();
     let mut deads = bit_set::BitSet::with_capacity(n_blocks);
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(id)) if *id as usize == local => lives.push(bb),
@@ -877,7 +877,7 @@ fn body_argument_borrow_place(
     local: usize,
 ) -> Option<Place> {
     let mut found = None;
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -914,7 +914,7 @@ fn body_pointer_place_of_local(
         return None;
     }
     let mut found = None;
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -2670,7 +2670,7 @@ impl<'a> Lowering<'a> {
             return true;
         }
         let mut saw = false;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -2709,7 +2709,7 @@ impl<'a> Lowering<'a> {
         self.call_dest_locals.get_or_init(|| {
             let mut dests = bit_set::BitSet::new();
             let mut unique: Vec<Option<(RegularCall, Vec<Operand>)>> = Vec::new();
-            for (bb_idx, block) in self.body.body.iter().enumerate() {
+            for (bb_idx, block) in self.body.body().iter().enumerate() {
                 if !self.forward_reached[bb_idx] {
                     continue;
                 }
@@ -2757,7 +2757,7 @@ impl<'a> Lowering<'a> {
         groups: &[RawScalarAddressGroup],
         depth: u8,
     ) -> bool {
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -2946,7 +2946,7 @@ impl<'a> Lowering<'a> {
         }
         let mut found = None;
         let mut saw = false;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -2980,7 +2980,7 @@ impl<'a> Lowering<'a> {
         self.projected_store_roots
             .get_or_init(|| {
                 let mut out = bit_set::BitSet::new();
-                for (bb_idx, block) in self.body.body.iter().enumerate() {
+                for (bb_idx, block) in self.body.body().iter().enumerate() {
                     if !self.forward_reached[bb_idx] {
                         continue;
                     }
@@ -3017,7 +3017,7 @@ impl<'a> Lowering<'a> {
             return SpillAddressSource::Unknown;
         }
         let mut found = None;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -3213,7 +3213,7 @@ impl<'a> Lowering<'a> {
             return Some(self.concrete_borrow_place(clone_place(place)));
         }
         let mut found = None;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -3416,7 +3416,7 @@ impl<'a> Lowering<'a> {
             return Some(clone_place(place));
         }
         let mut found = None;
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
+        for (bb_idx, block) in self.body.body().iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
             }
@@ -4136,7 +4136,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
     let mut projections = Vec::new();
     let mut escapes = false;
     let mut opaque_child = false;
-    let n = body.body.len();
+    let n = body.body().len();
     if n == 0 {
         return clean_address_escape();
     }
@@ -4153,7 +4153,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
     let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
-        for (index, block) in body.body.iter().enumerate() {
+        for (index, block) in body.body().iter().enumerate() {
             if !forward_blocks[index] {
                 continue;
             }
