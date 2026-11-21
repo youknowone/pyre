@@ -2846,6 +2846,13 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    // `&[u8; N] as &[u8]` of a const byte-string stays the
+                    // STR (`rstr.py` `AbstractStringRepr.rtype_getitem` /
+                    // `ll_stritem_nonneg`). Dest `&[u8]` is a window type
+                    // (`ValueType::Int`); aliasing avoids `cast_ptr_to_int`.
+                    if cast_kind_is_unsize(&op_json) && self.operand_is_string_byte_view(&operand) {
+                        return Ok((None, arg));
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -3673,6 +3680,8 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
                 let src_ty_owned = operand_tyref(&operand).cloned();
+                let unsize_const_byte_str =
+                    cast_kind_is_unsize(&kind) && self.operand_is_string_byte_view(&operand);
 
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
@@ -3682,6 +3691,10 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                // Twin of the UnaryOp Unsize alias: dest `&[u8]` is Int.
+                if unsize_const_byte_str {
+                    return Ok((None, v));
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -6952,6 +6965,81 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// True when `var` is already `rffi.py` `CCHARP`: a stamped
+    /// `Ptr(Array(Char))`, an Input whose `class_root` is `CCHARP`, a
+    /// fat-window `FatData` word, or `rffi.get_raw_address_of_string`.
+    /// `cast_int_to_ptr` / `rffi.cast` results carry that stamp on the
+    /// producer; `ann_cast_int_to_ptr` of an already-`SomePtr` cell is
+    /// rejected, so those producers must not be recast.
+    pub(in crate::front::mir) fn var_already_ccharp(&self, var: &Variable) -> bool {
+        if var.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return true;
+        }
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|result| result.concretetype().as_ref().is_some_and(lltype_is_ccharp))
+        {
+            return true;
+        }
+        match &op.kind {
+            OpKind::Input {
+                class_root: Some(root),
+                ..
+            } if root == "CCHARP" => true,
+            OpKind::FieldRead { field, .. }
+                if field.vec_part == Some(crate::model::VecFieldPart::FatData) =>
+            {
+                true
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => matches!(
+                segments.last().map(String::as_str),
+                Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                    | Some(crate::codewriter::get_raw_address::LL_GET_RAW_ADDRESS_OF_STRING)
+            ),
+            _ => false,
+        }
+    }
+
+    /// An int-kind Input is already the address word: stamp `CCHARP`
+    /// (`raw_ptr_annotation_incoming`) so the same variable stays the
+    /// `*u8` actual. A Call (`cast_ptr_to_int`) / FieldRead / Const /
+    /// BinOp / a phi with no single producer stays a bare Integer until
+    /// `cast_int_to_ptr` at this producer (`rffi.cast`).
+    pub(in crate::front::mir) fn var_producer_can_carry_ccharp_stamp(
+        &self,
+        var: &Variable,
+    ) -> bool {
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        matches!(&op.kind, OpKind::Input { .. })
+    }
+
     /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
     /// would `RawLoad` a primitive.
     ///
@@ -8100,33 +8188,20 @@ impl<'a> Lowering<'a> {
                                                 })
                                             })
                                             .or_else(|| {
-                                            stripped.and_then(|n| {
-                                                raw_ptr_pointee_class_root_with(
-                                                    n,
-                                                    self.llbc,
-                                                    self.tombstoned_leaves,
-                                                )
-                                                .filter(|root| {
-                                                    spelling_path_is_declared_gc(
-                                                        self.gc_struct_ids,
-                                                        root,
-                                                    )
-                                                })
-                                                .or_else(|| {
-                                                    let root = adt_node_class_root_with(
+                                                stripped.and_then(|n| {
+                                                    raw_ptr_pointee_class_root_with(
                                                         n,
                                                         self.llbc,
                                                         self.tombstoned_leaves,
-                                                    )?;
-                                                    // `&ObjectKey` is the dict key the
-                                                    // `eq` body reads `.hash` from. Other
-                                                    // structs stay uncast: a blanket
-                                                    // narrow paints `Tuple` onto values
-                                                    // that are already tuples.
-                                                    (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                                    )
+                                                    .filter(|root| {
+                                                        spelling_path_is_declared_gc(
+                                                            self.gc_struct_ids,
+                                                            root,
+                                                        )
+                                                    })
                                                 })
                                             })
-                                        })
                                 }
                             }
                         }
@@ -8982,21 +9057,32 @@ impl<'a> Lowering<'a> {
                         ));
                     }
                     if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
-                        let followed = self.concrete_borrow_place(recorded);
-                        // A local is the slot `mem::replace` writes. A projection
-                        // stays the borrowed value: re-resolving it would emit a
-                        // fresh field or index read for every borrow.
-                        if matches!(followed.kind, PlaceKind::Local(_)) {
-                            return self.resolve_place(mir_bb, followed);
-                        }
-                        if let Some(cell) = self.deref_cell_param_local(&followed) {
-                            let root = self.gc_mut_ref_param_root(cell).ok_or_else(|| {
-                                LowerError::Unsupported(format!(
-                                    "bb{mir_bb}: GC reference cell {cell} has no root"
-                                ))
-                            })?;
-                            let base = self.defined_local(mir_bb, cell)?;
-                            return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                        // Const byte-string STR: `&s` aliases the Constant
+                        // (`rstr.py` `ll_stritem_nonneg`). Peeling to the
+                        // array local would read it after it is dead
+                        // (`descr_repr` nibble index).
+                        if !self
+                            .const_byte_str_locals
+                            .get(local)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            let followed = self.concrete_borrow_place(recorded);
+                            // A local is the slot `mem::replace` writes. A projection
+                            // stays the borrowed value: re-resolving it would emit a
+                            // fresh field or index read for every borrow.
+                            if matches!(followed.kind, PlaceKind::Local(_)) {
+                                return self.resolve_place(mir_bb, followed);
+                            }
+                            if let Some(cell) = self.deref_cell_param_local(&followed) {
+                                let root = self.gc_mut_ref_param_root(cell).ok_or_else(|| {
+                                    LowerError::Unsupported(format!(
+                                        "bb{mir_bb}: GC reference cell {cell} has no root"
+                                    ))
+                                })?;
+                                let base = self.defined_local(mir_bb, cell)?;
+                                return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                            }
                         }
                     }
                 }
@@ -9189,7 +9275,12 @@ impl<'a> Lowering<'a> {
                             .is_some())
                     && !matches!(inner.kind, PlaceKind::Local(local)
                         if self.atomic_ref_place.contains_key(&(local as usize))
-                            || self.index_elem_alias.contains_key(&(local as usize)))
+                            || self.index_elem_alias.contains_key(&(local as usize))
+                            || self
+                                .const_byte_str_locals
+                                .get(local as usize)
+                                .copied()
+                                .unwrap_or(false))
                     // Primitive or `repr(transparent)` primitive wrapper
                     // (`tyref_primitive_or_transparent_primitive_node`).
                     && let Some((item_ty, itemsize, is_item_signed)) =

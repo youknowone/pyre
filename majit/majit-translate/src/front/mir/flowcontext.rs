@@ -481,6 +481,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
     /// same shape as [`Lowering::positional_aggregate_locals`].
     pub(in crate::front::mir) string_byte_view_locals: Vec<usize>,
+    /// Const `[u8; N]` byte-string literals and their Ref / Unsize aliases
+    /// (`rstr.py` `ll_stritem_nonneg`). Subset of
+    /// [`Self::string_byte_view_locals`]; a W1 STR owner is not this set.
+    pub(in crate::front::mir) const_byte_str_locals: Vec<bool>,
     /// Shared `&[u8]` locals that alias a W2 list owner (`Vec<u8>` /
     /// `Box<[u8]>` / `&mut [u8]`). One list word; converted to a window
     /// only at a window boundary. Restored per block from
@@ -1012,6 +1016,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             }
             None => (ty, class_root),
         };
+        if class_root.as_deref() == Some("CCHARP") {
+            stamp_as_ccharp(&var);
+        }
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -1632,6 +1639,7 @@ impl<'a> Lowering<'a> {
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed, block_u8) =
             pair_len_shadows(body, llbc, &name, accum, static_addrs.error_carrier);
+        let const_byte_str_locals = const_byte_str_view_locals(body, llbc);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -1896,6 +1904,9 @@ impl<'a> Lowering<'a> {
                 }
                 None => (ty, class_root),
             };
+            if class_root.as_deref() == Some("CCHARP") {
+                stamp_as_ccharp(&var);
+            }
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
@@ -2083,10 +2094,16 @@ impl<'a> Lowering<'a> {
                     live.remove(*temp);
                 }
                 for temp in root_bracket.pin_temps.keys() {
-                    live.remove(*temp);
+                    // Const `[u8; N]` STR aliases stay live so Index of
+                    // `*_t` sees the Constant (`rstr.py` `ll_stritem_nonneg`).
+                    if !const_byte_str_locals.get(*temp).copied().unwrap_or(false) {
+                        live.remove(*temp);
+                    }
                 }
                 for temp in root_bracket.capture_temps.keys() {
-                    live.remove(*temp);
+                    if !const_byte_str_locals.get(*temp).copied().unwrap_or(false) {
+                        live.remove(*temp);
+                    }
                 }
             }
         }
@@ -2387,6 +2404,7 @@ impl<'a> Lowering<'a> {
                         .filter_map(|(i, marked)| marked.then_some(i)),
                 )
                 .collect(),
+            const_byte_str_locals,
             list_view_locals: list_view_locals
                 .iter()
                 .enumerate()
@@ -3560,6 +3578,34 @@ impl<'a> Lowering<'a> {
         {
             return Ok(());
         }
+        // rstr.py AbstractStringRepr.rtype_getitem / ll_stritem_nonneg on a
+        // Constant string. descr_repr indexes a byte-string literal
+        // (`b"..."[n]`) as that Constant, not as an uninitialised `[u8; N]`
+        // local. Fold before the erased pin_temps skip so the Aggregate dest
+        // is bound even when it is a pin_temp of an erased root-bracket.
+        if let PlaceKind::Local(dest_local) = dest.kind {
+            let text = const_u8_array_aggregate_text(self.llbc, &rvalue, &dest.ty).or_else(|| {
+                self.body
+                    .locals
+                    .locals
+                    .get(dest_local as usize)
+                    .and_then(|local| const_u8_array_aggregate_text(self.llbc, &rvalue, &local.ty))
+            });
+            if let Some(text) = text {
+                self.bind_const_u8_array_str(mir_bb, dest_local as usize, &text);
+                return Ok(());
+            }
+        }
+        // `_t = &_s` / Unsize of a bound const `[u8; N]` STR is that
+        // same Constant (`rstr.py` `ll_stritem_nonneg`; `descr_repr`
+        // indexes it). Bind before the erased pin_temps skip so the
+        // later Index of `*_t` does not peel to a dead array local.
+        if let PlaceKind::Local(dest_local) = dest.kind
+            && let Some(src) = self.const_byte_str_alias_source(&rvalue)
+            && self.alias_const_byte_str_view(dest_local as usize, src)
+        {
+            return Ok(());
+        }
         // `vec![e0, …, eN-1]` Array store into `(*box).Field(1).Field(0)`.
         // The into_vec terminator emits `ll_vec_newlist` + `ll_setitem_fast`
         // (`rlist.py` `rtype_newlist`). Nested FieldWrite of the Array into
@@ -3607,6 +3653,7 @@ impl<'a> Lowering<'a> {
                     | Rvalue::UnaryOp(..)
                     | Rvalue::Use(_, _)
             )
+            && self.const_byte_str_alias_source(&rvalue).is_none()
         {
             return Ok(());
         }
@@ -3645,6 +3692,7 @@ impl<'a> Lowering<'a> {
                 &rvalue,
                 Rvalue::Ref { .. } | Rvalue::Aggregate(..) | Rvalue::Use(_, _)
             )
+            && self.const_byte_str_alias_source(&rvalue).is_none()
         {
             return Ok(());
         }
@@ -3665,11 +3713,25 @@ impl<'a> Lowering<'a> {
         if let PlaceKind::Local(i) = dest.kind
             && self.len_shadow[i as usize].is_some()
         {
+            // A const byte-string Unsize dest is one `Ptr(STR)` word
+            // (`rstr.py` `ll_stritem_nonneg`). A length shadow would
+            // split it into a window via `u8_array_unsize_source`.
+            let dest_i = i as usize;
+            let const_byte_str_unsize = self.string_byte_view_locals.contains(&dest_i)
+                || match &rvalue {
+                    Rvalue::UnaryOp(cast, op) | Rvalue::Cast(cast, op, _)
+                        if cast_kind_is_unsize(cast) =>
+                    {
+                        self.operand_is_string_byte_view(op)
+                    }
+                    _ => false,
+                };
             // Body-local `&dyn Trait` gets a length shadow so `Unsize`
             // can bind `{data, vtable}`. A one-word producer (Call,
             // field copy, param copy) keeps the helper ABI.
-            if !tyref_is_fat_dyn(&dest.ty, self.llbc)
-                || self.rvalue_is_dyn_fat_pair(&rvalue, &dest.ty)
+            if !const_byte_str_unsize
+                && (!tyref_is_fat_dyn(&dest.ty, self.llbc)
+                    || self.rvalue_is_dyn_fat_pair(&rvalue, &dest.ty))
             {
                 return self.lower_pair_assign(mir_bb, i as usize, rvalue);
             }
@@ -3733,8 +3795,12 @@ impl<'a> Lowering<'a> {
                     // word. Recording that local as a scalar alias makes
                     // the later `*q` skip `RawLoad`. A cell reborrow is
                     // recorded even when the local is assigned again.
+                    // Const byte-string STR: `&s` aliases the Constant
+                    // (`rstr.py` `ll_stritem_nonneg`). Recording the array
+                    // local would peel a later Index of `*_t` to a dead slot.
                     if self.raw_primitive_reborrow_inner(&place).is_none()
                         && (cell_reborrow || !self.multi_assigned_locals.contains(&local))
+                        && self.place_const_byte_str_alias(&place).is_none()
                     {
                         self.atomic_ref_place.insert(local, place);
                     }
@@ -3801,6 +3867,12 @@ impl<'a> Lowering<'a> {
                             .iter()
                             .any(|&local| place_references_local(place, local))
                             || tyref_is_w1_str(&place.ty, self.llbc)
+                    }
+                    // Const `[u8; N]` Array of UTF-8 bytes is a Constant
+                    // string (`rstr.py` `ll_stritem_nonneg`). Keep dest in
+                    // the STR-view set; the `_ => false` arm would clear it.
+                    Rvalue::Aggregate(..) => {
+                        const_u8_array_aggregate_text(self.llbc, &rvalue, &dest_ty).is_some()
                     }
                     _ => false,
                 };

@@ -19225,8 +19225,9 @@ fn non_reflexive_from_fn_item_const_is_not_identity_spec() {
 }
 
 /// `opt.map(str::to_string)` shape: a `FnDef` constant of the blanket
-/// `impl<T: Display> ToString for T`. Direct calls alias
-/// (`is_to_string_identity`) when the receiver is string-family; a
+/// `impl<T: Display> ToString for T`. Direct calls lower to
+/// `UnaryOp "str"` (`unaryop.py` `SomeObject.str`, `rmodel.py`
+/// `Repr.rtype_str`, `rstr.py` `AbstractStringRepr.ll_str`); a
 /// fn-item value is `FunctionDesc.getuniquegraph` of that instantiation
 /// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
 fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -> Llbc {
@@ -19304,13 +19305,55 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
                 serde_json::json!({"Use": [{"Const": [{
                     "FnDef": {
                         "kind": {"Fun": 1},
-                        "generics": fn_def_generics
+                        "generics": fn_def_generics.clone()
                     }
                 }, fn_ty.clone()]}, "No"]}),
             )],
             interior_return(),
         )],
     );
+    let concrete_recv = serde_json::json!({"Ref": ["Erased", self_ty.clone(), "Shared"]});
+    let call_types = if to_string_generic {
+        vec![self_ty.clone()]
+    } else {
+        vec![]
+    };
+    let call_to_string = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "call_to_string"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [concrete_recv.clone()],
+            "output": string_ty.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        interior_local(0, None, &string_ty),
+                        interior_local(1, Some("s"), &concrete_recv)
+                    ]
+                },
+                "body": [
+                    interior_bb(
+                        vec![],
+                        interior_call_with_types(
+                            1,
+                            vec![interior_copy(interior_place(1, &concrete_recv))],
+                            interior_place(0, &string_ty),
+                            1,
+                            2,
+                            call_types,
+                        ),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        }
+    });
     let string_decl = serde_json::json!({
         "def_id": 0,
         "item_meta": {
@@ -19365,7 +19408,7 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
     llbc_with_types_traits(
         "fixture",
         vec![string_decl],
-        vec![caller, to_string],
+        vec![caller, to_string, call_to_string],
         vec![trait_decl],
         vec![trait_impl],
     )
@@ -19376,7 +19419,7 @@ fn builtin_str_ty() -> serde_json::Value {
 }
 
 /// A `FnDef` constant of blanket `ToString::to_string` instantiated at
-/// `str` names the specialized identity graph, not the unregistered
+/// `str` names the specialized `str(arg0)` graph, not the unregistered
 /// generic template `to_string`.
 #[test]
 fn string_family_to_string_fn_item_const_registers_identity_spec() {
@@ -19394,8 +19437,8 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
-        "T = str is string-family; str(s) of a string is the string"
+        super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
+        "T = str is string-family; spec computes str(arg0)"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
         .expect("build semantic program for string-family ToString fn-item");
@@ -19421,7 +19464,7 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
     assert!(
         tail.last()
             .is_some_and(|leaf| leaf.starts_with("to_string__spec_")),
-        "fn-const names the specialized identity, not the generic template; tail={tail:?}"
+        "fn-const names the specialized str graph, not the generic template; tail={tail:?}"
     );
     assert_eq!(
         tail.last().map(String::as_str),
@@ -19444,13 +19487,20 @@ fn string_family_to_string_fn_item_const_registers_identity_spec() {
         });
     assert!(
         !residual_to_string,
-        "identity body has no residual to_string call; ops={:?}",
+        "str body has no residual to_string call; ops={:?}",
         graph_ops(spec.graph())
     );
+    assert_graph_is_str_of_arg0(spec.graph());
+    let direct = program
+        .functions
+        .iter()
+        .find(|f| f.name == "call_to_string")
+        .unwrap_or_else(|| panic!("expected call_to_string, functions={names:?}"));
+    assert_graph_is_str_of_arg0(direct.graph());
 }
 
-/// Blanket `ToString` of a non-string `Display` type is not identity:
-/// a FnDef constant of that `to_string` does not enqueue an identity spec.
+/// Blanket `ToString` of a non-string `Display` type is not string-str:
+/// a FnDef constant of that `to_string` does not enqueue a str spec.
 #[test]
 fn non_string_to_string_fn_item_const_is_not_identity_spec() {
     let i64_ty = interior_i64();
@@ -19467,7 +19517,7 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         "trait_refs": []
     });
     assert!(
-        !super::fun_decl_to_string_is_string_identity(&llbc, to_string, &fn_def_generics),
+        !super::fun_decl_to_string_is_string_str(&llbc, to_string, &fn_def_generics),
         "T = i64 is outside the string family"
     );
     let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
@@ -19477,7 +19527,62 @@ fn non_string_to_string_fn_item_const_is_not_identity_spec() {
         !names
             .iter()
             .any(|name| name.starts_with("to_string__spec_")),
-        "non-string ToString must not enqueue an identity spec; functions={names:?}"
+        "non-string ToString must not enqueue a str spec; functions={names:?}"
+    );
+}
+
+/// `str(arg0)` graph: one `UnaryOp "str"` on the first startblock
+/// inputarg, whose result is returned. An identity alias returns arg0
+/// with no `str` op.
+fn assert_graph_is_str_of_arg0(graph: &FunctionGraph) {
+    let arg0 = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .unwrap_or_else(|| panic!("expected arg0; graph={graph:#?}"));
+    let str_ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "str"))
+        .collect();
+    assert_eq!(
+        str_ops.len(),
+        1,
+        "exactly one UnaryOp str; ops={:?}",
+        graph_ops(graph)
+    );
+    match &str_ops[0].kind {
+        OpKind::UnaryOp { operand, .. } => {
+            assert_eq!(
+                operand.id(),
+                arg0.id(),
+                "str operand is arg0; ops={:?}",
+                graph_ops(graph)
+            );
+        }
+        other => panic!("expected UnaryOp str, got {other:?}"),
+    }
+    let result = str_ops[0]
+        .result
+        .as_ref()
+        .unwrap_or_else(|| panic!("UnaryOp str has a result; ops={:?}", graph_ops(graph)));
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
+                .iter()
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_eq!(
+        returned.map(|v| v.id()),
+        Some(result.id()),
+        "returns the UnaryOp str result; ops={:?}",
+        graph_ops(graph)
     );
 }
 
@@ -20872,7 +20977,9 @@ fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
 
 /// A `Result<ObjectKey, E>` sum shell intern's `Ok.__pos_0` as one GC
 /// pointer (`rtuple.py TupleRepr` / `rclass.py InstanceRepr` lowleveltype
-/// `Ptr(GcStruct)`). The field descr is FLAG_POINTER, one word, parent
+/// `Ptr(GcStruct)`). `ObjectKey` is `repr(transparent)` over `PyObjectRef`
+/// (`rordereddict.py get_ll_dict` DICTKEY = OBJECTPTR); the digest lives
+/// in `Entry.f_hash`. The field descr is FLAG_POINTER, one word, parent
 /// size two words (tag + payload).
 #[test]
 fn sum_shell_instance_payload_is_one_gc_pointer() {
@@ -20883,22 +20990,16 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
     let object_key = interior_struct(
         1,
         &["pyre_object", "dictmultiobject", "ObjectKey"],
-        &[
-            (
-                "hash",
-                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
-            ),
-            (
-                "obj",
-                serde_json::json!({"RawPtr": [
-                    {"Scalar": {"Integer": {"Unsigned": "U8"}}},
-                    "Mut"
-                ]}),
-            ),
-        ],
-        16,
-        &[0, 8],
-        false,
+        &[(
+            "__pos_0",
+            serde_json::json!({"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]}),
+        )],
+        8,
+        &[0],
+        true,
     );
     let err = interior_struct(
         2,
@@ -20934,9 +21035,10 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         "Ok.__pos_0 intern is Ptr(GcStruct); keys={keys:?}"
     );
     let payload = payload.unwrap();
+    let word = crate::layout::target_word_size();
     let known_structs: HashSet<String> = HashSet::from(["dictmultiobject::ObjectKey".to_string()]);
     let known_sizes: HashMap<String, usize> =
-        HashMap::from([("dictmultiobject::ObjectKey".to_string(), 16)]);
+        HashMap::from([("dictmultiobject::ObjectKey".to_string(), word)]);
     let layout = StructLayout::from_type_strings(
         &[
             ("__discriminant".to_string(), "i64".to_string()),
@@ -20948,7 +21050,6 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         &HashMap::new(),
         &HashSet::new(),
     );
-    let word = crate::layout::target_word_size();
     let pos0 = layout
         .fields
         .iter()
@@ -32210,6 +32311,230 @@ fn owned_buffer_borrowed_outside_append_stays_residual() {
     );
 }
 
+/// `descr_repr` walks `s[i]`. A leftover
+/// `core::slice::iter::<Impl>::into_iter` FunctionPath is the CallRegistry
+/// wall on `bytearray_repr_string.cachedgraph`.
+#[test]
+fn bytearray_repr_string_has_no_slice_into_iter() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "bytearray_repr_string")
+        .expect("lower bytearray_repr_string");
+    let leftover: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "into_iter") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "descr_repr's counted loop must not residualize into_iter; leftover={leftover:?} graph={}",
+        graph.dump()
+    );
+    let leftover_hex: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "HEX") => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover_hex.is_empty(),
+        "digit table is a constant string index; leftover HEX={leftover_hex:?} graph={}",
+        graph.dump()
+    );
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        let cp = match args.first() {
+            Some(LinkArg::Value(v)) => v,
+            other => panic!(
+                "charpsize2str cp is a Variable, got {other:?}; graph={}",
+                graph.dump()
+            ),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "window copy slot 0 is CCHARP; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+}
+
+/// `b"0123"[i as usize]` is `rstr.py` `AbstractStringRepr.rtype_getitem` /
+/// `ll_stritem_nonneg` on a Constant string: `__str_const` plus
+/// `__string_byte_getitem`, not a residual slice index or Array ctor.
+#[test]
+fn const_byte_str_literal_index_is_strgetitem() {
+    use crate::model::{CallTarget, OpKind};
+
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]);
+    let array_ty = serde_json::json!({"Array": [u8_ty.clone(), array_len, null]});
+    let array_ref = serde_json::json!({"Ref": ["Erased", array_ty.clone(), "Shared"]});
+    let shared = window_shared_slice();
+    let byte = |digits: &str| {
+        serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", digits]}},
+            u8_ty
+        ]})
+    };
+    let usize_lit = serde_json::json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", "4"]}},
+        n
+    ]});
+    let index_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 4}), &shared),
+            {"Index": {
+                "offset": {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                "from_end": false
+            }}
+        ]}),
+        &u8_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "const_byte_str_index"], true),
+        "signature": {"is_unsafe": false, "inputs": [n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &n),
+                window_local(2, &array_ty),
+                window_local(3, &array_ref),
+                window_local(4, &shared)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &array_ty),
+                            {"Aggregate": [
+                                {"Array": [u8_ty.clone(), usize_lit.clone()]},
+                                [byte("48"), byte("49"), byte("50"), byte("51")]
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &array_ref),
+                            {"Ref": {
+                                "place": window_place(serde_json::json!({"Local": 2}), &array_ty),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 4}), &shared),
+                            {"UnaryOp": [
+                                {"Cast": {"Unsize": [
+                                    array_ref.clone(),
+                                    shared.clone(),
+                                    {"Length": usize_lit}
+                                ]}},
+                                {"Move": window_place(serde_json::json!({"Local": 3}), &array_ref)}
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                            {"Use": [{"Read": index_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "const_byte_str_index")
+        .expect("lower b\"0123\"[i as usize]");
+    let mut has_str_const = false;
+    let mut has_getitem = false;
+    let mut residual = Vec::new();
+    for op in window_graph_ops(&graph) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                if segments.first().map(String::as_str) == Some("__str_const")
+                    && segments.get(1).map(String::as_str) == Some("0123")
+                {
+                    has_str_const = true;
+                } else if segments.last().map(String::as_str) == Some("__string_byte_getitem") {
+                    has_getitem = true;
+                } else {
+                    residual.push(segments.clone());
+                }
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {
+                residual.push(vec![name.clone()]);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        has_str_const,
+        "digit table is __str_const \"0123\"; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_getitem,
+        "b\"0123\"[i] is __string_byte_getitem; graph={}",
+        graph.dump()
+    );
+    assert!(
+        residual.is_empty(),
+        "const byte-string index must not residualize a call; leftover={residual:?} graph={}",
+        graph.dump()
+    );
+}
+
 /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
 /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
 /// `String::push_str` and `String::push(char)` in one loop, so omitting the
@@ -33995,6 +34320,7 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             result_ty,
+            args,
             ..
         } = &op.kind
         else {
@@ -34019,6 +34345,15 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
                 dest.concretetype().as_ref(),
                 Some(&*STRPTR),
                 "window STR copy stamps rstr STRPTR; graph={}",
+                graph.dump()
+            );
+            let cp = args[0].as_variable().expect("ll_charpsize2str cp");
+            assert!(
+                cp.concretetype()
+                    .as_ref()
+                    .is_some_and(super::lltype_is_ccharp),
+                "ll_charpsize2str slot 0 is CCHARP; ct={:?} graph={}",
+                cp.concretetype(),
                 graph.dump()
             );
             str_copies += 1;
@@ -34048,6 +34383,135 @@ fn window_str_copy_is_str_not_result_charpsize2str() {
         cp,
         Some("CCHARP"),
         "ll_charpsize2str cp Input class_root is CCHARP; helper={}",
+        helper.dump()
+    );
+}
+
+/// Integer address word used as `charpsize2str` `cp` is `rffi.cast` /
+/// `cast_int_to_ptr(CCHARP, int)` at the producer (`rffi.py` `CCHARP`).
+/// `from_raw_parts(usize, usize)` then `from_utf8_unchecked` is the
+/// Integer-for-`cp` call shape: helper slot 0 is `SomePtr` of `CCHARP`.
+#[test]
+fn integer_cp_to_ll_charpsize2str_is_ccharp() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let from_raw = window_opaque_fun(
+        1,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![n.clone(), n.clone()],
+        shared.clone(),
+    );
+    let from_utf8 = window_opaque_fun(
+        2,
+        &["core", "str", "converts", "from_utf8_unchecked"],
+        vec![shared.clone()],
+        str_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "integer_cp_charpsize2str"], true),
+        "signature": {"is_unsafe": true, "inputs": [n, n], "output": str_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &str_ty),
+                window_local(1, &n),
+                window_local(2, &n),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &n)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 3}), &shared), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 3}), &shared)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, from_raw, from_utf8]);
+    let graph = crate::test_support::lower_function(&llbc, "integer_cp_charpsize2str")
+        .expect("lower Integer-for-cp from_raw_parts + from_utf8_unchecked");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "cast_int_to_ptr"),
+        "Integer address is cast_int_to_ptr(CCHARP); leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let mut copies = 0usize;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_CHARPSIZE2STR] {
+            continue;
+        }
+        copies += 1;
+        assert_eq!(
+            args.len(),
+            2,
+            "charpsize2str(cp, size); graph={}",
+            graph.dump()
+        );
+        let cp = match &args[0] {
+            LinkArg::Value(v) => v,
+            other => panic!("cp is a Variable, got {other:?}; graph={}", graph.dump()),
+        };
+        assert!(
+            cp.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "helper slot 0 is CCHARP SomePtr; ct={:?} graph={}",
+            cp.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        copies >= 1,
+        "from_utf8_unchecked of an Integer window copies via ll_charpsize2str; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let helper = crate::front::join_chars::build_ll_charpsize2str_graph();
+    let cp_root = helper.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Input {
+                name, class_root, ..
+            } if name == "cp" => class_root.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        cp_root.as_deref(),
+        Some("CCHARP"),
+        "ll_charpsize2str slot 0 Input is CCHARP; helper={}",
         helper.dump()
     );
 }
