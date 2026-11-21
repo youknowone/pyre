@@ -83,7 +83,13 @@
 //!     and field-less structs stay constructors: `rewrite_op_malloc` needs
 //!     a non-empty `all_fielddescrs`. Transparent newtype wrappers stay a
 //!     no-op alias. Enum variants, tuples, and arrays still emit
-//!     `Call(SyntheticTransparentCtor)` for later rewrites.
+//!     `Call(SyntheticTransparentCtor)` for later rewrites. An all-const
+//!     `[u8; N]` Array of valid UTF-8 (`b"..."` inlined) whose
+//!     copy-component is single-assignment and immutable is `__str_const`
+//!     instead (`rstr.py` `AbstractStringRepr.rtype_getitem` /
+//!     `ll_stritem_nonneg` on a Constant string). A dest that may meet
+//!     array storage (`lltype.py` `_ptr.__setattr__` / `_ptr.__setitem__`;
+//!     `framestate.py` `FrameState.union`) keeps the Array ctor.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`. `new_array_clear` is produced later by
@@ -113,6 +119,10 @@
 //!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - A const `[u8; N]` Array aggregate of UTF-8 bytes (inlined `b"..."`)
+//!     whose copy-component is single-assignment and immutable is the
+//!     same `__str_const` Constant. Indexing it is
+//!     `__string_byte_getitem` (`rstr.py` `ll_stritem_nonneg`).
 //!   - `Char` → `ConstInt` of the code point then `builtin_unichr`
 //!     (`__majit_unichr`), so a Rust `char` annotates as
 //!     `SomeUnicodeCodePoint` while staying in the Int bank

@@ -2850,6 +2850,13 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    // `&[u8; N] as &[u8]` of a const byte-string stays the
+                    // STR (`rstr.py` `AbstractStringRepr.rtype_getitem` /
+                    // `ll_stritem_nonneg`). Dest `&[u8]` is a window type
+                    // (`ValueType::Int`); aliasing avoids `cast_ptr_to_int`.
+                    if cast_kind_is_unsize(&op_json) && self.operand_is_string_byte_view(&operand) {
+                        return Ok((None, arg));
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -3749,6 +3756,8 @@ impl<'a> Lowering<'a> {
                         .any(|&local| place_references_local(p, local)),
                     Operand::Const(_) => false,
                 };
+                let unsize_const_byte_str =
+                    cast_kind_is_unsize(&kind) && self.operand_is_string_byte_view(&operand);
 
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
@@ -3779,6 +3788,10 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                // Twin of the UnaryOp Unsize alias: dest `&[u8]` is Int.
+                if unsize_const_byte_str {
+                    return Ok((None, v));
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -9410,6 +9423,7 @@ impl<'a> Lowering<'a> {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
                     let copied_bytes = self.graph.name.ends_with("::copied_byte_vec");
                     let string_byte_view = copied_bytes
+                        || self.place_const_byte_str_alias(inner.as_ref()).is_some()
                         || self
                             .string_byte_view_locals
                             .iter()
@@ -9830,21 +9844,32 @@ impl<'a> Lowering<'a> {
                         return Ok(value);
                     }
                     if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
-                        let followed = self.concrete_borrow_place(recorded);
-                        // A local is the slot `mem::replace` writes. A projection
-                        // stays the borrowed value: re-resolving it would emit a
-                        // fresh field or index read for every borrow.
-                        if let PlaceKind::Local(_) = followed.kind {
-                            return self.resolve_place(mir_bb, followed);
-                        }
-                        if let Some(cell) = self.deref_cell_param_local(&followed) {
-                            let root = self.gc_mut_ref_param_root(cell).ok_or_else(|| {
-                                LowerError::Unsupported(format!(
-                                    "bb{mir_bb}: GC reference cell {cell} has no root"
-                                ))
-                            })?;
-                            let base = self.defined_local(mir_bb, cell)?;
-                            return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                        // Const byte-string STR: `&s` aliases the Constant
+                        // (`rstr.py` `ll_stritem_nonneg`). Peeling to the
+                        // array local would read it after it is dead
+                        // (`descr_repr` nibble index).
+                        if !self
+                            .const_byte_str_locals
+                            .get(local)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            let followed = self.concrete_borrow_place(recorded);
+                            // A local is the slot `mem::replace` writes. A projection
+                            // stays the borrowed value: re-resolving it would emit a
+                            // fresh field or index read for every borrow.
+                            if let PlaceKind::Local(_) = followed.kind {
+                                return self.resolve_place(mir_bb, followed);
+                            }
+                            if let Some(cell) = self.deref_cell_param_local(&followed) {
+                                let root = self.gc_mut_ref_param_root(cell).ok_or_else(|| {
+                                    LowerError::Unsupported(format!(
+                                        "bb{mir_bb}: GC reference cell {cell} has no root"
+                                    ))
+                                })?;
+                                let base = self.defined_local(mir_bb, cell)?;
+                                return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                            }
                         }
                     }
                 }
@@ -10037,7 +10062,12 @@ impl<'a> Lowering<'a> {
                             .is_some())
                     && !matches!(inner.kind, PlaceKind::Local(local)
                         if self.atomic_ref_place.contains_key(&(local as usize))
-                            || self.index_elem_alias.contains_key(&(local as usize)))
+                            || self.index_elem_alias.contains_key(&(local as usize))
+                            || self
+                                .const_byte_str_locals
+                                .get(local as usize)
+                                .copied()
+                                .unwrap_or(false))
                     // Primitive or `repr(transparent)` primitive wrapper
                     // (`tyref_primitive_or_transparent_primitive_node`).
                     && let Some((item_ty, itemsize, is_item_signed)) =
