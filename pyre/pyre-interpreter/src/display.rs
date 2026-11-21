@@ -286,29 +286,24 @@ pub fn format_wtf8_repr(s: &Wtf8) -> String {
 /// `'` but no `"`; the body always backslash-escapes `'` and `\` and never
 /// escapes `"`, so a `'` survives as `\'` even under a `"` outer quote.
 ///
-/// The counted loops are `descr_repr`'s: `c = s[i]`, `buf.append('\\x')`,
-/// then the two hex digits. Each digit is `getaddrstring`'s nibble
-/// arithmetic (`n += ord('0')`; past `'9'`, `n += ord('a') - ord('9') - 1`).
+/// The counted loops are `descr_repr`'s: the quote scan stops at the first
+/// `"`; the body loop reads `c = s[i]`, appends `'\\x'`, then the two hex
+/// digits `"0123456789abcdef"[n >> 4]` and `"0123456789abcdef"[n & 0xF]`.
 /// A slice `into_iter` / `format!` body is an opaque iterator the rtyper
 /// does not register.
 pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
-    let mut has_single = false;
-    let mut has_double = false;
+    let mut quote = b'\'';
     let mut i = 0;
     while i < data.len() {
         let c = data[i];
-        if c == b'\'' {
-            has_single = true;
-        } else if c == b'"' {
-            has_double = true;
+        if c == b'"' {
+            quote = b'\'';
+            break;
+        } else if c == b'\'' {
+            quote = b'"';
         }
         i += 1;
     }
-    let quote = if has_single && !has_double {
-        b'"'
-    } else {
-        b'\''
-    };
     let mut out = String::with_capacity(data.len() + 14);
     out.push_str(class_name);
     out.push_str("(b");
@@ -327,18 +322,8 @@ pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
             out.push_str("\\r");
         } else if !(0x20..0x7f).contains(&c) {
             out.push_str("\\x");
-            let mut hi = c >> 4;
-            hi += b'0';
-            if hi > b'9' {
-                hi += b'a' - b'9' - 1;
-            }
-            out.push(hi as char);
-            let mut lo = c & 0x0f;
-            lo += b'0';
-            if lo > b'9' {
-                lo += b'a' - b'9' - 1;
-            }
-            out.push(lo as char);
+            out.push(b"0123456789abcdef"[(c >> 4) as usize] as char);
+            out.push(b"0123456789abcdef"[(c & 0xF) as usize] as char);
         } else {
             out.push(c as char);
         }
@@ -378,18 +363,8 @@ pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
             out.push_str("\\n");
         } else if !(0x20..0x7f).contains(&c) {
             out.push_str("\\x");
-            let mut hi = c >> 4;
-            hi += b'0';
-            if hi > b'9' {
-                hi += b'a' - b'9' - 1;
-            }
-            out.push(hi as char);
-            let mut lo = c & 0x0f;
-            lo += b'0';
-            if lo > b'9' {
-                lo += b'a' - b'9' - 1;
-            }
-            out.push(lo as char);
+            out.push(b"0123456789abcdef"[(c >> 4) as usize] as char);
+            out.push(b"0123456789abcdef"[(c & 0xF) as usize] as char);
         } else {
             out.push(c as char);
         }
