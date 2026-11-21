@@ -21,6 +21,7 @@ const ALLOWED_CRATES: &[&str] = &["pyre_object", "pyre_interpreter", "majit_rlib
 
 /// First-failing skip reasons, in check order.
 const SKIP_REASONS: &[&str] = &[
+    "cross-target",
     "no-abi",
     "no-decl",
     "not-public",
@@ -360,12 +361,23 @@ pub fn write_generated_fnaddr_adapters(out_dir: &str, targets: &[SymbolicFnaddrT
     let mut skip_counts = vec![0usize; SKIP_REASONS.len()];
     let mut skipped_lines = Vec::new();
     let mut selected = Vec::new();
-    for (index, target) in targets.iter().enumerate() {
-        match select_target(index, target) {
+    // Host LLBC lists the host's graphs; a cross target has no graph list of
+    // its own (only type_decl layout sidecars), so no function pointer can be
+    // named for it.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host = std::env::var("HOST").unwrap_or_default();
+    let cross = majit_translate::layout::is_cross_target(&target, &host);
+    for (index, fn_target) in targets.iter().enumerate() {
+        let selected_or_skip = if cross {
+            Err("cross-target")
+        } else {
+            select_target(index, fn_target)
+        };
+        match selected_or_skip {
             Ok(adapter) => selected.push(adapter),
             Err(reason) => {
                 skip_counts[skip_index(reason)] += 1;
-                skipped_lines.push(format!("{} {reason}", target.path));
+                skipped_lines.push(format!("{} {reason}", fn_target.path));
             }
         }
     }
