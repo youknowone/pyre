@@ -6226,9 +6226,6 @@ pub(crate) fn is_rstr_str_family_spelling(spelling: &str) -> bool {
 /// (`bookkeeper.py Bookkeeper.getdesc`).
 pub(crate) const W_ROOT_CLASS_ROOT: &str = "pyobject::PyObject";
 
-/// Class identity of `pyre_object::dictmultiobject::ObjectKey`.
-pub(crate) const OBJECT_KEY_CLASS_ROOT: &str = "dictmultiobject::ObjectKey";
-
 /// Exact class-root spellings of the rstr `STR` / WTF-8 string family.
 ///
 /// `class_identity_spelling` of the declarations:

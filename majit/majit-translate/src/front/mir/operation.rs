@@ -8188,33 +8188,20 @@ impl<'a> Lowering<'a> {
                                                 })
                                             })
                                             .or_else(|| {
-                                            stripped.and_then(|n| {
-                                                raw_ptr_pointee_class_root_with(
-                                                    n,
-                                                    self.llbc,
-                                                    self.tombstoned_leaves,
-                                                )
-                                                .filter(|root| {
-                                                    spelling_path_is_declared_gc(
-                                                        self.gc_struct_ids,
-                                                        root,
-                                                    )
-                                                })
-                                                .or_else(|| {
-                                                    let root = adt_node_class_root_with(
+                                                stripped.and_then(|n| {
+                                                    raw_ptr_pointee_class_root_with(
                                                         n,
                                                         self.llbc,
                                                         self.tombstoned_leaves,
-                                                    )?;
-                                                    // `&ObjectKey` is the dict key the
-                                                    // `eq` body reads `.hash` from. Other
-                                                    // structs stay uncast: a blanket
-                                                    // narrow paints `Tuple` onto values
-                                                    // that are already tuples.
-                                                    (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                                    )
+                                                    .filter(|root| {
+                                                        spelling_path_is_declared_gc(
+                                                            self.gc_struct_ids,
+                                                            root,
+                                                        )
+                                                    })
                                                 })
                                             })
-                                        })
                                 }
                             }
                         }
