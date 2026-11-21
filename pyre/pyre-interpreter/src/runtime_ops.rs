@@ -2638,7 +2638,7 @@ mod tests {
     fn obj_or_memory_error_converts_null_to_memory_error() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _restore = RestoreRpyexcOccurred;
         let _ = majit_ir::eval_breaker_word::take_memory_error();
         let singleton = plant_pending_memory_error_singleton();
@@ -2664,7 +2664,7 @@ mod tests {
     fn obj_or_memory_error_takes_the_owed_breaker_once() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _restore = RestoreRpyexcOccurred;
         let _ = majit_ir::eval_breaker_word::take_memory_error();
         majit_ir::eval_breaker_word::set_memory_error();
@@ -2692,7 +2692,7 @@ mod tests {
     fn fetch_memory_error_takes_the_owed_breaker_once() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _restore = RestoreRpyexcOccurred;
         let _ = majit_ir::eval_breaker_word::take_memory_error();
         majit_ir::eval_breaker_word::set_memory_error();
@@ -2721,7 +2721,7 @@ mod tests {
     fn pyerror_from_rpyexc_value_maps_the_singleton_and_takes_the_breaker() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _ = majit_ir::eval_breaker_word::take_memory_error();
         majit_ir::eval_breaker_word::set_memory_error();
         let singleton = pyre_object::interp_exceptions::memory_error_singleton();
@@ -2741,7 +2741,7 @@ mod tests {
     fn fresh_alloc_or_memory_error_maps_null_and_passes_live() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _restore = RestoreRpyexcOccurred;
         let _ = majit_ir::eval_breaker_word::take_memory_error();
         let singleton = plant_pending_memory_error_singleton();
@@ -2769,7 +2769,7 @@ mod tests {
     fn fetch_memory_error_propagates_a_pending_non_memory_error() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         let _ctx = PyExecutionContext::default();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _restore = RestoreRpyexcOccurred;
         majit_gc::set_active_exception_occurred(Some(rpyexc_cell_occurred));
         let pending = pyre_object::interp_exceptions::w_exception_new_empty(

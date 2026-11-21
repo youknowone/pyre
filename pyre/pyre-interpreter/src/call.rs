@@ -6360,7 +6360,7 @@ mod pack_varargs_tests {
     fn pack_varargs_rereads_a_young_positional_after_the_tuple_alloc() {
         // Hides the nursery hook and the collector singleton's alloc path
         // from every other test thread for the whole body.
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let code = star_code();
@@ -6414,7 +6414,7 @@ mod pack_varargs_tests {
     fn resolve_kwargs_rereads_a_positional_across_the_kwonly_default_alloc() {
         // Same installer lock as the nursery-hook test. The string type id
         // and the stable hook stay invisible to every other thread.
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let module = crate::compile_exec("def f(a, *, b=1, c=2):\n    pass\n")
@@ -6526,7 +6526,7 @@ mod pack_varargs_tests {
     /// move it; `store_collected_keyword` then stores into the forwarded dict.
     #[test]
     fn resolve_kwargs_moves_the_young_kwargs_dict_across_empty_storage_alloc() {
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _signal_lock =
             crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let module =

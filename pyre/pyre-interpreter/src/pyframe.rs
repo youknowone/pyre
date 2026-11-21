@@ -8438,7 +8438,7 @@ x = 7
     fn frame_box_keeps_an_installed_builtin() {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
-        let _hook_lock = crate::test_hooks::hook_test_guard();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
         let _clear = ClearYoungFrameHooks;
 
         let code = crate::compile_exec("a = 1").expect("compile");
