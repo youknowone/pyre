@@ -1582,7 +1582,7 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
 }
 
 fn is_pyerror_handle_root(root: &str) -> bool {
-    root.rsplit("::").next() == Some("PyError")
+    matches!(root.rsplit("::").next(), Some("PyError" | "PyErrorObject"))
 }
 
 /// `PyError(make_pyerror(...))` is one pointer word. Value typing keeps
@@ -1638,7 +1638,7 @@ fn assert_pyerror_wrap_is_one_word(graph: &majit_translate::model::FunctionGraph
     );
     assert!(
         !handle_retags.is_empty(),
-        "{name}: PyError construction recasts the pointer onto the handle class, got {handle_retags:?}"
+        "{name}: PyError construction recasts the pointer onto the PyError carrier class, got {handle_retags:?}"
     );
 }
 
@@ -2950,4 +2950,87 @@ fn int_pow_trampoline_residual_is_canraise_with_catch_to_ovf2long() {
             Err(err) => eprintln!("int_pow_nomod_trampoline jitcode FAIL: {err}"),
         }
     }
+}
+
+fn pyerror_struct_ctor_names(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name, is_struct, ..
+                    },
+                ..
+            } if *is_struct && (name.contains("PyError") && !name.contains("PyErrorObject")) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `PyError(ptr)` is one pointer word (`retag_error_carrier`). A named-struct
+/// `New` of `error::PyError.__pos_0` is a second object; residual callees
+/// (`wrap_set_element_hash_error_raw`, `pyerror_to_exc_object`) take the
+/// payload (`*mut PyErrorObject`).
+#[test]
+fn from_exc_object_does_not_malloc_the_handle() {
+    let graph = lower_function(interp(), "from_exc_object")
+        .unwrap_or_else(|e| panic!("lower from_exc_object: {e}"));
+    let ctors = pyerror_struct_ctor_names(&graph);
+    assert!(
+        ctors.is_empty(),
+        "from_exc_object allocated a PyError wrapper: {ctors:?}"
+    );
+    let residual = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("pyerror_from_exc_object")
+            )
+        })
+    });
+    assert!(residual, "from_exc_object lost pyerror_from_exc_object");
+}
+
+/// `wrap_set_element_hash_error` peels `as_raw` into
+/// `wrap_set_element_hash_error_raw` and rewraps with `from_raw`. Both
+/// ends are the payload word; a `New` of the handle would pass the
+/// wrapper to the residual.
+#[test]
+fn wrap_set_element_hash_error_does_not_malloc_the_handle() {
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::baseobjspace::wrap_set_element_hash_error",
+    )
+    .unwrap_or_else(|e| panic!("lower wrap_set_element_hash_error: {e}"));
+    let ctors = pyerror_struct_ctor_names(&graph);
+    assert!(
+        ctors.is_empty(),
+        "wrap_set_element_hash_error allocated a PyError wrapper: {ctors:?}"
+    );
+    let raw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments
+                    .last()
+                    .map(String::as_str)
+                    == Some("wrap_set_element_hash_error_raw")
+            )
+        })
+    });
+    assert!(
+        raw,
+        "wrap_set_element_hash_error lost wrap_set_element_hash_error_raw"
+    );
 }

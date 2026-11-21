@@ -439,7 +439,37 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
         return std::ptr::null_mut();
     }
     let _item1_root = unsafe { PendingPairItemRoot::new(&mut item1) };
+    allocate_pair_from_rooted_items(&raw mut item0, &raw mut item1)
+}
 
+/// Allocate the `tuple2` while keeping an already-allocated item1 payload.
+///
+/// `rbigint._divrem` returns `(NULLRBIGINT, a)` when `abs(a) < abs(b)`;
+/// `_divmod_small` keeps that same remainder object when no opposite-sign
+/// correction is needed. The pair residual must store that input pointer as
+/// `item1` rather than allocating a fresh payload. Root and forward `item1`
+/// across the item0 and pair allocations (`framework.py` live locals).
+pub fn alloc_rbigint_pair_item1_alias_nursery_collecting(
+    item0: RBigInt,
+    mut item1: *mut RBigInt,
+) -> *mut RBigIntPair {
+    let item0 = RBigIntGcRoot::new(item0);
+    let _item1_root = unsafe { PendingPairItemRoot::new(&mut item1) };
+    let mut item0 = alloc_rbigint_nursery_collecting(item0.translated_alias());
+    let _item0_root = unsafe { PendingPairItemRoot::new(&mut item0) };
+    allocate_pair_from_rooted_items(&raw mut item0, &raw mut item1)
+}
+
+/// The collector rewrites the registered root slots during the collecting
+/// pair allocation (`framework.py` `gct_direct_call` /
+/// `shadowcolor.py` `expand_one_pop_roots` restore each live root after
+/// the call). Take raw slot pointers so the reads after the allocation load
+/// the forwarded values; `&mut` would let the compiler keep the
+/// pre-collection payload addresses.
+fn allocate_pair_from_rooted_items(
+    item0: *mut *mut RBigInt,
+    item1: *mut *mut RBigInt,
+) -> *mut RBigIntPair {
     let tid = rbigint_pair_gc_type_id();
     if tid != 0 {
         // The collecting hook is the one the JIT residual wants; backends
@@ -464,7 +494,13 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
             unsafe {
                 // Any collection the allocation above ran forwarded both roots,
                 // so these reads take the post-collection addresses.
-                std::ptr::write(raw as *mut RBigIntPair, RBigIntPair { item0, item1 });
+                std::ptr::write(
+                    raw as *mut RBigIntPair,
+                    RBigIntPair {
+                        item0: *item0,
+                        item1: *item1,
+                    },
+                );
             }
             // A nursery-full allocation can satisfy the pair from old-gen while
             // both payloads stay young, so this is not the fresh fixed-size
@@ -477,7 +513,12 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
             return std::ptr::null_mut();
         }
     }
-    crate::malloc_raw(RBigIntPair { item0, item1 })
+    unsafe {
+        crate::malloc_raw(RBigIntPair {
+            item0: *item0,
+            item1: *item1,
+        })
+    }
 }
 
 // PendingPartsCacheDigitRoot

@@ -2025,6 +2025,10 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `[item0 .. item_{n-1}]`. `build_set` peeks each then
         // `dropvalues(count)` (`eval.rs`).
         pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
+        // `[item0 .. item_{n-1}]`. `opcode_build_list` / `opcode_build_tuple`
+        // (`shared_opcode.rs`) `pop_n(size)`.
+        pyre_interpreter::Instruction::BuildList { count }
+        | pyre_interpreter::Instruction::BuildTuple { count } => count.get(op_arg) as usize,
         // `[value]`. `opcode_store_name` / `opcode_store_global`
         // (`pyopcode.rs`) pop the value then call `store_name_value` /
         // `store_global_value`.
@@ -2048,7 +2052,7 @@ fn caller_operand_slots<Sym: WalkSym>(
             return None;
         }
     };
-    // BUILD_SET/BUILD_MAP with count 0 pop nothing; no operand slot to prove.
+    // BUILD_LIST/BUILD_TUPLE/BUILD_SET/BUILD_MAP with count 0 pop nothing; no operand slot to prove.
     if operand_count == 0 {
         return Some(CallerOperandSlots::Empty);
     }
@@ -3121,13 +3125,17 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
-/// entry boundary, for a helper whose return is not the call's result
-/// ([`HelperReturn::Converted`] / [`HelperReturn::CalleePrologue`]). No
-/// `MIFrame` holds that conversion, so a guard inside the helper rebuilds
-/// its Python caller at the CALL and re-executes the call, while the
-/// already-paused outer frames remain below it. The caller still needs its
-/// own concrete blackhole image: without it the multi-frame conversion
-/// declines and the helper-local abort pc can escape into an outer frame's
+/// entry boundary.
+///
+/// [`HelperReturn::Converted`] / [`HelperReturn::CalleePrologue`] helpers
+/// have no `MIFrame` for the conversion (`pyframe.py execute_frame`
+/// `call_trace` is void and not the CALL's result). A guard rebuilds this
+/// Python caller at the CALL and re-executes the call.
+/// [`HelperReturn::CallResult`] numbers the helper instead
+/// (`capture_resumedata`); this frame is only the CALL-entry fallback of a
+/// numbered level (`HelperCallEntry`). The caller still needs its own
+/// concrete blackhole image: without it the multi-frame conversion declines
+/// and the helper-local abort pc can escape into an outer frame's
 /// coordinate space.
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3565,14 +3573,29 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
         .collect();
     let mut sections_have_markers = true;
     let mut any_blocker = false;
-    // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
-    for frame in &parent_frames[..split] {
-        if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
-            continue;
+    // Innermost section (`helper_innermost_resume_frame`): `resume_marker_jit_pc`.
+    // Every other helper section and every outer transparent-helper frame:
+    // CALL `next_pc` (`paused_parent_resume_pc`). `None` is a section with
+    // no resume coordinate.
+    let innermost = parent_frames.len().saturating_sub(1);
+    let section_resume_pc = |frame: &InlineParentFrame, is_innermost: bool| {
+        if is_innermost {
+            frame.resume_marker_jit_pc
+        } else {
+            crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32).and_then(|pjc| {
+                crate::jitcode_dispatch::residual_call::paused_parent_resume_pc(
+                    frame.call_jitcode_pc,
+                    frame.resume_marker_jit_pc,
+                    &pjc.jitcode.code,
+                )
+            })
         }
-        match frame.resume_marker_jit_pc {
+    };
+    let mut check = |frame: &InlineParentFrame, i: usize, entry_array_len: Option<usize>| {
+        match section_resume_pc(frame, i == innermost) {
             Some(pc) => {
-                if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
+                if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
+                {
                     any_blocker = true;
                 }
             }
@@ -3580,24 +3603,20 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
                 sections_have_markers = false;
                 any_blocker = true;
             }
+        }
+    };
+    // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
+    for (i, frame) in parent_frames[..split].iter().enumerate() {
+        if crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
+            check(frame, i, None);
         }
     }
-    for (frame, level) in parent_frames[split..].iter().zip(levels.iter().rev()) {
-        match frame.resume_marker_jit_pc {
-            Some(pc) => {
-                if helper_resume_reaches_blocker(
-                    frame.jitcode_index as usize,
-                    pc,
-                    level.helper_entry_array_len,
-                ) {
-                    any_blocker = true;
-                }
-            }
-            None => {
-                sections_have_markers = false;
-                any_blocker = true;
-            }
-        }
+    for (i, (frame, level)) in parent_frames[split..]
+        .iter()
+        .zip(levels.iter().rev())
+        .enumerate()
+    {
+        check(frame, split + i, level.helper_entry_array_len);
     }
     (sections_have_markers, any_blocker)
 }

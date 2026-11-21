@@ -2484,35 +2484,6 @@ pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
     PY_NULL
 }
 
-/// `s.add(value)` written as a bound-method call, for the walker arm that
-/// recognises it (`try_walker_specialize_set_add_method`).
-///
-/// The arm pins the callable to the `set.add` builtin and guards the receiver
-/// in the same spelling `require_set_receiver` uses, so the two checks the
-/// builtin opens with — its receiver predicate and one positional argument —
-/// are answered by those guards, and what remains is the store
-/// [`crate::opcode_ops::set_add_value`] already performs for `SET_ADD`. The
-/// element `__hash__` can run Python, so this is a MayForce residual like the
-/// accumulator it shares its body with.
-///
-/// Returns `None`. A raising `__hash__` publishes through both exception
-/// channels and answers PY_NULL, the residual-call ABI [`jit_next`] documents.
-pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
-    match crate::opcode_ops::set_add_value(set, value) {
-        Ok(()) => pyre_object::w_none(),
-        Err(err) => jit_publish_residual_error_ref(err),
-    }
-}
-
-/// `1` when [`pyre_object::plain_int_already_in_int_set`] is true.
-///
-/// Recorded as a cannot-collect call when the traced `set.add` is that hit.
-/// It does not insert, so a user `__hash__` never runs here. `0` fails the
-/// guard and the interpreter performs the real add.
-pub extern "C" fn jit_int_set_add_already_present(set: PyObjectRef, value: PyObjectRef) -> i64 {
-    pyre_object::plain_int_already_in_int_set(set, value) as i64
-}
-
 /// `pyopcode.py` FOR_ITER exception discrimination:
 /// `e.match(space, space.w_StopIteration)`. The caught object and match class
 /// are Python-level objects, so use the same MRO-aware helper as
@@ -2592,9 +2563,10 @@ mod tests {
         singleton
     }
 
-    /// `install_default_builtins` materializes `compile.py memory_error`
-    /// after the class terminator exists. The accessor is still
-    /// `get_or_init`; this asserts the init closure already ran.
+    /// `install_default_builtins` materializes the `compile.py memory_error`
+    /// singleton after `MemoryError` is registered. The instance carries the
+    /// exact MemoryError vtable (`exceptiondata.py get_standard_ll_exc_instance`),
+    /// and `type()` reads the registered class.
     #[test]
     fn memory_error_singleton_is_prebuilt_after_space_builtin() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
@@ -2613,23 +2585,19 @@ mod tests {
                 pyre_object::interp_exceptions::ExcKind::MemoryError,
             );
             assert!(!cls.is_null(), "MemoryError class is registered");
-            let term = pyre_object::w_type_get_terminator(cls);
             assert!(
-                !term.is_null(),
-                "install_type_terminator stored w_subtype.terminator"
-            );
-            let map_ptr = (prebuilt as *const u8)
-                .add(pyre_object::interp_exceptions::EXC_USER_MAP_OFFSET)
-                as *const pyre_object::mapdict::MapRef;
-            let map = *map_ptr;
-            assert_eq!(
-                map, term,
-                "user_setup copies the class terminator; the node stays reachable from the type"
+                std::ptr::eq(
+                    (*prebuilt).ob_type,
+                    pyre_object::interp_exceptions::exc_kind_to_pytype(
+                        pyre_object::interp_exceptions::ExcKind::MemoryError
+                    )
+                ),
+                "prebuilt instance carries the exact MemoryError vtable"
             );
             assert_eq!(
-                pyre_object::mapdict::map_terminator_w_cls(map),
+                crate::builtins::type_of_object(prebuilt),
                 cls,
-                "getclass of the singleton is MemoryError"
+                "type() of the singleton is MemoryError"
             );
         }
     }
