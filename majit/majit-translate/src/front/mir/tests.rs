@@ -47160,8 +47160,8 @@ fn interior_field_entry_ptr_reads_entries_header() {
         block.inputargs
     );
     assert!(
-        call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
-        "ops={ops:?}"
+        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
+        "address-only entry_ptr must disappear; ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
@@ -47173,8 +47173,8 @@ fn interior_field_entry_ptr_reads_entries_header() {
     );
 }
 
-/// `entries_item_ptr(header).add(i)` uses `header` itself. The call
-/// stays residual; its result is not given a second length word.
+/// `entries_item_ptr(header).add(i)` uses `header` itself. The address-only
+/// producer disappears; its result is not given a second length word.
 #[test]
 fn interior_field_entries_item_ptr_reuses_header_arg() {
     let i64_ty = interior_i64();
@@ -47286,10 +47286,10 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         "entries_item_ptr's argument is already the header; ops={ops:?}"
     );
     assert!(
-        call_leafs(&ops)
+        !call_leafs(&ops)
             .iter()
             .any(|leaf| leaf == "entries_item_ptr"),
-        "ops={ops:?}"
+        "address-only entries_item_ptr must disappear; ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
@@ -47299,9 +47299,6 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
         "ops={ops:?}"
     );
-    // The callee stays residual (`interior_opaque`). The 2-arg
-    // `cast_int_to_ptr(Ptr(ITEM), …)` is asserted on the substituted
-    // body (`entries_item_ptr_gcentries_i64_gcref_items_offset_is_8`).
     assert!(
         !call_leafs(&ops)
             .iter()
@@ -48837,6 +48834,12 @@ fn interior_field_entry_valid_real() {
     let graph =
         crate::test_support::lower_function(llbc, "entry_valid").expect("lower entry_valid");
     let ops = graph_ops(&graph);
+    for forbidden in ["entry_ptr", "entries_item_ptr", "cast_ptr_to_int"] {
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| leaf == forbidden),
+            "{forbidden} must not remain in the interior-field accessor; ops={ops:?}"
+        );
+    }
     let read = ops.iter().find_map(|op| match &op.kind {
         OpKind::InteriorFieldRead {
             base,
@@ -48885,6 +48888,12 @@ fn interior_field_entry_value_real() {
     let llbc = crate::test_support::load_ullbc(path);
     let graph = crate::test_support::lower_function(llbc, "value_at").expect("lower value_at");
     let ops = graph_ops(&graph);
+    for forbidden in ["entry_ptr", "entries_item_ptr", "cast_ptr_to_int"] {
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| leaf == forbidden),
+            "{forbidden} must not remain in the interior-field accessor; ops={ops:?}"
+        );
+    }
     let read = ops.iter().find_map(|op| match &op.kind {
         OpKind::InteriorFieldRead {
             base,

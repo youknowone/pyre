@@ -246,6 +246,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `slice_next_iter[opt] = Some(iter)` when `opt` is the destination of
     /// `next` on pair-slice iterator local `iter`. One-shot, from the body.
     pub(in crate::front::mir) slice_next_iter: Vec<Option<usize>>,
+    /// Address-only call destinations erased after the interior-field use proof.
+    /// Indexed by MIR local.
+    pub(in crate::front::mir) interior_pointer_alias_calls: Vec<bool>,
     /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`,
     /// when `i` is in the lowered closure. Incoming edges always target
     /// this entry. A bounds fork does not retarget it.
@@ -2051,6 +2054,8 @@ impl<'a> Lowering<'a> {
             compute_index_write_extra_live(body, llbc, gc_struct_ids, struct_fields);
         let interior_live =
             compute_interior_field_extra_live(body, llbc, gc_struct_ids, tombstoned_leaves);
+        let interior_pointer_alias_calls =
+            interior_pointer_alias_calls(body, llbc, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
             extra_live.resize(interior_live.len(), Vec::new());
         }
@@ -2369,6 +2374,7 @@ impl<'a> Lowering<'a> {
             raw_array,
             item_addr,
             slice_next_iter,
+            interior_pointer_alias_calls,
             emit_block: block_id.clone(),
             block_id,
             forward_reached,
