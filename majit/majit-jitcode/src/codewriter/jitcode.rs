@@ -880,9 +880,6 @@ impl JitCode {
     /// fields live here so `Arc<JitCode>` shells can be filled while
     /// shared (e.g. when `IndirectCallTargets` already holds clones).
     pub fn body(&self) -> &JitCodeBody {
-        if !self.body.is_set() {
-            panic!("JitCode body not yet set — call set_body() before reading body fields");
-        }
         self.body.published()
     }
 

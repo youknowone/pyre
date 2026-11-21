@@ -9633,8 +9633,11 @@ impl<S: JitState> JitDriver<S> {
         // interpreter hooks without going through the descriptor.
         self.meta.set_vable_ptr(std::ptr::null());
         self.meta.set_vable_array_lengths(Vec::new());
-        let info_clone = self.meta.virtualizable_info().cloned();
-        if let Some(ref info) = info_clone {
+        let info = self.meta.virtualizable_info().map(std::sync::Arc::as_ptr);
+        if let Some(info) = info {
+            // SAFETY: MetaInterp owns this Arc for its lifetime and this function
+            // never replaces it.
+            let info = unsafe { &*info };
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
                 // The entry names the frame this run executes.  The exits
