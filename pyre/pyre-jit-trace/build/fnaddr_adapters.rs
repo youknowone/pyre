@@ -341,7 +341,7 @@ fn emit_table(out: &mut String, selected: &[SelectedAdapter<'_>]) {
         out.push_str("    rows.push((\"");
         out.push_str(adapter.path);
         out.push_str("\", __gen_fnaddr_adapter_");
-        let _ = write!(out, "{} as usize as i64));\n", adapter.index);
+        let _ = write!(out, "{} as *const () as usize as i64));\n", adapter.index);
     }
     out.push_str("    rows\n}\n");
 }

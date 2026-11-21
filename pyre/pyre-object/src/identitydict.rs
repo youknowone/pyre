@@ -132,7 +132,7 @@ pub unsafe fn w_dict_lookup_identity_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    identity_storage(obj).get(&IdentityKey(key)).copied()
+    identity_storage(obj).get_value(&IdentityKey(key))
 }
 
 /// `dictmultiobject.py delitem`'s identity-keyed remove — drop the

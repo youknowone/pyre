@@ -404,7 +404,7 @@ pub unsafe fn dict_entries_probe_str(
     hash: i64,
     key: &str,
 ) -> Option<PyObjectRef> {
-    entries.get(&StrLookupKey { hash, key }).copied()
+    entries.get_value(&StrLookupKey { hash, key })
 }
 
 /// The owned-key probe [`dict_entries_get_str`]'s no-hook arm runs — the same
@@ -426,7 +426,7 @@ pub unsafe fn dict_entries_probe_object(
     entries: &ObjectDictStorage,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.get(&object_key_for(key)).copied()
+    entries.get_value(&object_key_for(key))
 }
 
 /// The object-keyed remove side of the same table — `dictmultiobject.py delitem
@@ -479,7 +479,7 @@ pub unsafe fn dict_entries_probe_hashed(
     hash: i64,
     obj: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    entries.get(&ObjectKey { hash, obj }).copied()
+    entries.get_value(&ObjectKey { hash, obj })
 }
 
 /// The store side of [`dict_entries_probe_hashed`] —
@@ -3457,7 +3457,7 @@ pub unsafe fn w_module_dict_lookup_object_entries(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     let entries = w_module_dict_object_storage(obj)?;
-    entries.get(&object_key_for(key)).copied()
+    entries.get_value(&object_key_for(key))
 }
 
 /// # Safety
@@ -5506,7 +5506,7 @@ pub unsafe fn w_dict_lookup_int_strategy(
     lock_dict_refs!(_dict_guard, obj, key);
     let entries = w_dict_int_storage(obj);
     let k = crate::listobject::plain_int_w(key);
-    entries.get(&k).copied()
+    entries.get_value(&k)
 }
 
 /// Return the insertion-order index selected by an int-strategy lookup.
@@ -5867,7 +5867,7 @@ pub unsafe fn w_dict_lookup_bytes_strategy(
     lock_dict_refs!(_dict_guard, obj, key);
     let entries = w_dict_bytes_storage(obj);
     let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
-    entries.get(&k).copied()
+    entries.get_value(&k)
 }
 
 /// Internal helper: `BytesDictStrategy::delitem` body —

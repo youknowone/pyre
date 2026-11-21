@@ -1763,6 +1763,23 @@ where
         Some(&self.entry_at(slot).value)
     }
 
+    /// `ll_dict_get`: the found entry's value, `d.entries[index].value`,
+    /// read as one interior field instead of a reference into the array.
+    pub fn get_value<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        V: Copy,
+    {
+        let hash = self.hash_of(key);
+        let slot = self.lookup(hash, key)?;
+        // Same stale-slot bound as `get`.
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
+            return None;
+        }
+        // SAFETY: `slot` is below `num_ever_used_items` and `f_valid` holds.
+        Some(unsafe { self.value_at(slot) })
+    }
+
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
