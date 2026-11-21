@@ -6775,11 +6775,10 @@ fn register_replace_value_inst(entries: &mut Vec<(&'static str, i64)>) {
 
 fn register_rdict_dont_look_inside_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
 where
-    K: std::hash::Hash
-        + Eq
-        + Copy
+    K: Copy
         + pyre_object::rordereddict::EntryDummy
-        + pyre_object::rordereddict::GcRefOffsets,
+        + pyre_object::rordereddict::GcRefOffsets
+        + pyre_object::rordereddict::DictKeyProbe,
     V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
     S: std::hash::BuildHasher,
     (K, V): pyre_object::rordereddict::GcEntriesType,
@@ -6793,7 +6792,7 @@ where
         std::any::type_name::<K>(),
         std::any::type_name::<V>(),
         std::any::type_name::<S>(),
-        std::any::type_name::<K>(),
+        std::any::type_name::<K::Probe>(),
     ];
     p1_inst!(
         entries,
@@ -6822,19 +6821,19 @@ where
     p3_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_lookup_trampoline",
-        pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K::Probe>,
         &kvsk,
     );
     p3_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_contains_trampoline",
-        pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K::Probe>,
         &kvsk,
     );
     p2_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_hash_of",
-        pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K::Probe>,
         &kvsk,
     );
 }
@@ -6843,8 +6842,6 @@ fn register_rdict_setitem_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
 where
     K: ResidualSlot
         + WasmWord
-        + std::hash::Hash
-        + Eq
         + Copy
         + pyre_object::rordereddict::EntryDummy
         + pyre_object::rordereddict::GcRefOffsets,

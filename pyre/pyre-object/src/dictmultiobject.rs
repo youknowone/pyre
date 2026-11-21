@@ -96,24 +96,11 @@ impl crate::rordereddict::EntryDummy for ObjectKey {
 #[derive(Clone, Copy)]
 pub struct ObjectEntryKey(pub PyObjectRef);
 
-impl std::hash::Hash for ObjectEntryKey {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // `K: Hash` for the generic table. Object-dict stores go through
-        // `insert_hashed` so `f_hash` is the `hash_w` digest, not this
-        // identity hash (`rordereddict.py` `ll_dict_setitem_with_hash`).
-        crate::gc_hook::gc_identity_hash(self.0 as usize).hash(state);
-    }
-}
-
-impl PartialEq for ObjectEntryKey {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.0, other.0)
-    }
-}
-
-impl Eq for ObjectEntryKey {}
+// Deliberately no `Hash`, `PartialEq`, or `Eq` implementation.  PyPy's
+// `ObjectDictStrategy.get_empty_storage` supplies exactly `space.hash_w` and
+// `space.eq_w`; the cached `hash_w` digest is `Entry.f_hash`, and lookup uses
+// an `ObjectKey` / `StrLookupKey` probe.  Giving the stored word an identity
+// contract would create a second, incompatible dictionary contract.
 
 impl crate::rordereddict::EntryDummy for ObjectEntryKey {
     fn dummy() -> Self {

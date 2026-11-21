@@ -322,6 +322,24 @@ impl<Q: ?Sized + Eq, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
     }
 }
 
+/// Probe that hashes and equals a stored `K`.
+///
+/// `get_ll_dict` keeps `DICTKEY` separate from `fnkeyhash` / `fnkeyeq`.
+/// `ObjectDictStrategy.get_empty_storage` supplies `space.hash_w` /
+/// `space.eq_w` on [`crate::dictmultiobject::ObjectKey`], not an identity
+/// contract on the stored word.
+pub trait DictKeyProbe {
+    type Probe: Hash + Equivalent<Self>;
+}
+
+impl<K: Hash + Eq> DictKeyProbe for K {
+    type Probe = K;
+}
+
+impl DictKeyProbe for crate::dictmultiobject::ObjectEntryKey {
+    type Probe = crate::dictmultiobject::ObjectKey;
+}
+
 /// See the module docs.
 ///
 /// `dicttable` (`rordereddict.py` `get_ll_dict`) is a `GcStruct` whose field
@@ -1117,7 +1135,7 @@ fn rdict_isvirtual_mut<K, V, S>(d: &mut RDict<K, V, S>) -> bool {
 #[majit_macros::unroll_safe]
 pub fn ll_dict_lookup_orig<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1156,7 +1174,7 @@ where
 #[majit_macros::oopspec("ordereddict.lookup")]
 pub fn ll_dict_lookup_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1167,7 +1185,7 @@ where
 
 pub fn ll_dict_lookup<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1214,7 +1232,7 @@ pub fn ll_dictnext_trampoline<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize
 /// `ll_dict_contains`. look_inside_iff(isvirtual(d)).
 pub fn ll_dict_contains<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1231,7 +1249,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_contains_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1246,7 +1264,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_hash_of<K, V, S, Q>(d: &RDict<K, V, S>, key: &Q) -> u64
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1263,7 +1281,7 @@ where
 #[majit_macros::oopspec("odict.resize(d)")]
 pub fn ll_dict_resize<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1276,7 +1294,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_remove_deleted_items<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1287,7 +1305,7 @@ where
 /// `ll_dict_grow`. look_inside_iff(isvirtual(d)).
 pub fn ll_dict_grow<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1301,7 +1319,7 @@ where
 
 fn ll_dict_grow_orig<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1322,7 +1340,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_grow_trampoline<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1339,7 +1357,7 @@ pub fn ll_dict_setitem_lookup_done<K, V, S>(
     key: K,
     value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1358,7 +1376,7 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
     mut key: K,
     mut value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1438,7 +1456,7 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
     key: K,
     value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1449,7 +1467,7 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
 /// `_ll_dict_del`. look_inside_iff(isvirtual(d) and isconstant(i)).
 pub fn ll_dict_del<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1463,7 +1481,7 @@ where
 
 fn ll_dict_del_orig<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1488,7 +1506,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_del_trampoline<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1522,7 +1540,7 @@ fn reload_gcrefs<T: GcRefOffsets>(roots: &crate::gc_roots::RootScope, val: &mut 
 
 impl<K, V, S> RDict<K, V, S>
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1826,7 +1844,7 @@ where
     /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V>
     where
-        K: GcRefOffsets,
+        K: Hash + Eq + GcRefOffsets,
         V: GcRefOffsets,
     {
         let hash = self.hash_of(&key);
@@ -1883,7 +1901,7 @@ where
     /// comparison able to re-enter it.
     pub fn insert_known_absent(&mut self, key: K, value: V)
     where
-        K: GcRefOffsets,
+        K: Hash + GcRefOffsets,
         V: GcRefOffsets,
     {
         let hash = self.hash_of(&key);
@@ -2529,6 +2547,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl EntryDummy for usize {
+        fn dummy() -> Self {
+            0
+        }
+    }
+
+    impl GcRefOffsets for usize {
+        const GC_REF_OFFSETS: &'static [usize] = &[];
+    }
+
+    impl GcEntriesType for (crate::dictmultiobject::ObjectEntryKey, usize) {
+        fn entries_gc_type_id() -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn cached_hash_probe_api_does_not_require_stored_key_hash_or_eq() {
+        use crate::dictmultiobject::{ObjectEntryKey, ObjectKeyBuildHasher};
+
+        #[derive(Clone, Copy)]
+        struct PointerProbe {
+            hash: u64,
+            obj: crate::PyObjectRef,
+        }
+        impl std::hash::Hash for PointerProbe {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                state.write_u64(self.hash);
+            }
+        }
+        impl crate::rordereddict::Equivalent<ObjectEntryKey> for PointerProbe {
+            fn equivalent(&self, stored: &ObjectEntryKey) -> bool {
+                self.obj == stored.0
+            }
+        }
+
+        type D = RDict<ObjectEntryKey, usize, ObjectKeyBuildHasher>;
+        let mut d = D::with_hasher(ObjectKeyBuildHasher::default());
+        let obj = 0x1000usize as crate::PyObjectRef;
+        let stored = ObjectEntryKey(obj);
+        let probe = PointerProbe { hash: 37, obj };
+
+        assert_eq!(d.insert_hashed(37, &probe, stored, 11), None);
+        assert_eq!(d.get_value(&probe), Some(11));
+        assert_eq!(d.remove(&probe), Some(11));
+        assert!(d.is_empty());
+    }
 
     #[test]
     fn perturb_probes_can_revisit_slots_before_covering_the_table() {
