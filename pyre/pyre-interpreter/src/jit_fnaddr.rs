@@ -7432,6 +7432,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             celldict::OBJECT_MUTABLE_CELL_TYPE
         ),
         pytype_addr!(
+            "listobject::KEY_CONTAINER_TYPE",
+            listobject::KEY_CONTAINER_TYPE
+        ),
+        pytype_addr!(
             "celldict::INT_MUTABLE_CELL_TYPE",
             celldict::INT_MUTABLE_CELL_TYPE
         ),

@@ -11,14 +11,33 @@
 //!   `len`, `acc`, `i`, and `obj`.
 //! * [`TupleHashJitState`] — `Meta = PyreMeta`, `Sym = TupleHashSym`, `Env = PyreEnv`.
 
+use std::sync::LazyLock;
+
 use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
 use majit_metainterp::{JitArgKind, JitCodeSym, JitDriverStaticData, JitState};
 
+use crate::jitcode_runtime::CompiledJitDriver;
 use crate::state::{PyreEnv, PyreMeta};
 use pyre_object::{PY_NULL, PyObjectRef};
 
 /// Registered main-jitcode key after `split_portal` copies the loop.
 pub const TUPLEHASH_PORTAL_KEY: &str = "builtins::tuple_hash_portal_portal";
+
+/// The driver's static data record, resolved once
+/// (`split_graph_and_record_jitdriver` / `jitdriver_sd`).
+pub fn tuple_hash_driver() -> &'static CompiledJitDriver {
+    static DRIVER: LazyLock<&'static CompiledJitDriver> = LazyLock::new(|| {
+        let driver = crate::jitcode_runtime::compiled_jit_driver_for_key(TUPLEHASH_PORTAL_KEY)
+            .unwrap_or_else(|| panic!("missing compiled JIT driver `{TUPLEHASH_PORTAL_KEY}`"));
+        assert_eq!(
+            driver.red_marker_positions.as_ref().map(Vec::len),
+            Some(4),
+            "tuple.hash red_marker_positions length"
+        );
+        driver
+    });
+    *DRIVER
+}
 
 /// Marker extras after the green: `hash_driver.jit_merge_point(w_type, w_tuple, len, acc, i)`.
 ///
@@ -167,7 +186,10 @@ fn tuple_hash_marker_boxes(sym: &TupleHashSym) -> [(OpRef, Type); 4] {
 }
 
 fn tuple_hash_recorded_boxes(sym: &TupleHashSym) -> Vec<(OpRef, Type)> {
-    crate::jitcode_runtime::permute_marker_reds(TUPLEHASH_PORTAL_KEY, &tuple_hash_marker_boxes(sym))
+    crate::jitcode_runtime::permute_marker_reds_on(
+        tuple_hash_driver(),
+        &tuple_hash_marker_boxes(sym),
+    )
 }
 
 fn tuple_hash_sym_from_recorded() -> TupleHashSym {
@@ -197,19 +219,21 @@ fn tuple_hash_sym_from_recorded() -> TupleHashSym {
 /// Reds in the rewritten merge-point order (`jtransform.py`
 /// `autodetect_jit_markers_redvars`). Call-site arguments stay
 /// `(len, acc, i, obj)`; `red_marker_positions` chooses slots.
-pub fn tuple_hash_live_values(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> Vec<Value> {
-    crate::jitcode_runtime::permute_marker_reds(
-        TUPLEHASH_PORTAL_KEY,
-        &tuple_hash_marker_values(len, acc, i, obj),
-    )
+pub fn tuple_hash_live_values(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [Value; 4] {
+    let marker = tuple_hash_marker_values(len, acc, i, obj);
+    let mut out = [Value::Void; 4];
+    crate::jitcode_runtime::permute_marker_reds_into(tuple_hash_driver(), &marker, &mut out);
+    out
 }
 
 /// `llmodel.py execute_token` words for the same reds (`unspecialize_value`).
-pub fn tuple_hash_raw_reds(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> Vec<i64> {
-    tuple_hash_live_values(len, acc, i, obj)
-        .iter()
-        .map(crate::jitcode_runtime::red_value_word)
-        .collect()
+pub fn tuple_hash_raw_reds(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [i64; 4] {
+    // Marker-operand order matches `tuple_hash_marker_values`; each word is
+    // `red_value_word` of that Value.
+    let marker = [(obj as usize) as i64, len, acc, i];
+    let mut out = [0i64; 4];
+    crate::jitcode_runtime::permute_marker_reds_into(tuple_hash_driver(), &marker, &mut out);
+    out
 }
 
 /// Trace `red_args` in rewritten slot order: InputArg `slot` plus the

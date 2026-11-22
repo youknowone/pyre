@@ -5,38 +5,48 @@
 //! name='_compute_keys_for_sorting')`
 //! drives `sortkey_portal`.
 
+use std::sync::LazyLock;
+
 use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
 use majit_metainterp::{JitArgKind, JitCodeSym, JitDriverStaticData, JitState};
 
+use crate::jitcode_runtime::CompiledJitDriver;
 use crate::state::{PyreEnv, PyreMeta};
 use pyre_object::PyObjectRef;
 
 pub const SORTKEY_PORTAL_KEY: &str = "builtins::sortkey_portal";
 pub const SORTKEY_JD_INDEX: usize = 4;
 
+/// The driver's static data record, resolved once
+/// (`split_graph_and_record_jitdriver` / `jitdriver_sd`).
+pub fn sortkey_driver() -> &'static CompiledJitDriver {
+    static DRIVER: LazyLock<&'static CompiledJitDriver> = LazyLock::new(|| {
+        crate::jitcode_runtime::compiled_jit_driver_for_key(SORTKEY_PORTAL_KEY)
+            .unwrap_or_else(|| panic!("missing compiled JIT driver `{SORTKEY_PORTAL_KEY}`"))
+    });
+    *DRIVER
+}
+
 /// Marker extras after the greens:
-/// `sortkey_jmp.jit_merge_point(strategy_type, tp, i, list_w, keys_w, w_callable)`.
+/// `sortkey_jmp.jit_merge_point(strategy_type, tp, i, list_w, w_callable)`.
 ///
 /// The marker's explicit red operands are this port's declaration of which
 /// live variable is which. `jtransform.py` `autodetect_jit_markers_redvars`
 /// rewrites them; `warmspot.py` `make_args_specification` consumes that
 /// list. Seeders permute this declaration through `red_marker_positions`.
-pub const SORTKEY_MARKER_REDS: [(&'static str, Type); 4] = [
+pub const SORTKEY_MARKER_REDS: [(&'static str, Type); 3] = [
     ("i", Type::Int),
     ("list_w", Type::Ref),
-    ("keys_w", Type::Ref),
     ("w_callable", Type::Ref),
 ];
 
 /// jd4 symbolic state at the `sortkey_jmp` merge point.
 ///
 /// listobject.py names the greens `strategy_type` and `tp` and `reds='auto'`
-/// the loop locals `i`, `list_w`, `w_callable`. pyre keeps keys in a parallel
-/// list (`keys_w`) because TimSort compares shadow-stack slots.
+/// the loop locals `i`, `list_w`, `w_callable`.
 pub struct SortkeySym {
     pub i: OpRef,
     pub list_w: OpRef,
-    pub keys_w: OpRef,
     pub w_callable: OpRef,
 }
 
@@ -96,52 +106,41 @@ fn sortkey_recorded_reds() -> Vec<(&'static str, Type)> {
     crate::jitcode_runtime::compiled_reds(SORTKEY_PORTAL_KEY, &SORTKEY_MARKER_REDS)
 }
 
-fn sortkey_marker_boxes(sym: &SortkeySym) -> [(OpRef, Type); 4] {
+fn sortkey_marker_boxes(sym: &SortkeySym) -> [(OpRef, Type); 3] {
     [
         (sym.i, SORTKEY_MARKER_REDS[0].1),
         (sym.list_w, SORTKEY_MARKER_REDS[1].1),
-        (sym.keys_w, SORTKEY_MARKER_REDS[2].1),
-        (sym.w_callable, SORTKEY_MARKER_REDS[3].1),
+        (sym.w_callable, SORTKEY_MARKER_REDS[2].1),
     ]
 }
 
 fn sortkey_sym_from_recorded() -> SortkeySym {
     let mut i = None;
     let mut list_w = None;
-    let mut keys_w = None;
     let mut w_callable = None;
     for (slot, (name, ty)) in sortkey_recorded_reds().into_iter().enumerate() {
         let op = OpRef::input_arg_typed(slot as u32, ty);
         match name {
             "i" => i = Some(op),
             "list_w" => list_w = Some(op),
-            "keys_w" => keys_w = Some(op),
             "w_callable" => w_callable = Some(op),
             other => panic!("unknown sortkey marker red `{other}`"),
         }
     }
     SortkeySym {
-        // Dead across the merge point: not an InputArg, never selected.
-        i: i.unwrap_or_else(|| OpRef::input_arg_typed(0, Type::Int)),
+        i: i.expect("sortkey marker red `i`"),
         list_w: list_w.expect("sortkey marker red `list_w`"),
-        keys_w: keys_w.expect("sortkey marker red `keys_w`"),
         w_callable: w_callable.expect("sortkey marker red `w_callable`"),
     }
 }
 
 /// Reds in rewritten merge-point order, from marker extras.
-pub fn sortkey_live_values(
-    i: i64,
-    list_w: PyObjectRef,
-    keys_w: PyObjectRef,
-    w_callable: PyObjectRef,
-) -> Vec<Value> {
-    crate::jitcode_runtime::permute_marker_reds(
-        SORTKEY_PORTAL_KEY,
+pub fn sortkey_live_values(i: i64, list_w: PyObjectRef, w_callable: PyObjectRef) -> Vec<Value> {
+    crate::jitcode_runtime::permute_marker_reds_on(
+        sortkey_driver(),
         &[
             Value::Int(i),
             Value::Ref(GcRef(list_w as usize)),
-            Value::Ref(GcRef(keys_w as usize)),
             Value::Ref(GcRef(w_callable as usize)),
         ],
     )
@@ -151,10 +150,9 @@ pub fn sortkey_live_values(
 pub fn sortkey_trace_red_args(
     i: i64,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Vec<(JitArgKind, OpRef, i64)> {
-    let live = sortkey_live_values(i, list_w, keys_w, w_callable);
+    let live = sortkey_live_values(i, list_w, w_callable);
     sortkey_recorded_reds()
         .into_iter()
         .enumerate()
@@ -168,17 +166,33 @@ pub fn sortkey_trace_red_args(
         .collect()
 }
 
-/// CRN I/R banks → marker extras `(i, list_w, keys_w, w_callable)`.
+/// Retry `red_args` after `set_redboxes`: loop-carried OpRefs in recorded
+/// order, concrete words from `live`.
+pub fn sortkey_trace_red_args_from_sym(
+    sym: &SortkeySym,
+    live: &[Value],
+) -> Vec<(JitArgKind, OpRef, i64)> {
+    crate::jitcode_runtime::permute_marker_reds_on(sortkey_driver(), &sortkey_marker_boxes(sym))
+        .into_iter()
+        .zip(live)
+        .map(|((op, ty), value)| {
+            (
+                JitArgKind::from_type(ty).expect("sortkey red is I/R/F"),
+                op,
+                crate::jitcode_runtime::red_value_word(value),
+            )
+        })
+        .collect()
+}
+
+/// CRN I/R banks → marker extras `(i, list_w, w_callable)`.
 ///
 /// `jitexc.py` `ContinueRunningNormally` carries kind banks;
 /// `warmspot.py` `handle_jitexception` walks the rewritten marker list.
-pub fn sortkey_portal_refs(
-    ints: &[i64],
-    refs: &[i64],
-) -> (i64, PyObjectRef, PyObjectRef, PyObjectRef) {
-    let live =
-        crate::jitcode_runtime::compiled_red_values_from_kind_banks(SORTKEY_PORTAL_KEY, ints, refs);
-    let marker = crate::jitcode_runtime::marker_reds_from_recorded(SORTKEY_PORTAL_KEY, &live);
+pub fn sortkey_portal_refs(ints: &[i64], refs: &[i64]) -> (i64, PyObjectRef, PyObjectRef) {
+    let driver = sortkey_driver();
+    let live = crate::jitcode_runtime::compiled_red_values_from_kind_banks_on(driver, ints, refs);
+    let marker = crate::jitcode_runtime::marker_reds_from_recorded_on(driver, &live);
     let ref_at = |idx: usize| match marker.get(idx) {
         Some(Some(Value::Ref(GcRef(ptr)))) => *ptr as PyObjectRef,
         other => panic!("sortkey marker red {idx}, got {other:?}"),
@@ -188,7 +202,7 @@ pub fn sortkey_portal_refs(
         Some(None) | None => 0,
         other => panic!("sortkey marker red 0, got {other:?}"),
     };
-    (i, ref_at(1), ref_at(2), ref_at(3))
+    (i, ref_at(1), ref_at(2))
 }
 
 impl SortkeyJitState {
@@ -238,7 +252,7 @@ impl JitState for SortkeyJitState {
         let _ = (meta, values);
     }
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        crate::jitcode_runtime::permute_marker_reds(SORTKEY_PORTAL_KEY, &sortkey_marker_boxes(sym))
+        crate::jitcode_runtime::permute_marker_reds_on(sortkey_driver(), &sortkey_marker_boxes(sym))
             .into_iter()
             .map(|(op, _)| op)
             .collect()
@@ -253,7 +267,9 @@ impl JitState for SortkeyJitState {
 mod tests {
     use super::*;
 
-    /// Extracted `sortkey_portal` merge-point banks (`red_r=[2, 3, 4]`).
+    /// Extracted `sortkey_portal` merge-point banks (`red_i=[i]`,
+    /// `red_r=[list_w, w_callable]`). Shim arity is greens + recorded reds
+    /// (`warmspot.py` `make_args_specification`).
     #[test]
     fn jd4_build_time_descrs_resolve_through_global_pool() {
         let canonical = crate::jitcode_runtime::portal_jitcode_for_key(SORTKEY_PORTAL_KEY)
@@ -269,18 +285,26 @@ mod tests {
         assert_eq!(banks.green_f.len(), 0);
         assert_eq!(
             banks.red_i.len(),
-            0,
-            "red_i={:?} red_r={:?}",
+            1,
+            "live `i`; red_i={:?} red_r={:?}",
             banks.red_i,
             banks.red_r
         );
         assert_eq!(
             banks.red_r.len(),
-            3,
-            "list_w, keys_w, w_callable; red_i={:?} red_r={:?}",
+            2,
+            "list_w, w_callable; red_i={:?} red_r={:?}",
             banks.red_i,
             banks.red_r
         );
         assert_eq!(banks.red_f.len(), 0);
+        let recorded = sortkey_recorded_reds();
+        let sd = SortkeyJitState::sortkey_driver_descriptor();
+        assert_eq!(
+            sd.greens().len() + recorded.len(),
+            5,
+            "shim arity: 2 greens + recorded reds {recorded:?}"
+        );
+        assert_eq!(sd.reds().len(), recorded.len());
     }
 }

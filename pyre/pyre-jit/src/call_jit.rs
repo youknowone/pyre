@@ -1533,6 +1533,14 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
     result as i64
 }
 
+/// `PYRE_JIT=0` master off, resolved once through `jit_env` so a wasm
+/// guest sees runner-forwarded values.
+pub(crate) fn pyre_jit_disabled() -> bool {
+    static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PYRE_JIT_DISABLED
+        .get_or_init(|| majit_metainterp::jit_env::env_var("PYRE_JIT").as_deref() == Some("0"))
+}
+
 /// `warmspot.py ll_portal_runner` for the jd0 driver: the JIT half of
 /// `maybe_compile_and_run` then `portal_ptr`. It never enters or leaves
 /// the execution context; the caller's `execute_frame` bracket owns that.
@@ -1551,10 +1559,7 @@ pub(crate) fn pypyjit_ll_portal_runner(
     let mut frame_root = crate::eval::FrameRoot::new(frame);
     crate::eval::ensure_jit_process_setup();
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
-    static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PYRE_JIT_DISABLED
-        .get_or_init(|| majit_metainterp::jit_env::env_var("PYRE_JIT").as_deref() == Some("0"))
-    {
+    if pyre_jit_disabled() {
         return pyre_interpreter::eval::eval_loop_dispatch(frame_root.frame(), ec);
     }
     // This door tests only `frame_tracing_active`, which is true when the
@@ -6462,15 +6467,14 @@ fn trace_sortkey_bridge_via_interpret(
         pyre_jit_trace::sortkey_state::SortkeyJitState::create_sym(&meta, 0).loop_header_pc()
     };
     let (strategy_type, tp, mut sym) = sortkey_sym_from_rebuilt_portal(mainjitcode, portal_pc);
-    // `drive_sortkey_trace` pins the two greens and the three GC reds
-    // (`list_w`, `keys_w`, `w_callable`) across `force_start_tracing` /
+    // `drive_sortkey_trace` pins the two greens and the two GC reds
+    // (`list_w`, `w_callable`) across `force_start_tracing` /
     // `interpret` / `compile_loop`. The same objects are live across this
     // walk and `compile_sortkey_bridge_close`.
     let list_w = concrete_ref_of(sym.list_w).unwrap_or(PY_NULL);
-    let keys_w = concrete_ref_of(sym.keys_w).unwrap_or(PY_NULL);
     let w_callable = concrete_ref_of(sym.w_callable).unwrap_or(PY_NULL);
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[strategy_type, tp, list_w, keys_w, w_callable]);
+    let base = roots.pin_roots(&[strategy_type, tp, list_w, w_callable]);
     let strategy_type = roots.get(base);
     let tp = roots.get(base + 1);
     {
@@ -6510,11 +6514,24 @@ fn trace_sortkey_bridge_via_interpret(
         }
         match action {
             majit_metainterp::TraceAction::CloseLoop => {
-                use majit_metainterp::JitState;
-                let jump_args =
-                    pyre_jit_trace::sortkey_state::SortkeyJitState::collect_jump_args(&sym);
-                if let Some(resolution) = compile_sortkey_bridge_close(green_key, &jump_args) {
-                    return resolution;
+                // `jitdriver.rs` CloseLoop reads `reached_loop_header`
+                // `close_jump_boxes` (`live_arg_boxes` after leftover).
+                // `collect_jump_args` is the guard-fail InputArgs.
+                let jump_args = {
+                    let (driver, _) = crate::eval::driver_pair();
+                    driver.meta_interp_mut().trace_ctx().and_then(|ctx| {
+                        ctx.close_jump_boxes
+                            .as_ref()
+                            .map(|b| b.iter().map(|(op, _)| *op).collect::<Vec<_>>())
+                    })
+                };
+                if let Some(jump_args) = jump_args {
+                    if let Some(resolution) = compile_sortkey_bridge_close(green_key, &jump_args) {
+                        return resolution;
+                    }
+                } else {
+                    abort_active_bridge_trace();
+                    return BridgeResolution::ResumeBlackhole;
                 }
             }
             majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
@@ -6533,7 +6550,8 @@ fn trace_sortkey_bridge_via_interpret(
 /// Greens `strategy_type`/`tp` come from `green_r`. Reds are the recorded
 /// merge-point list (`jtransform.py` `autodetect_jit_markers_redvars` /
 /// `red_marker_positions`): walk that list and consume `red_i`/`red_r`
-/// in kind order. Marker operand `i` is dead across the merge point.
+/// in kind order. Marker operand `i` is live (`listobject.py`
+/// `_compute_keys_for_sorting`).
 fn sortkey_sym_from_rebuilt_portal(
     mainjitcode: &majit_metainterp::JitCode,
     portal_pc: usize,
@@ -6611,7 +6629,6 @@ fn sortkey_sym_from_rebuilt_portal(
         match *name {
             "i" => sym.i = op,
             "list_w" => sym.list_w = op,
-            "keys_w" => sym.keys_w = op,
             "w_callable" => sym.w_callable = op,
             other => panic!("unknown sortkey marker red `{other}`"),
         }
@@ -9453,11 +9470,11 @@ pub extern "C" fn bh_list_extend_fn(list: PyObjectRef, iterable: PyObjectRef) {
 }
 
 /// SET_ADD residual (`set_add` HLOp → `residual_call_r_v`).  Runs
-/// `space.call_method(w_set, 'add', w_item)` (`pyopcode.py` `SET_ADD` /
-/// `BUILD_SET`); `set` is peeked and mutated in place. A user
-/// `__hash__`/`__eq__` can run Python (`MayForce`). Void result.
+/// `set_add_via_call_method` (`pyopcode.py` `SET_ADD` / `BUILD_SET`);
+/// `set` is peeked and mutated in place. A user `__hash__`/`__eq__` can
+/// run Python (`MayForce`). Void result.
 pub extern "C" fn bh_set_add_fn(set: PyObjectRef, value: PyObjectRef) {
-    if let Err(mut err) = pyre_interpreter::baseobjspace::call_method_add(set, value) {
+    if let Err(mut err) = pyre_interpreter::baseobjspace::set_add_via_call_method(set, value) {
         publish_residual_call_exception(err.to_exc_object());
     }
 }

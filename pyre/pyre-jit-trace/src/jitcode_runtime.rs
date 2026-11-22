@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
 use majit_ir::{DescrRef, ExtraEffect, GcRef, Type, Value};
-use majit_jitcode::artifacts::CompiledJitDriver;
+pub(crate) use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
 use majit_jitcode::artifacts::JitCodeIndex;
@@ -651,8 +651,16 @@ fn required_red_marker_positions<'a>(driver: &'a CompiledJitDriver, key: &str) -
         .unwrap_or_else(|| panic!("compiled JIT driver `{key}` requires red_marker_positions"))
 }
 
-/// Select and permute a marker-operand-order slice into rewritten merge-point
-/// red order.
+/// `red_marker_positions` of `driver`. The canonical key is built only if
+/// the field is missing (the panic in [`required_red_marker_positions`]).
+fn red_marker_positions_of(driver: &CompiledJitDriver) -> &[u32] {
+    match driver.red_marker_positions.as_deref() {
+        Some(positions) => positions,
+        None => required_red_marker_positions(driver, &driver.portal.canonical_key()),
+    }
+}
+
+/// Marker-operand items in rewritten merge-point red order.
 ///
 /// Linear scan: a driver has at most four reds. The marker's explicit red
 /// operands are this port's declaration of which live variable is which;
@@ -662,40 +670,72 @@ fn required_red_marker_positions<'a>(driver: &'a CompiledJitDriver, key: &str) -
 /// An operand that no slot names is not seeded. Requires `Some` on the
 /// compiled driver: a portal whose reds are not marker operands does not
 /// seed through this helper.
-pub fn permute_marker_reds<T: Clone>(key: &str, marker_order: &[T]) -> Vec<T> {
-    let driver = compiled_jit_driver_for_key(key)
-        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
-    let positions = required_red_marker_positions(driver, key);
+fn permute_marker_reds_slots<'a, T>(
+    driver: &'a CompiledJitDriver,
+    marker_order: &'a [T],
+) -> impl Iterator<Item = &'a T> + 'a {
+    let positions = red_marker_positions_of(driver);
     assert_eq!(
         positions.len(),
         driver.red_args_types.len(),
-        "compiled JIT driver `{key}` red_marker_positions/types length"
+        "compiled JIT driver `{}` red_marker_positions/types length",
+        driver.portal.canonical_key()
     );
-    positions
-        .iter()
-        .map(|&k| {
-            marker_order.get(k as usize).cloned().unwrap_or_else(|| {
-                panic!(
-                    "compiled JIT driver `{key}` marker position {k} is out of range (marker len {})",
-                    marker_order.len()
-                )
-            })
+    positions.iter().map(move |&k| {
+        marker_order.get(k as usize).unwrap_or_else(|| {
+            panic!(
+                "compiled JIT driver `{}` marker position {k} is out of range (marker len {})",
+                driver.portal.canonical_key(),
+                marker_order.len()
+            )
         })
+    })
+}
+
+/// [`permute_marker_reds_on`] into a caller-owned buffer.
+pub fn permute_marker_reds_into<T: Copy>(driver: &CompiledJitDriver, marker: &[T], out: &mut [T]) {
+    let n = red_marker_positions_of(driver).len();
+    assert_eq!(
+        out.len(),
+        n,
+        "compiled JIT driver `{}` permute dest length, got {}",
+        driver.portal.canonical_key(),
+        out.len()
+    );
+    for (slot, item) in permute_marker_reds_slots(driver, marker).enumerate() {
+        out[slot] = *item;
+    }
+}
+
+/// Select and permute a marker-operand-order slice into rewritten merge-point
+/// red order.
+pub fn permute_marker_reds_on<T: Clone>(driver: &CompiledJitDriver, marker_order: &[T]) -> Vec<T> {
+    permute_marker_reds_slots(driver, marker_order)
+        .cloned()
         .collect()
 }
 
-/// Inverse of [`permute_marker_reds`]: recorded-order values back into
-/// marker-operand order. `red_marker_positions` is injective; an undetected
-/// operand (dead across the merge point) is `None`.
-pub fn marker_reds_from_recorded<T: Clone>(key: &str, recorded: &[T]) -> Vec<Option<T>> {
+/// Look up the compiled driver by portal key, then [`permute_marker_reds_on`].
+pub fn permute_marker_reds<T: Clone>(key: &str, marker_order: &[T]) -> Vec<T> {
     let driver = compiled_jit_driver_for_key(key)
         .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
-    let positions = required_red_marker_positions(driver, key);
+    permute_marker_reds_on(driver, marker_order)
+}
+
+/// Inverse of [`permute_marker_reds_on`]: recorded-order values back into
+/// marker-operand order. `red_marker_positions` is injective; an undetected
+/// operand (dead across the merge point) is `None`.
+pub fn marker_reds_from_recorded_on<T: Clone>(
+    driver: &CompiledJitDriver,
+    recorded: &[T],
+) -> Vec<Option<T>> {
+    let positions = red_marker_positions_of(driver);
     let n = positions.len();
     assert_eq!(
         recorded.len(),
         n,
-        "compiled JIT driver `{key}` recorded red count, got {}",
+        "compiled JIT driver `{}` recorded red count, got {}",
+        driver.portal.canonical_key(),
         recorded.len()
     );
     let bound = positions.iter().map(|&k| k as usize + 1).max().unwrap_or(0);
@@ -704,12 +744,22 @@ pub fn marker_reds_from_recorded<T: Clone>(key: &str, recorded: &[T]) -> Vec<Opt
         let idx = k as usize;
         assert!(
             out[idx].is_none(),
-            "compiled JIT driver `{key}` red_marker_positions is not injective: {:?}",
+            "compiled JIT driver `{}` red_marker_positions is not injective: {:?}",
+            driver.portal.canonical_key(),
             positions
         );
         out[idx] = Some(recorded[slot].clone());
     }
     out
+}
+
+/// Inverse of [`permute_marker_reds`]: recorded-order values back into
+/// marker-operand order. `red_marker_positions` is injective; an undetected
+/// operand (dead across the merge point) is `None`.
+pub fn marker_reds_from_recorded<T: Clone>(key: &str, recorded: &[T]) -> Vec<Option<T>> {
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    marker_reds_from_recorded_on(driver, recorded)
 }
 
 /// `unspecialize_value` word of one recorded red.
@@ -743,11 +793,13 @@ pub fn compiled_reds(key: &str, marker_reds: &[(&'static str, Type)]) -> Vec<(&'
 /// `ContinueRunningNormally` carries I/R/F banks (`jitexc.py`); walking
 /// `red_args_types` pulls each bank in the same order `make_args_specification`
 /// flattened the marker list.
-pub fn compiled_red_values_from_kind_banks(key: &str, ints: &[i64], refs: &[i64]) -> Vec<Value> {
-    let driver = compiled_jit_driver_for_key(key)
-        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+pub fn compiled_red_values_from_kind_banks_on(
+    driver: &CompiledJitDriver,
+    ints: &[i64],
+    refs: &[i64],
+) -> Vec<Value> {
     assert_eq!(
-        required_red_marker_positions(driver, key).len(),
+        red_marker_positions_of(driver).len(),
         driver.red_args_types.len()
     );
     let mut int_i = 0usize;
@@ -766,10 +818,21 @@ pub fn compiled_red_values_from_kind_banks(key: &str, ints: &[i64], refs: &[i64]
                 ref_i += 1;
                 Value::Ref(GcRef(value as usize))
             }
-            Type::Float => panic!("compiled JIT driver `{key}` has a float red"),
+            Type::Float => panic!(
+                "compiled JIT driver `{}` has a float red",
+                driver.portal.canonical_key()
+            ),
             Type::Void => Value::Void,
         })
         .collect()
+}
+
+/// Look up the compiled driver by portal key, then
+/// [`compiled_red_values_from_kind_banks_on`].
+pub fn compiled_red_values_from_kind_banks(key: &str, ints: &[i64], refs: &[i64]) -> Vec<Value> {
+    let driver = compiled_jit_driver_for_key(key)
+        .unwrap_or_else(|| panic!("missing compiled JIT driver `{key}`"));
+    compiled_red_values_from_kind_banks_on(driver, ints, refs)
 }
 
 // Cached index of the charon-extracted `w_list_append` body within
@@ -7551,14 +7614,12 @@ mod tests {
                         &SORTKEY_MARKER_REDS,
                     );
                     let list_w = 0x100 as PyObjectRef;
-                    let keys_w = 0x200 as PyObjectRef;
                     let w_callable = 0x300 as PyObjectRef;
-                    let live = sortkey_live_values(0, list_w, keys_w, w_callable);
+                    let live = sortkey_live_values(0, list_w, w_callable);
                     assert_eq!(live.len(), positions.len());
                     let marker = [
                         Value::Int(0),
                         Value::Ref(GcRef(list_w as usize)),
-                        Value::Ref(GcRef(keys_w as usize)),
                         Value::Ref(GcRef(w_callable as usize)),
                     ];
                     for (slot, &kpos) in positions.iter().enumerate() {

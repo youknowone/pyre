@@ -1479,23 +1479,37 @@ where
             let frame = self.frames.current_mut();
             frame.read_getfield_gc()
         };
-        let (offset, fielddescr) = {
+        let (bh, fielddescr) = {
             let frame = self.frames.current_mut();
-            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                panic!("BC_GETFIELD_RAW_R: descrs[{descr_idx}] is not a BhDescr entry")
-            });
-            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_R");
+            let bh = frame
+                .runtime_bh_descr(descr_idx)
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("BC_GETFIELD_RAW_R: descrs[{descr_idx}] is not a BhDescr entry")
+                });
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)
-                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-            (offset, fielddescr)
+                .unwrap_or_else(|| field_descr_ref_from_bh(&bh).1);
+            (bh, fielddescr)
         };
         let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        // `MIFrame.opimpl_getfield_raw_r` is `execute_with_descr(rop.GETFIELD_RAW_R)`.
+        // `executor.do_getfield_raw_r` / `Backend.bh_getfield_raw_r` load a
+        // pointer-width GCREF (`read_ref_at_mem`). The Cpu sibling is the
+        // same `bh_getfield_gc_r` default when the executor cpu is unwired.
         let loaded = if struct_ptr == 0 {
             0
+        } else if let Some(cpu) = ctx.blackhole_cpu() {
+            crate::executor::do_getfield_raw_r(cpu, (), struct_ptr, &bh).0 as i64
         } else {
-            let addr = (struct_ptr as usize).wrapping_add(offset);
-            unsafe { core::ptr::read_unaligned(addr as *const i64) }
+            self.cpu
+                .bh_getfield_gc_r(
+                    struct_ptr as usize,
+                    fielddescr
+                        .as_field_descr()
+                        .expect("GETFIELD_RAW_R field descriptor"),
+                )
+                .0 as i64
         };
         ctx.profiler()
             .count_ops(OpCode::GetfieldRawR, crate::counters::OPS);

@@ -2208,10 +2208,14 @@ pub(crate) unsafe fn normalize_slice(
 /// `funccall(w_obj, *args_w)` — `w_obj` leads the positionals.  Pyre gives a
 /// type-owned `FunctionWithFixedCode` the distinct public
 /// `METHOD_DESCRIPTOR_TYPE`, but it retains this exact PyPy call shape.
-/// `BuiltinFunction` (`BUILTIN_FUNCTION_TYPE`) is excluded because it binds
-/// differently.  Every other descriptor is bound through `get` (`space.get`)
-/// first, then called with `args_w` alone, so `@staticmethod` /
-/// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
+/// `SLOT_WRAPPER_TYPE` is the same retag of a type-owned
+/// `FunctionWithFixedCode` (`function_retag_slot_wrapper`, the
+/// `add_operators` half of the TypeDef sweep that
+/// `function_retag_method_descriptor` serves) and takes that same call
+/// shape.  `BuiltinFunction` (`BUILTIN_FUNCTION_TYPE`) is excluded because
+/// it binds differently.  Every other descriptor is bound through `get`
+/// (`space.get`) first, then called with `args_w` alone, so `@staticmethod`
+/// / `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
 ///
 /// Upstream specialises `*args_w` per arity, so `hash_w`'s call
@@ -2235,6 +2239,9 @@ pub unsafe fn get_and_call_function(
         ) || std::ptr::eq(
             unsafe { (*w_descr).ob_type },
             &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        ) || std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::SLOT_WRAPPER_TYPE as *const _,
         ))
     {
         // `DescrOperation.get_and_call_function`'s fast path spells this
@@ -2315,6 +2322,9 @@ pub unsafe fn get_and_call_function_0(
         ) || std::ptr::eq(
             unsafe { (*w_descr).ob_type },
             &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        ) || std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::SLOT_WRAPPER_TYPE as *const _,
         ))
     {
         return crate::function::funccall_1(w_descr, w_obj);
@@ -17580,6 +17590,23 @@ pub fn call_method_add(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), Py
     }
 }
 
+/// Opcode SET_ADD: set-typed receivers keep `call_method_add`; a non-set
+/// raises TypeError with `set_add_value`'s non-set message.
+///
+/// `pyopcode.py SET_ADD` is `space.call_method(w_set, 'add', w_value)`
+/// (AttributeError on a non-set); the test `test_conditional_annotations_rebound`
+/// in lib-python/3/test/test_type_annotations.py requires TypeError —
+/// so the exception type follows the latter and the set path keeps `call_method`.
+pub fn set_add_via_call_method(w_set: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { pyre_object::setobject::is_set(w_set) } {
+        return call_method_add(w_set, w_value);
+    }
+    Err(PyError::type_error(format!(
+        "'{}' object is not a set",
+        unsafe { crate::display::type_fully_qualified_name_of(w_set) },
+    )))
+}
+
 /// `callmethod.py call_method_opt` tail after a failed shortcut:
 /// `w_meth = space.getattr(w_obj, w_name); return space.call_function(w_meth, *arg_w)`.
 #[majit_macros::dont_look_inside]
@@ -17825,8 +17852,13 @@ impl UnpackIterableJitDriver {
     /// and `items`; pyre's meta-tracer cannot auto-collect Rust locals, so the
     /// merge-point passes them to the hook as the two concrete reds.
     #[inline]
-    fn jit_merge_point(&self, greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
-        crate::call::unpack_merge_point(greenkey, w_iterator, items);
+    fn jit_merge_point(
+        &self,
+        greenkey: PyObjectRef,
+        w_iterator: PyObjectRef,
+        items: PyObjectRef,
+    ) -> Option<Result<PyObjectRef, crate::PyError>> {
+        crate::call::unpack_merge_point(greenkey, w_iterator, items)
     }
 }
 
@@ -18094,11 +18126,13 @@ pub fn unpackiterable_portal(
     let root_base = pyre_object::gc_roots::pin_roots(&[w_iterator, items, greenkey]);
     let items_slot = root_base + 1;
     loop {
-        unpackiterable_driver.jit_merge_point(
+        if let Some(result) = unpackiterable_driver.jit_merge_point(
             pyre_object::gc_roots::shadow_stack_get(root_base + 2),
             pyre_object::gc_roots::shadow_stack_get(root_base),
             pyre_object::gc_roots::shadow_stack_get(items_slot),
-        );
+        ) {
+            return result;
+        }
         match next(pyre_object::gc_roots::shadow_stack_get(root_base)) {
             Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
             Err(e) => {

@@ -678,6 +678,11 @@ pub struct DerivedBodyFacts {
     /// [`JitCode::descent_blocker_summary_for_entry_len`].
     descent_blocker_summary_by_entry_len:
         [OnceLock<DescentBlockerSummary>; DESCENT_ENTRY_LEN_SLOTS],
+    /// Whether a resume at a given instruction start, with a known entry
+    /// argument-array length, can reach a blocker. Indexed by that length;
+    /// each slot holds one `OnceLock` per bytecode offset. Read through
+    /// [`JitCode::descent_resume_blocker_for_entry_len`].
+    descent_resume_blocker_by_entry_len: [OnceLock<Box<[OnceLock<bool>]>>; DESCENT_ENTRY_LEN_SLOTS],
 }
 
 /// How many distinct entry argument-array lengths
@@ -951,6 +956,35 @@ impl JitCode {
         {
             Some(slot) => *slot.get_or_init(compute),
             None => compute(),
+        }
+    }
+
+    /// Whether a helper-section resume at `pc`, entered with `entry_len`
+    /// arguments, can reach a blocker.
+    ///
+    /// The scan is a function of the assembled body, that length, and `pc`,
+    /// so one slot per `(entry_len, pc)` is a complete cache. Lengths at or
+    /// above [`DESCENT_ENTRY_LEN_SLOTS`] recompute, matching
+    /// [`Self::descent_blocker_summary_for_entry_len`]. A `pc` past the
+    /// body is a blocker.
+    pub fn descent_resume_blocker_for_entry_len(
+        &self,
+        pc: usize,
+        entry_len: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        let Some(len_slot) = self
+            .derived
+            .descent_resume_blocker_by_entry_len
+            .get(entry_len)
+        else {
+            return compute();
+        };
+        let per_pc =
+            len_slot.get_or_init(|| (0..self.code.len()).map(|_| OnceLock::new()).collect());
+        match per_pc.get(pc) {
+            Some(slot) => *slot.get_or_init(compute),
+            None => true,
         }
     }
 

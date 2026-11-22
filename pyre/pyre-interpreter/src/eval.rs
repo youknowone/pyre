@@ -6018,12 +6018,11 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── SetAdd ──
-    // PyPy: SET_ADD; CPython: SET_ADD
-    // set = STACK[-i]; set.add(TOS); pop value
+    // SET_ADD: set = STACK[-i]; set.add(TOS); pop value
     fn set_add(&mut self, i: usize) -> Result<(), PyError> {
         let value = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
-        crate::baseobjspace::call_method_add(set, value)
+        crate::baseobjspace::set_add_via_call_method(set, value)
     }
 
     // ── none_value ──

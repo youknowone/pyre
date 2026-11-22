@@ -874,7 +874,15 @@ impl Drop for ListRootGuard {
         // scopes nest (`push_roots` / `pop_roots` pair up around one call); a
         // guard dropped under a newer one would unregister that one's roots.
         let depth = majit_gc::shadow_stack::depth();
-        if depth != self.base + self.len {
+        let end = self.base + self.len;
+        if depth < self.base {
+            // The callee already unwound through this span. Leftover
+            // `release_recursive_frame` `pop_to`s the enter pin, which sits
+            // below the residual's arg-list roots (`call.rs`
+            // `release_recursive_frame`).
+            return;
+        }
+        if depth != end {
             if std::thread::panicking() {
                 // Unwinding: an inner scope may not have popped. Saturate to
                 // this span's base so a second assert does not hide the
@@ -882,11 +890,12 @@ impl Drop for ListRootGuard {
                 majit_gc::shadow_stack::try_pop_to(self.base);
                 return;
             }
-            panic!(
-                "ListRootGuard dropped out of LIFO order: depth {depth}, span {}..{}",
-                self.base,
-                self.base + self.len
-            );
+            if depth > end {
+                panic!(
+                    "ListRootGuard dropped out of LIFO order: depth {depth}, span {}..{}",
+                    self.base, end
+                );
+            }
         }
         majit_gc::shadow_stack::try_pop_to(self.base);
     }

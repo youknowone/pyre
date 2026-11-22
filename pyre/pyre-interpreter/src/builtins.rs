@@ -24190,10 +24190,9 @@ impl SortkeyJitDriver {
         tp: PyObjectRef,
         i: i64,
         list_w: PyObjectRef,
-        keys_w: PyObjectRef,
         w_callable: PyObjectRef,
-    ) {
-        crate::call::sortkey_merge_point(strategy_type, tp, i, list_w, keys_w, w_callable);
+    ) -> crate::call::SortkeyMergeOutcome {
+        crate::call::sortkey_merge_point(strategy_type, tp, i, list_w, w_callable)
     }
 }
 
@@ -24206,13 +24205,12 @@ const sortkey_jmp: SortkeyJitDriver = SortkeyJitDriver;
 pub fn _compute_keys_for_sorting(
     strategy_type: PyObjectRef,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // Pin on the caller's `_key_roots` (unpack twin of
     // `_unpackiterable_unknown_length`). `typedef::type` can collect.
-    let base = pyre_object::gc_roots::pin_roots(&[strategy_type, list_w, keys_w, w_callable]);
-    let tp = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(base + 3))
+    let base = pyre_object::gc_roots::pin_roots(&[strategy_type, list_w, w_callable]);
+    let tp = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(base + 2))
         .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let tp_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(tp);
@@ -24222,66 +24220,92 @@ pub fn _compute_keys_for_sorting(
         0,
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         pyre_object::gc_roots::shadow_stack_get(base + 2),
-        pyre_object::gc_roots::shadow_stack_get(base + 3),
     )
 }
 
-/// Split-portal body. Merge at loop top. Progress lives in `keys_w` (unpack
-/// twin: iterator heap). After RunCompiled FINISH the interpreter while
-/// sees `w_list_len(keys_w) >= w_list_len(list_w)` and returns.
+/// Split-portal body. Merge at loop top. Progress is the live red `i`
+/// (`listobject.py` `_compute_keys_for_sorting`). After a blackhole finish
+/// or a compiled run the interpreter returns. `ContinueRunningNormally`
+/// assigns the payload reds and loops (`warmspot.py` `handle_jitexception`).
 pub fn sortkey_portal(
     strategy_type: PyObjectRef,
     tp: PyObjectRef,
     mut i: i64,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // Reload through named residuals, not `||` closures (unpack lesson:
     // `target:closure.call` hashes).
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base =
-        pyre_object::gc_roots::pin_roots(&[list_w, keys_w, w_callable, strategy_type, tp]);
-    let keys_slot = root_base + 1;
-    let callable_slot = root_base + 2;
-    let strategy_slot = root_base + 3;
-    let tp_slot = root_base + 4;
+    let root_base = pyre_object::gc_roots::pin_roots(&[list_w, w_callable, strategy_type, tp]);
+    let callable_slot = root_base + 1;
+    let strategy_slot = root_base + 2;
+    let tp_slot = root_base + 3;
+    // `_compute_keys_for_sorting` keeps `w_item` live across `call_function`.
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     while i < unsafe {
         pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
     } as i64
     {
-        sortkey_jmp.jit_merge_point(
+        match sortkey_jmp.jit_merge_point(
             pyre_object::gc_roots::shadow_stack_get(strategy_slot),
             pyre_object::gc_roots::shadow_stack_get(tp_slot),
             i,
             pyre_object::gc_roots::shadow_stack_get(root_base),
-            pyre_object::gc_roots::shadow_stack_get(keys_slot),
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
-        );
+        ) {
+            crate::call::SortkeyMergeOutcome::Finished(result) => {
+                result?;
+                return Ok(());
+            }
+            crate::call::SortkeyMergeOutcome::ContinueReds {
+                i: new_i,
+                list_w: new_list,
+                w_callable: new_callable,
+            } => {
+                i = new_i;
+                pyre_object::gc_roots::shadow_stack_set(root_base, new_list);
+                pyre_object::gc_roots::shadow_stack_set(callable_slot, new_callable);
+                continue;
+            }
+            crate::call::SortkeyMergeOutcome::KeepGoing => {}
+        }
         crate::stack_check::drain_jit_pending_exception()?;
         let list_w = pyre_object::gc_roots::shadow_stack_get(root_base);
-        let keys_w = pyre_object::gc_roots::shadow_stack_get(keys_slot);
-        i = unsafe { pyre_object::listobject::w_list_len(keys_w) } as i64;
-        if i >= unsafe { pyre_object::listobject::w_list_len(list_w) } as i64 {
-            break;
-        }
-        let w_item = unsafe { pyre_object::listobject::w_list_getitem_inner(list_w, i) }
-            .unwrap_or(pyre_object::PY_NULL);
+        // `w_item = list_w[i]`: a miss is IndexError, not a NULL key argument.
+        let w_item = match unsafe { pyre_object::listobject::w_list_getitem_inner(list_w, i) } {
+            Some(w) if pyre_object::gc_hook::gc_alloc_failed_pending() && w.is_null() => {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+            Some(w) => w,
+            None => {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
+                return Err(crate::PyError::index_error("list index out of range"));
+            }
+        };
+        pyre_object::gc_roots::shadow_stack_set(item_slot, w_item);
         // listobject.py _compute_keys_for_sorting: `space.call_function(w_callable, w_item)`. Its Function arms are
         // `Function.funccall` (`funccall_1` / `funccall_2`); any other callable is the residual `call_args` arm.
         let w_key = crate::baseobjspace::call_function_1(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
-            w_item,
+            pyre_object::gc_roots::shadow_stack_get(item_slot),
         )?;
-        // listobject.py stores `KeyContainer(w_keyitem, w_item)` into
-        // `list_w[i]`; pyre keeps the keys in a parallel list because TimSort
-        // compares shadow-stack slots (`KeyContainer`, `_compute_keys_for_sorting`).
-        // `drain_list_append` is the unpack `drain_append_at` seam: inlining
-        // `w_list_append` pulls `try_gc_alloc` into the portal graph.
+        // listobject.py: `w_keyitem = space.call_function(...)` then
+        // `list_w[i] = KeyContainer(w_keyitem, w_item)` with the same `w_item`.
+        let w_item = pyre_object::gc_roots::shadow_stack_get(item_slot);
+        let w_keyitem = pyre_object::listobject::key_container_new(w_key, w_item);
+        if w_keyitem.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
+        let list_w = pyre_object::gc_roots::shadow_stack_get(root_base);
         unsafe {
-            pyre_object::listobject::drain_list_append(
-                pyre_object::gc_roots::shadow_stack_get(keys_slot),
-                w_key,
+            pyre_object::listobject::ll_list_obj_setitem_fast(
+                &mut *(list_w as *mut pyre_object::listobject::W_ListObject),
+                i as usize,
+                w_keyitem,
             );
         }
         i += 1;
@@ -24314,8 +24338,8 @@ pub(crate) fn sort_rooted_items(
     let mut key_base = key_base + usize::from(key_fn_slot.is_some());
     if let Some(key_fn_slot) = key_fn_slot {
         // listobject.py `_compute_keys_for_sorting` before the reverse flip.
-        // Raising key leaves the input order. Keys pin onto this RootScope
-        // (KeyContainer equivalent) after the portal returns.
+        // Raising key leaves the input order. `sorter.list` holds
+        // `KeyContainer` after the portal returns.
         let strategy_type = pyre_object::unicodeobject::intern_str_value(strategy.class_name());
         let strategy_type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(strategy_type);
@@ -24330,13 +24354,9 @@ pub(crate) fn sort_rooted_items(
                 );
             }
         }
-        let keys_w = pyre_object::listobject::w_list_new_object_with_sizehint(item_len as i64);
-        let keys_w_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(keys_w);
         if let Err(err) = _compute_keys_for_sorting(
             pyre_object::gc_roots::shadow_stack_get(strategy_type_slot),
             pyre_object::gc_roots::shadow_stack_get(list_w_slot),
-            pyre_object::gc_roots::shadow_stack_get(keys_w_slot),
             pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
         ) {
             return (order, Err(err));
@@ -24346,14 +24366,14 @@ pub(crate) fn sort_rooted_items(
         }
         key_base = pyre_object::gc_roots::shadow_stack_len();
         for index in 0..item_len {
-            let key = unsafe {
+            let w_keyitem = unsafe {
                 pyre_object::listobject::w_list_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(keys_w_slot),
+                    pyre_object::gc_roots::shadow_stack_get(list_w_slot),
                     index as i64,
                 )
             }
             .unwrap_or(pyre_object::PY_NULL);
-            let _ = pyre_object::gc_roots::pin_root(key);
+            let _ = pyre_object::gc_roots::pin_root(w_keyitem);
         }
     }
 
@@ -24380,6 +24400,26 @@ pub(crate) fn sort_rooted_items(
     if reverse {
         order.reverse();
     }
+    // listobject.py descr_sort finally: `sorter.list[i] = w_obj.w_item` when
+    // `isinstance(w_obj, KeyContainer)`. Write unwrapped items into the
+    // snapshot in permutation order so the caller restores from `item_base`.
+    if key_fn_slot.is_some() {
+        let mut unwrapped = Vec::with_capacity(item_len);
+        for &idx in &order {
+            let obj = pyre_object::gc_roots::shadow_stack_get(key_base + idx);
+            unwrapped.push(unsafe {
+                if pyre_object::listobject::is_key_container(obj) {
+                    pyre_object::listobject::key_container_w_item(obj)
+                } else {
+                    obj
+                }
+            });
+        }
+        for (i, item) in unwrapped.into_iter().enumerate() {
+            pyre_object::gc_roots::shadow_stack_set(item_base + i, item);
+        }
+        order = (0..item_len).collect();
+    }
     (order, result)
 }
 
@@ -24397,11 +24437,17 @@ enum SortCompare {
     Float(usize),
     Str(usize),
     Generic(usize),
+    /// listobject.py `CustomKeySort` — slots hold `KeyContainer`.
+    CustomKey(usize),
 }
 
 impl crate::listsort::SortLt<usize> for SortCompare {
     fn lt(&mut self, a: usize, b: usize) -> Result<bool, crate::PyError> {
-        let (Self::Int(base) | Self::Float(base) | Self::Str(base) | Self::Generic(base)) = *self;
+        let (Self::Int(base)
+        | Self::Float(base)
+        | Self::Str(base)
+        | Self::Generic(base)
+        | Self::CustomKey(base)) = *self;
         let left = pyre_object::gc_roots::shadow_stack_get(base + a);
         let right = pyre_object::gc_roots::shadow_stack_get(base + b);
         // Each arm is what `compare_slot` reaches for that exact pair, taken
@@ -24409,6 +24455,20 @@ impl crate::listsort::SortLt<usize> for SortCompare {
         // WTF-8 byte order the str arm compares on.
         unsafe {
             match self {
+                Self::CustomKey(_) => {
+                    // listobject.py `CustomKeySort.lt`: `space.lt(a.w_key, b.w_key)`.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let keys = pyre_object::gc_roots::pin_roots(&[
+                        pyre_object::listobject::key_container_w_key(left),
+                        pyre_object::listobject::key_container_w_key(right),
+                    ]);
+                    let result = crate::baseobjspace::compare(
+                        pyre_object::gc_roots::shadow_stack_get(keys),
+                        pyre_object::gc_roots::shadow_stack_get(keys + 1),
+                        crate::baseobjspace::CompareOp::Lt,
+                    )?;
+                    crate::baseobjspace::is_true(result)
+                }
                 Self::Int(_) => {
                     // IntegerListStrategy / IntSort only unwraps a machine
                     // word.  A W_LongObject that slipped past is_plain_int1
@@ -24462,7 +24522,7 @@ impl crate::listsort::SortLt<usize> for SortCompare {
 /// generic upstream as well.
 fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
     if keyed {
-        return SortCompare::Generic(base);
+        return SortCompare::CustomKey(base);
     }
     let (mut all_int, mut all_float, mut all_str) = (true, true, true);
     for index in 0..len {

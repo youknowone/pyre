@@ -33925,8 +33925,9 @@ fn set_op_inplace_xor(
 /// `setobject.py W_BaseSetObject.descr_add` as `BuiltinCode2.fastfunc_2`.
 ///
 /// Receiver check (`unwrap_spec W_BaseSetObject`) then `set_add_value`
-/// (`IntegerSetStrategy.add` / hash + store). The slice wrapper below
-/// keeps missing-receiver / arity errors and calls this.
+/// (`IntegerSetStrategy.add` / hash + store). `gateway.py BuiltinCode2.fastcall_2`
+/// and `funcrun` both end in this `fastfunc_2(space, w1, w2)` body, so the
+/// unwrap lives only here.
 pub fn __majit_fastfunc_2_set_descr_add(
     w_self: PyObjectRef,
     w_other: PyObjectRef,
@@ -33946,9 +33947,28 @@ pub fn __majit_fastfunc_2_set_descr_add(
 /// as a generic `bh_call_fn` residual. Publishing the descriptor below gives
 /// the source translator the candidate graph; SET_ADD traces through
 /// `call_method_add` → `funccall_2` → this wrapper's `fastfunc_2`.
+///
+/// `gateway.py BuiltinCode2.fastcall_2` / `funcrun` both end in the same
+/// `fastfunc_2(space, w1, w2)`. Missing-receiver and arity stay here;
+/// the unwrap_spec receiver check is only in the fastfunc_2 body.
 pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::require_set_receiver(args, "add", true)?;
-    crate::type_methods::arity_exact(args, "add", 1)?;
+    // Length only: `arity_exact(args, …)` keeps the slice live across a
+    // host-malloc error path (`method_qualname` / `type_error`), so the wrap
+    // would sit beside `__majit_fastfunc_2_set_descr_add` in the
+    // unbracketed-if-host-malloc set. `gateway.py BuiltinCode2.fastcall_2`
+    // checks nargs then calls `fastfunc_2(space, w1, w2)` the same way.
+    let n = args.len();
+    if n == 0 {
+        return Err(crate::PyError::type_error(
+            "unbound method set.add() needs an argument",
+        ));
+    }
+    if n != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "add() takes exactly one argument ({} given)",
+            n - 1,
+        )));
+    }
     __majit_fastfunc_2_set_descr_add(args[0], args[1])
 }
 

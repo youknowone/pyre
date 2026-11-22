@@ -733,20 +733,30 @@ pub fn set_jit_param_enable_opts(value: &str) {
 ///
 /// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at the start
 /// of a portal that has none; this hook is that `maybe_enter_jit` body.
-type UnpackMergeFn = fn(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef);
+type UnpackMergeFn = fn(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>>;
 majit_gc::oncelock_fn_static!(static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn>);
 
 pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
     let _ = UNPACK_MERGE_HOOK.set(f);
 }
 
-/// Called from `UnpackIterableJitDriver::jit_merge_point`. No-op until the JIT
-/// installs the hook.
+/// Called from `UnpackIterableJitDriver::jit_merge_point`. `None` until the
+/// JIT installs the hook, or when the warm state stays in the interpreter.
+/// `Some` is the portal result: the trace, compiled drain, or abort
+/// blackhole already finished the unpack (`tuple_hash_merge_point`).
 #[inline]
-pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
-    if let Some(f) = UNPACK_MERGE_HOOK.get() {
-        f(greenkey, w_iterator, items);
-    }
+pub fn unpack_merge_point(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    UNPACK_MERGE_HOOK
+        .get()
+        .and_then(|f| f(greenkey, w_iterator, items))
 }
 
 /// jd `generatorentry_driver` (`generator.py`): greens=`pycode`,
@@ -980,44 +990,54 @@ impl Drop for FallbackEcGuard {
     }
 }
 
+/// `warmspot.py` `ll_portal_runner` / `handle_jitexception` for `sortkey_jmp`.
+///
+/// `KeepGoing` is `maybe_compile_and_run` returning without raising.
+/// `Finished` is `DoneWithThisFrameVoid` / `ExitFrameWithExceptionRef`.
+/// `ContinueReds` is `ContinueRunningNormally`: the portal assigns these
+/// reds and loops (`portal_ptr(*args)`).
+pub enum SortkeyMergeOutcome {
+    KeepGoing,
+    Finished(Result<i64, crate::PyError>),
+    ContinueReds {
+        i: i64,
+        list_w: PyObjectRef,
+        w_callable: PyObjectRef,
+    },
+}
+
 /// jd4 (`sortkey_jmp`) merge-point hook. Twin of `unpack_merge_point`.
-/// Greens `strategy_type`, `tp`; hook reds `i`, `list_w`, `keys_w`, `w_callable`.
+/// Greens `strategy_type`, `tp`; hook reds `i`, `list_w`, `w_callable`.
 type SortkeyMergeFn = fn(
     strategy_type: PyObjectRef,
     tp: PyObjectRef,
     i: i64,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
-);
+) -> SortkeyMergeOutcome;
 static SORTKEY_MERGE_HOOK: OnceLock<SortkeyMergeFn> = OnceLock::new();
 
 pub fn register_sortkey_merge_hook(f: SortkeyMergeFn) {
     let _ = SORTKEY_MERGE_HOOK.set(f);
 }
 
+/// `KeepGoing` means the warm state stayed in the interpreter.
 #[inline]
 pub fn sortkey_merge_point(
     strategy_type: PyObjectRef,
     tp: PyObjectRef,
     i: i64,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
-) {
-    if let Some(f) = SORTKEY_MERGE_HOOK.get() {
-        f(strategy_type, tp, i, list_w, keys_w, w_callable);
+) -> SortkeyMergeOutcome {
+    match SORTKEY_MERGE_HOOK.get() {
+        Some(f) => f(strategy_type, tp, i, list_w, w_callable),
+        None => SortkeyMergeOutcome::KeepGoing,
     }
 }
 
-type SortkeyPortalRunnerFn = fn(
-    PyObjectRef,
-    PyObjectRef,
-    i64,
-    PyObjectRef,
-    PyObjectRef,
-    PyObjectRef,
-) -> Result<(), crate::PyError>;
+type SortkeyPortalRunnerFn =
+    fn(PyObjectRef, PyObjectRef, i64, PyObjectRef, PyObjectRef) -> Result<(), crate::PyError>;
 static SORTKEY_PORTAL_RUNNER_HOOK: OnceLock<SortkeyPortalRunnerFn> = OnceLock::new();
 
 pub fn register_sortkey_portal_runner_hook(f: SortkeyPortalRunnerFn) {
@@ -1032,12 +1052,11 @@ pub fn sortkey_portal_runner(
     tp: PyObjectRef,
     i: i64,
     list_w: PyObjectRef,
-    keys_w: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     match SORTKEY_PORTAL_RUNNER_HOOK.get() {
-        Some(f) => f(strategy_type, tp, i, list_w, keys_w, w_callable),
-        None => crate::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable),
+        Some(f) => f(strategy_type, tp, i, list_w, w_callable),
+        None => crate::sortkey_portal(strategy_type, tp, i, list_w, w_callable),
     }
 }
 
