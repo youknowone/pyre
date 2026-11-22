@@ -195,13 +195,13 @@ where
 {
     type Reg = T::Reg;
     fn into_reg(self) -> Self::Reg {
-        match self {
-            Ok(v) => v.into_reg(),
-            Err(e) => {
+        self.map_or_else(
+            |e| {
                 crate::runtime_ops::jit_publish_residual_error(e);
                 T::Reg::default()
-            }
-        }
+            },
+            JitWordRet::into_reg,
+        )
     }
 }
 
