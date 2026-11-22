@@ -451,6 +451,10 @@ mod tests {
     /// A family that lives as long as the test, standing in for the one a code
     /// object owns. Allocated the GC way (`new_cell_family`).
     fn leak_family() -> *const CellFamily {
+        // Serialized with the tests that install a process-global
+        // `set_active_exception_occurred` hook under `hook_test_guard`;
+        // `new_cell_family` reads it through `gc_alloc_failed_pending`.
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         new_cell_family("x".to_string())
     }
 
