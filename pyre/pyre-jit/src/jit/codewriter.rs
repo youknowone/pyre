@@ -244,8 +244,14 @@ fn dispatch_case_pc(code: &CodeObject, mut py_pc: usize) -> usize {
 /// loop consumes the prefixes. The pinned CPython reports the real
 /// opcode instead: for a `LOAD_ATTR` behind an `EXTENDED_ARG` that
 /// raises, `tb_lasti` is the `LOAD_ATTR` offset on CPython 3.15 and
-/// the `EXTENDED_ARG` offset on pypy3; pinned by
-/// `extra_tests/parity_tests/tb_lasti_names_the_opcode_behind_extended_arg.py`.
+/// the `EXTENDED_ARG` offset on pypy3. The parity runner measures this
+/// against the pinned CPython in
+/// `extra_tests/parity_tests/tb_lasti_names_the_opcode_behind_extended_arg.py`
+/// (declared `pypy-diverges`). No PyPy hint governs which offset is stored:
+/// `interp_jit.py PyFrame._virtualizable_` fixes only the storage owner
+/// (`last_instr` stays a virtualizable field here), `pyframe.py
+/// resume_execute_frame` promotes whatever value is there, and
+/// `@jit.unroll_safe` on `dispatch_bytecode` governs unrolling only.
 /// The jitcode must agree with the interpreter, so it stores the same value.
 ///
 /// Continues do not store this value: the loop head writes the
