@@ -7620,6 +7620,23 @@ fn inline_leaf_size_align(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<(u64, u64)> {
+    let word = u64::try_from(crate::layout::target_word_size()).ok()?;
+    // Scalar size/align from `primitive_size_align`; a sized Ref/RawPtr is
+    // one address word. `get_type_flag` still classifies remaining leaves.
+    if let Some(node) = tyref_node(ty, llbc) {
+        let body = tyexpr_body(llbc, node).unwrap_or(node);
+        if let Some(lit) = body.get("Scalar") {
+            let size = primitive_size_align(false, lit)?;
+            let align = primitive_size_align(true, lit)?;
+            return Some((size, align));
+        }
+        if body.get("Ref").is_some() || body.get("RawPtr").is_some() {
+            if let Some(size) = size_align_of_tyexpr(llbc, false, node) {
+                let align = size_align_of_tyexpr(llbc, true, node).unwrap_or(word);
+                return Some((size, align));
+            }
+        }
+    }
     let spelling = tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
     let (_, ir_type, size) =
         crate::codewriter::call::get_type_flag(&spelling, raw_alloc_flavor_structs);
@@ -7627,7 +7644,6 @@ fn inline_leaf_size_align(
         return None;
     }
     let size = u64::try_from(size).ok()?;
-    let word = u64::try_from(crate::layout::target_word_size()).ok()?;
     Some((size, size.min(word)))
 }
 

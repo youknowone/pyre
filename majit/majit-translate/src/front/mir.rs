@@ -556,17 +556,35 @@ pub(crate) fn absorb_semantic_program(
             for (key, rows) in prog.struct_field_attrs {
                 acc.struct_field_attrs.entry(key).or_insert(rows);
             }
-            // One STRUCT per key (`descr.py get_field_descr` caches on the
-            // STRUCT object); a crate that cannot see a payload's TypeDecl
-            // contributes a partial view, so views are merged, not last-wins.
+            // Per-target sidecars are absorbed last and carry the product's
+            // offsetof (`symbolic.py get_field_token`); a later row replaces
+            // an earlier one. Rows only the earlier program has move with
+            // their parent: a parent offset change shifts every
+            // `"{name}."` descendant the incoming layout does not itself
+            // carry (incoming rows are inserted as given).
             for (key, layout) in prog.exact_layouts {
                 if let Some(dest) = acc.exact_layouts.get_mut(&key) {
-                    for (name, offset) in layout.field_offsets {
-                        dest.field_offsets.entry(name).or_insert(offset);
+                    for (name, offset) in &layout.field_offsets {
+                        if let Some(&old) = dest.field_offsets.get(name) {
+                            let delta = *offset as i64 - old as i64;
+                            if delta != 0 {
+                                let prefix = format!("{name}.");
+                                for (k, v) in dest.field_offsets.iter_mut() {
+                                    if k.starts_with(&prefix)
+                                        && !layout.field_offsets.contains_key(k)
+                                    {
+                                        *v = (*v as i64 + delta) as u64;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    dest.size = dest.size.or(layout.size);
-                    dest.align = dest.align.or(layout.align);
-                    if dest.host.is_none() {
+                    for (name, offset) in layout.field_offsets {
+                        dest.field_offsets.insert(name, offset);
+                    }
+                    dest.size = layout.size.or(dest.size);
+                    dest.align = layout.align.or(dest.align);
+                    if layout.host.is_some() {
                         dest.host = layout.host;
                     }
                 } else {
