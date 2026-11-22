@@ -234,15 +234,25 @@ fn dispatch_case_pc(code: &CodeObject, mut py_pc: usize) -> usize {
     py_pc
 }
 
-/// Post-prefix opcode pc a prefixed dispatch case stores at entry
-/// (`pyopcode.py dispatch_bytecode` EXTENDED_ARG loop /
-/// `eval.rs` `set_last_instr_from_next_instr(opcode_pc + 1)`). Continues
-/// do not store this value: the loop head writes the instruction start
-/// (`dispatch_bytecode` `self.last_instr = intmask(next_instr)`), and
-/// `jump_absolute` writes `dispatch_case_pc` of the target. The
-/// `next_instr` green stays the instruction start so prefixed cases
-/// still accumulate EXTENDED_ARG. Resume / Nop stay their own greens
-/// (`dispatch_bytecode` executes them).
+/// Post-prefix opcode pc a prefixed dispatch case stores at entry,
+/// mirroring the interpreter (`eval.rs` dispatch:
+/// `set_last_instr_from_next_instr(opcode_pc + 1)` after
+/// `decode_instruction_forward`).
+///
+/// [3.15-spec] This departs from `pyopcode.py dispatch_bytecode`, which
+/// leaves `last_instr` at the instruction start while its EXTENDED_ARG
+/// loop consumes the prefixes. The pinned CPython reports the real
+/// opcode instead: for a `LOAD_ATTR` behind an `EXTENDED_ARG` that
+/// raises, `tb_lasti` is the `LOAD_ATTR` offset on CPython 3.15 and
+/// the `EXTENDED_ARG` offset on pypy3 (measured run). The jitcode must
+/// agree with the interpreter, so it stores the same value.
+///
+/// Continues do not store this value: the loop head writes the
+/// instruction start (`dispatch_bytecode`
+/// `self.last_instr = intmask(next_instr)`), and `jump_absolute` writes
+/// `dispatch_case_pc` of the target. The `next_instr` green stays the
+/// instruction start so prefixed cases still accumulate EXTENDED_ARG.
+/// Resume / Nop stay their own greens (`dispatch_bytecode` executes them).
 fn dispatch_last_instr_pc(code: &CodeObject, py_pc: usize) -> usize {
     let mut opcode_pc = dispatch_case_pc(code, py_pc);
     while opcode_pc < code.instructions.len()
@@ -2850,7 +2860,10 @@ fn emit_vable_getfield_int(
 /// `next_instr = r_uint(self.last_instr)` and
 /// `pypyjit/interp_jit.py jump_absolute` at
 /// `jumpto = r_uint(self.last_instr)`. After the hook the registers
-/// must be refreshed from the vable before continuing.
+/// must be refreshed from the vable before continuing. Each read
+/// follows its own `-live-` (`jtransform.py do_fixed_list_getitem`),
+/// the resume point of the guard
+/// `pyjitpl.py MIFrame._nonstandard_virtualizable` records at the read.
 fn emit_vable_reload_frame_slots(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -2866,6 +2879,7 @@ fn emit_vable_reload_frame_slots(
             Some(super::flow::FlowValue::Variable(v)) if v.kind == Some(Kind::Ref) => {}
             _ => continue,
         }
+        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
         let loaded = emit_graph_op_with_result(
             graph,
             block,
@@ -2884,6 +2898,7 @@ fn emit_vable_reload_frame_slots(
             super::flow::FlowValue::Variable(v) if v.kind == Some(Kind::Ref) => {}
             _ => continue,
         }
+        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
         let loaded = emit_graph_op_with_result(
             graph,
             block,
@@ -2965,8 +2980,14 @@ fn emit_portal_is_being_profiled_read(
 
     let debugdata_in = graph.fresh_variable(Kind::Ref);
     let nonnull_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
+        let mut state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            current_state.copy(&mut fresh)
+        };
+        if let Some(super::flow::FlowValue::Variable(_)) = &state.dispatch_next_instr {
+            state.dispatch_next_instr = Some(graph.fresh_variable(Kind::Int).into());
+        }
+        state
     };
     let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
     let mut nonnull_inputs = nonnull_state.getvariables();
@@ -2976,8 +2997,14 @@ fn emit_portal_is_being_profiled_read(
 
     let profiled_phi = graph.fresh_variable(Kind::Int);
     let join_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
+        let mut state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            current_state.copy(&mut fresh)
+        };
+        if let Some(super::flow::FlowValue::Variable(_)) = &state.dispatch_next_instr {
+            state.dispatch_next_instr = Some(graph.fresh_variable(Kind::Int).into());
+        }
+        state
     };
     let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
     let mut join_inputs = join_state.getvariables();
@@ -4163,51 +4190,53 @@ fn emit_jump_absolute_tick(
     // The diamond closes `header_block`, so `loop_header` lives on the
     // join. That is the same predecessor/join split the portal header
     // uses, so `flatten_graph` emits the diamond before the marker.
-    let goto_block = if emit_header {
-        let header_state = header_block
-            .framestate()
-            .unwrap_or_else(|| current_state.clone());
+    // `interp_jit.py jump_absolute`: `jumpto = r_uint(self.last_instr)`
+    // after `bytecode_trace`, before the `can_enter_jit` arguments. During
+    // tracing the read returns the box the tick stored, so traces do not change.
+    let mut diamond_state = header_block
+        .framestate()
+        .unwrap_or_else(|| current_state.clone());
+    if emit_ticker || emit_breaker {
+        let next_instr = emit_vable_getfield_int(
+            graph,
+            &header_block.block(),
+            frame_var,
+            VABLE_LAST_INSTR_FIELD_IDX,
+            py_pc as i64,
+        );
+        diamond_state.dispatch_next_instr = Some(next_instr.into());
+    }
+    let (goto_block, goto_state) = if emit_header {
         let _ = emit_getcode(graph, &header_block.block(), frame_var, py_pc as i64);
         let (join, _) = emit_portal_is_being_profiled_read(
             graph,
             &header_block,
-            &header_state,
+            &diamond_state,
             frame_var,
             py_pc as i64,
             all_walker_blocks,
         );
         emit_loop_header(graph, &join, ssarepr, jdindex, py_pc);
-        join
+        let join_state = join.framestate().unwrap_or_else(|| diamond_state.clone());
+        (join, join_state)
     } else {
-        header_block
+        let continue_state = if emit_ticker || emit_breaker {
+            diamond_state
+        } else {
+            current_state.clone()
+        };
+        (header_block, continue_state)
     };
-    let goto_is_new_block = emit_header || emit_ticker || emit_breaker;
-    let goto_state = if goto_is_new_block {
-        goto_block
-            .framestate()
-            .unwrap_or_else(|| current_state.clone())
-    } else {
-        current_state.clone()
-    };
-    if emit_ticker || emit_breaker {
-        // `interp_jit.py jump_absolute` `jumpto = r_uint(self.last_instr)`.
-        // During tracing the read returns the box the tick stored, so
-        // traces do not change.
-        let next_instr = emit_vable_getfield_int(
-            graph,
-            &goto_block.block(),
-            frame_var,
-            VABLE_LAST_INSTR_FIELD_IDX,
-            py_pc as i64,
-        );
-        dispatch_continue_to_loop_head_with_next_instr(
+    match goto_state.dispatch_next_instr.clone() {
+        Some(next_instr) => dispatch_continue_to_loop_head_with_next_instr(
             &goto_block,
             &goto_state,
             dispatch,
-            next_instr.into(),
-        );
-    } else {
-        dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
+            next_instr,
+        ),
+        None => {
+            dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc)
+        }
     }
 }
 
@@ -21789,6 +21818,9 @@ mod tests {
                     "live" | "getarrayitem_vable_r" | "int_copy" | "ref_copy"
                 )
             }) && after.contains(&"getarrayitem_vable_r")
+                && after.iter().enumerate().all(|(k, name)| {
+                    *name != "getarrayitem_vable_r" || (k > 0 && after[k - 1] == "live")
+                })
         });
         if !reload_then_array {
             eprintln!(
@@ -21797,7 +21829,7 @@ mod tests {
         }
         assert!(
             reload_then_array,
-            "trace-arm last_instr reload must be a reload block of live/getarrayitem_vable_r/int_copy/ref_copy with at least one getarrayitem_vable_r; last_instr getfield tails={last_instr_getfield_tails:?}, opnames={opnames:?}"
+            "trace-arm last_instr reload must be a reload block of live/getarrayitem_vable_r/int_copy/ref_copy with every getarrayitem_vable_r immediately preceded by live; last_instr getfield tails={last_instr_getfield_tails:?}, opnames={opnames:?}"
         );
         let last_instr_reloads = decoded
             .iter()
@@ -22075,6 +22107,8 @@ mod tests {
         let mut ticker_load_pos = None;
         let mut breaker_load_pos = None;
         let mut tick_last_instr = None;
+        let mut last_instr_read_pos = None;
+        let mut pycode_promote_pos = None;
         for (idx, op) in before.iter().enumerate() {
             if op.opname == "int_copy" {
                 apply_int_copy_to_regs(
@@ -22087,6 +22121,15 @@ mod tests {
             }
             if let Some(value) = last_instr_setfield_value(jitcode, op, num_regs_i, &regs) {
                 tick_last_instr = Some(value);
+            }
+            if op.opname == "getfield_vable_i"
+                && vable_field_index(jitcode, decoded_descr_u16(&jitcode.code, op.pc, 2))
+                    == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            {
+                last_instr_read_pos = Some(idx);
+            }
+            if op.opname == "ref_guard_value" {
+                pycode_promote_pos = Some(idx);
             }
             if let Some(name) = inline_call_callee_name(jitcode, op) {
                 if name.ends_with("gil_ready_word") {
@@ -22172,6 +22215,16 @@ mod tests {
                 && breaker_load_pos < uint_ge_pos
                 && uint_ge_pos < breaker_slow_pos,
             "back-edge order, got {opnames:?}"
+        );
+        let last_instr_read_pos = last_instr_read_pos.unwrap_or_else(|| {
+            panic!("jump tick reads last_instr before loop_header, got {opnames:?}")
+        });
+        let pycode_promote_pos = pycode_promote_pos.unwrap_or_else(|| {
+            panic!("getcode promotes pycode before loop_header, got {opnames:?}")
+        });
+        assert!(
+            breaker_slow_pos < last_instr_read_pos && last_instr_read_pos < pycode_promote_pos,
+            "jumpto = r_uint(self.last_instr) follows bytecode_trace and precedes can_enter_jit's getcode, got {opnames:?}"
         );
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
