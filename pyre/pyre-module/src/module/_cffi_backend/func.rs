@@ -1,8 +1,17 @@
 //! The module-level functions — PyPy:
 //! `pypy/module/_cffi_backend/func.py`.
+//!
+//! `func.py RawBytes` is the product value: an RPython instance whose light
+//! destructor (`RawBytes.__del__`) frees the `str2charp` block. It is a
+//! headerless GC instance (`lltype.malloc` / `gct_fv_gc_malloc`) with
+//! `TypeInfo::with_destructor`, the same shape as `CellFamily` and
+//! `W_ArrayBase.__del__`.
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
+use pyre_object::lltype::{GcType, TypeIdCell};
 
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj;
@@ -278,6 +287,100 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata(ptr, a[0]))
 }
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `func.py RawBytes`.
+pub static RAWBYTES_GC_TYPE_ID_CELL: TypeIdCell = TypeIdCell::auto();
+
+static RAWBYTES_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_rawbytes_gc_type_id(id: u32) {
+    RAWBYTES_GC_TYPE_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn rawbytes_gc_type_id() -> u32 {
+    RAWBYTES_GC_TYPE_ID.load(Ordering::Relaxed)
+}
+
+/// `func.py RawBytes` — `self.ptr = rffi.str2charp(string, track_allocation=False)`.
+#[repr(C)]
+pub struct RawBytes {
+    /// `RawBytes.ptr`.
+    pub ptr: *mut u8,
+}
+
+impl GcType for RawBytes {
+    fn type_id() -> u32 {
+        match rawbytes_gc_type_id() {
+            0 => 0,
+            id => id,
+        }
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// `RawBytes.__del__`: `rffi.free_charp(self.ptr, track_allocation=False)`.
+///
+/// # Safety
+/// `obj_addr` must point at a swept [`RawBytes`]. Runs at most once per
+/// allocation.
+pub unsafe fn rawbytes_destructor(obj_addr: usize) {
+    let raw = obj_addr as *mut RawBytes;
+    let ptr = unsafe { (*raw).ptr };
+    if !ptr.is_null() {
+        unsafe {
+            (*raw).ptr = std::ptr::null_mut();
+            majit_rlib::rffi::free_charp(ptr, false);
+        }
+    }
+}
+
+/// `RawBytes(string)` after `str2charp`. Null means MemoryError is pending.
+/// Takes ownership of `ptr`; a failed malloc frees it.
+pub fn rawbytes_from_charp(ptr: *mut u8) -> *mut RawBytes {
+    let value = RawBytes { ptr };
+    debug_assert_eq!(
+        std::mem::size_of::<RawBytes>(),
+        RawBytes::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = RawBytes::type_id();
+    let mut allocation_root: pyre_object::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+            type_id,
+            RawBytes::SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_raise()
+    .unwrap_or(std::ptr::null_mut());
+    if raw.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            unsafe { majit_rlib::rffi::free_charp(ptr, false) };
+            return std::ptr::null_mut();
+        }
+        return pyre_object::lltype::malloc_typed(value);
+    }
+    unsafe {
+        std::ptr::write(raw as *mut RawBytes, value);
+        if needs_write_barrier {
+            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+        }
+    }
+    raw as *mut RawBytes
+}
+
+/// `RawBytes(string)`: `str2charp` then `lltype.malloc` of the instance.
+/// Null means MemoryError is pending or `str2charp` failed.
+pub fn rawbytes_new(data: &[u8]) -> *mut RawBytes {
+    let ptr = match majit_rlib::rffi::str2charp(data, false) {
+        Ok(ptr) => ptr,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    rawbytes_from_charp(ptr)
+}
+
 /// `WEAKDICT` pointer. The table is a prebuilt GC object (`ll_new_weakdict`).
 struct WeakKeyDictPtr(*mut pyre_object::rweakkeydict::WeakKeyDict);
 unsafe impl Send for WeakKeyDictPtr {}
@@ -332,7 +435,7 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
     let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
     let existing = unsafe { (*d).ll_get(w_x) };
     if !existing.is_null() {
-        return Ok(unsafe { (*(existing as *mut pyre_object::rweakkeydict::RawBytes)).ptr });
+        return Ok(unsafe { (*(existing as *mut RawBytes)).ptr });
     }
     let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
     let block = unsafe { pyre_object::bytesobject::w_bytes_block(w_x) };
@@ -351,7 +454,7 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_x) };
         majit_rlib::rffi::str2charp(data, false).map_err(|_| PyError::memory_error(""))?
     };
-    let rawbytes = pyre_object::rweakkeydict::rawbytes_from_charp(charp);
+    let rawbytes = rawbytes_from_charp(charp);
     if rawbytes.is_null() {
         return Err(PyError::memory_error(""));
     }
@@ -363,7 +466,7 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
         return Err(PyError::memory_error(""));
     }
     let rawbytes = pyre_object::gc_roots::shadow_stack_get(raw_slot);
-    Ok(unsafe { (*(rawbytes as *mut pyre_object::rweakkeydict::RawBytes)).ptr })
+    Ok(unsafe { (*(rawbytes as *mut RawBytes)).ptr })
 }
 
 /// `func.py from_buffer`.
@@ -720,4 +823,24 @@ pub fn load_library(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         None => 0,
     };
     super::libraryobj::load_library(a[0], flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RawBytes.__del__` frees the `str2charp` block.
+    #[test]
+    fn rawbytes_destructor_frees_the_charp() {
+        let raw = rawbytes_new(b"abc");
+        assert!(!raw.is_null());
+        let ptr = unsafe { (*raw).ptr };
+        assert!(!ptr.is_null());
+        unsafe {
+            assert_eq!(*ptr, b'a');
+            assert_eq!(*ptr.add(3), 0);
+            rawbytes_destructor(raw as usize);
+            assert!((*raw).ptr.is_null());
+        }
+    }
 }

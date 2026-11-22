@@ -429,6 +429,7 @@ pub fn register() {
             ctypes_array_instance: hook_ctypes_array_instance,
             ctypes_pointer_instance: hook_ctypes_pointer_instance,
             gc_types: module_gc_types,
+            raw_gc_types: module_raw_gc_types,
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
             gc_initialize: hook_gc_initialize,
@@ -529,6 +530,18 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     ))]
     module::_cffi_backend::gc_types(&mut types);
     module::_csv::gc_types(&mut types);
+    types
+}
+
+/// Headerless `lltype.malloc(GcStruct)` instances this crate's modules own.
+fn module_raw_gc_types() -> Vec<pyre_interpreter::importing::ModuleRawGcType> {
+    let mut types = Vec::new();
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    module::_cffi_backend::raw_gc_types(&mut types);
     types
 }
 

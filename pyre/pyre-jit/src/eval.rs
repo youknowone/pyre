@@ -6132,20 +6132,20 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     pyre_object::rweakkeydict::WEAKKEYDICT_GC_TYPE_ID_CELL.set(weakkeydict_tid);
     pyre_object::rweakkeydict::set_weakkeydict_gc_type_id(weakkeydict_tid);
-    // `func.py RawBytes`: headerless GC instance whose light destructor
-    // (`RawBytes.__del__`) frees the `str2charp` block. Same destructor
-    // mechanism as `CellFamily` / `W_ArrayBase.__del__`.
-    let rawbytes_tid = gc.get_type_id(
-        GcTypeKey::of(&pyre_object::rweakkeydict::RAWBYTES_GC_TYPE_ID_CELL),
-        || {
-            TypeInfo::with_destructor(
-                std::mem::size_of::<pyre_object::rweakkeydict::RawBytes>(),
-                pyre_object::rweakkeydict::rawbytes_destructor,
-            )
-        },
-    );
-    pyre_object::rweakkeydict::RAWBYTES_GC_TYPE_ID_CELL.set(rawbytes_tid);
-    pyre_object::rweakkeydict::set_rawbytes_gc_type_id(rawbytes_tid);
+    // Optional-module headerless GC instances (`OptionalModuleHooks.raw_gc_types`).
+    // `func.py RawBytes` is the product case: a headerless GC instance whose
+    // light destructor (`RawBytes.__del__`) frees the `str2charp` block. Same
+    // destructor mechanism as `CellFamily` / `W_ArrayBase.__del__`. With no
+    // hooks installed (jit-core), register nothing.
+    if let Some(hooks) = pyre_interpreter::importing::optional_module_hooks() {
+        for ty in (hooks.raw_gc_types)() {
+            let tid = gc.get_type_id(GcTypeKey::of(ty.cell), || {
+                TypeInfo::with_destructor(ty.size, ty.destructor)
+            });
+            ty.cell.set(tid);
+            (ty.set_id)(tid);
+        }
+    }
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(

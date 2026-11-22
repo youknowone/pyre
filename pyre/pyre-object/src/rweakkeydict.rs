@@ -25,12 +25,6 @@
 //! takes `try_gc_alloc_stable_raw`, stamps `GCFLAG_NO_HEAP_PTRS`, and
 //! write-barriers so `remember_young_pointer` enrolls it in
 //! `prebuilt_root_objects`. `_ll_free_entries` is a no-op.
-//!
-//! `func.py RawBytes` is the product value: an RPython instance whose light
-//! destructor (`RawBytes.__del__`) frees the `str2charp` block. It is a
-//! headerless GC instance (`lltype.malloc` / `gct_fv_gc_malloc`) with
-//! `TypeInfo::with_destructor`, the same shape as `CellFamily` and
-//! `W_ArrayBase.__del__`.
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -48,12 +42,9 @@ pub static WEAKKEYDICT_GC_TYPE_ID_CELL: TypeIdCell = TypeIdCell::auto();
 /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for the key-dict
 /// `WEAKDICTENTRYARRAY`.
 pub static WEAKKEYDICT_ENTRIES_GC_TYPE_ID_CELL: TypeIdCell = TypeIdCell::auto();
-/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `func.py RawBytes`.
-pub static RAWBYTES_GC_TYPE_ID_CELL: TypeIdCell = TypeIdCell::auto();
 
 static WEAKKEYDICT_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 static WEAKKEYDICT_ENTRIES_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
-static RAWBYTES_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_weakkeydict_gc_type_id(id: u32) {
     WEAKKEYDICT_GC_TYPE_ID.store(id, Ordering::Relaxed);
@@ -63,101 +54,12 @@ pub fn set_weakkeydict_entries_gc_type_id(id: u32) {
     WEAKKEYDICT_ENTRIES_GC_TYPE_ID.store(id, Ordering::Relaxed);
 }
 
-pub fn set_rawbytes_gc_type_id(id: u32) {
-    RAWBYTES_GC_TYPE_ID.store(id, Ordering::Relaxed);
-}
-
 pub fn weakkeydict_gc_type_id() -> u32 {
     WEAKKEYDICT_GC_TYPE_ID.load(Ordering::Relaxed)
 }
 
 fn weakkeydict_entries_gc_type_id() -> u32 {
     WEAKKEYDICT_ENTRIES_GC_TYPE_ID.load(Ordering::Relaxed)
-}
-
-pub fn rawbytes_gc_type_id() -> u32 {
-    RAWBYTES_GC_TYPE_ID.load(Ordering::Relaxed)
-}
-
-/// `func.py RawBytes` — `self.ptr = rffi.str2charp(string, track_allocation=False)`.
-#[repr(C)]
-pub struct RawBytes {
-    /// `RawBytes.ptr`.
-    pub ptr: *mut u8,
-}
-
-impl GcType for RawBytes {
-    fn type_id() -> u32 {
-        match rawbytes_gc_type_id() {
-            0 => 0,
-            id => id,
-        }
-    }
-    const SIZE: usize = std::mem::size_of::<Self>();
-}
-
-/// `RawBytes.__del__`: `rffi.free_charp(self.ptr, track_allocation=False)`.
-///
-/// # Safety
-/// `obj_addr` must point at a swept [`RawBytes`]. Runs at most once per
-/// allocation.
-pub unsafe fn rawbytes_destructor(obj_addr: usize) {
-    let raw = obj_addr as *mut RawBytes;
-    let ptr = unsafe { (*raw).ptr };
-    if !ptr.is_null() {
-        unsafe {
-            (*raw).ptr = std::ptr::null_mut();
-            majit_rlib::rffi::free_charp(ptr, false);
-        }
-    }
-}
-
-/// `RawBytes(string)` after `str2charp`. Null means MemoryError is pending.
-/// Takes ownership of `ptr`; a failed malloc frees it.
-pub fn rawbytes_from_charp(ptr: *mut u8) -> *mut RawBytes {
-    let value = RawBytes { ptr };
-    debug_assert_eq!(
-        std::mem::size_of::<RawBytes>(),
-        RawBytes::SIZE,
-        "GcType::SIZE drift from std::mem::size_of"
-    );
-    let type_id = RawBytes::type_id();
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            type_id,
-            RawBytes::SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
-    .allocated_or_raise()
-    .unwrap_or(std::ptr::null_mut());
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            unsafe { majit_rlib::rffi::free_charp(ptr, false) };
-            return std::ptr::null_mut();
-        }
-        return crate::lltype::malloc_typed(value);
-    }
-    unsafe {
-        std::ptr::write(raw as *mut RawBytes, value);
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-        }
-    }
-    raw as *mut RawBytes
-}
-
-/// `RawBytes(string)`: `str2charp` then `lltype.malloc` of the instance.
-/// Null means MemoryError is pending or `str2charp` failed.
-pub fn rawbytes_new(data: &[u8]) -> *mut RawBytes {
-    let ptr = match majit_rlib::rffi::str2charp(data, false) {
-        Ok(ptr) => ptr,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    rawbytes_from_charp(ptr)
 }
 
 /// `WEAKDICTENTRY`.
@@ -761,20 +663,5 @@ mod tests {
         assert!(unsafe { (*entry(d.entries, i)).value }.is_null());
         assert!(everused(d.entries, i));
         assert!(!valid(d.entries, i));
-    }
-
-    /// `RawBytes.__del__` frees the `str2charp` block.
-    #[test]
-    fn rawbytes_destructor_frees_the_charp() {
-        let raw = rawbytes_new(b"abc");
-        assert!(!raw.is_null());
-        let ptr = unsafe { (*raw).ptr };
-        assert!(!ptr.is_null());
-        unsafe {
-            assert_eq!(*ptr, b'a');
-            assert_eq!(*ptr.add(3), 0);
-            rawbytes_destructor(raw as usize);
-            assert!((*raw).ptr.is_null());
-        }
     }
 }
