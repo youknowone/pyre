@@ -23072,9 +23072,9 @@ mod tests {
 
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getfield_raw_i/id>i"),
             "getfield_raw_i missing, got {:?}",
@@ -23204,9 +23204,9 @@ mod tests {
 
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getfield_raw_i/id>i"),
             "getfield_raw_i missing, got {:?}",
@@ -23320,9 +23320,9 @@ mod tests {
 
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getfield_raw_i/id>i"),
             "getfield_raw_i missing, got {:?}",
@@ -23440,9 +23440,9 @@ mod tests {
 
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "raw FLAG_POINTER borrow must not assemble getfield_raw_r, got {:?}",
@@ -23560,9 +23560,9 @@ mod tests {
 
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "raw tagged-enum borrow must not assemble getfield_raw_r, got {:?}",
@@ -23689,9 +23689,9 @@ mod tests {
         crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "one-word raw struct borrow must not assemble getfield_raw_r, got {:?}",
@@ -23825,9 +23825,9 @@ mod tests {
         }
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "flavor-raw Pointer borrow must not assemble getfield_raw_r, got {:?}",
@@ -23901,9 +23901,9 @@ mod tests {
         crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.keys().any(|k| k.starts_with("getfield_raw_i")),
             "one-word raw struct value must assemble getfield_raw_i, got {:?}",
@@ -23981,9 +23981,9 @@ mod tests {
         crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "raw pointer field must not assemble getfield_raw_r, got {:?}",
@@ -24302,9 +24302,9 @@ mod tests {
         }
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.keys().any(|k| k.starts_with("getfield_gc_r")),
             "GC pointer field must assemble getfield_gc_r, got {:?}",
@@ -40031,9 +40031,9 @@ mod tests {
         }
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, cc);
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, cc);
         asm
     }
 

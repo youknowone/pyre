@@ -19710,9 +19710,9 @@ mod tests {
         let mut graph = out.graph;
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getfield_raw_i/id>i"),
             "getfield_raw_i missing, got {:?}",
@@ -20032,9 +20032,9 @@ mod tests {
             "f must assemble through a call op, graph={graph:?}"
         );
 
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.keys().any(|key| key.contains("call")),
             "assembled call missing, keys={:?}",

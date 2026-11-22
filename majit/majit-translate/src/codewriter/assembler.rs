@@ -493,6 +493,13 @@ pub trait AssemblerExt {
 
     fn assemble_with_callcontrol(
         &mut self,
+        ssarepr: SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocator>,
+        callcontrol: Option<&CallControl>,
+    ) -> JitCodeBody;
+
+    fn assemble_inner(
+        &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocator>,
         callcontrol: Option<&CallControl>,
@@ -795,13 +802,31 @@ impl AssemblerExt for Assembler {
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol(ssarepr, regallocs, None)
+        let mut body = self.assemble_inner(ssarepr, regallocs, None);
+        // The caller keeps its SSARepr, so the body gets a copy.
+        body._ssarepr = Some(std::sync::Arc::new(ssarepr.clone()));
+        body
     }
 
     /// `assemble` overload with an attached [`CallControl`] — the
     /// production codewriter path threads the callcontrol so descriptor
     /// emission can reach the rtyper-built `CallDescriptor` cache.
     fn assemble_with_callcontrol(
+        &mut self,
+        mut ssarepr: SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocator>,
+        callcontrol: Option<&CallControl>,
+    ) -> JitCodeBody {
+        let mut body = self.assemble_inner(&mut ssarepr, regallocs, callcontrol);
+        // dump() reads `_ssarepr`. Assembler.assemble assigns
+        // `jitcode._ssarepr = ssarepr`. The production path moves the
+        // flattened graph; the `&mut` entry copies it. The serialized
+        // body skips the field.
+        body._ssarepr = Some(std::sync::Arc::new(ssarepr));
+        body
+    }
+
+    fn assemble_inner(
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocator>,
@@ -1000,9 +1025,7 @@ impl AssemblerExt for Assembler {
             jit_merge_point_offset: state.jit_merge_point_offset,
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
-            // dump() reads `_ssarepr`. Assembler.assemble always assigns
-            // `jitcode._ssarepr = ssarepr`. The serialized body skips the field.
-            _ssarepr: Some(std::sync::Arc::new(ssarepr.clone())),
+            _ssarepr: None,
         };
 
         self.count_jitcodes += 1;
@@ -11397,7 +11420,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
         let desc = &body.prebuilt_instance_consts[0];
         assert_eq!(desc.container_index, 0);
@@ -11433,7 +11456,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
         assert_eq!(body.prebuilt_instance_consts[0].type_id, type_id);
         let descrs = asm.snapshot_descrs();
@@ -11476,7 +11499,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
         assert_eq!(body.prebuilt_instance_consts[0].container_index, 0);
         assert_eq!(body.constants_r.len(), 1);
@@ -11505,7 +11528,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 2);
         assert_eq!(body.prebuilt_instance_consts[0].container_index, 0);
         assert_eq!(body.prebuilt_instance_consts[1].container_index, 1);
@@ -11538,7 +11561,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
     }
 
     #[test]
@@ -11612,7 +11635,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.constants_i, vec![0x30, 0x10, 0x20]);
         for class in [&stop, &base, &exc] {
             assert!(!body.constants_i.contains(&(class.identity_id() as i64)));
@@ -11657,7 +11680,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.constants_i, vec![0, 0x30]);
         assert!(!body.constants_i.contains(&(minted.identity_id() as i64)));
         assert!(!body.constants_i.contains(&(stop.identity_id() as i64)));
@@ -11709,7 +11732,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
     }
 
     #[test]
@@ -11772,7 +11795,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(&cc));
     }
 
     #[test]
@@ -12592,7 +12615,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         asm
     }
 
@@ -13056,7 +13079,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
     }
 
     /// A Constant ref `base` still keys `jit_force_quasi_immutable/rd`
@@ -13174,7 +13197,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
 
         // The key must be exactly `newlist_clear/idddd>r` — four `d` descr
         // slots in the length/struct-length-items-array order.  Any drift
@@ -13475,7 +13498,7 @@ mod tests {
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
         asm.intern_type_static_addrs(intern);
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(cc));
         let want = majit_ir::descr::struct_id_for_name(owner)
             .unwrap_or_else(|| panic!("struct id for {owner}"))
             .as_u64();
@@ -14543,7 +14566,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         let keys: Vec<&String> = asm.insns.keys().collect();
         assert!(
             keys.iter().any(|k| k.as_str() == "getfield_raw_i/id>i"),
@@ -14861,7 +14884,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         let keys: Vec<&String> = asm.insns.keys().collect();
         assert!(
             keys.iter().any(|k| k.as_str() == "getfield_raw_i/id>i"),
@@ -15315,7 +15338,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         (body, asm)
     }
 
@@ -16805,7 +16828,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getinteriorfield_gc_i/rid>i"),
             "expected getinteriorfield_gc_i/rid>i, got {:?}",
@@ -16866,7 +16889,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("setinteriorfield_gc_r/rird"),
             "expected setinteriorfield_gc_r/rird, got {:?}",
@@ -16926,7 +16949,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
     }
 
     use std::cell::RefCell;
@@ -17158,7 +17181,7 @@ mod tests {
         };
         let mut asm = Assembler::new();
         match callcontrol {
-            Some(cc) => asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(cc)),
+            Some(cc) => asm.assemble_with_callcontrol(flat, &empty_regallocs(), Some(cc)),
             None => asm.assemble(&mut flat, &empty_regallocs()),
         }
     }
@@ -17315,7 +17338,7 @@ mod tests {
             vec![normal_link, typed, catchall],
         );
         let mut regallocs = identity_int_regallocs(&graph);
-        let flat = flatten_graph(&graph, &mut regallocs);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
