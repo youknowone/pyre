@@ -20222,27 +20222,44 @@ fn raw_list_produced_const(
     })
 }
 
-/// ARRAY identity of a `RustVec` item buffer, from `ARRAY.OF`.
+/// Pointer-width integer lltype for a `Vec` Int/Ref item.
 ///
-/// `descr.py` `get_type_flag` reads that element lltype, and `rint.py`
-/// `unsigned_repr` is what an unsigned item lowers to. `Signed` spells
-/// `Vec<isize>`, `Unsigned` spells `Vec<usize>`, `Float` spells `Vec<f64>`.
-/// A reference item is stored as an untraced word (`cast_ptr_to_int`), so
-/// that spelling stays `usize`. The identity is what lets `arraydescrof`
-/// read the flag and `sizeof(ARRAY.OF)`; without one, an int element is
-/// eight bytes wide.
-/// The ARRAY is `rffi.CArray(ITEM)` (`rewrite_op_raw_store`); a GC-pointer
-/// item is stored as an untraced word, so `ITEM` is `Unsigned`.
+/// `rffi.sizeof(Signed|Unsigned)` is `target_signed_size()`. When that is
+/// not the word, `INTPTR_T` / `UINTPTR_T` (`sizeof_number` of the C type).
+fn vec_word_item_lltype(
+    signed: bool,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi;
+    let word = crate::layout::target_word_size();
+    let primitive = if signed {
+        LowLevelType::Signed
+    } else {
+        LowLevelType::Unsigned
+    };
+    match rffi::sizeof(&primitive) {
+        Ok(crate::flowspace::model::ConstValue::Int(n)) if n > 0 && n as usize == word => primitive,
+        _ if signed => (*rffi::INTPTR_T).clone(),
+        _ => (*rffi::UINTPTR_T).clone(),
+    }
+}
+
+/// A Vec item buffer holds pointer-width items (`vec_item_malloc_word`).
+/// `get_array_descr` sizes items by `rffi.sizeof(ARRAY.OF)`.
+/// `lltype.Signed`/`Unsigned` are `target_signed_size` wide; when that
+/// is not the word, `ARRAY.OF` is `INTPTR_T`/`UINTPTR_T`.
 fn rust_vec_item_array(
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> crate::translator::rtyper::lltypesystem::lltype::Array {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     use crate::translator::rtyper::lltypesystem::rffi::CArray;
-    if matches!(item, LowLevelType::Ptr(p) if p._needsgc()) {
-        CArray(LowLevelType::Unsigned)
-    } else {
-        CArray(item.clone())
-    }
+    let of = match item {
+        LowLevelType::Ptr(p) if p._needsgc() => vec_word_item_lltype(false),
+        LowLevelType::Signed => vec_word_item_lltype(true),
+        LowLevelType::Unsigned => vec_word_item_lltype(false),
+        _ => item.clone(),
+    };
+    CArray(of)
 }
 
 fn rust_vec_item_array_type_id(
@@ -49628,21 +49645,47 @@ mod tests {
     /// gives the raw `CArray` of that item.
     #[test]
     fn rust_vec_item_id_matches_raw_carray() {
-        use crate::codewriter::call::array_type_id_of_lltype;
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::codewriter::call::{array_item_size_of_lltype, array_type_id_of_lltype};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
         use crate::translator::rtyper::lltypesystem::rffi;
-        assert_eq!(
-            rust_vec_item_array_type_id(&LowLevelType::Signed),
-            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed)),
-        );
-        assert_eq!(
-            rust_vec_item_array_type_id(&LowLevelType::Unsigned),
-            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Unsigned)),
-        );
+        use majit_ir::rvec::VecItemKind;
+        let word = crate::layout::target_word_size();
+        let signed_bytes = match rffi::sizeof(&LowLevelType::Signed) {
+            Ok(crate::flowspace::model::ConstValue::Int(n)) if n > 0 => n as usize,
+            other => panic!("sizeof Signed: {other:?}"),
+        };
+        if signed_bytes == word {
+            assert_eq!(
+                rust_vec_item_array_type_id(&LowLevelType::Signed),
+                array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed)),
+            );
+            assert_eq!(
+                rust_vec_item_array_type_id(&LowLevelType::Unsigned),
+                array_type_id_of_lltype(&rffi::CArray(LowLevelType::Unsigned)),
+            );
+        }
         assert_eq!(
             rust_vec_item_array_type_id(&LowLevelType::Float),
             array_type_id_of_lltype(&rffi::CArray(LowLevelType::Float)),
         );
+        let item_w = VecItemKind::Int.size_align(word).0;
+        for item in [&LowLevelType::Signed, &LowLevelType::Unsigned, &*GCREF] {
+            let array = rust_vec_item_array(item);
+            assert_eq!(
+                rust_vec_item_array_type_id(item),
+                array_type_id_of_lltype(&array),
+            );
+            assert_eq!(array_item_size_of_lltype(&array.OF), Some(item_w));
+            let descr = crate::codewriter::call::CallControl::new().arraydescrof_array(&array);
+            let ad = descr
+                .as_array_descr()
+                .expect("arraydescrof_array must answer an ArrayDescr");
+            assert_eq!(ad.item_size(), item_w);
+            assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
+            assert_eq!(ad.base_size(), 0);
+            assert!(ad.len_descr().is_none());
+            assert!(!array_type_id_of_lltype(&array).contains("GcArray<i64>"));
+        }
     }
 
     /// The item descr of `list.getitem` / `list.setitem` is `arraydescrof`
@@ -49702,6 +49745,19 @@ mod tests {
             .expect("Unsigned item descr");
         assert_eq!(unsigned.item_size(), word);
         assert!(!unsigned.is_item_signed());
+        assert_eq!(
+            signed.item_size(),
+            VecItemKind::Int.size_align(word).0,
+            "Int item ARRAY.OF matches vec_item_malloc_word"
+        );
+        let ref_arr = rust_vec_item_array(&GCREF);
+        let ref_descr = cc.arraydescrof_array(&ref_arr);
+        let ref_ad = ref_descr.as_array_descr().expect("Ref item descr");
+        assert_eq!(
+            ref_ad.item_size(),
+            VecItemKind::Int.size_align(word).0,
+            "Ref item ARRAY.OF matches vec_item_malloc_word"
+        );
         assert_eq!(
             crate::codewriter::call::get_type_flag("isize", &std::collections::HashSet::new()).2,
             word,
