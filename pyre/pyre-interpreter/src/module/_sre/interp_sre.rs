@@ -6,14 +6,14 @@
 //! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
-    make_builtin_function, make_builtin_function_passthrough1, make_builtin_function_with_arity,
-    make_builtin_function_with_signature, make_module_builtin_function_with_arity,
-    make_module_builtin_function_with_arity_and_sig, Signature,
+    Signature, make_builtin_function, make_builtin_function_passthrough1,
+    make_builtin_function_with_arity, make_builtin_function_with_signature,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_sig,
 };
 use pyre_object::interp_sre::{
-    is_sre_match, is_sre_pattern, is_sre_scanner, is_sre_template, w_sre_match_get_span,
-    w_sre_match_new, w_sre_pattern_new, w_sre_scanner_new, w_sre_template_new, W_SRE_Match,
-    W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template,
+    W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template, is_sre_match, is_sre_pattern,
+    is_sre_scanner, is_sre_template, w_sre_match_get_span, w_sre_match_new, w_sre_pattern_new,
+    w_sre_scanner_new, w_sre_template_new,
 };
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
@@ -1669,11 +1669,7 @@ fn make_match(
     // `_last_index` (interp_sre.py); -1 plays None.
     let lastindex = {
         let li = state.marks.last_index();
-        if li >= 0 {
-            li as i64
-        } else {
-            -1
-        }
+        if li >= 0 { li as i64 } else { -1 }
     };
     let spans = flatten_spans(pat, state);
     w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, &spans)
@@ -1950,11 +1946,13 @@ enum SubxFilter {
 /// The `bool` is `is_buffer`. An acquisition failure is not an error here —
 /// the replacement is treated as non-literal so `compile_template` raises.
 ///
-/// [3.15-spec] `pattern_subx` clears a `getstring` failure and sets
-/// `literal = 0` ↔ PyPy `W_SRE_Pattern.subx` raises from `acquire_py_buffer`.
-/// Observable: `re.sub('b', 1, 'ab')` is `decoding to str: need a bytes-like
-/// object, int found` from the template compiler, not `a bytes-like object
-/// is required, not int`.
+/// [3.15-spec] acquire/read failure → non-literal (`compile_template` raises)
+/// ↔ PyPy `W_SRE_Pattern.subx` raises from `acquire_py_buffer` — `re.sub('b',
+/// 1, 'ab')` is `TypeError: decoding to str: need a bytes-like object, int
+/// found`; evidence: CPython tag v3.15.1 `Modules/_sre/sre.c` `pattern_subx`
+/// (`ptr = getstring(...); if (ptr) { ... } else { PyErr_Clear(); literal =
+/// 0; }` then `compile_template`) and a measured python3.15 run of that
+/// snippet (PyPy: `a bytes-like object is required, not int`).
 fn try_filter_as_string(w_repl: PyObjectRef) -> Option<(Vec<u8>, bool)> {
     // `to_vec` / `ReadableBuffer::acquire` can host-malloc. Pin `w_repl`
     // across them (`push_roots` / `pop_roots`).
@@ -1970,28 +1968,32 @@ fn try_filter_as_string(w_repl: PyObjectRef) -> Option<(Vec<u8>, bool)> {
                 false,
             ));
         }
-        match crate::builtins::ReadableBuffer::acquire(w_repl.get()) {
-            Ok(buf) => match crate::builtins::acquire_readbuf(buf.owner()) {
-                Ok(bytes) => Some((bytes.to_vec(), true)),
-                Err(_) => None,
-            },
+        let Ok(buf) = crate::builtins::ReadableBuffer::acquire(w_repl.get()) else {
+            return None;
+        };
+        // `space.release_py_buffer` / `PyBuffer_Release(&view)`: Drop of
+        // `ReadableBuffer` is the `finally`, including when the read fails.
+        let copied = match crate::builtins::acquire_readbuf(buf.owner()) {
+            Ok(bytes) => Some(bytes.to_vec()),
             Err(_) => None,
-        }
+        };
+        drop(buf);
+        copied.map(|bytes| (bytes, true))
     }
 }
 
 /// `_sub_append_slice` join-path arm: append `slice_w` of `[start, end)` onto
 /// `sublist_w`. The caller skips empty gaps (`last_pos < ctx.match_start`).
-fn subx_append_slice(sublist: PyObjectRef, subj: Subject, span: (i64, i64)) {
+/// `sublist` is a shadow-stack slot: `slice_subject` allocates, so the list
+/// is re-read immediately before `w_list_append`.
+fn subx_append_slice(sublist: RootedObject, subj: Subject, span: (i64, i64)) {
     let _item_roots = pyre_object::gc_roots::push_roots();
     let w_item = RootedObject::pin(slice_subject(subj, span, w_none()));
-    unsafe { w_list_append(sublist, w_item.get()) };
+    unsafe { w_list_append(sublist.get(), w_item.get()) };
 }
 
-fn subx_append_obj(sublist: PyObjectRef, w_obj: PyObjectRef) {
-    let _item_roots = pyre_object::gc_roots::push_roots();
-    let w_obj = RootedObject::pin(w_obj);
-    unsafe { w_list_append(sublist, w_obj.get()) };
+fn subx_append_obj(sublist: RootedObject, w_obj: RootedObject) {
+    unsafe { w_list_append(sublist.get(), w_obj.get()) };
 }
 
 /// Non-literal arm: `compile_template`, then `pattern_subx`'s size-0 → LITERAL
@@ -2005,11 +2007,11 @@ fn subx_compiled_kind(
 ) -> Result<SubxFilter, crate::PyError> {
     let w_compiled = compile_template_object(pat, w_source)?;
     let compiled_slot = pyre_object::gc_roots::pin_roots(&[w_compiled]);
-    let w_compiled = pyre_object::gc_roots::shadow_stack_get(compiled_slot);
-    if unsafe { is_sre_template(w_compiled) } {
-        let indexes = unsafe { (*(w_compiled as *const W_SRE_Template)).indexes };
+    let w_compiled = || pyre_object::gc_roots::shadow_stack_get(compiled_slot);
+    if unsafe { is_sre_template(w_compiled()) } {
+        let indexes = unsafe { (*(w_compiled() as *const W_SRE_Template)).indexes };
         if unsafe { pyre_object::w_tuple_len(indexes) } == 0 {
-            let lit = unsafe { (*(w_compiled as *const W_SRE_Template)).literal };
+            let lit = unsafe { (*(w_compiled() as *const W_SRE_Template)).literal };
             *filter_slot = pyre_object::gc_roots::pin_roots(&[lit]);
             Ok(SubxFilter::JoinLiteral)
         } else {
@@ -2017,7 +2019,7 @@ fn subx_compiled_kind(
             Ok(SubxFilter::JoinTemplate)
         }
     } else {
-        *items = template_items_from_compiled(w_compiled)?;
+        *items = template_items_from_compiled(w_compiled())?;
         Ok(SubxFilter::ExpandItems)
     }
 }
@@ -2125,29 +2127,31 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         match kind {
             SubxFilter::JoinLiteral => {
                 if last < mstart {
-                    subx_append_slice(sublist.get(), subject_now(), (last, mstart));
+                    subx_append_slice(sublist, subject_now(), (last, mstart));
                 }
-                subx_append_obj(
-                    sublist.get(),
-                    pyre_object::gc_roots::shadow_stack_get(filter_slot),
-                );
+                subx_append_obj(sublist, RootedObject(filter_slot));
             }
             SubxFilter::JoinTemplate => {
                 if last < mstart {
-                    subx_append_slice(sublist.get(), subject_now(), (last, mstart));
+                    subx_append_slice(sublist, subject_now(), (last, mstart));
                 }
-                let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
-                    pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                    string(),
-                    w_buffer(),
-                    snap,
-                    0,
-                    endpos as i64,
-                ))?;
-                let w_piece =
-                    expand_template(pyre_object::gc_roots::shadow_stack_get(template_slot), m)?;
-                if !unsafe { is_none(w_piece) } {
-                    subx_append_obj(sublist.get(), w_piece);
+                let _match_roots = pyre_object::gc_roots::push_roots();
+                let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                    make_match_from_snapshot(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        string(),
+                        w_buffer(),
+                        snap,
+                        0,
+                        endpos as i64,
+                    ),
+                )?);
+                let w_piece = RootedObject::pin(expand_template(
+                    pyre_object::gc_roots::shadow_stack_get(template_slot),
+                    m.get(),
+                )?);
+                if !unsafe { is_none(w_piece.get()) } {
+                    subx_append_obj(sublist, w_piece);
                 }
             }
             SubxFilter::Builder => {
@@ -2160,34 +2164,43 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
                     out.extend_from_slice(gap);
                 }
-                let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
-                    pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                    string(),
-                    w_buffer(),
-                    snap,
-                    0,
-                    endpos as i64,
-                ))?;
-                expand_into(&mut out, &items, m as *const W_SRE_Match, subject_now());
+                let _match_roots = pyre_object::gc_roots::push_roots();
+                let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                    make_match_from_snapshot(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        string(),
+                        w_buffer(),
+                        snap,
+                        0,
+                        endpos as i64,
+                    ),
+                )?);
+                expand_into(&mut out, &items, m, &subject_now);
             }
             SubxFilter::Callable => {
                 if last < mstart {
-                    subx_append_slice(sublist.get(), subject_now(), (last, mstart));
+                    subx_append_slice(sublist, subject_now(), (last, mstart));
                 }
                 // `W_SRE_Pattern.subx`: callable filter. None is skipped;
                 // any other `w_piece` is appended as-is. Type errors come
                 // from the subject's empty-string `join`, not from here.
-                let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
-                    pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                    string(),
-                    w_buffer(),
-                    snap,
-                    0,
-                    endpos as i64,
-                ))?;
-                let w_piece = crate::call::call_function_impl_result(w_repl(), &[m])?;
-                if !unsafe { is_none(w_piece) } {
-                    subx_append_obj(sublist.get(), w_piece);
+                let _match_roots = pyre_object::gc_roots::push_roots();
+                let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                    make_match_from_snapshot(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        string(),
+                        w_buffer(),
+                        snap,
+                        0,
+                        endpos as i64,
+                    ),
+                )?);
+                let w_piece = RootedObject::pin(crate::call::call_function_impl_result(
+                    w_repl(),
+                    &[m.get()],
+                )?);
+                if !unsafe { is_none(w_piece.get()) } {
+                    subx_append_obj(sublist, w_piece);
                 }
             }
         }
@@ -2239,16 +2252,16 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         let w_result = if is_exact_str_or_bytes(string()) {
             string()
         } else {
-            let w_empty = RootedObject::pin(empty_subject(subj));
+            let w_empty = RootedObject::pin(empty_subject(subject_now()));
             slice_subject(subject_now(), (0, endpos as i64), w_empty.get())
         };
         return Ok((w_result, 0));
     }
     if use_join {
         if last < endpos as i64 {
-            subx_append_slice(sublist.get(), subject_now(), (last, endpos as i64));
+            subx_append_slice(sublist, subject_now(), (last, endpos as i64));
         }
-        let w_empty = RootedObject::pin(empty_subject(subj));
+        let w_empty = RootedObject::pin(empty_subject(subject_now()));
         let w_item =
             crate::baseobjspace::call_method_result(w_empty.get(), "join", &[sublist.get()])?;
         return Ok((w_item, n));
@@ -2258,7 +2271,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     if let Some(tail) = subject_span_bytes(subject_now(), (last, endpos as i64)) {
         out.extend_from_slice(tail);
     }
-    Ok((finish_output(subj, out), n))
+    Ok((finish_output(subject_now(), out), n))
 }
 
 /// `type(w_string) is unicode` / `is bytes` — the exact-type gate of the
@@ -2775,8 +2788,7 @@ fn expand_template(w_template: PyObjectRef, m: PyObjectRef) -> Result<PyObjectRe
     let t_slot = pyre_object::gc_roots::pin_roots(&[w_template, m]);
     let template = || pyre_object::gc_roots::shadow_stack_get(t_slot) as *const W_SRE_Template;
     let m = || pyre_object::gc_roots::shadow_stack_get(t_slot + 1);
-    let indexes = unsafe { (*template()).indexes };
-    let indexes_slot = pyre_object::gc_roots::pin_roots(&[indexes]);
+    let indexes_slot = pyre_object::gc_roots::pin_roots(&[unsafe { (*template()).indexes }]);
     let n =
         unsafe { pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(indexes_slot)) };
     if n == 0 {
@@ -2827,15 +2839,20 @@ fn expand_template(w_template: PyObjectRef, m: PyObjectRef) -> Result<PyObjectRe
 
 /// Expand the parsed template against a match, appending into `out` — the
 /// `_sre.template().expand()` substitution.  An unmatched group reference
-/// contributes the empty string (`g(group) or empty`).
-fn expand_into(out: &mut Vec<u8>, items: &[TemplateItem], m: *const W_SRE_Match, subj: Subject) {
+/// contributes the empty string (`g(group) or empty`). `out.extend` can
+/// host-malloc, so `m` and the subject are re-read on every group.
+fn expand_into(
+    out: &mut Vec<u8>,
+    items: &[TemplateItem],
+    m: RootedObject,
+    subj: impl Fn() -> Subject,
+) {
     for item in items {
         match item {
             TemplateItem::Literal(lit) => out.extend_from_slice(lit),
             TemplateItem::Group(idx) => {
-                let span =
-                    unsafe { w_sre_match_get_span(m as PyObjectRef, *idx) }.unwrap_or((-1, -1));
-                if let Some(piece) = subject_span_bytes(subj, span) {
+                let span = unsafe { w_sre_match_get_span(m.get(), *idx) }.unwrap_or((-1, -1));
+                if let Some(piece) = subject_span_bytes(subj(), span) {
                     out.extend_from_slice(piece);
                 }
             }
@@ -3060,11 +3077,13 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let w_pat = RootedObject::pin(unsafe { (*(m.get() as *const W_SRE_Match)).w_srepat });
     let items = compile_template(w_pat.get(), w_template.get())?;
     // Re-read after `compile_template`.
-    let mp = m.get() as *const W_SRE_Match;
-    let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
+    let subject_now = || {
+        let mp = m.get() as *const W_SRE_Match;
+        unsafe { subject_of((*mp).w_string, (*mp).w_buffer) }
+    };
     let mut out: Vec<u8> = Vec::new();
-    expand_into(&mut out, &items, mp, subj);
-    Ok(finish_output(subj, out))
+    expand_into(&mut out, &items, m, &subject_now);
+    Ok(finish_output(subject_now(), out))
 }
 
 /// `repr_w` (interp_sre.py) — `<re.Match object; span=(s, e),
