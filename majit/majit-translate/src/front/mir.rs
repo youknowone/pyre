@@ -523,6 +523,9 @@ pub(crate) fn absorb_semantic_program(
                     .entry(key)
                     .or_insert(kind);
             }
+            for (key, kind) in prog.struct_fields.transparent_pointer_kinds {
+                acc.struct_fields.note_transparent_pointer_kind(key, kind);
+            }
             acc.struct_fields
                 .option_struct_ids
                 .extend(prog.struct_fields.option_struct_ids);
@@ -7341,6 +7344,12 @@ fn derive_program_metadata(
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
                 );
+                let pointer_wrapper_kind = transparent_pointer_wrapper_kind(
+                    td,
+                    llbc,
+                    gc_struct_ids,
+                    handle_payload.is_some(),
+                );
                 let handle_field_index = handle_payload
                     .as_ref()
                     .and_then(|_| transparent_nonzst_field(td, llbc).map(|(i, _)| i));
@@ -7405,6 +7414,14 @@ fn derive_program_metadata(
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
+                if let Some(kind) = pointer_wrapper_kind {
+                    // Full and crate-stripped qualified declaration identities only.
+                    // Never publish `leaf`: unrelated crates may declare the same leaf.
+                    struct_fields.note_transparent_pointer_kind(name.clone(), kind);
+                    if canonical_name.contains("::") {
+                        struct_fields.note_transparent_pointer_kind(canonical_name.clone(), kind);
+                    }
+                }
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields
                     .fields
@@ -7494,9 +7511,11 @@ fn derive_program_metadata(
                         .map(|(i, f)| (field_decl_name(i, f), f.ty.clone()))
                         .collect(),
                 });
-                known_struct_names.insert(name);
-                known_struct_names.insert(canonical_name);
-                known_struct_names.insert(leaf);
+                if pointer_wrapper_kind.is_none() {
+                    known_struct_names.insert(name);
+                    known_struct_names.insert(canonical_name);
+                    known_struct_names.insert(leaf);
+                }
             }
             TypeDeclKind::Enum(variants) => {
                 // Enums register under their type name *and* under each
@@ -8534,6 +8553,39 @@ pub(crate) fn struct_id_is_field0_parent(
             .is_some_and(|template| ids.contains(&template))
 }
 
+fn transparent_pointer_wrapper_kind(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    is_transparent_handle: bool,
+) -> Option<crate::front::semantic::TransparentPointerKind> {
+    if !td.item_meta.is_local || !td.is_repr_transparent() || is_transparent_handle {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let (index, _) = transparent_nonzst_field(td, llbc)?;
+    let field = fields.get(index)?;
+    let node = tyref_node(&field.ty, llbc)?;
+    let pointee = one_word_pointer_pointee(node, llbc)?;
+    // Charon production nodes wrap the pointee as `Deduplicated` /
+    // `Value`; `adt_node_def_id` is the bare-`Adt` tail of that peel.
+    let kind = json_ty_adt_def_id(llbc, pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .filter(|pointee_decl| {
+            let spelling = strip_crate_prefix(pointee_decl.item_meta.name_path_str());
+            struct_id_is_declared_gc(
+                gc_struct_ids,
+                struct_id_for_type_decl(pointee_decl),
+                &spelling,
+            )
+        })
+        .map(|_| crate::front::semantic::TransparentPointerKind::GcObject)
+        .unwrap_or(crate::front::semantic::TransparentPointerKind::Pointer);
+    Some(kind)
+}
+
 /// StructIds whose LLBC declaration records `#[repr(transparent)]`.
 ///
 /// `TypeDecl::is_repr_transparent` is the Charon layout fact. Folded
@@ -8837,6 +8889,9 @@ impl DuplicateLeafFacts {
                 .transparent_scalar_kinds
                 .entry(key)
                 .or_insert(kind);
+        }
+        for (key, kind) in other.struct_fields.transparent_pointer_kinds {
+            self.struct_fields.note_transparent_pointer_kind(key, kind);
         }
         self.struct_fields
             .option_struct_ids

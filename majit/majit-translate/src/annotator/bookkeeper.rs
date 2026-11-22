@@ -2089,6 +2089,12 @@ impl Bookkeeper {
     /// descriptor for that class object forever.  The host keeps the
     /// name it was minted with.  Idempotent: a second call overwrites
     /// the previous registry.
+    pub(crate) fn struct_fields(
+        &self,
+    ) -> Option<std::cell::Ref<'_, crate::front::StructFieldRegistry>> {
+        std::cell::Ref::filter_map(self.struct_fields.borrow(), |fields| fields.as_deref()).ok()
+    }
+
     pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.struct_fields.borrow_mut() = Some(registry.clone());
         // A root walked under the previous registry (or under none) has
@@ -4311,14 +4317,32 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        // `IdentityKey` / `ObjectEntryKey` are the object pointer
-        // (`identitydict.py`; `rordereddict.py` `get_ll_dict` DICTKEY).
-        // Minting a sibling ClassDef makes `generalize_key` raise
-        // `PyObject ∪ IdentityKey` (`rclass.py` no common base).
-        if is_object_pointer_key_spelling(root) {
-            return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
-        }
+        // Harvested transparent GC-object wrappers alias the declared
+        // pointee ClassDef (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
         let registry = self.struct_fields.borrow().clone();
+        if registry
+            .as_deref()
+            .is_some_and(|reg| is_object_pointer_key_spelling(reg, root))
+        {
+            let rows = registry
+                .as_deref()
+                .and_then(|reg| reg.field_rows(root))
+                .expect("transparent GC-object wrapper keeps its unique field row");
+            let inner = rows
+                .iter()
+                .find(|row| !crate::codewriter::call::type_str_leaf_is_void_zst(&row.ty))
+                .expect("transparent GC-object wrapper has one non-ZST field");
+            let super::model::SomeValue::Instance(instance) =
+                self.project_struct_field_type(&inner.ty)
+            else {
+                return Err(AnnotatorError::new(format!(
+                    "transparent GC-object wrapper field is not an instance: {root}"
+                )));
+            };
+            return instance
+                .classdef
+                .ok_or_else(|| AnnotatorError::new(format!("missing pointee ClassDef: {root}")));
+        }
         // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
         // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
         // `SomePtr(GCREF)` and raises (`llannotation.py`
@@ -6186,12 +6210,14 @@ impl Bookkeeper {
                 self.project_struct_field_type("pyobject::PyObject"),
             );
         }
-        // `IdentityKey` / `ObjectEntryKey` are `repr(transparent)` over
-        // `PyObjectRef`. The constructor is that pointer, so the dict key
-        // cell is the same nullable instance. A separate key class has no
-        // common base with `PyObject` (`rclass.py`).
-        if is_object_pointer_key_spelling(t) {
-            return self.project_struct_field_type("PyObjectRef");
+        // Harvested transparent GC-object wrappers project the inner
+        // pointer spelling (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+        if let Some(registry) = self.struct_fields.borrow().clone()
+            && is_object_pointer_key_spelling(&registry, t)
+            && let Some(rows) = registry.field_rows(t)
+            && let Some(inner) = rows.first()
+        {
+            return self.project_struct_field_type(&inner.ty);
         }
         // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
         // function family `setllprofile` stores (`description.py`
@@ -8254,34 +8280,14 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
-/// `identitydict.py IdentityKey`: `repr(transparent)` over `PyObjectRef`.
-/// The key cell is the object (`rclass.py` identity hash); a sibling
-/// ClassDef has no common base with `PyObject`.
-pub(crate) fn is_identity_key_spelling(stripped: &str) -> bool {
-    stripped == "IdentityKey" || stripped.ends_with("::IdentityKey")
-}
-
-/// Stored `DICTENTRY.key` for object-eq dicts (`rordereddict.py`
-/// `get_ll_dict`). Same one-word `PyObjectRef` wrapper as IdentityKey;
-/// the `hash_w` digest lives in `Entry.f_hash`.
-pub(crate) fn is_object_entry_key_spelling(stripped: &str) -> bool {
-    stripped == "ObjectEntryKey" || stripped.ends_with("::ObjectEntryKey")
-}
-
-/// One-word wrapped `PyObjectRef` stored as `DICTENTRY.key`.
-pub(crate) fn is_object_pointer_key_spelling(stripped: &str) -> bool {
-    is_identity_key_spelling(stripped) || is_object_entry_key_spelling(stripped)
-}
-
-/// One-word dict-key wrappers (`rordereddict.py` `DICTKEY`).
-/// `IdentityKey` / `ObjectEntryKey` wrap `PyObjectRef`; `BytesKey` /
-/// `StrKey` wrap a STR pointer. None of them is an inline STRUCT.
-pub(crate) fn is_dict_key_word_spelling(stripped: &str) -> bool {
-    is_object_pointer_key_spelling(stripped)
-        || stripped == "BytesKey"
-        || stripped.ends_with("::BytesKey")
-        || stripped == "StrKey"
-        || stripped.ends_with("::StrKey")
+/// Harvested `#[repr(transparent)]` one-word pointer whose pointee is a
+/// declared-GC instance (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+pub(crate) fn is_object_pointer_key_spelling(
+    registry: &crate::front::StructFieldRegistry,
+    spelling: &str,
+) -> bool {
+    registry.transparent_pointer_kind(spelling)
+        == Some(crate::front::semantic::TransparentPointerKind::GcObject)
 }
 
 /// `lltype.GCREF` (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
@@ -10649,30 +10655,58 @@ mod tests {
     }
 
     #[test]
-    fn identity_key_spelling_matches_qualified_and_leaf() {
-        assert!(is_identity_key_spelling("IdentityKey"));
-        assert!(is_identity_key_spelling("identitydict::IdentityKey"));
-        assert!(!is_identity_key_spelling("ObjectKey"));
-        assert!(!is_identity_key_spelling("ObjectEntryKey"));
-        assert!(!is_identity_key_spelling("pyobject::PyObject"));
-        assert!(is_object_entry_key_spelling("ObjectEntryKey"));
-        assert!(is_object_entry_key_spelling(
+    fn transparent_pointer_key_recognition_uses_qualified_declaration_identity() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::TransparentPointerKind;
+
+        let mut reg = StructFieldRegistry::default();
+        reg.note_transparent_pointer_kind(
+            "identitydict::IdentityKey".into(),
+            TransparentPointerKind::GcObject,
+        );
+        reg.note_transparent_pointer_kind(
+            "dictmultiobject::ObjectEntryKey".into(),
+            TransparentPointerKind::GcObject,
+        );
+        reg.note_transparent_pointer_kind(
+            "dictmultiobject::BytesKey".into(),
+            TransparentPointerKind::Pointer,
+        );
+        reg.note_transparent_pointer_kind(
+            "celldict::StrKey".into(),
+            TransparentPointerKind::Pointer,
+        );
+
+        assert!(is_object_pointer_key_spelling(
+            &reg,
+            "identitydict::IdentityKey"
+        ));
+        assert!(is_object_pointer_key_spelling(
+            &reg,
             "dictmultiobject::ObjectEntryKey"
         ));
-        assert!(!is_object_entry_key_spelling("ObjectKey"));
-        assert!(is_object_pointer_key_spelling("IdentityKey"));
-        assert!(is_object_pointer_key_spelling("ObjectEntryKey"));
-        assert!(!is_object_pointer_key_spelling("ObjectKey"));
-        assert!(is_dict_key_word_spelling("BytesKey"));
-        assert!(is_dict_key_word_spelling("celldict::StrKey"));
-        assert!(!is_dict_key_word_spelling("ObjectKey"));
-        assert!(!is_dict_key_word_spelling("pyobject::PyObject"));
+        assert!(!is_object_pointer_key_spelling(
+            &reg,
+            "other::ObjectEntryKey"
+        ));
+        assert!(!is_object_pointer_key_spelling(
+            &reg,
+            "dictmultiobject::BytesKey"
+        ));
+        assert_eq!(
+            reg.transparent_pointer_kind("dictmultiobject::BytesKey"),
+            Some(TransparentPointerKind::Pointer)
+        );
+        assert!(reg.transparent_pointer_kind("other::StrKey").is_none());
+        assert!(!is_object_pointer_key_spelling(&reg, "ObjectEntryKey"));
+        assert!(reg.transparent_pointer_kind("StrKey").is_none());
     }
 
     #[test]
     fn object_entry_key_projects_as_nullable_like_identity_key() {
         use super::super::model::SomeValue;
         use crate::front::StructFieldRegistry;
+        use crate::front::semantic::TransparentPointerKind;
 
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
@@ -10696,12 +10730,26 @@ mod tests {
                 ("obj".to_string(), "PyObjectRef".to_string()),
             ],
         );
+        let key_row = vec![("0".to_string(), "PyObjectRef".to_string())];
+        reg.fields
+            .insert("identitydict::IdentityKey".to_string(), key_row.clone());
+        reg.fields
+            .insert("dictmultiobject::ObjectEntryKey".to_string(), key_row);
+        reg.note_transparent_pointer_kind(
+            "identitydict::IdentityKey".into(),
+            TransparentPointerKind::GcObject,
+        );
+        reg.note_transparent_pointer_kind(
+            "dictmultiobject::ObjectEntryKey".into(),
+            TransparentPointerKind::GcObject,
+        );
         bk.set_struct_fields(Rc::new(reg));
 
         let root_classdef = bk
             .getuniqueclassdef_for_struct_root("pyobject::PyObject")
             .expect("PyObject classdef");
-        let SomeValue::Instance(ident) = bk.project_struct_field_type("IdentityKey") else {
+        let SomeValue::Instance(ident) = bk.project_struct_field_type("identitydict::IdentityKey")
+        else {
             panic!("IdentityKey must project to a nullable PyObject instance")
         };
         let SomeValue::Instance(stored) =

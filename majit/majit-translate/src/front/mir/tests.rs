@@ -20567,6 +20567,189 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
     );
 }
 
+/// `#[repr(transparent)]` one-word pointer wrappers are harvested from
+/// Charon `TypeDecl` identity (`bookkeeper.py` `getuniqueclassdef`).
+/// A declared-GC pointee is `GcObject`; a raw pointee is `Pointer`; an
+/// ordinary struct stays unrecognised; a unique harvested leaf resolves.
+#[test]
+fn transparent_pointer_wrapper_harvest_is_structural_and_qualified() {
+    use crate::front::semantic::TransparentPointerKind;
+
+    let root = struct_decl(
+        0,
+        ident_path(&["fixture", "gc", "Root"]),
+        serde_json::json!([]),
+        false,
+    );
+    let a_key = struct_decl(
+        1,
+        ident_path(&["fixture", "a", "Key"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [named_adt(0, vec![]), "Mut"]},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let b_key = struct_decl(
+        2,
+        ident_path(&["fixture", "b", "Key"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": usize_ty(),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let c_key = struct_decl(
+        3,
+        ident_path(&["fixture", "c", "RawKey"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [{"Value": [0, named_adt(0, vec![])]}]
+            }
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![root, a_key, b_key, c_key],
+        vec![],
+        vec![trait_decl],
+        vec![impl_row],
+    );
+    let (known, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("a::Key"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("c::RawKey"),
+        Some(TransparentPointerKind::Pointer)
+    );
+    assert_eq!(fields.transparent_pointer_kind("b::Key"), None);
+    assert_eq!(
+        fields.transparent_pointer_kind("Key"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert!(
+        !known.contains("a::Key") && !known.contains("fixture::a::Key"),
+        "transparent GC-object wrapper is omitted from known_struct_names; known={known:?}"
+    );
+    assert!(
+        !known.contains("c::RawKey") && !known.contains("fixture::c::RawKey"),
+        "transparent pointer wrapper is omitted from known_struct_names; known={known:?}"
+    );
+    assert!(
+        known.contains("b::Key") || known.contains("fixture::b::Key"),
+        "ordinary struct stays in known_struct_names; known={known:?}"
+    );
+}
+
+/// Production `pyre-object.ullbc`: `IdentityKey` / `ObjectEntryKey` alias
+/// the object ClassDef; `BytesKey` / `StrKey` stay one-word pointer keys.
+#[test]
+fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
+    use crate::front::semantic::TransparentPointerKind;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
+    );
+    let kinds = &fields.transparent_pointer_kinds;
+    let kind_of = |suffix: &str| {
+        fields.transparent_pointer_kind(suffix).or_else(|| {
+            kinds.iter().find_map(|(path, kind)| {
+                (path == suffix || path.ends_with(&format!("::{suffix}"))).then_some(*kind)
+            })
+        })
+    };
+    assert_eq!(
+        kind_of("identitydict::IdentityKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("dictmultiobject::ObjectEntryKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("dictmultiobject::BytesKey"),
+        Some(TransparentPointerKind::Pointer),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("celldict::StrKey"),
+        Some(TransparentPointerKind::Pointer),
+        "kinds={kinds:?}"
+    );
+    let extra_gc: Vec<&str> = kinds
+        .iter()
+        .filter(|(path, kind)| {
+            *kind == TransparentPointerKind::GcObject
+                && !path.ends_with("identitydict::IdentityKey")
+                && !path.ends_with("dictmultiobject::ObjectEntryKey")
+        })
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        extra_gc.is_empty(),
+        "no other local type is GcObject; extra={extra_gc:?}; kinds={kinds:?}"
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("ObjectEntryKey"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("BytesKey"),
+        Some(TransparentPointerKind::Pointer)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("StrKey"),
+        Some(TransparentPointerKind::Pointer)
+    );
+    for leaf in ["ObjectEntryKey", "BytesKey", "StrKey"] {
+        assert!(
+            fields
+                .class_identity
+                .get(leaf)
+                .and_then(|slot| slot.as_ref())
+                .is_some(),
+            "bare {leaf} must resolve to one ClassIdentity; slot={:?}",
+            fields.class_identity.get(leaf)
+        );
+    }
+}
+
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
 /// substituted callee signature. The caller has no Option local. A Fun
 /// RegularCall and a `CallKind::Trait` that `trait_impl_method` resolves

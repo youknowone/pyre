@@ -6520,13 +6520,14 @@ pub(crate) fn derive_subject_inputcells(
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
-                // `IdentityKey` / `ObjectEntryKey` are the object pointer
-                // (`identitydict.py`; `rordereddict.py` `get_ll_dict`).
-                // `project_struct_field_type` already aliases them to
-                // `PyObjectRef`; minting a sibling class here made
-                // `generalize_key` raise `PyObject ∪ IdentityKey`.
+                // Harvested transparent GC-object wrappers seed the
+                // declared pointee (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
                 if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
-                    && crate::annotator::bookkeeper::is_object_pointer_key_spelling(root)
+                    && bk.struct_fields().is_some_and(|registry| {
+                        crate::annotator::bookkeeper::is_object_pointer_key_spelling(
+                            &registry, root,
+                        )
+                    })
                 {
                     cells.push(bk.project_struct_field_type(root));
                     continue;

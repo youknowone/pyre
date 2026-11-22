@@ -5765,11 +5765,6 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
-        // `rordereddict.py` `DICTKEY` is a one-word pointer (`W_Root` /
-        // STR). `interiorfielddescrof` has no descr for FLAG_STRUCT
-        // (`UnsupportedFieldExc`); `key_at` of these wrappers is
-        // `getinteriorfield_gc_r`.
-        || crate::annotator::bookkeeper::is_dict_key_word_spelling(type_name)
     {
         return false;
     }
@@ -6592,7 +6587,8 @@ impl CallControl {
 
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
-        is_known_by_value_struct(&self.known_struct_names, name)
+        self.struct_fields.transparent_pointer_kind(name).is_none()
+            && is_known_by_value_struct(&self.known_struct_names, name)
     }
 
     /// Field-row owner for ARRAY.OF. Prefer a harvested instantiation
@@ -20509,61 +20505,52 @@ mod tests {
         assert_eq!(layout.size, 8);
     }
 
-    /// `DICTENTRY.key` for object-eq tables is a one-word pointer
-    /// (`rordereddict.py` `get_ll_dict`). The wrapper TypeDecl stays in
-    /// `known_struct_names`; the field is still FLAG_POINTER so
-    /// `interiorfielddescrof` can mint `getinteriorfield_gc_r`.
+    /// A harvested transparent one-word pointer wrapper is omitted from
+    /// `known_struct_names`, so `is_known_by_value_struct` is false and
+    /// `interiorfielddescrof` treats the field as FLAG_POINTER
+    /// (`heaptracker.py` `all_interiorfielddescrs`).
     #[test]
-    fn from_type_strings_object_entry_key_is_flag_pointer_word() {
+    fn from_type_strings_transparent_pointer_wrapper_is_not_known_struct() {
         use majit_ir::descr::ArrayFlag;
 
+        let known = HashSet::from(["ordinary::InlineKey".to_string()]);
+        assert!(is_known_by_value_struct(&known, "ordinary::InlineKey"));
+        assert!(!is_known_by_value_struct(
+            &known,
+            "declared::TransparentPointerKey"
+        ));
+
         let word = crate::layout::target_word_size();
-        let mut known = std::collections::HashSet::new();
-        known.insert("ObjectEntryKey".to_string());
-        known.insert("IdentityKey".to_string());
-        known.insert("ObjectKey".to_string());
         let sizes = std::collections::HashMap::from([
-            ("ObjectEntryKey".to_string(), word),
-            ("IdentityKey".to_string(), word),
-            ("ObjectKey".to_string(), 2 * word),
+            ("ordinary::InlineKey".to_string(), 2 * word),
+            ("declared::TransparentPointerKey".to_string(), word),
         ]);
         let aligns = std::collections::HashMap::from([
-            ("ObjectEntryKey".to_string(), word),
-            ("IdentityKey".to_string(), word),
-            ("ObjectKey".to_string(), word),
+            ("ordinary::InlineKey".to_string(), word),
+            ("declared::TransparentPointerKey".to_string(), word),
         ]);
         let empty_ranks = std::collections::HashMap::new();
         let empty_raw = HashSet::new();
-        let stored = StructLayout::from_type_strings(
-            &[("key".into(), "ObjectEntryKey".into())],
+        let inline = StructLayout::from_type_strings(
+            &[("key".into(), "ordinary::InlineKey".into())],
             &known,
             &sizes,
             &aligns,
             &empty_ranks,
             &empty_raw,
         );
-        assert_eq!(stored.fields[0].flag, ArrayFlag::Pointer);
-        assert_eq!(stored.fields[0].size, word);
-        let ident = StructLayout::from_type_strings(
-            &[("key".into(), "IdentityKey".into())],
+        assert_eq!(inline.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(inline.fields[0].size, 2 * word);
+        let wrapped = StructLayout::from_type_strings(
+            &[("key".into(), "declared::TransparentPointerKey".into())],
             &known,
             &sizes,
             &aligns,
             &empty_ranks,
             &empty_raw,
         );
-        assert_eq!(ident.fields[0].flag, ArrayFlag::Pointer);
-        assert_eq!(ident.fields[0].size, word);
-        let probe = StructLayout::from_type_strings(
-            &[("key".into(), "ObjectKey".into())],
-            &known,
-            &sizes,
-            &aligns,
-            &empty_ranks,
-            &empty_raw,
-        );
-        assert_eq!(probe.fields[0].flag, ArrayFlag::Struct);
-        assert_eq!(probe.fields[0].size, 2 * word);
+        assert_eq!(wrapped.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(wrapped.fields[0].size, word);
     }
 
     /// A pointer-typed field of a known struct pointee is FLAG_POINTER /
@@ -26986,6 +26973,124 @@ mod tests {
                 .is_none(),
             "inline Struct leaf must not mint an interiorfield descr"
         );
+    }
+
+    /// Instantiated `Entry.key` whose spelling is a unique harvested
+    /// transparent-pointer leaf gets an interior-field descriptor even when
+    /// `known_struct_names` still lists that leaf.
+    #[test]
+    fn interiorfielddescrof_keyed_bare_transparent_pointer_key() {
+        use crate::front::semantic::{
+            ClassIdentity, FieldRow, StructFieldRegistry, TransparentPointerKind,
+        };
+        use crate::layout::{HeuristicLayoutProvider, program_struct_layouts};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType, Struct};
+
+        let word = crate::layout::target_word_size();
+        let cases = [
+            ("declared::GcKey", "GcKey", TransparentPointerKind::GcObject),
+            (
+                "declared::WordKey",
+                "WordKey",
+                TransparentPointerKind::Pointer,
+            ),
+            (
+                "declared::RawKey",
+                "RawKey",
+                TransparentPointerKind::Pointer,
+            ),
+        ];
+        let mut ids = std::collections::HashMap::new();
+        for (qualified, bare, _) in cases {
+            let entry = format!("ordered::Entry<{bare},*mut Object>");
+            ids.insert(
+                qualified.to_string(),
+                Some(majit_ir::descr::StructId::from_canonical(qualified)),
+            );
+            ids.insert(
+                entry.clone(),
+                Some(majit_ir::descr::StructId::from_canonical(&entry)),
+            );
+        }
+        let _registry = crate::test_support::register_struct_ids_serialized(ids);
+
+        for (qualified, bare, kind) in cases {
+            let elem = format!("ordered::Entry<{bare},*mut Object>");
+            let atid = format!("GcArray<{elem}>");
+            let elem_sid = majit_ir::descr::StructId::from_canonical(&elem);
+            let wrapper_sid = majit_ir::descr::StructId::from_canonical(qualified);
+
+            let mut fields = StructFieldRegistry::default();
+            fields.fields.insert(
+                qualified.to_string(),
+                vec![FieldRow::named("__pos_0", "*mut Object")],
+            );
+            fields.fields.insert(
+                elem.clone(),
+                vec![
+                    FieldRow::named("key", bare),
+                    FieldRow::named("value", "*mut Object"),
+                ],
+            );
+            for path in [qualified, bare] {
+                fields.class_identity.insert(
+                    path.to_string(),
+                    Some(ClassIdentity {
+                        id: wrapper_sid,
+                        spelling: qualified.into(),
+                    }),
+                );
+            }
+            fields.note_transparent_pointer_kind(qualified.into(), kind);
+
+            let known = std::collections::HashSet::from([bare.to_string(), elem.clone()]);
+            let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+                fields.fields.clone().into();
+            let provider = HeuristicLayoutProvider::from_struct_fields(
+                &pair_fields,
+                &known,
+                &std::collections::HashMap::new(),
+                &HashSet::new(),
+            );
+            let installed =
+                program_struct_layouts(&fields, &std::collections::HashMap::new(), &provider);
+            let entry_layout = installed
+                .into_iter()
+                .find(|row| row.sid == elem_sid)
+                .expect("normalized entry layout")
+                .layout;
+            let key = entry_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "key")
+                .expect("key");
+            assert_eq!(key.flag, majit_ir::descr::ArrayFlag::Pointer);
+            assert_eq!(key.size, word);
+
+            let mut cc = CallControl::new();
+            cc.set_known_struct_names(known);
+            cc.set_struct_fields(fields);
+            cc.set_struct_layout(elem_sid, entry_layout);
+
+            let arr = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem.as_str(),
+                vec![
+                    ("key".into(), GCREF.clone()),
+                    ("value".into(), GCREF.clone()),
+                ],
+            ))));
+            let (descr, _) = cc
+                .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "key", None, None)
+                .expect("transparent pointer key has an interior-field descriptor");
+            let interior = descr
+                .as_interior_field_descr()
+                .expect("interior descriptor");
+            assert!(interior.field_descr().is_pointer_field());
+            assert_eq!(
+                interior.field_descr().field_size(),
+                crate::layout::target_word_size()
+            );
+        }
     }
 
     /// `heaptracker.py get_fielddescr_index_in` numbers flattened non-Void
