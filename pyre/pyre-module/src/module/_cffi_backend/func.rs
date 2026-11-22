@@ -381,7 +381,8 @@ pub fn rawbytes_new(data: &[u8]) -> *mut RawBytes {
     rawbytes_from_charp(ptr)
 }
 
-/// `WEAKDICT` pointer. The table is a prebuilt GC object (`ll_new_weakdict`).
+/// `WEAKDICT` pointer. The table is a prebuilt GC object
+/// (`ll_new_weakdict_prebuilt`).
 struct WeakKeyDictPtr(*mut pyre_object::rweakkeydict::WeakKeyDict);
 unsafe impl Send for WeakKeyDictPtr {}
 
@@ -395,15 +396,34 @@ struct RawBytesCache {
 /// `space.fromcache(X)` makes one per space, and the product has one space,
 /// the process-wide `baseobjspace::OBJECT_SPACE`, so this static is its
 /// `RawBytesCache` (`errorbox.rs` `TEXT_P`, `_pickle` `PICKLE_STATE`).
-/// The dict is `ll_new_weakdict` (`alloc_raw` + `GCFLAG_NO_HEAP_PTRS` +
-/// write barrier) and is reached from `prebuilt_root_objects`; there is no
-/// extra-root walk (`baseobjspace.py interned_strings`).
+/// The dict is `ll_new_weakdict_prebuilt` (`WeakKeyDictRepr.convert_const`:
+/// `alloc_raw` + `GCFLAG_NO_HEAP_PTRS` + write barrier) and is reached from
+/// `prebuilt_root_objects`; there is no extra-root walk (`baseobjspace.py
+/// interned_strings`).
 static RAW_BYTES_CACHE: std::sync::OnceLock<RawBytesCache> = std::sync::OnceLock::new();
 
 fn raw_bytes_cache() -> &'static RawBytesCache {
     RAW_BYTES_CACHE.get_or_init(|| RawBytesCache {
         wdict: parking_lot::Mutex::new(WeakKeyDictPtr(std::ptr::null_mut())),
     })
+}
+
+/// PyPy `rthread.Lock.acquire` calls `c_thread_acquirelock`, a `releasegil`
+/// llexternal (`rpython/rlib/rthread.py`). The wrapper runs
+/// `rffi.aroundstate.before()` before the native wait. pyre's equivalent is
+/// `try_lock`, else `before_external_block()` then `lock()`, matching
+/// `queue_lock` and `extension_load_lock`. Its only caller,
+/// `get_raw_address_of_string`, is residual; lookup and insert stay there.
+fn raw_bytes_cache_lock(
+    cache: &'static RawBytesCache,
+) -> parking_lot::MutexGuard<'static, WeakKeyDictPtr> {
+    if let Some(guard) = cache.wdict.try_lock() {
+        return guard;
+    }
+    let blocked = pyre_interpreter::module::thread::before_external_block();
+    let guard = cache.wdict.lock();
+    drop(blocked);
+    guard
 }
 
 /// `func.py get_raw_address_of_string` — CFFI `ffi.from_buffer` on a bytes
@@ -417,11 +437,12 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
     let cache = raw_bytes_cache();
     // Lookup and insert stay in one critical section: two threads must get
     // the same pointer for the same live bytes (`func.py
-    // get_raw_address_of_string` docstring). MiniMark STW means a collection
-    // inside `set` / resize does not re-enter this mutex.
-    let mut wdict_guard = cache.wdict.lock();
+    // get_raw_address_of_string` docstring). A thread that has to wait
+    // leaves the running-mutator census (`before_external_block`), so a
+    // collection inside the section by the holder does not wait for it.
+    let mut wdict_guard = raw_bytes_cache_lock(cache);
     if wdict_guard.0.is_null() {
-        let d = pyre_object::rweakkeydict::ll_new_weakdict();
+        let d = pyre_object::rweakkeydict::ll_new_weakdict_prebuilt();
         if d.is_null() {
             return Err(PyError::memory_error(""));
         }
@@ -494,11 +515,12 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     // `_fetch_as_write_buffer` / `_fetch_as_read_buffer`: `space.buffer_w`
     // with `BUF_WRITABLE` / `BUF_SIMPLE`.  `W_CDataFromBuffer` stores `buf`,
-    // `w_keepalive = w_object`, and `view`.  `_finalize_` / `enter_exit`
-    // call `view.releasebuffer()`: a no-op for `NonOwningReleaseView`
-    // (memoryview / `__buffer__` result).  Only a native `_exports`
-    // increment is released.  Drop of this lease covers the length /
-    // address errors below; success `disarm`s it onto the cdata.
+    // `w_keepalive = w_object`, and `view`.  Drop of this lease covers the
+    // length / address errors below. Success `disarm`s it: a made view
+    // (C / ctypes fallthrough) is not released (`NonOwningReleaseView`,
+    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view as
+    // the `CPyBuffer` carrier (lease 0). The native `_exports` increment
+    // (lease 1) is the release.
     let flags = if require_writable {
         pyre_interpreter::builtins::BUF_WRITABLE
     } else {
@@ -552,16 +574,40 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(acquired.owner());
     let held = acquired.is_held();
-    // `W_MemoryView.buffer_w` returns `NonOwningReleaseView(self.view)`:
-    // keep the backing even after `m.release()` drops the header's view.
-    // `W_Root.__buffer_w` keeps the returned memoryview (and through it
-    // the backing).  Native `_exports` is the only lease that releases.
-    let export_owner = if held {
-        roots.get(owner_slot)
-    } else if unsafe { pyre_object::memoryview::is_w_memoryview(roots.get(object_slot)) } {
-        unsafe { pyre_object::memoryview::w_memoryview_backing(roots.get(object_slot)) }
+    let made_view = acquired.made_view();
+    let owner = roots.get(owner_slot);
+    // Native `_exports` (held) keeps the owner. A made view
+    // (`acquire_buffer_w` C / ctypes fallthrough) is the `CPyBuffer`
+    // carrier: keep it and `disarm` without releasing (`NonOwningReleaseView`,
+    // `wrap_getbuffer` `owns_export=False`). Otherwise a memoryview owner
+    // → `w_memoryview_backing` (null → owner); else owner. A made view is
+    // lease 0: the cdata never releases it.
+    let keep_owner = held || made_view;
+    let backing = if !keep_owner && unsafe { pyre_object::memoryview::is_w_memoryview(owner) } {
+        // `w_memoryview_backing` is `view.backing().w_obj()`: the ultimate
+        // exporter (bytes / bytearray / array) or the GC object that owns
+        // the storage. A live view always has a backing (`w_memoryview_view`
+        // requires it). `w_obj` is that Buffer's exporter field; it is not
+        // null for bytes / bytearray / array. `ctypes.memoryview_at` stores
+        // `None`. If the pointer is null, fall back to `owner` so the
+        // memoryview that holds the off-heap view stays reachable.
+        unsafe { pyre_object::memoryview::w_memoryview_backing(owner) }
     } else {
-        roots.get(owner_slot)
+        pyre_object::PY_NULL
+    };
+    let export_owner = if keep_owner || backing.is_null() {
+        owner
+    } else {
+        backing
+    };
+    // Bytes (exact or subclass): `self.buf` is the STR
+    // (`StringBuffer(self._value)`), not the wrapper. bytearray
+    // (`ByteArrayBuffer(self)`) and array (`ArrayBuffer(self)`) keep
+    // the wrapper. `w_keepalive` is still `w_x` until release.
+    let export_owner = if unsafe { pyre_object::bytesobject::is_bytes(export_owner) } {
+        unsafe { pyre_object::bytesobject::w_bytes_block(export_owner) as PyObjectRef }
+    } else {
+        export_owner
     };
     let export_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(export_owner);

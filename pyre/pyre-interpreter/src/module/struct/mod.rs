@@ -2349,9 +2349,10 @@ pub mod unpack_iter {
         buffer: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         let _ = type_object();
-        // `Struct_iter_unpack_impl`: `s_size == 0` is raised before
-        // `PyObject_GetBuffer`, so `iter_unpack("", None)` is struct.error
-        // and never runs `__buffer__`. `W_UnpackIter.__init__` acquires first.
+        // [3.15-spec] CPython tag v3.15.2 (identical at the stdlib pin
+        // v3.15.0, `lib-python/stdlib-version.txt`) `Modules/_struct.c`
+        // `Struct_iter_unpack_impl` (`s_size == 0` raised before
+        // `PyObject_GetBuffer`) ↔ PyPy `W_UnpackIter.__init__` acquires first.
         let _roots = pyre_object::gc_roots::push_roots();
         // Both operands already exist. Sequential `pin_root` would normalize
         // after the format and leave the buffer unpublished

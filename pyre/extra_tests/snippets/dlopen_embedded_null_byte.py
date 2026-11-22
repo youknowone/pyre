@@ -133,6 +133,36 @@ c_hold[0] = b"Z"
 assert c_hold[0] == b"Z", c_hold[0]
 assert c_hold[1] == b"b", c_hold[1]
 
+# `__buffer__` returns a memoryview of an otherwise-unreferenced bytearray.
+# After that view is released the cdata still holds the backing (`self.buf`).
+class ViewBuf:
+    releases = 0
+
+    def __buffer__(self, flags):
+        self.view = memoryview(bytearray(b"wxyz"))
+        return self.view
+
+    def __release_buffer__(self, view):
+        type(self).releases += 1
+
+ViewBuf.releases = 0
+vb = ViewBuf()
+c_vb = B.from_buffer(BCharA, vb)
+vb.view.release()
+del vb.view
+for _ in range(32):
+    _ = bytearray(4096)
+    gc.collect()
+assert c_vb[0] == b"w", c_vb[0]
+assert c_vb[3] == b"z", c_vb[3]
+
+try:
+    B.from_buffer(BCharA, memoryview(b"abcd")[::2], True)
+except BufferError as exc:
+    assert str(exc) == "Object is not writable.", exc
+else:
+    raise SystemExit("from_buffer(strided memoryview, require_writable=True) succeeded")
+
 # `func.py get_raw_address_of_string` / `RawBytesCache.wdict`: two calls on
 # the same live bytes object return the same pointer.
 intptr = B.new_primitive_type("intptr_t")
@@ -166,3 +196,122 @@ for i in range(32):
     del c
     gc.collect()
 assert _buf_addr(B.from_buffer(BCharA, kept_bytes)) == kept_addr
+
+# Native `buffer_w` before a Python `__buffer__` (`ObjSpace._try_buffer_w`).
+# A bytes / bytearray subclass that defines `__buffer__` still exports the
+# native payload; the override is not called.
+ovr_calls = []
+
+
+class BA(bytearray):
+    def __buffer__(self, flags):
+        ovr_calls.append("ba")
+        return memoryview(bytearray(b"OVERRIDE-LONGER"))
+
+
+class BY(bytes):
+    def __buffer__(self, flags):
+        ovr_calls.append("by")
+        return memoryview(b"XY")
+
+
+c_ba = B.from_buffer(BCharA, BA(b"abc"))
+assert len(c_ba) == 3, len(c_ba)
+assert c_ba[0] == b"a", c_ba[0]
+assert ovr_calls == [], ovr_calls
+c_by = B.from_buffer(BCharA, BY(b"abcdef"))
+assert len(c_by) == 6, len(c_by)
+assert c_by[0] == b"a", c_by[0]
+assert ovr_calls == [], ovr_calls
+
+
+class Raise(bytearray):
+    def __buffer__(self, flags):
+        raise RuntimeError("boom")
+
+
+c_raise = B.from_buffer(BCharA, Raise(b"q"))
+assert len(c_raise) == 1, len(c_raise)
+assert c_raise[0] == b"q", c_raise[0]
+
+# ctypes exporter: `wrap_getbuffer` / `NonOwningReleaseView` — `B.release`
+# does not run the native release. A second cdata from the same object
+# still reads.
+ct_arr = (ctypes.c_char * 4)(*b"wxyz")
+c_ct = B.from_buffer(BCharA, ct_arr)
+assert c_ct[0] == b"w", c_ct[0]
+assert c_ct[3] == b"z", c_ct[3]
+B.release(c_ct)
+gc.collect()
+for _ in range(32):
+    _ = bytearray(4096)
+    gc.collect()
+c_ct2 = B.from_buffer(BCharA, ct_arr)
+assert c_ct2[0] == b"w", c_ct2[0]
+assert c_ct2[3] == b"z", c_ct2[3]
+
+# Concurrent `from_buffer` on fresh bytes plus nursery churn. A waiter
+# leaves the running-mutator census so a collection inside `RawBytesCache`
+# proceeds while that thread is blocked on the lock.
+import threading
+
+_rawbytes_errors = [None] * 4
+
+
+def _rawbytes_worker(tid):
+    try:
+        for i in range(200):
+            first = i % 251
+            c = B.from_buffer(BCharA, bytes([first]) * 64)
+            assert c[0] == bytes([first]), (c[0], first)
+            if i % 7 == 0:
+                _ = bytearray(4096)
+    except BaseException as exc:
+        _rawbytes_errors[tid] = exc
+
+
+_rawbytes_threads = [
+    threading.Thread(target=_rawbytes_worker, args=(tid,)) for tid in range(4)
+]
+for t in _rawbytes_threads:
+    t.start()
+for t in _rawbytes_threads:
+    t.join(60)
+    assert not t.is_alive()
+assert not any(_rawbytes_errors), _rawbytes_errors
+
+# A released from_buffer cdata over bytes keeps the STR, not the bytes
+# wrapper (`W_CDataFromBuffer.buf` is `StringBuffer(self._value)`).
+_finalized = []
+
+
+class BS(bytes):
+    def __del__(self):
+        _finalized.append(1)
+
+
+bs = BS(b"abcd")
+c_bs = B.from_buffer(BCharA, bs)
+assert c_bs[0] == b"a"
+B.release(c_bs)
+del bs
+gc.collect()
+gc.collect()
+assert _finalized == [1], _finalized
+
+_finalized_mv = []
+
+
+class BSmv(bytes):
+    def __del__(self):
+        _finalized_mv.append(1)
+
+
+bs_mv = BSmv(b"abcd")
+c_bs_mv = B.from_buffer(BCharA, memoryview(bs_mv))
+assert c_bs_mv[0] == b"a"
+B.release(c_bs_mv)
+del bs_mv
+gc.collect()
+gc.collect()
+assert _finalized_mv == [1], _finalized_mv

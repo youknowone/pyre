@@ -177,4 +177,45 @@ assert re.sub("b", lambda m: None, "ab") == "a"
 assert re.sub("z", lambda m: 1, "ab") == "ab"
 assert re.subn("b", lambda m: "X", "abab") == ("aXaX", 2)
 
+# PyPy `ObjSpace.acquire_py_buffer` reads a native `W_BufferExporter` first.
+# A bytes/bytearray/array subclass that defines `__buffer__` still contributes
+# its native payload; the override is not called. CPython honours the slot.
+if sys.implementation.name != "cpython":
+    import array
+
+    _buf_calls = []
+
+    class BA(bytearray):
+        def __buffer__(self, flags):
+            _buf_calls.append("ba")
+            return memoryview(b"x")
+
+    assert re.sub(b"a", BA(b"z"), b"a") == b"z"
+    assert _buf_calls == [], _buf_calls
+    _buf_calls.clear()
+
+    class AR(array.array):
+        def __buffer__(self, flags):
+            _buf_calls.append("ar")
+            return memoryview(b"x")
+
+    assert re.sub(b"a", AR("B", b"z"), b"a") == b"z"
+    assert _buf_calls == [], _buf_calls
+
+
+# PEP 688 Python exporter: `getstring` → `PyObject_GetBuffer` accepts
+# `P.__buffer__`. CPython may call twice through `bytes.join`; assert the
+# value only.
+class P:
+    def __buffer__(self, flags):
+        return memoryview(b"x")
+
+
+assert re.sub(b"a", P(), b"a") == b"x"
+
+# `W_SRE_Pattern.subx`: no-match shortcut returns the subject before
+# allocating `sublist_w`.
+assert re.sub(b"q", b"r", b"abc") == b"abc"
+assert re.subn("q", "r", "abc") == ("abc", 0)
+
 print("OK")

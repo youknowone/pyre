@@ -25802,7 +25802,8 @@ fn bytes_like_required(obj: PyObjectRef) -> crate::PyError {
     ))
 }
 
-/// `ObjSpace.BUF_WRITABLE` (`baseobjspace.py`).
+/// `ObjSpace.BUF_SIMPLE` / `ObjSpace.BUF_WRITABLE` (`baseobjspace.py`).
+pub const BUF_SIMPLE: i32 = 0x0000;
 pub const BUF_WRITABLE: i32 = 0x0001;
 
 /// One `space.acquire_py_buffer(w_obj, space.BUF_SIMPLE)` export.
@@ -25894,22 +25895,61 @@ impl ReadableBuffer {
         }
     }
 
-    /// `ObjSpace.buffer_w(w_obj, flags)` — the lease `W_CDataFromBuffer` holds.
+    /// `W_MemoryView._check_buffer_flags`: released, then writable
+    /// (`check_buf_flags`), then C-contiguity. `buffer_w` then returns
+    /// `NonOwningReleaseView` (`held=false`).
+    unsafe fn acquire_buffer_w_memoryview(
+        obj_slot: usize,
+        flags: i32,
+    ) -> Result<Self, crate::PyError> {
+        unsafe {
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            memoryview_check_released(r_obj)?;
+            if flags & BUF_WRITABLE == BUF_WRITABLE
+                && pyre_object::memoryview::w_memoryview_readonly(r_obj)
+            {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "Object is not writable.",
+                ));
+            }
+            if !memoryview_contiguity(r_obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            Ok(Self {
+                owner_slot: obj_slot,
+                held: false,
+                made_view: false,
+            })
+        }
+    }
+
+    /// `ObjSpace.buffer_w(w_obj, flags)` — the lease `W_CDataFromBuffer` holds
+    /// and `re.sub` reads a replacement through.
     ///
-    /// `W_BytearrayObject.buffer_w` increments `_exports`.
-    /// `W_MemoryView.buffer_w` returns `NonOwningReleaseView` (no extra
-    /// export: the memoryview already owns one; `releasebuffer` is a no-op).
-    /// `W_Root.__buffer_w` calls Python `__buffer__` once and then
-    /// `W_MemoryView.buffer_w` on that result, so `__release_buffer__` is
-    /// never invoked from `from_buffer`.
+    /// `_try_buffer_w` calls `w_obj.buffer_w`: a native type answers with its
+    /// own storage (`W_BytearrayObject.buffer_w` increments `_exports`;
+    /// `W_MemoryView.buffer_w` returns `NonOwningReleaseView`; bytes, array,
+    /// … including their subclasses).  Only `W_Root.buffer_w` → `__buffer_w`
+    /// consults a Python `__buffer__`, so a bytes / bytearray subclass that
+    /// defines one still exports the native payload.  A C / ctypes exporter
+    /// builds a memoryview (`acquire_made_view`, `made_view` true: a view
+    /// this call built). Drop releases it on the error paths; `disarm` hands
+    /// it over. `from_buffer` disarms that made view without releasing it
+    /// (`NonOwningReleaseView`, `wrap_getbuffer` `owns_export=False`): the
+    /// cdata keeps the view as the `CPyBuffer` carrier and never releases it
+    /// (its own finalizer is the release).
     pub unsafe fn acquire_buffer_w(obj: PyObjectRef, flags: i32) -> Result<Self, crate::PyError> {
         unsafe {
             let _ = pyre_object::gc_roots::pin_root(obj);
             let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let want_write = flags & BUF_WRITABLE == BUF_WRITABLE;
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if memoryview_python_buffer_descr(r_obj).is_some() {
-                return Self::acquire_buffer_w_python(obj_slot, flags);
+            if pyre_object::memoryview::is_w_memoryview(r_obj) {
+                return Self::acquire_buffer_w_memoryview(obj_slot, flags);
             }
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if try_acquire_readbuf(r_obj)?.is_some() {
@@ -25920,11 +25960,7 @@ impl ReadableBuffer {
                         "Object is not writable.",
                     ));
                 }
-                let held = if pyre_object::memoryview::is_w_memoryview(r_obj) {
-                    false
-                } else {
-                    buffer_export_incref(r_obj)
-                };
+                let held = buffer_export_incref(r_obj);
                 return Ok(Self {
                     owner_slot: obj_slot,
                     held,
@@ -25932,17 +25968,18 @@ impl ReadableBuffer {
                 });
             }
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if memoryview_python_buffer_descr(r_obj).is_some() {
+                return Self::acquire_buffer_w_python(obj_slot, flags);
+            }
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if !is_c_or_ctypes_buffer_exporter(r_obj) {
                 return Err(bytes_like_required(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 ));
             }
-            // C / ctypes exporter: build a memoryview to hold the export, then
-            // keep it the `NonOwningReleaseView` way (no `made_view` release).
-            let mut acquired =
-                Self::acquire_made_view(pyre_object::gc_roots::shadow_stack_get(obj_slot), flags)?;
-            acquired.made_view = false;
-            Ok(acquired)
+            // C / ctypes exporter: a view this call built (`made_view` true).
+            // Drop releases it on the error paths; `disarm` hands it over.
+            Self::acquire_made_view(pyre_object::gc_roots::shadow_stack_get(obj_slot), flags)
         }
     }
 
@@ -25978,27 +26015,7 @@ impl ReadableBuffer {
             }
             let _ = pyre_object::gc_roots::pin_root(w_ret);
             let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
-            memoryview_check_released(r_view)?;
-            if flags & BUF_WRITABLE == BUF_WRITABLE
-                && pyre_object::memoryview::w_memoryview_readonly(r_view)
-            {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::BufferError,
-                    "Object is not writable.",
-                ));
-            }
-            if !memoryview_contiguity(r_view).0 {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::BufferError,
-                    "memoryview: underlying buffer is not C-contiguous",
-                ));
-            }
-            Ok(Self {
-                owner_slot: view_slot,
-                held: false,
-                made_view: false,
-            })
+            Self::acquire_buffer_w_memoryview(view_slot, flags)
         }
     }
 
@@ -26064,11 +26081,17 @@ impl Drop for ReadableBuffer {
 /// `BufferView.releasebuffer` / `space.release_py_buffer` for a lease
 /// [`ReadableBuffer::disarm`] handed to a longer-lived owner.
 ///
-/// `made_view` is the memoryview `acquire_py_buffer` built (`struct`
-/// `do_unpack` / `W_UnpackIter`); `held` is the matching native `_exports`
-/// increment.  `from_buffer`'s `buffer_w` lease never sets `made_view`:
-/// `NonOwningReleaseView.releasebuffer` is a no-op.  A `made_view` release
-/// error is unraisable (`do_unpack` / `W_UnpackIter._finalize_`).
+/// `made_view` is a memoryview this acquire built (`acquire_made_view`:
+/// `struct` `do_unpack` / `W_UnpackIter` via [`ReadableBuffer::acquire`],
+/// and the C / ctypes fallthrough of [`ReadableBuffer::acquire_buffer_w`]).
+/// `held` is the matching native `_exports` increment.  A memoryview /
+/// Python `__buffer__` result is `made_view` false (`NonOwningReleaseView`).
+/// `from_buffer` disarms a made view without releasing it
+/// (`NonOwningReleaseView`, `wrap_getbuffer` `owns_export=False`): the
+/// cdata keeps the view as the `CPyBuffer` carrier; Drop of the lease on
+/// `acquire_buffer_w` error paths is the release.
+/// A `made_view` release error is unraisable (`do_unpack` /
+/// `W_UnpackIter._finalize_`).
 ///
 /// # Safety
 /// `owner` is the object [`ReadableBuffer::owner`] named, still live, and

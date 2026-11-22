@@ -62,16 +62,20 @@ pub struct W_CData {
     pub length: i64,
     /// `W_CDataNewStd.datasize`, which becomes -1 once the memory is freed.
     /// A `W_CDataFromBuffer` keeps no size here and uses the slot for the
-    /// `self.view` lease: 0 none / `NonOwningReleaseView` (no `releasebuffer`
-    /// action), 1 native `_exports` (`W_BytearrayObject.buffer_w`).
+    /// `self.view` lease: 0 none/released / `NonOwningReleaseView`, 1 native
+    /// `_exports` (`W_BytearrayObject.buffer_w`).
     pub datasize: i64,
     /// Whatever the cdata must keep alive: `W_CDataPtrToStructOrUnion`'s
     /// `structobj`, `W_CDataFromBuffer`'s `w_keepalive`, `W_CDataGCP`'s
     /// `w_original_cdata`, or `W_CDataCallback.w_callable`.
     pub w_keepalive: PyObjectRef,
     /// `W_CDataGCP.w_destructor`, a `W_CDataFromBuffer` extra keepalive
-    /// (native `_exports` owner, `NonOwningReleaseView` backing, or the
-    /// memoryview `__buffer__` returned), or `W_CDataCallback.w_onerror`.
+    /// (`self.buf`: native `_exports` owner, the STR of a bytes source
+    /// (`StringBuffer(self._value)`), `NonOwningReleaseView` backing,
+    /// the memoryview `__buffer__` returned, or the memoryview
+    /// `acquire_buffer_w` built for a C exporter (the `CPyBuffer` carrier);
+    /// survives `enter_exit`),
+    /// or `W_CDataCallback.w_onerror`.
     pub w_destructor: PyObjectRef,
     /// The translated `special_memory_pressure` field installed for classes
     /// passed as the object argument to `rgc.add_memory_pressure`.
@@ -662,8 +666,11 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
 
 /// `W_CDataFromBuffer.enter_exit` / `_finalize_`: drop `self.view` then
 /// `view.releasebuffer()`.  `NonOwningReleaseView.releasebuffer` is a
-/// no-op; only a native `_exports` increment (lease 1) releases.  The
+/// no-op (lease 0: memoryview / `__buffer__` result / C-exporter made
+/// view).  A native `_exports` increment (lease 1) releases.  The
 /// lease is cleared first so a re-entrant release is a no-op.
+/// `self.buf` is immutable and stays; `w_destructor` is that storage
+/// reference and is not cleared.
 fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cdata_slot = roots.base();
@@ -674,7 +681,6 @@ fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let _ = roots.pin_root(cdata.w_destructor);
     cdata.datasize = 0;
     cdata.w_keepalive = pyre_object::PY_NULL;
-    cdata.w_destructor = pyre_object::PY_NULL;
     pyre_object::gc_hook::try_gc_write_barrier_managed(
         roots.get(cdata_slot) as pyre_object::gc_hook::GCREF
     );
