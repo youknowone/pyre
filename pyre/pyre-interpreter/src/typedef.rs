@@ -4027,8 +4027,8 @@ pub fn make_builtin_type_with_metatype(
 /// `newint_from_float`).  An exact `str` takes the unicode arm
 /// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
 /// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
-/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
-/// arms are not graphs inside this one.
+/// and those cases continue through the ordinary [`int_descr_new`] graph
+/// (`intobject.py W_IntObject.descr_new` / `_new_int`).
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -4073,7 +4073,6 @@ crate::builtin_wrapper_descriptor!(
 /// If cls is the builtin int type, returns a plain W_IntObject.
 /// If cls is a subclass of int, returns a W_ObjectObject with the
 /// int value stored internally (for int subclasses like IntFlag).
-#[majit_macros::dont_look_inside]
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
@@ -7093,9 +7092,8 @@ pub(crate) fn check_new_subtype(
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());
     }
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub = !mro_ptr.is_null()
-        && unsafe { crate::baseobjspace::mro_contains((*mro_ptr).as_slice(), w_self) };
+    // typeobject.py check_user_subclass: `w_subtype.issubtype(self)`.
+    let is_sub = unsafe { pyre_object::w_type_issubtype(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
