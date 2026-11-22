@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pypy3's dispatch_bytecode leaves last_instr at the EXTENDED_ARG prefix, so tb_lasti names EXTENDED_ARG there
 # CPython-suite gap: no frame or traceback test reads `tb_lasti` for an
 # instruction behind an EXTENDED_ARG prefix.
 # parity-tests reason: the dispatch jitcode stores the post-prefix opcode pc
@@ -43,5 +44,6 @@ def main(n):
     return sorted(seen.items())
 
 
-print(main(1))
-print(main(3000))
+assert main(1) == [("LOAD_ATTR", 1)], main(1)
+assert main(3000) == [("LOAD_ATTR", 3000)], main(3000)
+print("OK")
