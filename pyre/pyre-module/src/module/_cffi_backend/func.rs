@@ -390,10 +390,12 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         None => false,
     };
     // `_fetch_as_write_buffer` / `_fetch_as_read_buffer`: `space.buffer_w`
-    // with `BUF_WRITABLE` / `BUF_SIMPLE`.  The returned view is stored on
-    // `W_CDataFromBuffer` (`self.view`) and released in `_finalize_` /
-    // `enter_exit`.  Drop of this lease covers the length / address errors
-    // below; success `disarm`s it onto the cdata.
+    // with `BUF_WRITABLE` / `BUF_SIMPLE`.  `W_CDataFromBuffer` stores `buf`,
+    // `w_keepalive = w_object`, and `view`.  `_finalize_` / `enter_exit`
+    // call `view.releasebuffer()`: a no-op for `NonOwningReleaseView`
+    // (memoryview / `__buffer__` result).  Only a native `_exports`
+    // increment is released.  Drop of this lease covers the length /
+    // address errors below; success `disarm`s it onto the cdata.
     let flags = if require_writable {
         pyre_interpreter::builtins::BUF_WRITABLE
     } else {
@@ -447,16 +449,27 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(acquired.owner());
     let held = acquired.is_held();
-    let made_view = acquired.made_view();
+    // `W_MemoryView.buffer_w` returns `NonOwningReleaseView(self.view)`:
+    // keep the backing even after `m.release()` drops the header's view.
+    // `W_Root.__buffer_w` keeps the returned memoryview (and through it
+    // the backing).  Native `_exports` is the only lease that releases.
+    let export_owner = if held {
+        roots.get(owner_slot)
+    } else if unsafe { pyre_object::memoryview::is_w_memoryview(roots.get(object_slot)) } {
+        unsafe { pyre_object::memoryview::w_memoryview_backing(roots.get(object_slot)) }
+    } else {
+        roots.get(owner_slot)
+    };
+    let export_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(export_owner);
     acquired.disarm();
     Ok(cdataobj::new_cdata_from_buffer(
         ptr as usize,
         arraylength,
         roots.get(ctype_slot),
         roots.get(object_slot),
-        roots.get(owner_slot),
+        roots.get(export_slot),
         held,
-        made_view,
     ))
 }
 

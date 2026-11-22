@@ -112,7 +112,26 @@ assert CountBuf.acquires == 1, CountBuf.acquires
 assert CountBuf.releases == 0, CountBuf.releases
 B.release(c_pep)
 assert CountBuf.acquires == 1, CountBuf.acquires
-assert CountBuf.releases == 1, CountBuf.releases
+assert CountBuf.releases == 0, CountBuf.releases
+del c_pep
+gc.collect()
+assert CountBuf.acquires == 1, CountBuf.acquires
+assert CountBuf.releases == 0, CountBuf.releases
+
+# `W_MemoryView.buffer_w` / `NonOwningReleaseView`: after `m.release()` the
+# cdata still holds the backing, so reads and writes through `c` succeed.
+m_hold = memoryview(bytearray(b"abcdefgh"))
+c_hold = B.from_buffer(BCharA, m_hold)
+m_hold.release()
+del m_hold
+for _ in range(32):
+    _ = bytearray(4096)
+    gc.collect()
+assert c_hold[0] == b"a", c_hold[0]
+assert c_hold[7] == b"h", c_hold[7]
+c_hold[0] = b"Z"
+assert c_hold[0] == b"Z", c_hold[0]
+assert c_hold[1] == b"b", c_hold[1]
 
 # `func.py get_raw_address_of_string` / `RawBytesCache.wdict`: two calls on
 # the same live bytes object return the same pointer.

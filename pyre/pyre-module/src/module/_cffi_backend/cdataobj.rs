@@ -62,15 +62,16 @@ pub struct W_CData {
     pub length: i64,
     /// `W_CDataNewStd.datasize`, which becomes -1 once the memory is freed.
     /// A `W_CDataFromBuffer` keeps no size here and uses the slot for the
-    /// `self.view` lease: 0 none/released, 1 native `_exports`
-    /// (`W_BytearrayObject.buffer_w`), 2 a memoryview `__buffer_w` built.
+    /// `self.view` lease: 0 none / `NonOwningReleaseView` (no `releasebuffer`
+    /// action), 1 native `_exports` (`W_BytearrayObject.buffer_w`).
     pub datasize: i64,
     /// Whatever the cdata must keep alive: `W_CDataPtrToStructOrUnion`'s
     /// `structobj`, `W_CDataFromBuffer`'s `w_keepalive`, `W_CDataGCP`'s
     /// `w_original_cdata`, or `W_CDataCallback.w_callable`.
     pub w_keepalive: PyObjectRef,
-    /// `W_CDataGCP.w_destructor`, the object a `W_CDataFromBuffer` took its
-    /// export from, or `W_CDataCallback.w_onerror`.
+    /// `W_CDataGCP.w_destructor`, a `W_CDataFromBuffer` extra keepalive
+    /// (native `_exports` owner, `NonOwningReleaseView` backing, or the
+    /// memoryview `__buffer__` returned), or `W_CDataCallback.w_onerror`.
     pub w_destructor: PyObjectRef,
     /// The translated `special_memory_pressure` field installed for classes
     /// passed as the object argument to `rgc.add_memory_pressure`.
@@ -313,18 +314,11 @@ pub fn new_cdata_from_buffer(
     w_keepalive: PyObjectRef,
     w_export_owner: PyObjectRef,
     export_held: bool,
-    made_view: bool,
 ) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let owner_slot = roots.base();
     let _ = roots.pin_root(w_export_owner);
-    let lease = if made_view {
-        2
-    } else if export_held {
-        1
-    } else {
-        0
-    };
+    let lease = if export_held { 1 } else { 0 };
     let obj = new_cdata_full(ptr, w_ctype, FLAVOR_FROM_BUFFER, length, lease, w_keepalive);
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
@@ -667,8 +661,9 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
 }
 
 /// `W_CDataFromBuffer.enter_exit` / `_finalize_`: drop `self.view` then
-/// `view.releasebuffer()`.  The lease is cleared first so a re-entrant
-/// release is a no-op.
+/// `view.releasebuffer()`.  `NonOwningReleaseView.releasebuffer` is a
+/// no-op; only a native `_exports` increment (lease 1) releases.  The
+/// lease is cleared first so a re-entrant release is a no-op.
 fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cdata_slot = roots.base();
@@ -683,13 +678,9 @@ fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
     pyre_object::gc_hook::try_gc_write_barrier_managed(
         roots.get(cdata_slot) as pyre_object::gc_hook::GCREF
     );
-    if lease == 1 || lease == 2 {
+    if lease == 1 {
         unsafe {
-            pyre_interpreter::builtins::release_buffer_w_lease(
-                roots.get(owner_slot),
-                lease == 1,
-                lease == 2,
-            )
+            pyre_interpreter::builtins::release_buffer_w_lease(roots.get(owner_slot), true, false)
         };
     }
     Ok(())
