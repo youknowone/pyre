@@ -318,14 +318,10 @@ impl CachedField {
         // info.py get_known_class. PyPy: opinfo1.get_known_class(cpu)
         // / opinfo2.get_known_class(cpu); CANNOT_ALIAS iff both are
         // known and not the same constant.
-        ctx.with_resolved_operand(box1, |b1| {
-            ctx.with_resolved_operand(box2, |b2| {
-                let class1 = ctx
-                    .getptrinfo_handle(b1)
-                    .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
-                let class2 = ctx
-                    .getptrinfo_handle(b2)
-                    .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
+        ctx.with_ptrinfo(box1, |info1| {
+            ctx.with_ptrinfo(box2, |info2| {
+                let class1 = info1.and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
+                let class2 = info2.and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
                 matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
             })
         })
