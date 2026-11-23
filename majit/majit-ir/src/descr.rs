@@ -6446,8 +6446,7 @@ pub trait FieldDescr: Descr {
         if name == "typeptr" || name.ends_with(".typeptr") {
             return true;
         }
-        let leaf = name.rsplit('.').next().unwrap_or(name);
-        leaf == "ob_type" && self.offset() == 0
+        self.offset() == 0 && (name == "ob_type" || name.ends_with(".ob_type"))
     }
 
     /// Whether this descr names the class word: the header slot carrying

@@ -2727,9 +2727,9 @@ pub struct ResumeDataLoopMemo {
     /// We store (value, type) pairs to preserve type information.
     consts: Arc<majit_ir::SharedConstPool>,
     /// resume.py — large integers (outside TAGINT range) → tagged const.
-    large_ints: indexmap::IndexMap<i64, i16>,
+    large_ints: indexmap::IndexMap<i64, i16, rustc_hash::FxBuildHasher>,
     /// resume.py:149 — ref pointers → tagged const.
-    refs: indexmap::IndexMap<i64, i16>,
+    refs: indexmap::IndexMap<i64, i16, rustc_hash::FxBuildHasher>,
     /// resume.py self.consts — shared constant pool.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
@@ -2775,8 +2775,8 @@ impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
             consts: majit_ir::SharedConstPool::new(Vec::new()),
-            large_ints: indexmap::IndexMap::new(),
-            refs: indexmap::IndexMap::new(),
+            large_ints: indexmap::IndexMap::default(),
+            refs: indexmap::IndexMap::default(),
             cached_boxes: indexmap::IndexMap::new(),
             cached_virtuals: indexmap::IndexMap::new(),
             nvirtuals: 0,
@@ -2927,7 +2927,8 @@ impl ResumeDataLoopMemo {
         if self.refs.is_empty() {
             return;
         }
-        let mut rebuilt: IndexMap<i64, i16> = IndexMap::with_capacity(self.refs.len());
+        let mut rebuilt: IndexMap<i64, i16, rustc_hash::FxBuildHasher> =
+            IndexMap::with_capacity_and_hasher(self.refs.len(), rustc_hash::FxBuildHasher);
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;

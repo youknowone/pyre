@@ -8287,6 +8287,14 @@ impl<S: JitState> JitDriver<S> {
             // `BlackholeInterpBuilder.acquire_interp`).
             if self.state_field_layout.total_live_values() == 0 {
                 self.state_field_layout = state.state_field_layout();
+                // `blackhole.py BlackholeInterpBuilder.__init__` fixes the
+                // builder's metadata once; the layout of a state type never
+                // changes, so it is handed over where it is first computed.
+                self.meta
+                    .staticdata
+                    .blackholeinterpbuilder
+                    .borrow_mut()
+                    .state_field_layout = self.state_field_layout.clone();
             }
             let cpu = self.meta.blackhole_cpu();
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta.staticdata);
@@ -8302,9 +8310,6 @@ impl<S: JitState> JitDriver<S> {
                 // is the one `finish_setup` installed.
                 if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                     bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-                }
-                if bh_builder.state_field_layout != self.state_field_layout {
-                    bh_builder.state_field_layout = self.state_field_layout.clone();
                 }
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
