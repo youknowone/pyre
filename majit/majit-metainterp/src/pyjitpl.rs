@@ -13899,7 +13899,13 @@ impl<M: Clone> MetaInterp<M> {
         u64,
         Option<std::sync::Arc<majit_backend::JitCellToken>>,
     ) {
-        self.make_enter_function(jd_no);
+        debug_assert!(
+            self.staticdata
+                .jitdrivers_sd
+                .get(jd_no)
+                .is_some_and(|jd| jd.warmstate.is_some()),
+            "entry door used before register_jitdriver_sd/make_enter_function"
+        );
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             return warm_state.back_edge_step(resolved, None, reds);
@@ -13956,7 +13962,13 @@ impl<M: Clone> MetaInterp<M> {
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.make_enter_function(jd_no);
+        debug_assert!(
+            self.staticdata
+                .jitdrivers_sd
+                .get(jd_no)
+                .is_some_and(|jd| jd.warmstate.is_some()),
+            "entry door used before register_jitdriver_sd/make_enter_function"
+        );
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             return warm_state.function_entry_step(resolved, None, reds);

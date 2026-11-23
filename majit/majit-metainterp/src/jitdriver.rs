@@ -9421,19 +9421,31 @@ impl<S: JitState> JitDriver<S> {
     /// the per-entry paths only read through it.
     /// Address of the cached driver descriptor. The `Arc` in
     /// [`Self::descriptor_cache`] keeps it alive for the driver's life.
+    #[inline(always)]
     fn driver_descriptor_ptr(
         &mut self,
         state: &S,
         meta: &S::Meta,
     ) -> Option<*const JitDriverStaticData> {
-        if self.descriptor_cache.is_none() {
-            let resolved = self
-                .descriptor
-                .clone()
-                .or_else(|| state.driver_descriptor(meta))
-                .map(std::sync::Arc::new);
-            self.descriptor_cache = Some(resolved);
+        if let Some(cached) = self.descriptor_cache.as_ref() {
+            return cached.as_ref().map(std::sync::Arc::as_ptr);
         }
+        self.init_driver_descriptor_ptr(state, meta)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn init_driver_descriptor_ptr(
+        &mut self,
+        state: &S,
+        meta: &S::Meta,
+    ) -> Option<*const JitDriverStaticData> {
+        let resolved = self
+            .descriptor
+            .clone()
+            .or_else(|| state.driver_descriptor(meta))
+            .map(std::sync::Arc::new);
+        self.descriptor_cache = Some(resolved);
         self.descriptor_cache
             .as_ref()
             .and_then(|cached| cached.as_ref().map(std::sync::Arc::as_ptr))
@@ -9610,23 +9622,24 @@ impl<S: JitState> JitDriver<S> {
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
     ) -> bool {
+        let info_ptr = self.meta.virtualizable_info().map(std::sync::Arc::as_ptr);
+        // SAFETY: MetaInterp owns this Arc for its lifetime and this function
+        // never replaces it.
+        let info = info_ptr.map(|ptr| unsafe { &*ptr });
+
         // Descriptor-gated token-reset path — RPython
         // compile.py::sync_before_jit calls `vinfo.reset_vable_token(virt)`
         // when the JitDriver has a virtualizable declared.  Pyre routes
         // this through the interpreter's `sync_named_virtualizable_before_jit`.
         if let Some(virtualizable) = virtualizable {
-            let ok = state.sync_named_virtualizable_before_jit(
-                meta,
-                &virtualizable.name,
-                self.meta.virtualizable_info().map(|a| a.as_ref()),
-            );
+            let ok = state.sync_named_virtualizable_before_jit(meta, &virtualizable.name, info);
             if !ok {
                 return false;
             }
         }
         // `execute_assembler` clears the vable token only `if vinfo is not None`.
         // A driver with no virtualizable info has nothing to reset.
-        if virtualizable.is_none() && self.meta.virtualizable_info().is_none() {
+        if virtualizable.is_none() && info.is_none() {
             return true;
         }
 
@@ -9638,11 +9651,7 @@ impl<S: JitState> JitDriver<S> {
         // interpreter hooks without going through the descriptor.
         self.meta.set_vable_ptr(std::ptr::null());
         self.meta.set_vable_array_lengths(Vec::new());
-        let info = self.meta.virtualizable_info().map(std::sync::Arc::as_ptr);
         if let Some(info) = info {
-            // SAFETY: MetaInterp owns this Arc for its lifetime and this function
-            // never replaces it.
-            let info = unsafe { &*info };
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
                 // The entry names the frame this run executes.  The exits
