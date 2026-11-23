@@ -109,6 +109,7 @@ fn init_wide_chunk(chunk_i: usize) -> *mut Cell<WideStored> {
     }
 }
 
+#[inline]
 fn wide_slot(id: u32) -> &'static Cell<WideStored> {
     let idx = id as usize;
     let chunk_i = idx / WIDE_CHUNK;
@@ -282,6 +283,7 @@ pub struct OperandView<'a> {
 impl OperandView<'_> {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     /// SmallWide reads the packed 2-bit type and does not load the slab.
+    #[inline]
     pub fn type_(&self) -> Type {
         match &self.inner {
             Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
@@ -297,6 +299,7 @@ impl OperandView<'_> {
 
     /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
+    #[inline]
     pub fn const_value(&self) -> Option<Value> {
         match &self.inner {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
@@ -654,6 +657,7 @@ impl Operand {
     /// re-expressed, never retired. An `Op` reads its (post-compaction)
     /// position straight off `op.pos`; a `Const*` maps to the matching inline
     /// `OpRef` (`history.py:227/268/314`).
+    #[inline]
     pub fn to_opref(&self) -> OpRef {
         match self.view() {
             Opnd::None => OpRef::NONE,
@@ -691,6 +695,7 @@ impl Operand {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     /// SmallWide reads the 2-bit type packed at mint (`history.py` Const type
     /// on the object) and does not load the slab.
+    #[inline]
     pub fn type_(&self) -> Type {
         if self.packed & OP_TAG == OP_SMALLWIDE {
             return small_wide_type(self.packed);
@@ -709,6 +714,7 @@ impl Operand {
 
     /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
+    #[inline]
     pub fn const_value(&self) -> Option<Value> {
         match self.view() {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
@@ -805,6 +811,7 @@ impl Operand {
     /// the former box-wrapper round-trip (`from_bound_*` memoizes one
     /// wrapper per producer, so its `Rc::ptr_eq` short-circuit and this
     /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
+    #[inline]
     pub fn same_box(&self, other: &Operand) -> bool {
         if (self.is_resop() && other.is_resop())
             || (self.is_inputarg() && other.is_inputarg())
@@ -857,6 +864,7 @@ impl Operand {
 
     /// Packed word of the `_forwarded` chain terminal, not counted: `self`
     /// or a hop's `_forwarded` slot keeps it alive.
+    #[inline]
     fn replacement_packed(&self, not_const: bool) -> u64 {
         if !self.is_resop() && !self.is_inputarg() && !self.is_temp_var() {
             return self.packed;

@@ -3583,9 +3583,11 @@ fn result_pos_high_water(segments: &[&[OpRc]]) -> u32 {
     for ops in segments {
         for op in *ops {
             reserve(op.pos().get());
-            for arg in op.getarglist() {
-                reserve(arg.to_opref());
-            }
+            op.with_arglist(|args| {
+                for arg in args {
+                    reserve(arg.to_opref());
+                }
+            });
             if let Some(fail_args) = op.guard_fail_args() {
                 for arg in fail_args.iter() {
                     reserve(arg.to_opref());

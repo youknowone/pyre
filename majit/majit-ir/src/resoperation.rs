@@ -2710,6 +2710,7 @@ unsafe fn drop_descr_extra(lo: usize, hi: usize) {
     }
 }
 
+#[inline]
 fn slot_bits(w: u64) -> (usize, usize) {
     if w == 0 || is_stamp_inline(w) {
         (0, 0)

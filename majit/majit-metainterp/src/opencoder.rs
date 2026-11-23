@@ -3011,9 +3011,7 @@ impl Trace {
             value = 0;
         }
         let (_, old_len) = decode_varint_signed(&self.ops_bytes()[descr_pos..]);
-        let mut encoded = Vec::with_capacity(4);
-        encode_varint_signed(&mut encoded, value);
-        let new_len = encoded.len();
+        let (encoded, new_len) = encode_varint_signed_array(value);
         if new_len != old_len {
             let tail = descr_pos + old_len;
             if new_len > old_len {
@@ -3029,7 +3027,7 @@ impl Trace {
                 self._pos -= d;
             }
         }
-        self._ops.bytes_mut()[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
+        self._ops.bytes_mut()[descr_pos..descr_pos + new_len].copy_from_slice(&encoded[..new_len]);
     }
 
     /// Patch the named guard's trailing descr slot to `snapshot_index`.
