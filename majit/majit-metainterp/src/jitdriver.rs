@@ -3413,18 +3413,24 @@ impl<S: JitState> JitDriver<S> {
     /// The `#[jit_interp]` expansion calls this after assigning greens so
     /// the next compiled entry reuses the Vec capacities. `ResumeAt` has
     /// no banks (`jtransform.py` `promote_greens` already passed).
-    pub fn recycle_portal_resume(&mut self, resume: PortalResume) {
-        if let Some(args) = resume.into_args() {
-            self.meta.recycle_portal_resume_args(args);
+    pub fn recycle_portal_resume(&mut self, resume: &mut PortalResume) {
+        if let Some(args) = resume.args_mut() {
+            args.green_int.clear();
+            args.green_ref.clear();
+            args.green_float.clear();
+            args.red_int.clear();
+            args.red_ref.clear();
+            args.red_float.clear();
+            std::mem::swap(args, &mut self.meta.portal_resume_scratch);
         }
     }
 
     /// Function-entry maps `PortalResume` to a pc and would otherwise drop
     /// the Vec capacities. Recycle first (`blackhole.py`
     /// `recycle_merge_point_args`).
-    fn resume_pc_recycling(&mut self, resume: PortalResume) -> Option<usize> {
+    fn resume_pc_recycling(&mut self, mut resume: PortalResume) -> Option<usize> {
         let pc = resume.resume_pc();
-        self.recycle_portal_resume(resume);
+        self.recycle_portal_resume(&mut resume);
         pc
     }
 

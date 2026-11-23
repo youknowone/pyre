@@ -2349,7 +2349,7 @@ pub struct MetaInterp<M: Clone> {
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
     /// six Vec capacities on the pooled interpreter; exits that never enter
     /// the blackhole reuse this buffer the same way.
-    portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
+    pub(crate) portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
     /// Recycled terminal blackhole banks for guard-failure resume.
     /// Capacity reuse for the terminal banks, same role as the CRN scratch.
     pub(crate) blackhole_terminal_scratch: Option<crate::blackhole::BlackholeTerminalImage>,
@@ -2465,6 +2465,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) jitlog_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
+    /// False only when `record_guard_failure_event` can have no work past the
+    /// failure tally for the life of the process (no hook installed, guardlog,
+    /// debug printing and guard census all off).
+    guard_failure_diag_enabled: bool,
     /// Green key of the loop trace currently being recorded. `should_inline_core`
     /// counts it as compiled for the window before the trace is installed
     /// (`warmstate.py get_assembler_token`). The `JitCellToken` itself is made
@@ -4641,11 +4645,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.stats.guard_failures
         };
         *tally += 1;
-        if self.hooks.on_guard_failure.is_none()
-            && !guardlog_enabled()
-            && !crate::majit_log_enabled()
-            && !crate::guard_census_enabled()
-        {
+        if !self.guard_failure_diag_enabled {
             return;
         }
         self.record_guard_failure_event_diag(green_key, descr);
@@ -4761,6 +4761,9 @@ impl<M: Clone> MetaInterp<M> {
             next_trace_id: 1,
             jitlog_trace_id: 0,
             hooks: JitHooks::default(),
+            guard_failure_diag_enabled: guardlog_enabled()
+                || crate::debug::debug_prints_configured()
+                || crate::guard_census_enabled(),
             pending_green_key: None,
             stats: JitStatsCounters::default(),
             pending_vable_ptr: std::ptr::null(),
@@ -6757,6 +6760,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `f` receives `(green_key, descr_id, count)`.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, usize, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
+        self.guard_failure_diag_enabled = true;
     }
 
     /// Set a callback fired immediately before a call enters compiled code.
@@ -14014,27 +14018,11 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
     /// on the returned value; the field is left empty until
-    /// [`Self::recycle_portal_resume_args`] puts it back.
+    /// `JitDriver::recycle_portal_resume` swaps a cleared payload back.
     pub(crate) fn take_portal_resume_scratch(
         &mut self,
     ) -> crate::jitexc::ContinueRunningNormallyArgs {
         std::mem::take(&mut self.portal_resume_scratch)
-    }
-
-    /// Return banks after `handle_jitexception` has assigned them.
-    /// Values are cleared; the six Vec capacities are kept
-    /// (`blackhole.py` `recycle_merge_point_args`).
-    pub(crate) fn recycle_portal_resume_args(
-        &mut self,
-        mut args: crate::jitexc::ContinueRunningNormallyArgs,
-    ) {
-        args.green_int.clear();
-        args.green_ref.clear();
-        args.green_float.clear();
-        args.red_int.clear();
-        args.red_ref.clear();
-        args.red_float.clear();
-        self.portal_resume_scratch = args;
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /

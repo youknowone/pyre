@@ -1837,6 +1837,16 @@ impl BlackholeInterpreter {
         if !self.chain_needs_run_rooting() {
             return self.run_after_rooting();
         }
+        self.run_with_explicit_roots()
+    }
+
+    /// Root the pending caller chain, then dispatch.
+    ///
+    /// `BlackholeInterpreter.run` takes this arm when a frame is not already
+    /// registered or a heap virtualizable is attached.
+    #[cold]
+    #[inline(never)]
+    fn run_with_explicit_roots(&mut self) -> BhRunOutcome {
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
         // blackhole interpreter chain transitively GC-traced from the head for
@@ -3680,6 +3690,33 @@ fn handle_jitexception<P: BlackholeInterpPool>(
             BlackholeTerminalImage::store_into(terminal_out, &mut bh);
         }
         builder.release_chain(Some(bh));
+        return Err(exc);
+    }
+    // Nothing between here and the return allocates, so the payload needs no
+    // root; the caller roots it before restoring state.
+    if on_leave_level.is_none() && bh.nextblackholeinterp.is_none() {
+        if bh.jitcode.jitdriver_sd().is_none() {
+            builder.release_interp(bh);
+            if let Some(terminal_out) = terminal_out {
+                *terminal_out = None;
+            }
+            return Err(exc);
+        }
+        if let Some(terminal_out) = terminal_out {
+            let skip_image = match &exc {
+                JitException::ContinueRunningNormally(args) => {
+                    bh.state_field_layout.has_no_scalar_identity()
+                        || bh.state_field_layout.crn_reds_are_identity(args)
+                }
+                _ => false,
+            };
+            if skip_image {
+                *terminal_out = None;
+            } else {
+                BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            }
+        }
+        builder.release_interp(bh);
         return Err(exc);
     }
     // The leave callback runs return_trace/leave, which can collect; the pending
