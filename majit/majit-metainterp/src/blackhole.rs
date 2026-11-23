@@ -1460,8 +1460,20 @@ impl BlackholeInterpreter {
         self._get_list_of_values_f_into(&mut args.red_float);
 
         if self.nextblackholeinterp.is_none() {
-            // blackhole.py:1068-1069: bottommost level.
+            // `bhimpl_jit_merge_point`, bottommost level:
             //   raise ContinueRunningNormally(*args)
+            // `_get_list_of_values` built six fresh lists, which
+            // `make_sure_not_resized` turns into fixed arrays (header word,
+            // length word, one word per item), and `jitexc.py
+            // ContinueRunningNormally` is a six-field instance. The buffers
+            // here are reused, so their translated size is charged instead.
+            let items = args.green_int.len()
+                + args.green_ref.len()
+                + args.green_float.len()
+                + args.red_int.len()
+                + args.red_ref.len()
+                + args.red_float.len();
+            majit_gc::charge_translated_nursery(6 * 16 + items * 8 + (8 + 6 * 8));
             return Err(DispatchError::ContinueRunningNormally(args));
         }
         // blackhole.py:1074-1093: recursive portal level.

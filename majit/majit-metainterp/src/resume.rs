@@ -66,6 +66,14 @@ pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
 
+/// Translated size of `resume.py ResumeDataDirectReader`: one header word and
+/// the nine fields that survive translation (`cpu`, `metainterp_sd` and
+/// `callinfocollection` are prebuilt constants).
+const RESUME_DIRECT_READER_NURSERY_BYTES: usize = 8 + 9 * 8;
+/// Translated size of `resumecode.py Reader`: one header word, `code`,
+/// `cur_pos`, `items_read`.
+const RESUMECODE_READER_NURSERY_BYTES: usize = 8 + 3 * 8;
+
 /// Ordered livebox map: canonical box (`Rc::ptr_eq`) → i16 tag.
 ///
 /// `ResumeDataLoopMemo._number_boxes` / `_number_virtuals`: RPython uses
@@ -9400,6 +9408,11 @@ where
     // reads `storage.rd_numb`). The caller may allocate before this call,
     // and a minor would then decode the header from a stale slice while
     // the bind below reloads the rest.
+    // `resume.py ResumeDataDirectReader` and the `resumecode.Reader` it
+    // owns are nursery instances; the reader here is a stack value.
+    majit_gc::charge_translated_nursery(
+        RESUME_DIRECT_READER_NURSERY_BYTES + RESUMECODE_READER_NURSERY_BYTES,
+    );
     let mut resumereader = ResumeDataDirectReader::new(
         numb_root.as_slice(),
         rd_consts,
