@@ -17652,27 +17652,160 @@ fn handle<Sym: WalkSym>(
             let (red_r_regs, _) = read_var_list_reg_indices(code, op, red_r_off);
             let (red_f_regs, _) = read_var_list_reg_indices(code, op, red_f_off);
 
-            // Green key from (pycode, next_instr) = (gr[0], gi[0]) concretes.
-            let (Some(&pc_green), Some(&code_green)) = (gi.first(), gr.first()) else {
+            // `MIFrame.opimpl_jit_merge_point` selects the operand schema by
+            // `staticdata.jitdrivers_sd[jdindex]`.  `warmspot.py`
+            // `WarmRunnerDesc.make_args_specification` derives these kinds
+            // from the codewriter's merge-point arguments; do not duplicate
+            // them in a driver-name table here.
+            //
+            // A `force_start_tracing` fixture may park an empty
+            // `JitDriverStaticData` (`vars` empty) at the slot so the portal
+            // runner address exists.  That stub is not a schema.  A unit-test
+            // `TraceCtx` may also omit `jitdrivers_sd` entirely.  Skip those
+            // and reconstruct from the encoded banks so existing portal
+            // merge-point tests keep their payload.  A non-empty descriptor
+            // whose kind counts disagree with the payload still fails loud.
+            let payload_green_counts = (gi.len(), gr.len(), gf.len());
+            let payload_red_counts = (ri.len(), rr.len(), rf.len());
+            let (green_spec, red_types, green_kind_counts, red_kind_counts, no_loop_header) = {
+                if let Some(jitdriver_sd) = ctx
+                    .trace_ctx
+                    .metainterp_sd()
+                    .jitdrivers_sd
+                    .get(jdindex)
+                    .filter(|jd| {
+                        !jd.vars.is_empty()
+                            && jd.green_kind_counts() == payload_green_counts
+                            && jd.red_kind_counts() == payload_red_counts
+                    })
+                {
+                    (
+                        jitdriver_sd.green_args_spec(),
+                        jitdriver_sd.red_arg_types_as_ir_types(),
+                        jitdriver_sd.green_kind_counts(),
+                        jitdriver_sd.red_kind_counts(),
+                        jitdriver_sd.no_loop_header,
+                    )
+                } else if let Some(jitdriver_sd) =
+                    crate::driver::try_driver_pair().and_then(|(d, _)| {
+                        d.meta_interp()
+                            .staticdata
+                            .jitdrivers_sd
+                            .get(jdindex)
+                            .filter(|jd| {
+                                !jd.vars.is_empty()
+                                    && jd.green_kind_counts() == payload_green_counts
+                                    && jd.red_kind_counts() == payload_red_counts
+                            })
+                            .cloned()
+                    })
+                {
+                    (
+                        jitdriver_sd.green_args_spec(),
+                        jitdriver_sd.red_arg_types_as_ir_types(),
+                        jitdriver_sd.green_kind_counts(),
+                        jitdriver_sd.red_kind_counts(),
+                        jitdriver_sd.no_loop_header,
+                    )
+                } else if ctx
+                    .trace_ctx
+                    .metainterp_sd()
+                    .jitdrivers_sd
+                    .get(jdindex)
+                    .is_some_and(|jd| !jd.vars.is_empty())
+                {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                } else {
+                    let green_spec = std::iter::repeat_n(majit_ir::GreenType::Int, gi.len())
+                        .chain(std::iter::repeat_n(majit_ir::GreenType::Ref, gr.len()))
+                        .chain(std::iter::repeat_n(majit_ir::GreenType::Float, gf.len()))
+                        .collect::<Vec<_>>();
+                    let red_types = std::iter::repeat_n(Type::Int, ri.len())
+                        .chain(std::iter::repeat_n(Type::Ref, rr.len()))
+                        .chain(std::iter::repeat_n(Type::Float, rf.len()))
+                        .collect::<Vec<_>>();
+                    (
+                        green_spec,
+                        red_types,
+                        payload_green_counts,
+                        payload_red_counts,
+                        false,
+                    )
+                }
+            };
+            if green_kind_counts != payload_green_counts || red_kind_counts != payload_red_counts {
                 return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
-            };
-            // `next_instr` is a Python bytecode position. A negative green
-            // is not one; `as usize` would wrap it and file the loop under
-            // a different header.
-            let next_instr = match ctx.trace_ctx.concrete_of_opref(pc_green) {
-                Some(Value::Int(v)) => usize::try_from(v).ok(),
-                _ => None,
-            };
-            let Some(next_instr) = next_instr else {
+            }
+
+            let mut green_i = 0usize;
+            let mut green_r = 0usize;
+            let mut green_f = 0usize;
+            let mut green_ops = Vec::with_capacity(green_spec.len());
+            let mut green_values = Vec::with_capacity(green_spec.len());
+            for green_type in &green_spec {
+                let Some(bank) = recursive_call_bank(majit_ir::green_type_to_ir(*green_type))
+                else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                let Some(green) = take_banked(
+                    bank,
+                    &mut green_i,
+                    &mut green_r,
+                    &mut green_f,
+                    &gi,
+                    &gr,
+                    &gf,
+                ) else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                let Some(value) = opref_known_i64(ctx, green) else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                green_ops.push(green);
+                green_values.push(value);
+            }
+
+            let mut red_i = 0usize;
+            let mut red_r = 0usize;
+            let mut red_f = 0usize;
+            let mut red_ops = Vec::with_capacity(red_types.len());
+            for red_type in &red_types {
+                let Some(bank) = recursive_call_bank(*red_type) else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                let Some(red) =
+                    take_banked(bank, &mut red_i, &mut red_r, &mut red_f, &ri, &rr, &rf)
+                else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                red_ops.push(red);
+            }
+
+            let generatorentry = jdindex == crate::genentry_state::GENERATORENTRY_JD_INDEX;
+            let portal_greens = if generatorentry {
+                None
+            } else if jdindex == crate::state::PyreJitState::PYPYJIT_JD_INDEX {
+                let (Some(&pc_green), Some(&profile_green), Some(&code_green)) =
+                    (green_ops.first(), green_ops.get(1), green_ops.get(2))
+                else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                let next_instr = match ctx.trace_ctx.concrete_of_opref(pc_green) {
+                    Some(Value::Int(value)) => usize::try_from(value).ok(),
+                    _ => None,
+                };
+                let Some(next_instr) = next_instr else {
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                };
+                let is_being_profiled = match ctx.trace_ctx.concrete_of_opref(profile_green) {
+                    Some(Value::Int(value)) => value != 0,
+                    _ => {
+                        return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                    }
+                };
+                Some((pc_green, code_green, next_instr, is_being_profiled))
+            } else {
                 return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
-            };
-            // `eval.rs get_unique_id`: the Int green is true when nonzero.
-            let is_being_profiled = match gi
-                .get(1)
-                .and_then(|op| ctx.trace_ctx.concrete_of_opref(*op))
-            {
-                Some(Value::Int(v)) => v != 0,
-                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
 
             // `MIFrame.opimpl_jit_merge_point` (`pyjitpl.py`) reads
@@ -17713,15 +17846,38 @@ fn handle<Sym: WalkSym>(
                 .as_ref()
                 .map(|f| f())
                 .unwrap_or(0);
-            let mut debug_args = Vec::with_capacity(3 + gi.len() + gr.len() + gf.len());
+            let mut debug_args = Vec::with_capacity(3 + green_ops.len());
             debug_args.push(ctx.trace_ctx.const_int(jdindex as i64));
             debug_args.push(ctx.trace_ctx.const_int(portal_call_depth as i64));
             debug_args.push(ctx.trace_ctx.const_int(current_call_id as i64));
-            debug_args.extend_from_slice(&gi);
-            debug_args.extend_from_slice(&gr);
-            debug_args.extend_from_slice(&gf);
+            debug_args.extend_from_slice(&green_ops);
             ctx.trace_ctx
                 .record_op(OpCode::DebugMergePoint, &debug_args);
+
+            // `generator.py generatorentry_driver` has only the `pycode`
+            // green. This dispatcher is walking it as a nested driver body;
+            // its `gen` and `w_arg` reds remain in the decoded red registers.
+            // Apply `MIFrame.opimpl_jit_merge_point`'s per-driver
+            // `no_loop_header` bookkeeping without interpreting the payload
+            // as pypyjit's `(next_instr, is_being_profiled, pycode)` tuple.
+            if generatorentry {
+                debug_assert_eq!(green_spec.as_slice(), &[majit_ir::GreenType::Ref]);
+                debug_assert_eq!(red_types.as_slice(), &[Type::Ref, Type::Ref]);
+                debug_assert_eq!(green_values.len(), 1);
+                debug_assert_eq!(red_ops.len(), 2);
+                if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 && any_operation && no_loop_header
+                {
+                    ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                }
+                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+                    debug_assert_eq!(ctx.trace_ctx.seen_loop_header_for_jdindex as usize, jdindex,);
+                    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+                }
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+
+            let (pc_green, code_green, next_instr, is_being_profiled) =
+                portal_greens.expect("pypyjit merge point has portal greens");
             note_debug_merge_point_py_pc(&mut ctx.session.borrow_mut(), next_instr as u32);
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
@@ -17876,13 +18032,6 @@ fn handle<Sym: WalkSym>(
             // helper, and the auto-stamp below. `no_loop_header` stamps
             // `seen_loop_header_for_jdindex` itself instead of waiting for
             // an explicit `loop_header`.
-            let no_loop_header = ctx
-                .trace_ctx
-                .metainterp_sd()
-                .jitdrivers_sd
-                .get(jdindex)
-                .map(|jd| jd.no_loop_header)
-                .unwrap_or(false);
             // `opimpl_jit_merge_point` (`pyjitpl.py`):
             // `if seen_loop_header_for_jdindex < 0` and
             // `not jitdriver_sd.no_loop_header` and `portal_call_depth`:

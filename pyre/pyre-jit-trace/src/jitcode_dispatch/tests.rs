@@ -30456,6 +30456,96 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     }
 }
 
+/// `generator.py generatorentry_driver` declares one Ref green (`pycode`)
+/// and two Ref reds (`gen`, `w_arg`). The dispatcher must select that schema
+/// by jdindex instead of requiring pypyjit's two Int greens.
+#[test]
+fn jit_merge_point_generatorentry_pycode_only_green_uses_driver_descriptor() {
+    crate::state::ensure_trace_test_driver();
+    {
+        let (driver, _) = crate::driver::driver_pair();
+        let meta = driver.meta_interp_mut();
+        let _ = meta.warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX);
+        let slot_ok = meta
+            .staticdata
+            .jitdrivers_sd
+            .get(crate::genentry_state::GENERATORENTRY_JD_INDEX)
+            .is_some_and(|jd| {
+                jd.green_kind_counts() == (0, 1, 0) && jd.red_kind_counts() == (0, 2, 0)
+            });
+        if !slot_ok {
+            let mut descriptor = crate::state::PyreJitState::generatorentry_driver_descriptor();
+            descriptor.index = Some(crate::genentry_state::GENERATORENTRY_JD_INDEX);
+            if let Some(slot) =
+                meta.jitdriver_sd_mut(crate::genentry_state::GENERATORENTRY_JD_INDEX)
+            {
+                descriptor.warmstate = slot.warmstate.clone();
+                *slot = descriptor;
+            }
+            meta.finish_setup_descrs_for_jitdrivers();
+        }
+        let descriptor =
+            &meta.staticdata.jitdrivers_sd[crate::genentry_state::GENERATORENTRY_JD_INDEX];
+        assert_eq!(descriptor.green_kind_counts(), (0, 1, 0));
+        assert_eq!(descriptor.red_kind_counts(), (0, 2, 0));
+    }
+
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte,
+        crate::genentry_state::GENERATORENTRY_JD_INDEX as u8,
+        0x00, // green Ints
+        0x01,
+        0x00, // green Refs: pycode=r0
+        0x00, // green Floats
+        0x00, // red Ints
+        0x02,
+        0x01,
+        0x02, // red Refs: gen=r1, w_arg=r2
+        0x00, // red Floats
+    ];
+    let mut tc = fresh_trace_ctx();
+    let pycode = tc.const_ref(test_pycode_ptr() as i64);
+    let generator = tc.const_ref(0x2_0000);
+    let w_arg = tc.const_ref(0x3_0000);
+    let regs_r = RegisterBank::new([pycode, generator, w_arg]);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let (outcome, next_pc) = step(&code, 0, &mut wc)
+        .expect("generatorentry merge point must not require portal Int greens");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
+}
+
 /// A green list with no concrete leading element cannot form the
 /// green key — surfaces `JitMergePointGreenKeyUnresolved` rather than
 /// guessing.
