@@ -163,6 +163,17 @@ pub(crate) fn wide_value(id: u64) -> Value {
     }
 }
 
+/// `same_box` on two wide constants, without materializing `Value`s.
+fn wide_stored_same(a: u64, b: u64) -> bool {
+    match (wide_slot(a as u32).get(), wide_slot(b as u32).get()) {
+        (WideStored::Int(x), WideStored::Int(y)) => x == y,
+        (WideStored::Float(x), WideStored::Float(y)) => x.to_bits() == y.to_bits(),
+        (WideStored::Ref(x), WideStored::Ref(y)) => x == y,
+        (WideStored::Void, WideStored::Void) => true,
+        _ => false,
+    }
+}
+
 /// Table index stored for a wide `ConstPtr`, if this slot is a ref.
 pub(crate) fn wide_ref_index(id: u64) -> Option<u32> {
     match wide_slot(id as u32).get() {
@@ -813,6 +824,11 @@ impl Operand {
     /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
     #[inline]
     pub fn same_box(&self, other: &Operand) -> bool {
+        // The same packed word is the same producer, the same constant
+        // identity, or `None` on both sides.
+        if self.packed == other.packed {
+            return true;
+        }
         if (self.is_resop() && other.is_resop())
             || (self.is_inputarg() && other.is_inputarg())
             || (self.is_temp_var() && other.is_temp_var())
@@ -820,6 +836,12 @@ impl Operand {
             return self.packed == other.packed;
         }
         if self.is_constant() && other.is_constant() {
+            if self.packed & OP_TAG == OP_SMALLWIDE && other.packed & OP_TAG == OP_SMALLWIDE {
+                return wide_stored_same(
+                    small_wide_index(self.packed),
+                    small_wide_index(other.packed),
+                );
+            }
             return self.const_value() == other.const_value();
         }
         self.is_none() && other.is_none()
@@ -1303,6 +1325,34 @@ mod tests {
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::from_bound_inputarg(&ia)));
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::const_(Const::Int(0))));
         assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::none()));
+    }
+
+    #[test]
+    fn same_box_wide_constants_compare_stored_values() {
+        let v = i64::MAX - 7;
+        let a = Operand::const_from_value(Value::Int(v));
+        let b = Operand::const_from_value(Value::Int(v));
+        assert!(a.is_small_wide());
+        assert!(b.is_small_wide());
+        assert!(a.same_box(&b));
+        assert!(!a.same_box(&Operand::const_from_value(Value::Int(v - 1))));
+
+        let f1 = Operand::const_from_value(Value::Float(1.25));
+        let f2 = Operand::const_from_value(Value::Float(1.25));
+        assert!(f1.is_small_wide());
+        assert!(f1.same_box(&f2));
+
+        let n1 = Operand::const_from_value(Value::Float(f64::NAN));
+        let n2 = Operand::const_from_value(Value::Float(f64::NAN));
+        assert!(n1.same_box(&n2));
+
+        assert!(
+            !Operand::const_from_value(Value::Float(0.0))
+                .same_box(&Operand::const_from_value(Value::Float(-0.0)))
+        );
+
+        assert!(!a.same_box(&Operand::const_from_value(Value::Float(1.0))));
+        assert!(a.same_box(&a.clone()));
     }
 
     /// `from_opref` builds the absent / inline-const arms natively (mirror of
