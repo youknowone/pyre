@@ -21,7 +21,9 @@ fn cpybuffer_carrier_gc_type_id() -> u32 {
     CPYBUFFER_CARRIER_GC_TYPE_ID.load(Ordering::Relaxed)
 }
 
+/// `CPyBuffer._immutable_ = True` (`pypy.module.cpyext.buffer.CPyBuffer`).
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("buffer", "w_obj")]
 pub struct CPyBufferCarrier {
     pub buffer: *mut u8,
     pub w_obj: PyObjectRef,
