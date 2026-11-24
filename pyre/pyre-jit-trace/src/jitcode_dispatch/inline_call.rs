@@ -41,66 +41,6 @@ struct AttributeErrorInlineContext {
     name_concrete: pyre_object::PyObjectRef,
 }
 
-/// Whether this concrete receiver takes PyPy's installed `__len__` shortcut
-/// straight to a builtin layout's length body.
-///
-/// `typedef.py use_special_method_shortcut('__len__')` replaces the generic
-/// lookup in `descroperation.py _len` for builtin implementations.  The
-/// generated walk is execution-driven and therefore follows just that body,
-/// while [`descent_blocker_summary`] deliberately joins the generic error and
-/// override arms too.  Those arms contain formatting helpers after apparent
-/// effects and make the static pre-scan reject a clean exact-builtin walk.
-///
-/// This predicate emits no IR and proves no later value.  It only admits the
-/// generated body; that body still records the payload-class and promoted
-/// `w_class` guards which keep the recording-time shortcut valid at runtime.
-unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    let ob_type = unsafe { (*obj).ob_type };
-    let exact_w_class = if std::ptr::eq(ob_type, &pyre_object::pyobject::LIST_TYPE) {
-        // The admitted set is the strategies whose length read the generated
-        // body already lowers.  `IntOrFloat` is `Integer`'s own read —
-        // `live_len` sends both to `ll_list_int_length` — so it is admitted on
-        // the same proof.  Bytes/Ascii and the range strategies read a
-        // differently shaped nested storage, and exact `list` alone does not
-        // prove that lowering.
-        if !(unsafe { pyre_object::w_list_uses_int_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_int_or_float_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_float_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_object_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_empty_storage(obj) })
-        {
-            return false;
-        }
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE)
-    } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::pyobject::STR_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::bytesobject::BYTES_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::functional::RANGE_TYPE)
-        // `len_slot` forwards an exact dict and its views to `w_dict_len`
-        // (`W_DictMultiObject.length` → `get_strategy().length(self)`).
-        || std::ptr::eq(ob_type, &pyre_object::pyobject::DICT_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_KEYS_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_VALUES_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_ITEMS_TYPE)
-    {
-        pyre_object::pyobject::get_instantiate(unsafe { &*ob_type })
-    } else if specialised_pair_kind(ob_type).is_some() {
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE)
-    } else {
-        return false;
-    };
-    std::ptr::eq(
-        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) },
-        exact_w_class,
-    )
-}
-
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
 /// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
@@ -8155,13 +8095,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     {
         return Ok(Some(inlined));
     }
-    let builtin_len_shortcut = builtin_len_call
-        && spec_gate(SpecFold::BuiltinLenDescent, || {
-            Ok::<Option<()>, DispatchError>(
-                unsafe { exact_builtin_len_shortcut_receiver(len_receiver) }.then_some(()),
-            )
-        })?
-        .is_some();
     let builtin_sig = if type_query || builtin_code.is_null() {
         None
     } else {
@@ -8176,21 +8109,10 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         usize::from(receiver.is_some()) + (r_args.len() - 2)
     };
-    // `W_CData.call` on a function pointer. The scan's red `kind` join
-    // reaches `allocate_stable` on an arm `W_CTypeFunc.call` does not take
-    // after it promotes the ctype. The generated descent records the call.
-    let cdata_func_descent =
-        receiver.is_some_and(pyre_interpreter::importing::cdata_is_function_pointer);
-    if !builtin_len_shortcut
-        && !cdata_func_descent
-        && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
-    {
-        if matches!(decline, DescentDecline::Helper(_)) {
-            log_descent_unlowered_helper_blockers(jitcode.index());
-        }
-        builtin_inline_decline!(decline, fnaddr);
-        return Ok(None);
-    }
+    // PyPy admits an MIFrame by executing its selected path.  This wrapper is
+    // `HelperReturn::CallResult`: an unexecutable helper reached on that path
+    // either leaves a clean attempt for the ordinary residual CALL, or the
+    // live helper stack is latched and continued without replaying the CALL.
     // `typeobject.py descr_call` runs `__init__` after `__new__` returns.
     // The `__new__` wrapper's return is delivered into
     // `OperatorTail::TypeCallNew` (`operator_continuation_parent_frame`),
@@ -8207,14 +8129,14 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // The descent scan above proved its facts for this argument count; a
-    // guard's resume scan proves them the same way.
+    // A numbered helper guard uses the entry argument count when checking
+    // whether each captured helper section is runnable.
     if let Some(level) = site.nested_helper_entry.as_mut() {
         level.entry_array_len = Some(wrapper_item_count);
     }
-    // Rewind point for the un-lowered-helper decline below.  Nothing above
-    // this line records IR or touches the heap cache, so cutting back to it
-    // leaves the caller's trace exactly as the ordinary residual call found it.
+    // Rewind point for a clean executed-path decline.  Nothing above this
+    // line records IR or touches the heap cache, so cutting back to it leaves
+    // the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // From here on the guards, the args array and the wrapper sub-walk append
     // to `opencoder.py Trace._ops` and can minor-collect.  Every concrete
@@ -17362,9 +17284,9 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
 /// `space.len` wrapper, and the wrapper's generic lookup and error arms carry
 /// un-lowered helper calls, so the body-wide descent scan refuses the descent
 /// and every `len(obj)` over a user instance runs as a fresh interpreter frame
-/// behind a `CALL_MAY_FORCE`.  [`exact_builtin_len_shortcut_receiver`] walks
-/// the receivers whose length is a layout read past that same scan; this route
-/// is the other half, for the receivers whose length really is a call.
+/// behind a `CALL_MAY_FORCE`.
+/// The generated builtin wrapper is admitted by executing its selected
+/// path; this route is for receivers whose length really is a Python call.
 ///
 /// The gate is `len_fast_path`, which admits exactly the receivers `_len`
 /// dispatches a method for — a user instance, or a builtin subclass overriding
