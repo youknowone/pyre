@@ -24036,12 +24036,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 
@@ -24124,12 +24124,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 
@@ -24206,12 +24206,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         let resume_data = crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 0,
-            fail_arg_types: vec![],
+            fail_arg_types: vec![].into(),
         };
         tracing.set_bridge_resume_data(resume_data.clone());
 
@@ -24377,12 +24377,12 @@ mod portal_resume_rebuild_tests {
             vec![],
         );
         tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
-            frames: vec![],
-            virtualizable_boxes: vec![],
-            virtualref_values: vec![],
+            frames: vec![].into(),
+            virtualizable_boxes: vec![].into(),
+            virtualref_values: vec![].into(),
             storage: Some(storage),
             num_failargs: 1,
-            fail_arg_types: vec![majit_ir::Type::Ref],
+            fail_arg_types: vec![majit_ir::Type::Ref].into(),
         });
         meta.tracing = Some(Box::new(tracing));
 

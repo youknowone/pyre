@@ -65,8 +65,9 @@ pub fn numbering_gc_type_id() -> u32 {
 }
 
 /// `lltype.malloc(NUMBERING, len)` via the collecting nursery entry.
-fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
-    let len = bytes.len();
+/// Stores the length word; encoded bytes are written after this returns
+/// (`Writer.create_numbering`).
+fn alloc_numbering_bytes(len: usize) -> usize {
     let payload = TRACE_OPS_CHARS + len;
     let mut live = majit_ir::GcRef(0);
     let mut needs_write_barrier = false;
@@ -83,13 +84,6 @@ fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
     }
     unsafe {
         *(fresh.0 as *mut usize) = len;
-        if len > 0 {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (fresh.0 as *mut u8).add(TRACE_OPS_CHARS),
-                len,
-            );
-        }
     }
     let _ = needs_write_barrier;
     let _ = live;

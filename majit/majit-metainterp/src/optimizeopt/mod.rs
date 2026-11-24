@@ -6645,7 +6645,7 @@ impl OptContext {
         // `fail_index`, subtype, vector_info) and only mutates its
         // `fail_arg_types`. Pyre's `ResumeGuardDescr` /
         // ResumeAtPositionDescr / CompileLoopVersionDescr keep `types`
-        // in `UnsafeCell<Vec<Type>>`, exposed via
+        // in `UnsafeCell<SmallVec<[Type; 16]>>`, exposed via
         // `FailDescr::set_fail_arg_types`, so we mutate in place — the
         // load-bearing contract that subtype markers
         // (`is_resume_at_position()`, `loop_version()`) survive

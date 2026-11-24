@@ -11275,7 +11275,7 @@ impl JitState for PyreJitState {
         }
         // `consume_virtualref_boxes` decodes exactly `size * 2` entries; a
         // malformed odd-length stream is a bug.
-        let vref_values = &resume_data.virtualref_values;
+        let vref_values = resume_data.virtualref_values.as_ref();
         assert!(
             vref_values.len() % 2 == 0,
             "virtualref_values must contain an even number of entries (got {})",
@@ -12442,9 +12442,9 @@ impl JitState for PyreJitState {
         // when the frame-section loop does not run. `rebuild_state_after_failure`
         // then keeps tracing with that empty framestack.
         Some(majit_metainterp::ResumeDataResult {
-            frames,
-            virtualizable_boxes: vable_values,
-            virtualref_values: vref_values,
+            frames: ::std::rc::Rc::from(frames),
+            virtualizable_boxes: ::std::rc::Rc::from(vable_values),
+            virtualref_values: ::std::rc::Rc::from(vref_values),
             storage: Some(storage.clone()),
             // resume.py rebuild_from_resumedata num_failargs from rd_numb header. Used by
             // bridge virtual materialization (resume.py decode_box
@@ -12455,7 +12455,7 @@ impl JitState for PyreJitState {
             // `OpRef::input_arg_typed(idx, fail_arg_types[idx])` per
             // resume.py:1247-1264 (`return self.liveboxes[num]` whose Box
             // carries history.py:220 `box.type`).
-            fail_arg_types: fail_arg_types.to_vec(),
+            fail_arg_types: ::std::rc::Rc::from(fail_arg_types),
         })
     }
 
@@ -15442,7 +15442,8 @@ mod tests {
                     RebuiltValue::Box(0, Type::Ref),
                     RebuiltValue::Box(1, Type::Ref),
                 ],
-            }],
+            }]
+            .into(),
             // Exercise both authorities in one bridge setup.  The first local's
             // register is a dead null and the second local/cell's register is a
             // stale non-null object; both vable entries are live.  Conversely,
@@ -15457,11 +15458,12 @@ mod tests {
                 RebuiltValue::Box(6, Type::Ref),
                 RebuiltValue::Box(9, Type::Ref),
                 RebuiltValue::Box(6, Type::Ref),
-            ],
-            virtualref_values: Vec::new(),
+            ]
+            .into(),
+            virtualref_values: Vec::new().into(),
             storage: None,
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
 
         let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
@@ -15579,18 +15581,19 @@ mod tests {
             Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
+            frames: Vec::new().into(),
             virtualizable_boxes: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
                 RebuiltValue::Box(3, Type::Ref),
                 RebuiltValue::Box(4, Type::Int),
                 RebuiltValue::Box(5, Type::Ref),
-            ],
-            virtualref_values: Vec::new(),
+            ]
+            .into(),
+            virtualref_values: Vec::new().into(),
             storage: None,
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
         let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
@@ -15668,7 +15671,7 @@ mod tests {
             Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
+            frames: Vec::new().into(),
             virtualizable_boxes: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
@@ -15676,11 +15679,12 @@ mod tests {
                 RebuiltValue::Box(4, Type::Int),
                 RebuiltValue::Box(5, Type::Ref),
                 RebuiltValue::Box(6, Type::Ref),
-            ],
-            virtualref_values: Vec::new(),
+            ]
+            .into(),
+            virtualref_values: Vec::new().into(),
             storage: None,
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
         let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
@@ -15745,12 +15749,12 @@ mod tests {
         let fail_values = [&mut field_target as *mut FieldTarget as i64, 9];
         let fail_types = [Type::Ref, Type::Int];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
@@ -15859,12 +15863,12 @@ mod tests {
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
@@ -15954,12 +15958,12 @@ mod tests {
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
@@ -16077,12 +16081,12 @@ mod tests {
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
-            frames: Vec::new(),
-            virtualizable_boxes: Vec::new(),
-            virtualref_values: Vec::new(),
+            frames: Vec::new().into(),
+            virtualizable_boxes: Vec::new().into(),
+            virtualref_values: Vec::new().into(),
             storage: Some(storage),
             num_failargs: fail_values.len() as i32,
-            fail_arg_types: fail_types.to_vec(),
+            fail_arg_types: fail_types.to_vec().into(),
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));

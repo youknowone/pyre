@@ -6617,7 +6617,7 @@ impl<S: JitState> JitDriver<S> {
             // `rebuild_from_resumedata` just appends them as it reads.
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
                 Vec::with_capacity(resume.frames.len());
-            for frame in &resume.frames {
+            for frame in resume.frames.iter() {
                 let Some(index) = usize::try_from(frame.jitcode_index).ok() else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
@@ -17920,12 +17920,12 @@ mod tests {
                 // trait stub, the fixture admits the symbolic setup path.
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18017,12 +18017,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18156,12 +18156,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18246,12 +18246,12 @@ mod tests {
             ) -> Option<crate::ResumeDataResult> {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
-                    frames: vec![],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    frames: vec![].into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
         }
@@ -18388,12 +18388,13 @@ mod tests {
                         jitcode_index: 0,
                         pc: 0,
                         values: vec![],
-                    }],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    }]
+                    .into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
             fn prepare_bridge_resume(
@@ -18560,12 +18561,13 @@ mod tests {
                         jitcode_index: 0,
                         pc: 0,
                         values: vec![],
-                    }],
-                    virtualizable_boxes: vec![],
-                    virtualref_values: vec![],
+                    }]
+                    .into(),
+                    virtualizable_boxes: vec![].into(),
+                    virtualref_values: vec![].into(),
                     storage: storage.cloned(),
                     num_failargs: 0,
-                    fail_arg_types: vec![],
+                    fail_arg_types: vec![].into(),
                 })
             }
             fn consume_vref_and_vable_boxes(

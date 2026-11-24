@@ -9113,9 +9113,9 @@ impl<'a> ResolvedJitCode<'a> {
 /// index here pairs with the i-th int-bank `RebuiltValue`.
 #[derive(Default, Clone, Debug)]
 pub struct FrameLivenessRegIndices {
-    pub int: Vec<u32>,
-    pub ref_: Vec<u32>,
-    pub float: Vec<u32>,
+    pub int: SmallVec<[u32; 16]>,
+    pub ref_: SmallVec<[u32; 16]>,
+    pub float: SmallVec<[u32; 16]>,
 }
 
 impl FrameLivenessRegIndices {
@@ -9167,9 +9167,9 @@ pub fn read_frame_liveness_reg_indices(
         return FrameLivenessRegIndices::default();
     }
     // `enumerate_vars` yields exactly these many indices per bank.
-    let mut int = Vec::with_capacity(all_liveness[info] as usize);
-    let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);
-    let mut float = Vec::with_capacity(all_liveness[info + 2] as usize);
+    let mut int = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info] as usize);
+    let mut ref_ = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info + 1] as usize);
+    let mut float = SmallVec::<[u32; 16]>::with_capacity(all_liveness[info + 2] as usize);
     // SAFETY: `liveness_record_is_complete` proved the three count bytes
     // and the three `encode_liveness` banks of those lengths
     // (`jitcode.py` `enumerate_vars`).
@@ -9183,6 +9183,122 @@ pub fn read_frame_liveness_reg_indices(
         );
     }
     FrameLivenessRegIndices { int, ref_, float }
+}
+
+#[cfg(test)]
+mod liveness_bank_tests {
+    use super::{FrameLivenessRegIndices, read_frame_liveness_reg_indices};
+    use crate::jitcode::JitCode;
+    use crate::jitcode::insns::BC_LIVE;
+    use majit_jitcode::codewriter::liveness::encode_liveness;
+    use majit_jitcode::jitcode::JitCodeBody;
+
+    fn live_jitcode() -> JitCode {
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        let jc = JitCode::new("liveness-banks");
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0],
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        jc
+    }
+
+    fn record(int: &[u8], ref_: &[u8], float: &[u8]) -> Vec<u8> {
+        let mut buf = vec![int.len() as u8, ref_.len() as u8, float.len() as u8];
+        for live in [int, ref_, float] {
+            buf.extend_from_slice(&encode_liveness(live));
+        }
+        buf
+    }
+
+    fn indices(int: &[u8], ref_: &[u8], float: &[u8]) -> FrameLivenessRegIndices {
+        let jc = live_jitcode();
+        let all = record(int, ref_, float);
+        read_frame_liveness_reg_indices(&jc, 0, BC_LIVE, &all)
+    }
+
+    fn regs(n: u8) -> Vec<u8> {
+        (0..n).collect()
+    }
+
+    fn as_u32(live: &[u8]) -> Vec<u32> {
+        live.iter().map(|&i| i as u32).collect()
+    }
+
+    #[test]
+    fn read_frame_liveness_reg_indices_covers_empty_inline_and_heap_banks() {
+        let empty = indices(&[], &[], &[]);
+        assert_eq!(empty.int.as_slice(), &[] as &[u32]);
+        assert_eq!(empty.ref_.as_slice(), &[] as &[u32]);
+        assert_eq!(empty.float.as_slice(), &[] as &[u32]);
+
+        for n in [16u8, 17] {
+            let live = regs(n);
+            let want = as_u32(&live);
+            let int_only = indices(&live, &[], &[]);
+            assert_eq!(int_only.int.as_slice(), want.as_slice());
+            assert_eq!(int_only.ref_.as_slice(), &[] as &[u32]);
+            assert_eq!(int_only.float.as_slice(), &[] as &[u32]);
+            let ref_only = indices(&[], &live, &[]);
+            assert_eq!(ref_only.int.as_slice(), &[] as &[u32]);
+            assert_eq!(ref_only.ref_.as_slice(), want.as_slice());
+            assert_eq!(ref_only.float.as_slice(), &[] as &[u32]);
+            let float_only = indices(&[], &[], &live);
+            assert_eq!(float_only.int.as_slice(), &[] as &[u32]);
+            assert_eq!(float_only.ref_.as_slice(), &[] as &[u32]);
+            assert_eq!(float_only.float.as_slice(), want.as_slice());
+        }
+
+        let mixed_int = regs(16);
+        let mixed_ref = regs(17);
+        let mixed_float = regs(0);
+        let mixed = indices(&mixed_int, &mixed_ref, &mixed_float);
+        assert_eq!(mixed.int.as_slice(), as_u32(&mixed_int).as_slice());
+        assert_eq!(mixed.ref_.as_slice(), as_u32(&mixed_ref).as_slice());
+        assert_eq!(mixed.float.as_slice(), &[] as &[u32]);
+        let mut order = Vec::new();
+        order.extend(mixed.int.iter().copied());
+        order.extend(mixed.ref_.iter().copied());
+        order.extend(mixed.float.iter().copied());
+        let mut want_order = as_u32(&mixed_int);
+        want_order.extend(as_u32(&mixed_ref));
+        assert_eq!(order, want_order);
+    }
+}
+
+#[cfg(test)]
+mod numbering_encode_tests {
+    use majit_ir::resumecode::Writer;
+
+    #[test]
+    fn encode_into_matches_encode_bytes_at_varint_boundaries() {
+        let values: &[i32] = &[
+            0,
+            63,
+            64,
+            -64,
+            -65,
+            8191,
+            8192,
+            -8192,
+            -8193,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 24) - 1,
+        ];
+        let mut w = Writer::new(values.len());
+        for &v in values {
+            w.append_short(v);
+        }
+        let encoded = w.encode_bytes();
+        assert_eq!(w.encoded_len(), encoded.len());
+        let mut into = vec![0u8; w.encoded_len()];
+        w.encode_into(&mut into);
+        assert_eq!(into, encoded);
+        assert_eq!(w.create_numbering().as_slice(), encoded.as_slice());
+    }
 }
 
 /// One `resume.py` `ResumeDataBoxReader.decode_box` result: the box to

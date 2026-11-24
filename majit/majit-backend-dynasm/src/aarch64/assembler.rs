@@ -23,6 +23,7 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{
     AsmMemoryBlock, AsmMemoryManager, BackendError, JitCellToken, MachineDataBlockWrapper,
+    ResumeGuardDescr,
 };
 use majit_ir::{
     FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, TargetArgLoc, Type,
@@ -5743,7 +5744,14 @@ impl<'a> AssemblerARM64<'a> {
         }
         let inferred = self.infer_fail_arg_types(op, op_index);
         if fd.fail_arg_types() != inferred.as_slice() {
-            fd.set_fail_arg_types(inferred.into_vec());
+            if let Some(rg) = fd
+                .as_any()
+                .and_then(|a| a.downcast_ref::<ResumeGuardDescr>())
+            {
+                rg.set_fail_arg_types_from_slice(&inferred);
+            } else {
+                fd.set_fail_arg_types(inferred.into_vec());
+            }
         }
     }
 
