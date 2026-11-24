@@ -7298,7 +7298,7 @@ pub(in crate::front::mir) fn interior_pointer_alias_calls(
 ) -> Vec<bool> {
     let mut aliases = vec![false; body.locals.locals.len()];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
