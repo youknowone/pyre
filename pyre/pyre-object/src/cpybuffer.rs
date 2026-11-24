@@ -39,10 +39,31 @@ impl GcType for CPyBufferCarrier {
 /// the result, reloads the exporter after this collection point, and stores it
 /// with [`set_w_obj`].
 pub fn alloc(buffer: *mut u8) -> *mut CPyBufferCarrier {
-    crate::lltype::malloc_typed_managed(CPyBufferCarrier {
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            cpybuffer_carrier_gc_type_id(),
+            std::mem::size_of::<CPyBufferCarrier>(),
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    };
+    let payload = CPyBufferCarrier {
         buffer,
         w_obj: PY_NULL,
-    })
+    };
+    match crate::gc_hook::GcAllocOutcome::from_hook(raw).allocated_or_raise() {
+        Some(raw) => unsafe {
+            std::ptr::write(raw as *mut CPyBufferCarrier, payload);
+            if needs_write_barrier {
+                crate::gc_hook::try_gc_write_barrier_managed(raw);
+            }
+            raw as *mut CPyBufferCarrier
+        },
+        None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => crate::lltype::malloc_typed(payload),
+    }
 }
 
 /// Store the exporter after both it and `carrier` have been rooted.

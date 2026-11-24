@@ -497,9 +497,12 @@ fn release_c_view(view: *mut CPyBuffer) {
     drop(unsafe { Box::from_raw(view) });
 }
 
-struct CPyBufferFinalizerQueue;
+struct CPyBufferFinalizerQueue {
+    _identity: u8,
+}
 
-static CPYBUFFER_FINALIZER_QUEUE: CPyBufferFinalizerQueue = CPyBufferFinalizerQueue;
+static CPYBUFFER_FINALIZER_QUEUE: CPyBufferFinalizerQueue =
+    CPyBufferFinalizerQueue { _identity: 0 };
 
 impl CPyBufferFinalizerQueue {
     fn fq_tag() -> pyre_object::gc_hook::GcFinalizerQueueTag {
@@ -1659,6 +1662,14 @@ pub(super) fn ensure_linked() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpybuffer_and_wroot_finalizer_queue_addresses_are_distinct() {
+        assert_ne!(
+            super::CPyBufferFinalizerQueue::fq_tag().fq,
+            crate::executioncontext::WRootFinalizerQueue::fq_address_for_test(),
+        );
+    }
+
     /// A request word is one thing two places spell: an extension compiled
     /// against `include/pyre3.15t/object.h` builds it, and this file reads it.
     /// Nothing tied the two together -- upstream has no such pair, because
