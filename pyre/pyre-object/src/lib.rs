@@ -59,6 +59,7 @@ pub mod operation;
 pub mod pyobject;
 pub mod quasiimmut;
 pub mod rbuilder;
+pub mod rdict;
 pub mod rordereddict;
 pub mod rordereddict_entries;
 pub mod rstring;
