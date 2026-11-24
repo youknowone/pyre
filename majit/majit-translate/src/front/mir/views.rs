@@ -3345,6 +3345,23 @@ impl<'a> Lowering<'a> {
         tyref_option_pair_slice_item_kind(ty, self.llbc)
     }
 
+    /// `Option<&[T]>` / Charon `Option<[T]>` whose intern is the nullable
+    /// list (`project_struct_field_type` Option arm). Includes non-word
+    /// items such as `[u32]`; the payload must resolve to a slice behind
+    /// its reference (`tyref_strips_to_slice`). The u8 window and
+    /// `Vec`/`VecDeque` stay out.
+    pub(in crate::front::mir) fn option_nullable_list_slice(&self, ty: &TyRef) -> bool {
+        if tyref_is_option_of_shared_u8_slice(ty, self.llbc) {
+            return false;
+        }
+        let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, self.llbc) else {
+            return false;
+        };
+        !tyref_is_shared_u8_slice(&payload, self.llbc)
+            && !tyref_is_bare_u8_slice(&payload, self.llbc)
+            && tyref_strips_to_slice(&payload, self.llbc)
+    }
+
     /// Item kind of `Result<&[T], PyError>` when the Ok payload is a pair.
     pub(in crate::front::mir) fn result_pair_slice_kind(
         &self,

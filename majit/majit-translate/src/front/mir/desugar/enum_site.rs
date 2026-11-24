@@ -1923,6 +1923,8 @@ impl<'a> Lowering<'a> {
             payload_ty,
             error_ty,
             niche: self.tyref_is_niche_option_ptr(recv_ty),
+            pair_slice_niche: self.option_pair_slice_kind(recv_ty).is_some()
+                || self.option_nullable_list_slice(recv_ty),
             scalar_niche,
             some_vsid: self.stamp_variant_vsid(recv_ty, "Some"),
             ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),

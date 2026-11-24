@@ -1447,6 +1447,7 @@ mod tests {
             payload_ty: ValueType::Int,
             error_ty: ValueType::Ref(None),
             niche: false,
+            pair_slice_niche: false,
             scalar_niche: false,
             some_vsid: None,
             ok_vsid: None,

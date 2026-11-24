@@ -4485,6 +4485,9 @@ pub(crate) struct OptionOkOrElseTrySite {
     pub payload_ty: ValueType,
     pub error_ty: ValueType,
     pub niche: bool,
+    /// `Option<&[T]>` whose pair/window lowering exposes the nullable list
+    /// payload directly. `None` is the null list; `Some` is the list itself.
+    pub pair_slice_niche: bool,
     /// `Option<NonZero*>`: the word itself, `None` is integer 0.
     pub scalar_niche: bool,
     /// Instance STRUCT of the receiver `Some`, when the TyRef is concrete.
@@ -6367,7 +6370,7 @@ fn rewire_one_option_ok_or_else_try_site(
 
     let opt_in_some = map_source(&some_sources, &some_inputs, &opt)
         .expect("some_sources explicitly includes the Option value");
-    let payload = if site.niche || site.scalar_niche {
+    let payload = if site.niche || site.pair_slice_niche || site.scalar_niche {
         opt_in_some
     } else {
         let payload = graph.alloc_value_var();
@@ -6444,7 +6447,9 @@ fn rewire_one_option_ok_or_else_try_site(
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
-    if site.niche || site.scalar_niche {
+    if site.pair_slice_niche {
+        graph.push_niche_is_some(a_id, opt.clone().into_variable(), None, None, disc.clone());
+    } else if site.niche || site.scalar_niche {
         let rhs = if site.scalar_niche {
             graph
                 .push_op_var(
@@ -22062,6 +22067,7 @@ mod option_ok_or_else_try_tests {
             payload_ty: ValueType::Int,
             error_ty: ValueType::Ref(None),
             niche: false,
+            pair_slice_niche: false,
             scalar_niche: false,
             some_vsid: None,
             ok_vsid: None,
@@ -22208,6 +22214,47 @@ mod option_ok_or_else_try_tests {
         assert!(
             leftover.is_empty(),
             "Method ok_or_else `?` left from_residual / ControlFlow Break: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn option_u32_slice_ok_or_else_branches_before_payload_list() {
+        let (mut graph, mut site) = ok_or_else_try_diamond();
+        let option = graph.block(graph.startblock).inputargs[0].clone();
+        site.option_owner = "core::option::Option<&[u32]>".into();
+        site.some_owner = "core::option::Option<&[u32]>::Some".into();
+        site.payload_ty = ValueType::Ref(Some("[u32]".into()));
+        site.pair_slice_niche = true;
+
+        assert_eq!(
+            rewire_option_ok_or_else_try_sites(&mut graph, &[site], true),
+            1
+        );
+
+        let ops = graph.blocks.iter().flat_map(|block| &block.operations);
+        let mut saw_presence_test = false;
+        for op in ops {
+            match &op.kind {
+                OpKind::BinOp { op, lhs, .. } if op == "is_" && lhs == &option => {
+                    saw_presence_test = true;
+                }
+                OpKind::FieldRead { base, field, .. }
+                    if base == &option
+                        && matches!(field.name.as_str(), "__discriminant" | "__pos_0") =>
+                {
+                    panic!(
+                        "pair-slice Option payload read {}; graph={}",
+                        field.name,
+                        graph.dump()
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_presence_test,
+            "pair-slice Option did not test list presence; graph={}",
+            graph.dump()
         );
     }
 

@@ -35569,6 +35569,58 @@ fn iobase_writelines_ok_or_else_try_is_value_or_exception() {
     );
 }
 
+#[test]
+fn sre_get_code_option_payload_has_no_list_discriminant_getattr() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
+        "sre_scanner_step",
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..crate::HostStaticAddrs::default()
+        },
+    )
+    .expect("lower sre_scanner_step");
+
+    let mut saw_presence_test = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::BinOp { op, .. } if op == "is_" => {
+                saw_presence_test = true;
+            }
+            OpKind::FieldRead { field, .. }
+                if matches!(field.name.as_str(), "__discriminant" | "__pos_0")
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner == "core::option::Option<&[u32]>"
+                            || owner == "core::option::Option<&[u32]>::Some"
+                    }) =>
+            {
+                panic!(
+                    "get_code list payload read {}; graph={}",
+                    field.name,
+                    graph.dump()
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_presence_test,
+        "no list presence test; graph={}",
+        graph.dump()
+    );
+}
+
 /// A by-value fixed array is an RPython list-model iteration source, just
 /// like the already-covered `&[T]` loop: its `IntoIter::next` must become
 /// the native `iter`/`next` vertical rather than remain a foreign core
