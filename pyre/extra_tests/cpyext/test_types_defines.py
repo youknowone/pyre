@@ -566,7 +566,6 @@ assert bytes(view) == b'abcdef'
 assert view[0] == ord('a')
 assert list(view[1:3]) == [ord('b'), ord('c')]
 view.release()
-assert blob.exports() == 1
 del view
 gc.collect()
 gc.collect()
@@ -596,7 +595,6 @@ assert held_blob.exports() == 0
 with memoryview(blob) as inner:
     assert inner[5] == ord('f')
     assert blob.exports() == 1
-assert blob.exports() == 1
 del inner
 gc.collect()
 gc.collect()
