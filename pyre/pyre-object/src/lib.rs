@@ -17,6 +17,7 @@ pub mod bytes_array;
 pub mod bytesobject;
 pub mod celldict;
 pub mod complexobject;
+pub mod cpybuffer;
 pub mod descriptor;
 pub mod dict_eq_hook;
 pub mod dictmultiobject;

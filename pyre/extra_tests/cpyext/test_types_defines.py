@@ -555,6 +555,9 @@ assert blob.exports() == 0
 view = memoryview(blob)
 assert blob.exports() == 1
 assert view.obj is blob
+# Internal `CPyBuffer` carriers have no typedef and must not leak through the
+# app-level object enumeration while their C export is live.
+assert all(isinstance(type(obj), type) for obj in gc.get_objects())
 assert len(view) == 6
 assert view.readonly is False
 assert view.itemsize == 1
@@ -580,10 +583,12 @@ held_blob = m.Blob(b'held')
 held_view = memoryview(held_blob)
 held_cdata = B.from_buffer(char_array, held_view)
 held_view.release()
+del held_view
+gc.collect()
+gc.collect()
 assert held_blob.exports() == 1
 assert b''.join(held_cdata[index] for index in range(4)) == b'held'
 del held_cdata
-del held_view
 gc.collect()
 gc.collect()
 assert held_blob.exports() == 0

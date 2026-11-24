@@ -53,11 +53,6 @@ pub struct W_MemoryView {
     /// builds as `W_MemoryView(view, owns_export=False)` and which shares the
     /// original's export.  Only an owning view releases the underlying export.
     pub owns_export: bool,
-    /// The exact C `Py_buffer` owned by a hidden GC carrier for cpyext's
-    /// `CPyBuffer`.  Null on ordinary and Python-visible memoryviews.  The
-    /// cpyext finalizer takes this pointer before `CPyBuffer.releasebuffer`,
-    /// making the native release exactly-once without an address side table.
-    pub cpy_buffer: *mut u8,
 }
 
 /// CPython 3.14 `PyBufferWrapper` (`Objects/typeobject.c`): the owner placed
@@ -106,7 +101,6 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         w_weakreflifeline: PY_NULL,
         restricted: false,
         owns_export,
-        cpy_buffer: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
@@ -255,6 +249,16 @@ pub unsafe fn w_memoryview_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe { w_memoryview_view(obj).backing().w_obj() }
 }
 
+/// The managed owner of the view's storage, including an internal cpyext
+/// carrier. This reference is for GC keepalive use, not Python object access.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_backing_gc_owner(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { w_memoryview_view(obj).backing().gc_owner() }
+}
+
 mv_view_obj!(w_memoryview_obj, w_obj);
 mv_view_scalar!(w_memoryview_itemsize, itemsize, i64);
 mv_view_scalar!(w_memoryview_ndim, ndim, i64);
@@ -347,33 +351,6 @@ pub unsafe fn w_memoryview_set_hash(obj: PyObjectRef, hash: i64) {
 #[inline]
 pub unsafe fn w_memoryview_owns_export(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).owns_export }
-}
-
-/// Attach the exact C `Py_buffer` to its GC-managed carrier.
-///
-/// # Safety
-/// `obj` must point to a live `W_MemoryView` carrier and `buffer` must remain
-/// valid until its registered finalizer takes it.
-#[inline]
-pub unsafe fn w_memoryview_set_cpy_buffer(obj: PyObjectRef, buffer: *mut u8) {
-    unsafe {
-        (*(obj as *mut W_MemoryView)).cpy_buffer = buffer;
-    }
-}
-
-/// Take the C `Py_buffer` from its carrier before running
-/// `CPyBuffer.releasebuffer`.  A second finalization observes null.
-///
-/// # Safety
-/// `obj` must point to a live `W_MemoryView` carrier.
-#[inline]
-pub unsafe fn w_memoryview_take_cpy_buffer(obj: PyObjectRef) -> *mut u8 {
-    unsafe {
-        let mv = obj as *mut W_MemoryView;
-        let buffer = (*mv).cpy_buffer;
-        (*mv).cpy_buffer = std::ptr::null_mut();
-        buffer
-    }
 }
 
 /// Flip `released` without touching the view box, so a re-entrant `release()`

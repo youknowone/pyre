@@ -870,22 +870,14 @@ pub(crate) unsafe fn memoryview_register_finalizer(mv: PyObjectRef) {
 /// `W_MemoryView._finalize_`: `if self.view is not None:
 /// self._release_underlying(None)`.  With no space, `_release_underlying`
 /// consults no `__release_buffer__` and calls `view.releasebuffer()`; then the
-/// view is gone.  A hidden cpyext carrier reaches `FQ.finalizer_trigger` first:
-/// it takes and releases the inline `CPyBuffer`, while an ordinary memoryview
-/// follows `_release_underlying`.  In both cases the finalizer queue keeps the
-/// carrier alive across the release callback.
+/// view is gone. The internal cpyext carrier is registered on its own queue,
+/// so memoryview finalization only follows `_release_underlying`.
 ///
 /// # Safety
 /// `mv` must be a `W_MemoryView`.
 pub(crate) unsafe fn memoryview_finalize(mv: PyObjectRef) {
     use pyre_object::memoryview::*;
     unsafe {
-        #[cfg(all(
-            feature = "cpyext",
-            not(feature = "sandbox"),
-            any(target_os = "macos", target_os = "linux")
-        ))]
-        crate::cpyext::buffer::finalize_cpy_buffer(mv);
         if (*(mv as *const W_MemoryView)).view.is_null() {
             return;
         }

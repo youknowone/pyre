@@ -337,17 +337,27 @@ fn acquire(
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_str_new_managed(&format));
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
-    // `wrap_getbuffer` builds `NonOwningReleaseView(CPyBuffer)`: the visible
-    // memoryview does not own the export.  A separate hidden managed carrier
-    // owns the exact C structure and is registered with the finalizer queue,
-    // matching `fq.register_finalizer(buf)` and `FQ.finalizer_trigger`.
-    let cpy_buffer = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    // `pypy.module.cpyext.slotdefs.wrap_getbuffer` builds
+    // `NonOwningReleaseView(CPyBuffer)`: the visible memoryview does not own
+    // the export. The interpreter-level carrier owns the exact C structure;
+    // `pypy.module.cpyext.buffer.FQ.finalizer_trigger` releases it directly.
+    let cpy_buffer = pyre_object::cpybuffer::alloc(view.cast());
+    if cpy_buffer.is_null() {
+        release_c_view(view);
+        return Err(crate::PyError::memory_error(""));
+    }
     let cpy_buffer_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(cpy_buffer);
+    let _ = roots.pin_root(cpy_buffer.cast());
+    let cpy_buffer = pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot)
+        as *mut pyre_object::cpybuffer::CPyBufferCarrier;
+    let r_obj = owner_slot
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .unwrap_or_else(pyre_object::w_none);
+    unsafe { pyre_object::cpybuffer::set_w_obj(cpy_buffer, r_obj) };
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
     let mv_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(mv);
-    let r_obj = owner_slot
+    let w_obj = owner_slot
         .map(pyre_object::gc_roots::shadow_stack_get)
         .unwrap_or_else(pyre_object::w_none);
     let built = carrier_for(
@@ -361,25 +371,16 @@ fn acquire(
             strides,
             suboffsets,
         },
-        r_obj,
+        w_obj,
         reload(0),
         pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot),
     );
-    let visible = built.clone();
-    let cpy_buffer = pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot);
-    unsafe {
-        pyre_object::memoryview::w_memoryview_set_view(
-            cpy_buffer,
-            pyre_object::memoryview::bufferview_alloc(built),
-        );
-        pyre_object::memoryview::w_memoryview_set_cpy_buffer(cpy_buffer, view.cast());
-    }
-    crate::executioncontext::register_finalizer(cpy_buffer);
+    fq_register_finalizer(pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot));
     let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
     unsafe {
         pyre_object::memoryview::w_memoryview_set_view(
             mv,
-            pyre_object::memoryview::bufferview_alloc(visible),
+            pyre_object::memoryview::bufferview_alloc(built),
         )
     };
     Ok(mv)
@@ -496,17 +497,50 @@ fn release_c_view(view: *mut CPyBuffer) {
     drop(unsafe { Box::from_raw(view) });
 }
 
-/// `FQ.finalizer_trigger` for the hidden managed `CPyBuffer` carrier.
-/// Taking the inline pointer before `CPyBuffer.releasebuffer` makes a repeated
-/// dispatch a no-op and keeps `bf_releasebuffer` exactly once per export.
-///
-/// # Safety
-/// `carrier` must be the live managed carrier created by [`acquire`].
-pub(crate) unsafe fn finalize_cpy_buffer(carrier: PyObjectRef) {
-    let view =
-        unsafe { pyre_object::memoryview::w_memoryview_take_cpy_buffer(carrier) } as *mut CPyBuffer;
-    if !view.is_null() {
-        release_c_view(view);
+struct CPyBufferFinalizerQueue;
+
+static CPYBUFFER_FINALIZER_QUEUE: CPyBufferFinalizerQueue = CPyBufferFinalizerQueue;
+
+impl CPyBufferFinalizerQueue {
+    fn fq_tag() -> pyre_object::gc_hook::GcFinalizerQueueTag {
+        pyre_object::gc_hook::GcFinalizerQueueTag {
+            fq: std::ptr::addr_of!(CPYBUFFER_FINALIZER_QUEUE) as usize,
+            trigger: cpybuffer_finalizer_trigger,
+        }
+    }
+
+    fn fq_index() -> usize {
+        pyre_object::gc_hook::try_gc_get_finalizer_queue_index(Self::fq_tag())
+    }
+
+    fn next_dead() -> Option<*mut pyre_object::cpybuffer::CPyBufferCarrier> {
+        let carrier = pyre_object::gc_hook::try_gc_finalizer_next_dead(Self::fq_index());
+        (!carrier.is_null()).then_some(carrier.cast())
+    }
+}
+
+fn fq_register_finalizer(carrier: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_register_finalizer(CPyBufferFinalizerQueue::fq_index(), carrier);
+}
+
+/// `pypy.module.cpyext.buffer.FQ.finalizer_trigger`: drain only dead
+/// `CPyBuffer` carriers and call `CPyBuffer.releasebuffer` directly.
+fn cpybuffer_finalizer_trigger() {
+    while let Some(carrier) = CPyBufferFinalizerQueue::next_dead() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(carrier.cast());
+        let carrier = pyre_object::gc_roots::shadow_stack_get(carrier_slot)
+            as *mut pyre_object::cpybuffer::CPyBufferCarrier;
+        let view = unsafe { pyre_object::cpybuffer::take_buffer(carrier) } as *mut CPyBuffer;
+        if !view.is_null() {
+            release_c_view(view);
+        }
+        // `pypy.module.cpyext.buffer.CPyBuffer.releasebuffer` clears `w_obj`
+        // after the native callback. Reload because that callback can collect.
+        let carrier = pyre_object::gc_roots::shadow_stack_get(carrier_slot)
+            as *mut pyre_object::cpybuffer::CPyBufferCarrier;
+        unsafe { pyre_object::cpybuffer::clear_w_obj(carrier) };
     }
 }
 
