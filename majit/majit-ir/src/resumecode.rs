@@ -843,6 +843,10 @@ fn detach(
         }
     };
     let index = index_ptr.load(Ordering::Relaxed);
+    if index == usize::MAX {
+        // Absent from this list: nothing to unlink.
+        return;
+    }
     let pos = if index < list.len() && list[index] == slot {
         Some(index)
     } else {
