@@ -2592,6 +2592,16 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if is_ptr_write(canonical_strip) {
         return Some(SKIP_PTR_WRITE);
     }
+    // `core::ptr::copy` is an opaque foreign decl with the same unique-
+    // graph hazard: Layer-1 `call_registry.lookup` would mint one empty
+    // body whose `mergeinputargs` unions every pointee. The overlap-safe
+    // move; the callsite reaches the `std.ptr.copy` host builtin
+    // (`std_ptr_copy`). The `copy` leaf is shared, so decline only the
+    // `ptr` path, and a bare-leaf alias whose `source_identity` is this
+    // path via `registration_decline_graph_origin`.
+    if is_ptr_copy(canonical_strip) {
+        return Some(SKIP_PTR_COPY);
+    }
     // `<*T>::add` / `wrapping_add` is one opaque foreign decl. Layer-1
     // `call_registry.lookup` would mint one empty body whose
     // `mergeinputargs` unions every pointee. The callsite is
@@ -2653,6 +2663,9 @@ const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 /// [`registration_decline`] reason for `ptr::write`.
 const SKIP_PTR_WRITE: &str = "skip-ptr-write";
 
+/// [`registration_decline`] reason for `ptr::copy`.
+const SKIP_PTR_COPY: &str = "skip-ptr-copy";
+
 /// [`registration_decline`] reason for `<*T>::add` / `wrapping_add`.
 const SKIP_PTR_ADD: &str = "skip-ptr-add";
 
@@ -2694,6 +2707,22 @@ fn is_ptr_write(canonical_strip: &[String]) -> bool {
                 && owner == "mut_ptr"
                 && impl_seg == "<Impl>"
                 && leaf == "write" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `core::ptr::copy` / `std::ptr::copy`. The `copy` leaf is not unique.
+/// `<*mut T>::copy_from` / `copy_to` call this free function and are
+/// not this path.
+fn is_ptr_copy(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [crate_or_std, module, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && leaf == "copy" =>
         {
             true
         }
@@ -4645,6 +4674,7 @@ pub(crate) fn register_unsafe_fn_stubs(
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING
                 || reason == SKIP_STD_ALLOC_RAW
                 || reason == SKIP_PTR_WRITE
+                || reason == SKIP_PTR_COPY
                 || reason == SKIP_PTR_ADD
                 || reason == SKIP_JIT_LL_ARRAYCOPY)
         {
@@ -10114,7 +10144,8 @@ mod tests {
         }
         assert_eq!(
             registration_decline(&["core".into(), "ptr".into(), "copy".into()]),
-            None
+            Some(SKIP_PTR_COPY),
+            "ptr::copy is declined as copy, not as copy_nonoverlapping"
         );
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
@@ -10444,6 +10475,157 @@ mod tests {
             &["std", "ptr", "write"][..],
             &["core", "ptr", "mut_ptr", "<Impl>", "write"][..],
         ] {
+            assert!(
+                stub_registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ptr_copy_is_declined_and_unregistered() {
+        for segments in [
+            vec!["core".to_string(), "ptr".into(), "copy".into()],
+            vec!["std".into(), "ptr".into(), "copy".into()],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_PTR_COPY),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["copy".into()]),
+            None,
+            "the copy leaf is shared with other functions"
+        );
+        assert_eq!(
+            registration_decline(&["foo".into(), "copy".into()]),
+            None,
+            "an unrelated foo::copy is not ptr::copy"
+        );
+        let mut origin = LegacyGraph::new("copy");
+        origin.source_identity = Some("core::ptr::copy".into());
+        assert_eq!(
+            registration_decline_graph_origin(&origin, &[]),
+            Some(SKIP_PTR_COPY),
+            "bare-leaf copy whose source_identity is core::ptr::copy is declined"
+        );
+        let mut foreign_origin = LegacyGraph::new("copy");
+        foreign_origin.source_identity = Some("user_mod::copy".into());
+        assert_eq!(
+            registration_decline_graph_origin(&foreign_origin, &[]),
+            None,
+            "an unrelated copy source_identity is not ptr::copy"
+        );
+        assert_eq!(
+            registration_decline(&[
+                "core".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "copy_from".into(),
+            ]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "ptr::copy");
+        fields.note_foreign_body_callable("std", "ptr::copy");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [vec!["core", "ptr", "copy"], vec!["std", "ptr", "copy"]] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            };
+            let mut graph = LegacyGraph::new("copy");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        let alias_path = crate::parse::CallPath::from_segments(["copy"]);
+        let mut alias_graph = LegacyGraph::new("copy");
+        alias_graph.set_return(alias_graph.startblock.clone(), None);
+        alias_graph.source_identity = Some("core::ptr::copy".into());
+        graphs.insert(alias_path, alias_graph);
+        let foreign_path = crate::parse::CallPath::from_segments(["user_mod", "copy"]);
+        let mut foreign_graph = LegacyGraph::new("copy");
+        foreign_graph.set_return(foreign_graph.startblock.clone(), None);
+        foreign_graph.source_identity = Some("user_mod::copy".into());
+        graphs.insert(foreign_path, foreign_graph);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "ptr", "copy"][..],
+            &["std", "ptr", "copy"][..],
+            &["copy"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["user_mod", "copy"]))
+                .is_some(),
+            "an unrelated copy stays registered"
+        );
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "copy"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.copy resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let mut stub_fields = crate::front::StructFieldRegistry::default();
+        stub_fields.note_foreign_body_callable("core", "ptr::copy");
+        stub_fields.note_foreign_body_callable("std", "ptr::copy");
+        stub_registry.set_struct_fields(std::rc::Rc::new(stub_fields));
+        let mut specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+            None,
+            None,
+        )];
+        for segments in [vec!["core", "ptr", "copy"], vec!["std", "ptr", "copy"]] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(
+                    vec!["src".to_string(), "dst".to_string(), "count".to_string()],
+                    None,
+                    None,
+                ),
+                None,
+                None,
+                None,
+            ));
+        }
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined ptr::copy specs must not be registered"
+        );
+        assert!(
+            stub_registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        for segments in [&["core", "ptr", "copy"][..], &["std", "ptr", "copy"][..]] {
             assert!(
                 stub_registry
                     .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))

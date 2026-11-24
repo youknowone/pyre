@@ -19295,8 +19295,11 @@ fn effect_transduce_op(
                 false,
             );
         }
-        name @ ("raw_memcopy" | "raw_memclear") => {
-            // `lloperation.py`: `LLOp(revdb_protect=True)`.
+        name @ ("raw_memcopy" | "raw_memmove" | "raw_memclear" | "gc_writebarrier_before_move") => {
+            // `lloperation.py`: `raw_memcopy` / `raw_memmove` /
+            // `raw_memclear` are `LLOp(revdb_protect=True)`;
+            // `gc_writebarrier_before_move` is a void llop with no
+            // struct/array field write (`writeanalyze.py` records none).
             // Generic llops keep the original argument list
             // (`SpaceOperation.args`); analyzers read the opname
             // (`GraphAnalyzer.analyze_simple_operation`).
@@ -35077,6 +35080,78 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(converted_raise("rmc", graph), CanRaise::No);
+    }
+
+    /// `lloperation.py`: `raw_memmove` is `LLOp(revdb_protect=True)`;
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
+    #[test]
+    fn effect_graph_raw_memmove_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let src = variable_with_lltype("src", LowLevelType::Address);
+        let dest = variable_with_lltype("dst", LowLevelType::Address);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let args = vec![
+            crate::flowspace::model::Hlvalue::Variable(src),
+            crate::flowspace::model::Hlvalue::Variable(dest),
+            crate::flowspace::model::Hlvalue::Variable(n),
+        ];
+        let graph = rtyped_one_op("rmm", "raw_memmove", args.clone(), result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args } if opname == "raw_memmove" => {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(effect_linkarg).collect()),
+            "raw_memmove: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("rmm", graph), CanRaise::No);
+    }
+
+    /// `lloperation.py`: `gc_writebarrier_before_move` is a void llop;
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
+    /// `writeanalyze.py analyze_simple_operation` records no struct/array
+    /// field write.
+    #[test]
+    fn effect_graph_gc_writebarrier_before_move_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let array = variable_with_lltype("a", LowLevelType::Address);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let args = vec![crate::flowspace::model::Hlvalue::Variable(array)];
+        let graph = rtyped_one_op("wb", "gc_writebarrier_before_move", args.clone(), result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args }
+                    if opname == "gc_writebarrier_before_move" =>
+                {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(effect_linkarg).collect()),
+            "gc_writebarrier_before_move: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("wb", graph), CanRaise::No);
     }
 
     fn converted_readwrite(

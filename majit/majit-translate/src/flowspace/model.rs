@@ -2221,6 +2221,11 @@ impl HostEnv {
             "raw_memcopy",
             HostObject::new_builtin_callable("llmemory.raw_memcopy"),
         );
+        // `llmemory.py` `raw_memmove` / `RawMemmoveEntry`.
+        llmemory.module_set(
+            "raw_memmove",
+            HostObject::new_builtin_callable("llmemory.raw_memmove"),
+        );
         llmemory.module_set(
             "raw_memclear",
             HostObject::new_builtin_callable("llmemory.raw_memclear"),
@@ -2259,7 +2264,8 @@ impl HostEnv {
         // so the module key matches the join shape.  Analyzers that
         // exist for these callables are registered in
         // `annotator/builtin.rs` (`std_ptr_eq`, `ptr_null_constant`,
-        // `std_ptr_copy_nonoverlapping`, `std_ptr_write`, `std_alloc_raw`).
+        // `std_ptr_copy_nonoverlapping`, `std_ptr_copy`, `std_ptr_write`,
+        // `std_alloc_raw`).
         let std_ptr = HostObject::new_module("std.ptr");
         std_ptr.module_set(
             "null_mut",
@@ -2270,6 +2276,7 @@ impl HostEnv {
             "copy_nonoverlapping",
             HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
         );
+        std_ptr.module_set("copy", HostObject::new_builtin_callable("std.ptr.copy"));
         // `std::ptr::write` / `core::ptr::write` — one-item store. Same
         // unique-graph hazard as `copy_nonoverlapping`: a residual body
         // `mergeinputargs`s every pointee into one slot. Bind one
@@ -2619,6 +2626,14 @@ impl HostEnv {
             std_ptr
                 .module_get("copy_nonoverlapping")
                 .expect("std.ptr.copy_nonoverlapping bound above"),
+        );
+        // `std::ptr::copy` re-exports `core::ptr::copy`; both spellings
+        // share one HostObject.
+        core_ptr.module_set(
+            "copy",
+            std_ptr
+                .module_get("copy")
+                .expect("std.ptr.copy bound above"),
         );
         core_ptr.module_set(
             "write",

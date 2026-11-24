@@ -400,6 +400,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "std.ptr.copy_nonoverlapping",
         std_ptr_copy_nonoverlapping,
     );
+    analyzer_for(&mut reg, "std.ptr.copy", std_ptr_copy);
     // `core.ptr.write` is the same `HostObject` as `std.ptr.write`
     // (`flowspace/model.rs`), so this qualname covers both spellings
     // and `core.ptr.mut_ptr.<Impl>.write`.
@@ -1833,6 +1834,27 @@ fn std_ptr_copy_nonoverlapping(
     if !kwds.is_empty() || args_s.len() != 3 {
         return Err(AnnotatorError::new(
             "std.ptr.copy_nonoverlapping expects (src, dst, count)",
+        ));
+    }
+    Ok(s_none())
+}
+
+/// `std::ptr::copy(src, dst, count) -> ()`.
+///
+/// The overlap-safe move, rtyped to `llmemory.raw_memmove`. The
+/// foreign decl is opaque. A user graph for it has one input slot
+/// per argument, and `mergeinputargs` unions every caller's pointee
+/// into that slot. `llmemory.raw_memmove` returns nothing and does
+/// not read the pointee, so this analyzer does not either: `()` is
+/// `s_None`.
+fn std_ptr_copy(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 3 {
+        return Err(AnnotatorError::new(
+            "std.ptr.copy expects (src, dst, count)",
         ));
     }
     Ok(s_none())
@@ -8547,6 +8569,40 @@ mod tests {
         let err = call_builtin(
             &bk,
             "std.ptr.copy_nonoverlapping",
+            &[Some(inst), Some(count.clone())],
+            &no_kwds(),
+        )
+        .expect_err("two arguments are not the signature");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("expects (src, dst, count)")
+        );
+    }
+
+    #[test]
+    fn copy_returns_none_for_an_instance_and_a_string() {
+        let bk = bk();
+        let inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let text = SomeValue::String(SomeString::new(false, false));
+        let count = SomeValue::Integer(SomeInteger::new(true, true));
+        for (src, dst) in [(&inst, &inst), (&text, &text), (&inst, &text)] {
+            let result = call_builtin(
+                &bk,
+                "std.ptr.copy",
+                &[Some(src.clone()), Some(dst.clone()), Some(count.clone())],
+                &no_kwds(),
+            )
+            .expect("copy annotates");
+            assert!(
+                matches!(result, SomeValue::None_(_)),
+                "copy returns (), got {result:?}"
+            );
+        }
+        let err = call_builtin(
+            &bk,
+            "std.ptr.copy",
             &[Some(inst), Some(count.clone())],
             &no_kwds(),
         )

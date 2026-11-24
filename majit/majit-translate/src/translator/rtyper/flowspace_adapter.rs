@@ -2823,10 +2823,10 @@ fn enum_base_leaf_is_option(owner: &str) -> bool {
 /// The registry probe is `CallRegistry::lookup_existing`: a pure
 /// identity test (`extregistry.is_registered`), never a materializing
 /// lookup.
-fn declared_llop(
+fn callee_registry_entry(
     target: &crate::model::CallTarget,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
-) -> Option<String> {
+) -> Option<Rc<crate::translator::rtyper::call_registry::FunctionEntry>> {
     use crate::model::CallTarget;
     use crate::translator::rtyper::call_registry::FunctionPathKey;
     let key = match target {
@@ -2848,8 +2848,14 @@ fn declared_llop(
         }
         _ => return None,
     };
-    let entry = call_registry.lookup_existing(&key)?;
-    entry
+    call_registry.lookup_existing(&key)
+}
+
+fn declared_llop(
+    target: &crate::model::CallTarget,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Option<String> {
+    callee_registry_entry(target, call_registry)?
         .function_desc
         .borrow()
         .base
@@ -2857,6 +2863,48 @@ fn declared_llop(
         .as_ref()
         .and_then(HostObject::user_function)
         .and_then(|func| func._jit_llop_.clone())
+}
+
+/// `lloperation.py` `_LLOpEntry`: `simple_call(llop.<opname>, RESULTTYPE, *args)`.
+///
+/// `GraphFunc` carries `_jit_llop_` only; it has no declared result type.
+/// `FunctionEntry.declared_funcptr_type` is the callee `FuncType` when
+/// populate could project one. A missing projection is Void — only a
+/// unit-returning source marker is lowered generically.
+fn translate_catalogued_llop_call(
+    opname: &str,
+    target: &crate::model::CallTarget,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    arg_hls: Vec<Hlvalue>,
+    result: Hlvalue,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
+    if !ll_operations().contains_key(opname) {
+        return Err(TyperError::message(format!(
+            "jit_llop {opname}: not in LL_OPERATIONS"
+        )));
+    }
+    if let Some(entry) = callee_registry_entry(target, call_registry)
+        && let Some(ft) = entry.declared_funcptr_type.borrow().as_ref()
+        && ft.result != LowLevelType::Void
+    {
+        return Err(TyperError::message(format!(
+            "jit_llop {opname}: only Void-result markers are lowered generically (RESULTTYPE)"
+        )));
+    }
+    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+        HostObject::new_builtin_callable(format!(
+            "rpython.rtyper.lltypesystem.lloperation.llop.{opname}"
+        )),
+    )));
+    let resulttype = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+        LowLevelType::Void,
+    ))));
+    let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+    call_args.push(callable);
+    call_args.push(resulttype);
+    call_args.extend(arg_hls);
+    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
 }
 
 /// A `CallTarget::FunctionPath` [`translate_op`] rewrites to a high-level
@@ -4523,6 +4571,15 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    if let Some(opname) = declared_llop(target, call_registry) {
+                        return translate_catalogued_llop_call(
+                            &opname,
+                            target,
+                            call_registry,
+                            arg_hls,
+                            result,
+                        );
+                    }
                     // Fail-closed on an UNFUSED
                     // `lltype::malloc[_typed/_managed/_stable]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
@@ -5058,6 +5115,12 @@ pub fn translate_op(
                     call_args.push(callable);
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                }
+                CallTarget::Method { .. } if declared_llop(target, call_registry).is_some() => {
+                    let opname = declared_llop(target, call_registry).ok_or_else(|| {
+                        TyperError::message("declared llop missing after translate_op Method guard")
+                    })?;
+                    translate_catalogued_llop_call(&opname, target, call_registry, arg_hls, result)
                 }
                 CallTarget::Method {
                     name,

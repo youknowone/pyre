@@ -48,10 +48,11 @@ use crate::translator::rtyper::rrange::{
     rtype_builtin_enumerate, rtype_builtin_range, rtype_builtin_xrange,
 };
 
-use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
+use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::extregistry::{self, ExtRegistryEntry};
+use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::rtyper::lltypesystem::lltype::{
     LowLevelType, signed_long_long, unsigned_long_long,
 };
@@ -488,6 +489,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "raw_memcopy",
             rtype_raw_memcopy,
         ),
+        // `llmemory.py` `RawMemmoveEntry.specialize_call`.
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "raw_memmove",
+            rtype_raw_memmove,
+        ),
         // rbuiltin.py:611-618
         (
             "rpython.rtyper.lltypesystem.llmemory",
@@ -541,6 +548,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
         ("std.ptr", "copy_nonoverlapping", rtype_copy_nonoverlapping),
+        ("std.ptr", "copy", rtype_copy),
         // `core.ptr` / `mut_ptr.<Impl>` share the `std.ptr.write` attr
         // instance (model.rs), so one entry covers every spelling.
         ("std.ptr", "write", rtype_ptr_write),
@@ -1877,6 +1885,99 @@ pub(super) fn rtype_jit_force_quasi_immutable(
         vec![v_inst, c_fieldname],
         GenopResult::LLType(LowLevelType::Void),
     ))
+}
+
+/// `lloperation.py` `_LLOpEntry.specialize_call`.
+///
+/// `BuiltinFunctionRepr.rtype_simple_call` has already popped the
+/// callable, so hop arg 0 is RESULTTYPE. Remaining args are the llop
+/// operands (`hop.args_s[1:]`). The opname is the `SomeBuiltin.methodname`
+/// stored on the callable (`ExtRegistryEntry::LLOp`), read back from
+/// `spaceop.args[0]` after the pop.
+pub(super) fn rtype_llop(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let opname = llop_opname_from_hop(hop)?;
+    if hop.nb_args() < 1 {
+        return Err(TyperError::message(format!(
+            "rtype_llop {opname}: RESULTTYPE missing"
+        )));
+    }
+    let mut args_v = Vec::new();
+    for i in 1..hop.nb_args() {
+        let s_arg = hop.args_s.borrow().get(i).cloned().ok_or_else(|| {
+            TyperError::message(format!("rtype_llop {opname}: missing args_s[{i}]"))
+        })?;
+        let r_arg = hop
+            .args_r
+            .borrow()
+            .get(i)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| {
+                TyperError::message(format!("rtype_llop {opname}: missing args_r[{i}]"))
+            })?;
+        if s_arg.is_constant() {
+            let cv = s_arg.const_().cloned().ok_or_else(|| {
+                TyperError::message(format!(
+                    "rtype_llop {opname}: args_s[{i}] is constant without const"
+                ))
+            })?;
+            args_v.push(Hlvalue::Constant(HighLevelOp::inputconst(&r_arg, &cv)?));
+        } else {
+            args_v.push(hop.inputarg(&r_arg, i)?);
+        }
+    }
+    let canraise = ll_operations()
+        .get(opname)
+        .map(|op| !op.canraise.is_empty())
+        .ok_or_else(|| TyperError::message(format!("rtype_llop {opname}: not in LL_OPERATIONS")))?;
+    if canraise {
+        hop.exception_is_here()?;
+    } else {
+        hop.exception_cannot_occur()?;
+    }
+    let resulttype = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .map(|r| r.lowleveltype().clone());
+    match resulttype {
+        None | Some(LowLevelType::Void) => {
+            let _ = hop.genop(opname, args_v, GenopResult::Void);
+            let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+            Ok(Some(Hlvalue::Constant(void_const)))
+        }
+        Some(ll) => Ok(hop.genop(opname, args_v, GenopResult::LLType(ll))),
+    }
+}
+
+fn llop_opname_from_hop(hop: &HighLevelOp) -> Result<&'static str, TyperError> {
+    let callable = hop.spaceop.args.first().ok_or_else(|| {
+        TyperError::message("rtype_llop: callable missing from spaceop.args after r_s_popfirstarg")
+    })?;
+    if let Hlvalue::Constant(c) = callable
+        && let Some(ExtRegistryEntry::LLOp { opname }) = extregistry::lookup(&c.value)
+    {
+        return Ok(opname);
+    }
+    match hop.rtyper.binding(callable) {
+        SomeValue::Builtin(sb) => {
+            let name = sb.methodname.ok_or_else(|| {
+                TyperError::message("rtype_llop: SomeBuiltin.methodname missing on the callable")
+            })?;
+            ll_operations()
+                .get_key_value(name.as_str())
+                .map(|(&key, _)| key)
+                .ok_or_else(|| {
+                    TyperError::message(format!("rtype_llop: {name} is not in LL_OPERATIONS"))
+                })
+        }
+        other => Err(TyperError::message(format!(
+            "rtype_llop: callable is not SomeBuiltin, got {:?}",
+            other.tag()
+        ))),
+    }
 }
 
 /// `rlib/jit.py ConditionalCallEntry.specialize_call` for
@@ -3950,6 +4051,32 @@ pub fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     Ok(hop.genop("raw_memcopy", vlist, GenopResult::Void))
 }
 
+/// `llmemory.py` `RawMemmoveEntry.specialize_call` — same Address /
+/// Address / Signed operands as `rtype_raw_memcopy`, emitting
+/// `raw_memmove`.
+pub fn rtype_raw_memmove(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let args_s = hop.args_s.borrow();
+    for s_addr in args_s.iter().take(2) {
+        if let SomeValue::Address(s) = s_addr
+            && s.is_null_address()
+        {
+            return Err(TyperError::message("raw_memmove() with a constant NULL"));
+        }
+    }
+    drop(args_s);
+
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Address),
+        ConvertedTo::LowLevelType(&LowLevelType::Address),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("raw_memmove", vlist, GenopResult::Void))
+}
+
 /// rbuiltin.py:611-618
 pub fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeValue;
@@ -4817,12 +4944,23 @@ fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRes
 /// constant after `raw_memcopy`, as `rtype_keepalive` does for
 /// `immutablevalue(None)`.
 fn rtype_copy_nonoverlapping(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    rtype_raw_move(hop, "copy_nonoverlapping", "raw_memcopy")
+}
+
+/// `std::ptr::copy(src, dst, count)`, the overlap-safe move
+/// (`llmemory.py` `raw_memmove`, as `rgc.ll_arraymove` uses it); same
+/// byte scaling and `Address` operands.
+fn rtype_copy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    rtype_raw_move(hop, "copy", "raw_memmove")
+}
+
+fn rtype_raw_move(hop: &HighLevelOp, name: &str, llop: &str) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
     if hop.nb_args() != 3 {
         return Err(TyperError::message(format!(
-            "copy_nonoverlapping: expected 3 arguments, got {}",
+            "{name}: expected 3 arguments, got {}",
             hop.nb_args()
         )));
     }
@@ -4837,11 +4975,7 @@ fn rtype_copy_nonoverlapping(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     let v_src = ptr_as_address(hop, vlist[0].clone(), r0.lowleveltype())?;
     let v_dst = ptr_as_address(hop, vlist[1].clone(), r1.lowleveltype())?;
     let v_nbytes = scale_copy_count(hop, r0.lowleveltype(), vlist[2].clone())?;
-    let _ = hop.genop(
-        "raw_memcopy",
-        vec![v_src, v_dst, v_nbytes],
-        GenopResult::Void,
-    );
+    let _ = hop.genop(llop, vec![v_src, v_dst, v_nbytes], GenopResult::Void);
     let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
     Ok(Some(Hlvalue::Constant(void_const)))
 }
@@ -7077,6 +7211,31 @@ mod tests {
     }
 
     #[test]
+    fn copy_typer_is_shared_by_core_and_std_ptr() {
+        let std_host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("copy"))
+            .expect("HOST_ENV missing std.ptr.copy");
+        let core_host = HOST_ENV
+            .import_module("core.ptr")
+            .and_then(|m| m.module_get("copy"))
+            .expect("HOST_ENV missing core.ptr.copy");
+        assert_eq!(
+            std_host, core_host,
+            "core.ptr.copy must be the std.ptr HostObject"
+        );
+        assert_eq!(std_host.qualname(), "std.ptr.copy");
+        assert!(
+            lookup_typer(&std_host).is_some(),
+            "BUILTIN_TYPER missing std.ptr.copy"
+        );
+        assert!(
+            lookup_typer(&core_host).is_some(),
+            "the shared HostObject must carry the typer"
+        );
+    }
+
+    #[test]
     fn ptr_write_typer_is_shared_by_core_and_std_ptr() {
         let std_host = HOST_ENV
             .import_module("std.ptr")
@@ -7205,6 +7364,98 @@ mod tests {
         assert!(
             names.iter().any(|name| name == "raw_memcopy"),
             "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "int_mul"),
+            "element count must scale by sizeof, missing int_mul in {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "cast_ptr_to_adr"),
+            "Ptr operands must convert to Address, missing cast_ptr_to_adr in {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn copy_s_none_simple_call_emits_raw_memmove() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("copy"))
+            .expect("HOST_ENV missing std.ptr.copy");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // Instance / OBJECT is a fixed-size GcStruct. SomeString's STR
+        // is varsize (`chars` array), so sizeof of that pointee errors.
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("copy hop setup");
+        // `setup_block_entry` stamps each input's concretetype before
+        // `translate_hl_to_ll`. These operands are not block inputs.
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("s_None simple_call must agree with the void copy");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memmove"),
+            "raw_memmove missing from {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "raw_memcopy"),
+            "copy must not emit raw_memcopy, got {names:?}"
         );
         assert!(
             names.iter().any(|name| name == "int_mul"),
@@ -7923,6 +8174,19 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `llmemory.raw_malloc_usage`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_raw_memmove_from_llmemory_module() {
+        // `llmemory.py` `RawMemmoveEntry`.
+        let host = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.llmemory")
+            .and_then(|m| m.module_get("raw_memmove"))
+            .expect("HOST_ENV missing llmemory.raw_memmove");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `llmemory.raw_memmove`"
         );
     }
 
@@ -8716,6 +8980,63 @@ mod tests {
         assert!(
             llops._called_exception_is_here_or_cannot_occur,
             "the typer must declare that the force cannot raise",
+        );
+    }
+
+    /// `_LLOpEntry.specialize_call` genops the catalogued opname. Arg 0
+    /// is RESULTTYPE (skipped); the remaining args are the llop operands.
+    #[test]
+    fn rtype_llop_emits_the_named_void_op() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let mut hop = dummy_hop();
+        hop.spaceop
+            .args
+            .push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                HostObject::new_builtin_callable(
+                    "rpython.rtyper.lltypesystem.lloperation.llop.gc_writebarrier_before_move",
+                ),
+            ))));
+
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
+                Box::new(LowLevelType::Void),
+            ))));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::s_none());
+        hop.args_r.borrow_mut().push(None);
+
+        let array = Variable::named("v_array");
+        array.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(array));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        let array_repr: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
+        hop.args_r.borrow_mut().push(Some(array_repr));
+
+        rtype_llop(&hop, &HashMap::new()).expect("rtype_llop");
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the named llop is emitted");
+        assert_eq!(last.opname, "gc_writebarrier_before_move");
+        assert_eq!(last.args.len(), 1, "one operand after RESULTTYPE");
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("the array argument must stay a Variable, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("the llop result must be Void, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "the typer must declare whether the llop can raise",
         );
     }
 
