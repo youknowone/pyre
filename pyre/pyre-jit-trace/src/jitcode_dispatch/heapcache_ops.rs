@@ -21,9 +21,7 @@ use super::*;
 /// there; that shadow holds the same MIFrame box value, so it answers after
 /// the ordinary OpRef carrier rather than instead of it.
 ///
-/// A null and an all-ones word are both rejected: null is no object, and
-/// all-ones is `GcRef::NO_CONCRETE`, an unresolved-ref sentinel rather
-/// than a live pointer.
+/// Null, `GcRef::NO_CONCRETE`, and the all-ones tombstone are rejected.
 fn concrete_ref_operand_ptr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -34,16 +32,19 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
     ctx.trace_ctx
         .box_value(obj)
         .and_then(|value| match value {
-            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
+            majit_ir::Value::Ref(reference) if reference.is_concrete() => Some(reference.0 as i64),
             _ => None,
         })
         .or_else(
             || match read_ref_reg_concrete(code, op, operand_offset, ctx) {
-                ConcreteValue::Ref(reference) => Some(reference as usize as i64),
+                ConcreteValue::Ref(reference) => {
+                    let reference = majit_ir::GcRef(reference as usize);
+                    reference.is_concrete().then_some(reference.0 as i64)
+                }
                 _ => None,
             },
         )
-        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
+        .filter(|&ptr| ptr != usize::MAX as i64)
 }
 
 /// The live value of a store's value operand, or `None` where the walk holds
@@ -950,7 +951,7 @@ fn interior_field_addr(
     index: i64,
     access: &InteriorFieldAccess,
 ) -> Option<*mut u8> {
-    if array_ptr == 0
+    if !majit_ir::GcRef(array_ptr as usize).is_concrete()
         || array_ptr == usize::MAX as i64
         || !majit_ir::ptr_info::reasonable_array_index(index)
     {
@@ -1995,7 +1996,7 @@ pub(crate) fn opimpl_copystrcontent<Sym: WalkSym>(
 mod tests {
     use std::sync::Arc;
 
-    use super::interior_field_access;
+    use super::{InteriorFieldAccess, interior_field_access, interior_field_addr};
 
     /// The flat `GcTypedArray` header and an 8-aligned `GcEntries` item
     /// base differ on wasm32 and match on a 64-bit host. A descr base
@@ -2046,5 +2047,19 @@ mod tests {
             super::materialize_cleared_struct_gcarray(8, published, item_size, items_base)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn no_concrete_ref_is_never_an_interior_address() {
+        let access = InteriorFieldAccess {
+            items_base: 8,
+            field_offset: 0,
+            field_size: 8,
+            item_size: 8,
+            field_type: 1,
+            signed: false,
+        };
+        assert!(!majit_ir::GcRef::NO_CONCRETE.is_concrete());
+        assert!(interior_field_addr(majit_ir::GcRef::NO_CONCRETE.0 as i64, 0, &access,).is_none());
     }
 }

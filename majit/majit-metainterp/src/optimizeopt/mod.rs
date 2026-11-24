@@ -7626,7 +7626,7 @@ impl OptContext {
         // reads `box.getref_base()`); the tracked `setfield_gc` source is
         // consulted only for an unmaterialized virtual with no pointer.
         let raw = match self.runtime_value_of(runtime_box) {
-            Some(Value::Ref(gcref)) if !gcref.is_null() => gcref.0 as i64,
+            Some(Value::Ref(gcref)) if gcref.is_concrete() => gcref.0 as i64,
             _ => {
                 if let Some(field) = self.get_virtual_runtime_field(runtime_box, descr) {
                     return Some(field);
@@ -7802,7 +7802,7 @@ impl OptContext {
         // `runtime_value_of` reads the box's own stamped value
         // (`InputArg*.value`).
         let raw = match self.runtime_value_of(runtime_box)? {
-            Value::Ref(gcref) if !gcref.is_null() => gcref.0 as i64,
+            Value::Ref(gcref) if gcref.is_concrete() => gcref.0 as i64,
             _ => return None,
         };
         let ad = descr.as_array_descr()?;
@@ -7869,7 +7869,7 @@ impl OptContext {
         // reads `box.getref_base()`); the tracked `setfield_gc` source is
         // consulted only for an unmaterialized virtual with no pointer.
         let raw = match self.runtime_value_of(runtime_box) {
-            Some(Value::Ref(gcref)) if !gcref.is_null() => gcref.0 as i64,
+            Some(Value::Ref(gcref)) if gcref.is_concrete() => gcref.0 as i64,
             _ => {
                 if let Some(field) = self.get_virtual_runtime_interiorfield(runtime_box, descr, i) {
                     return Some(field);
@@ -9010,6 +9010,56 @@ mod get_runtime_field_tests {
             .expect("live field");
         assert_eq!(got.const_value(), Some(Value::Int(2)));
         let _keep = (heap, ia);
+    }
+
+    #[test]
+    fn no_concrete_runtime_refs_fall_back_without_dereference() {
+        assert!(!GcRef::NULL.is_concrete());
+        assert!(!GcRef::NO_CONCRETE.is_concrete());
+        assert!(GcRef(8).is_concrete());
+
+        let mut ctx = OptContext::new(0);
+        let (runtime_box, ia) = bound_inputarg_operand(Type::Ref, 0);
+        ia.set_value(Value::Ref(GcRef::NO_CONCRETE));
+
+        let field = Arc::new(SimpleFieldDescr::new(0x1000_0001, 0, 8, Type::Int, false));
+        let field_descr: DescrRef = field.clone();
+        let mut fields = VirtualFieldList::new();
+        fields.push((0, Operand::const_from_value(Value::Int(17))));
+        ctx.set_ptr_info(
+            &runtime_box,
+            PtrInfo::Virtual(VirtualInfo {
+                descr: Arc::new(majit_ir::descr::SimpleSizeDescr::new(0x3000_0001, 16, 1)),
+                known_class: None,
+                ob_type_descr: None,
+                fields,
+                last_guard_pos: -1,
+                avpi: AbstractVirtualPtrInfo::new(),
+            }),
+        );
+        assert_eq!(
+            ctx.get_runtime_field(&runtime_box, &field_descr)
+                .and_then(|op| op.const_value()),
+            Some(Value::Int(17)),
+        );
+
+        let array = Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+            0x2000_0001,
+            8,
+            8,
+            0,
+            Type::Int,
+        ));
+        let interior: DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            0x2000_0002,
+            array,
+            field,
+        ));
+        assert!(
+            ctx.get_runtime_interiorfield(&runtime_box, &interior, 0)
+                .is_none()
+        );
+        let _keep = ia;
     }
 }
 
