@@ -645,6 +645,13 @@ trait AssemblerEncode {
         callcontrol: Option<&CallControl>,
     ) -> u8;
 
+    fn emit_class_vtable_const_i(
+        &mut self,
+        ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8;
+
     fn emit_const_r(
         &mut self,
         value: &ConstValue,
@@ -4413,6 +4420,22 @@ impl AssemblerEncode for Assembler {
                 );
                 return (self.emit_fnaddr_const(&target, state, callcontrol), 'i');
             }
+            if ptr.nonzero() {
+                use crate::translator::rtyper::lltypesystem::lltype::{
+                    GcKind, LowLevelType, PtrTarget,
+                };
+                let is_raw_struct = match &ptr._TYPE.TO {
+                    PtrTarget::Struct(s) => s._gckind == GcKind::Raw,
+                    PtrTarget::ForwardReference(fr) => matches!(
+                        fr.resolved().as_ref(),
+                        Some(LowLevelType::Struct(s)) if s._gckind == GcKind::Raw
+                    ),
+                    _ => false,
+                };
+                if is_raw_struct {
+                    return (self.emit_class_vtable_const_i(ptr, state, callcontrol), 'i');
+                }
+            }
         }
         if let ConstValue::LLAddress(
             crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n),
@@ -4626,27 +4649,34 @@ impl AssemblerEncode for Assembler {
             // `bh_classof` reads word 0 and `bh_issubclass` compares it
             // with `majit_gc::subclass_range` (`exceptiondata.ll_issubclass`,
             // `jtransform.py` `goto_if_exception_mismatch`).
-            ConstValue::LLPtr(ptr) => {
-                let typeptr = object_vtable_typeptr(ptr);
-                if let Some(name) = vtable_class_name(&typeptr) {
-                    let pytypes = callcontrol.map_or(&[][..], CallControl::exc_pytype_rows);
-                    if let Some((row_name, bits)) =
-                        lookup_exc_static_row_named(pytypes, &name, "_TYPE")
-                    {
-                        return self.emit_const_i_reloc(
-                            bits,
-                            ConstIRelocKind::StaticAddr { name: row_name },
-                            state,
-                        );
-                    }
-                }
-                let bits = rpython_exception_vtable_word(ptr);
-                self.emit_const_i(bits, state)
-            }
+            ConstValue::LLPtr(ptr) => self.emit_class_vtable_const_i(ptr, state, callcontrol),
             other => {
                 panic!("goto_if_exception_mismatch: unsupported llexitcase constant {other:?}")
             }
         }
+    }
+
+    fn emit_class_vtable_const_i(
+        &mut self,
+        ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
+        // `object_vtable_typeptr` returns `ptr` unchanged when the pointee
+        // is already `OBJECT_VTABLE`; subclass vtables walk `super`.
+        let typeptr = object_vtable_typeptr(ptr);
+        if let Some(name) = vtable_class_name(&typeptr) {
+            let pytypes = callcontrol.map_or(&[][..], CallControl::exc_pytype_rows);
+            if let Some((row_name, bits)) = lookup_exc_static_row_named(pytypes, &name, "_TYPE") {
+                return self.emit_const_i_reloc(
+                    bits,
+                    ConstIRelocKind::StaticAddr { name: row_name },
+                    state,
+                );
+            }
+        }
+        let bits = rpython_exception_vtable_word(ptr);
+        self.emit_const_i(bits, state)
     }
 
     fn emit_const_r(

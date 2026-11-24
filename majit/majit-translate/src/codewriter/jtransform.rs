@@ -19038,7 +19038,7 @@ fn materialize_const_result(
     }
 }
 
-fn materialize_const_result_copy(
+pub(crate) fn materialize_const_result_copy(
     result: crate::flowspace::model::Variable,
     c: &crate::flowspace::model::Constant,
 ) -> SpaceOperation {
