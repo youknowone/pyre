@@ -1625,12 +1625,17 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     pub(in crate::front::mir) fn try_lower_usize_try_from(
         &mut self,
         mir_bb: usize,
         kind: &CallKind,
         segments: &[String],
         args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
         dest_local: usize,
         dest_ty: &TyRef,
         target: usize,
@@ -1639,7 +1644,7 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         if first.as_str() != "core"
-            || module.as_str() != "ptr_try_from_impls"
+            || !matches!(module.as_str(), "num" | "ptr_try_from_impls")
             || impl_seg.as_str() != "<Impl>"
             || leaf.as_str() != "try_from"
         {
@@ -1654,25 +1659,27 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Ok(false);
         };
-        let Some(src) = fd.signature.inputs.first() else {
+        let declared_src = fd.signature.inputs.first();
+        let src_uint_atom = declared_src
+            .and_then(|src| self.tyref_literal_uint_atom(src))
+            .or_else(|| first_arg_ty.and_then(|src| self.tyref_literal_uint_atom(src)));
+        let src_int_atom = declared_src
+            .and_then(|src| self.tyref_literal_int_atom(src))
+            .or_else(|| first_arg_ty.and_then(|src| self.tyref_literal_int_atom(src)));
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
             return Ok(false);
         };
-        let src_is_small_uint = matches!(
-            self.tyref_literal_uint_atom(src),
-            Some("U8" | "U16" | "U32")
-        );
-        let src_is_signed_word = match self.tyref_literal_int_atom(src) {
+        let dst_uint_atom = self.tyref_literal_uint_atom(&success_ty);
+        let dst_int_atom = self.tyref_literal_int_atom(&success_ty);
+        let usize_to_isize = src_uint_atom == Some("Usize") && dst_int_atom == Some("Isize");
+        let src_is_small_uint = matches!(src_uint_atom, Some("U8" | "U16" | "U32"));
+        let src_is_signed_word = match src_int_atom {
             Some("Isize") => true,
             Some("I64") => self.llbc.target_pointer_size() == Some(8),
             _ => false,
         };
-        if !src_is_small_uint && !src_is_signed_word {
-            return Ok(false);
-        }
-        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
-            return Ok(false);
-        };
-        if self.tyref_literal_uint_atom(&success_ty) != Some("Usize") {
+        let to_usize = dst_uint_atom == Some("Usize") && (src_is_small_uint || src_is_signed_word);
+        if !usize_to_isize && !to_usize {
             return Ok(false);
         }
         let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
@@ -1692,6 +1699,49 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
+        if usize_to_isize {
+            let max = match self.llbc.target_pointer_size() {
+                Some(4) => i32::MAX as u64,
+                Some(8) => i64::MAX as u64,
+                _ => return Ok(false),
+            };
+            let bb_id = self.emit_bb(mir_bb);
+            let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(result.clone()),
+                    kind,
+                });
+                result
+            };
+            let max = push_op(&mut self.graph, OpKind::ConstUInt(max));
+            let disc = push_op(
+                &mut self.graph,
+                OpKind::BinOp {
+                    op: "gt".to_string(),
+                    lhs: arg.clone(),
+                    rhs: max,
+                    result_ty: ValueType::Int,
+                },
+            );
+            let payload = push_op(
+                &mut self.graph,
+                rarithmetic_mask("intmask", arg, ValueType::Int),
+            );
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate_typed(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                payload,
+                ValueType::Int,
+                dest_local,
+                target,
+            )?;
+            return Ok(true);
+        }
         if src_is_signed_word {
             let bb_id = self.emit_bb(mir_bb);
             let push_op = |graph: &mut FunctionGraph, kind: OpKind| {

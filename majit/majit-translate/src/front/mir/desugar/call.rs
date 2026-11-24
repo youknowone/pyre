@@ -6346,6 +6346,7 @@ impl<'a> Lowering<'a> {
                     &reg.kind,
                     &segments,
                     &args,
+                    first_arg_ty.as_ref(),
                     dest_local,
                     &call.dest.ty,
                     target,

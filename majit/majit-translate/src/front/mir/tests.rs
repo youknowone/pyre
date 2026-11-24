@@ -26316,6 +26316,96 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
     );
 }
 
+/// `publish_physical_capacity` checks whether a physical `usize` capacity
+/// fits the signed strategy-size word. The generic core `TryFrom` shell must
+/// become one unsigned upper-bound test and one signed payload retype.
+#[test]
+fn publish_physical_capacity_lowers_usize_to_isize_try_from() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(
+        llbc,
+        "pyre_object::listobject::publish_physical_capacity",
+    )
+    .expect("lower listobject::publish_physical_capacity");
+
+    let residuals: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["core", "convert", "num", "<Impl>", "try_from"] => {
+                Some(segments.join("::"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residuals.is_empty(),
+        "usize-to-isize conversion must not leave an opaque core call: {residuals:?}"
+    );
+
+    let signed_max = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match (&op.result, &op.kind) {
+            (Some(result), OpKind::ConstUInt(value))
+                if *value == i32::MAX as u64 || *value == i64::MAX as u64 =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .expect("usize-to-isize lowering emits the target signed maximum");
+    let has_unsigned_bound = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp {
+                    op,
+                    rhs,
+                    result_ty: ValueType::Int,
+                    ..
+                } if op == "gt" && rhs == &signed_max
+            )
+        });
+    assert!(
+        has_unsigned_bound,
+        "usize-to-isize Result discriminant is the unsigned upper-bound test; graph={}",
+        graph.dump()
+    );
+
+    let has_intmask = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Int,
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        });
+    assert!(
+        has_intmask,
+        "the successful usize payload must be retyped to Signed; graph={}",
+        graph.dump()
+    );
+}
+
 /// `complex_val` returns the RPython spelling of an optional pair.  The
 /// arithmetic helpers call `unwrap` only after their numeric dispatch has
 /// established the value is present. The extracted core body is a regular
