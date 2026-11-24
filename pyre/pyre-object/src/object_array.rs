@@ -282,16 +282,17 @@ unsafe fn arraycopy_store_item(
     }
 }
 
-/// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
-/// target for the `list.ll_arraymove` oopspec (OS_ARRAYMOVE / 9).
+/// `rgc.ll_arraymove(array, source_start, dest_start, length)` — residual
+/// target the codewriter installs for OS_ARRAYMOVE (`list.ll_arraymove`).
+/// No source graph calls this body; the annotatable wrappers
+/// (`ll_arraymove_*_items_block`) run `gc_writebarrier_before_move` and
+/// `ptr::copy` themselves.
 ///
-/// RPython's native path calls `gc_writebarrier_before_move` when the array
-/// item contains GC pointers, casts the two item addresses to raw addresses,
-/// and invokes `raw_memmove_no_free`. The residual ABI deliberately keeps
-/// only those same four arguments. For a managed block, the existing GC
-/// TYPE_INFO row supplies the array token and `_contains_gcptr(TYPE.OF)` bit;
-/// a raw fallback block uses the `GcArray(PyObjectRef)` token this adapter
-/// boundary allocates. `ptr::copy` has memmove's overlap contract.
+/// The residual ABI keeps the same four arguments. For a managed block, the
+/// existing GC TYPE_INFO row supplies the array token and
+/// `_contains_gcptr(TYPE.OF)` bit; a raw fallback block uses the
+/// `GcArray(PyObjectRef)` token this adapter boundary allocates. `ptr::copy`
+/// has memmove's overlap contract.
 pub extern "C" fn jit_ll_arraymove(
     array: crate::PyObjectRef,
     source_start: i64,
@@ -633,9 +634,11 @@ pub unsafe fn ll_arraycopy_float_items_block(
 ///
 /// The `length <= 1` head is rgc.py `copy_item` (`array[dest_start] =
 /// array[source_start]`), kept as an explicit write-barriered store so the
-/// effect info sees the ARRAY write. Longer moves run [`jit_ll_arraymove`],
-/// which performs `gc_writebarrier_before_move` (`_contains_gcptr(TP.OF)`)
-/// and the overlap-safe memmove.
+/// EffectInfo sees the ARRAY write. Longer moves run
+/// `gc_writebarrier_before_move` (`_contains_gcptr(TP.OF)`) and the
+/// overlap-safe `ptr::copy` (`raw_memmove`) in this body.
+/// `jit_ll_arraymove` is only the residual target the codewriter installs
+/// for OS_ARRAYMOVE.
 ///
 /// # Safety
 /// `array` is a live `ItemsBlock` and both ranges are in bounds.
@@ -654,11 +657,25 @@ pub unsafe fn ll_arraymove_items_block(
         }
         return;
     }
-    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+    crate::gc_hook::gc_writebarrier_before_move(array as crate::gc_hook::GCREF);
+    unsafe {
+        let base = items_block_items_base(array);
+        core::ptr::copy(
+            base.add(source_start as usize),
+            base.add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// [`ll_arraycopy_int_items_block`] for an overlapping `GcArray(Signed)` move.
 /// `rgc.py ll_arraymove`.
+///
+/// The `length <= 1` head is rgc.py `copy_item`, kept so the EffectInfo sees
+/// the ARRAY write. Longer moves run the overlap-safe `ptr::copy`
+/// (`raw_memmove`) in this body; items hold no GC pointers, so there is no
+/// `gc_writebarrier_before_move`. `jit_ll_arraymove` is only the residual
+/// target the codewriter installs for OS_ARRAYMOVE.
 ///
 /// # Safety
 /// `array` is a live int `TypedItemsBlock` and both ranges are in bounds.
@@ -681,7 +698,14 @@ pub unsafe fn ll_arraymove_int_items_block(
         }
         return;
     }
-    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+    unsafe {
+        let base = typed_items_block_items_base(array) as *mut i64;
+        core::ptr::copy(
+            base.add(source_start as usize),
+            base.add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// [`ll_arraycopy_float_items_block`] for an overlapping `GcArray(Float)` move.
@@ -689,7 +713,12 @@ pub unsafe fn ll_arraymove_int_items_block(
 ///
 /// `array` is a [`FloatItemsBlock`] pointer: `do_fixed_list_ll_arraycopy`
 /// names the copy's ARRAY from `dest`'s type, and a `TypedItemsBlock` there
-/// names `GcArray(Signed)`.
+/// names `GcArray(Signed)`. The `length <= 1` head is rgc.py `copy_item`,
+/// kept so the EffectInfo sees the ARRAY write. Longer moves run the
+/// overlap-safe `ptr::copy` (`raw_memmove`) in this body; items hold no GC
+/// pointers, so there is no `gc_writebarrier_before_move`.
+/// `jit_ll_arraymove` is only the residual target the codewriter installs
+/// for OS_ARRAYMOVE.
 ///
 /// # Safety
 /// `array` is a live float items block and both ranges are in bounds.
@@ -714,7 +743,14 @@ pub unsafe fn ll_arraymove_float_items_block(
         }
         return;
     }
-    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+    unsafe {
+        let base = typed_items_block_items_base(array as *mut TypedItemsBlock) as *mut f64;
+        core::ptr::copy(
+            base.add(source_start as usize),
+            base.add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// Allocated capacity (GcArray length header) of an `ItemsBlock`.
@@ -2756,6 +2792,154 @@ mod tests {
         unsafe { ll_arraymove_items_block(block, 1, 0, 1) };
         assert_eq!(unsafe { *items_block_items_base(block) }, b);
         unsafe { dealloc_list_items_block(block) };
+    }
+
+    #[test]
+    fn ll_arraymove_items_block_preserves_overlap_and_lengths() {
+        let values = || {
+            [
+                1usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        };
+        let zero = unsafe { alloc_list_items_block(&values()) };
+        unsafe { ll_arraymove_items_block(zero, 1, 0, 0) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(zero), 4) },
+            &values()
+        );
+        unsafe { dealloc_list_items_block(zero) };
+
+        let one = unsafe { alloc_list_items_block(&values()) };
+        unsafe { ll_arraymove_items_block(one, 3, 0, 1) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(one), 4) },
+            &[
+                4usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(one) };
+
+        let left = unsafe { alloc_list_items_block(&values()) };
+        unsafe { ll_arraymove_items_block(left, 1, 0, 3) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(left), 4) },
+            &[
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(left) };
+
+        let right = unsafe { alloc_list_items_block(&values()) };
+        unsafe { ll_arraymove_items_block(right, 0, 1, 3) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(right), 4) },
+            &[
+                1usize as PyObjectRef,
+                1usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(right) };
+    }
+
+    #[test]
+    fn ll_arraymove_int_items_block_preserves_overlap_and_lengths() {
+        unsafe {
+            let fill = |block: *mut TypedItemsBlock| {
+                let base = typed_items_block_items_base(block) as *mut i64;
+                for i in 0..6 {
+                    *base.add(i) = i as i64;
+                }
+                base
+            };
+
+            let block = alloc_typed_items_block(6, gc_int_array_gc_type_id());
+            let base = fill(block);
+            ll_arraymove_int_items_block(block, 2, 1, 0);
+            assert_eq!(std::slice::from_raw_parts(base, 6), &[0, 1, 2, 3, 4, 5]);
+            dealloc_typed_items_block(block);
+
+            let block = alloc_typed_items_block(6, gc_int_array_gc_type_id());
+            let base = fill(block);
+            ll_arraymove_int_items_block(block, 5, 0, 1);
+            assert_eq!(std::slice::from_raw_parts(base, 6), &[5, 1, 2, 3, 4, 5]);
+            dealloc_typed_items_block(block);
+
+            let block = alloc_typed_items_block(6, gc_int_array_gc_type_id());
+            let base = fill(block);
+            ll_arraymove_int_items_block(block, 2, 1, 4);
+            assert_eq!(std::slice::from_raw_parts(base.add(1), 4), &[2, 3, 4, 5]);
+            dealloc_typed_items_block(block);
+
+            let block = alloc_typed_items_block(6, gc_int_array_gc_type_id());
+            let base = fill(block);
+            ll_arraymove_int_items_block(block, 1, 2, 4);
+            assert_eq!(std::slice::from_raw_parts(base.add(2), 4), &[1, 2, 3, 4]);
+            dealloc_typed_items_block(block);
+        }
+    }
+
+    #[test]
+    fn ll_arraymove_float_items_block_preserves_overlap_and_lengths() {
+        unsafe {
+            let fill = |block: *mut FloatItemsBlock| {
+                let base = typed_items_block_items_base(block as *mut TypedItemsBlock) as *mut f64;
+                for i in 0..6 {
+                    *base.add(i) = i as f64;
+                }
+                base
+            };
+
+            let block =
+                alloc_typed_items_block(6, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+            let base = fill(block);
+            ll_arraymove_float_items_block(block, 2, 1, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(base, 6),
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+            );
+            dealloc_typed_items_block(block as *mut TypedItemsBlock);
+
+            let block =
+                alloc_typed_items_block(6, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+            let base = fill(block);
+            ll_arraymove_float_items_block(block, 5, 0, 1);
+            assert_eq!(
+                std::slice::from_raw_parts(base, 6),
+                &[5.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+            );
+            dealloc_typed_items_block(block as *mut TypedItemsBlock);
+
+            let block =
+                alloc_typed_items_block(6, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+            let base = fill(block);
+            ll_arraymove_float_items_block(block, 2, 1, 4);
+            assert_eq!(
+                std::slice::from_raw_parts(base.add(1), 4),
+                &[2.0, 3.0, 4.0, 5.0]
+            );
+            dealloc_typed_items_block(block as *mut TypedItemsBlock);
+
+            let block =
+                alloc_typed_items_block(6, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+            let base = fill(block);
+            ll_arraymove_float_items_block(block, 1, 2, 4);
+            assert_eq!(
+                std::slice::from_raw_parts(base.add(2), 4),
+                &[1.0, 2.0, 3.0, 4.0]
+            );
+            dealloc_typed_items_block(block as *mut TypedItemsBlock);
+        }
     }
 
     #[test]

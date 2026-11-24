@@ -1308,6 +1308,15 @@ pub extern "C" fn try_gc_write_barrier_before_move(obj: GCREF) -> bool {
     }
 }
 
+/// `llop.gc_writebarrier_before_move(array)` (`rgc.py` `ll_arraymove`,
+/// `lloperation.py`). Translated graphs see the llop; the native body
+/// asks the installed before-move hook.
+#[majit_macros::jit_llop("gc_writebarrier_before_move")]
+#[inline(never)]
+pub fn gc_writebarrier_before_move(array: GCREF) {
+    let _ = try_gc_write_barrier_before_move(array);
+}
+
 /// Run the active barrier for a pointer returned by a managed allocation
 /// hook.  The backend may omit the general hybrid-heap ownership lookup.
 /// TRACK-clear skip is valid here: the pointer is collector-owned.
