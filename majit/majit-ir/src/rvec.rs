@@ -612,14 +612,33 @@ pub const SLICE_LEN_SLOT_STORE: &str = "majit_rlib::lltypesystem::rvec::ll_slice
 /// `ll_slice_len_slot_take`: the caller reads the length and frees the slot.
 pub const SLICE_LEN_SLOT_TAKE: &str = "majit_rlib::lltypesystem::rvec::ll_slice_len_slot_take";
 
+/// Signed-word specialization of `SliceOp::ToVec`.
+///
+/// `rlist.py` `ll_copy` is specialized for the list representation.  The
+/// ordinary `Int` row remains the unsigned-word helper used by `Vec<usize>`;
+/// a residual call needs a distinct Rust return declaration for `Vec<i64>`.
+pub const SLICE_TO_VEC_SIGNED_I: &str = "majit_rlib::lltypesystem::rvec::ll_slice_to_vec_signed_i";
+
 /// Path of the helper that lowers `op` on a slice of `kind` items.
 pub fn slice_helper_path(op: SliceOp, kind: VecItemKind) -> &'static str {
     SLICE_HELPERS[op.row()][kind.column()]
 }
 
+/// Path of the `to_vec` helper, retaining signedness for a word item.
+pub fn slice_to_vec_helper_path(kind: VecItemKind, signed_word: bool) -> &'static str {
+    if kind == VecItemKind::Int && signed_word {
+        SLICE_TO_VEC_SIGNED_I
+    } else {
+        slice_helper_path(SliceOp::ToVec, kind)
+    }
+}
+
 /// The `(operation, item kind)` a slice helper path lowers, if it is one of
-/// [`SLICE_HELPERS`].
+/// [`SLICE_HELPERS`] or the signed-word `to_vec` specialization.
 pub fn slice_helper_for_path(path: &str) -> Option<(SliceOp, VecItemKind)> {
+    if path == SLICE_TO_VEC_SIGNED_I {
+        return Some((SliceOp::ToVec, VecItemKind::Int));
+    }
     SliceOp::ALL.into_iter().find_map(|op| {
         VecItemKind::ALL
             .into_iter()
@@ -844,6 +863,10 @@ mod tests {
                 assert_eq!(vec_helper_for_path(path), None);
             }
         }
+        assert_eq!(
+            slice_helper_for_path(SLICE_TO_VEC_SIGNED_I),
+            Some((SliceOp::ToVec, VecItemKind::Int))
+        );
     }
 
     #[test]

@@ -3197,12 +3197,16 @@ impl<'a> Lowering<'a> {
                 "alloc::slice::<Impl>::to_vec" => {
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
-                    self.emit_path_call(
+                    let item = tyref_rust_vec_item_spelling(&dest_ty, self.llbc);
+                    let signed_word = matches!(item.as_deref(), Some("isize" | "i64"));
+                    let result = self.emit_path_call(
                         mir_bb,
-                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ToVec, kind),
+                        majit_ir::rvec::slice_to_vec_helper_path(kind, signed_word),
                         vec![args[0].clone(), len],
                         self.value_type_of(&dest_ty),
-                    )
+                    );
+                    stamp_rust_vec_header(&result, &dest_ty, self.llbc);
+                    result
                 }
                 "core::slice::<Impl>::first"
                 | "core::slice::<Impl>::last"
