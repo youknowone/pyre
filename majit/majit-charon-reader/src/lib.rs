@@ -1433,6 +1433,19 @@ impl Llbc {
             .filter_map(Option::as_ref)
     }
 
+    /// Target declarations authorize getfunctionptr publication, not graph lowering.
+    /// A present but unsupported manifest fails closed.
+    pub fn target_fun_decls(&self) -> Option<&[Option<FunDecl>]> {
+        match (
+            self.file.translated.target_fun_decls_version,
+            self.file.translated.target_fun_decls.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(1), Some(rows)) => Some(rows),
+            _ => panic!("invalid target function declaration manifest; re-extract LLBC"),
+        }
+    }
+
     /// Drop every body [`FunDecl::unstructured_shared`] parsed for this artefact.
     pub fn release_body_cache(&self) {
         for fd in self.iter_fun_decls() {
@@ -1598,8 +1611,8 @@ enum ValueBody {
 /// `Global` and the other const kinds). A layout scalar is the object
 /// `{"Constant": {"Value": [id, [literal, ty]]}}` and uses its own id
 /// space. An object body is otherwise a type, a trait ref (`"kind"`),
-/// or a span (`"data"`). A string body is a payload-free type kind,
-/// `"Never"`.
+/// or a span (`"data"`). A string body is a payload-free type kind
+/// (`"Never"`, `"Bool"`).
 fn classify_value_body(raw: &serde_json::value::RawValue) -> ValueBody {
     const TY_KINDS: &[&str] = &[
         "Scalar",
@@ -1613,6 +1626,7 @@ fn classify_value_body(raw: &serde_json::value::RawValue) -> ValueBody {
         "DynTrait",
         "Pattern",
         "Never",
+        "Bool",
         "TypeVar",
         "TraitType",
         "PtrMetadata",

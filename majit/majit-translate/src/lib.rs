@@ -402,7 +402,17 @@ fn build_semantic_program_via_active_frontend(
             discovered.dedup();
             let foldable_cross = front::mir::register_foldable_const_lits(foldable_cross);
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
-            crate::local_crates::register_local_crate_roots(crate_names);
+            // Host artefacts and layout sidecars share crate_name values.
+            // symbolic_fnaddr_targets_from treats two crate-prefix hits as
+            // ambiguous, including the same root listed twice
+            // (rtyper getfunctionptr).
+            let mut unique_crate_names = Vec::new();
+            for name in crate_names {
+                if !unique_crate_names.iter().any(|seen| seen == &name) {
+                    unique_crate_names.push(name);
+                }
+            }
+            crate::local_crates::register_local_crate_roots(unique_crate_names);
             crate::profilefunc_family::register_profilefunc_family(
                 profilefunc_graphs.clone(),
                 profilefunc_spellings.clone(),
@@ -423,6 +433,11 @@ fn build_semantic_program_via_active_frontend(
             let mut seen_trait_names = std::collections::HashSet::new();
             let mut symbolic_decl_rows: Vec<(String, pipeline::SymbolicTargetDecl, bool)> =
                 Vec::new();
+            let use_target_declarations = layout::is_cross_target(
+                &std::env::var("TARGET").unwrap_or_default(),
+                &std::env::var("HOST").unwrap_or_default(),
+            );
+            let mut saw_target_declarations = false;
             let gc_struct_ids = declared_gc.gc_struct_ids();
             let field0_parents = declared_gc.field0_parent_ids().clone();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
@@ -468,7 +483,19 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
                 fun_decl_identity_aliases
                     .extend(front::mir::collect_fun_decl_identity_aliases(&llbc));
-                collect_symbolic_target_decls(&llbc, &mut symbolic_decl_rows);
+                if use_target_declarations {
+                    let present = llbc.target_fun_decls().is_some();
+                    assert!(
+                        !p.ends_with(".layouts.ullbc") || present,
+                        "target layout sidecar {p} lacks a declaration manifest; re-extract LLBC"
+                    );
+                    saw_target_declarations |= present;
+                }
+                collect_symbolic_target_decls(
+                    &llbc,
+                    &mut symbolic_decl_rows,
+                    use_target_declarations,
+                );
                 // Stub FUNC.RESULT is computed after intern-row harvest
                 // inside `lower_prelinked_crate` so the classifier reads
                 // the same registry ordinary lowering uses.
@@ -491,6 +518,10 @@ fn build_semantic_program_via_active_frontend(
                     &front::mir::semantic_function_dedup_key,
                 );
             }
+            assert!(
+                !use_target_declarations || saw_target_declarations,
+                "cross-target fnaddr publication requires target declaration manifests; re-extract LLBC"
+            );
             let mut program = merged.unwrap_or_else(|| front::SemanticProgram {
                 functions: Vec::new(),
                 harvested_hints: std::collections::HashMap::new(),
@@ -613,15 +644,28 @@ fn symbolic_fnaddr_targets_from(
 fn collect_symbolic_target_decls(
     llbc: &majit_charon_reader::Llbc,
     out: &mut Vec<(String, pipeline::SymbolicTargetDecl, bool)>,
+    use_target_declarations: bool,
 ) {
-    // Owner `TypeDecl` public flags, keyed by `name_path`. Inherent methods
-    // on a private type cannot be named as `Type::method` from another crate.
+    // rtyper RPythonTyper.getcallable / lltype.getfunctionptr and codewriter
+    // CallControl.get_jitcode_calldescr bind the graph's actual callable.
+    // Cross builds must never authorize a host-only declaration.
+    let declarations: Vec<_> = if use_target_declarations {
+        llbc.target_fun_decls()
+            .into_iter()
+            .flatten()
+            .filter_map(Option::as_ref)
+            .collect()
+    } else {
+        llbc.iter_fun_decls().collect()
+    };
+    // Owner TypeDecl public flags, keyed by name_path. Inherent methods
+    // on a private type cannot be named as Type::method from another crate.
     let mut type_public: Vec<(String, bool)> = llbc
         .iter_type_decls()
         .map(|td| (td.item_meta.name_path(), td.item_meta.attr_info.public))
         .collect();
     type_public.sort_by(|a, b| a.0.cmp(&b.0));
-    for fd in llbc.iter_fun_decls() {
+    for fd in declarations {
         let path = inherent_method_decl_path(llbc, fd, &type_public)
             .unwrap_or_else(|| fd.item_meta.name_path());
         out.push((
@@ -629,6 +673,122 @@ fn collect_symbolic_target_decls(
             symbolic_target_decl_from(fd, llbc),
             fd.item_meta.is_local,
         ));
+    }
+}
+#[cfg(all(test, feature = "mir-frontend"))]
+mod target_fnaddr_manifest_tests {
+    use super::*;
+
+    fn declaration(leaf: &str, output: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [{"Ident": ["example_runtime", 0]}, {"Ident": [leaf, 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }},
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [], "inline": null, "rename": null, "public": true
+                },
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": output},
+            "body": null
+        })
+    }
+
+    fn artifact(manifest: bool) -> majit_charon_reader::Llbc {
+        let mut translated = serde_json::json!({
+            "crate_name": "example_runtime",
+            "fun_decls": [
+                declaration("portable", serde_json::json!("I64")),
+                declaration("unix_only", serde_json::json!("I64"))
+            ]
+        });
+        if manifest {
+            translated["target_fun_decls_version"] = serde_json::json!(1);
+            translated["target_decl_dedup"] = serde_json::json!([{"Value": [91, "Bool"]}]);
+            translated["target_fun_decls"] = serde_json::json!([
+                null,
+                declaration("portable", serde_json::json!({"Deduplicated": 91}))
+            ]);
+        }
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "charon_version": "test",
+            "has_errors": false,
+            "translated": translated
+        }))
+        .unwrap();
+        majit_charon_reader::Llbc::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn target_manifest_excludes_host_only_names_and_uses_target_signature() {
+        let llbc = artifact(true);
+        assert_eq!(llbc.iter_fun_decls().count(), 2);
+        assert_eq!(llbc.target_fun_decls().unwrap().len(), 2);
+        assert!(llbc.target_fun_decls().unwrap()[0].is_none());
+        let mut rows = Vec::new();
+        collect_symbolic_target_decls(&llbc, &mut rows, true);
+        let rows = unique_symbolic_target_decls(rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "example_runtime::portable");
+        assert!(matches!(rows[0].1.output, pipeline::TyShape::Bool));
+        assert!(
+            llbc.target_fun_decls().unwrap()[1]
+                .as_ref()
+                .unwrap()
+                .body
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_manifest_collection_is_unchanged() {
+        let llbc = artifact(true);
+        let mut rows = Vec::new();
+        collect_symbolic_target_decls(&llbc, &mut rows, false);
+        let rows = unique_symbolic_target_decls(rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "example_runtime::portable");
+        assert_eq!(rows[1].0, "example_runtime::unix_only");
+        assert!(matches!(
+            rows[0].1.output,
+            pipeline::TyShape::Int {
+                signed: true,
+                bits: 64
+            }
+        ));
+    }
+
+    #[test]
+    fn cross_collection_never_falls_back_to_host_declarations() {
+        let llbc = artifact(false);
+        assert!(llbc.target_fun_decls().is_none());
+        let mut rows = Vec::new();
+        collect_symbolic_target_decls(&llbc, &mut rows, true);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid target function declaration manifest")]
+    fn unsupported_manifest_version_is_rejected() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "charon_version": "test",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "example_runtime",
+                "fun_decls": [],
+                "target_fun_decls_version": 2,
+                "target_fun_decls": []
+            }
+        }))
+        .unwrap();
+        let llbc = majit_charon_reader::Llbc::from_slice(&bytes).unwrap();
+        let _ = llbc.target_fun_decls();
     }
 }
 

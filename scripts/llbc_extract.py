@@ -2931,29 +2931,110 @@ def scan_for_keys(
 LAYOUT_DECODE_WINDOW = 1 << 22
 
 
+def read_layout_target_declarations(source: Path, offset: int) -> tuple[list, list]:
+    """Read one target function at a time and preserve removed SerDedup definitions."""
+    decoder = json.JSONDecoder()
+    declarations = []
+    definitions = []
+    seen = set()
+
+    def retain_definitions(value):
+        pending = [value]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, dict):
+                pair = node.get("Value")
+                if (
+                    isinstance(pair, list)
+                    and len(pair) == 2
+                    and type(pair[0]) is int
+                    and pair[0] >= 0
+                ):
+                    wrapper = {"Value": pair}
+                    key = json.dumps(wrapper, sort_keys=True, ensure_ascii=False)
+                    if key not in seen:
+                        seen.add(key)
+                        definitions.append(wrapper)
+                pending.extend(reversed(list(node.values())))
+            elif isinstance(node, list):
+                pending.extend(reversed(node))
+
+    with source.open("rb") as artefact:
+        artefact.seek(offset)
+
+        def token():
+            while True:
+                byte = artefact.read(1)
+                if not byte:
+                    raise SystemExit(f"extract-llbc.py: {source.name} truncated fun_decls")
+                if byte not in b" \t\r\n":
+                    return byte
+
+        if token() != b"[":
+            raise SystemExit(f"extract-llbc.py: {source.name} fun_decls is not an array")
+        first = token()
+        if first == b"]":
+            return declarations, definitions
+        artefact.seek(-1, os.SEEK_CUR)
+        while True:
+            start = artefact.tell()
+            window = 1 << 14
+            while True:
+                artefact.seek(start)
+                raw = artefact.read(window)
+                text = raw.decode("utf-8", errors="replace")
+                try:
+                    row, end = decoder.raw_decode(text)
+                except json.JSONDecodeError as exc:
+                    if len(raw) == window:
+                        window *= 4
+                        continue
+                    raise SystemExit(
+                        f"extract-llbc.py: {source.name} invalid fun_decls row: {exc}"
+                    ) from exc
+                artefact.seek(start + len(text[:end].encode("utf-8")))
+                break
+            if row is not None:
+                if not isinstance(row, dict):
+                    raise SystemExit(
+                        f"extract-llbc.py: {source.name} fun_decls row is not an object"
+                    )
+                retain_definitions(row)
+                row["body"] = None
+            declarations.append(row)
+            separator = token()
+            if separator == b"]":
+                break
+            if separator != b",":
+                raise SystemExit(
+                    f"extract-llbc.py: {source.name} invalid fun_decls separator"
+                )
+            if token() == b"]":
+                raise SystemExit(
+                    f"extract-llbc.py: {source.name} trailing comma in fun_decls"
+                )
+            artefact.seek(-1, os.SEEK_CUR)
+    return declarations, definitions
+
+
 def write_layout_sidecar(source: Path, dest: Path) -> None:
-    """Reduce a full `.ullbc` to its type declarations.
+    """Reduce a target extraction to layouts and a body-free declaration manifest.
 
-    A cross-target extraction is only wanted for the struct layouts Charon
-    resolved for that target; its function bodies are compiled under
-    different `cfg`s and must not displace the host's. Keep `type_decls`
-    and the serialized prelude before it, then drop the body declarations.
-    Charon's SerDedup writes a type's first `Value` in that prelude (for
-    example in `item_names`); a field can then contain only `Deduplicated`.
-    Dropping the prelude loses the field's primitive type. The ordinary LLBC
-    reader can consume this self-contained sidecar without a special case.
+    Host graph bodies remain the translation input. Target declarations only
+    authorize callable publication (rtyper getfunctionptr; codewriter
+    CallControl.get_jitcode_calldescr). Keep the serialized prelude and type
+    declarations, plus SerDedup definitions first emitted in removed bodies.
 
-    Only the fields kept are decoded, and only a window of the file around
-    each is ever in memory: the artefact is three quarters of a GB of
-    one-line JSON, and `read_text` on it peaked at 7 GB of RSS (measured on
-    the interpreter's), the entire memory of a 7 GB macos runner. The keys
-    are located by one streamed byte scan; each value is then decoded from
-    a window that starts at the value and widens until the value closes.
+    Decode the function array one row at a time so peak memory is bounded by
+    the largest function row rather than the complete body table.
     """
     decoder = json.JSONDecoder()
     keys = {
         name: f'"{name}":'.encode("ascii")
-        for name in ("charon_version", "has_errors", "crate_name", "translated", "type_decls")
+        for name in (
+            "charon_version", "has_errors", "crate_name", "translated",
+            "type_decls", "fun_decls",
+        )
     }
     offsets = scan_for_keys(source, list(keys.values()))
     size = source.stat().st_size
@@ -3019,6 +3100,15 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
         raise SystemExit(f"extract-llbc.py: {source.name} has an invalid translated prelude")
     translated["type_decls"] = type_decls
     translated["fun_decls"] = []
+    key = keys["fun_decls"]
+    if key not in offsets:
+        raise SystemExit(f"extract-llbc.py: {source.name} has no fun_decls field")
+    declarations, definitions = read_layout_target_declarations(
+        source, offsets[key] + len(key)
+    )
+    translated["target_fun_decls_version"] = 1
+    translated["target_decl_dedup"] = definitions
+    translated["target_fun_decls"] = declarations
     slim = {
         "charon_version": field("charon_version", want=str),
         "has_errors": field("has_errors", want=bool),

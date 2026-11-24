@@ -206,7 +206,15 @@ def run_layout_sidecar(engine) -> int:
         # sidecar drops function bodies (VersionTag(u64) on wasm32).
         type_decls[0]["kind"] = {"Struct": [{"ty": {"Deduplicated": 36}}]}
         item_names = [{"Value": [36, {"Scalar": {"Integer": {"Unsigned": "U64"}}}]}]
-        fun_decls = [{"body": "\u2603" * 512, "index": i} for i in range(2_000)]
+        fun_decls = [
+            {
+                "body": {"text": "\u2603" * 512, "ty": {"Value": [91, "Bool"]}},
+                "index": i,
+                "signature": {"output": {"Deduplicated": 91}},
+            }
+            for i in range(2_000)
+        ]
+        fun_decls.append(None)
         artefact = {
             "charon_version": "probe",
             "translated": {
@@ -232,6 +240,12 @@ def run_layout_sidecar(engine) -> int:
                 "item_names": item_names,
                 "type_decls": type_decls,
                 "fun_decls": [],
+                "target_fun_decls_version": 1,
+                "target_decl_dedup": [{"Value": [91, "Bool"]}],
+                "target_fun_decls": [
+                    None if row is None else dict(row, body=None)
+                    for row in fun_decls
+                ],
             },
         }
         encoded = json.dumps(type_decls, ensure_ascii=False).encode("utf-8")
