@@ -32,7 +32,11 @@ class C(metaclass=M, x=1):
     pass
 
 
-print(log)
+assert log == [
+    ("MM.__call__", ["x"]),
+    ("M.__new__", ["x"]),
+    ("M.__init__", ["x"]),
+], log
 
 log2 = []
 
@@ -56,7 +60,7 @@ class D(metaclass=N, y=2):
     pass
 
 
-print(log2)
+assert log2 == [("bound __init__", "D", ["y"])], log2
 
 log3 = []
 
@@ -81,14 +85,16 @@ class E(metaclass=P, z=3):
     pass
 
 
-print(log3, type(E).__name__)
+assert log3 == [("desc __new__", ["z"])], log3
+assert type(E) is P, type(E)
 
 for kwds in ({}, {"metaclass": type}):
     try:
         __build_class__(lambda: None, "a\0b", **kwds)
-        print("no error")
-    except Exception as e:
-        print(type(e).__name__, e)
+    except ValueError as e:
+        assert str(e) == "type name must not contain null characters", str(e)
+    else:
+        raise AssertionError("NUL in the class name accepted: %r" % (kwds,))
 
 
 class RaisingCallDesc:
@@ -110,6 +116,9 @@ for make in (
 ):
     try:
         make()
-        print("no error")
-    except Exception as e:
-        print(type(e).__name__, e)
+    except ValueError as e:
+        assert str(e) == "from __get__", str(e)
+    else:
+        raise AssertionError("the __get__ error was not propagated")
+
+print("OK")
