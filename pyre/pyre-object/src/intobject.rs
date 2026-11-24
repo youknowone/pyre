@@ -311,23 +311,9 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_INT_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_IntObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_IntObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    // `allocate_instance` -> `lltype.malloc(STRUCT)`: one managed malloc
+    // that the codewriter lowers to `new_with_vtable`.
+    crate::lltype::malloc_typed_managed(obj) as PyObjectRef
 }
 
 /// Return the address of INT_TYPE for JIT type-id validation.

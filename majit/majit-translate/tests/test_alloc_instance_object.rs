@@ -173,10 +173,12 @@ fn has_ptr_write(graph: &FunctionGraph) -> bool {
     })
 }
 
-fn object_alloc_pytypes() -> [(&'static str, i64); 2] {
+fn object_alloc_pytypes() -> [(&'static str, i64); 4] {
     [
         ("pyobject::INSTANCE_TYPE", 0x1000_0000i64),
         ("pyobject::INSTANCE_USER_TYPE", 0x1000_1000i64),
+        ("pyobject::INT_TYPE", 0x1000_2000i64),
+        ("pyobject::INT_USER_TYPE", 0x1000_3000i64),
     ]
 }
 
@@ -194,7 +196,11 @@ fn object_alloc_callcontrol() -> CallControl {
             ..Default::default()
         },
         &[],
-        &["alloc_exact_object_instance", "alloc_user_object_instance"],
+        &[
+            "alloc_exact_object_instance",
+            "alloc_user_object_instance",
+            "w_int_subclass_new",
+        ],
     )
     .unwrap_or_else(|e| panic!("object alloc program: {e:?}"));
     let mut cc = CallControl::new();
@@ -255,4 +261,9 @@ fn alloc_exact_object_instance_is_new_with_vtable() {
 #[test]
 fn alloc_user_object_instance_is_new_with_vtable() {
     assert_new_with_vtable_and_no_typeptr_store("alloc_user_object_instance");
+}
+
+#[test]
+fn w_int_subclass_new_is_new_with_vtable() {
+    assert_new_with_vtable_and_no_typeptr_store("w_int_subclass_new");
 }
