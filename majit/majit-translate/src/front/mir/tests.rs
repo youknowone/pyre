@@ -47491,6 +47491,109 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
 }
 
 #[test]
+fn interior_pointer_producer_with_another_use_stays_residual() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let unit = interior_unit_ty();
+    let entry = interior_adt(0);
+    let entry_ptr_ty = interior_raw_mut(entry.clone());
+    let header_ty =
+        interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}));
+    let entry_decl = interior_struct(
+        0,
+        &["fixture", "Entry"],
+        &[("pad", i64_ty.clone()), ("value", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "read_and_keep_entries_item",
+        2,
+        vec![header_ty.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("header"), &header_ty),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("item"), &entry_ptr_ty),
+            interior_local(4, Some("slot"), &entry_ptr_ty),
+            interior_local(5, Some("ignored"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &header_ty))],
+                    interior_place(3, &entry_ptr_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(3, &entry_ptr_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &entry_ptr_ty),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(3, &entry_ptr_ty))],
+                    interior_place(5, &unit),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_field(4, &entry_ptr_ty, &entry, &i64_ty, 1)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let items = interior_opaque(
+        1,
+        &["fixture", "entries_item_ptr"],
+        vec![header_ty],
+        entry_ptr_ty.clone(),
+    );
+    let add = interior_opaque(
+        2,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![entry_ptr_ty.clone(), usize_ty],
+        entry_ptr_ty.clone(),
+    );
+    let keep = interior_opaque(3, &["fixture", "keep_pointer"], vec![entry_ptr_ty], unit);
+    let llbc = llbc_with_types("fixture", vec![entry_decl], vec![caller, items, add, keep]);
+    let graph = lower_interior(&llbc, "read_and_keep_entries_item");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "entries_item_ptr"),
+        "producer with a non-interior use must remain; ops={ops:?}",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "the independently proven interior read must still lower; ops={ops:?}",
+    );
+}
+
+#[test]
 fn interior_field_ptr_sub_stays_direct_ptradd() {
     let i64_ty = interior_i64();
     let usize_ty = interior_usize();

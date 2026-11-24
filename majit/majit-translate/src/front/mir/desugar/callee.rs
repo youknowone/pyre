@@ -7289,6 +7289,133 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     })
 }
 
+/// True when every use of `local` is a raw-pointer copy/cast chain whose
+/// leaves are proven `struct_field_ptr_add_trace` calls. A switch,
+/// assertion, aggregate, arithmetic/address call, return path, projection,
+/// or unproven call keeps the producer.
+fn pointer_alias_uses_are_proven(
+    body: &Unstructured,
+    llbc: &Llbc,
+    local: usize,
+    tombstoned: &std::collections::HashSet<String>,
+    active: &mut Vec<usize>,
+) -> bool {
+    if active.contains(&local) {
+        return false;
+    }
+    active.push(local);
+    let ok = (|| {
+        let forward = forward_reachable_mask(llbc, body);
+        let mut uses = 0usize;
+        for (bb_idx, bb) in body.body().iter().enumerate() {
+            if !forward[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                match stmt.stmt_kind_ref() {
+                    Ok(StmtKind::Assign(place, rvalue)) => {
+                        if !matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+                            && place_references_local(place, local)
+                        {
+                            return false;
+                        }
+                        let mut derefs = 0;
+                        let mut other = 0;
+                        scan_rvalue_dest_ref(rvalue, local, &mut derefs, &mut other);
+                        if derefs == 0 && other == 0 {
+                            continue;
+                        }
+                        if derefs != 0 {
+                            return false;
+                        }
+                        let PlaceKind::Local(next) = place.kind else {
+                            return false;
+                        };
+                        let next = next as usize;
+                        let follows = match rvalue {
+                            Rvalue::Use(op, _) => operand_local(Some(op)) == Some(local),
+                            Rvalue::Cast(_, op, target_ty) => matches!(
+                                copy_prod_if_raw_ptr(op, operand_tyref(op), target_ty, llbc),
+                                HeaderProd::Copy(Some(source)) if source == local
+                            ),
+                            Rvalue::UnaryOp(kind, op) if unary_op_is_cast(kind) => matches!(
+                                copy_prod_if_raw_ptr(op, operand_tyref(op), &place.ty, llbc),
+                                HeaderProd::Copy(Some(source)) if source == local
+                            ),
+                            _ => false,
+                        };
+                        if !follows {
+                            return false;
+                        }
+                        uses += 1;
+                        if !pointer_alias_uses_are_proven(body, llbc, next, tombstoned, active) {
+                            return false;
+                        }
+                    }
+                    Ok(StmtKind::Assert(assert))
+                        if operand_place(&assert.cond)
+                            .is_some_and(|place| place_references_local(place, local)) =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            match bb.term_ref(llbc) {
+                Ok(TermKind::Call { call, .. }) => {
+                    for (arg_index, arg) in call.args.iter().enumerate() {
+                        if !operand_place(arg)
+                            .is_some_and(|place| place_references_local(place, local))
+                        {
+                            continue;
+                        }
+                        uses += 1;
+                        let CallFunc::Regular(reg) = &call.func else {
+                            return false;
+                        };
+                        let PlaceKind::Local(dest) = call.dest.kind else {
+                            return false;
+                        };
+                        if arg_index != 0
+                            || operand_local(Some(arg)) != Some(local)
+                            || struct_field_ptr_add_trace(
+                                reg,
+                                call.args.len(),
+                                operand_local(call.args.first()),
+                                call.args.first().and_then(operand_tyref),
+                                operand_local(call.args.get(1)),
+                                dest as usize,
+                                body,
+                                llbc,
+                                tombstoned,
+                            )
+                            .is_none()
+                        {
+                            return false;
+                        }
+                    }
+                }
+                Ok(TermKind::Switch { discr, .. })
+                    if operand_place(discr)
+                        .is_some_and(|place| place_references_local(place, local)) =>
+                {
+                    return false;
+                }
+                Ok(TermKind::Assert { assert, .. })
+                    if operand_place(&assert.cond)
+                        .is_some_and(|place| place_references_local(place, local)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        uses != 0
+    })();
+    active.pop();
+    ok
+}
+
 /// MIR call destinations that exist only to recover the base of a proven
 /// `getinteriorfield`/`setinteriorfield` access.
 pub(in crate::front::mir) fn interior_pointer_alias_calls(
@@ -7325,7 +7452,10 @@ pub(in crate::front::mir) fn interior_pointer_alias_calls(
             continue;
         };
         for local in traced.pointer_call_locals {
-            if let Some(alias) = aliases.get_mut(local) {
+            let mut active = Vec::new();
+            if pointer_alias_uses_are_proven(body, llbc, local, tombstoned, &mut active)
+                && let Some(alias) = aliases.get_mut(local)
+            {
                 *alias = true;
             }
         }
