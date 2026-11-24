@@ -21,14 +21,13 @@
 //! zero=True)` of a `GcArray` (`rdict.py` `_ll_malloc_entries`,
 //! `framework.py` `push_roots`). Access is index-based (`entry(entries, i)`);
 //! no `&K` / `&V` iterator is handed out, so the rordereddict no-collect
-//! non-moving path does not apply. The `WEAKDICT` object itself stands for
-//! the prebuilt `interned_strings` dict (`ObjSpace.__init__` /
-//! `WeakValueDictRepr.convert_const`): `alloc_raw` takes
-//! `try_gc_alloc_stable_raw`, stamps `GCFLAG_NO_HEAP_PTRS`, and write-barriers
-//! so `remember_young_pointer` enrolls it in `prebuilt_root_objects`.
-//! `_ll_free_entries` is a no-op, so a replaced array is left for the
-//! collector — collecting malloc lets a minor reclaim it instead of spilling
-//! the block OLD (`alloc_with_type_no_collect`).
+//! non-moving path does not apply. `ll_new_weakdict` allocates the `WEAKDICT`
+//! header the same collecting way (`lltype.malloc(WEAKDICT)`). A prebuilt
+//! table (`WeakValueDictRepr.convert_const`) uses `ll_new_weakdict_prebuilt`
+//! (`alloc_raw`: `try_gc_alloc_stable_raw`, `GCFLAG_NO_HEAP_PTRS`, write
+//! barrier into `prebuilt_root_objects`). `_ll_free_entries` is a no-op, so a
+//! replaced array is left for the collector — collecting malloc lets a minor
+//! reclaim it instead of spilling the block OLD (`alloc_with_type_no_collect`).
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -162,24 +161,9 @@ fn alloc_raw(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
     raw as crate::gc_hook::GCREF
 }
 
-fn entries_bytes<K>(n: usize) -> usize {
-    std::mem::offset_of!(WeakDictEntries<K>, items)
-        .checked_add(
-            n.checked_mul(std::mem::size_of::<WeakDictEntry<K>>())
-                .expect("weakdict entries size"),
-        )
-        .expect("weakdict entries size")
-}
-
-/// `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` of a `GcArray`.
-/// Collecting (`try_gc_alloc_collecting_rooted`), matching that malloc
-/// (`framework.py` `push_roots` around `_ll_malloc_entries`). Access is
-/// index-based (`entry`); the array may move. The `WEAKDICT` object stays
-/// on the old/prebuilt path (`alloc_raw`). Callers pin `d` and the old
-/// array before this returns.
-fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
-    let bytes = entries_bytes::<K>(n);
-    let tid = weakdict_entries_gc_type_id();
+/// Collecting nursery malloc (`try_gc_alloc_collecting_rooted`) with the
+/// no-GC host fallback `alloc_entries` uses.
+fn alloc_collecting_or_host(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
     if tid != 0 {
         let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
         let mut needs_write_barrier = true;
@@ -198,17 +182,11 @@ fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
             return std::ptr::null_mut();
         }
         if !raw.is_null() {
-            // Collecting malloc stamps the header only. `_ll_malloc_entries`
-            // is `zero=True`. `GCREF` is `*mut GCREFOpaque` (`size_of` 0), so
-            // `write_bytes` on the GCREF itself writes no bytes; zero through
-            // `*mut u8`.
             unsafe { std::ptr::write_bytes(raw as *mut u8, 0, bytes) };
             if needs_write_barrier {
                 crate::gc_hook::try_gc_write_barrier_managed(raw);
             }
-            let entries = raw as *mut WeakDictEntries<K>;
-            unsafe { (*entries).length = n };
-            return entries;
+            return raw;
         }
     }
     let layout = std::alloc::Layout::from_size_align(bytes, std::mem::align_of::<usize>())
@@ -216,6 +194,30 @@ fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
     if raw.is_null() {
         std::alloc::handle_alloc_error(layout);
+    }
+    raw as crate::gc_hook::GCREF
+}
+
+fn entries_bytes<K>(n: usize) -> usize {
+    std::mem::offset_of!(WeakDictEntries<K>, items)
+        .checked_add(
+            n.checked_mul(std::mem::size_of::<WeakDictEntry<K>>())
+                .expect("weakdict entries size"),
+        )
+        .expect("weakdict entries size")
+}
+
+/// `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` of a `GcArray`.
+/// Collecting (`try_gc_alloc_collecting_rooted`), matching that malloc
+/// (`framework.py` `push_roots` around `_ll_malloc_entries`). Access is
+/// index-based (`entry`); the array may move. Callers pin `d` and the old
+/// array before this returns.
+fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
+    let bytes = entries_bytes::<K>(n);
+    let tid = weakdict_entries_gc_type_id();
+    let raw = alloc_collecting_or_host(tid, bytes);
+    if raw.is_null() {
+        return std::ptr::null_mut();
     }
     let entries = raw as *mut WeakDictEntries<K>;
     unsafe { (*entries).length = n };
@@ -376,25 +378,52 @@ pub fn barrier_weakdict<K>(d: *mut WeakDict<K>) {
     barrier_dict(d);
 }
 
-/// `rordereddict.rs` `pin_table_and_entries`. Barrier-before-pin of an
-/// old table: pinning an old object does not walk its children during
-/// Scanning. Pin the table if it is a GC object; pin `entries` whenever
-/// it is non-null. A host table must not be published as a `GCREF`.
-/// Returns the shadow-stack index of the `entries` pin, or the current
-/// length when `entries` is null.
-fn pin_table_and_entries<K>(d: *mut WeakDict<K>, entries: *mut WeakDictEntries<K>) -> usize {
-    if !d.is_null() {
+/// `rordereddict.rs` `RDict::pin_table_and_entries`.
+///
+/// Pins `d` when it is a GC object (`try_gc_owns_object`), then pins
+/// `entries` when non-null. Returns `(dict_slot, entries_slot)` recorded
+/// at each pin: `dict_slot` is `None` when `d` is not a GC object
+/// (host-fallback test dicts), and the caller keeps the raw pointer.
+/// `entries_slot` is the slot `entries` was published into, or the current
+/// stack length when `entries` is null. A nursery `WEAKDICT` moves, so
+/// callers read both back after a collecting malloc (`pinned_dict` /
+/// `pinned_entries`; `rordereddict.rs` `pinned_entries`).
+fn pin_table_and_entries<K>(
+    d: *mut WeakDict<K>,
+    entries: *mut WeakDictEntries<K>,
+) -> (Option<usize>, usize) {
+    let dict_slot = if !d.is_null() {
         barrier_dict(d);
         if crate::gc_hook::try_gc_owns_object(d as crate::gc_hook::GCREF) {
             let _ = crate::gc_roots::pin_root(d as crate::pyobject::PyObjectRef);
+            Some(crate::gc_roots::shadow_stack_len() - 1)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     let entries_slot = crate::gc_roots::shadow_stack_len();
     if !entries.is_null() {
         crate::gc_hook::try_gc_write_barrier(entries as crate::gc_hook::GCREF);
         let _ = crate::gc_roots::pin_root(entries as crate::pyobject::PyObjectRef);
     }
-    entries_slot
+    (dict_slot, entries_slot)
+}
+
+/// `WEAKDICT` read back from the slot [`pin_table_and_entries`] published,
+/// or `raw` when the dict is not a GC object.
+fn pinned_dict<K>(dict_slot: Option<usize>, raw: *mut WeakDict<K>) -> *mut WeakDict<K> {
+    match dict_slot {
+        Some(slot) => crate::gc_roots::shadow_stack_get(slot) as *mut WeakDict<K>,
+        None => raw,
+    }
+}
+
+/// `d.entries` read back from the slot [`pin_table_and_entries`] answered
+/// (`rordereddict.rs` `pinned_entries`).
+fn pinned_entries<K>(slot: usize) -> *mut WeakDictEntries<K> {
+    crate::gc_roots::shadow_stack_get(slot) as *mut WeakDictEntries<K>
 }
 
 /// `ll_setitem_fast` on `d.entries[i]`: barrier, then the key and value
@@ -412,7 +441,7 @@ impl<K: WeakDictKey> RDict for WeakDict<K> {
     type LookupKey = K;
     type Value = *mut Weakref;
     type Entries = WeakDictEntries<K>;
-    type ResizePin = usize;
+    type ResizePin = (Option<usize>, usize);
 
     fn num_items(d: *mut Self) -> isize {
         unsafe { (*d).num_items }
@@ -497,31 +526,50 @@ impl<K: WeakDictKey> RDict for WeakDict<K> {
         d: *mut Self,
         pin: &Self::ResizePin,
     ) -> (*mut Self, *mut Self::Entries) {
-        (
-            d,
-            crate::gc_roots::shadow_stack_get(*pin) as *mut WeakDictEntries<K>,
-        )
+        (pinned_dict(pin.0, d), pinned_entries(pin.1))
     }
 }
 
-/// `ll_new_weakdict`. The `dont_look_inside` trampoline cannot sit inside
-/// an `impl`.
+/// `WeakValueDictRepr.ll_new_weakdict`: an ordinary collecting `malloc(WEAKDICT)`.
 #[majit_macros::dont_look_inside]
 pub fn ll_new_weakdict<K: WeakDictKey>() -> *mut WeakDict<K> {
-    let raw = alloc_raw(weakdict_gc_type_id(), std::mem::size_of::<WeakDict<K>>());
-    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
+    let bytes = std::mem::size_of::<WeakDict<K>>();
+    let tid = weakdict_gc_type_id();
+    let raw = alloc_collecting_or_host(tid, bytes);
+    if raw.is_null() {
         return std::ptr::null_mut();
     }
-    // `_ll_malloc_entries` may collect (`framework.py` `push_roots`). `d` is
-    // the livevar across that malloc (`_rweakvaldict.py` `ll_new_weakdict`).
-    // The table is `alloc_raw` old-gen (`WEAKDICT`); `d` does not move.
     let _roots = crate::gc_roots::push_roots();
-    let _ = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
+    let (dict_slot, _) = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
     let entries = alloc_entries::<K>(DICT_INITSIZE);
     if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
         return std::ptr::null_mut();
     }
-    let d = raw as *mut WeakDict<K>;
+    let d = pinned_dict(dict_slot, raw as *mut WeakDict<K>);
+    barrier_dict(d);
+    unsafe {
+        (*d).entries = entries;
+        (*d).num_items = 0;
+        (*d).resize_counter = (DICT_INITSIZE * 2) as isize;
+    }
+    d
+}
+
+/// `WeakValueDictRepr.convert_const`: a prebuilt `WEAKDICT`.
+/// `alloc_raw` enrolls it in `prebuilt_root_objects`.
+#[majit_macros::dont_look_inside]
+pub fn ll_new_weakdict_prebuilt<K: WeakDictKey>() -> *mut WeakDict<K> {
+    let raw = alloc_raw(weakdict_gc_type_id(), std::mem::size_of::<WeakDict<K>>());
+    if crate::gc_hook::gc_alloc_failed_pending() && raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let (dict_slot, _) = pin_table_and_entries(raw as *mut WeakDict<K>, std::ptr::null_mut());
+    let entries = alloc_entries::<K>(DICT_INITSIZE);
+    if crate::gc_hook::gc_alloc_failed_pending() && entries.is_null() {
+        return std::ptr::null_mut();
+    }
+    let d = pinned_dict(dict_slot, raw as *mut WeakDict<K>);
     barrier_dict(d);
     unsafe {
         (*d).entries = entries;
