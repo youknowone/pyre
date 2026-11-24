@@ -1150,6 +1150,43 @@ fn rpython_exception_vtable_word(
     bits
 }
 
+/// `Assembler.see_raw_object` classifies a raw `Ptr` as a class only when
+/// its pointee is `rclass.OBJECT_VTABLE`, or a vtable struct whose
+/// first-struct chain reaches it.
+fn ptr_target_is_object_vtable(
+    to: &crate::translator::rtyper::lltypesystem::lltype::PtrTarget,
+) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rclass::OBJECT_VTABLE;
+
+    let mut current = match to {
+        PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(s)) => *s,
+            _ => return false,
+        },
+        PtrTarget::Struct(s) => s.clone(),
+        _ => return false,
+    };
+    let vtable = match OBJECT_VTABLE.clone() {
+        LowLevelType::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(s)) => *s,
+            _ => return false,
+        },
+        LowLevelType::Struct(s) => *s,
+        _ => return false,
+    };
+    for _ in 0..64 {
+        if current == vtable {
+            return true;
+        }
+        match current._first_struct_owned() {
+            Some((_, parent)) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
 fn object_vtable_typeptr(
     ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
 ) -> crate::translator::rtyper::lltypesystem::lltype::_ptr {
@@ -4421,6 +4458,9 @@ impl AssemblerEncode for Assembler {
                 return (self.emit_fnaddr_const(&target, state, callcontrol), 'i');
             }
             if ptr.nonzero() {
+                if ptr_target_is_object_vtable(&ptr._TYPE.TO) {
+                    return (self.emit_class_vtable_const_i(ptr, state, callcontrol), 'i');
+                }
                 use crate::translator::rtyper::lltypesystem::lltype::{
                     GcKind, LowLevelType, PtrTarget,
                 };
@@ -4433,7 +4473,10 @@ impl AssemblerEncode for Assembler {
                     _ => false,
                 };
                 if is_raw_struct {
-                    return (self.emit_class_vtable_const_i(ptr, state, callcontrol), 'i');
+                    panic!(
+                        "Assembler.emit_const: raw prebuilt struct constant {:?} has no runtime relocation (needs a prebuilt raw-struct relocation)",
+                        ptr._TYPE.TO
+                    );
                 }
             }
         }
@@ -17394,6 +17437,48 @@ mod tests {
                 .expect("OBJECT_VTABLE forward-reference must be resolved"),
             other => other,
         }
+    }
+
+    #[test]
+    fn object_vtable_pointer_is_a_class_vtable() {
+        use crate::translator::rtyper::lltypesystem::lltype::{PtrTarget, Struct};
+
+        let to = match rclass::OBJECT_VTABLE.clone() {
+            LowLevelType::ForwardReference(fwd) => PtrTarget::ForwardReference(*fwd),
+            LowLevelType::Struct(s) => PtrTarget::Struct(*s),
+            other => panic!("OBJECT_VTABLE is a ForwardReference or Struct, got {other:?}"),
+        };
+        assert!(
+            ptr_target_is_object_vtable(&to),
+            "exact OBJECT_VTABLE is a class vtable"
+        );
+
+        let leaf = Struct::with_hints(
+            "synth_leaf_vtable",
+            vec![("super".into(), resolved_object_vtable())],
+            vec![],
+        );
+        assert!(
+            ptr_target_is_object_vtable(&PtrTarget::Struct(leaf)),
+            "inlined OBJECT_VTABLE first-struct is a class vtable"
+        );
+    }
+
+    #[test]
+    fn frozen_pbc_struct_is_not_a_class_vtable() {
+        use crate::translator::rtyper::lltypesystem::lltype::{PtrTarget, Struct};
+
+        let pbc = Struct::new("pbc", vec![]);
+        assert!(
+            !ptr_target_is_object_vtable(&PtrTarget::Struct(pbc)),
+            "zero-field Struct pbc is not a class vtable"
+        );
+
+        let fake = Struct::new("not_a_vtable", vec![("super".into(), LowLevelType::Signed)]);
+        assert!(
+            !ptr_target_is_object_vtable(&PtrTarget::Struct(fake)),
+            "a field named super is not a class vtable"
+        );
     }
 
     fn fresh_exception_typer() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {

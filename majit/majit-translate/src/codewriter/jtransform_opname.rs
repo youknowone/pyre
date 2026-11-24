@@ -851,6 +851,10 @@ fn transduce_op(
         // `STRUCT._immutable_field(name)`; a struct with the `immutable`
         // hint (`TUPLE_TYPE`) is `getfield_gc_*_pure`.
         "getfield" => {
+            // `Transformer.rewrite_op_getfield` returns for a Void result.
+            if hlvalue_is_void(&op.result) {
+                return;
+            }
             let field_name = field_name_of(&op.args[1]);
             // `Transformer.handle_getfield_typeptr`: a Constant receiver
             // folds to `same_as` of `op.args[0].value.typeptr`.
@@ -974,6 +978,10 @@ fn transduce_op(
         // the stored value's kind: `current_buf` is a `Ref`, the size/offset
         // fields `Int`.  Void result.
         "setfield" => {
+            // `Transformer.rewrite_op_setfield` returns for a Void value.
+            if hlvalue_is_void(&op.args[2]) {
+                return;
+            }
             let field_name = field_name_of(&op.args[1]);
             let field = field_descriptor_of_hlvalue(&op.args[0], &field_name, "setfield");
             let base = materialize(out, block, &op.args[0]);
@@ -1330,6 +1338,12 @@ fn transduce_op(
         // result is renamed to the argument, which is what the shared
         // `UnaryOp same_as` handling in `Transformer` does.
         "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr" => {
+            // `Transformer.rewrite_op_same_as` returns None, so `optimize_block`
+            // renames the result. `do_rename` makes a Void result
+            // `Constant(None, lltype.Void)` and allocates no register.
+            if hlvalue_is_void(&op.args[0]) || hlvalue_is_void(&op.result) {
+                return;
+            }
             let result = expect_var(&op.result);
             if let Hlvalue::Constant(c) = &op.args[0] {
                 assert_rtyped_link_constant_kind(&out.name, c, &result);
@@ -2511,6 +2525,10 @@ fn emit_getinteriorfield(
     block: BlockId,
     op: &crate::flowspace::model::SpaceOperation,
 ) {
+    // `Transformer.rewrite_op_getinteriorfield` returns for a Void result.
+    if hlvalue_is_void(&op.result) {
+        return;
+    }
     assert_eq!(
         op.args.len(),
         3,
@@ -2561,9 +2579,6 @@ fn emit_getinteriorfield(
             },
             result,
         );
-        return;
-    }
-    if hlvalue_is_void(&op.result) {
         return;
     }
     let Some(array) = gc_array_of_operand(&op.args[0]) else {
@@ -3749,6 +3764,141 @@ mod tests {
             model.block(model.startblock).exits[0].args,
             vec![LinkArg::Value(casted)]
         );
+    }
+
+    fn assert_void_lowering_emits_nothing(graph: &FlowGraph) {
+        let model = lower_graph(graph);
+        for block in &model.blocks {
+            for op in &block.operations {
+                let is_const = matches!(
+                    op.kind,
+                    OpKind::ConstInt(_)
+                        | OpKind::ConstUInt(_)
+                        | OpKind::ConstInt128(_)
+                        | OpKind::ConstUInt128(_)
+                        | OpKind::ConstBool(_)
+                        | OpKind::ConstFloat(_)
+                        | OpKind::ConstSingleFloat(_)
+                        | OpKind::ConstStr(_)
+                        | OpKind::ConstInternedStr(_)
+                        | OpKind::ConstFnAddr { .. }
+                        | OpKind::ConstVtable { .. }
+                );
+                let is_copy = match &op.kind {
+                    OpKind::LoweredBlackholeOp { opname, .. } => opname.ends_with("_copy"),
+                    OpKind::UnaryOp { op, .. } => op.ends_with("_copy") || op == "same_as",
+                    _ => false,
+                };
+                panic!(
+                    "void operand must emit nothing and no Const*/_copy, got {:?} (const={is_const}, copy={is_copy})",
+                    op.kind
+                );
+            }
+        }
+    }
+
+    fn void_field_struct_ptr() -> LowLevelType {
+        let s = Struct::gc("VoidField", vec![("empty".into(), LowLevelType::Void)]);
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(s),
+        }))
+    }
+
+    /// `Transformer.rewrite_op_same_as` / `do_rename`: Void is
+    /// `Constant(None, lltype.Void)` and allocates no register.
+    #[test]
+    fn void_same_as_emits_nothing() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let graph =
+            FlowGraph::with_return_var("void_same_as", start.clone(), Hlvalue::Variable(n.clone()));
+        let void_res = variable_with_lltype("v", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![constant_with_lltype(ConstValue::None, LowLevelType::Void)],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, n);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_getfield` returns for a Void result.
+    #[test]
+    fn void_getfield_result_emits_nothing() {
+        let v = variable_with_lltype("v", void_field_struct_ptr());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "void_getfield",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("empty", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_setfield` returns for a Void stored value.
+    #[test]
+    fn void_setfield_value_emits_nothing() {
+        let v = variable_with_lltype("v", void_field_struct_ptr());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "void_setfield",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::None, LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v);
+        assert_void_lowering_emits_nothing(&graph);
+    }
+
+    /// `Transformer.rewrite_op_getinteriorfield` returns for a Void result.
+    #[test]
+    fn void_getinteriorfield_result_emits_nothing() {
+        let entry = Struct::new("VOIDENTRY", vec![("empty".into(), LowLevelType::Void)]);
+        let array_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(entry)))),
+        }));
+        let arr = variable_with_lltype("arr", array_ptr);
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(arr.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "void_getinteriorfield",
+            start.clone(),
+            Hlvalue::Variable(arr.clone()),
+        );
+        let void_res = variable_with_lltype("empty", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(arr.clone()),
+                Hlvalue::Variable(index),
+                constant_with_lltype(ConstValue::byte_str("empty"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, arr);
+        assert_void_lowering_emits_nothing(&graph);
     }
 
     /// `Transformer.rewrite_op_int_{floordiv,mod} = _do_builtin_call`.
