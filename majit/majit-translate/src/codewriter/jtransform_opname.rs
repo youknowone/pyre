@@ -4399,30 +4399,38 @@ mod tests {
     }
 
     /// End-to-end: the restructured production `ll_strconcat` helper lowers
-    /// cleanly through Spine B.  The two `copystrcontent` ops become void
-    /// `LoweredBlackholeOp`s, the source-length reads fuse to `strlen`, and
+    /// cleanly through Spine B.  The two `copy_string_contents` `direct_call`s
+    /// become `OpKind::Call`s, the source-length reads fuse to `strlen`, and
     /// the cross-Phi `resolve_string` fail-loud is never reached because no
     /// per-char loop (strgetitem/strsetitem) survives.
     #[test]
-    fn lower_graph_lowers_strconcat_helper_to_copystrcontent() {
+    fn lower_graph_lowers_strconcat_helper_copy_calls() {
+        use crate::model::CallTarget;
         use crate::translator::rtyper::lltypesystem::rstr::{
             STRPTR, build_ll_strconcat_helper_graph,
         };
 
-        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let rtyper = crate::translator::rtyper::rtyper::RPythonTyper::new(&ann);
+        let helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
             .expect("build strconcat helper");
         let flow = helper.graph.borrow();
         let model = lower_graph(&flow);
 
         let mut blackhole = Vec::new();
+        let mut copy_calls = 0;
         for block in &model.blocks {
             for op in &block.operations {
-                if let OpKind::LoweredBlackholeOp { opname, args } = &op.kind {
-                    blackhole.push(opname.clone());
-                    if opname == "copystrcontent" {
-                        assert_eq!(args.len(), 5, "copystrcontent has 5 operands");
-                        assert!(op.result.is_none(), "copystrcontent is void");
+                match &op.kind {
+                    OpKind::LoweredBlackholeOp { opname, .. } => {
+                        blackhole.push(opname.clone());
                     }
+                    OpKind::Call { target, .. }
+                        if *target == CallTarget::function_path(["copy_string_contents"]) =>
+                    {
+                        copy_calls += 1;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4436,9 +4444,10 @@ mod tests {
         assert_eq!(blackhole.iter().filter(|n| *n == "newstr").count(), 1);
         assert_eq!(
             blackhole.iter().filter(|n| *n == "copystrcontent").count(),
-            2,
-            "two copystrcontent bulk copies"
+            0,
+            "no copystrcontent blackhole op"
         );
+        assert_eq!(copy_calls, 2, "two copy_string_contents calls");
         // No per-char string ops: the loop is gone, so resolve_string never runs.
         assert!(
             !blackhole
