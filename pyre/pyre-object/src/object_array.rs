@@ -629,6 +629,66 @@ pub unsafe fn ll_arraycopy_float_items_block(
     );
 }
 
+/// [`ll_arraycopy_int_items_block`] for an overlapping `GcArray(Signed)` move.
+/// `rgc.py ll_arraymove`.
+///
+/// # Safety
+/// `array` is a live int `TypedItemsBlock` and both ranges are in bounds.
+#[majit_macros::oopspec("list.ll_arraymove(array, source_start, dest_start, length)")]
+pub unsafe fn ll_arraymove_int_items_block(
+    array: *mut TypedItemsBlock,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `array[dest_start] = array[source_start]`.
+            let item = unsafe {
+                *(typed_items_block_items_base(array) as *const i64).add(source_start as usize)
+            };
+            unsafe {
+                *(typed_items_block_items_base(array) as *mut i64).add(dest_start as usize) = item
+            };
+        }
+        return;
+    }
+    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+}
+
+/// [`ll_arraycopy_float_items_block`] for an overlapping `GcArray(Float)` move.
+/// `rgc.py ll_arraymove`.
+///
+/// `array` is a [`FloatItemsBlock`] pointer: `do_fixed_list_ll_arraycopy`
+/// names the copy's ARRAY from `dest`'s type, and a `TypedItemsBlock` there
+/// names `GcArray(Signed)`.
+///
+/// # Safety
+/// `array` is a live float items block and both ranges are in bounds.
+#[majit_macros::oopspec("list.ll_arraymove(array, source_start, dest_start, length)")]
+pub unsafe fn ll_arraymove_float_items_block(
+    array: *mut FloatItemsBlock,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `array[dest_start] = array[source_start]`.
+            let item = unsafe {
+                *(typed_items_block_items_base(array as *mut TypedItemsBlock) as *const f64)
+                    .add(source_start as usize)
+            };
+            unsafe {
+                *(typed_items_block_items_base(array as *mut TypedItemsBlock) as *mut f64)
+                    .add(dest_start as usize) = item
+            };
+        }
+        return;
+    }
+    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+}
+
 /// Allocated capacity (GcArray length header) of an `ItemsBlock`.
 /// Returns 0 for a null pointer so "empty list" is represented by
 /// a null `items` field.
@@ -2626,6 +2686,38 @@ mod tests {
             ]
         );
         unsafe { dealloc_list_items_block(one) };
+    }
+
+    #[test]
+    fn ll_arraymove_int_items_block_shifts_left_with_overlap() {
+        unsafe {
+            let block = alloc_typed_items_block(6, gc_int_array_gc_type_id());
+            let base = typed_items_block_items_base(block) as *mut i64;
+            for i in 0..6 {
+                *base.add(i) = i as i64;
+            }
+            ll_arraymove_int_items_block(block, 2, 1, 4);
+            assert_eq!(std::slice::from_raw_parts(base.add(1), 4), &[2, 3, 4, 5]);
+            dealloc_typed_items_block(block);
+        }
+    }
+
+    #[test]
+    fn ll_arraymove_float_items_block_shifts_left_with_overlap() {
+        unsafe {
+            let block =
+                alloc_typed_items_block(6, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+            let base = typed_items_block_items_base(block as *mut TypedItemsBlock) as *mut f64;
+            for i in 0..6 {
+                *base.add(i) = i as f64;
+            }
+            ll_arraymove_float_items_block(block, 2, 1, 4);
+            assert_eq!(
+                std::slice::from_raw_parts(base.add(1), 4),
+                &[2.0, 3.0, 4.0, 5.0]
+            );
+            dealloc_typed_items_block(block as *mut TypedItemsBlock);
+        }
     }
 
     #[test]
