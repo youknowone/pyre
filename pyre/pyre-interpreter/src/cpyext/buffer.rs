@@ -2,7 +2,7 @@
 //!
 //! Two directions meet here.  A C-defined type's `bf_getbuffer` becomes a
 //! `memoryview` over the exported memory ([`buffer_view`]), the exporter's
-//! `bf_releasebuffer` running when that view is released ([`release_view`]).
+//! `bf_releasebuffer` running when the GC finalizes its `CPyBuffer` carrier.
 //! In the other direction `PyObject_GetBuffer` hands C a `Py_buffer`; for an
 //! interpreter object that is a **snapshot**, because pyre's collector moves
 //! object storage and the address a `Py_buffer` carries has to stay put for as
@@ -109,18 +109,6 @@ fn releasebuffer_of(tp: *mut CPyTypeObject) -> *const c_void {
 type BufferTable = super::address_table::AddressMap<usize>;
 type BufferSet = super::address_table::AddressSet;
 
-/// The `Py_buffer` behind each live `memoryview` this layer built, keyed by the
-/// `BufferView` that memoryview carries.
-///
-/// A view has to hand the exporter back the exact structure it filled in --
-/// `internal` is the exporter's own state and nothing else can reconstruct it,
-/// and two live views over one address each have their own.  The key is the
-/// `BufferView` allocation rather than the memoryview because the collector
-/// moves the object and not that block, and rather than the exported address
-/// because several exports can name the same one.
-static EXPORTS: super::ForkMutex<BufferTable> =
-    super::ForkMutex::new(BufferTable::with_hasher(BuildHasherDefault::new()));
-
 /// The snapshots [`PyObject_GetBuffer`] took of interpreter objects, keyed by
 /// the address handed to C, with the byte length `PyBuffer_Release` frees.
 static SNAPSHOTS: super::ForkMutex<BufferTable> =
@@ -132,21 +120,9 @@ static SNAPSHOTS: super::ForkMutex<BufferTable> =
 /// release.
 pub(super) unsafe fn after_fork_child() {
     unsafe {
-        EXPORTS.reinit_after_fork();
         SNAPSHOTS.reinit_after_fork();
         GEOMETRIES.reinit_after_fork();
     }
-}
-
-fn record_export(carrier: usize, view: *mut CPyBuffer) {
-    EXPORTS.lock().insert(carrier, view as usize);
-}
-
-fn take_export(carrier: usize) -> Option<*mut CPyBuffer> {
-    EXPORTS
-        .lock()
-        .remove(&carrier)
-        .map(|view| view as *mut CPyBuffer)
 }
 
 // ── reading the geometry a `Py_buffer` carries ──────────────────────────
@@ -361,7 +337,16 @@ fn acquire(
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_str_new_managed(&format));
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
-    let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+    // `wrap_getbuffer` builds `NonOwningReleaseView(CPyBuffer)`: the visible
+    // memoryview does not own the export.  A separate hidden managed carrier
+    // owns the exact C structure and is registered with the finalizer queue,
+    // matching `fq.register_finalizer(buf)` and `FQ.finalizer_trigger`.
+    let cpy_buffer = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    let cpy_buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(cpy_buffer);
+    let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(mv);
     let r_obj = owner_slot
         .map(pyre_object::gc_roots::shadow_stack_get)
         .unwrap_or_else(pyre_object::w_none);
@@ -378,11 +363,25 @@ fn acquire(
         },
         r_obj,
         reload(0),
+        pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot),
     );
-    let carrier = pyre_object::memoryview::bufferview_alloc(built);
-    unsafe { pyre_object::memoryview::w_memoryview_set_view(mv, carrier) };
-    record_export(carrier as usize, view);
-    unsafe { crate::builtins::memoryview_register_finalizer(mv) };
+    let visible = built.clone();
+    let cpy_buffer = pyre_object::gc_roots::shadow_stack_get(cpy_buffer_slot);
+    unsafe {
+        pyre_object::memoryview::w_memoryview_set_view(
+            cpy_buffer,
+            pyre_object::memoryview::bufferview_alloc(built),
+        );
+        pyre_object::memoryview::w_memoryview_set_cpy_buffer(cpy_buffer, view.cast());
+    }
+    crate::executioncontext::register_finalizer(cpy_buffer);
+    let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
+    unsafe {
+        pyre_object::memoryview::w_memoryview_set_view(
+            mv,
+            pyre_object::memoryview::bufferview_alloc(visible),
+        )
+    };
     Ok(mv)
 }
 
@@ -408,6 +407,7 @@ fn carrier_for(
     geometry: Geometry,
     w_obj: PyObjectRef,
     w_fmt: PyObjectRef,
+    w_cpy_buffer: PyObjectRef,
 ) -> pyre_object::bufferview::BufferView {
     use pyre_object::buffer::Buffer;
     use pyre_object::bufferview::BufferView;
@@ -428,7 +428,7 @@ fn carrier_for(
     {
         return BufferView::Raw {
             backing: Buffer::External {
-                w_obj,
+                w_obj: w_cpy_buffer,
                 address,
                 size: length.max(0) as usize,
                 readonly,
@@ -460,7 +460,7 @@ fn carrier_for(
     };
     BufferView::CBuffer {
         backing: Buffer::External {
-            w_obj,
+            w_obj: w_cpy_buffer,
             address: (address as isize + low as isize) as usize,
             size: (high - low).max(0) as usize,
             readonly,
@@ -496,25 +496,18 @@ fn release_c_view(view: *mut CPyBuffer) {
     drop(unsafe { Box::from_raw(view) });
 }
 
-/// End the export a released `memoryview` held, if a C exporter produced it.
+/// `FQ.finalizer_trigger` for the hidden managed `CPyBuffer` carrier.
+/// Taking the inline pointer before `CPyBuffer.releasebuffer` makes a repeated
+/// dispatch a no-op and keeps `bf_releasebuffer` exactly once per export.
 ///
 /// # Safety
-/// `mv` must be a live memoryview and `backing` the object its view names.
-pub unsafe fn release_view(mv: PyObjectRef, backing: PyObjectRef) -> bool {
-    use pyre_object::buffer::Buffer;
-    let carrier = unsafe { pyre_object::memoryview::w_memoryview_view(mv) };
-    let Buffer::External { .. } = *carrier.backing() else {
-        return false;
-    };
-    if let Some(view) = take_export(carrier as *const _ as usize) {
+/// `carrier` must be the live managed carrier created by [`acquire`].
+pub(crate) unsafe fn finalize_cpy_buffer(carrier: PyObjectRef) {
+    let view =
+        unsafe { pyre_object::memoryview::w_memoryview_take_cpy_buffer(carrier) } as *mut CPyBuffer;
+    if !view.is_null() {
         release_c_view(view);
-        return true;
     }
-    // Preserve the pre-existing derived-view case: its cloned carrier has no
-    // table row of its own, but the C backing still identifies the native
-    // release path.  The table lookup comes first so a legacy export whose
-    // filled `Py_buffer.obj` is NULL is nevertheless freed.
-    !slot_of(backing, getbuffer_of).is_null()
 }
 
 // ── the buffer slots of a synthesized type mirror ───────────────────────
@@ -1597,6 +1590,7 @@ fn unowned_view_nd(geometry: Geometry, format: &str) -> PyObjectRef {
         geometry,
         w_obj,
         pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+        w_obj,
     );
     unsafe {
         pyre_object::memoryview::w_memoryview_set_view(

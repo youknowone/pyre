@@ -518,8 +518,8 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // `w_keepalive = w_object`, and `view`.  Drop of this lease covers the
     // length / address errors below. Success `disarm`s it: a made view
     // (C / ctypes fallthrough) is not released (`NonOwningReleaseView`,
-    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view as
-    // the `CPyBuffer` carrier (lease 0). The native `_exports` increment
+    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view and
+    // its hidden `CPyBuffer` carrier (lease 0). The native `_exports` increment
     // (lease 1) is the release.
     let flags = if require_writable {
         pyre_interpreter::builtins::BUF_WRITABLE
@@ -577,7 +577,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let made_view = acquired.made_view();
     let owner = roots.get(owner_slot);
     // Native `_exports` (held) keeps the owner. A made view
-    // (`acquire_buffer_w` C / ctypes fallthrough) is the `CPyBuffer`
+    // (`acquire_buffer_w` C / ctypes fallthrough) retains the `CPyBuffer`
     // carrier: keep it and `disarm` without releasing (`NonOwningReleaseView`,
     // `wrap_getbuffer` `owns_export=False`). Otherwise a memoryview owner
     // → `w_memoryview_backing` (null → owner); else owner. A made view is
