@@ -503,7 +503,9 @@ impl<'a> Lowering<'a> {
         // (`TypedItemsBlock`) is `lltype.nullptr(GcArray(ITEM))`:
         // `try_lower_gcarray_ptr_null` emits `cast_int_to_ptr`. A spelled
         // `core.ptr.null_mut` of the wrapper class would steal that dest.
-        if self.tyref_is_scalar_flexible_gcarray(&call.dest.ty) {
+        if self.tyref_is_scalar_flexible_gcarray(&call.dest.ty)
+            || self.tyref_object_fixed_list_root(&call.dest.ty).is_some()
+        {
             return Ok(false);
         }
         if !is_core_ptr_null_fun_path(&path) {
@@ -625,6 +627,16 @@ impl<'a> Lowering<'a> {
         };
         if !is_core_ptr_null_fun_path(&path) {
             return Ok(false);
+        }
+        if let Some(root) = self.tyref_object_fixed_list_root(&call.dest.ty) {
+            let bb_id = self.emit_bb(mir_bb);
+            let cast = (root.clone(), ValueType::Ref(Some(root)));
+            let res = self.graph.push_niche_null(bb_id, Some(&cast));
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
         }
         let Some(item) = self.tyref_scalar_flexible_gcarray_item(&call.dest.ty) else {
             return Ok(false);

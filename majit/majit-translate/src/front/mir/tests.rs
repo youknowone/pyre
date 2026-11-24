@@ -24137,6 +24137,26 @@ fn empty_dict_get_empty_storage_production_recasts_gcref() {
 /// Residual `ptr_null_constant` is a classdef-less Instance and must
 /// not remain; dest recast through `__cast_instance_intrinsic` is
 /// skipped when the Call dest already names that root.
+/// `mapdict.py MapdictStorageMixin._mapdict_read_storage` returns the
+/// object-item fixed-size list. Each Rust null storage arm must be narrowed
+/// onto the `ItemsBlock` list representation; a bare `ConstNone` would rtype
+/// as Void and a primitive GcArray pointer would be a different repr.
+#[test]
+fn mapdict_typed_load_storage_nulls_are_nullable_fixed_lists() {
+    let graph = lower_object_fn("pyre_object::mapdict::mapdict_typed_load_storage");
+    let ops = graph_ops(&graph);
+    let roots: Vec<_> = ops
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .filter(|root| *root == "object_array::ItemsBlock")
+        .collect();
+    assert_eq!(
+        roots.len(),
+        3,
+        "the three storage null arms must project onto ItemsBlock; ops={ops:?}"
+    );
+}
+
 #[test]
 fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
     use crate::model::{CallTarget, LinkArg, OpKind};
