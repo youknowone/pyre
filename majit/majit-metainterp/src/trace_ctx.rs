@@ -5802,11 +5802,10 @@ impl TraceCtx {
         let force_token = Self::do_record_op(&mut self.recorder, OpCode::ForceToken, &[]);
         let token_descr = info.token_field_descr();
         self.vable_setfield_descr(vbox, force_token, token_descr);
-        // pyjitpl.py self.generate_guard(rop.GUARD_NOT_FORCED_2)
-        // is recorded by the caller via the proper guard generation
-        // path (`MIFrame::generate_guard` in the pyre frontend) so the
-        // guard captures fresh resumedata at the current framestack
-        // position, matching RPython's gen_store_back_in_vable.
+        // pyjitpl.py self.generate_guard(rop.GUARD_NOT_FORCED_2) is
+        // recorded by the caller, which owns the resumedata capture:
+        // `MetaInterp::store_token_in_vable` from its framestack, and
+        // `fbw_store_token_in_vable` from the walker's snapshot.
         true
     }
 
