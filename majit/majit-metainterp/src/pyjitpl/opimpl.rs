@@ -704,27 +704,8 @@ where
             .as_field_descr()
             .map(|f| f.store_is_release())
             .unwrap_or(false);
-        // `_record_helper` runs `heapcache.invalidate_caches` before it
-        // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
-        // only the mark-escaped half runs: a ref written into an
-        // already-escaped struct escapes with it. Same shape as
-        // BC_SETARRAYITEM_GC below.
-        ctx.heapcache_invalidate_caches_varargs(
-            OpCode::SetfieldGc,
-            None,
-            &[struct_opref, value_opref],
-        );
-        ctx.profiler()
-            .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-        ctx.profiler()
-            .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_opref, value_opref], fielddescr);
-        // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
-        // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
-        // The cache stores the Box identity, not the value word.
-        if let Some(field_key) = field_key {
-            ctx.heapcache_setfield_cached(struct_opref, field_key, value_opref);
-        }
+        // Store first: execute_and_record may collect (`Trace._double_ops`)
+        // and the concrete value is not a root.
         if struct_ptr != 0 {
             // blackhole.py bhimpl_getfield_raw_f stores through the fielddescr,
             // which carries the field's byte width, and the getfield
@@ -772,6 +753,27 @@ where
                     }
                 }
             }
+        }
+        // `_record_helper` runs `heapcache.invalidate_caches` before it
+        // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
+        // only the mark-escaped half runs: a ref written into an
+        // already-escaped struct escapes with it. Same shape as
+        // BC_SETARRAYITEM_GC below.
+        ctx.heapcache_invalidate_caches_varargs(
+            OpCode::SetfieldGc,
+            None,
+            &[struct_opref, value_opref],
+        );
+        ctx.profiler()
+            .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_opref, value_opref], fielddescr);
+        // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
+        // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
+        // The cache stores the Box identity, not the value word.
+        if let Some(field_key) = field_key {
+            ctx.heapcache_setfield_cached(struct_opref, field_key, value_opref);
         }
         TraceAction::Continue
     }
@@ -2206,6 +2208,32 @@ where
             _ => self.read_int_reg(ctx, value_reg),
         };
         let descr_index = descr.index();
+        // Store first: execute_and_record may collect (`Trace._double_ops`)
+        // and the concrete value is not a root.
+        if array_addr != 0 {
+            let item_addr = (array_addr as usize)
+                .wrapping_add(base_size)
+                .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+            unsafe {
+                match itemsize {
+                    1 => *(item_addr as *mut u8) = value_concrete as u8,
+                    2 => *(item_addr as *mut u16) = value_concrete as u16,
+                    4 => *(item_addr as *mut u32) = value_concrete as u32,
+                    8 => *(item_addr as *mut i64) = value_concrete,
+                    other => {
+                        panic!("BC_SETARRAYITEM_GC: unsupported itemsize {other}")
+                    }
+                }
+            }
+            // A ref store adds a heap edge array→value; notify the GC on
+            // the container so a young value survives a minor collection
+            // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
+            if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R
+                && majit_gc::gc_owns_object(array_addr as usize)
+            {
+                majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
+            }
+        }
         // `execute_setarrayitem_gc` (pyjitpl.py) records through
         // `execute_and_record` → `_record_helper` (pyjitpl.py),
         // which runs `heapcache.invalidate_caches` → `mark_escaped` →
@@ -2237,30 +2265,6 @@ where
         // descr index the getarrayitem read path uses), not the raw
         // bytecode operand descr_idx.
         ctx.heapcache_setarrayitem(array_opref, index_opref, descr_index, value_opref);
-        if array_addr != 0 {
-            let item_addr = (array_addr as usize)
-                .wrapping_add(base_size)
-                .wrapping_add((index_value as usize).wrapping_mul(itemsize));
-            unsafe {
-                match itemsize {
-                    1 => *(item_addr as *mut u8) = value_concrete as u8,
-                    2 => *(item_addr as *mut u16) = value_concrete as u16,
-                    4 => *(item_addr as *mut u32) = value_concrete as u32,
-                    8 => *(item_addr as *mut i64) = value_concrete,
-                    other => {
-                        panic!("BC_SETARRAYITEM_GC: unsupported itemsize {other}")
-                    }
-                }
-            }
-            // A ref store adds a heap edge array→value; notify the GC on
-            // the container so a young value survives a minor collection
-            // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
-            if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R
-                && majit_gc::gc_owns_object(array_addr as usize)
-            {
-                majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
-            }
-        }
         TraceAction::Continue
     }
 
@@ -9543,6 +9547,14 @@ where
         // ── 4. store the items block into the header's `items` field.
         // A ref store adds a heap edge header→items, so notify the GC
         // on the container (mirrors BC_SETFIELD_GC_R / bh_setfield_gc_r).
+        // Store first: execute_and_record may collect (`Trace._double_ops`)
+        // and the concrete value is not a root.
+        if struct_ptr != 0 {
+            unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
+            if majit_gc::gc_owns_object(struct_ptr as usize) {
+                majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+            }
+        }
         ctx.profiler()
             .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
         ctx.profiler()
@@ -9552,12 +9564,6 @@ where
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
         if let Some(field_key) = items_field_key {
             ctx.heapcache_setfield_cached(sbox_op, field_key, abox_op);
-        }
-        if struct_ptr != 0 {
-            unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
-            if majit_gc::gc_owns_object(struct_ptr as usize) {
-                majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
-            }
         }
 
         // ── 5. bind the list header to the destination ref register. ──
