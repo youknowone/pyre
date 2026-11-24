@@ -27064,7 +27064,11 @@ mod tests {
                 .iter()
                 .find(|field| field.name == "key")
                 .expect("key");
-            assert_eq!(key.flag, majit_ir::descr::ArrayFlag::Pointer);
+            let expected_flag = match kind {
+                TransparentPointerKind::GcObject => majit_ir::descr::ArrayFlag::Pointer,
+                TransparentPointerKind::Pointer => majit_ir::descr::ArrayFlag::Unsigned,
+            };
+            assert_eq!(key.flag, expected_flag);
             assert_eq!(key.size, word);
 
             let mut cc = CallControl::new();
@@ -27072,12 +27076,13 @@ mod tests {
             cc.set_struct_fields(fields);
             cc.set_struct_layout(elem_sid, entry_layout);
 
+            let key_lltype = match kind {
+                TransparentPointerKind::GcObject => GCREF.clone(),
+                TransparentPointerKind::Pointer => LowLevelType::Unsigned,
+            };
             let arr = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
                 elem.as_str(),
-                vec![
-                    ("key".into(), GCREF.clone()),
-                    ("value".into(), GCREF.clone()),
-                ],
+                vec![("key".into(), key_lltype), ("value".into(), GCREF.clone())],
             ))));
             let (descr, _) = cc
                 .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "key", None, None)
@@ -27085,7 +27090,14 @@ mod tests {
             let interior = descr
                 .as_interior_field_descr()
                 .expect("interior descriptor");
-            assert!(interior.field_descr().is_pointer_field());
+            match kind {
+                TransparentPointerKind::GcObject => {
+                    assert!(interior.field_descr().is_pointer_field());
+                }
+                TransparentPointerKind::Pointer => {
+                    assert!(!interior.field_descr().is_pointer_field());
+                }
+            }
             assert_eq!(
                 interior.field_descr().field_size(),
                 crate::layout::target_word_size()

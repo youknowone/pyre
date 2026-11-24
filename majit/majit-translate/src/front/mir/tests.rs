@@ -20667,8 +20667,7 @@ fn transparent_pointer_wrapper_harvest_is_structural_and_qualified() {
     );
 }
 
-/// Production `pyre-object.ullbc`: `IdentityKey` / `ObjectEntryKey` alias
-/// the object ClassDef; `BytesKey` / `StrKey` stay one-word pointer keys.
+/// `Utf8Str` is the rstr `STR` GcStruct, so `Ptr(STR)` key wrappers are GC references.
 #[test]
 fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
     use crate::front::semantic::TransparentPointerKind;
@@ -20704,12 +20703,12 @@ fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
     );
     assert_eq!(
         kind_of("dictmultiobject::BytesKey"),
-        Some(TransparentPointerKind::Pointer),
+        Some(TransparentPointerKind::GcObject),
         "kinds={kinds:?}"
     );
     assert_eq!(
         kind_of("celldict::StrKey"),
-        Some(TransparentPointerKind::Pointer),
+        Some(TransparentPointerKind::GcObject),
         "kinds={kinds:?}"
     );
     let extra_gc: Vec<&str> = kinds
@@ -20718,6 +20717,8 @@ fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
             *kind == TransparentPointerKind::GcObject
                 && !path.ends_with("identitydict::IdentityKey")
                 && !path.ends_with("dictmultiobject::ObjectEntryKey")
+                && !path.ends_with("dictmultiobject::BytesKey")
+                && !path.ends_with("celldict::StrKey")
         })
         .map(|(path, _)| path.as_str())
         .collect();
@@ -20731,11 +20732,11 @@ fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
     );
     assert_eq!(
         fields.transparent_pointer_kind("BytesKey"),
-        Some(TransparentPointerKind::Pointer)
+        Some(TransparentPointerKind::GcObject)
     );
     assert_eq!(
         fields.transparent_pointer_kind("StrKey"),
-        Some(TransparentPointerKind::Pointer)
+        Some(TransparentPointerKind::GcObject)
     );
     for leaf in ["ObjectEntryKey", "BytesKey", "StrKey"] {
         assert!(

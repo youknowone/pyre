@@ -423,13 +423,21 @@ fn apply_transparent_pointer_field_kinds(
         let Some(row) = rows.iter().find(|row| row.name == field.name) else {
             continue;
         };
-        if registry.transparent_pointer_kind(&row.ty).is_none() {
+        let Some(kind) = registry.transparent_pointer_kind(&row.ty) else {
             continue;
+        };
+        // `descr.py` `get_type_flag`: a GC pointee is `FLAG_POINTER`;
+        // a raw pointee is a machine-word `FLAG_UNSIGNED` value.
+        match kind {
+            crate::front::semantic::TransparentPointerKind::GcObject => {
+                field.flag = majit_ir::descr::ArrayFlag::Pointer;
+                field.field_type = majit_ir::value::Type::Ref;
+            }
+            crate::front::semantic::TransparentPointerKind::Pointer => {
+                field.flag = majit_ir::descr::ArrayFlag::Unsigned;
+                field.field_type = majit_ir::value::Type::Int;
+            }
         }
-        // descr.py get_type_flag(Ptr(gc)) / heaptracker.py
-        // all_interiorfielddescrs: this is one pointer leaf, not Struct.
-        field.flag = majit_ir::descr::ArrayFlag::Pointer;
-        field.field_type = majit_ir::value::Type::Ref;
         field.size = word;
     }
 }
@@ -923,11 +931,16 @@ mod tests {
                 .expect("key")
                 .clone()
         };
-        for key in [key_of(gc_entry_id), key_of(word_entry_id)] {
-            assert_eq!(key.offset, 0);
-            assert_eq!(key.size, word);
-            assert_eq!(key.flag, ArrayFlag::Pointer);
-            assert_eq!(key.field_type, Type::Ref);
-        }
+        let gc_key = key_of(gc_entry_id);
+        assert_eq!(gc_key.offset, 0);
+        assert_eq!(gc_key.size, word);
+        assert_eq!(gc_key.flag, ArrayFlag::Pointer);
+        assert_eq!(gc_key.field_type, Type::Ref);
+
+        let raw_key = key_of(word_entry_id);
+        assert_eq!(raw_key.offset, 0);
+        assert_eq!(raw_key.size, word);
+        assert_eq!(raw_key.flag, ArrayFlag::Unsigned);
+        assert_eq!(raw_key.field_type, Type::Int);
     }
 }

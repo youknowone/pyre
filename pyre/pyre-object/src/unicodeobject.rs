@@ -46,6 +46,17 @@ const _: () = {
     );
 };
 
+/// `STR` is a `GcStruct` (`rstr.py`): a `Ptr(STR)` field or key is a GC
+/// reference (`descr.py get_type_flag` -> `FLAG_POINTER`). Varsized: mortal
+/// blocks come from `alloc_utf8_payload` under [`lowlevel_str_gc_type_id`],
+/// never from `malloc_typed`.
+impl crate::lltype::GcType for Utf8Str {
+    fn type_id() -> u32 {
+        lowlevel_str_gc_type_id()
+    }
+    const SIZE: usize = std::mem::size_of::<Utf8Str>();
+}
+
 /// `_utf8` payload — pointer to an [`Utf8Str`] / rstr `STR` allocation.
 pub type UnicodeValueStorage = Utf8Str;
 
