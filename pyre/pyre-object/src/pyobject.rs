@@ -793,28 +793,42 @@ pub fn w_class_current_qmut() -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
 
 /// Invalidate loops that folded a `w_class` read. Call after a published
 /// object's class changes (`descr_set___class__`, exception retag).
-#[inline]
+///
+/// `quasiimmut.py make_invalidation_function` (`_invalidate_now`) bound to
+/// the prebuilt `OBJECT_LAYOUT` owner: traced code reaches it as a residual
+/// call with no field address (`jit_force_quasi_immutable`).
+#[majit_macros::dont_look_inside]
 pub fn notify_w_class_mutated() {
     if OBJECT_LAYOUT.w_class_watchers().is_installed() {
         OBJECT_LAYOUT.w_class_watchers().invalidate();
     }
 }
 
-/// Unlink the `w_class` watcher and publish `w_class` under the same lock
-/// so a tracer cannot fold the old class onto a freshly installed watcher.
+/// Unlink the `w_class` watcher and store `w_class`.
 ///
-/// `rclass.py hook_setfield` plus the store (`publish_quasi_immut_ptr`).
+/// `rclass.py hook_setfield` plus the store. The interpreter publishes under
+/// the field lock (`publish_quasi_immut_ptr`) so a tracer cannot fold the old
+/// class onto a freshly installed watcher. Traced code takes the
+/// `jit_force_quasi_immutable` shape instead: the owner-bound invalidation
+/// ([`notify_w_class_mutated`]) is a residual call, and the store is an
+/// ordinary setfield on `obj`; no interior pointer is handed to a residual
+/// call.
 ///
 /// # Safety
 /// `obj` is live. `w_class` is the header class word being published.
 #[inline]
 pub unsafe fn notify_w_class_mutated_then(obj: PyObjectRef, w_class: PyObjectRef) {
     unsafe {
-        crate::quasiimmut::publish_quasi_immut_ptr(
-            std::ptr::addr_of!(OBJECT_LAYOUT.w_class_watchers),
-            std::ptr::addr_of_mut!((*obj).w_class),
-            w_class,
-        );
+        if !majit_rlib::jit::we_are_jitted() {
+            crate::quasiimmut::publish_quasi_immut_ptr(
+                std::ptr::addr_of!(OBJECT_LAYOUT.w_class_watchers),
+                std::ptr::addr_of_mut!((*obj).w_class),
+                w_class,
+            );
+        } else {
+            notify_w_class_mutated();
+            (*obj).w_class = w_class;
+        }
     }
 }
 
