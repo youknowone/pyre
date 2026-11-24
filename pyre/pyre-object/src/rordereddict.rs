@@ -1847,7 +1847,16 @@ where
         K: Hash + Eq + GcRefOffsets,
         V: GcRefOffsets,
     {
+        // Root before hash_of: Hash may collect (gctransform framework.py gct_direct_call push_roots).
+        let _roots = crate::gc_roots::push_roots();
+        let mut key = key;
+        let mut value = value;
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        self.pin_table_and_entries();
         let hash = self.hash_of(&key);
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
         self.insert_hashed(hash, &key, key, value)
     }
 
@@ -1904,7 +1913,16 @@ where
         K: Hash + GcRefOffsets,
         V: GcRefOffsets,
     {
+        // Root before hash_of: Hash may collect (gctransform framework.py gct_direct_call push_roots).
+        let _roots = crate::gc_roots::push_roots();
+        let mut key = key;
+        let mut value = value;
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        self.pin_table_and_entries();
         let hash = self.hash_of(&key);
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
         self.insert_known_absent_hashed(hash, key, value);
     }
 
@@ -2217,16 +2235,24 @@ where
         if n == 0 {
             return Self::with_hasher(S::default());
         }
+        let _roots = crate::gc_roots::push_roots();
+        let mut key_slots = Vec::with_capacity(n);
+        for key in keys {
+            key_slots.push(pin_key_gc_refs(key));
+        }
         let mut hashes = vec![0u64; n];
+        let mut reloaded_keys = Vec::with_capacity(n);
         {
             let dst = Self::with_hasher(S::default());
             for slot in 0..n {
+                let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
                 if live[slot] {
-                    hashes[slot] = dst.hash_of(&keys[slot]);
+                    hashes[slot] = dst.hash_of(&key);
                 }
+                reloaded_keys.push(key);
             }
         }
-        Self::from_preserved_slots_with_hashes(keys, &hashes, live, index_len)
+        Self::from_preserved_slots_with_hashes(&reloaded_keys, &hashes, live, index_len)
     }
 
     /// [`Self::from_preserved_slots`] with the cached `f_hash` already known.
@@ -3297,5 +3323,51 @@ mod tests {
             let want = if i == 50 { None } else { Some(i) };
             assert_eq!(d.get(&Nasty(i)).copied(), want, "colliding key {i}");
         }
+    }
+
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RootCheckedKey(crate::PyObjectRef);
+
+    impl Hash for RootCheckedKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            let rooted = (0..crate::gc_roots::shadow_stack_len())
+                .any(|slot| crate::gc_roots::shadow_stack_get(slot) == self.0);
+            assert!(rooted, "key GC word must be rooted before Hash::hash");
+            state.write_usize(self.0 as usize);
+        }
+    }
+
+    impl EntryDummy for RootCheckedKey {
+        fn dummy() -> Self {
+            Self(std::ptr::null_mut())
+        }
+    }
+
+    impl GcRefOffsets for RootCheckedKey {
+        const GC_REF_OFFSETS: &'static [usize] = &[0];
+    }
+
+    impl GcEntriesType for (RootCheckedKey, usize) {
+        fn entries_gc_type_id() -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn hashing_entry_points_root_gc_words_before_hash() {
+        type D = RDict<
+            RootCheckedKey,
+            usize,
+            std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>,
+        >;
+        let key1 = RootCheckedKey(0x1000usize as crate::PyObjectRef);
+        let key2 = RootCheckedKey(0x2000usize as crate::PyObjectRef);
+        let mut d = D::new();
+        assert_eq!(d.insert(key1, 1), None);
+        d.insert_known_absent(key2, 2);
+
+        let copied = D::from_preserved_slots(&[key1, key2], &[true, true], 8);
+        assert_eq!(copied.len(), 2);
     }
 }
