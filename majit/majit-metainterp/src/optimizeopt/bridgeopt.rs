@@ -137,8 +137,7 @@ pub fn serialize_optimizer_knowledge(
     // (`box1.is_constant() or box1 in available_boxes`); only `box2` is
     // walked through `get_box_replacement` first.
     let field_ok = |obj: &Operand, val: &Operand| {
-        let obj_available =
-            obj.is_constant() || env.is_const(obj) || available_boxes.contains_key(obj);
+        let obj_available = obj.is_constant() || available_boxes.contains_key(obj);
         obj_available
             && val.with_box_replacement(|val| {
                 val.is_constant() || env.is_const(val) || available_boxes.contains_key(val)
