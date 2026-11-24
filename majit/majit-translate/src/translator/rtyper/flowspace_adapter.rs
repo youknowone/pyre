@@ -2934,7 +2934,6 @@ enum FunctionPathHighLevel<'a> {
     CastPointer,
     CastInstance,
     CastAddress,
-    LlArraymove,
     BuiltinShim(&'static str),
     StringBuilderNew,
     StringBuilderAppend,
@@ -3114,9 +3113,6 @@ fn function_path_high_level_kind<'a>(
     }
     if is_single_segment(segments, shims::CAST_ADDRESS) {
         return Some(FunctionPathHighLevel::CastAddress);
-    }
-    if is_single_segment(segments, shims::LL_ARRAYMOVE) {
-        return Some(FunctionPathHighLevel::LlArraymove);
     }
     if let Some(builtin) = function_path_builtin_shim(segments) {
         return Some(FunctionPathHighLevel::BuiltinShim(builtin));
@@ -3372,27 +3368,6 @@ fn emit_function_path_high_level_op(
                 .ok_or_else(|| {
                     TyperError::message(
                         "__cast_address_intrinsic missing from HOST_ENV bootstrap".to_string(),
-                    )
-                })?;
-            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                callable_host,
-            ))));
-            call_args.extend(arg_hls);
-            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
-        }
-        FunctionPathHighLevel::LlArraymove => {
-            if arg_hls.len() != 4 {
-                return Err(TyperError::message(format!(
-                    "__majit_ll_arraymove requires exactly four args, got {}",
-                    arg_hls.len()
-                )));
-            }
-            let callable_host = HOST_ENV
-                .lookup_builtin(shims::LL_ARRAYMOVE)
-                .ok_or_else(|| {
-                    TyperError::message(
-                        "__majit_ll_arraymove missing from HOST_ENV bootstrap".to_string(),
                     )
                 })?;
             let mut call_args = Vec::with_capacity(arg_hls.len() + 1);

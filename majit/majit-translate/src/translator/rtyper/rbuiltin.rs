@@ -254,10 +254,6 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             crate::runtime_names::shims::CAST_ADDRESS,
             rtype_cast_instance_intrinsic,
         ),
-        (
-            crate::runtime_names::shims::LL_ARRAYMOVE,
-            rtype_ll_arraymove_intrinsic,
-        ),
     ];
     for (name, typer) in entries {
         if let Some(host) = HOST_ENV.lookup_builtin(name) {
@@ -5839,60 +5835,6 @@ pub fn rtype_cast_instance_intrinsic(
         "cast_pointer"
     };
     Ok(hop.genop(opname, vec![v_ptr], GenopResult::LLType(result_lltype)))
-}
-
-/// Restore the MIR adapter marker to RPython
-/// `rgc.ll_arraymove(array, source_start, dest_start, length)`.
-///
-/// `source_start` and `dest_start` arrive as `Signed` variables, so the
-/// direction of the move is not known here.  The minted helper carries
-/// upstream's runtime `delta` dispatch (`rpython/rlib/rgc.py`,
-/// `ll_arraymove`) and is overlap-safe either way, which is also what lets
-/// it be minted under the single name `ll_arraymove`: the rtyper caches
-/// low-level helpers on `(name, args, result)`, and both directions present
-/// the identical key.
-pub fn rtype_ll_arraymove_intrinsic(
-    hop: &HighLevelOp,
-    _kwds_i: &HashMap<String, usize>,
-) -> RTypeResult {
-    use crate::translator::rtyper::rlist::{FixedSizeListRepr, build_ll_arraymove_helper_graph};
-
-    let r_array = arg_repr(hop, 0)?;
-    let any_array: &dyn std::any::Any = r_array.as_ref();
-    let fixed = any_array
-        .downcast_ref::<FixedSizeListRepr>()
-        .ok_or_else(|| {
-            TyperError::message(
-                "rtype_ll_arraymove_intrinsic requires FixedSizeListRepr items".to_string(),
-            )
-        })?;
-    let item_lltype = fixed.item_lowleveltype();
-    let array_lltype = r_array.lowleveltype().clone();
-    let mut args = hop.inputargs(vec![
-        ConvertedTo::Repr(r_array.as_ref()),
-        ConvertedTo::LowLevelType(&LowLevelType::Signed),
-        ConvertedTo::LowLevelType(&LowLevelType::Signed),
-        ConvertedTo::LowLevelType(&LowLevelType::Signed),
-    ])?;
-    let array = args.remove(0);
-    let source_start = args.remove(0);
-    let dest_start = args.remove(0);
-    let length = args.remove(0);
-    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-        "ll_arraymove".to_string(),
-        vec![
-            array_lltype,
-            LowLevelType::Signed,
-            LowLevelType::Signed,
-            LowLevelType::Signed,
-        ],
-        LowLevelType::Void,
-        move |_rtyper, _args, _result| {
-            build_ll_arraymove_helper_graph("ll_arraymove", item_lltype.clone())
-        },
-    )?;
-    hop.exception_cannot_occur()?;
-    hop.gendirectcall(&helper, vec![array, source_start, dest_start, length])
 }
 
 #[cfg(test)]

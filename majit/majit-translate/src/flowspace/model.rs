@@ -1855,15 +1855,6 @@ impl HostEnv {
             crate::runtime_names::shims::CAST_ADDRESS,
             HostObject::new_builtin_callable(crate::runtime_names::shims::CAST_ADDRESS),
         );
-        // Front-end spelling of the exact RPython `rgc.ll_arraymove` helper.
-        // Rust source reaches the same operation as `ptr::copy`; the MIR
-        // adapter reconstructs the array plus logical source/destination
-        // indices before resolving this singleton through the annotator and
-        // rtyper registries.
-        self.insert_builtin(
-            crate::runtime_names::shims::LL_ARRAYMOVE,
-            HostObject::new_builtin_callable(crate::runtime_names::shims::LL_ARRAYMOVE),
-        );
         // Front-end spelling of `rutf8.Utf8StringIterator(s)`: `s.chars()`
         // becomes `__majit_utf8iter(s)`.  Not a Python builtin class; a
         // translator shim keyed like CAST_INSTANCE (callable, not a class).

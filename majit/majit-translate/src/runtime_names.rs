@@ -100,15 +100,6 @@ pub(crate) mod artifacts {
 
 /// Host adapter spellings — callables the consumer exports for the flowspace
 /// HOST_ENV when Rust source has no directly importable RPython callable.
-/// Most are translation-only shims. `LL_ARRAYMOVE` is the one exception: it
-/// names a callable RPython does have (`rpython/rtyper/rlist.py`,
-/// `ll_arraymove`, wrapping `rgc.ll_arraymove`), reached here through a
-/// proven adapter boundary because neither `rlist.ll_arraymove` nor its
-/// caller `ll_delitem_nonneg` is built yet. The restoration reaches the
-/// rtyper, oopspec, and codewriter boundary: the minted helper is marked
-/// `list.ll_arraymove`, and `_handle_list_call` emits OS_ARRAYMOVE (9) while
-/// retaining this adapter only as the source-level restoration seam.
-///
 /// Registered in `flowspace::model`, given an annotator in
 /// `annotator::builtin`, and resolved in `translator::rtyper`. All three must
 /// agree, which is the whole reason these are constants.
@@ -151,9 +142,6 @@ pub(crate) mod shims {
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";
-    /// Rust `ptr::copy` at a proven list-storage adapter boundary, restored
-    /// to RPython `rgc.ll_arraymove(array, source_start, dest_start, length)`.
-    pub(crate) const LL_ARRAYMOVE: &str = "__majit_ll_arraymove";
     /// Prefix, not a whole name: the wrapping arithmetic shims are
     /// `__majit_wrap_<op>`, matched by prefix where the op is not known.
     pub(crate) const WRAP_PREFIX: &str = "__majit_wrap_";
