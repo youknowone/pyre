@@ -819,7 +819,7 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
     match tagged {
         crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
             if opref.is_none() || opref.is_constant() {
-                return SnapshotBox::from_cached(Operand::from_opref(*opref));
+                return SnapshotBox::constant(*opref);
             }
             // List-path capture holds only the snapshot coordinate here.
             // The iterator box is planted by `attach_iter_cache` /
@@ -830,17 +830,15 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
         crate::recorder::SnapshotTagged::Const(val, tp) => {
             // `Type::Ref` payload is a const_ptr_table index
             // (`SnapshotTagged::const_ref` / history.py `ConstPtr`).
-            // `Operand::from_opref(OpRef::ConstPtr(idx))` stores
-            // `WideStored::Ref(idx)` without intern. Index 0 is null
-            // (`const_ref(0)` / intern(NULL) → 0) and stays NullRef.
-            if *tp == majit_ir::Type::Ref {
-                if *val == 0 {
-                    SnapshotBox::from_cached(Operand::const_from_value(Value::Ref(GcRef::NULL)))
-                } else {
-                    SnapshotBox::from_cached(Operand::from_opref(OpRef::ConstPtr(*val as u32)))
+            // Index 0 is null (`const_ref(0)` / intern(NULL) → 0).
+            match *tp {
+                majit_ir::Type::Ref if *val == 0 => SnapshotBox::constant(OpRef::ConstPtr(0)),
+                majit_ir::Type::Ref => SnapshotBox::constant(OpRef::ConstPtr(*val as u32)),
+                majit_ir::Type::Int => SnapshotBox::constant(OpRef::const_int(*val)),
+                majit_ir::Type::Float => {
+                    SnapshotBox::constant(OpRef::const_float(f64::from_bits(*val as u64)))
                 }
-            } else {
-                SnapshotBox::from_cached(Operand::const_from_value(heap_value_for(*tp, *val)))
+                majit_ir::Type::Void => SnapshotBox::constant(OpRef::NONE),
             }
         }
     }
@@ -5494,13 +5492,10 @@ impl<M: Clone> MetaInterp<M> {
     /// unroll.py Optimizer and compile.py CompileData read enable_opts and
     /// pureop_historylength off `jitdriver_sd.warmstate`. Snapshot so later
     /// unroll_opt assignment does not reborrow that slot.
-    fn snapshot_compiling_opt_params(&mut self) -> (Vec<String>, usize) {
+    fn snapshot_compiling_opt_params(&mut self) -> (std::rc::Rc<[String]>, usize) {
         let jd = self.active_jitdriver_sd.unwrap_or(0);
         let ws = self.warm_state_for_driver(jd);
-        (
-            ws.get_enable_opts().to_vec(),
-            ws.pureop_historylength() as usize,
-        )
+        (ws.clone_enable_opts(), ws.pureop_historylength() as usize)
     }
 
     /// compile.py compile_loop reads `warmstate.vec` / `vec_all` /
@@ -6676,14 +6671,14 @@ impl<M: Clone> MetaInterp<M> {
 
     fn make_optimizer(&mut self) -> Optimizer {
         // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
-        let jd = self.active_jitdriver_sd.unwrap_or(0);
-        let enable_opts = self
-            .warm_state_ref_for_driver(jd)
-            .expect("make_enter_function has not run for the active jitdriver_sd")
-            .get_enable_opts()
-            .to_vec();
-        let mut opt =
-            Optimizer::build_opt_chain(&enable_opts, self.current_virtualizable_optimizer_config());
+        let vable = self.current_virtualizable_optimizer_config();
+        let mut opt = {
+            let jd = self.active_jitdriver_sd.unwrap_or(0);
+            let ws = self
+                .warm_state_ref_for_driver(jd)
+                .expect("make_enter_function has not run for the active jitdriver_sd");
+            Optimizer::build_opt_chain(ws.get_enable_opts(), vable)
+        };
         self.pin_optimizer_host_state(&mut opt);
         opt
     }

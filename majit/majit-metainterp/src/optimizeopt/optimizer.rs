@@ -5893,7 +5893,18 @@ impl Optimizer {
         vable: Option<VirtualizableConfig>,
     ) -> Self {
         let enabled = |name: &str| enable_opts.iter().any(|opt| opt == name);
+        let n_passes = ALL_OPTS
+            .iter()
+            .filter(|(name, instantiate)| *instantiate && enabled(name))
+            .count()
+            + usize::from(
+                !enabled("rewrite")
+                    || !enabled("virtualize")
+                    || !enabled("heap")
+                    || !enabled("pure"),
+            );
         let mut opt = Self::new();
+        opt.passes.reserve(n_passes);
         if let Some(config) = vable.as_ref() {
             // resume.py:399-402 `minimum_virtualizable_size` from
             // `virtualizable_info.minimum_size()` (`num_static_fields`).

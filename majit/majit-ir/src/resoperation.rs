@@ -2161,16 +2161,36 @@ impl ArgSlot {
     /// `N_aryOp.initarglist`: `numargs` is `len(self._args)`, returned with
     /// the slot so a nested constructor cannot clobber the outer length.
     pub fn new(v: OpArgVec) -> (Self, u8) {
-        let len = store_arg_len(v.len());
-        (ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v))), len)
+        Self::from_exact_iter(v)
     }
 
-    fn pack_data(v: OpArgVec) -> ArgData {
+    /// Pack args from a slice with the same length-class layout as [`Self::new`].
+    pub fn from_slice(args: &[Operand]) -> (Self, u8) {
+        Self::from_exact_iter(args.iter().cloned())
+    }
+
+    fn from_exact_iter<I>(v: I) -> (Self, u8)
+    where
+        I: IntoIterator<Item = Operand>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = v.into_iter();
+        let len = store_arg_len(iter.len());
+        (
+            ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(iter))),
+            len,
+        )
+    }
+
+    fn pack_data<I>(v: I) -> ArgData
+    where
+        I: ExactSizeIterator<Item = Operand>,
+    {
         let len_us = v.len();
         if len_us <= ARG_INLINE {
             let mut inline: [std::mem::MaybeUninit<Operand>; ARG_INLINE] =
                 unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-            for (i, arg) in v.into_iter().enumerate() {
+            for (i, arg) in v.enumerate() {
                 inline[i].write(arg);
             }
             ArgData {
@@ -2180,7 +2200,7 @@ impl ArgSlot {
             // 3–4 args: 32 B payload from the reserved slot slab so
             // GC_STORE's extra pair does not mint the 32-byte class.
             let ptr = alloc_arg32();
-            for (i, arg) in v.into_iter().enumerate() {
+            for (i, arg) in v.enumerate() {
                 unsafe {
                     ptr.add(i).write(arg);
                 }
@@ -2192,7 +2212,8 @@ impl ArgSlot {
                 }),
             }
         } else if len_us <= ARG_LEN_STORED_MAX as usize {
-            let mut vec = v.into_vec();
+            let mut vec = Vec::with_capacity(len_us);
+            vec.extend(v);
             let heap = ArgHeap {
                 ptr: vec.as_mut_ptr(),
                 cap: vec.capacity(),
@@ -2216,7 +2237,7 @@ impl ArgSlot {
             unsafe {
                 base.cast::<usize>().write(len_us);
                 let ptr = base.add(header).cast::<Operand>();
-                for (i, arg) in v.into_iter().enumerate() {
+                for (i, arg) in v.enumerate() {
                     ptr.add(i).write(arg);
                 }
                 ArgData {
@@ -2264,7 +2285,7 @@ impl ArgSlot {
         unsafe {
             let data = &mut *self.0.get();
             drop_arg_data(data, old_len);
-            std::ptr::write(data, Self::pack_data(v));
+            std::ptr::write(data, Self::pack_data(v.into_iter()));
         }
         new_len
     }
@@ -3396,8 +3417,7 @@ impl Op {
     }
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
-        let collected: OpArgVec = args.iter().cloned().collect();
-        let (args, arg_len) = ArgSlot::new(collected);
+        let (args, arg_len) = ArgSlot::from_slice(args);
         Op {
             opcode,
             type_: opcode.result_type(),
@@ -3410,8 +3430,7 @@ impl Op {
     }
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
-        let collected: OpArgVec = args.iter().cloned().collect();
-        let (args, arg_len) = ArgSlot::new(collected);
+        let (args, arg_len) = ArgSlot::from_slice(args);
         Op {
             opcode,
             type_: opcode.result_type(),

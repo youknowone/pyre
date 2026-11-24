@@ -6633,7 +6633,7 @@ impl OptContext {
                 final_oprefs,
             );
         }
-        op.set_fail_arg_types(new_types.clone());
+        op.set_fail_arg_types(&new_types);
         // optimizer.py `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()

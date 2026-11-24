@@ -3539,6 +3539,9 @@ impl<'a> Assembler386<'a> {
         // (`_relative_unaryop`), not before every op.
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(ops));
         self.fail_index = 0;
+        // assembler.py pending_guard_tokens — one token per guard.
+        self.pending_guard_tokens
+            .reserve(ops.iter().filter(|op| op.opcode.is_guard()).count());
         let mut datablockwrapper = std::mem::replace(
             &mut self.datablockwrapper,
             MachineDataBlockWrapper::new(Arc::clone(&self.asm_memory_manager)),
@@ -6238,7 +6241,7 @@ impl<'a> Assembler386<'a> {
                 self.pending_guard_tokens.len()
             );
         }
-        let mut stub_offsets = Vec::new();
+        let mut stub_offsets = Vec::with_capacity(self.pending_guard_tokens.len());
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token));
         }

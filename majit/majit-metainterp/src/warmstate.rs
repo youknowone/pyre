@@ -641,8 +641,8 @@ const DEFAULT_RETRACE_LIMIT: u32 = 0;
 const DEFAULT_MAX_UNROLL_LOOPS: u32 = 0;
 
 /// rlib/jit.py:600 enable_opts = "all"
-fn default_enable_opts() -> Vec<String> {
-    vec![
+fn default_enable_opts() -> Rc<[String]> {
+    Rc::from(vec![
         "intbounds".to_string(),
         "rewrite".to_string(),
         "virtualize".to_string(),
@@ -651,7 +651,7 @@ fn default_enable_opts() -> Vec<String> {
         "earlyforce".to_string(),
         "heap".to_string(),
         "unroll".to_string(),
-    ]
+    ])
 }
 
 /// rlib/jit.py `PARAMETERS['disable_unrolling']`, stored by
@@ -803,7 +803,7 @@ pub struct WarmEnterState {
     /// jit.py:583,604: vec_cost — cost threshold for vectorization decisions.
     vec_cost: u32,
     /// warmstate.py: enable_opts — list of enabled optimization pass names.
-    enable_opts: Vec<String>,
+    enable_opts: Rc<[String]>,
     /// warmstate.py: set_param_inlining — whether inlining is enabled.
     inlining: bool,
     /// warmstate.py: set_param_disable_unrolling — "after how many
@@ -2594,17 +2594,26 @@ impl WarmEnterState {
         self.enable_opts = if value == "all" {
             default_enable_opts()
         } else {
-            value
-                .split(':')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
+            Rc::from(
+                value
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            )
         };
     }
 
     /// Get enabled optimization pass names.
     pub fn get_enable_opts(&self) -> &[String] {
         &self.enable_opts
+    }
+
+    /// Clone the `enable_opts` handle. Compile snapshots keep this `Rc`
+    /// across later mutable uses of `WarmEnterState` (`compile.py`
+    /// `CompileData.optimize_trace` reads `warmstate.enable_opts`).
+    pub fn clone_enable_opts(&self) -> Rc<[String]> {
+        Rc::clone(&self.enable_opts)
     }
 
     /// `warmstate.py` `make_jitdriver_callbacks` —
@@ -3756,11 +3765,7 @@ mod tests {
     fn an_empty_enable_opts_selects_no_passes() {
         let mut ws = WarmEnterState::new(1);
         let all = default_enable_opts();
-        assert_eq!(
-            ws.get_enable_opts(),
-            all.as_slice(),
-            "default is the full set"
-        );
+        assert_eq!(ws.get_enable_opts(), &*all, "default is the full set");
 
         ws.set_param_enable_opts("");
         assert!(
@@ -3770,7 +3775,7 @@ mod tests {
         );
 
         ws.set_param_enable_opts("all");
-        assert_eq!(ws.get_enable_opts(), all.as_slice(), "`all` restores them");
+        assert_eq!(ws.get_enable_opts(), &*all, "`all` restores them");
 
         ws.set_param_enable_opts("intbounds:heap");
         assert_eq!(ws.get_enable_opts(), ["intbounds", "heap"]);

@@ -318,6 +318,19 @@ impl SnapshotBox {
         }
     }
 
+    /// Constant or none snapshot slot. Same fields as [`Self::from_cached`]
+    /// for a constant operand (`cached` empty, `const_gcref` unset).
+    /// `opref` is already a const/none `OpRef`; a `ConstPtr` payload is a
+    /// const-ptr-table index (`history.py` `ConstPtr`).
+    pub fn constant(opref: majit_ir::OpRef) -> Self {
+        debug_assert!(opref.is_none() || opref.is_constant());
+        SnapshotBox {
+            opref,
+            cached: None,
+            const_gcref: None,
+        }
+    }
+
     /// The trace-position `OpRef` view of this slot.
     pub fn opref(&self) -> majit_ir::OpRef {
         self.opref
