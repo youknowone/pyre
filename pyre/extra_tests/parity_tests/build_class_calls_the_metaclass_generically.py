@@ -6,6 +6,7 @@
 # meta-metaclass `__call__` and descriptor `__new__` / `__init__` see the
 # class keywords; the default path reaches `_create_new_type`, which rejects
 # a NUL in the name.
+# A metaclass `__call__` descriptor whose `__get__` raises propagates that error.
 
 """__build_class__ calls a type metaclass generically and checks the name."""
 
@@ -85,6 +86,30 @@ print(log3, type(E).__name__)
 for kwds in ({}, {"metaclass": type}):
     try:
         __build_class__(lambda: None, "a\0b", **kwds)
+        print("no error")
+    except Exception as e:
+        print(type(e).__name__, e)
+
+
+class RaisingCallDesc:
+    def __get__(self, obj, objtype=None):
+        raise ValueError("from __get__")
+
+
+class RaisingMM(type):
+    __call__ = RaisingCallDesc()
+
+
+class RaisingM(type, metaclass=RaisingMM):
+    pass
+
+
+for make in (
+    lambda: RaisingM("X", (), {}),
+    lambda: __build_class__(lambda: None, "Y", metaclass=RaisingM, k=1),
+):
+    try:
+        make()
         print("no error")
     except Exception as e:
         print(type(e).__name__, e)

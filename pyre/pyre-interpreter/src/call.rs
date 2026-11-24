@@ -2527,34 +2527,40 @@ fn read_root_run(
 /// `__call__` dict entry — the implicit `__new__`/`__init__` path below is
 /// its `tp_call` — so any `__call__` resolved on a *non-`type`* metaclass
 /// is a genuine override (enum.EnumType, custom metaclasses with
-/// `__call__`).  Returns the override bound to `callable`, or `None` when
-/// the default class-instantiation path should run.
+/// `__call__`).  Returns the override bound to `callable`, `None` when
+/// the default class-instantiation path should run, or the error raised while binding it.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
-    let metaclass = crate::typedef::r#type(callable)?;
+fn metaclass_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let Some(metaclass) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
     if std::ptr::eq(metaclass.as_ptr(), crate::typedef::w_type()) {
-        return None;
+        return Ok(None);
     }
     // Resolve WHERE `__call__` is defined first; the default `type.__call__`
     // (the implicit instantiation path) is not an override, so a metaclass
     // that merely inherits it — e.g. ABCMeta — keeps the fast path.  The
     // defining-class half is the cheap guard, so it runs before the value
     // half's second residual walk (avoided on the common fast path).
-    let where_defined = unsafe {
+    let Some(where_defined) = (unsafe {
         crate::baseobjspace::lookup_where_class_uncached(metaclass.as_ptr(), "__call__")
-    }?;
+    }) else {
+        return Ok(None);
+    };
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
-        return None;
+        return Ok(None);
     }
-    let mut call_descr = unsafe {
+    let Some(mut call_descr) = (unsafe {
         crate::baseobjspace::lookup_in_type_where_uncached(metaclass.as_ptr(), "__call__")
-    }?;
-    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr())) }
-        .ok()
-        .flatten()
+    }) else {
+        return Ok(None);
+    };
+    // descroperation.py `get_and_call_args`: `space.get(w_descr, w_obj)`
+    // raises out of `__get__`; a descriptor without `__get__` is called as is.
+    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr())) }?
         .unwrap_or(call_descr);
-    Some(bound)
+    Ok(Some(bound))
 }
 
 /// Resolve a `__call__` introduced by a classmethod *subtype*. The base
@@ -2752,7 +2758,7 @@ fn call_non_function_callable_with_mode(
     // frameless `space.call_args` / `get_and_call_args`, so the frame stops
     // here and none of them can arm the C-profile path.
     if unsafe { pyre_object::is_type(callable) } {
-        if let Some(bound) = metaclass_call_override(callable) {
+        if let Some(bound) = metaclass_call_override(callable)? {
             return call_callable_with_mode(
                 execution_context,
                 bound,
@@ -4132,7 +4138,7 @@ fn call_with_kwargs_in_ctx_impl(
     // overrides it (enum functional API passes `module=`/`type=` kwargs).
     if dispatch_metaclass_call
         && unsafe { pyre_object::is_type(current_callable()) }
-        && let Some(bound) = metaclass_call_override(current_callable())
+        && let Some(bound) = metaclass_call_override(current_callable())?
     {
         let args = overridden_args();
         return forward_kw(bound, &args, true, std::ptr::null_mut());
@@ -4972,7 +4978,7 @@ pub fn call_function_impl_result(
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
-            if let Some(bound) = metaclass_call_override(callable) {
+            if let Some(bound) = metaclass_call_override(callable)? {
                 return call_function_impl_result(bound, &reloaded_args());
             }
             // The override lookup can collect: dispatch from the roots.
