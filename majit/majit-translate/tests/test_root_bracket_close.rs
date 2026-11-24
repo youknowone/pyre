@@ -33,8 +33,9 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, interpreter_llbc, load_llbc, module_llbc,
-    object_llbc, with_llbc_link_state, with_shared_lowering, with_shared_lowering_many,
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, RLIB_LLBC, interpreter_llbc, load_llbc,
+    module_llbc, object_llbc, with_llbc_link_state, with_shared_lowering,
+    with_shared_lowering_many,
 };
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
@@ -50,7 +51,7 @@ use majit_translate::front::mir::{
     harvest_published_structs, lower_fun_decl, lower_fun_decl_with_root_stack,
     lower_fun_decl_with_static_addrs,
 };
-use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
+use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
@@ -100,6 +101,39 @@ fn with_linked_lowering<R>(llbc: &'static Llbc, f: impl FnOnce(&LowerContext<'_>
 
 fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
     with_linked_lowering(llbc, |ctx| lower_fun(llbc, ctx, leaf))
+}
+
+/// Harvest root-stack effects in production artefact order
+/// (`lib.rs` `build_semantic_program_via_active_frontend`: majit-rlib,
+/// pyre-object, pyre-interpreter) and lower `leaf` from the interpreter.
+/// Same loop as `wrap_cdata_call_erases_the_incoming_slice_bracket`.
+fn lower_named_with_production_dependency_effects(leaf: &str) -> Option<FunctionGraph> {
+    if !std::path::Path::new(RLIB_LLBC).is_file()
+        || !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        return None;
+    }
+    let rlib = load_llbc(RLIB_LLBC);
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    Some(with_llbc_link_state(rlib, || {
+        with_llbc_link_state(object, || {
+            with_llbc_link_state(interpreter, || {
+                let mut crates = Vec::new();
+                let mut touching = Vec::new();
+                for llbc in [rlib, object, interpreter] {
+                    llbc.set_root_stack_effects(crates.clone(), touching.clone());
+                    touching.extend(
+                        majit_translate::front::mir::harvest_root_stack_touching_paths(llbc),
+                    );
+                    crates.push(llbc.crate_name().to_string());
+                }
+                let context = LowerContext::new(interpreter);
+                lower_fun(interpreter, &context, leaf)
+            })
+        })
+    }))
 }
 
 /// Same class-static bucket the production driver stamps
@@ -1411,8 +1445,9 @@ fn format_int_decimal_bracket_is_scalar_replaced() {
 /// calls makes the walker residualize the whole body through its fnaddr.
 #[test]
 fn set_add_value_bracket_is_scalar_replaced() {
-    let llbc = interpreter_llbc();
-    let graph = lower_named(llbc, "set_add_value");
+    let Some(graph) = lower_named_with_production_dependency_effects("set_add_value") else {
+        return;
+    };
     for leaf in [
         "push_roots",
         "shadow_stack_len",
@@ -2449,9 +2484,9 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
 }
 
 /// `w_code_frame_stores_global` publishes `[obj, w_globals]`, then on the
-/// miss path calls `publish_code_slot_store_rooting` which returns an owned
-/// nested `RootScope`. The leftover is that dest (and ParamSlots methods
-/// of it), so scalar replacement takes the outer bracket out.
+/// miss path calls `publish_code_slot_store` (no nested owned `RootScope`;
+/// `obj`/`w_globals` stay on the outer leftover). Scalar replacement takes
+/// the outer bracket out; the store stays residual.
 #[test]
 fn w_code_frame_stores_global_erases_the_outer_root_bracket() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -2474,9 +2509,110 @@ fn w_code_frame_stores_global_erases_the_outer_root_bracket() {
                 "w_code_frame_stores_global still calls {leaf} after owned-scope erasure"
             );
         }
+        assert_eq!(
+            calls_to(&graph, "publish_code_slot_store_rooting"),
+            0,
+            "miss path must not open a nested owned scope"
+        );
         assert!(
-            calls_to(&graph, "publish_code_slot_store_rooting") > 0,
-            "the nested owned-scope helper keeps its own bracket"
+            calls_to(&graph, "publish_code_slot_store") > 0,
+            "miss-path store stays residual on the outer leftover"
+        );
+    });
+}
+
+/// Residual `publish_quasi_immut_cas` takes the owner plus two field offsets
+/// (`rewrite_op_jit_force_quasi_immutable` / `make_invalidation_function`).
+/// Interior addresses stay inside the opaque helper, so the caller has no
+/// `cast_int_to_ptr` and the callee formals are `r,i,i,r,r`.
+#[test]
+fn w_code_frame_stores_global_has_no_cast_int_to_ptr() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        let context = LowerContext::new(interpreter);
+        let graph = lower_fun(interpreter, &context, "w_code_frame_stores_global");
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            match &op.kind {
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr" => {
+                    panic!(
+                        "w_code_frame_stores_global must not emit cast_int_to_ptr; dump={}",
+                        graph.dump()
+                    );
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s == "cast_int_to_ptr") => {
+                    panic!(
+                        "w_code_frame_stores_global must not call cast_int_to_ptr; dump={}",
+                        graph.dump()
+                    );
+                }
+                _ => {}
+            }
+        }
+        let mut cas_arg_lens = Vec::new();
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments
+                .last()
+                .is_some_and(|s| s == "publish_quasi_immut_cas")
+            {
+                cas_arg_lens.push(args.len());
+                let n_const = args
+                    .iter()
+                    .filter(|a| matches!(a, LinkArg::Const(_)))
+                    .count();
+                assert_eq!(
+                    n_const, 0,
+                    "offset words must be Variables so call_arg_vars keeps them; args={args:?}"
+                );
+            }
+        }
+        assert_eq!(
+            cas_arg_lens.as_slice(),
+            [5].as_slice(),
+            "publish_quasi_immut_cas keeps owner, two offsets, expected, value; dump={}",
+            graph.dump()
+        );
+        let object_ctx = LowerContext::new(object);
+        let callee = lower_fun(object, &object_ctx, "publish_quasi_immut_cas");
+        let start = callee.block(callee.startblock);
+        let classes: String = start
+            .operations
+            .iter()
+            .take_while(|op| matches!(op.kind, OpKind::Input { .. }))
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } => Some(match ty {
+                    ValueType::Int | ValueType::Bool | ValueType::Unsigned => 'i',
+                    ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+                    ValueType::Float => 'f',
+                    other => panic!("unexpected formal type {other:?}"),
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            classes,
+            "riirr",
+            "publish_quasi_immut_cas formals are r,i,i,r,r; dump={}",
+            callee.dump()
         );
     });
 }

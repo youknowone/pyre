@@ -125,16 +125,115 @@ use crate::pyframe::PyFrame;
 
 /// The payload a suspended frame is resumed with.
 ///
-/// `generator.py _invoke_execute_frame` hands the frame one
-/// `w_arg_or_err` word — the sent value, or an `SApplicationException`
-/// (`pyframe.py execute_frame` / `resume_execute_frame`). Original
-/// `throw()` arguments for a non-generator delegate live on that object.
+/// `pyframe.py execute_frame(self, w_arg_or_err=None)` holds one nullable GC
+/// word: the sent value, an `SApplicationException` carrying the
+/// `OperationError`, or None. `generator.py _invoke_execute_frame` forwards
+/// that same word; `pyframe.py resume_execute_frame` consumes it.
+/// `throw_args` is the original three-argument form from
+/// `SApplicationException` for a non-generator delegate.
 ///
-/// Passed by `&mut` so this stays a single pointer in [`EvalFn`]: putting
-/// the word in every ordinary Python call would widen the hottest path for
-/// the one caller that resumes a frame.
+/// Passed by `&mut` so the resume consumes the word in place, keeping this a
+/// single pointer in [`EvalFn`].
 pub struct FrameResumeArgs {
+    /// `pyframe.py execute_frame` `w_arg_or_err`: null is a fresh frame; an
+    /// ordinary object is the sent value (including the non-null `w_None`
+    /// that starts a generator); a `PyErrorObject` is the thrown
+    /// `OperationError` carrier.
     pub w_arg_or_err: PyObjectRef,
+    pub throw_args: Option<([PyObjectRef; 3], usize)>,
+}
+
+impl FrameResumeArgs {
+    pub fn from_parts(
+        w_inputvalue: Option<PyObjectRef>,
+        operr: Option<crate::PyError>,
+        throw_args: Option<([PyObjectRef; 3], usize)>,
+    ) -> Self {
+        debug_assert!(
+            !(w_inputvalue.is_some() && operr.is_some()),
+            "pyframe.py execute_frame: w_arg_or_err is one word"
+        );
+        let w_arg_or_err = if let Some(err) = operr {
+            err.as_raw() as PyObjectRef
+        } else if let Some(word) = w_inputvalue {
+            word
+        } else {
+            PY_NULL
+        };
+        Self {
+            w_arg_or_err,
+            throw_args,
+        }
+    }
+
+    pub fn take_w_arg_or_err(&mut self) -> PyObjectRef {
+        let word = self.w_arg_or_err;
+        self.w_arg_or_err = PY_NULL;
+        word
+    }
+
+    /// Consume `throw_args`.
+    ///
+    /// `pyframe.py execute_frame` seeds from `w_arg_or_err` only; this
+    /// field is not on the traced `execute_frame` path.
+    pub fn take_throw_args(&mut self) -> Option<([PyObjectRef; 3], usize)> {
+        self.throw_args.take()
+    }
+}
+
+#[cfg(test)]
+mod frame_resume_args_tests {
+    use super::FrameResumeArgs;
+    use pyre_object::{PY_NULL, w_none};
+
+    #[test]
+    fn frame_resume_args_hold_one_w_arg_or_err_word() {
+        let empty = FrameResumeArgs::from_parts(None, None, None);
+        assert!(empty.w_arg_or_err.is_null());
+        assert_eq!(
+            std::mem::size_of_val(&empty.w_arg_or_err),
+            std::mem::size_of::<usize>()
+        );
+
+        let sent = w_none();
+        let mut with_sent = FrameResumeArgs::from_parts(Some(sent), None, None);
+        assert!(!with_sent.w_arg_or_err.is_null());
+        assert!(!unsafe { crate::error::is_pyerror_raw(with_sent.w_arg_or_err) });
+        assert_eq!(with_sent.take_w_arg_or_err(), sent);
+        assert!(with_sent.w_arg_or_err.is_null());
+
+        let err = crate::PyError::new(crate::PyErrorKind::RuntimeError, "resume");
+        let raw = err.as_raw() as pyre_object::PyObjectRef;
+        let mut with_err = FrameResumeArgs::from_parts(None, Some(err), None);
+        assert_eq!(with_err.w_arg_or_err, raw);
+        assert!(unsafe { crate::error::is_pyerror_raw(with_err.w_arg_or_err) });
+        assert_eq!(with_err.take_w_arg_or_err(), raw);
+        assert!(with_err.w_arg_or_err.is_null());
+        assert_eq!(with_err.take_w_arg_or_err(), PY_NULL);
+    }
+
+    #[test]
+    fn take_throw_args_none_is_none() {
+        let mut empty = FrameResumeArgs::from_parts(None, None, None);
+        assert!(empty.take_throw_args().is_none());
+        assert!(empty.throw_args.is_none());
+        let args = ([PY_NULL, PY_NULL, PY_NULL], 0usize);
+        empty.throw_args = Some(args);
+        assert_eq!(empty.take_throw_args(), Some(args));
+        assert!(empty.throw_args.is_none());
+        assert!(empty.take_throw_args().is_none());
+    }
+}
+
+#[cfg(test)]
+mod recursion_depth_guard_tests {
+    #[test]
+    fn recursion_depth_guard_is_one_residual_word() {
+        assert_eq!(
+            std::mem::size_of::<super::RecursionDepthGuard>(),
+            std::mem::size_of::<usize>()
+        );
+    }
 }
 
 type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
@@ -144,6 +243,15 @@ majit_gc::oncelock_fn_static!(static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn>)
 
 type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 majit_gc::oncelock_fn_static!(static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn>);
+
+/// The context this activation charged its unit to, or a null pointer when
+/// the thread had none and [`DETACHED_RECURSION`] stood in for it.
+///
+/// Carried on the guard rather than looked up again at exit: the context a
+/// frame entered under is the one its release must reach, and reading the
+/// slot twice would let a context installed mid-activation take back a unit
+/// it never received.
+type RecursionHome = *mut crate::PyExecutionContext;
 
 thread_local! {
     /// Activation accounting for a thread that has no `ExecutionContext`
@@ -155,6 +263,15 @@ thread_local! {
     /// read against each other.
     static DETACHED_RECURSION: Cell<(usize, *mut PyFrame)> =
         const { Cell::new((0, std::ptr::null_mut())) };
+
+    /// Restore records for [`RecursionDepthGuard`]. The guard itself is one
+    /// residual word (the 1-based stack height) so unique look-inside can
+    /// leftover-bind `enter_recursive_frame`; the restore record lives here
+    /// because a heap GCREF `cast_ptr_to_int` is illegal in
+    /// `blackhole.py bhimpl_cast_ptr_to_int`. The middle word is the
+    /// shadow-stack slot that roots `prev`, not the frame address.
+    static RECURSION_GUARD_STACK: RefCell<Vec<(RecursionHome, usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
@@ -170,15 +287,6 @@ thread_local! {
     /// discriminator cannot see.
     static FRAME_ENTRY_COUNT: Cell<u64> = const { Cell::new(0) };
 }
-
-/// The context this activation charged its unit to, or a null pointer when
-/// the thread had none and [`DETACHED_RECURSION`] stood in for it.
-///
-/// Carried on the guard rather than looked up again at exit: the context a
-/// frame entered under is the one its release must reach, and reading the
-/// slot twice would let a context installed mid-activation take back a unit
-/// it never received.
-type RecursionHome = *mut crate::PyExecutionContext;
 
 /// Read the bootstrap recursion state used before an execution context is
 /// installed.  PyPy's translated hot path owns this state on its live
@@ -287,20 +395,82 @@ pub fn bump_frame_entry_count() {
 /// unit whether it runs as compiled code, through the JIT eval loop, or in the
 /// plain evaluator.  `pyframe.py` (`execute_frame.insert_stack_check_here`)
 /// puts the matching stack check at the same seam.
-#[inline]
+///
+/// `dont_look_inside`: `rstack.py stack_check` is kept out of jitcodes
+/// (`driver.py task_stackcheckinsertion_lltype` / `insert_ll_stackcheck`
+/// after `make_jitcodes`). This is that seam's Python-frame half.
+/// Looking inside emits `cast_ptr_to_int/r>i` of the heap PyFrame
+/// (`frame as usize`) which `blackhole.py bhimpl_cast_ptr_to_int`
+/// rejects (tagged immediate only). Unique look-inside residual-calls
+/// the native charge instead. `#[inline(never)]` keeps rustc from
+/// splicing the CAST into callers.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let home = recursion_home();
     let key = frame as *mut PyFrame;
     let (saved_depth, accounted) = recursion_state_get(home);
     if std::ptr::eq(accounted, key) {
-        return RecursionDepthGuard::arm(home, key, saved_depth);
+        return RecursionDepthGuard::push(home, key, saved_depth);
     }
     // Root the displaced claim before the store: the write barrier in
     // `recursion_state_set` sits between the read and the guard
     // (`shadowstack.py` `push_roots` / `pop_roots`).
-    let guard = RecursionDepthGuard::arm(home, accounted, saved_depth);
+    let guard = RecursionDepthGuard::push(home, accounted, saved_depth);
     recursion_state_set(home, saved_depth + 1, key);
     guard
+}
+
+/// Read `py_recursion_depth` for the traced `execute_frame` arm.
+///
+/// One residual word so unique look-inside leftover is `>i`.
+/// `dont_look_inside`: `rstack.py stack_check` stays residual
+/// (`driver.py task_stackcheckinsertion_lltype` / `insert_ll_stackcheck`
+/// after `make_jitcodes`). This is that seam split into word-returning
+/// pieces. `#[inline(never)]` keeps rustc from splicing a CAST into
+/// callers.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn recursion_saved_depth() -> usize {
+    recursion_state_get(recursion_home()).0
+}
+
+/// Read `accounted_activation` as a frame pointer.
+///
+/// Unique look-inside leftover is `>r`; the dest is an r register the
+/// JIT and blackhole root and forward. Twin of [`recursion_saved_depth`].
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn recursion_accounted_activation() -> *mut PyFrame {
+    recursion_state_get(recursion_home()).1
+}
+
+/// Charge this frame if it is not already the accounted claim.
+///
+/// Same semantics as [`enter_recursive_frame`] (`if accounted != frame {
+/// set(saved_depth + 1, frame) }`) without a shadow-stack pin or a
+/// restore record. `executioncontext.py ExecutionContext.enter` keeps
+/// the previous value in a frame-local.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn charge_recursive_frame(frame: *const PyFrame, saved_depth: usize, accounted: *mut PyFrame) {
+    let home = recursion_home();
+    let key = frame as *mut PyFrame;
+    if !std::ptr::eq(accounted, key) {
+        recursion_state_set(home, saved_depth + 1, key);
+    }
+}
+
+/// Write both activation slots back from the locals saved at the
+/// activation boundary (`executioncontext.py ExecutionContext.leave`).
+///
+/// Unique look-inside leftover of the traced `execute_frame` finally.
+/// `finally_cleanups_to_returnblock` / `is_exception_tail_cleanup`
+/// replay this call on the raise edge.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn restore_recursive_frame(saved_depth: usize, accounted: *mut PyFrame) {
+    recursion_state_set(recursion_home(), saved_depth, accounted);
 }
 
 /// Spend one unit of the recursion budget on a dispatch level that pushes no
@@ -311,14 +481,33 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
 /// no activation to key on: the unit is spent unconditionally and
 /// `accounted_activation` is carried through unchanged, leaving the next real
 /// activation to account for itself.
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn enter_native_dispatch() -> RecursionDepthGuard {
     let home = recursion_home();
     let (saved_depth, accounted) = recursion_state_get(home);
     // The claim is carried through unchanged, so only the depth is written;
     // no write barrier sits between the read and the guard.
     recursion_depth_set(home, saved_depth + 1);
-    RecursionDepthGuard::arm(home, accounted, saved_depth)
+    RecursionDepthGuard::push(home, accounted, saved_depth)
+}
+
+/// Pop the restore record [`enter_recursive_frame`] pushed and write the
+/// two activation slots back. Unique look-inside leftover of Drop is this
+/// call. `prev` is read back from its shadow-stack slot, which a
+/// collection during the activation forwarded.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) fn release_recursive_frame(token: usize) {
+    RECURSION_GUARD_STACK.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        debug_assert_eq!(stack.len(), token);
+        if let Some((home, prev_root, saved_depth)) = stack.pop() {
+            let prev = majit_gc::shadow_stack::get(prev_root);
+            majit_gc::shadow_stack::pop_to(prev_root);
+            recursion_state_set(home, saved_depth, prev.0 as *mut PyFrame);
+        }
+    });
 }
 
 /// RAII guard that gives back the activation unit `enter_recursive_frame`
@@ -339,29 +528,42 @@ pub fn enter_native_dispatch() -> RecursionDepthGuard {
 /// shadow stack (`shadowstack.py` `push_roots` / `pop_roots`) so a
 /// collection during the activation forwards it, matching that guard's
 /// saved `topframeref`.
-pub struct RecursionDepthGuard {
-    home: RecursionHome,
-    prev_root: usize,
-    saved_depth: usize,
-}
+///
+/// One residual word (the TLS stack height) so leftover of
+/// `enter_recursive_frame` / `enter_native_dispatch` is `r>i`. The
+/// restore record (home, the shadow-stack slot of `prev`, saved depth)
+/// lives in `RECURSION_GUARD_STACK`. The traced `execute_frame` arm
+/// does not construct this guard: it keeps the two slots in locals and
+/// writes them back through [`restore_recursive_frame`].
+#[repr(transparent)]
+pub struct RecursionDepthGuard(pub(crate) usize);
 
 impl RecursionDepthGuard {
-    #[inline]
-    fn arm(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
-        Self {
-            home,
-            prev_root: majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize)),
-            saved_depth,
-        }
+    fn push(home: RecursionHome, prev: *mut PyFrame, saved_depth: usize) -> Self {
+        let prev_root = majit_gc::shadow_stack::push(majit_ir::GcRef(prev as usize));
+        RECURSION_GUARD_STACK.with(|slot| {
+            let mut stack = slot.borrow_mut();
+            stack.push((home, prev_root, saved_depth));
+            Self(stack.len())
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) const fn from_residual_word(word: usize) -> Self {
+        Self(word)
+    }
+
+    #[inline(always)]
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) const fn residual_word(&self) -> usize {
+        self.0
     }
 }
 
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
-        let prev = majit_gc::shadow_stack::get(self.prev_root);
-        majit_gc::shadow_stack::pop_to(self.prev_root);
-        recursion_state_set(self.home, self.saved_depth, prev.0 as *mut PyFrame);
+        release_recursive_frame(self.0);
     }
 }
 
@@ -531,20 +733,30 @@ pub fn set_jit_param_enable_opts(value: &str) {
 ///
 /// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at the start
 /// of a portal that has none; this hook is that `maybe_enter_jit` body.
-type UnpackMergeFn = fn(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef);
+type UnpackMergeFn = fn(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>>;
 majit_gc::oncelock_fn_static!(static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn>);
 
 pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
     let _ = UNPACK_MERGE_HOOK.set(f);
 }
 
-/// Called from `UnpackIterableJitDriver::jit_merge_point`. No-op until the JIT
-/// installs the hook.
+/// Called from `UnpackIterableJitDriver::jit_merge_point`. `None` until the
+/// JIT installs the hook, or when the warm state stays in the interpreter.
+/// `Some` is the portal result: the trace, compiled drain, or abort
+/// blackhole already finished the unpack (`tuple_hash_merge_point`).
 #[inline]
-pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
-    if let Some(f) = UNPACK_MERGE_HOOK.get() {
-        f(greenkey, w_iterator, items);
-    }
+pub fn unpack_merge_point(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    UNPACK_MERGE_HOOK
+        .get()
+        .and_then(|f| f(greenkey, w_iterator, items))
 }
 
 /// jd `generatorentry_driver` (`generator.py`): greens=`pycode`,
@@ -776,6 +988,118 @@ impl Drop for FallbackEcGuard {
             Err(_) => crate::module::thread::unregister_execution_context(),
         }
     }
+}
+
+/// `warmspot.py` `ll_portal_runner` / `handle_jitexception` for `sortkey_jmp`.
+///
+/// `KeepGoing` is `maybe_compile_and_run` returning without raising.
+/// `Finished` is `DoneWithThisFrameVoid` / `ExitFrameWithExceptionRef`.
+/// `ContinueReds` is `ContinueRunningNormally`: the portal assigns these
+/// reds and loops (`portal_ptr(*args)`).
+pub enum SortkeyMergeOutcome {
+    KeepGoing,
+    Finished(Result<i64, crate::PyError>),
+    ContinueReds {
+        i: i64,
+        list_w: PyObjectRef,
+        w_callable: PyObjectRef,
+    },
+}
+
+/// jd4 (`sortkey_jmp`) merge-point hook. Twin of `unpack_merge_point`.
+/// Greens `strategy_type`, `tp`; hook reds `i`, `list_w`, `w_callable`.
+type SortkeyMergeFn = fn(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> SortkeyMergeOutcome;
+static SORTKEY_MERGE_HOOK: OnceLock<SortkeyMergeFn> = OnceLock::new();
+
+pub fn register_sortkey_merge_hook(f: SortkeyMergeFn) {
+    let _ = SORTKEY_MERGE_HOOK.set(f);
+}
+
+/// `KeepGoing` means the warm state stayed in the interpreter.
+#[inline]
+pub fn sortkey_merge_point(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> SortkeyMergeOutcome {
+    match SORTKEY_MERGE_HOOK.get() {
+        Some(f) => f(strategy_type, tp, i, list_w, w_callable),
+        None => SortkeyMergeOutcome::KeepGoing,
+    }
+}
+
+type SortkeyPortalRunnerFn =
+    fn(PyObjectRef, PyObjectRef, i64, PyObjectRef, PyObjectRef) -> Result<(), crate::PyError>;
+static SORTKEY_PORTAL_RUNNER_HOOK: OnceLock<SortkeyPortalRunnerFn> = OnceLock::new();
+
+pub fn register_sortkey_portal_runner_hook(f: SortkeyPortalRunnerFn) {
+    let _ = SORTKEY_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `sortkey_jmp`. Falls back to
+/// [`crate::sortkey_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn sortkey_portal_runner(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    match SORTKEY_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(strategy_type, tp, i, list_w, w_callable),
+        None => crate::sortkey_portal(strategy_type, tp, i, list_w, w_callable),
+    }
+}
+
+/// jd0 (`pypyjitdriver`) portal runner. Twin of [`unpack_portal_runner`] /
+/// [`sortkey_portal_runner`], with Recursive polarity: `guess_call_kind`
+/// classifies a direct call of this name as `recursive` because it is
+/// `jitdriver_sd.portal_runner` (`call.py` `jitdriver_sd_from_portal_runner_ptr`).
+/// Greens `next_instr`, `is_being_profiled`, `pycode`; reds `frame`, `ec`
+/// (`interp_jit.py` `PyPyJitDriver`).
+type PypyjitPortalRunnerFn =
+    fn(i64, i64, PyObjectRef, &mut PyFrame, *mut crate::PyExecutionContext) -> PyResult;
+static PYPYJIT_PORTAL_RUNNER_HOOK: OnceLock<PypyjitPortalRunnerFn> = OnceLock::new();
+
+pub fn register_pypyjit_portal_runner_hook(f: PypyjitPortalRunnerFn) {
+    let _ = PYPYJIT_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for the jd0 driver: `maybe_compile_and_run`
+/// then `portal_ptr`. It never enters or leaves the execution context; the
+/// caller's `execute_frame` bracket owns that.
+///
+/// Three cases:
+/// - `is_force_plain_eval()`: `dispatch_frame` (`FrameDispatch::Plain`), so a
+///   residual-called frame still ticks `can_enter_jit` at back-edges
+///   (`bh_call_kw_impl` / `force_plain_eval`).
+/// - `PYPYJIT_PORTAL_RUNNER_HOOK`: `pypyjit_ll_portal_runner`.
+/// - else: `eval_loop_dispatch` (no runner installed).
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn pypyjit_portal_runner(
+    next_instr: i64,
+    is_being_profiled: i64,
+    pycode: PyObjectRef,
+    frame: &mut PyFrame,
+    ec: *mut crate::PyExecutionContext,
+) -> PyResult {
+    if is_force_plain_eval() {
+        return crate::eval::dispatch_frame(frame);
+    }
+    if let Some(runner) = PYPYJIT_PORTAL_RUNNER_HOOK.get() {
+        return runner(next_instr, is_being_profiled, pycode, frame, ec);
+    }
+    crate::eval::eval_loop_dispatch(frame, ec)
 }
 
 thread_local! {
@@ -1305,14 +1629,27 @@ fn make_user_call_frame(
     execution_context: *const crate::PyExecutionContext,
     closure: PyObjectRef,
 ) -> Result<crate::pyframe::FrameBox, crate::PyError> {
-    let frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code as *const (),
-        args,
-        w_globals,
+    // `baseobjspace.py createframe` takes no argument list. Pin the
+    // positionals across `pick_builtin` (`pyframe.py Frame.__init__`) and
+    // write them after, `function.py` `new_frame.locals_cells_stack_w[i] =
+    // args_w[i]`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(3 + args.len());
+    live.push(w_code);
+    live.push(w_globals);
+    live.push(closure);
+    live.extend_from_slice(args);
+    let root_base = _roots.pin_roots(&live);
+    let mut frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        _roots.get(root_base) as *const (),
+        _roots.get(root_base + 1),
         execution_context,
-        closure,
+        _roots.get(root_base + 2),
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     )?;
+    for i in 0..args.len() {
+        frame.set_locals_w(i, _roots.get(root_base + 3 + i));
+    }
     crate::pyframe::FrameBox::new(frame)
 }
 
@@ -1428,19 +1765,19 @@ pub fn call_user_function_with_ctx(
 /// Keywords bind through the shared keyword path (`_match_signature` with
 /// keywords); positional-only calls keep `fill_user_function_args`.
 pub fn function_call_args(func: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
-    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
-    let values = args.keywords_w.as_deref().unwrap_or(&[]);
-    if !names.is_empty() {
-        return call_with_kwargs_in_ctx_impl(
-            getexecutioncontext(),
-            func,
-            &args.arguments_w,
-            names,
-            values,
-            true,
-            std::ptr::null_mut(),
-            args.methodcall,
-        );
+    if let (Some(names), Some(values)) = (&args.keyword_names_w, &args.keywords_w) {
+        if !names.is_empty() {
+            return call_with_kwargs_in_ctx_impl(
+                getexecutioncontext(),
+                func,
+                &args.arguments_w,
+                names,
+                values,
+                true,
+                std::ptr::null_mut(),
+                args.methodcall,
+            );
+        }
     }
     let code = unsafe { crate::getcode(func) };
     if unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
@@ -1472,32 +1809,19 @@ pub fn call_user_function_resolved(
 
     // Generator function
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-        let gen_frame = pyre_object::with_roots!(callable => {
-            let inner = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                args,
-                w_globals,
-                execution_context,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )?;
-            crate::pyframe::FrameBox::new(inner)
-        })?;
+        let gen_frame = pyre_object::with_roots!(callable => make_user_call_frame(
+            w_code,
+            args,
+            w_globals,
+            execution_context,
+            closure,
+        ))?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
     let eval_fn = get_eval_fn();
 
-    let mut func_frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
-            execution_context,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)?;
+    let mut func_frame = make_user_call_frame(w_code, args, w_globals, execution_context, closure)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     eval_fn(&mut func_frame, None)
@@ -2037,7 +2361,8 @@ fn call_kw_in_ctx_impl(
     // prepends through `argument.py Arguments.replace_arguments`, which leaves
     // methodcall false.
     let methodcall = self_or_null != pyre_object::PY_NULL;
-    let mut args: Vec<PyObjectRef> = positional.to_vec();
+    let mut args = vec![pyre_object::PY_NULL; positional.len()];
+    pyre_object::gc_roots::copy_object_slice_range_into_vec(positional, 0, &mut args);
 
     if self_or_null != pyre_object::PY_NULL {
         // argument.py Arguments.prepend: `[w_firstarg] + self.arguments_w`.
@@ -2071,7 +2396,6 @@ fn call_kw_in_ctx_impl(
             0
         };
         let n_pos = args.len().saturating_sub(nkw);
-        let pos_args = args[..n_pos].to_vec();
         let mut kw_entries = Vec::with_capacity(nkw);
         for ki in 0..nkw {
             if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
@@ -2083,7 +2407,7 @@ fn call_kw_in_ctx_impl(
         return call_with_kwargs_in_ctx(
             execution_context,
             callable_unwrapped,
-            &pos_args,
+            &args[..n_pos],
             &kw_entries,
         );
     }
@@ -2098,7 +2422,6 @@ fn call_kw_in_ctx_impl(
             0
         };
         let n_pos = args.len().saturating_sub(nkw);
-        let pos_args = args[..n_pos].to_vec();
         let mut kw_entries = Vec::with_capacity(nkw);
         for ki in 0..nkw {
             if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
@@ -2110,7 +2433,7 @@ fn call_kw_in_ctx_impl(
         return call_with_kwargs_in_ctx(
             execution_context,
             callable_unwrapped,
-            &pos_args,
+            &args[..n_pos],
             &kw_entries,
         );
     }
@@ -2125,7 +2448,6 @@ fn call_kw_in_ctx_impl(
         };
         if nkw > 0 {
             let n_pos = args.len() - nkw;
-            let pos_args = args[..n_pos].to_vec();
             let mut kw_entries = Vec::with_capacity(nkw);
             for ki in 0..nkw {
                 let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
@@ -2137,7 +2459,7 @@ fn call_kw_in_ctx_impl(
             return call_with_kwargs_in_ctx(
                 execution_context,
                 callable_unwrapped,
-                &pos_args,
+                &args[..n_pos],
                 &kw_entries,
             );
         }
@@ -2154,7 +2476,6 @@ fn call_kw_in_ctx_impl(
             0
         };
         let n_pos = args.len().saturating_sub(nkw);
-        let pos_args = args[..n_pos].to_vec();
         let mut kw_entries = Vec::with_capacity(nkw);
         for ki in 0..nkw {
             let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
@@ -2166,7 +2487,7 @@ fn call_kw_in_ctx_impl(
         return call_with_kwargs_in_ctx(
             execution_context,
             callable_unwrapped,
-            &pos_args,
+            &args[..n_pos],
             &kw_entries,
         );
     }
@@ -2193,7 +2514,6 @@ fn call_kw_in_ctx_impl(
             // profile frame before that loop and pass the reloaded pointer.
             let profile_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
             let n_pos = args.len() - nkw;
-            let pos_args = args[..n_pos].to_vec();
             // The kwnames tuple already holds the name objects. Pass those
             // objects and the values through so the profiled builtin path
             // builds `Arguments::with_kw` (`keyword_names_w` / `keywords_w`).
@@ -2211,7 +2531,7 @@ fn call_kw_in_ctx_impl(
             return call_with_kwargs_in_ctx_impl(
                 execution_context,
                 callable_unwrapped,
-                &pos_args,
+                &args[..n_pos],
                 &keyword_names_w,
                 &keywords_w,
                 true,
@@ -2243,7 +2563,6 @@ fn call_kw_in_ctx_impl(
         };
         if nkw > 0 {
             let n_pos = args.len().saturating_sub(nkw);
-            let pos_args = args[..n_pos].to_vec();
             let mut kw_entries = Vec::with_capacity(nkw);
             for ki in 0..nkw {
                 if let Some(name_obj) =
@@ -2256,7 +2575,7 @@ fn call_kw_in_ctx_impl(
             return call_with_kwargs_in_ctx(
                 execution_context,
                 callable_unwrapped,
-                &pos_args,
+                &args[..n_pos],
                 &kw_entries,
             );
         }
@@ -2266,7 +2585,12 @@ fn call_kw_in_ctx_impl(
     // (`argument.py Arguments.prepend`) and then calls `Function.call_args`.
     // `Arguments.replace_arguments` leaves `methodcall` false; the flag
     // above is only the `callmethod.py CALL_METHOD_KW` self slot.
-    let (target_func, mut prepended) = if unsafe { pyre_object::is_method(callable_unwrapped) } {
+    // Keep the prepend in a Vec: `&Vec` coerces at the call through
+    // `vec::Vec::deref`. Matching `Option<Vec>` into `&[T]` is
+    // `option::Option::as_deref`.
+    let mut prepended_storage = Vec::new();
+    let mut use_prepended = false;
+    let target_func = if unsafe { pyre_object::is_method(callable_unwrapped) } {
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe {
             let w_self = pyre_object::w_method_get_self(callable_unwrapped);
@@ -2277,17 +2601,15 @@ fn call_kw_in_ctx_impl(
             }
         };
         if !receiver.is_null() {
-            let mut prepended = Vec::with_capacity(1 + args.len());
-            prepended.push(receiver);
-            prepended.extend_from_slice(&args);
-            (func, Some(prepended))
-        } else {
-            (func, None)
+            prepended_storage.reserve(1 + args.len());
+            prepended_storage.push(receiver);
+            prepended_storage.extend_from_slice(&args);
+            use_prepended = true;
         }
+        func
     } else {
-        (callable_unwrapped, None)
+        callable_unwrapped
     };
-    let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
     // `crate::is_function` is also true for a builtin function and a method
     // descriptor. Those stay on `resolve_kwargs` (the builtin arm above
     // already returned). `get_pycode` is the same user-code gate
@@ -2295,6 +2617,12 @@ fn call_kw_in_ctx_impl(
     let plain_user = unsafe {
         crate::is_function(target_func)
             && !crate::is_builtin_code(crate::getcode(target_func) as pyre_object::PyObjectRef)
+    };
+    // `&Vec` coerces through `vec::Vec::deref`; the prepend stays a live Vec.
+    let call_args: &[PyObjectRef] = if use_prepended {
+        &prepended_storage
+    } else {
+        &args
     };
     if plain_user {
         // `Function.call_args` → `pycode.py PyCode.funcrun`. The caller
@@ -2342,9 +2670,7 @@ fn call_kw_in_ctx_impl(
             ));
         }
     };
-    // Drop the temporary prepended buffer once resolved is built.
-    prepended = None;
-    let _ = prepended;
+    prepended_storage.clear();
 
     let target_func = roots.get(func_slot);
     if unsafe { crate::is_function(target_func) } {
@@ -2460,25 +2786,19 @@ fn call_user_function_from_call_kw(
     // `push_roots`, so the fields it reads are reloaded from this bracket
     // after that safepoint and after the qualname / defaults allocations.
     let pos = read_root_run(&roots, args_base, n_pos);
-    let names = if nkw == 0 {
-        None
-    } else {
-        Some(read_root_run(&roots, names_base, n_kept))
-    };
-    let values = if nkw == 0 {
-        None
-    } else {
-        Some(read_root_run(&roots, values_base, n_kept))
-    };
-    let mut arguments =
-        crate::argument::Arguments::full(&pos, names.as_deref(), values.as_deref(), methodcall);
+    let mut arguments = crate::argument::Arguments::full(&pos, None, None, methodcall);
     arguments.arguments_w = read_root_run(&roots, args_base, n_pos);
     if nkw == 0 {
         arguments.keyword_names_w = None;
         arguments.keywords_w = None;
+        arguments.jit_few_keywords = true;
     } else {
         arguments.keyword_names_w = Some(read_root_run(&roots, names_base, n_kept));
         arguments.keywords_w = Some(read_root_run(&roots, values_base, n_kept));
+        arguments.jit_few_keywords = match &arguments.keyword_names_w {
+            None => true,
+            Some(names) => majit_rlib::jit::isconstant(&names.len()),
+        };
     }
     let defaults_now = if ndef == 0 {
         Vec::new()
@@ -2711,6 +3031,39 @@ fn call_callable_with_mode(
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
 }
 
+/// Residual ABI of leftover `call_non_function_callable_with_mode`
+/// (`baseobjspace.py call_function` non-Function/Method arm). Unique
+/// look-inside of CALL residualizes the `dont_look_inside` helper as
+/// `rrrir>r` (`execution_context`, `callable`, `args_w` GcArray, `CallMode`
+/// discriminant, `profile_frame`). `&[PyObjectRef]` is one length-prefixed
+/// object-array word (`object_gcarray_slice`).
+#[inline(never)]
+pub extern "C" fn call_non_function_callable_with_mode_jit_abi(
+    execution_context: i64,
+    callable: i64,
+    args: i64,
+    mode: i64,
+    profile_frame: i64,
+) -> i64 {
+    majit_ir::icf_identity!("call::call_non_function_callable_with_mode_jit_abi");
+    let mode = if mode == 0 {
+        CallMode::Jit
+    } else {
+        CallMode::Plain
+    };
+    let args = unsafe { majit_ir::helper_fnaddr::object_gcarray_slice::<PyObjectRef>(args) };
+    match call_non_function_callable_with_mode(
+        execution_context as usize as *const crate::PyExecutionContext,
+        callable as usize as PyObjectRef,
+        args,
+        mode,
+        profile_frame as usize as *mut PyFrame,
+    ) {
+        Ok(value) => value as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
+    }
+}
+
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn call_non_function_callable_with_mode(
@@ -2916,30 +3269,18 @@ pub fn call_user_function_plain_with_ctx(
     let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, false))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-        let gen_frame = pyre_object::with_roots!(callable => {
-            let inner = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                &final_args,
-                w_globals,
-                execution_context,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )?;
-            crate::pyframe::FrameBox::new(inner)
-        })?;
-        return frame_into_generator_for_function(gen_frame, callable);
-    }
-
-    let mut func_frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
+        let gen_frame = pyre_object::with_roots!(callable => make_user_call_frame(
+            w_code,
             &final_args,
             w_globals,
             execution_context,
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)?;
+        ))?;
+        return frame_into_generator_for_function(gen_frame, callable);
+    }
+
+    let mut func_frame =
+        make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
     func_frame.run()
@@ -4691,15 +5032,6 @@ fn call_with_kwargs_in_ctx_impl(
                 }
                 packed_tail_slots.push(kw_dict_slot);
             }
-            let mut final_args: Vec<PyObjectRef> = (0..result.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(bound_root_base + i))
-                .collect();
-            final_args.extend(
-                packed_tail_slots
-                    .iter()
-                    .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot)),
-            );
-
             // Create frame and execute.
             // Reload after `function_get_globals_obj`, which can collect.
             // Copy `CodeFlags` before `try_new_for_call_with_closure_and_globals_obj`
@@ -4711,13 +5043,26 @@ fn call_with_kwargs_in_ctx_impl(
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                     w_code_now as *const (),
-                    &final_args,
                     w_globals,
                     execution_context,
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
                 )?,
             )?;
+            // `function.py` writes locals after `createframe`; the bound
+            // slots and packed tails already sit on the shadow stack.
+            for i in 0..result.len() {
+                func_frame.set_locals_w(
+                    i,
+                    pyre_object::gc_roots::shadow_stack_get(bound_root_base + i),
+                );
+            }
+            for (j, &slot) in packed_tail_slots.iter().enumerate() {
+                func_frame.set_locals_w(
+                    result.len() + j,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                );
+            }
             func_frame.fix_array_ptrs();
             // Generator/coroutine function: return a generator object
             // instead of running the body, matching the positional call
@@ -5778,24 +6123,13 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-        let gen_frame = match pyre_object::with_roots!(func => {
-            let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                &final_args,
-                w_globals,
-                exec_ctx,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ) {
-                Ok(f) => f,
-                Err(e) => {
-                    set_call_error(e);
-                    return PY_NULL;
-                }
-            };
-            crate::pyframe::FrameBox::new(inner)
-        }) {
+        let gen_frame = match pyre_object::with_roots!(func => make_user_call_frame(
+            w_code,
+            &final_args,
+            w_globals,
+            exec_ctx,
+            closure,
+        )) {
             Ok(f) => f,
             Err(e) => {
                 set_call_error(e);
@@ -5811,21 +6145,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
         };
     }
 
-    let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code as *const (),
-        &final_args,
-        w_globals,
-        exec_ctx,
-        closure,
-        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            set_call_error(e);
-            return PY_NULL;
-        }
-    };
-    let mut frame = match crate::pyframe::FrameBox::new(inner) {
+    let mut frame = match make_user_call_frame(w_code, &final_args, w_globals, exec_ctx, closure) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);
@@ -5888,24 +6208,31 @@ fn call_user_function_resolved_frameless(
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
+    let _arg_roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(3 + args.len());
+    live.push(w_code);
+    live.push(w_globals);
+    live.push(closure);
+    live.extend_from_slice(args);
+    let root_base = _arg_roots.pin_roots(&live);
+    let mut built = match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        _arg_roots.get(root_base) as *const (),
+        _arg_roots.get(root_base + 1),
+        exec_ctx,
+        _arg_roots.get(root_base + 2),
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+    )) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
+    for i in 0..args.len() {
+        built.set_locals_w(i, _arg_roots.get(root_base + 3 + i));
+    }
     // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-    let mut frame = match pyre_object::with_roots!(func => {
-        let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        };
-        crate::pyframe::FrameBox::new(inner)
-    }) {
+    let mut frame = match pyre_object::with_roots!(func => crate::pyframe::FrameBox::new(built)) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);
@@ -7452,7 +7779,6 @@ fn build_class_inner(
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
-            &[],
             w_globals,
             exec_ctx,
             closure,

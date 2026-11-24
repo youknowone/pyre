@@ -2639,6 +2639,51 @@ mod tests {
     }
 
     #[test]
+    fn absorb_semantic_program_later_exact_layout_moves_dotted_rows_with_parent() {
+        let sid = majit_ir::descr::StructId::from_canonical("AbsorbLayout");
+        let mut first = SemanticProgram::default();
+        let mut first_offsets = HashMap::new();
+        first_offsets.insert("a".to_string(), 8u64);
+        first_offsets.insert("b".to_string(), 16u64);
+        first_offsets.insert("a.leaf".to_string(), 8u64);
+        first_offsets.insert("a.leaf.inner".to_string(), 12u64);
+        first_offsets.insert("ab".to_string(), 24u64);
+        first.exact_layouts.insert(
+            sid,
+            ExactLayout {
+                size: Some(32),
+                align: Some(8),
+                field_offsets: first_offsets,
+                host: None,
+            },
+        );
+        let mut second = SemanticProgram::default();
+        let mut second_offsets = HashMap::new();
+        second_offsets.insert("a".to_string(), 4u64);
+        second_offsets.insert("b".to_string(), 8u64);
+        second.exact_layouts.insert(
+            sid,
+            ExactLayout {
+                size: Some(12),
+                align: Some(4),
+                field_offsets: second_offsets,
+                host: None,
+            },
+        );
+        let acc = absorb_hints(first, second);
+        let layout = acc.exact_layouts.get(&sid).expect("merged layout");
+        assert_eq!(layout.field_offsets.get("a"), Some(&4));
+        assert_eq!(layout.field_offsets.get("b"), Some(&8));
+        // `a` 8→4: leaf_old + (a_new - a_old) = 8 + (4 - 8) = 4.
+        assert_eq!(layout.field_offsets.get("a.leaf"), Some(&4));
+        assert_eq!(layout.field_offsets.get("a.leaf.inner"), Some(&8));
+        // Prefix match is `a.`, not `a`.
+        assert_eq!(layout.field_offsets.get("ab"), Some(&24));
+        assert_eq!(layout.size, Some(12));
+        assert_eq!(layout.align, Some(4));
+    }
+
+    #[test]
     fn absorb_appends_exception_class_hints() {
         let mut first = SemanticProgram::default();
         first.exception_class_hints.push(exception_hint("synth::E"));

@@ -1193,7 +1193,25 @@ impl<'a> Lowering<'a> {
                 // (`rffi.py` `_get_structcopy_fn`): each Charon field offset,
                 // not one residual copy. A `__deref_write` call has no bound
                 // address.
-                if let Some(place) = self.bare_deref_place(&slot) {
+                //
+                // A nullable-GCREF `Option` is that pointer word
+                // (`model.py` `SomeObject.noneify`): exchange the slot
+                // pointer. `move_plan` still sees Charon's multi-word
+                // enum layout and would `getfield` the box.
+                if let Some(place) = self.bare_deref_place(&slot)
+                    && self.option_value_is_nullable_gcref(&place.ty)
+                {
+                    let Some(old) = self.exchange_nullable_gcref_option(
+                        mir_bb,
+                        &place,
+                        args[1].clone(),
+                        address,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                } else if let Some(place) = self.bare_deref_place(&slot) {
                     let old = if let Some(old) =
                         self.exchange_deref_word(mir_bb, &place, args[1].clone())?
                     {
@@ -1305,6 +1323,22 @@ impl<'a> Lowering<'a> {
                     };
                     let address = arg_address(self, 0);
                     if let Some(place) = self.bare_deref_place(&slot)
+                        && self.option_value_is_nullable_gcref(&place.ty)
+                    {
+                        // The Option word is the nullable pointer:
+                        // read it, store None, return it. No `getfield`
+                        // of the box (`execute_and_record` of a null
+                        // struct when the Option is None).
+                        let Some(fresh) = self.emit_option_none(mir_bb, &place.ty)? else {
+                            return Ok(false);
+                        };
+                        let Some(old) =
+                            self.exchange_nullable_gcref_option(mir_bb, &place, fresh, address)?
+                        else {
+                            return Ok(false);
+                        };
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    } else if let Some(place) = self.bare_deref_place(&slot)
                         && self.move_plan(&place.ty).is_some()
                     {
                         let fresh = if option_take {
@@ -1378,6 +1412,87 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `Option<T>` whose rtyper value is a nullable GCREF
+    /// (`model.py` `SomeObject.noneify`). A scalar payload (`Option<u64>`)
+    /// stays the tagged inline enum: its payload bank is not `Ref`.
+    fn option_value_is_nullable_gcref(&self, ty: &TyRef) -> bool {
+        let dest = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        if !crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+            return false;
+        }
+        matches!(self.value_type_of(&dest), ValueType::Ref(_))
+            && matches!(
+                self.tyref_option_payload_value_type(&dest),
+                Some(ValueType::Ref(_))
+            )
+    }
+
+    /// Read the Option slot as a pointer, store `new_value`, return the
+    /// old pointer. The box is not loaded (`getfield` of a null struct).
+    fn exchange_nullable_gcref_option(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        new_value: Variable,
+        address: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        if let Some(old) = self.exchange_deref_word(mir_bb, place, new_value.clone())? {
+            return Ok(Some(old));
+        }
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            return Ok(None);
+        };
+        let base = if let PlaceKind::Local(i) = &inner.kind
+            && self
+                .local_var
+                .get(*i as usize)
+                .and_then(|var| var.as_ref())
+                .is_none()
+            && let Some(address) = address
+        {
+            address
+        } else {
+            self.resolve_place(mir_bb, (**inner).clone())?
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let itemsize = crate::layout::target_word_size();
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let old = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let item_ty = self.value_type_of(&place.ty);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(old.clone()),
+            kind: OpKind::RawLoad {
+                base: base.clone(),
+                offset: offset.clone(),
+                item_ty: item_ty.clone(),
+                itemsize,
+                is_item_signed: false,
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base,
+                offset,
+                value: new_value,
+                item_ty,
+                itemsize,
+                is_item_signed: false,
+            },
+        });
+        Ok(Some(old))
     }
 
     /// `None` of `dest_ty` as `Lowering::build_rvalue` builds an MIR
@@ -2018,6 +2133,7 @@ impl<'a> Lowering<'a> {
                         vidx,
                         &inst_args,
                         inst_adt,
+                        Some(ty),
                         variant_id,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
@@ -2193,7 +2309,7 @@ impl<'a> Lowering<'a> {
                     field: if cell_slot {
                         container_field.clone()
                     } else {
-                        container_leaf_descriptor(container_field, at_offset_zero, &leaf)
+                        container_leaf_descriptor(container_field, at_offset_zero, 0, &leaf)
                     },
                     value: LinkArg::Value(read),
                     ty: leaf.ty,
@@ -9921,6 +10037,8 @@ impl<'a> Lowering<'a> {
     /// over `u32`, so the result's bits equal `u32::from(arg)` — the
     /// argument's own integer value.  Returning `arg` (`args[1]`) directly
     /// is the identity the marker `self` is dropped around.
+    /// The leaf is compared through [`crate::front::clause_spec::unspecialized_leaf`]
+    /// so a `get__spec_*` copy (`FunctionDesc.cachedgraph`) aliases the same way.
     ///
     /// Without this the `.get` method call lowers to `getattr(Integer,
     /// "get")` on the integer `self` marker — an attribute the annotator
@@ -9940,7 +10058,8 @@ impl<'a> Lowering<'a> {
         args: &[Variable],
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        if segments.last().map(String::as_str) != Some("get") {
+        let leaf = segments.last().map(String::as_str)?;
+        if crate::front::clause_spec::unspecialized_leaf(leaf) != "get" {
             return None;
         }
         let CallKind::Fun(FunId::Regular { id }) = kind else {
@@ -9968,6 +10087,82 @@ impl<'a> Lowering<'a> {
             return None;
         }
         args.get(1).cloned()
+    }
+
+    /// `Arg::<T>::try_get` is `T::try_from(u32::from(arg))` with `T` a
+    /// `newtype_oparg!` wrapper. The blanket `From` impl is always-`Ok`
+    /// identity on that integer (`objectmodel` has no such call; RPython
+    /// opcode dispatch reads the operand word). Unique look-inside of the
+    /// spec copy residualizes `CallKind::Trait` `TryFrom::try_from` until
+    /// this rewrite materializes `Ok(arg)`.
+    pub(in crate::front::mir) fn try_lower_oparg_try_from(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        if crate::front::clause_spec::unspecialized_leaf(leaf) != "try_from" {
+            return Ok(false);
+        }
+        let is_trait_try_from = matches!(
+            segments,
+            [trait_leaf, method]
+                if crate::front::clause_spec::unspecialized_leaf(trait_leaf) == "TryFrom"
+                    && crate::front::clause_spec::unspecialized_leaf(method) == "try_from"
+        );
+        let is_core_try_from = segments.first().is_some_and(|s| s == "core");
+        if !is_trait_try_from && !is_core_try_from {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(ok_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !tyref_is_oparg(&ok_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
+        );
+        let bb_id = self.emit_bb(mir_bb);
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            dest_local,
+            target,
+        )?;
+        Ok(true)
     }
 
     /// Alias the transparent `OpArgType` conversions to their single

@@ -2524,16 +2524,23 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         None
     }
 
-    // `heaptracker.all_fielddescrs(gccache, STRUCT)` walks an embedded base
-    // before the subclass's own fields.  Consequently a subclass SizeDescr
+    // `heaptracker.all_fielddescrs` walks an embedded base before the
+    // subclass's own fields.  Consequently a subclass SizeDescr
     // legitimately contains the base's FieldDescr at the same slot even
     // though their parent STRUCT keys differ (`rclass.InstanceRepr._setup_repr`
-    // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
+    // creates exactly this `super` edge).  The explicit Result/Option shell
     // serializes the flattened row under the variant parent while a read of
     // that row can name the enum, so recover that one proven inheritance edge
     // from the qualified owners.  Two *different* variants of one enum are not
-    // that edge -- their payloads are different fields sharing an address --
-    // and neither is a same-name/same-offset field from an arbitrary struct.
+    // that edge for payload rows -- `Ok.__pos_0` and `Err.__pos_0` are
+    // different fields sharing an address -- and neither is a same-name /
+    // same-offset field from an arbitrary struct.  The tag is the exception:
+    // `_setup_repr` gives every variant subclass the base's fields first, and
+    // the tag is the only row the base carries (`variant_inherits_enum_tag`),
+    // so `Result::Ok.__discriminant` and `Result::Err.__discriminant` name one
+    // base field under two variant parents.  A `match` whose variant is not
+    // statically known reads that row under one variant's spelling whatever
+    // shell was allocated.
     fn is_registered_std_shell(owner: &str) -> bool {
         // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
         // uses, plus the enum roots the inherited-tag edge names. A name
@@ -2560,18 +2567,24 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         })
     }
 
-    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
+    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str, field_name: &str) -> bool {
         let (Some((slot_enum, slot_variant)), Some((field_enum, field_variant))) = (
             shelled_sum_owner(slot_owner),
             shelled_sum_owner(field_owner),
         ) else {
             return false;
         };
-        if slot_enum != field_enum
-            || !(slot_variant == field_variant
-                || slot_variant.is_empty()
-                || field_variant.is_empty())
-        {
+        if slot_enum != field_enum {
+            return false;
+        }
+        // Same variant, or one spelling names the enum itself. Sibling
+        // variants share only the base tag (`_setup_repr`); a payload row
+        // at the same address is a different field. `named_apart` already
+        // refuses a `__pos_0` slot against a `__discriminant` field when
+        // both keys are present, so the exception is the read's key.
+        let same_variant_or_base =
+            slot_variant == field_variant || slot_variant.is_empty() || field_variant.is_empty();
+        if !same_variant_or_base && field_name != "__discriminant" {
             return false;
         }
         // Spelling is not identity. When the StructId table is populated,
@@ -2633,7 +2646,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     }
 
     let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
-        explicit_sum_inherits(slot_owner, field_owner)
+        explicit_sum_inherits(slot_owner, field_owner, field.field_key())
             || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
     };
 
@@ -3762,6 +3775,53 @@ mod tests {
         )
         .with_parent_descr(template_parent, 1);
         assert!(!slot_holds_field(&ok, &err));
+    }
+
+    #[test]
+    fn sibling_variant_tag_rows_of_one_shelled_sum_identify_the_base_field() {
+        let descr = |size: usize, owner: &str, key: &str, offset: usize, index: usize| {
+            let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                index as u32,
+                offset,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                format!("{owner}.{key}"),
+                key,
+            )
+            .with_parent_descr(parent.clone(), index);
+            (field, parent)
+        };
+
+        let (err_tag, _err_parent) = descr(16, "core::result::Result::Err", "__discriminant", 0, 0);
+        let (ok_tag, _ok_parent) = descr(16, "core::result::Result::Ok", "__discriminant", 0, 0);
+        assert!(
+            slot_holds_field(&err_tag, &ok_tag),
+            "the tag row of a shelled sum is the base's, shared by sibling variants"
+        );
+        assert!(slot_holds_field(&ok_tag, &err_tag));
+
+        let (err_payload, _err_payload_parent) =
+            descr(16, "core::result::Result::Err", "__pos_0", 8, 1);
+        let (ok_payload, _ok_payload_parent) =
+            descr(16, "core::result::Result::Ok", "__pos_0", 8, 1);
+        assert!(
+            !slot_holds_field(&err_payload, &ok_payload),
+            "sibling payload rows at one address stay distinct fields"
+        );
+
+        // `named_apart` (`named_field_keys_agree`): a `__pos_0` slot cannot
+        // identify a `__discriminant` field even at the tag's address, so the
+        // sibling-tag exception cannot leak a payload row.
+        let (pos0_at_tag_offset, _pos0_parent) =
+            descr(16, "core::result::Result::Err", "__pos_0", 0, 0);
+        assert!(!slot_holds_field(&pos0_at_tag_offset, &ok_tag));
+        assert!(!slot_holds_field(&err_tag, &ok_payload));
     }
 
     #[test]
@@ -5478,6 +5538,146 @@ mod tests {
             "an unwritten slot folds to the zeroed allocation on either side \
              of the read-side slot check; this leg discriminates nothing and \
              exists to prove the positive leg is not measuring the fold"
+        );
+    }
+
+    /// Explicit Result/Option shell: tag at 0, optional `__pos_0` at 8.
+    /// Each owner gets its own SizeDescr identity so sibling variants do
+    /// not `Arc::ptr_eq` or share a cache_key.
+    fn shelled_result_layout(
+        owner: &str,
+        with_payload: bool,
+    ) -> (DescrRef, DescrRef, Option<DescrRef>) {
+        let tag = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                format!("{owner}.__discriminant"),
+                "__discriminant",
+            )
+            .with_index_in_parent(0),
+        );
+        let payload = if with_payload {
+            Some(Arc::new(
+                majit_ir::SimpleFieldDescr::new_with_name(
+                    1,
+                    8,
+                    8,
+                    Type::Int,
+                    false,
+                    majit_ir::ArrayFlag::Signed,
+                    format!("{owner}.__pos_0"),
+                    "__pos_0",
+                )
+                .with_index_in_parent(1),
+            ))
+        } else {
+            None
+        };
+        let mut fields: Vec<Arc<dyn FieldDescr>> = vec![tag.clone()];
+        if let Some(ref p) = payload {
+            fields.push(p.clone());
+        }
+        let size = if with_payload { 16 } else { 8 };
+        let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+        size_descr
+            .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+        let parent = Arc::new(size_descr.with_all_fielddescrs(fields)) as DescrRef;
+        tag.set_parent_descr(&parent);
+        if let Some(ref p) = payload {
+            p.set_parent_descr(&parent);
+        }
+        (parent, tag as DescrRef, payload.map(|p| p as DescrRef))
+    }
+
+    /// A virtual allocated under the `Result::Err` shell, tag stored as 1
+    /// through the enum-base tag descr, read through `Result::Ok.__discriminant`.
+    #[test]
+    fn a_virtual_err_shell_tag_read_through_the_ok_spelling_folds_the_stored_tag() {
+        let (err_sd, _err_tag, _err_payload) =
+            shelled_result_layout("core::result::Result::Err", true);
+        let (_ok_sd, ok_tag, _ok_payload) = shelled_result_layout("core::result::Result::Ok", true);
+        let (_base_sd, base_tag, _) = shelled_result_layout("core::result::Result", false);
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], err_sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Int(1)),
+                ],
+                base_tag,
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                ok_tag,
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass_typed(&ops, &[200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            Some(Value::Int(1)),
+            "a match that reads the tag under the Ok spelling of an Err shell \
+             must fold the stored tag, not the zeroed allocation"
+        );
+    }
+
+    /// A populated `Err.__pos_0` must not be forwarded to a read of
+    /// `Result::Ok.__pos_0` on the same virtual.
+    #[test]
+    fn a_virtual_err_shell_payload_read_through_the_ok_spelling_does_not_forward_the_err_payload() {
+        let (err_sd, _err_tag, err_payload) =
+            shelled_result_layout("core::result::Result::Err", true);
+        let (_ok_sd, _ok_tag, ok_payload) = shelled_result_layout("core::result::Result::Ok", true);
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], err_sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Int(100)),
+                ],
+                err_payload.expect("Err shell lists __pos_0"),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                ok_payload.expect("Ok shell lists __pos_0"),
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass_typed(&ops, &[200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            Some(Value::Int(0)),
+            "sibling payload rows at one address stay distinct; the Ok \
+             spelling of __pos_0 must not forward the Err payload"
         );
     }
 

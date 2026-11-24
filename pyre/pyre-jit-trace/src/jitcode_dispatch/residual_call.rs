@@ -4023,7 +4023,7 @@ impl ResidualFrameChainGuard {
             // executor runs `do_recursive_call`.
             pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
             majit_gc::bh_probe_note_store(
-                frame as usize,
+                frame as majit_gc::GCREF,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 2,
             );

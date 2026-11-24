@@ -495,6 +495,63 @@ impl crate::lltype::GcType for W_ListObjectUser {
     const SIZE: usize = W_LIST_USER_OBJECT_SIZE;
 }
 
+/// listobject.py `class KeyContainer(W_Root)`.
+///
+/// `KeyContainer.__init__(w_key, w_item)` stores both refs; `CustomKeySort.lt`
+/// compares `w_key`, and `descr_sort`'s finally restores `w_item`.
+#[repr(C)]
+pub struct KeyContainer {
+    pub ob: PyObject,
+    pub w_key: PyObjectRef,
+    pub w_item: PyObjectRef,
+}
+
+/// listobject.py `KeyContainer` — RPython class identity, not an app type.
+pub static KEY_CONTAINER_TYPE: PyType = new_pytype("KeyContainer");
+
+/// GC tid for [`KeyContainer`], assigned at `register_type`.
+pub static KEY_CONTAINER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+
+impl crate::lltype::GcType for KeyContainer {
+    fn type_id() -> u32 {
+        KEY_CONTAINER_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// listobject.py `KeyContainer(w_keyitem, w_item)`.
+///
+/// `malloc_typed_managed` does not collect, so the two values it stores are
+/// the addresses the caller passed (`w_specialised_tuple_oo_new`).
+pub fn key_container_new(w_key: PyObjectRef, w_item: PyObjectRef) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(KeyContainer {
+        ob: PyObject {
+            ob_type: &KEY_CONTAINER_TYPE,
+            w_class: std::ptr::null_mut(),
+        },
+        w_key,
+        w_item,
+    }) as PyObjectRef
+}
+
+/// listobject.py `isinstance(w_obj, KeyContainer)`.
+#[inline]
+pub unsafe fn is_key_container(obj: PyObjectRef) -> bool {
+    !obj.is_null() && (*obj).ob_type == &KEY_CONTAINER_TYPE as *const PyType
+}
+
+/// listobject.py `KeyContainer.w_key`.
+#[inline]
+pub unsafe fn key_container_w_key(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const KeyContainer)).w_key
+}
+
+/// listobject.py `KeyContainer.w_item`.
+#[inline]
+pub unsafe fn key_container_w_item(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const KeyContainer)).w_item
+}
+
 /// Allocate the translated `SizeListStrategy` instance payload.  The object
 /// space reference is process-global in pyre, leaving its sole per-instance
 /// field (`sizehint`) as one Signed cell.  This is GC state, not a Python int:

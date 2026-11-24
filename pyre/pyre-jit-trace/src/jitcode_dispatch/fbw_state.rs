@@ -3791,6 +3791,16 @@ pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
     )
 }
 
+/// Put the two unjournaled flags back to a snapshot.
+///
+/// A declined speculative subwalk may have recorded a residual it never
+/// executed and marked one of these; cutting that residual has to take the
+/// mark with it. The cells already exist; this only writes them.
+pub(crate) fn fbw_restore_unjournaled_kinds(kinds: (bool, bool)) {
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(kinds.0));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(kinds.1));
+}
+
 pub(crate) fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
     let counter = if is_void {
         &FBW_EXECUTED_RESIDUAL_VOID

@@ -183,6 +183,19 @@ pub struct CompiledJitDriver {
     /// accounts are independent and nothing makes them agree.
     #[serde(default)]
     pub red_args_types: Vec<majit_ir::Type>,
+    /// For each detected red, the index `k` of the marker call's explicit
+    /// red operand that is that variable (`user_args[num_greens + k]`).
+    ///
+    /// The marker's explicit red operands are this port's declaration of
+    /// which live variable is which. `jtransform.py`
+    /// `autodetect_jit_markers_redvars` produces the rewritten order
+    /// `warmspot.py` `make_args_specification` consumes. `Some(map)` when
+    /// every detected red is a marker operand (injective; an undetected
+    /// operand is dead across the merge point). `None` when at least one
+    /// detected red is not a marker operand. Explicit-red drivers store
+    /// `Some([0, 1, …])`.
+    #[serde(default)]
+    pub red_marker_positions: Option<Vec<u32>>,
     /// RPython: `jitdriver.virtualizables` — the red names declared
     /// virtualizable. Empty is the common non-pyre case.
     #[serde(default)]

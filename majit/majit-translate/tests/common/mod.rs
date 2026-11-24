@@ -166,12 +166,21 @@ pub fn ensure_link_baseline(llbc: &'static Llbc) {
     });
 }
 
+/// Same crate list `build_semantic_program_via_active_frontend` registers
+/// before lowering: each loaded artefact's `crate_name()`.
+fn install_local_crate_roots<'a>(llbcs: impl IntoIterator<Item = &'a Llbc>) {
+    majit_translate::register_local_crate_roots(
+        llbcs.into_iter().map(|llbc| llbc.crate_name().to_string()),
+    );
+}
+
 /// `ensure_link_baseline` then the cached context, under the read lock.
 pub fn with_shared_lowering<R>(
     llbc: &'static Llbc,
     f: impl FnOnce(&'static LowerContext<'static>) -> R,
 ) -> R {
     ensure_link_baseline(llbc);
+    install_local_crate_roots(std::iter::once(llbc));
     with_llbc_link_read(std::iter::once(llbc), || f(cached_lower_context(llbc)))
 }
 
@@ -196,6 +205,7 @@ pub fn with_shared_lowering_many<R>(
     for llbc in llbcs {
         ensure_link_baseline(llbc);
     }
+    install_local_crate_roots(llbcs.iter().copied());
     with_llbc_link_read(llbcs.iter().copied(), || {
         let ctxs: Vec<&'static LowerContext<'static>> =
             llbcs.iter().copied().map(cached_lower_context).collect();
@@ -236,6 +246,9 @@ fn with_shared_link_write<'a, R>(
     f: impl FnOnce() -> R,
 ) -> R {
     let llbcs: Vec<&Llbc> = llbcs.into_iter().collect();
+    if !llbcs.is_empty() {
+        install_local_crate_roots(llbcs.iter().copied());
+    }
     let shared: Vec<&'static Llbc> = llbcs
         .iter()
         .copied()

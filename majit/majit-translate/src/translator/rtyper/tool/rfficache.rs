@@ -694,11 +694,11 @@ mod tests {
     #[test]
     fn sizeof_c_types_via_rustc_wasm32_unknown_unknown() {
         let result = sizeof_c_types_via_rustc(
-            &["long", "void*", "long long", "int"],
+            &["long", "void*", "long long", "int", "uintptr_t", "intptr_t"],
             "wasm32-unknown-unknown",
         );
         match result {
-            Ok(sizes) => assert_eq!(sizes, vec![4, 4, 8, 4]),
+            Ok(sizes) => assert_eq!(sizes, vec![4, 4, 8, 4, 4, 4]),
             Err(err) => {
                 let message = err.message.to_ascii_lowercase();
                 let missing_core = message.contains("can't find crate")

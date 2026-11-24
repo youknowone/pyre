@@ -547,6 +547,7 @@ pub fn frame_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
         "eval::handle_exception",        // &mut PyFrame
         "executioncontext::force_frame", // *mut PyFrame
         "call::enter_recursive_frame",   // *const PyFrame
+        "call::charge_recursive_frame",  // *const PyFrame
     ];
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {

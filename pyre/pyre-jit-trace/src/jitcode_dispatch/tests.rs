@@ -549,6 +549,36 @@ fn tuplehash_portal_reachable_symbolic_residual_scan_is_empty() {
     );
 }
 
+/// jd4's `sortkey_portal` is a fourth driver. Same named-reload discipline
+/// as unpackiterable: a `||` closure in livevar reloads would mint
+/// `target:closure.call` hashes the walk refuses.
+#[test]
+fn sortkey_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = crate::jitcode_runtime::portal_jitcode_for_key("builtins::sortkey_portal")
+        .expect("the build-time table registers the sortkey portal");
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the sortkey portal index resolves to a runtime jitcode");
+
+    let scan = portal.reachable_symbolic_residuals();
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
+    );
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the sortkey portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / list / call residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd4 walk",
+    );
+}
+
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     let mut session = WalkSession::default();
@@ -1371,6 +1401,20 @@ fn void_return() -> Vec<u8> {
     ]
 }
 
+fn test_summary_body(code: Vec<u8>, constants_i: Vec<i64>) -> super::inline_call::TestSummaryBody {
+    super::inline_call::TestSummaryBody {
+        code,
+        num_regs_i: 1,
+        constants_i,
+    }
+}
+
+fn inline_call_then_return(descr: u16) -> Vec<u8> {
+    let mut code = inline_call_with_descr(descr);
+    code.extend(void_return());
+    code
+}
+
 fn abort_op() -> Vec<u8> {
     vec![
         *insns_opname_to_byte()
@@ -2062,6 +2106,26 @@ fn a_reachable_abort_is_not_a_whole_body_blocker() {
     assert_eq!(summary.blocker_after_effect, None);
 }
 
+/// The assembler still emits the residual that would have run after an
+/// unlowered call (`abort` then the call). Whole-body admission walks that
+/// remainder so the residual is classified; resume keeps `abort` a sink.
+#[test]
+fn a_symbolic_residual_after_abort_is_a_whole_body_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = abort_op();
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert!(whole.has_reachable_abort);
+    assert_eq!(whole.blocker_effect_free, Some(symbolic));
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume =
+        super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[symbolic], |_| None);
+    assert_eq!(resume.blocker_effect_free, Some(0));
+    assert_eq!(resume.blocker_after_effect, None);
+}
+
 /// Capture-time resume treats a reachable `abort` as a blocker.
 #[test]
 fn a_reachable_abort_is_a_resume_blocker() {
@@ -2361,6 +2425,165 @@ fn a_zero_conditional_call_value_applies_the_funcbox_check() {
     code.extend(void_return());
     let summary = super::inline_call::summarize_body_blockers(&code, 0, &[0, symbolic], |_| None);
     assert_eq!(summary.blocker_effect_free, Some(symbolic));
+}
+
+/// A two-node cycle must not publish B's stub-only answer: querying A then B
+/// as a root still sees B's local blocker (`DependencyTracker` merges the
+/// cyclic dependency rather than storing a stub-dependent body).
+#[test]
+fn descent_summary_two_cycle_propagates_b_blocker_to_b_root() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut b = inline_call_with_descr(0);
+    b.extend(residual_call_with_funcbox(1));
+    b.extend(void_return());
+    let mut analysis = super::inline_call::DescentSummaryAnalysis::with_test_bodies(
+        &[],
+        vec![
+            test_summary_body(inline_call_then_return(1), Vec::new()),
+            test_summary_body(b, vec![symbolic]),
+        ],
+    );
+    let a_sum = analysis.solve(0, super::inline_call::EntryMode::FactFree);
+    let b_sum = analysis.solve(1, super::inline_call::EntryMode::FactFree);
+    assert!(
+        a_sum.blocker_effect_free.is_some() || a_sum.blocker_after_effect.is_some(),
+        "A as root must see B's blocker"
+    );
+    assert!(
+        b_sum.blocker_effect_free.is_some() || b_sum.blocker_after_effect.is_some(),
+        "B as root must see its own blocker"
+    );
+    let scans = analysis.solve_scan_count();
+    let b_again = analysis.solve(1, super::inline_call::EntryMode::FactFree);
+    assert_eq!(
+        analysis.solve_scan_count(),
+        scans,
+        "B's second query is a cache hit"
+    );
+    assert_eq!(b_again.blocker_after_effect, b_sum.blocker_after_effect);
+    assert_eq!(b_again.blocker_effect_free, b_sum.blocker_effect_free);
+}
+
+/// Diamond A→{B,C}→D→A: discovery visits each state once; D is solve-scanned
+/// once per lattice growth, not once per incoming path.
+#[test]
+fn descent_summary_scc_diamond_walks_each_stable_body_once() {
+    let mut a = goto_if_not(0, 10);
+    a.extend(inline_call_with_descr(1));
+    a.extend(void_return());
+    assert_eq!(a.len(), 10);
+    a.extend(inline_call_with_descr(2));
+    a.extend(void_return());
+    let mut analysis = super::inline_call::DescentSummaryAnalysis::with_test_bodies(
+        &[],
+        vec![
+            test_summary_body(a, Vec::new()),
+            test_summary_body(inline_call_then_return(3), Vec::new()),
+            test_summary_body(inline_call_then_return(3), Vec::new()),
+            test_summary_body(inline_call_then_return(0), Vec::new()),
+        ],
+    );
+    analysis.solve(0, super::inline_call::EntryMode::FactFree);
+    assert_eq!(
+        analysis.discover_scan_count(),
+        4,
+        "discovery visits every reachable state once"
+    );
+    let d_scans = analysis.solve_scan_count_for(3);
+    assert!(
+        d_scans >= 1 && d_scans <= 7,
+        "D is solve-scanned once per lattice growth, not per diamond path; got {d_scans}"
+    );
+    assert!(
+        analysis.solve_scan_count() <= 4 * 7,
+        "total solve scans bounded by 4 nodes times lattice height 7, got {}",
+        analysis.solve_scan_count()
+    );
+}
+
+/// Candidate (a) counterexample: A calls B then blocker X; B calls A. Query A
+/// then B as a root; B must still see X after the forced internal edge.
+#[test]
+fn descent_summary_scc_member_later_root_sees_ancestor_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut a = inline_call_with_descr(1);
+    a.extend(residual_call_with_funcbox(1));
+    a.extend(void_return());
+    let mut analysis = super::inline_call::DescentSummaryAnalysis::with_test_bodies(
+        &[],
+        vec![
+            test_summary_body(a, vec![symbolic]),
+            test_summary_body(inline_call_then_return(0), Vec::new()),
+        ],
+    );
+    analysis.solve(0, super::inline_call::EntryMode::FactFree);
+    let scans_after_a = analysis.solve_scan_count();
+    let b_sum = analysis.solve(1, super::inline_call::EntryMode::FactFree);
+    assert_eq!(
+        analysis.solve_scan_count(),
+        scans_after_a,
+        "querying B as a root after A performs zero further body scans"
+    );
+    assert_eq!(
+        b_sum.blocker_after_effect,
+        Some(symbolic),
+        "B as root must report A's X after-effect under the forced internal edge"
+    );
+}
+
+/// wrapper → callee → leaf, leaf is an effectful residual then a refused one.
+/// `descent_decline` names the helper: an abort there would re-run the effect.
+/// An `abort` laid out between them (unlowered call, then the residual) must
+/// not hide the refused residual from whole-body admission.
+#[test]
+fn descent_summary_wrapper_callee_leaf_effect_then_blocker_is_a_helper_decline() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
+
+    let mut leaf = residual_call_with_funcbox(1);
+    leaf.extend(abort_op());
+    leaf.extend(residual_call_with_funcbox(2));
+    leaf.extend(void_return());
+    let mut analysis = super::inline_call::DescentSummaryAnalysis::with_test_bodies(
+        &[],
+        vec![
+            test_summary_body(inline_call_then_return(1), Vec::new()),
+            test_summary_body(inline_call_then_return(2), Vec::new()),
+            test_summary_body(leaf, vec![real, symbolic]),
+        ],
+    );
+    let decline = analysis.descent_decline(0, super::inline_call::EntryMode::FactFree);
+    assert!(
+        matches!(decline, Some(super::inline_call::DescentDecline::Helper(_))),
+        "wrapper must decline: leaf effect then blocker, got {decline:?}"
+    );
+}
+
+/// Same graph, but the refused residual is first: a rewind covers it, so the
+/// wrapper is admitted (`descent_decline` is `None`).
+#[test]
+fn descent_summary_wrapper_callee_leaf_blocker_before_effect_is_admitted() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
+
+    let mut leaf = residual_call_with_funcbox(1);
+    leaf.extend(residual_call_with_funcbox(2));
+    leaf.extend(void_return());
+    let mut analysis = super::inline_call::DescentSummaryAnalysis::with_test_bodies(
+        &[],
+        vec![
+            test_summary_body(inline_call_then_return(1), Vec::new()),
+            test_summary_body(inline_call_then_return(2), Vec::new()),
+            test_summary_body(leaf, vec![symbolic, real]),
+        ],
+    );
+    let decline = analysis.descent_decline(0, super::inline_call::EntryMode::FactFree);
+    assert_eq!(
+        decline, None,
+        "blocker before any effect is a rewind, not a decline"
+    );
 }
 
 #[test]

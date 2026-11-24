@@ -1025,6 +1025,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
     "TupleHashJitDriver",
+    "SortkeyJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -2681,6 +2682,76 @@ fn prefix_unsigned_binop(
     }
 }
 
+/// Map each autodetected red onto its index in the marker call's explicit
+/// red operands (`user_args[num_greens + k]`).
+///
+/// The marker's explicit red operands are this port's declaration of which
+/// live variable is which. `jtransform.py` `autodetect_jit_markers_redvars`
+/// produces the rewritten order `warmspot.py` `make_args_specification`
+/// consumes; `red_marker_positions[i] = k` means detected red `i` is
+/// explicit operand `k`. Compare after the same alias resolution the
+/// merge-point rewrite uses for greens. `Some(map)` when every detected
+/// red is a marker operand: the map is injective, not a permutation of
+/// `0..n` (an undetected operand is a red that is dead across the merge
+/// point). `None` when at least one detected red is not a marker operand.
+pub(crate) fn red_marker_positions_for(
+    driver_name: &str,
+    detected: &[crate::flowspace::model::Variable],
+    explicit_reds: &[crate::flowspace::model::Variable],
+    aliases: Option<
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        >,
+    >,
+) -> Option<Vec<u32>> {
+    use crate::flowspace::model::Variable;
+    use crate::model::FunctionGraph;
+
+    let resolve = |variable: &Variable| match aliases {
+        Some(map) => resolve_alias(variable, map),
+        None => variable.clone(),
+    };
+    let describe = |variable: &Variable| {
+        format!(
+            "id={} kind={:?} prefix={}",
+            variable.id(),
+            FunctionGraph::concretetype_of(variable),
+            variable.name_prefix()
+        )
+    };
+
+    let resolved_explicit: Vec<Variable> = explicit_reds.iter().map(resolve).collect();
+    let mut claimed = vec![false; explicit_reds.len()];
+    let mut positions = Vec::with_capacity(detected.len());
+    for red in detected {
+        let resolved = resolve(red);
+        let k = resolved_explicit
+            .iter()
+            .position(|candidate| *candidate == resolved);
+        match k {
+            Some(k) if !claimed[k] => {
+                claimed[k] = true;
+                positions.push(k as u32);
+            }
+            Some(k) => panic!(
+                "auto-red driver `{driver_name}`: detected red {} maps onto marker operand {k} twice\n\
+                 detected: [{}]\n\
+                 marker:   [{}]",
+                describe(red),
+                detected.iter().map(describe).collect::<Vec<_>>().join(", "),
+                explicit_reds
+                    .iter()
+                    .map(describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => return None,
+        }
+    }
+    Some(positions)
+}
+
 /// RPython: `support.autodetect_jit_markers_redvars` (support.py).
 /// Compute the Variables live across the portal's `jit_merge_point`, remove
 /// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
@@ -3629,7 +3700,14 @@ fn raw_field_layout_offset(
     descr.as_field_descr().map(|fd| fd.offset())
 }
 
-/// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
+/// `Rvalue::Ref` / `RawPtr` borrow of a field (`rewrite_op_getsubstruct`).
+///
+/// A wide inline aggregate (`inline_vec` / `FLAG_STRUCT` larger than a
+/// word) is the usual case. A one-word row still has an address: `&s.f`
+/// is `int_add(ptr, offsetof)` on a raw owner even when the layout flag
+/// is a scalar (`bytecode::CodeObject.obj_name` as a `String` / `RustVec`
+/// header). `jtransform.py rewrite_op_getfield` raises for a leftover
+/// non-pure `getfield_raw_r`.
 fn wide_inline_borrow_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
@@ -12152,6 +12230,60 @@ impl<'a> Transformer<'a> {
             {
                 return result;
             }
+            // `Transformer.rewrite_op_malloc` → `new` / `new_with_vtable`.
+            // `lltype.malloc(STRUCT)` has no value; leftover empty-init
+            // moving flavors rewrite the same way. A surviving
+            // `malloc_typed(value)` still holds the initializer in
+            // `args[0]`; rewriting it to empty `new` would drop that copy.
+            // `UnsupportedMallocFlags` refuses a `nonmovable` flavor
+            // (`malloc_typed_stable` / `malloc_typed_young_nonmoving`)
+            // because the allocation op is a nursery bump. Residualize
+            // those two so the native copy remains (`guess_call_kind`).
+            if crate::codewriter::call::is_lltype_malloc_target(target)
+                && !crate::codewriter::call::is_lltype_malloc_varsize_clear_target(target)
+                && let ValueType::Ref(Some(owner)) = result_ty
+                && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
+            {
+                let flavor = crate::model::lltype_fixed_malloc_flavor(target).unwrap_or("?");
+                let nonmoving = matches!(
+                    flavor,
+                    "malloc_typed_stable" | "malloc_typed_young_nonmoving"
+                );
+                let has_init = !args.is_empty();
+                if !nonmoving && !has_init {
+                    if self.flavor_raw_ref_is_int_banked(result_ty) {
+                        return self.rewrite_raw_malloc_fixedsize_owner(
+                            op,
+                            graph_name,
+                            graph,
+                            &alloc_owner,
+                            false,
+                            false,
+                            true,
+                        );
+                    }
+                    let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
+                        crate::codewriter::heaptracker::callcontrol_has_vtable(cc, &alloc_owner)
+                    });
+                    return self.rewrite_ctor_malloc(
+                        graph_name,
+                        graph,
+                        op.result.clone(),
+                        alloc_owner,
+                        has_vtable,
+                        Vec::new(),
+                    );
+                }
+                crate::decline::record(
+                    crate::decline::gate::REWRITE_OP_MALLOC,
+                    if nonmoving {
+                        "unsupported-malloc-flags-nonmovable"
+                    } else {
+                        "malloc-typed-initializer"
+                    },
+                    format_args!("{alloc_owner} in {graph_name}"),
+                );
+            }
             // `rewrite_op_same_as` / `rewrite_op_cast_pointer` /
             // `rewrite_op_cast_opaque_ptr`: one operand alias, no jitcode
             // op. `current_gc_ref` is the residual stand-in for the GC
@@ -16996,17 +17128,30 @@ impl<'a> Transformer<'a> {
                     &green_kinds,
                     &red_kinds,
                 );
-                // warmspot.py:663-664 `jd._green_args_spec` / `jd.red_args_types`
-                // are read off the marker's own operands, not off the
-                // declaration. Record them here for the same reason upstream
-                // does it here: this is where the marker operands exist. A
+                // `warmspot.py` `make_args_specification` reads
+                // `jd._green_args_spec` / `jd.red_args_types` off the marker's
+                // own operands, not off the declaration. Record them here for
+                // the same reason: this is where the marker operands exist. A
                 // consumer that builds the run-time driver then works from the
                 // graph's answer instead of re-typing the declaration, which is
                 // what makes the two unable to disagree. For an auto-red driver
                 // these describe the reds `autodetect_jit_markers_redvars` just
-                // found, which nothing else records.
+                // found. The marker's explicit red operands are this port's
+                // declaration of which live variable is which;
+                // `red_marker_positions` is the injective map onto the
+                // rewritten list (`split_graph_and_record_jitdriver`).
                 let green_args_spec = self.marker_operand_kinds(greens_raw);
                 let red_args_types = self.marker_operand_kinds(reds_raw);
+                let computed_positions = if autoreds {
+                    red_marker_positions_for(
+                        &driver_name,
+                        reds_raw,
+                        &user_args[num_greens..],
+                        Some(&self.aliases),
+                    )
+                } else {
+                    Some((0..reds_raw.len() as u32).collect())
+                };
                 {
                     let jd = self
                         .callcontrol
@@ -17014,6 +17159,16 @@ impl<'a> Transformer<'a> {
                         .jitdriver_sd_from_jitdriver_mut(jitdriver_index)?;
                     jd.green_args_spec = green_args_spec;
                     jd.red_args_types = red_args_types;
+                    // `find_portals` rewrites the marker to autodetect order
+                    // before this transform runs on the split copy. Keep the
+                    // map recorded against the source operands when this
+                    // later rewrite would only see the identity.
+                    let identity: Vec<u32> = (0..reds_raw.len() as u32).collect();
+                    if jd.red_marker_positions.is_none()
+                        || computed_positions.as_deref() != Some(identity.as_slice())
+                    {
+                        jd.red_marker_positions = computed_positions;
+                    }
                 }
                 if autoreds {
                     let jd = self
@@ -20067,27 +20222,44 @@ fn raw_list_produced_const(
     })
 }
 
-/// ARRAY identity of a `RustVec` item buffer, from `ARRAY.OF`.
+/// Pointer-width integer lltype for a `Vec` Int/Ref item.
 ///
-/// `descr.py` `get_type_flag` reads that element lltype, and `rint.py`
-/// `unsigned_repr` is what an unsigned item lowers to. `Signed` spells
-/// `Vec<isize>`, `Unsigned` spells `Vec<usize>`, `Float` spells `Vec<f64>`.
-/// A reference item is stored as an untraced word (`cast_ptr_to_int`), so
-/// that spelling stays `usize`. The identity is what lets `arraydescrof`
-/// read the flag and `sizeof(ARRAY.OF)`; without one, an int element is
-/// eight bytes wide.
-/// The ARRAY is `rffi.CArray(ITEM)` (`rewrite_op_raw_store`); a GC-pointer
-/// item is stored as an untraced word, so `ITEM` is `Unsigned`.
+/// `rffi.sizeof(Signed|Unsigned)` is `target_signed_size()`. When that is
+/// not the word, `INTPTR_T` / `UINTPTR_T` (`sizeof_number` of the C type).
+fn vec_word_item_lltype(
+    signed: bool,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi;
+    let word = crate::layout::target_word_size();
+    let primitive = if signed {
+        LowLevelType::Signed
+    } else {
+        LowLevelType::Unsigned
+    };
+    match rffi::sizeof(&primitive) {
+        Ok(crate::flowspace::model::ConstValue::Int(n)) if n > 0 && n as usize == word => primitive,
+        _ if signed => (*rffi::INTPTR_T).clone(),
+        _ => (*rffi::UINTPTR_T).clone(),
+    }
+}
+
+/// A Vec item buffer holds pointer-width items (`vec_item_malloc_word`).
+/// `get_array_descr` sizes items by `rffi.sizeof(ARRAY.OF)`.
+/// `lltype.Signed`/`Unsigned` are `target_signed_size` wide; when that
+/// is not the word, `ARRAY.OF` is `INTPTR_T`/`UINTPTR_T`.
 fn rust_vec_item_array(
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> crate::translator::rtyper::lltypesystem::lltype::Array {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     use crate::translator::rtyper::lltypesystem::rffi::CArray;
-    if matches!(item, LowLevelType::Ptr(p) if p._needsgc()) {
-        CArray(LowLevelType::Unsigned)
-    } else {
-        CArray(item.clone())
-    }
+    let of = match item {
+        LowLevelType::Ptr(p) if p._needsgc() => vec_word_item_lltype(false),
+        LowLevelType::Signed => vec_word_item_lltype(true),
+        LowLevelType::Unsigned => vec_word_item_lltype(false),
+        _ => item.clone(),
+    };
+    CArray(of)
 }
 
 fn rust_vec_item_array_type_id(
@@ -21867,7 +22039,7 @@ mod tests {
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
-    fn register_codeobject_origin() -> parking_lot::MutexGuard<'static, ()> {
+    fn register_codeobject_origin() -> crate::test_support::StructRegistryTestGuard {
         crate::test_support::register_struct_origins_serialized(std::collections::HashMap::from([
             ("CodeObject".to_string(), "bytecode".to_string()),
         ]))
@@ -23950,6 +24122,94 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "flavor-raw Pointer borrow must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `rewrite_op_getsubstruct` is raw-only (`jtransform.py` raises
+    /// `only supported for gckind=raw`). A GC owner's one-word Pointer
+    /// borrow is a value load; folding it into getsubstruct then aborting
+    /// because the owner is GC emits `abort/>i` into unique look-inside.
+    #[test]
+    fn gc_pointer_borrow_is_not_getsubstruct_abort() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "objectmodel::W_Root";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "w_class".into(),
+                    offset: word,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let field = FieldDescriptor::new("w_class", Some(owner.into()))
+            .with_taken_by_address(true)
+            .with_owner_declared_gc(Some(true));
+        assert_eq!(
+            wide_inline_borrow_offset(&field, Some(&cc)),
+            None,
+            "GC Pointer borrow is not rewrite_op_getsubstruct"
+        );
+
+        let mut graph = FunctionGraph::new("gc_pointer_borrow");
+        let obj =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, obj.clone());
+        let w_class = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: obj,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(w_class));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter().cloned())
+            .collect();
+        let aborted = ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. }));
+        assert!(
+            !aborted,
+            "GC Pointer borrow must not emit abort/>i; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_class"
+            )),
+            "GC Pointer borrow stays a value getfield; ops={ops:?}"
         );
     }
 
@@ -29987,7 +30247,7 @@ mod tests {
     /// `FieldRead`.  Tracking it would drop the op — the array is only
     /// materialised at an array access — and leave the consumer that
     /// wanted the address with an undefined operand.
-    /// `pyframe::FrameLocalsRoot::new` is the shape: it hands the slot
+    /// `pyframe::FrameLocalsRoot::register` is the shape: it hands the slot
     /// address to `try_gc_add_root`.
     #[test]
     fn address_of_a_vable_array_field_is_not_tracked() {
@@ -35773,6 +36033,11 @@ mod tests {
             jit_marker_key_from_target(&tuplehash_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
+        let sortkey_merge = CallTarget::method("jit_merge_point", Some("SortkeyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&sortkey_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
 
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
@@ -36062,7 +36327,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36230,7 +36495,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36335,7 +36600,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36561,7 +36826,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36786,7 +37051,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -36961,7 +37226,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37136,7 +37401,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37292,7 +37557,7 @@ mod tests {
                         "jit_merge_point",
                         Some("TupleHashJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![receiver, green.clone(), red.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -37959,6 +38224,7 @@ mod tests {
             jd.red_args_types,
             vec![majit_ir::Type::Ref, majit_ir::Type::Int],
         );
+        assert_eq!(jd.red_marker_positions, Some(vec![0, 1]));
     }
 
     #[test]
@@ -43140,6 +43406,146 @@ mod tests {
                 }
             )),
             "synthetic ctor must not remain, ops={ops:?}"
+        );
+    }
+
+    fn leftover_lltype_malloc_rewrite(
+        leaf: &str,
+        nargs: usize,
+    ) -> (
+        RewriteResult,
+        crate::flowspace::model::Variable,
+        &'static str,
+    ) {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        let owner = "core::alloc::layout::Layout";
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__pos_0".to_string(), "usize".to_string()),
+                ("__pos_1".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("leftover_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let mut arg_vars = Vec::new();
+        for _ in 0..nargs {
+            arg_vars.push(graph.alloc_value_var_with_type(ConcreteType::GcRef));
+        }
+        let target = CallTarget::function_path(["lltype", leaf]);
+        let result_ty = ValueType::Ref(Some(owner.to_string()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(arg_vars.clone()),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &arg_vars,
+            &result_ty,
+            "leftover_malloc",
+            &mut graph,
+        );
+        (rewritten, result_var, owner)
+    }
+
+    fn leftover_rewrite_is_empty_new(rewritten: &RewriteResult, owner: &str) -> bool {
+        match rewritten {
+            RewriteResult::Replace(ops) => matches!(
+                ops.as_slice(),
+                [SpaceOperation {
+                    kind: OpKind::New { owner: allocated },
+                    ..
+                }] if allocated == owner
+            ),
+            _ => false,
+        }
+    }
+
+    fn leftover_rewrite_is_residual(rewritten: &RewriteResult) -> bool {
+        match rewritten {
+            RewriteResult::Keep => true,
+            RewriteResult::Replace(ops) => ops
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::Call { .. } | OpKind::CallResidual { .. })),
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => false,
+        }
+    }
+
+    fn leftover_rewrite_detail(rewritten: &RewriteResult) -> String {
+        match rewritten {
+            RewriteResult::Replace(ops) => format!("{ops:?}"),
+            RewriteResult::Keep => "Keep".to_string(),
+            RewriteResult::Identity(_) => "Identity".to_string(),
+            RewriteResult::Constant(_) => "Constant".to_string(),
+        }
+    }
+
+    /// Leftover `malloc_typed(value)` keeps the native copy (`args[0]`),
+    /// matching main's unfused path (`Transformer.rewrite_op_malloc`).
+    #[test]
+    fn leftover_malloc_typed_initializer_stays_residual() {
+        let (rewritten, _, owner) = leftover_lltype_malloc_rewrite("malloc_typed", 1);
+        let detail = leftover_rewrite_detail(&rewritten);
+        assert!(
+            leftover_rewrite_is_residual(&rewritten),
+            "leftover malloc_typed(value) must stay residual, got {detail}"
+        );
+        assert!(
+            !leftover_rewrite_is_empty_new(&rewritten, &owner),
+            "leftover malloc_typed(value) must not become empty new, got {detail}"
+        );
+    }
+
+    /// `UnsupportedMallocFlags`: leftover `malloc_typed_young_nonmoving`
+    /// / `malloc_typed_stable` must not become a nursery `new`.
+    #[test]
+    fn leftover_malloc_typed_nonmoving_stays_residual() {
+        for leaf in ["malloc_typed_young_nonmoving", "malloc_typed_stable"] {
+            let (rewritten, _, owner) = leftover_lltype_malloc_rewrite(leaf, 1);
+            let detail = leftover_rewrite_detail(&rewritten);
+            assert!(
+                leftover_rewrite_is_residual(&rewritten),
+                "{leaf} leftover must stay residual, got {detail}"
+            );
+            assert!(
+                !leftover_rewrite_is_empty_new(&rewritten, &owner),
+                "{leaf} leftover must not become nursery new, got {detail}"
+            );
+        }
+    }
+
+    /// Empty-init moving leftover (`malloc_typed_managed`) is still
+    /// `rewrite_op_malloc` → `new`.
+    #[test]
+    fn leftover_empty_moving_malloc_still_lowers_to_new() {
+        let (rewritten, result_var, owner) =
+            leftover_lltype_malloc_rewrite("malloc_typed_managed", 0);
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!(
+                "empty-init moving leftover must lower to New, got {}",
+                leftover_rewrite_detail(&rewritten)
+            );
+        };
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [SpaceOperation {
+                    result: Some(result),
+                    kind: OpKind::New { owner: allocated },
+                }] if result == &result_var && allocated == owner
+            ),
+            "expected New of {owner}, ops={ops:?}"
         );
     }
 
@@ -49239,21 +49645,47 @@ mod tests {
     /// gives the raw `CArray` of that item.
     #[test]
     fn rust_vec_item_id_matches_raw_carray() {
-        use crate::codewriter::call::array_type_id_of_lltype;
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::codewriter::call::{array_item_size_of_lltype, array_type_id_of_lltype};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
         use crate::translator::rtyper::lltypesystem::rffi;
-        assert_eq!(
-            rust_vec_item_array_type_id(&LowLevelType::Signed),
-            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed)),
-        );
-        assert_eq!(
-            rust_vec_item_array_type_id(&LowLevelType::Unsigned),
-            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Unsigned)),
-        );
+        use majit_ir::rvec::VecItemKind;
+        let word = crate::layout::target_word_size();
+        let signed_bytes = match rffi::sizeof(&LowLevelType::Signed) {
+            Ok(crate::flowspace::model::ConstValue::Int(n)) if n > 0 => n as usize,
+            other => panic!("sizeof Signed: {other:?}"),
+        };
+        if signed_bytes == word {
+            assert_eq!(
+                rust_vec_item_array_type_id(&LowLevelType::Signed),
+                array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed)),
+            );
+            assert_eq!(
+                rust_vec_item_array_type_id(&LowLevelType::Unsigned),
+                array_type_id_of_lltype(&rffi::CArray(LowLevelType::Unsigned)),
+            );
+        }
         assert_eq!(
             rust_vec_item_array_type_id(&LowLevelType::Float),
             array_type_id_of_lltype(&rffi::CArray(LowLevelType::Float)),
         );
+        let item_w = VecItemKind::Int.size_align(word).0;
+        for item in [&LowLevelType::Signed, &LowLevelType::Unsigned, &*GCREF] {
+            let array = rust_vec_item_array(item);
+            assert_eq!(
+                rust_vec_item_array_type_id(item),
+                array_type_id_of_lltype(&array),
+            );
+            assert_eq!(array_item_size_of_lltype(&array.OF), Some(item_w));
+            let descr = crate::codewriter::call::CallControl::new().arraydescrof_array(&array);
+            let ad = descr
+                .as_array_descr()
+                .expect("arraydescrof_array must answer an ArrayDescr");
+            assert_eq!(ad.item_size(), item_w);
+            assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
+            assert_eq!(ad.base_size(), 0);
+            assert!(ad.len_descr().is_none());
+            assert!(!array_type_id_of_lltype(&array).contains("GcArray<i64>"));
+        }
     }
 
     /// The item descr of `list.getitem` / `list.setitem` is `arraydescrof`
@@ -49313,6 +49745,19 @@ mod tests {
             .expect("Unsigned item descr");
         assert_eq!(unsigned.item_size(), word);
         assert!(!unsigned.is_item_signed());
+        assert_eq!(
+            signed.item_size(),
+            VecItemKind::Int.size_align(word).0,
+            "Int item ARRAY.OF matches vec_item_malloc_word"
+        );
+        let ref_arr = rust_vec_item_array(&GCREF);
+        let ref_descr = cc.arraydescrof_array(&ref_arr);
+        let ref_ad = ref_descr.as_array_descr().expect("Ref item descr");
+        assert_eq!(
+            ref_ad.item_size(),
+            VecItemKind::Int.size_align(word).0,
+            "Ref item ARRAY.OF matches vec_item_malloc_word"
+        );
         assert_eq!(
             crate::codewriter::call::get_type_flag("isize", &std::collections::HashSet::new()).2,
             word,

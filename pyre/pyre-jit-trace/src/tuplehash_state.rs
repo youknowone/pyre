@@ -11,20 +11,53 @@
 //!   `len`, `acc`, `i`, and `obj`.
 //! * [`TupleHashJitState`] — `Meta = PyreMeta`, `Sym = TupleHashSym`, `Env = PyreEnv`.
 
-use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
-use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
+use std::sync::LazyLock;
 
+use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
+use majit_metainterp::{JitArgKind, JitCodeSym, JitDriverStaticData, JitState};
+
+use crate::jitcode_runtime::CompiledJitDriver;
 use crate::state::{PyreEnv, PyreMeta};
 use pyre_object::{PY_NULL, PyObjectRef};
 
 /// Registered main-jitcode key after `split_portal` copies the loop.
 pub const TUPLEHASH_PORTAL_KEY: &str = "builtins::tuple_hash_portal_portal";
 
+/// The driver's static data record, resolved once
+/// (`split_graph_and_record_jitdriver` / `jitdriver_sd`).
+pub fn tuple_hash_driver() -> &'static CompiledJitDriver {
+    static DRIVER: LazyLock<&'static CompiledJitDriver> = LazyLock::new(|| {
+        let driver = crate::jitcode_runtime::compiled_jit_driver_for_key(TUPLEHASH_PORTAL_KEY)
+            .unwrap_or_else(|| panic!("missing compiled JIT driver `{TUPLEHASH_PORTAL_KEY}`"));
+        assert_eq!(
+            driver.red_marker_positions.as_ref().map(Vec::len),
+            Some(4),
+            "tuple.hash red_marker_positions length"
+        );
+        driver
+    });
+    *DRIVER
+}
+
+/// Marker extras after the green: `hash_driver.jit_merge_point(w_type, w_tuple, len, acc, i)`.
+///
+/// The marker's explicit red operands are this port's declaration of which
+/// live variable is which. `jtransform.py` `autodetect_jit_markers_redvars`
+/// rewrites them; `warmspot.py` `make_args_specification` consumes that
+/// list. Seeders permute this declaration through `red_marker_positions`.
+pub const TUPLEHASH_MARKER_REDS: [(&'static str, Type); 4] = [
+    ("obj", Type::Ref),
+    ("len", Type::Int),
+    ("acc", Type::Int),
+    ("i", Type::Int),
+];
+
 /// jd3 symbolic state at the `hash_driver` merge point.
 ///
 /// `tupleobject.py` `_descr_hash_jitdriver` names the live set
-/// `reds='auto'`; autodetect records three Int reds then one Ref red
-/// (`len`, `acc`, `i`, `obj`) as `jd.red_args_types`.
+/// `reds='auto'`. Semantic fields stay `len`/`acc`/`i`/`obj`; flattened
+/// InputArg slots come from the rewritten merge-point list
+/// (`jtransform.py` `autodetect_jit_markers_redvars`).
 pub struct TupleHashSym {
     /// `jit_merge_point(w_type=...)` green.
     pub w_type: PyObjectRef,
@@ -57,24 +90,23 @@ impl JitCodeSym for TupleHashSym {
 
     fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
         // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`:
-        // the boxes held by the merge point's red registers, in `(I, R, F)`
-        // operand order (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
-        // `hash_driver` reds='auto' is `len`, `acc`, `i`, then `obj`.
-        match redboxes {
-            [
-                (len, Type::Int),
-                (acc, Type::Int),
-                (i, Type::Int),
-                (obj, Type::Ref),
-            ] => {
-                self.len = *len;
-                self.acc = *acc;
-                self.i = *i;
-                self.obj = *obj;
+        // the boxes held by the merge point's red registers, in rewritten
+        // list order (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
+        let recorded = tuple_hash_recorded_reds();
+        assert_eq!(
+            redboxes.len(),
+            recorded.len(),
+            "tuple.hash merge-point red count, got {redboxes:?}"
+        );
+        for ((name, ty), (op, got_ty)) in recorded.iter().zip(redboxes) {
+            assert_eq!(*got_ty, *ty, "tuple.hash red `{name}`");
+            match *name {
+                "len" => self.len = *op,
+                "acc" => self.acc = *op,
+                "i" => self.i = *op,
+                "obj" => self.obj = *op,
+                other => panic!("unknown tuple.hash marker red `{other}`"),
             }
-            other => panic!(
-                "tuple.hash merge-point reds are len, acc, i, obj in (I,I,I,R) order, got {other:?}"
-            ),
         }
     }
 
@@ -83,12 +115,7 @@ impl JitCodeSym for TupleHashSym {
         //   live_arg_boxes = greenboxes + redboxes
         //   live_arg_boxes += self.virtualizable_boxes
         //   live_arg_boxes.pop()
-        let mut boxes = vec![
-            (self.len, Type::Int),
-            (self.acc, Type::Int),
-            (self.i, Type::Int),
-            (self.obj, Type::Ref),
-        ];
+        let mut boxes = tuple_hash_recorded_boxes(self);
         let n = vable_boxes.len().saturating_sub(1);
         boxes.extend_from_slice(&vable_boxes[..n]);
         Some(boxes)
@@ -136,25 +163,118 @@ pub fn tuple_hash_resolved_cell_key(
     warm.resolve_cell_key_with_greenargs(hash, &greenargs, &TUPLE_HASH_GREEN_TYPES)
 }
 
-/// Reds in merge-point bank order (red I: `len`, `acc`, `i`; red R: `obj`).
-///
-/// Stack array so the merge-point tick never heap-allocates them.
-/// `warmstate.py maybe_compile_and_run` builds `execute_args` only when
-/// raising `EnterJitAssembler`.
-#[inline]
-pub fn tuple_hash_live_values(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [Value; 4] {
+fn tuple_hash_recorded_reds() -> Vec<(&'static str, Type)> {
+    crate::jitcode_runtime::compiled_reds(TUPLEHASH_PORTAL_KEY, &TUPLEHASH_MARKER_REDS)
+}
+
+fn tuple_hash_marker_values(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [Value; 4] {
     [
+        Value::Ref(GcRef(obj as usize)),
         Value::Int(len),
         Value::Int(acc),
         Value::Int(i),
-        Value::Ref(GcRef(obj as usize)),
     ]
 }
 
+fn tuple_hash_marker_boxes(sym: &TupleHashSym) -> [(OpRef, Type); 4] {
+    [
+        (sym.obj, TUPLEHASH_MARKER_REDS[0].1),
+        (sym.len, TUPLEHASH_MARKER_REDS[1].1),
+        (sym.acc, TUPLEHASH_MARKER_REDS[2].1),
+        (sym.i, TUPLEHASH_MARKER_REDS[3].1),
+    ]
+}
+
+fn tuple_hash_recorded_boxes(sym: &TupleHashSym) -> Vec<(OpRef, Type)> {
+    crate::jitcode_runtime::permute_marker_reds_on(
+        tuple_hash_driver(),
+        &tuple_hash_marker_boxes(sym),
+    )
+}
+
+fn tuple_hash_sym_from_recorded() -> TupleHashSym {
+    let mut len = None;
+    let mut acc = None;
+    let mut i = None;
+    let mut obj = None;
+    for (slot, (name, ty)) in tuple_hash_recorded_reds().into_iter().enumerate() {
+        let op = OpRef::input_arg_typed(slot as u32, ty);
+        match name {
+            "len" => len = Some(op),
+            "acc" => acc = Some(op),
+            "i" => i = Some(op),
+            "obj" => obj = Some(op),
+            other => panic!("unknown tuple.hash marker red `{other}`"),
+        }
+    }
+    TupleHashSym {
+        w_type: PY_NULL,
+        len: len.expect("tuple.hash marker red `len`"),
+        acc: acc.expect("tuple.hash marker red `acc`"),
+        i: i.expect("tuple.hash marker red `i`"),
+        obj: obj.expect("tuple.hash marker red `obj`"),
+    }
+}
+
+/// Reds in the rewritten merge-point order (`jtransform.py`
+/// `autodetect_jit_markers_redvars`). Call-site arguments stay
+/// `(len, acc, i, obj)`; `red_marker_positions` chooses slots.
+pub fn tuple_hash_live_values(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [Value; 4] {
+    let marker = tuple_hash_marker_values(len, acc, i, obj);
+    let mut out = [Value::Void; 4];
+    crate::jitcode_runtime::permute_marker_reds_into(tuple_hash_driver(), &marker, &mut out);
+    out
+}
+
 /// `llmodel.py execute_token` words for the same reds (`unspecialize_value`).
-#[inline]
 pub fn tuple_hash_raw_reds(len: i64, acc: i64, i: i64, obj: PyObjectRef) -> [i64; 4] {
-    [len, acc, i, obj as usize as i64]
+    // Marker-operand order matches `tuple_hash_marker_values`; each word is
+    // `red_value_word` of that Value.
+    let marker = [(obj as usize) as i64, len, acc, i];
+    let mut out = [0i64; 4];
+    crate::jitcode_runtime::permute_marker_reds_into(tuple_hash_driver(), &marker, &mut out);
+    out
+}
+
+/// Trace `red_args` in rewritten slot order: InputArg `slot` plus the
+/// matching raw word from [`tuple_hash_raw_reds`].
+pub fn tuple_hash_trace_red_args(
+    len: i64,
+    acc: i64,
+    i: i64,
+    obj: PyObjectRef,
+) -> Vec<(JitArgKind, OpRef, i64)> {
+    let raw = tuple_hash_raw_reds(len, acc, i, obj);
+    tuple_hash_recorded_reds()
+        .into_iter()
+        .enumerate()
+        .map(|(slot, (_, ty))| {
+            (
+                JitArgKind::from_type(ty).expect("tuple.hash red is I/R/F"),
+                OpRef::input_arg_typed(slot as u32, ty),
+                raw[slot],
+            )
+        })
+        .collect()
+}
+
+/// Retry `red_args` after `set_redboxes`: loop-carried OpRefs in recorded
+/// order, concrete words from `live`.
+pub fn tuple_hash_trace_red_args_from_sym(
+    sym: &TupleHashSym,
+    live: &[Value],
+) -> Vec<(JitArgKind, OpRef, i64)> {
+    tuple_hash_recorded_boxes(sym)
+        .into_iter()
+        .zip(live)
+        .map(|((op, ty), value)| {
+            (
+                JitArgKind::from_type(ty).expect("tuple.hash red is I/R/F"),
+                op,
+                crate::jitcode_runtime::red_value_word(value),
+            )
+        })
+        .collect()
 }
 
 impl TupleHashJitState {
@@ -162,15 +282,8 @@ impl TupleHashJitState {
     /// `tupleobject.py` `greens=['w_type'], reds='auto'`. The extracted
     /// body names `len`, `acc`, `i`, and `obj`.
     pub fn tuple_hash_driver_descriptor() -> JitDriverStaticData {
-        let mut sd = JitDriverStaticData::new(
-            vec![("w_type", Type::Ref)],
-            vec![
-                ("len", Type::Int),
-                ("acc", Type::Int),
-                ("i", Type::Int),
-                ("obj", Type::Ref),
-            ],
-        );
+        let mut sd =
+            JitDriverStaticData::new(vec![("w_type", Type::Ref)], tuple_hash_recorded_reds());
         // tupleobject.py hash_driver = jit.JitDriver(name='tuple.hash', ...)
         sd.name = "tuple.hash".into();
         // tupleobject.py `hash_driver` = reds='auto', only a
@@ -215,13 +328,7 @@ impl JitState for TupleHashJitState {
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym {
         let _ = (meta, header_pc);
-        TupleHashSym {
-            w_type: PY_NULL,
-            len: OpRef::input_arg_typed(0, Type::Int),
-            acc: OpRef::input_arg_typed(1, Type::Int),
-            i: OpRef::input_arg_typed(2, Type::Int),
-            obj: OpRef::input_arg_typed(3, Type::Ref),
-        }
+        tuple_hash_sym_from_recorded()
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
@@ -237,7 +344,10 @@ impl JitState for TupleHashJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        vec![sym.len, sym.acc, sym.i, sym.obj]
+        tuple_hash_recorded_boxes(sym)
+            .into_iter()
+            .map(|(op, _)| op)
+            .collect()
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -288,7 +398,7 @@ mod tests {
         assert_eq!(
             banks.red_i,
             vec![0, 1, 2],
-            "red I registers are len, acc, i"
+            "three red Int registers in rewritten list order"
         );
         assert_eq!(banks.red_r, vec![1], "red R register is obj");
 
@@ -387,36 +497,35 @@ mod tests {
         // `live_arg_boxes = greenboxes + redboxes`. The CloseLoop JUMP is
         // `collect_jump_args`, so `set_redboxes` must replace the portal
         // InputArgs with the loop-carried values the body just wrote.
-        let len = OpRef::input_arg_typed(0, Type::Int);
-        let acc0 = OpRef::input_arg_typed(1, Type::Int);
-        let i0 = OpRef::input_arg_typed(2, Type::Int);
-        let obj = OpRef::input_arg_typed(3, Type::Ref);
-        let mut sym = TupleHashSym {
-            w_type: PY_NULL,
-            len,
-            acc: acc0,
-            i: i0,
-            obj,
-        };
-        assert_eq!(
-            TupleHashJitState::collect_jump_args(&sym),
-            vec![len, acc0, i0, obj]
+        let mut sym = TupleHashJitState::create_sym(
+            &TupleHashJitState { w_type: PY_NULL }.build_meta(0, &PyreEnv),
+            0,
         );
+        let before = TupleHashJitState::collect_jump_args(&sym);
+        let recorded = tuple_hash_recorded_reds();
         let acc1 = OpRef::input_arg_typed(14, Type::Int);
         let i1 = OpRef::input_arg_typed(15, Type::Int);
-        JitCodeSym::set_redboxes(
-            &mut sym,
-            &[
-                (len, Type::Int),
-                (acc1, Type::Int),
-                (i1, Type::Int),
-                (obj, Type::Ref),
-            ],
-        );
-        assert_eq!(
-            TupleHashJitState::collect_jump_args(&sym),
-            vec![len, acc1, i1, obj]
-        );
+        let updated: Vec<(OpRef, Type)> = recorded
+            .iter()
+            .zip(&before)
+            .map(|((name, ty), op)| {
+                let next = match *name {
+                    "acc" => acc1,
+                    "i" => i1,
+                    _ => *op,
+                };
+                (next, *ty)
+            })
+            .collect();
+        JitCodeSym::set_redboxes(&mut sym, &updated);
+        let after = TupleHashJitState::collect_jump_args(&sym);
+        for ((name, old), new) in recorded.iter().zip(&before).zip(&after) {
+            match name.0 {
+                "acc" => assert_eq!(*new, acc1),
+                "i" => assert_eq!(*new, i1),
+                _ => assert_eq!(new, old),
+            }
+        }
     }
 
     #[test]
@@ -432,8 +541,24 @@ mod tests {
             .find(|op| op.opname == "jit_merge_point")
             .expect("jd3 portal body must contain a jit_merge_point");
         let banks = majit_metainterp::decode_jit_merge_point_banks(&canonical.code, merge.pc);
-        let acc_reg = banks.red_i[1] as u8;
-        let i_reg = banks.red_i[2] as u8;
+        let driver = crate::jitcode_runtime::compiled_jit_driver_for_key(TUPLEHASH_PORTAL_KEY)
+            .expect("jd3 compiled metadata");
+        let int_index = |marker_k: u32| {
+            let positions = driver.red_marker_positions.as_ref().unwrap_or_else(|| {
+                panic!("compiled JIT driver `{TUPLEHASH_PORTAL_KEY}` requires red_marker_positions")
+            });
+            let slot = positions
+                .iter()
+                .position(|&k| k == marker_k)
+                .unwrap_or_else(|| panic!("tuple.hash has no marker red {marker_k}"));
+            assert_eq!(driver.red_args_types[slot], Type::Int);
+            driver.red_args_types[..slot]
+                .iter()
+                .filter(|ty| **ty == Type::Int)
+                .count()
+        };
+        let acc_reg = banks.red_i[int_index(2)] as u8;
+        let i_reg = banks.red_i[int_index(3)] as u8;
         let back_edge = ops
             .iter()
             .find(|op| {

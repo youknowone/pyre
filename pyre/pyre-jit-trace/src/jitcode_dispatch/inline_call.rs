@@ -1758,11 +1758,10 @@ pub(crate) fn exception_string_override_straight_line(
 /// name.
 ///
 /// The scan follows `inline_call_*` into the callee bodies the descent would
-/// enter, because the abort propagates from any depth.  A body already on the
-/// scan stack is a cycle, and answers "executes an effect, names no blocker":
-/// the blockers behind the recursion belong to the occurrence that opened it,
-/// but reporting no effect there would let a blocker past the recursion read
-/// as effect-free, which is the one direction this scan may not err in.
+/// enter, because the abort propagates from any depth.  A cyclic component
+/// forces `may_execute_effect` on every internal edge (`cycle_stub`), the
+/// same conservatism a stack-occurrence stub used: reporting no effect there
+/// would let a blocker past the recursion read as effect-free.
 ///
 /// The answer names the blocker rather than merely reporting one, because a
 /// declined descent is a wall to be removed and the removal work is per
@@ -1771,11 +1770,10 @@ pub(crate) fn exception_string_override_straight_line(
 /// `jit_metadata.json` carries.
 ///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
-/// (body, entry argument-array length) rather than once per call site.  Only
-/// this entry point memoizes: the summary a cycle produces belongs to the
-/// occurrence that opened it, not to the body, so
-/// [`summarize_descent_blockers`] caches nothing, and a body entered with more
-/// than [`DESCENT_ENTRY_LEN_SLOTS`] arguments recomputes.
+/// (body, entry argument-array length) rather than once per call site.  A
+/// fact-free `OnceLock` is published only after that body's SCC is stable.
+/// A body entered with more than [`DESCENT_ENTRY_LEN_SLOTS`] arguments
+/// recomputes.
 fn descent_decline(
     jitcode_index: usize,
     entry_array_lengths: &[(usize, usize)],
@@ -1786,7 +1784,7 @@ fn descent_decline(
     let summary = match entry_array_lengths {
         [] => descent_blocker_summary(jitcode_index),
         &[(0, entry_len)] => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
-        other => summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), other),
+        other => summarize_descent_blockers_with_entry(jitcode_index, other),
     };
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
@@ -1839,6 +1837,12 @@ pub(crate) fn helper_resume_reaches_blocker(
         let mut call_effect_free = |index| residual_call_is_effect_free_in(payload_descrs, index);
         let mut switch_targets = |index| switch_descr_targets_in(payload_descrs, index);
         let mut callee_fnaddr = |index| jitcode_fnaddr_for_descr_in(payload_descrs, index);
+        // Same `analysis` object and `EntryMode::FactFree` as the former
+        // pre-solve of every `inline_call_*`: a recursive helper cycle is
+        // still one SCC. Solve runs the first time this body's dataflow
+        // asks, so a callee no reachable op names is not scanned.
+        let mut analysis = DescentSummaryAnalysis::new(&[]);
+        let mut scratch = DescentScanScratch::default();
         let summary = summarize_body_blockers_from(
             Some(pc),
             jitcode.code.as_slice(),
@@ -1859,7 +1863,7 @@ pub(crate) fn helper_resume_reaches_blocker(
                                 ..DescentBlockerSummary::default()
                             }
                         } else {
-                            descent_blocker_summary(callee_index)
+                            analysis.solve(callee_index, EntryMode::FactFree)
                         }
                     })
             },
@@ -1869,14 +1873,19 @@ pub(crate) fn helper_resume_reaches_blocker(
             &entry_array_lengths,
             &mut callee_fnaddr,
             descr_refs,
+            &mut scratch,
         );
         summary.body_not_walked
             || summary.blocker_effect_free.is_some()
             || summary.blocker_after_effect.is_some()
     };
-    // Only the entry without argument-array facts is memoized per pc; a
-    // gateway's answer depends on the call site's argument count.
-    if entry_array_len.is_some() {
+    // A gateway's answer depends on the call site's argument count, so the
+    // no-facts per-pc cell is not that memo. Lengths that fit
+    // `DESCENT_ENTRY_LEN_SLOTS` share the body's derived slots.
+    if let Some(entry_len) = entry_array_len {
+        if let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) {
+            return jc.descent_resume_blocker_for_entry_len(pc, entry_len, scan);
+        }
         return scan();
     }
     let memo = pjc.helper_resume_blockers.get_or_init(|| {
@@ -1891,7 +1900,8 @@ pub(crate) fn helper_resume_reaches_blocker(
 }
 
 /// Why a descent into a body is refused.
-enum DescentDecline {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already
     /// executed, named by the symbolic hash standing in for its funcbox.
     Helper(i64),
@@ -2193,7 +2203,7 @@ fn descent_blocker_summary_for_entry_len(
         return body_not_walked();
     };
     jitcode.descent_blocker_summary_for_entry_len(entry_len, || {
-        summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), &[(0, entry_len)])
+        summarize_descent_blockers_with_entry(jitcode_index, &[(0, entry_len)])
     })
 }
 
@@ -2206,7 +2216,104 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
         // `summarize_descent_blockers`.
         return body_not_walked();
     };
-    jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
+    jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index))
+}
+
+/// Known GC-array lengths of Ref-bank slots. Only `Some` entries are stored;
+/// a missing slot is `None`. Join keeps a length only when both paths agree.
+#[derive(Clone, Default)]
+struct KnownArrayLens {
+    entries: Vec<(u8, usize)>,
+}
+
+impl KnownArrayLens {
+    fn get(&self, slot: usize) -> Option<usize> {
+        if slot >= FRESH_SLOTS {
+            return None;
+        }
+        let slot = slot as u8;
+        self.entries
+            .iter()
+            .find(|&&(s, _)| s == slot)
+            .map(|&(_, len)| len)
+    }
+
+    fn set(&mut self, slot: usize, value: Option<usize>) {
+        if slot >= FRESH_SLOTS {
+            return;
+        }
+        let slot = slot as u8;
+        match (self.entries.iter().position(|&(s, _)| s == slot), value) {
+            (Some(i), Some(len)) => self.entries[i].1 = len,
+            (Some(i), None) => {
+                self.entries.remove(i);
+            }
+            (None, Some(len)) => {
+                let i = self.entries.partition_point(|&(s, _)| s < slot);
+                self.entries.insert(i, (slot, len));
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn seed(&mut self, lengths: &[(usize, usize)]) {
+        self.entries.clear();
+        for &(slot, len) in lengths {
+            self.set(slot, Some(len));
+        }
+    }
+
+    /// Keep only lengths that `other` also holds. True when a `Some` was lost.
+    fn meet(&mut self, other: &Self) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|&(slot, len)| other.get(slot as usize) == Some(len));
+        self.entries.len() != before
+    }
+}
+
+/// Ref-bank slots that hold an object this body allocated, as a 256-bit set.
+#[derive(Clone, Copy, Default)]
+struct FreshRegs {
+    bits: [u64; 4],
+}
+
+impl FreshRegs {
+    fn get(self, slot: usize) -> bool {
+        let word = slot / 64;
+        let bit = slot % 64;
+        self.bits.get(word).is_some_and(|w| w & (1u64 << bit) != 0)
+    }
+
+    fn set(&mut self, slot: usize, value: bool) {
+        let word = slot / 64;
+        let bit = slot % 64;
+        let Some(w) = self.bits.get_mut(word) else {
+            return;
+        };
+        if value {
+            *w |= 1u64 << bit;
+        } else {
+            *w &= !(1u64 << bit);
+        }
+    }
+
+    /// Intersection: a slot stays fresh only on every path. True when a bit fell.
+    fn meet(&mut self, other: &Self) -> bool {
+        let mut widened = false;
+        for (slot, &incoming) in self.bits.iter_mut().zip(&other.bits) {
+            let joined = *slot & incoming;
+            if joined != *slot {
+                *slot = joined;
+                widened = true;
+            }
+        }
+        widened
+    }
 }
 
 /// One reachable point of [`summarize_descent_blockers`]'s dataflow.
@@ -2215,7 +2322,7 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
 /// false to true, disagreeing known-value slots go to `None`, freshness goes
 /// true to false, and `may_symbolic_i` goes false to true — so the worklist
 /// converges.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct DescentPoint {
     /// Whether some path to here passed the resume point a resume scan asks
     /// about; always set for a scan without one.
@@ -2230,17 +2337,51 @@ struct DescentPoint {
     /// `__majit_wrap_*` gateways receive their concrete argument-array length
     /// from the call site; copies preserve it and any other Ref producer drops
     /// it back to unknown.
-    known_array_len_r: Vec<Option<usize>>,
+    known_array_len_r: KnownArrayLens,
     /// Which Ref-bank slots hold an object this body itself allocated (a
     /// `new*` result) on every path to here.  A write into such an object is
     /// not an effect: a rewind discards the allocation with it.
-    fresh_r: Vec<bool>,
+    fresh_r: FreshRegs,
     /// Whether a symbolic fnaddr constant (`is_symbolic_fnaddr`) may reach
     /// each Int-bank slot. Union at joins; set when a symbolic constant is
     /// moved or loaded into the slot; cleared when the slot is overwritten
     /// by a non-symbolic value or op result. A runtime-only unknown is
     /// false: `ResumeDataDirectReader.consume_one_section` restores it.
     may_symbolic_i: Vec<bool>,
+}
+
+impl DescentPoint {
+    /// Merge `incoming` into `self`. True when the lattice grew.
+    fn join_from(&mut self, incoming: &Self) -> bool {
+        let mut widened = false;
+        if incoming.resumed && !self.resumed {
+            self.resumed = true;
+            widened = true;
+        }
+        if incoming.effect && !self.effect {
+            self.effect = true;
+            widened = true;
+        }
+        for (slot, incoming_slot) in self.known_i.iter_mut().zip(&incoming.known_i) {
+            if *slot != *incoming_slot && slot.is_some() {
+                *slot = None;
+                widened = true;
+            }
+        }
+        if self.known_array_len_r.meet(&incoming.known_array_len_r) {
+            widened = true;
+        }
+        if self.fresh_r.meet(&incoming.fresh_r) {
+            widened = true;
+        }
+        for (slot, incoming_slot) in self.may_symbolic_i.iter_mut().zip(&incoming.may_symbolic_i) {
+            if !*slot && *incoming_slot {
+                *slot = true;
+                widened = true;
+            }
+        }
+        widened
+    }
 }
 
 /// True when a funcbox constant names a residual
@@ -2321,7 +2462,7 @@ const FRESH_SLOTS: usize = 256;
 fn heap_write_into_fresh_object(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
-    fresh_r: &[bool],
+    fresh_r: FreshRegs,
 ) -> bool {
     (op.opname.starts_with("setfield_gc")
         || op.opname.starts_with("setarrayitem_gc")
@@ -2329,7 +2470,7 @@ fn heap_write_into_fresh_object(
         && op.argcodes.starts_with('r')
         && code
             .get(op.pc + 1)
-            .is_some_and(|&obj| fresh_r.get(obj as usize).copied().unwrap_or(false))
+            .is_some_and(|&obj| fresh_r.get(obj as usize))
 }
 
 /// The descr-pool index an op's first `d` operand names, read past the
@@ -2533,17 +2674,13 @@ fn inline_call_ref_varlist<'a>(
 fn identity_trampoline_entry_array_length(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
-    known_array_len_r: &[Option<usize>],
+    known_array_len_r: &KnownArrayLens,
 ) -> Option<(usize, usize)> {
     let regs = inline_call_ref_varlist(code, op)?;
     if !matches!(regs, [0]) {
         return None;
     }
-    known_array_len_r
-        .first()
-        .copied()
-        .flatten()
-        .map(|len| (0, len))
+    known_array_len_r.get(0).map(|len| (0, len))
 }
 
 /// Whether `info` is the static form of a residual the walk would not have
@@ -2605,6 +2742,32 @@ fn residual_call_is_effect_free_in(
     extra_info_is_rewindable_allocation(call.get_extra_info())
 }
 
+/// Whether a residual is identity-elidable for [`DescentSummaryAnalysis`].
+///
+/// [`extra_info_is_rewindable_allocation`] also spares `CanRaise` with a
+/// known-empty write set (the allocation shape). Writeanalyze reports that
+/// same empty set for a `dont_look_inside` helper whose body it never saw,
+/// so the walk odometer and a scan that used that predicate would miss an
+/// effect the helper still performs. Elidable extraeffects are blanked by
+/// `EffectInfo.__new__`; those are the residuals this scan may spare.
+/// [`effect_free_residual_fnaddr`] still spares root-bracket helpers by
+/// address, independently of the descr.
+fn residual_call_is_elidable(descr_index: usize) -> bool {
+    let Some(descr) = helper_resume_descr_at(None, descr_index) else {
+        return false;
+    };
+    let Some(call) = descr.as_call_descr() else {
+        return false;
+    };
+    matches!(
+        call.get_extra_info().extraeffect,
+        majit_ir::ExtraEffect::ElidableCannotRaise
+            | majit_ir::ExtraEffect::ElidableCanRaise
+            | majit_ir::ExtraEffect::ElidableOrMemoryError
+            | majit_ir::ExtraEffect::LoopInvariant
+    )
+}
+
 /// The arm targets of the `switch/id` whose descr is `descr_index`, in key
 /// order, or `None` when the descr is not a switch table or a listed key
 /// does not resolve to a target.
@@ -2655,7 +2818,7 @@ fn known_int_result(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
     known_i: &[Option<i64>],
-    known_array_len_r: &[Option<usize>],
+    known_array_len_r: &KnownArrayLens,
 ) -> Option<i64> {
     let int = |offset: usize| {
         code.get(op.pc + 1 + offset)
@@ -2673,8 +2836,6 @@ fn known_int_result(
         "arraylen_gc/rd>i" => code
             .get(op.pc + 1)
             .and_then(|&slot| known_array_len_r.get(slot as usize))
-            .copied()
-            .flatten()
             .and_then(|value| i64::try_from(value).ok()),
         "int_copy/i>i" => int(0),
         "int_copy/c>i" => immediate(0),
@@ -2747,47 +2908,10 @@ fn known_goto_if_taken(
     Some(!predicate)
 }
 
-/// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
-/// jitcode indices currently being scanned.
-fn summarize_descent_blockers(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-) -> DescentBlockerSummary {
-    let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_hits)
-}
-
-/// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
-/// when the answer belongs to that body.
-///
-/// A callee is scanned with no entry facts, so what it computes is the same
-/// fact-free summary [`descent_blocker_summary`] holds — except under a cycle,
-/// where a body already on the stack answers "executes an effect, names no
-/// blocker" for the occurrence that opened the cycle rather than for the body.
-/// A subtree that took that arm nowhere did not read the stack at all and its
-/// answer is a property of the body alone.  Without the memo a callee shared by
-/// several paths is re-walked once per path, and the walk is transitive, so the
-/// scan a single gateway pays grows with the shape of the graph beneath it.
-fn summarize_descent_blockers_cached(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-    cycle_hits: &mut u64,
-) -> DescentBlockerSummary {
-    if seen.contains(&jitcode_index) {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    }
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    };
-    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
-        return cached;
-    }
-    let cycles_before = *cycle_hits;
-    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    if *cycle_hits == cycles_before {
-        jitcode.descent_blocker_summary(|| summary);
-    }
-    summary
+/// Worker of [`descent_blocker_summary`]: one fact-free analysis rooted at
+/// `jitcode_index`.
+fn summarize_descent_blockers(jitcode_index: usize) -> DescentBlockerSummary {
+    DescentSummaryAnalysis::new(&[]).solve(jitcode_index, EntryMode::FactFree)
 }
 
 /// [`summarize_descent_blockers`] with concrete facts known at the entry of
@@ -2796,80 +2920,701 @@ fn summarize_descent_blockers_cached(
 /// other callee keeps the fact-free summary.
 fn summarize_descent_blockers_with_entry(
     jitcode_index: usize,
-    seen: &mut Vec<usize>,
     entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
-    // This memoization fence belongs to this analysis stack, not to the
-    // executing thread. Every recursive callee shares it; an independent
-    // analysis (including a reentrant one) must not change its value.
-    let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(
-        jitcode_index,
-        seen,
-        entry_array_lengths,
-        &mut cycle_hits,
-    )
+    let mut analysis = DescentSummaryAnalysis::new(entry_array_lengths);
+    let mode = if entry_array_lengths.is_empty() {
+        EntryMode::FactFree
+    } else {
+        EntryMode::RootFacts
+    };
+    analysis.solve(jitcode_index, mode)
 }
 
-fn summarize_descent_blockers_with_entry_inner(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-    entry_array_lengths: &[(usize, usize)],
-    cycle_hits: &mut u64,
-) -> DescentBlockerSummary {
-    if seen.contains(&jitcode_index) {
-        *cycle_hits += 1;
-        return DescentBlockerSummary {
-            may_execute_effect: true,
-            ..DescentBlockerSummary::default()
-        };
+/// The cycle-edge answer: effectful, names no blocker.
+///
+/// `GraphAnalyzer.analyze_direct_call` / `DependencyTracker` join a recursive
+/// call rather than storing a stub-dependent body answer. Internal SCC edges
+/// keep this conservatism so a blocker past the recursion cannot read as
+/// effect-free.
+fn cycle_stub() -> DescentBlockerSummary {
+    DescentBlockerSummary {
+        may_execute_effect: true,
+        ..DescentBlockerSummary::default()
     }
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        // A body the scan cannot obtain is a callee it holds nothing about, so
-        // it answers the same way as an `inline_call` whose descr names no
-        // JitCode.  Returning the default instead would say "executes no
-        // effect, holds no blocker" — the most permissive answer there is,
-        // reached by not looking — and would also let the blocker behind such a
-        // call read as effect-free, which asserts a rewind covers it.
-        //
-        // Unreachable in a consistent build, and not for the reason the entry
-        // point's own lookup suggests: `descent_blocker_summary` resolves the
-        // index before calling here, so at the top level this repeats a lookup
-        // that just succeeded and only the `inline_call` descent can arrive
-        // with an index of its own.  `get_jitcode_ref_by_index` answers `None`
-        // only past the end of the table — inside it, the cell is loaded on
-        // demand — and every `JitCode` descr names an index inside it: 2335 of
-        // 2335 in this build, over a table of 2905 whose indices are dense.
-        return body_not_walked();
-    };
-    seen.push(jitcode_index);
-    let descrs = crate::jitcode_runtime::descr_ref_table();
-    let summary = summarize_body_blockers_with(
-        jitcode.code.as_slice(),
-        jitcode.num_regs_i(),
-        jitcode.constants_i.as_slice(),
-        |descr_index, _caller_effect, entry_lens| {
-            let callee = descrs
-                .at(descr_index)
-                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
-            match entry_lens {
-                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
-                // Nested identity-trampoline facts stay on this `seen` path.
-                // The entry-length OnceLock starts an empty `seen`, so an
-                // A → B → A trampoline would reenter A's in-progress slot.
-                other => Some(summarize_descent_blockers_with_entry_inner(
-                    callee, seen, other, cycle_hits,
-                )),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryMode {
+    FactFree,
+    RootFacts,
+    ForwardedR0,
+}
+
+impl EntryMode {
+    fn lane(self) -> usize {
+        match self {
+            Self::FactFree => 0,
+            Self::RootFacts => 1,
+            Self::ForwardedR0 => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DescentSummaryKey {
+    jitcode_index: usize,
+    entry_mode: EntryMode,
+}
+
+struct DescentSummaryNode {
+    key: DescentSummaryKey,
+    callees: Vec<usize>,
+    /// Body descr pool, looked up once when the node is interned.
+    descr_refs: &'static [DescrRef],
+}
+
+/// Reused per-body scan tables. Owned by [`DescentSummaryAnalysis`] so a
+/// descent of hundreds of nodes does not allocate a fresh point table, worklist,
+/// or decode list on every body.
+#[derive(Default)]
+struct DescentScanScratch {
+    starts: Vec<usize>,
+    ops: Vec<DecodedOp>,
+    folded: Vec<bool>,
+    pc_to_start: Vec<u32>,
+    points: Vec<DescentPoint>,
+    point_gen: Vec<u32>,
+    generation: u32,
+    work: std::collections::VecDeque<usize>,
+    working: DescentPoint,
+    handler: DescentPoint,
+    queued: Vec<bool>,
+}
+
+impl DescentScanScratch {
+    fn next_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.point_gen.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn begin_body(&mut self, code_len: usize) {
+        self.next_generation();
+        self.starts.clear();
+        self.ops.clear();
+        self.folded.clear();
+        self.work.clear();
+        if self.pc_to_start.len() < code_len {
+            self.pc_to_start.resize(code_len, 0);
+        } else {
+            self.pc_to_start[..code_len].fill(0);
+        }
+    }
+
+    fn ensure_point_len(&mut self, n: usize) {
+        if self.points.len() < n {
+            self.points.resize_with(n, DescentPoint::default);
+            self.point_gen.resize(n, 0);
+        }
+    }
+
+    fn start_index(&self, pc: usize) -> Option<usize> {
+        self.pc_to_start
+            .get(pc)
+            .copied()
+            .filter(|&v| v != 0)
+            .map(|v| (v - 1) as usize)
+    }
+
+    fn push_point(&mut self, target_pc: usize, state: &DescentPoint) {
+        let Some(idx) = self.start_index(target_pc) else {
+            return;
+        };
+        if self.point_gen[idx] != self.generation {
+            self.point_gen[idx] = self.generation;
+            self.points[idx].clone_from(state);
+            self.work.push_back(idx);
+        } else if self.points[idx].join_from(state) {
+            self.work.push_back(idx);
+        }
+    }
+
+    fn push_handler(&mut self, target_pc: usize, resumed: bool) {
+        self.handler.resumed = resumed;
+        self.handler.effect = true;
+        let Some(idx) = self.start_index(target_pc) else {
+            return;
+        };
+        if self.point_gen[idx] != self.generation {
+            self.point_gen[idx] = self.generation;
+            self.points[idx].clone_from(&self.handler);
+            self.work.push_back(idx);
+        } else if self.points[idx].join_from(&self.handler) {
+            self.work.push_back(idx);
+        }
+    }
+
+    fn point_reached(&self, pc: usize) -> bool {
+        self.start_index(pc)
+            .is_some_and(|idx| self.point_gen.get(idx) == Some(&self.generation))
+    }
+}
+
+/// One body's bytes for a test-only analysis (`descr` = callee body index).
+#[cfg(test)]
+pub(crate) struct TestSummaryBody {
+    pub code: Vec<u8>,
+    pub num_regs_i: usize,
+    pub constants_i: Vec<i64>,
+}
+
+/// Per-analysis reachable-state graph plus monotone SCC fixpoint.
+///
+/// `discover_stack_effects` is the same least-consistent-assignment shape:
+/// FIFO caller requeue on lattice growth. `GraphAnalyzer.analyze_direct_call`
+/// joins callee results; `DependencyTracker` merges cyclic call dependencies.
+pub(crate) struct DescentSummaryAnalysis {
+    root_entry_array_lengths: Vec<(usize, usize)>,
+    forwarded_r0: Option<(usize, usize)>,
+    nodes: Vec<DescentSummaryNode>,
+    summaries: Vec<DescentBlockerSummary>,
+    node_by_jitcode: Vec<[Option<usize>; 3]>,
+    callers: Vec<Vec<usize>>,
+    discovered: Vec<bool>,
+    solved: Vec<bool>,
+    scratch: DescentScanScratch,
+    #[cfg(test)]
+    test_bodies: Option<Vec<TestSummaryBody>>,
+    #[cfg(test)]
+    discover_scans: usize,
+    #[cfg(test)]
+    solve_scans: usize,
+    #[cfg(test)]
+    solve_scans_by_node: Vec<usize>,
+}
+
+impl DescentSummaryAnalysis {
+    fn new(root_facts: &[(usize, usize)]) -> Self {
+        Self {
+            root_entry_array_lengths: root_facts.to_vec(),
+            forwarded_r0: root_facts.iter().copied().find(|&(slot, _)| slot == 0),
+            nodes: Vec::new(),
+            summaries: Vec::new(),
+            node_by_jitcode: Vec::new(),
+            callers: Vec::new(),
+            discovered: Vec::new(),
+            solved: Vec::new(),
+            scratch: DescentScanScratch::default(),
+            #[cfg(test)]
+            test_bodies: None,
+            #[cfg(test)]
+            discover_scans: 0,
+            #[cfg(test)]
+            solve_scans: 0,
+            #[cfg(test)]
+            solve_scans_by_node: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_bodies(
+        root_facts: &[(usize, usize)],
+        bodies: Vec<TestSummaryBody>,
+    ) -> Self {
+        let mut analysis = Self::new(root_facts);
+        analysis.test_bodies = Some(bodies);
+        analysis
+    }
+
+    fn canonicalize(&self, mode: EntryMode) -> EntryMode {
+        let mode = match mode {
+            EntryMode::ForwardedR0 if self.forwarded_is_exactly_root() => EntryMode::RootFacts,
+            other => other,
+        };
+        match mode {
+            EntryMode::RootFacts if self.root_entry_array_lengths.is_empty() => EntryMode::FactFree,
+            EntryMode::ForwardedR0 if self.forwarded_r0.is_none() => EntryMode::FactFree,
+            other => other,
+        }
+    }
+
+    fn forwarded_is_exactly_root(&self) -> bool {
+        match self.forwarded_r0 {
+            Some(pair) => self.root_entry_array_lengths.as_slice() == [pair],
+            None => self.root_entry_array_lengths.is_empty(),
+        }
+    }
+
+    fn canonical_forwarded_mode(&self) -> EntryMode {
+        self.canonicalize(EntryMode::ForwardedR0)
+    }
+
+    fn mode_for(&self, entry_lens: &[(usize, usize)]) -> EntryMode {
+        let mode = match entry_lens {
+            [] => EntryMode::FactFree,
+            other if other == self.root_entry_array_lengths.as_slice() => EntryMode::RootFacts,
+            [(0, len)] if Some((0, *len)) == self.forwarded_r0 => self.canonical_forwarded_mode(),
+            _ => unreachable!("the body scanner only forwards the exact r0 fact"),
+        };
+        self.canonicalize(mode)
+    }
+
+    fn entry_lens(&self, mode: EntryMode) -> &[(usize, usize)] {
+        match self.canonicalize(mode) {
+            EntryMode::FactFree => &[],
+            EntryMode::RootFacts => self.root_entry_array_lengths.as_slice(),
+            EntryMode::ForwardedR0 => match self.forwarded_r0.as_ref() {
+                Some(pair) => std::slice::from_ref(pair),
+                None => &[],
+            },
+        }
+    }
+
+    fn uses_test_bodies(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_bodies.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn cached_fact_free(&self, jitcode_index: usize) -> Option<DescentBlockerSummary> {
+        if self.uses_test_bodies() {
+            return None;
+        }
+        crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)
+            .and_then(|jc| jc.descent_blocker_summary_if_computed())
+    }
+
+    fn body_parts(&self, jitcode_index: usize) -> Option<(&[u8], usize, &[i64])> {
+        #[cfg(test)]
+        if let Some(bodies) = &self.test_bodies {
+            return bodies.get(jitcode_index).map(|body| {
+                (
+                    body.code.as_slice(),
+                    body.num_regs_i,
+                    body.constants_i.as_slice(),
+                )
+            });
+        }
+        let jc = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)?;
+        Some((
+            jc.code.as_slice(),
+            jc.num_regs_i(),
+            jc.constants_i.as_slice(),
+        ))
+    }
+
+    fn resolve_callee(&self, descr_index: usize) -> Option<usize> {
+        #[cfg(test)]
+        if let Some(bodies) = &self.test_bodies {
+            return (descr_index < bodies.len()).then_some(descr_index);
+        }
+        crate::jitcode_runtime::descr_ref_table()
+            .at(descr_index)
+            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+    }
+
+    fn intern(&mut self, jitcode_index: usize, mode: EntryMode) -> usize {
+        let mode = self.canonicalize(mode);
+        if self.node_by_jitcode.len() <= jitcode_index {
+            self.node_by_jitcode.resize(jitcode_index + 1, [None; 3]);
+        }
+        if let Some(idx) = self.node_by_jitcode[jitcode_index][mode.lane()] {
+            return idx;
+        }
+        let idx = self.nodes.len();
+        self.node_by_jitcode[jitcode_index][mode.lane()] = Some(idx);
+        let descr_refs = if self.uses_test_bodies() {
+            &[]
+        } else {
+            descr_refs_for_jitcode_index(jitcode_index)
+        };
+        self.nodes.push(DescentSummaryNode {
+            key: DescentSummaryKey {
+                jitcode_index,
+                entry_mode: mode,
+            },
+            callees: Vec::new(),
+            descr_refs,
+        });
+        self.summaries.push(DescentBlockerSummary::default());
+        self.callers.push(Vec::new());
+        self.discovered.push(false);
+        self.solved.push(false);
+        #[cfg(test)]
+        self.solve_scans_by_node.push(0);
+        idx
+    }
+
+    fn add_edge(&mut self, from: usize, to: usize) {
+        if !self.nodes[from].callees.contains(&to) {
+            self.nodes[from].callees.push(to);
+            self.callers[to].push(from);
+        }
+    }
+
+    fn discover_from(&mut self, root: usize, scratch: &mut DescentScanScratch) {
+        let mut work = vec![root];
+        while let Some(node) = work.pop() {
+            if self.discovered[node] {
+                continue;
             }
-        },
-        &mut |_blocker, _effect| true,
-        &mut residual_call_is_effect_free,
-        &mut switch_descr_targets,
-        entry_array_lengths,
-        descr_refs_for_jitcode_index(jitcode_index),
-    );
-    seen.pop();
-    summary
+            self.scan_for_edges(node, scratch);
+            let start = work.len();
+            work.extend(
+                self.nodes[node]
+                    .callees
+                    .iter()
+                    .copied()
+                    .filter(|&callee| !self.discovered[callee]),
+            );
+            work[start..].reverse();
+        }
+    }
+
+    fn scan_for_edges(&mut self, node: usize, scratch: &mut DescentScanScratch) {
+        self.discovered[node] = true;
+        let mut pending = Vec::new();
+        if !self.collect_callee_edges(node, &mut pending, scratch) {
+            self.summaries[node] = body_not_walked();
+            self.solved[node] = true;
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.discover_scans += 1;
+        }
+        for (callee, mode) in pending {
+            let to = self.intern(callee, mode);
+            self.add_edge(node, to);
+        }
+    }
+
+    /// Record each uncached callee of `node` in first-visit order. Intern and
+    /// `add_edge` run after this returns so `body_parts` can borrow `self`.
+    fn collect_callee_edges(
+        &self,
+        node: usize,
+        pending: &mut Vec<(usize, EntryMode)>,
+        scratch: &mut DescentScanScratch,
+    ) -> bool {
+        let key = self.nodes[node].key;
+        let descr_refs = self.nodes[node].descr_refs;
+        let Some((code, num_regs_i, constants_i)) = self.body_parts(key.jitcode_index) else {
+            return false;
+        };
+        let entry_lens = self.entry_lens(key.entry_mode);
+        let test = self.uses_test_bodies();
+        let mut call_effect_free = |index| {
+            if test {
+                false
+            } else {
+                residual_call_is_effect_free(index)
+            }
+        };
+        let mut switch_targets = |index| {
+            if test {
+                None
+            } else {
+                switch_descr_targets(index)
+            }
+        };
+        // Edges are recorded in the callee callback; the stub walk is discarded.
+        summarize_body_blockers_from(
+            None,
+            code,
+            num_regs_i,
+            constants_i,
+            |descr_index, _caller_effect, entry_lens| {
+                let callee = self.resolve_callee(descr_index)?;
+                let mode = self.mode_for(entry_lens);
+                if mode == EntryMode::FactFree {
+                    if let Some(cached) = self.cached_fact_free(callee) {
+                        return Some(cached);
+                    }
+                }
+                pending.push((callee, mode));
+                Some(cycle_stub())
+            },
+            &mut |_blocker, _effect| true,
+            &mut call_effect_free,
+            &mut switch_targets,
+            entry_lens,
+            &mut jitcode_fnaddr_for_descr,
+            descr_refs,
+            scratch,
+        );
+        true
+    }
+
+    fn components(&self) -> Vec<Vec<usize>> {
+        let n = self.nodes.len();
+        let mut dfs_index: Vec<Option<usize>> = vec![None; n];
+        let mut lowlink = vec![0usize; n];
+        let mut on_stack = vec![false; n];
+        let mut stack = Vec::new();
+        let mut frames: Vec<(usize, usize)> = Vec::new();
+        let mut next = 0usize;
+        let mut comps = Vec::new();
+        for start in 0..n {
+            if dfs_index[start].is_some() {
+                continue;
+            }
+            dfs_index[start] = Some(next);
+            lowlink[start] = next;
+            next += 1;
+            stack.push(start);
+            on_stack[start] = true;
+            frames.push((start, 0));
+            while let Some(&(v, edge_i)) = frames.last() {
+                if edge_i < self.nodes[v].callees.len() {
+                    let w = self.nodes[v].callees[edge_i];
+                    frames.last_mut().unwrap().1 = edge_i + 1;
+                    if dfs_index[w].is_none() {
+                        dfs_index[w] = Some(next);
+                        lowlink[w] = next;
+                        next += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        frames.push((w, 0));
+                    } else if on_stack[w] {
+                        lowlink[v] = lowlink[v].min(dfs_index[w].unwrap());
+                    }
+                } else {
+                    frames.pop();
+                    if lowlink[v] == dfs_index[v].unwrap() {
+                        let mut comp = Vec::new();
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack[w] = false;
+                            comp.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        comps.push(comp);
+                    }
+                    if let Some(&(p, _)) = frames.last() {
+                        lowlink[p] = lowlink[p].min(lowlink[v]);
+                    }
+                }
+            }
+        }
+        comps
+    }
+
+    fn scan_body(
+        &mut self,
+        node: usize,
+        component: &[usize],
+        stub_internal: bool,
+        scratch: &mut DescentScanScratch,
+    ) -> DescentBlockerSummary {
+        #[cfg(test)]
+        {
+            self.solve_scans += 1;
+            self.solve_scans_by_node[node] += 1;
+        }
+        self.scan_body_at(node, component, stub_internal, scratch)
+    }
+
+    fn scan_body_at(
+        &self,
+        node: usize,
+        component: &[usize],
+        stub_internal: bool,
+        scratch: &mut DescentScanScratch,
+    ) -> DescentBlockerSummary {
+        let key = self.nodes[node].key;
+        let descr_refs = self.nodes[node].descr_refs;
+        let Some((code, num_regs_i, constants_i)) = self.body_parts(key.jitcode_index) else {
+            return body_not_walked();
+        };
+        let entry_lens = self.entry_lens(key.entry_mode);
+        let test = self.uses_test_bodies();
+        let mut call_effect_free = |index| {
+            if test {
+                false
+            } else {
+                residual_call_is_elidable(index)
+            }
+        };
+        let mut switch_targets = |index| {
+            if test {
+                None
+            } else {
+                switch_descr_targets(index)
+            }
+        };
+        summarize_body_blockers_from(
+            None,
+            code,
+            num_regs_i,
+            constants_i,
+            |descr_index, _caller_effect, entry_lens| {
+                let callee = self.resolve_callee(descr_index)?;
+                let mode = self.mode_for(entry_lens);
+                if mode == EntryMode::FactFree {
+                    if let Some(cached) = self.cached_fact_free(callee) {
+                        return Some(cached);
+                    }
+                }
+                let Some(to) = self.lookup_node(callee, mode) else {
+                    return Some(body_not_walked());
+                };
+                if stub_internal && component.contains(&to) {
+                    Some(self.summaries[to].join(cycle_stub()))
+                } else {
+                    Some(self.summaries[to])
+                }
+            },
+            &mut |_blocker, _effect| true,
+            &mut call_effect_free,
+            &mut switch_targets,
+            entry_lens,
+            &mut jitcode_fnaddr_for_descr,
+            descr_refs,
+            scratch,
+        )
+    }
+
+    fn lookup_node(&self, jitcode_index: usize, mode: EntryMode) -> Option<usize> {
+        let mode = self.canonicalize(mode);
+        self.node_by_jitcode
+            .get(jitcode_index)
+            .and_then(|lanes| lanes[mode.lane()])
+    }
+
+    fn solve_component(&mut self, component: &[usize], scratch: &mut DescentScanScratch) {
+        if component.iter().all(|&n| self.solved[n]) {
+            return;
+        }
+        let cyclic = component.len() > 1
+            || component
+                .first()
+                .is_some_and(|&node| self.nodes[node].callees.contains(&node));
+        if !cyclic {
+            let node = component[0];
+            self.summaries[node] = self.scan_body(node, component, false, scratch);
+            self.solved[node] = true;
+            return;
+        }
+        for &node in component {
+            self.summaries[node] = DescentBlockerSummary::default();
+        }
+        let n = self.nodes.len();
+        if scratch.queued.len() < n {
+            scratch.queued.resize(n, false);
+        }
+        let mut queue = std::collections::VecDeque::new();
+        for &node in component {
+            queue.push_back(node);
+            scratch.queued[node] = true;
+        }
+        while let Some(node) = queue.pop_front() {
+            scratch.queued[node] = false;
+            let walk = self.scan_body(node, component, true, scratch);
+            let joined = self.summaries[node].join(walk);
+            if joined != self.summaries[node] {
+                self.summaries[node] = joined;
+                let callers = self.callers[node].clone();
+                for caller in callers {
+                    if component.contains(&caller) && !scratch.queued[caller] {
+                        queue.push_back(caller);
+                        scratch.queued[caller] = true;
+                    }
+                }
+            }
+        }
+        for &node in component {
+            self.solved[node] = true;
+        }
+    }
+
+    fn publish_fact_free_component(&mut self, component: &[usize]) {
+        if self.uses_test_bodies() {
+            return;
+        }
+        for &node in component {
+            if self.nodes[node].key.entry_mode != EntryMode::FactFree {
+                continue;
+            }
+            let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(
+                self.nodes[node].key.jitcode_index,
+            ) else {
+                continue;
+            };
+            let stable = self.summaries[node];
+            let published = jc.descent_blocker_summary(|| stable);
+            self.summaries[node] = published;
+        }
+    }
+
+    fn solve_all(&mut self, scratch: &mut DescentScanScratch) {
+        let comps = self.components();
+        for comp in comps {
+            self.solve_component(&comp, scratch);
+            self.publish_fact_free_component(&comp);
+        }
+    }
+
+    pub(crate) fn solve(&mut self, jitcode_index: usize, mode: EntryMode) -> DescentBlockerSummary {
+        let mode = self.canonicalize(mode);
+        if mode == EntryMode::FactFree {
+            if let Some(cached) = self.cached_fact_free(jitcode_index) {
+                return cached;
+            }
+        }
+        let root = self.intern(jitcode_index, mode);
+        if self.solved[root] {
+            return self.summaries[root];
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.discover_from(root, &mut scratch);
+        self.solve_all(&mut scratch);
+        self.scratch = scratch;
+        self.summaries[root]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discover_scan_count(&self) -> usize {
+        self.discover_scans
+    }
+
+    #[cfg(test)]
+    pub(crate) fn solve_scan_count(&self) -> usize {
+        self.solve_scans
+    }
+
+    #[cfg(test)]
+    pub(crate) fn solve_scan_count_for(&self, jitcode_index: usize) -> usize {
+        let Some(idx) = self.lookup_node(jitcode_index, EntryMode::FactFree) else {
+            return 0;
+        };
+        self.solve_scans_by_node[idx]
+    }
+
+    /// The production [`descent_decline`] rule over a summary this analysis
+    /// already computed: unread body, or a blocker reachable after an effect.
+    #[cfg(test)]
+    pub(crate) fn descent_decline(
+        &mut self,
+        jitcode_index: usize,
+        mode: EntryMode,
+    ) -> Option<DescentDecline> {
+        let summary = self.solve(jitcode_index, mode);
+        if summary.body_not_walked {
+            return Some(DescentDecline::BodyNotWalked);
+        }
+        summary.blocker_after_effect.map(DescentDecline::Helper)
+    }
 }
 
 /// The dataflow of [`summarize_descent_blockers`] over one body's bytes.
@@ -2936,6 +3681,7 @@ pub(crate) fn summarize_body_blockers_resume_fnaddr(
     mut callee_summary: impl FnMut(usize) -> Option<DescentBlockerSummary>,
     mut callee_fnaddr: impl FnMut(usize) -> Option<i64>,
 ) -> DescentBlockerSummary {
+    let mut scratch = DescentScanScratch::default();
     summarize_body_blockers_from(
         Some(resume_pc),
         code,
@@ -2948,6 +3694,7 @@ pub(crate) fn summarize_body_blockers_resume_fnaddr(
         &[],
         &mut callee_fnaddr,
         &[],
+        &mut scratch,
     )
 }
 
@@ -2992,6 +3739,7 @@ pub(crate) fn summarize_body_blockers_with(
     entry_array_lengths: &[(usize, usize)],
     descr_refs: &[DescrRef],
 ) -> DescentBlockerSummary {
+    let mut scratch = DescentScanScratch::default();
     summarize_body_blockers_from(
         None,
         code,
@@ -3004,6 +3752,7 @@ pub(crate) fn summarize_body_blockers_with(
         entry_array_lengths,
         &mut jitcode_fnaddr_for_descr,
         descr_refs,
+        &mut scratch,
     )
 }
 
@@ -3025,6 +3774,7 @@ fn summarize_body_blockers_from(
     entry_array_lengths: &[(usize, usize)],
     callee_fnaddr: &mut dyn FnMut(usize) -> Option<i64>,
     descr_refs: &[DescrRef],
+    scratch: &mut DescentScanScratch,
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -3034,26 +3784,27 @@ fn summarize_body_blockers_from(
     // all, ascending.  `switch` enumerates this as its successor set, so the
     // order has to be the body's own rather than a hash order: which of
     // several blockers the answer names would otherwise change per process.
-    let mut starts = Vec::new();
-    let mut folded_debugdata_goto = vec![false; code.len().max(1)];
+    scratch.begin_body(code.len());
     let mut pc = 0usize;
     let mut prev_non_live: Option<DecodedOp> = None;
     while let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) {
-        starts.push(pc);
-        if is_fresh_frame_debugdata_null_goto(code, &d, prev_non_live.as_ref(), descr_refs) {
-            folded_debugdata_goto[pc] = true;
-        }
+        let folded =
+            is_fresh_frame_debugdata_null_goto(code, &d, prev_non_live.as_ref(), descr_refs);
+        scratch.pc_to_start[pc] = scratch.ops.len() as u32 + 1;
+        scratch.starts.push(pc);
+        scratch.folded.push(folded);
         if !is_live_marker(d.opname) {
             prev_non_live = Some(d.clone());
         }
         pc = d.next_pc;
+        scratch.ops.push(d);
         if pc >= code.len() {
             break;
         }
     }
     if pc < code.len() {
         // The decode stopped inside the body, so `starts` names a prefix of it
-        // and the `push!` gate below would drop every target past that point
+        // and the successor gate below would drop every target past that point
         // as "not a start".  A dropped successor removes a region from the
         // graph, and a region the scan never enters reports no blocker, so
         // walking a graph already known to be partial can only produce an
@@ -3061,14 +3812,28 @@ fn summarize_body_blockers_from(
         // known instead.
         return body_not_walked();
     }
+    if scratch.starts.is_empty() {
+        return body_not_walked();
+    }
+    if resume_pc.is_some_and(|pc| scratch.start_index(pc).is_none()) {
+        return body_not_walked();
+    }
+    scratch.ensure_point_len(scratch.starts.len());
 
-    let mut entry_known = vec![None; num_regs_i + constants_i.len()];
-    let mut entry_may_symbolic = vec![false; num_regs_i + constants_i.len()];
+    let n_int = num_regs_i + constants_i.len();
+    scratch.working.resumed = resume_pc.is_none();
+    scratch.working.effect = false;
+    scratch.working.known_i.clear();
+    scratch.working.known_i.resize(n_int, None);
+    scratch.working.may_symbolic_i.clear();
+    scratch.working.may_symbolic_i.resize(n_int, false);
     for (slot, &value) in constants_i.iter().enumerate() {
-        entry_known[num_regs_i + slot] = Some(value);
-        entry_may_symbolic[num_regs_i + slot] =
+        scratch.working.known_i[num_regs_i + slot] = Some(value);
+        scratch.working.may_symbolic_i[num_regs_i + slot] =
             majit_jitcode::codewriter::call::is_symbolic_fnaddr(value);
     }
+    scratch.working.known_array_len_r.seed(entry_array_lengths);
+    scratch.working.fresh_r = FreshRegs::default();
     // A handler runs with the join of every state in the region it protects, so
     // its registers hold no known value -- but a constant slot is never a `>i`
     // destination, so it holds the same value at every one of those points and
@@ -3076,112 +3841,30 @@ fn summarize_body_blockers_from(
     // `residual_call` in a handler reads its funcbox from. A register there is
     // a runtime value `consume_one_section` restores, unless a symbolic
     // constant still occupies the slot.
-    let handler_known = entry_known.clone();
-    let handler_may_symbolic = entry_may_symbolic.clone();
-    let mut entry_array_len_r = vec![None; FRESH_SLOTS];
-    for &(slot, len) in entry_array_lengths {
-        if let Some(value) = entry_array_len_r.get_mut(slot) {
-            *value = Some(len);
+    scratch.handler.known_i.clone_from(&scratch.working.known_i);
+    scratch
+        .handler
+        .may_symbolic_i
+        .clone_from(&scratch.working.may_symbolic_i);
+    scratch.handler.known_array_len_r.clear();
+    scratch.handler.fresh_r = FreshRegs::default();
+    scratch.handler.effect = true;
+    scratch.handler.resumed = false;
+
+    scratch.point_gen[0] = scratch.generation;
+    scratch.points[0].clone_from(&scratch.working);
+    scratch.work.push_back(0);
+
+    while let Some(idx) = scratch.work.pop_front() {
+        if scratch.point_gen.get(idx) != Some(&scratch.generation) {
+            continue;
         }
-    }
-    if resume_pc.is_some_and(|pc| starts.binary_search(&pc).is_err()) {
-        return body_not_walked();
-    }
-    let mut points: std::collections::HashMap<usize, DescentPoint> =
-        std::collections::HashMap::new();
-    points.insert(
-        0,
-        DescentPoint {
-            resumed: resume_pc.is_none(),
-            effect: false,
-            known_i: entry_known,
-            known_array_len_r: entry_array_len_r,
-            fresh_r: vec![false; FRESH_SLOTS],
-            may_symbolic_i: entry_may_symbolic,
-        },
-    );
-    let mut work = std::collections::VecDeque::from([0usize]);
-
-    // `push` is the dataflow's only join: it merges `state` into the point at
-    // `target` and re-queues it when that widened anything.
-    macro_rules! push {
-        ($points:expr, $work:expr, $target:expr, $state:expr) => {{
-            let target: usize = $target;
-            if starts.binary_search(&target).is_ok() {
-                let state: DescentPoint = $state;
-                match $points.get_mut(&target) {
-                    None => {
-                        $points.insert(target, state);
-                        $work.push_back(target);
-                    }
-                    Some(existing) => {
-                        let mut widened = false;
-                        if state.resumed && !existing.resumed {
-                            existing.resumed = true;
-                            widened = true;
-                        }
-                        if state.effect && !existing.effect {
-                            existing.effect = true;
-                            widened = true;
-                        }
-                        for (slot, incoming) in existing.known_i.iter_mut().zip(&state.known_i) {
-                            if *slot != *incoming && slot.is_some() {
-                                *slot = None;
-                                widened = true;
-                            }
-                        }
-                        for (slot, incoming) in existing
-                            .known_array_len_r
-                            .iter_mut()
-                            .zip(&state.known_array_len_r)
-                        {
-                            if *slot != *incoming && slot.is_some() {
-                                *slot = None;
-                                widened = true;
-                            }
-                        }
-                        for (slot, incoming) in existing.fresh_r.iter_mut().zip(&state.fresh_r) {
-                            if *slot && !*incoming {
-                                *slot = false;
-                                widened = true;
-                            }
-                        }
-                        for (slot, incoming) in existing
-                            .may_symbolic_i
-                            .iter_mut()
-                            .zip(&state.may_symbolic_i)
-                        {
-                            if !*slot && *incoming {
-                                *slot = true;
-                                widened = true;
-                            }
-                        }
-                        if widened {
-                            $work.push_back(target);
-                        }
-                    }
-                }
-            }
-        }};
-    }
-
-    while let Some(pc) = work.pop_front() {
-        let Some(point) = points.get(&pc).cloned() else {
-            continue;
-        };
-        let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) else {
-            // Every queued point is one of `starts`, and the guard above
-            // established that those cover the body, so this does not happen.
-            // It is still the same missing-region shape if it ever does.
-            summary.body_not_walked = true;
-            continue;
-        };
-        let resumed = point.resumed || resume_pc == Some(pc);
-        let mut effect = point.effect;
-        let mut known_i = point.known_i;
-        let mut known_array_len_r = point.known_array_len_r;
-        let mut fresh_r = point.fresh_r;
-        let mut may_symbolic_i = point.may_symbolic_i;
+        let d = scratch.ops[idx].clone();
+        let folded = scratch.folded[idx];
+        let mut working = std::mem::take(&mut scratch.working);
+        working.clone_from(&scratch.points[idx]);
+        let resumed = working.resumed || resume_pc == Some(d.pc);
+        working.resumed = resumed;
 
         if let Some(funcbox) = residual_or_conditional_funcbox(code, &d) {
             // `reject_unresolved_call` bails at a symbolic placeholder or
@@ -3189,19 +3872,24 @@ fn summarize_body_blockers_from(
             // into `known_i` and survives handler joins. A red register is a
             // runtime address `consume_one_section` restores; only a slot a
             // symbolic constant may still reach is a blocker.
-            if resumed && !conditional_call_skips(code, &d, &known_i) {
-                let fnaddr = known_i.get(funcbox).copied().flatten();
-                let may_symbolic = may_symbolic_i.get(funcbox).copied().unwrap_or(false);
+            if resumed && !conditional_call_skips(code, &d, &working.known_i) {
+                let fnaddr = working.known_i.get(funcbox).copied().flatten();
+                let may_symbolic = working
+                    .may_symbolic_i
+                    .get(funcbox)
+                    .copied()
+                    .unwrap_or(false);
                 let blocker = funcbox_call_blocker(fnaddr, may_symbolic);
                 if let Some(blocker) = blocker {
-                    let slot = if effect {
+                    let slot = if working.effect {
                         &mut summary.blocker_after_effect
                     } else {
                         &mut summary.blocker_effect_free
                     };
                     slot.get_or_insert(blocker);
-                    if on_blocker(blocker, effect) {
+                    if on_blocker(blocker, working.effect) {
                         // The walk stops here, so this op has no successors.
+                        scratch.working = working;
                         continue;
                     }
                 }
@@ -3212,7 +3900,7 @@ fn summarize_body_blockers_from(
             let descr_index = code.get(d.pc + 1).copied().unwrap_or(0) as usize
                 | ((code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
             let trampoline_one =
-                identity_trampoline_entry_array_length(code, &d, &known_array_len_r);
+                identity_trampoline_entry_array_length(code, &d, &working.known_array_len_r);
             let trampoline_entry: &[(usize, usize)] = match &trampoline_one {
                 Some(pair) => std::slice::from_ref(pair),
                 None => &[],
@@ -3220,16 +3908,18 @@ fn summarize_body_blockers_from(
             if !resumed {
                 // A callee entered before the resume point already ran in the
                 // trace; its section, if any, is counted on its own.
-                if callee_summary(descr_index, effect, trampoline_entry)
+                if callee_summary(descr_index, working.effect, trampoline_entry)
                     .is_some_and(|callee| callee.may_execute_effect)
                 {
-                    effect = true;
+                    working.effect = true;
                     summary.first_effect_pc.get_or_insert(d.pc);
                 }
-            } else if let Some(callee) = callee_summary(descr_index, effect, trampoline_entry) {
+            } else if let Some(callee) =
+                callee_summary(descr_index, working.effect, trampoline_entry)
+            {
                 // Entering with an effect behind us turns every blocker the
                 // callee holds into one that cannot be rewound.
-                let after = if effect {
+                let after = if working.effect {
                     callee.blocker_after_effect.or(callee.blocker_effect_free)
                 } else {
                     callee.blocker_after_effect
@@ -3251,7 +3941,7 @@ fn summarize_body_blockers_from(
                         .or_else(|| jitcode_fnaddr_for_descr(descr_index))
                         .unwrap_or(0);
                     if blackhole_interprets_inline_callee(fnaddr) {
-                        let slot = if effect {
+                        let slot = if working.effect {
                             &mut summary.blocker_after_effect
                         } else {
                             &mut summary.blocker_effect_free
@@ -3260,7 +3950,7 @@ fn summarize_body_blockers_from(
                     }
                 }
                 if callee.may_execute_effect {
-                    effect = true;
+                    working.effect = true;
                     summary.first_effect_pc.get_or_insert(d.pc);
                 }
                 // The descent enters this callee, so a region of it the callee's
@@ -3275,7 +3965,7 @@ fn summarize_body_blockers_from(
                 // condition `body_not_walked` already names one level down: a
                 // region of this descent the scan did not walk.
                 summary.body_not_walked = true;
-                effect = true;
+                working.effect = true;
                 summary.first_effect_pc.get_or_insert(d.pc);
             }
         }
@@ -3291,19 +3981,19 @@ fn summarize_body_blockers_from(
             && (descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index))
                 || code
                     .get(d.pc + 1)
-                    .and_then(|&slot| known_i.get(slot as usize).copied().flatten())
+                    .and_then(|&slot| working.known_i.get(slot as usize).copied().flatten())
                     .is_some_and(effect_free_residual_fnaddr));
         let applies_effect = descent_op_applies_effect(d.opname)
             && !residual_odometer_exempt
-            && !heap_write_into_fresh_object(code, &d, &fresh_r);
+            && !heap_write_into_fresh_object(code, &d, working.fresh_r);
         // Every blocker a body reports reads as `after_effect` once one early
         // op arms the flag, so the reachable set alone does not say what to
         // repair.  Name each op that arms it — with the helper a residual's
         // funcbox resolves to, and the field a store writes — so the first one
         // on the entry path is readable.
-        if !effect && applies_effect && fbw_inline_diag_enabled() {
+        if !working.effect && applies_effect && fbw_inline_diag_enabled() {
             let funcbox = residual_or_conditional_funcbox(code, &d)
-                .and_then(|slot| known_i.get(slot).copied())
+                .and_then(|slot| working.known_i.get(slot).copied())
                 .flatten();
             let field = descr_operand_index(code, &d).and_then(|index| {
                 crate::jitcode_runtime::descr_ref_table()
@@ -3328,10 +4018,10 @@ fn summarize_body_blockers_from(
             );
         }
         if applies_effect {
-            effect = true;
+            working.effect = true;
             summary.first_effect_pc.get_or_insert(d.pc);
         }
-        if effect {
+        if working.effect {
             summary.may_execute_effect = true;
         }
 
@@ -3344,18 +4034,22 @@ fn summarize_body_blockers_from(
             .is_some_and(|(_, dst)| dst == "i")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
-            let carried = known_int_result(code, &d, &known_i, &known_array_len_r);
+            let carried = known_int_result(code, &d, &working.known_i, &working.known_array_len_r);
             let may_symbolic = match d.key {
                 "int_copy/i>i" => code.get(d.pc + 1).is_some_and(|&src| {
                     carried.is_some_and(majit_jitcode::codewriter::call::is_symbolic_fnaddr)
-                        || may_symbolic_i.get(src as usize).copied().unwrap_or(false)
+                        || working
+                            .may_symbolic_i
+                            .get(src as usize)
+                            .copied()
+                            .unwrap_or(false)
                 }),
                 _ => carried.is_some_and(majit_jitcode::codewriter::call::is_symbolic_fnaddr),
             };
-            if let Some(slot) = known_i.get_mut(dst as usize) {
+            if let Some(slot) = working.known_i.get_mut(dst as usize) {
                 *slot = carried;
             }
-            if let Some(slot) = may_symbolic_i.get_mut(dst as usize) {
+            if let Some(slot) = working.may_symbolic_i.get_mut(dst as usize) {
                 *slot = may_symbolic;
             }
         }
@@ -3373,41 +4067,33 @@ fn summarize_body_blockers_from(
                 || (d.key == "ref_copy/r>r"
                     && code
                         .get(d.pc + 1)
-                        .and_then(|&src| fresh_r.get(src as usize).copied())
-                        .unwrap_or(false));
-            if let Some(slot) = fresh_r.get_mut(dst as usize) {
-                *slot = fresh;
-            }
+                        .is_some_and(|&src| working.fresh_r.get(src as usize)));
+            working.fresh_r.set(dst as usize, fresh);
             // The wrapper-argument array can move between Ref colors before its
             // length check.  Only a plain ref copy preserves that entry fact.
             let carried = (d.key == "ref_copy/r>r")
                 .then(|| code.get(d.pc + 1))
                 .flatten()
-                .and_then(|&src| known_array_len_r.get(src as usize).copied())
-                .flatten();
-            if let Some(slot) = known_array_len_r.get_mut(dst as usize) {
-                *slot = carried;
-            }
+                .and_then(|&src| working.known_array_len_r.get(src as usize));
+            working.known_array_len_r.set(dst as usize, carried);
         }
 
-        let state = DescentPoint {
-            resumed,
-            effect,
-            known_i: known_i.clone(),
-            known_array_len_r: known_array_len_r.clone(),
-            fresh_r: fresh_r.clone(),
-            may_symbolic_i: may_symbolic_i.clone(),
-        };
+        let effect = working.effect;
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
             // Frame exits: the walk leaves this body here.
             "ref_return" | "int_return" | "float_return" | "void_return" => {}
-            // `bhimpl_abort` cannot finish a helper section. The whole-body
-            // scan records that an `abort` is reachable without naming it as
-            // a descent-admission blocker. Capture-time resume
-            // (`helper_resume_reaches_blocker`) treats a reachable `abort` as
-            // a blocker so the guard takes the CALL-entry fallback instead
-            // of numbering a section that cannot complete.
+            // `bhimpl_abort` cannot finish a helper section. Capture-time
+            // resume (`helper_resume_reaches_blocker`) treats a reachable
+            // `abort` as a blocker so the guard takes the CALL-entry
+            // fallback instead of numbering a section that cannot complete.
+            // Whole-body admission does not name that `abort` itself as a
+            // blocker when no effect has run; it does keep walking the
+            // linear remainder. The assembler still emits the residual that
+            // would have run after an unlowered call (`abort` then the
+            // call), and leaving that residual unreachable publishes a
+            // clean body and admits a wrapper that will hit the abort after
+            // an effect.
             "abort" => {
                 summary.has_reachable_abort = true;
                 if resume_pc.is_some() && resumed {
@@ -3417,6 +4103,8 @@ fn summarize_body_blockers_from(
                         &mut summary.blocker_effect_free
                     };
                     slot.get_or_insert(0);
+                } else if resume_pc.is_none() {
+                    scratch.push_point(d.next_pc, &working);
                 }
             }
             // A raise leaves the body only when nothing in it catches.
@@ -3437,42 +4125,30 @@ fn summarize_body_blockers_from(
                 if let Some(target) =
                     crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
                 {
-                    push!(
-                        points,
-                        work,
-                        target,
-                        DescentPoint {
-                            resumed,
-                            effect: true,
-                            known_i: handler_known.clone(),
-                            known_array_len_r: vec![None; FRESH_SLOTS],
-                            fresh_r: vec![false; FRESH_SLOTS],
-                            may_symbolic_i: handler_may_symbolic.clone(),
-                        }
-                    );
+                    scratch.push_handler(target, resumed);
                 }
             }
             "goto" => {
                 if let Some(target) = label {
-                    push!(points, work, target, state);
+                    scratch.push_point(target, &working);
                 }
             }
             name if name.starts_with("goto_if") => {
-                if folded_debugdata_goto.get(d.pc).copied().unwrap_or(false) {
-                    push!(points, work, d.next_pc, state);
+                if folded {
+                    scratch.push_point(d.next_pc, &working);
                 } else {
-                    match known_goto_if_taken(code, &d, &known_i) {
+                    match known_goto_if_taken(code, &d, &working.known_i) {
                         Some(true) => {
                             if let Some(target) = label {
-                                push!(points, work, target, state);
+                                scratch.push_point(target, &working);
                             }
                         }
-                        Some(false) => push!(points, work, d.next_pc, state),
+                        Some(false) => scratch.push_point(d.next_pc, &working),
                         None => {
                             if let Some(target) = label {
-                                push!(points, work, target, state.clone());
+                                scratch.push_point(target, &working);
                             }
-                            push!(points, work, d.next_pc, state);
+                            scratch.push_point(d.next_pc, &working);
                         }
                     }
                 }
@@ -3489,21 +4165,9 @@ fn summarize_body_blockers_from(
                 // (`helper_residual_guard_lands_on_catch`); `resumed` is
                 // true in that case too.
                 if let Some(target) = label {
-                    push!(
-                        points,
-                        work,
-                        target,
-                        DescentPoint {
-                            resumed,
-                            effect: true,
-                            known_i: handler_known.clone(),
-                            known_array_len_r: vec![None; FRESH_SLOTS],
-                            fresh_r: vec![false; FRESH_SLOTS],
-                            may_symbolic_i: handler_may_symbolic.clone(),
-                        }
-                    );
+                    scratch.push_handler(target, resumed);
                 }
-                push!(points, work, d.next_pc, state);
+                scratch.push_point(d.next_pc, &working);
             }
             "switch" => {
                 // `bhimpl_switch`: a known discriminant takes one arm, or
@@ -3513,27 +4177,29 @@ fn summarize_body_blockers_from(
                 // fallthrough (`bhimpl_switch` KeyError path).
                 let disc = code
                     .get(d.pc + 1)
-                    .and_then(|&slot| known_i.get(slot as usize).copied())
+                    .and_then(|&slot| working.known_i.get(slot as usize).copied())
                     .flatten();
                 let descr_index = descr_operand_index(code, &d);
                 if let (Some(value), Some(index)) = (disc, descr_index)
                     && let Some(hit) = switch_descr_lookup(index, value)
                 {
                     match hit {
-                        Some(target) => push!(points, work, target, state),
-                        None => push!(points, work, d.next_pc, state),
+                        Some(target) => scratch.push_point(target, &working),
+                        None => scratch.push_point(d.next_pc, &working),
                     }
                 } else {
                     match descr_index.and_then(|index| switch_targets(index)) {
                         Some(targets) => {
                             for target in targets {
-                                push!(points, work, target, state.clone());
+                                scratch.push_point(target, &working);
                             }
-                            push!(points, work, d.next_pc, state);
+                            scratch.push_point(d.next_pc, &working);
                         }
                         None => {
-                            for &target in &starts {
-                                push!(points, work, target, state.clone());
+                            let n_starts = scratch.starts.len();
+                            for i in 0..n_starts {
+                                let target = scratch.starts[i];
+                                scratch.push_point(target, &working);
                             }
                         }
                     }
@@ -3550,14 +4216,15 @@ fn summarize_body_blockers_from(
                 // remove a region, and a region the scan never enters reports
                 // no blocker.
                 if let Some(target) = label {
-                    push!(points, work, target, state.clone());
+                    scratch.push_point(target, &working);
                 }
-                push!(points, work, d.next_pc, state);
+                scratch.push_point(d.next_pc, &working);
             }
         }
+        scratch.working = working;
     }
 
-    if resume_pc.is_some_and(|pc| !points.contains_key(&pc)) {
+    if resume_pc.is_some_and(|pc| !scratch.point_reached(pc)) {
         summary.body_not_walked = true;
     }
     summary
@@ -6511,6 +7178,7 @@ pub(crate) struct SubWalkRewind {
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     effects_before: usize,
     unjournaled_before: bool,
+    unjournaled_kinds_before: (bool, bool),
 }
 
 impl SubWalkRewind {
@@ -6523,6 +7191,7 @@ impl SubWalkRewind {
             pre_fold_pos,
             effects_before,
             unjournaled_before,
+            unjournaled_kinds_before: fbw_unjournaled_kinds(),
         }
     }
 
@@ -6534,6 +7203,17 @@ impl SubWalkRewind {
         fbw_executed_effect_count() == self.effects_before
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
+    }
+
+    /// Whether this subwalk executed no effect and inherited no unjournaled
+    /// mark. A recorded-but-unexecuted residual created inside the cut
+    /// region does not fail this: that op and its mark are one transaction
+    /// with the cut (`MIFrame.do_residual_or_indirect_call` then
+    /// `do_residual_call`).
+    pub(crate) fn only_unexecuted_marks_since_entry(&self) -> bool {
+        fbw_executed_effect_count() == self.effects_before
+            && !self.unjournaled_kinds_before.0
+            && !self.unjournaled_kinds_before.1
     }
 
     /// Whether every effect executed since the rewind point is one the cut
@@ -7223,7 +7903,7 @@ fn walker_ec_enter(
     let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as pyre_object::gc_hook::GCREF);
     majit_gc::bh_probe_note_store(
-        concrete_frame as usize,
+        concrete_frame as majit_gc::GCREF,
         crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
         4,
     );
@@ -7330,8 +8010,8 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// `walker_call_trace_hook_reads`. A profiler uses the `is_being_profiled`
 /// green / back-edge read.
 ///
-/// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
-/// which `frame_tracing_active` holds to `execute_frame_plain` is a
+/// `pypyjit_ll_portal_runner` (`pyre-jit/src/call_jit.rs`) routing every frame for
+/// which `frame_tracing_active` holds to `eval_loop_dispatch` is a
 /// compilation gate, not a reporting one.  The portal frame's jitted arm
 /// reads that frame's own `debugdata.w_f_trace`; a global tracer that
 /// leaves the caller's `f_trace` unset is the inlined `call_trace`
@@ -8725,11 +9405,15 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // rewind arm below reads it to decide whether this descent already applied
     // something.
     let effects_before = fbw_executed_effect_count();
-    let unjournaled_before = fbw_has_unjournaled_effect();
+    let unjournaled_kinds_before = fbw_unjournaled_kinds();
+    let unjournaled_before = unjournaled_kinds_before.0 || unjournaled_kinds_before.1;
+    let journal_before = fbw_effect_journal_mark();
+    let crossed_inline_subwalk_before = ctx.session.borrow().crossed_inline_subwalk;
     let rewind = SubWalkRewind {
         pre_fold_pos,
         effects_before,
         unjournaled_before,
+        unjournaled_kinds_before,
     };
     // A nested helper's byte offset is not a coordinate in the Python
     // jitcode. Keep the outermost CALL so a portal entered from inside
@@ -8825,8 +9509,13 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         // to the frame latch, which resumes forward at this opcode losing
         // nothing.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
-            if rewind.nothing_applied() =>
+            if rewind.nothing_applied()
+                || (rewind.only_unexecuted_marks_since_entry() && !abort_blackhole_latched()) =>
         {
+            // `MIFrame.do_residual_or_indirect_call`: a callee that is not
+            // followed goes to `do_residual_call`, which executes once and
+            // records. The recorded-but-unexecuted op inside the cut region
+            // and its unjournaled mark are one transaction with that residual.
             if fbw_inline_diag_enabled() {
                 eprintln!(
                     "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
@@ -8842,6 +9531,10 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                 );
             }
             cut_declined_subwalk(ctx, pre_fold_pos);
+            fbw_restore_unjournaled_kinds(unjournaled_kinds_before);
+            ctx.session.borrow_mut().crossed_inline_subwalk = crossed_inline_subwalk_before;
+            debug_assert_eq!(fbw_executed_effect_count(), effects_before);
+            debug_assert_eq!(fbw_journaled_effect_delta_since(journal_before), 0);
             return Ok(None);
         }
         Err(error) => {
@@ -11763,9 +12456,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let boxed = callee_arg_concretes[i].to_pyobj();
             pyre_object::gc_roots::shadow_stack_set(arg_root_base + i, boxed);
         }
-        let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
-            .collect();
         let concrete_ec = sym.concrete_execution_context();
         // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
         // stamped onto the active trace's frontend op below, and
@@ -11780,7 +12470,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let mut frame = match pyre_interpreter::pyframe::FrameBox::new(
             match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                &concrete_args,
                 inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 live_closure(),
@@ -11799,6 +12488,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
             }
         };
+        for i in 0..seeded_locals {
+            frame.set_locals_w(
+                i,
+                pyre_object::gc_roots::shadow_stack_get(arg_root_base + i),
+            );
+        }
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;
@@ -22049,10 +22744,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let unjournaled_kinds_before = fbw_unjournaled_kinds();
     let rewind = SubWalkRewind {
         pre_fold_pos,
         effects_before: fbw_executed_effect_count(),
-        unjournaled_before: fbw_has_unjournaled_effect(),
+        unjournaled_before: unjournaled_kinds_before.0 || unjournaled_kinds_before.1,
+        unjournaled_kinds_before,
     };
     let saved_subwalk_floor = ctx.fbw_mode.subwalk_floor;
     ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
@@ -25291,6 +25988,59 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             pc,
             provided: float_args.len(),
             callee_num_regs_f: sub_body.num_regs_f,
+        });
+    }
+    // `MIFrame.setup_call` writes every argbox into the callee registers.
+    // A list shorter than `JitCode.calldescr.arg_classes` of that kind, or a
+    // supplied Ref that is `OpRef::NONE`, leaves a hole the callee then
+    // reads (`pyjitpl.py` setup_call). Empty `arg_classes` is unset, not
+    // nullary (`assembler.py` `check_inline_call_arg_classes`).
+    let declared = sub_body.jitcode_index.and_then(|idx| {
+        let jc = crate::jitcode_runtime::get_jitcode_ref_by_index(idx)?;
+        let classes = jc.calldescr().arg_classes.as_str();
+        if classes.is_empty() {
+            return None;
+        }
+        Some((
+            classes.chars().filter(|&c| c == 'i').count(),
+            classes.chars().filter(|&c| c == 'r').count(),
+            classes.chars().filter(|&c| c == 'f').count(),
+        ))
+    });
+    if let Some((need_i, need_r, need_f)) = declared {
+        if int_args.len() < need_i {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallIntArityMismatch {
+                pc,
+                provided: int_args.len(),
+                callee_num_regs_i: need_i,
+            });
+        }
+        if ref_args.len() < need_r {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallArityMismatch {
+                pc,
+                provided: ref_args.len(),
+                callee_num_regs_r: need_r,
+            });
+        }
+        if float_args.len() < need_f {
+            ctx.session.borrow_mut().pending_helper_level = None;
+            return Err(DispatchError::InlineCallFloatArityMismatch {
+                pc,
+                provided: float_args.len(),
+                callee_num_regs_f: need_f,
+            });
+        }
+    }
+    if ref_args.iter().any(|arg| *arg == OpRef::NONE) {
+        ctx.session.borrow_mut().pending_helper_level = None;
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: declared
+                .map(|(_, need_r, _)| need_r)
+                .unwrap_or(sub_body.num_regs_r),
         });
     }
     for (i, arg) in int_args.iter().enumerate() {

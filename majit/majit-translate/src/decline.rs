@@ -160,6 +160,11 @@ pub mod gate {
     /// or the call-site generics could not be rewritten into that crate's
     /// tables). The call keeps the unspecialized path.
     pub const CROSS_CRATE_SPEC: &str = "clause_spec::cross_crate_spec";
+    /// Leftover `malloc_typed*` in `rewrite_op_direct_call`
+    /// (`Transformer.rewrite_op_malloc`). Residualizes a value
+    /// initializer so the native copy remains, and a nonmovable flavor
+    /// (`UnsupportedMallocFlags`).
+    pub const REWRITE_OP_MALLOC: &str = "codewriter::jtransform::rewrite_op_malloc";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.
