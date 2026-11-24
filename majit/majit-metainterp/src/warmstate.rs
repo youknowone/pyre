@@ -3193,12 +3193,9 @@ impl WarmEnterState {
         if cell.jitdriver_sd != self.jitdriver_sd {
             return DoorCell::Occupied;
         }
-        if cell.is_compiled() {
+        if let Some(token) = Self::cell_entry_procedure_token(&cell) {
             let cell_key = cell.cell_key.get().unwrap_or(hash);
-            return match Self::cell_entry_procedure_token(&cell) {
-                Some(token) => DoorCell::Enter { cell_key, token },
-                None => DoorCell::Occupied,
-            };
+            return DoorCell::Enter { cell_key, token };
         }
         if cell.is_tracing() {
             return DoorCell::Tracing;
@@ -6947,8 +6944,10 @@ mod tests {
         );
     }
 
-    /// The door keeps the chain-head token `maybe_compile_and_run` would
-    /// carry, and a comparekey miss at that hash is Occupied.
+    /// The door keeps the token `maybe_compile_and_run` would carry after
+    /// `JC_TRACING | JC_TEMPORARY` then `cell.get_procedure_token()`. A live
+    /// occupant is Enter; a temporary cell ticks (Empty); an invalidated or
+    /// dead token is Occupied. A comparekey miss at that hash is Occupied.
     #[test]
     fn door_cell_carries_the_resolved_token() {
         let mut ws = WarmEnterState::new(100);
@@ -6989,6 +6988,74 @@ mod tests {
         assert!(
             matches!(ws.door_cell(hash, Some(miss)), DoorCell::Occupied),
             "comparekey miss with the same hash is Occupied"
+        );
+
+        let mut ws_tmp = WarmEnterState::new(100);
+        let key_tmp = GreenKey::new(vec![0x7E, 0x11]);
+        let token_tmp = Arc::new(JitCellToken::new(0x7e11));
+        GreenRefPin::with(&key_tmp, |__p, __l| {
+            ws_tmp.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token_tmp.clone()))
+        })
+        .expect("tmp token");
+        let hash_tmp = key_tmp.get_uhash();
+        let hit_tmp = (key_tmp.values.as_slice(), key_tmp.types.as_slice());
+        assert!(
+            ws_tmp
+                .lookup_chain(hash_tmp)
+                .expect("installed")
+                .flags
+                .get()
+                .contains(JcFlags::JC_TEMPORARY),
+            "fixture: occupant is JC_TEMPORARY"
+        );
+        assert!(
+            matches!(ws_tmp.door_cell(hash_tmp, Some(hit_tmp)), DoorCell::Empty),
+            "a temporary cell ticks; it is not entered"
+        );
+
+        let mut ws_inv = WarmEnterState::new(100);
+        let key_inv = GreenKey::new(vec![0x3, 0x4]);
+        let token_inv = attach_alive_for_key(
+            &mut ws_inv,
+            &key_inv,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
+        token_inv.invalidate();
+        let hash_inv = key_inv.get_uhash();
+        let hit_inv = (key_inv.values.as_slice(), key_inv.types.as_slice());
+        assert!(
+            matches!(
+                ws_inv.door_cell(hash_inv, Some(hit_inv)),
+                DoorCell::Occupied
+            ),
+            "an invalidated token is Occupied"
+        );
+
+        let mut ws_dead = WarmEnterState::new(100);
+        let key_dead = GreenKey::new(vec![0x70, 0xCE]);
+        GreenRefPin::with(&key_dead, |__p, __l| ws_dead.ensure_cell_for_key(__p, __l));
+        {
+            let token = token_with_compiled_code();
+            let cell = GreenRefPin::with(&key_dead, |__p, __l| {
+                ws_dead.lookup_chain_with_key(__p, __l)
+            })
+            .expect("installed");
+            cell.set_procedure_token(token, false);
+        }
+        let hash_dead = key_dead.get_uhash();
+        let hit_dead = (key_dead.values.as_slice(), key_dead.types.as_slice());
+        assert!(
+            ws_dead.lookup_chain(hash_dead).is_some_and(|cell| {
+                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none()
+            }),
+            "fixture: occupant holds a dead token"
+        );
+        assert!(
+            matches!(
+                ws_dead.door_cell(hash_dead, Some(hit_dead)),
+                DoorCell::Occupied
+            ),
+            "a dead token is Occupied"
         );
     }
 

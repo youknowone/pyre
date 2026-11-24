@@ -6067,7 +6067,17 @@ impl<S: JitState> JitDriver<S> {
                 DoorLookup::Occupied => (target_pc as u64, None),
             };
         self.back_edge_internal(
-            key, None, false, carried, target_pc, state, env, None, pre_run, None,
+            key,
+            None,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            None,
         )
     }
 
@@ -6086,7 +6096,17 @@ impl<S: JitState> JitDriver<S> {
                 DoorLookup::Occupied => (green_key, None),
             };
         self.back_edge_internal(
-            key, None, false, carried, target_pc, state, env, None, pre_run, None,
+            key,
+            None,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            None,
         )
     }
 
@@ -6187,7 +6207,17 @@ impl<S: JitState> JitDriver<S> {
             }
         };
         self.back_edge_internal(
-            key, greenargs, false, carried, target_pc, state, env, None, pre_run, pin_live,
+            key,
+            greenargs,
+            false,
+            carried.is_some(),
+            carried,
+            target_pc,
+            state,
+            env,
+            None,
+            pre_run,
+            pin_live,
         )
     }
 
@@ -6234,6 +6264,7 @@ impl<S: JitState> JitDriver<S> {
             cell_key,
             greenargs,
             false,
+            false,
             Some(procedure_token),
             target_pc,
             state,
@@ -6259,6 +6290,7 @@ impl<S: JitState> JitDriver<S> {
             cell_key,
             None,
             true,
+            false,
             Some(procedure_token),
             target_pc,
             state,
@@ -7164,6 +7196,7 @@ impl<S: JitState> JitDriver<S> {
         green_key_hash: u64,
         greenargs: Option<(&[i64], &[GreenType])>,
         confirmed: bool,
+        door_checked: bool,
         carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
@@ -7219,9 +7252,11 @@ impl<S: JitState> JitDriver<S> {
         // on another key still enters. `opimpl_jit_merge_point` records the
         // loop being traced; those back edges never reach
         // `maybe_compile_and_run`. A sibling still ticks on the occupied door
-        // below.
+        // below. `door_checked` is the `DoorLookup::Enter` proof from
+        // `try_empty_chain_tick`: that arm already tested `JC_TRACING |
+        // JC_TEMPORARY` on this cell before reading the token.
 
-        if self.cell_is_tracing(green_key) {
+        if !door_checked && self.cell_is_tracing(green_key) {
             return None;
         }
         // `EnterJitAssembler.procedure_token` is a live reference for the
@@ -14108,6 +14143,7 @@ mod tests {
             hash,
             None,
             false,
+            false,
             Some(token),
             19,
             &mut label_state,
@@ -19264,6 +19300,7 @@ mod tests {
             hash,
             Some((key.values.as_slice(), key.types.as_slice())),
             false,
+            false,
             None,
             19,
             &mut state,
@@ -19280,6 +19317,7 @@ mod tests {
         let carried = driver.back_edge_internal(
             hash,
             None,
+            false,
             false,
             Some(token),
             19,
