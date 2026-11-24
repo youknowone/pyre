@@ -1002,6 +1002,27 @@ fn transduce_op(
                 out.push_op_with_result_var(block, OpKind::New { owner }, result);
             }
         }
+        // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`:
+        // hand the one-reference `UnaryOp` to the shared `Transformer`,
+        // which emits `direct_call(_ll_1_gc_identityhash, x)` (`support.py`).
+        "gc_identityhash" => {
+            assert_eq!(
+                op.args.len(),
+                1,
+                "jtransform_opname::lower_graph: gc_identityhash takes one argument"
+            );
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "gc_identityhash".to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
         // `Transformer` rename table: Bool and Signed share the `i` input
         // bank, so the one backend conversion is `cast_int_to_float`.
         "cast_bool_to_float" => {
@@ -7793,6 +7814,30 @@ mod tests {
                 );
             }
             other => panic!("gc_add_memory_pressure leftover Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_graph_gc_identityhash_arm() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let h = variable_with_lltype("h", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "gc_identityhash_arm",
+            start.clone(),
+            Hlvalue::Variable(h.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_identityhash",
+            vec![Hlvalue::Variable(p.clone())],
+            Hlvalue::Variable(h.clone()),
+        ));
+        close_return(&start, &graph, h);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::UnaryOp { op, .. }] => {
+                assert_eq!(op, "gc_identityhash");
+            }
+            other => panic!("gc_identityhash → UnaryOp, got {other:?}"),
         }
     }
 
