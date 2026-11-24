@@ -2633,14 +2633,6 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if is_std_alloc_raw(canonical_strip) {
         return Some(SKIP_STD_ALLOC_RAW);
     }
-    // `rgc.py` `ll_arraycopy` is `@specialize.ll()` plus an oopspec
-    // residual, not one look-inside graph. Layer-1 `call_registry.lookup`
-    // would beat `host_env_callable` and `mergeinputargs` would union
-    // List and Instance(PyObject) into slot=0. Declining the registry
-    // entry lets the callsite reach the HOST_ENV builtin.
-    if crate::flowspace::model::is_jit_ll_arraycopy_path(canonical_strip) {
-        return Some(SKIP_JIT_LL_ARRAYCOPY);
-    }
     // `core::slice::raw::from_raw_parts{,_mut}` is an opaque foreign
     // decl. Layer-1 `call_registry.lookup` beats `host_env_callable`,
     // so a harvested stub would be the callee. Declining the registry
@@ -2653,9 +2645,6 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
 
     None
 }
-
-/// [`registration_decline`] reason for `rgc.py` `ll_arraycopy` residual.
-const SKIP_JIT_LL_ARRAYCOPY: &str = "skip-jit-ll-arraycopy";
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
@@ -4675,8 +4664,7 @@ pub(crate) fn register_unsafe_fn_stubs(
                 || reason == SKIP_STD_ALLOC_RAW
                 || reason == SKIP_PTR_WRITE
                 || reason == SKIP_PTR_COPY
-                || reason == SKIP_PTR_ADD
-                || reason == SKIP_JIT_LL_ARRAYCOPY)
+                || reason == SKIP_PTR_ADD)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
@@ -10249,71 +10237,6 @@ mod tests {
     }
 
     #[test]
-    fn jit_ll_arraycopy_is_declined_and_host_env_wins() {
-        for segments in [
-            vec![
-                crate::runtime_names::crates::OBJECT.to_string(),
-                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
-                "jit_ll_arraycopy".into(),
-            ],
-            vec![
-                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
-                "jit_ll_arraycopy".into(),
-            ],
-        ] {
-            assert_eq!(
-                registration_decline(&segments),
-                Some(SKIP_JIT_LL_ARRAYCOPY),
-                "{segments:?}"
-            );
-        }
-        assert_eq!(
-            registration_decline(&["jit_ll_arraycopy".into()]),
-            None,
-            "bare leaf jit_ll_arraycopy is not the rgc residual"
-        );
-        assert_eq!(
-            registration_decline(&["helpers".into(), "jit_ll_arraycopy".into()]),
-            None,
-            "helpers::jit_ll_arraycopy is not the rgc residual"
-        );
-        assert_eq!(
-            registration_decline(&[
-                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED.into(),
-                "ll_arraycopy_int_items_block".into()
-            ]),
-            None
-        );
-
-        let host = crate::flowspace::model::host_env_callable(
-            &[
-                crate::runtime_names::crates::OBJECT,
-                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED,
-                "jit_ll_arraycopy",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        )
-        .expect("pyre_object.object_array.jit_ll_arraycopy resolves in HOST_ENV");
-        assert!(crate::annotator::builtin::is_registered(host.qualname()));
-        let stripped = crate::flowspace::model::host_env_callable(
-            &[
-                crate::runtime_names::modules::OBJECT_ARRAY_STRIPPED,
-                "jit_ll_arraycopy",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        )
-        .expect("object_array.jit_ll_arraycopy resolves in HOST_ENV");
-        assert_eq!(
-            host, stripped,
-            "crate-stripped alias is the same HostObject"
-        );
-    }
-
-    #[test]
     fn ptr_write_is_declined_and_unregistered() {
         for segments in [
             vec!["core".to_string(), "ptr".into(), "write".into()],
@@ -13093,7 +13016,7 @@ mod tests {
         // `source_graph_func` copies the first `specialize:` hint onto
         // `GraphFunc.annspecialcase` so `Bookkeeper.newfuncdesc` installs
         // `Specializer::Ll`.
-        let mut graph = LegacyGraph::new("jit_ll_arraycopy");
+        let mut graph = LegacyGraph::new("specialized");
         graph.hints.push("specialize:ll".into());
         let func = source_graph_func(&graph);
         assert_eq!(func.annspecialcase.as_deref(), Some("specialize:ll"));

@@ -358,27 +358,10 @@ pub extern "C" fn jit_ll_arraymove(
 }
 
 /// `rgc.ll_arraycopy(source, dest, source_start, dest_start, length)` —
-/// runtime target for the `list.ll_arraycopy` oopspec (OS_ARRAYCOPY / 1)
-/// and for an erased (`PyObjectRef`) ARRAY residual.
-///
-/// rgc.py `ll_arraycopy`: `copy_item` when `length <= 1`; otherwise
-/// `writebarrier_before_copy` when the item contains GC pointers, then
-/// `raw_memcopy`. `false` from the barrier is the per-item `copy_item`
-/// slow path. A known ARRAY mints `ll_arraycopy` and `jtransform.py`
-/// `do_fixed_list_ll_arraycopy` rewrites that helper to OS_ARRAYCOPY.
-/// An erased items block has no ARRAY to specialize; the rtyper emits a
-/// residual `direct_call` of this body, which reads both layouts from
-/// `gc_varsize_layout`. No `@jit.oopspec` here: harvested
-/// `list.ll_arraycopy` on this name would make `guess_call_kind` return
-/// Builtin and name dest as `GcArray(OBJECTPTR)`.
-/// `dont_look_inside_cannot_raise` matches `_canraise` False on that
-/// helper (`call.py`): the `assert!` on negative starts is a native
-/// contract, not a Python exception. Without it the residual is
-/// `CallMayForceR` and a transparent BINARY_SLICE walk declines.
-/// `rgc.py` `ll_arraycopy` is `@specialize.ll()`: each ARRAY pointer
-/// type owns a graph (`annlowlevel.py` `lowlevelspecialize`).
-#[majit_macros::specialize_ll]
-#[majit_macros::dont_look_inside_cannot_raise]
+/// residual target the codewriter installs for OS_ARRAYCOPY
+/// (`list.ll_arraycopy`). No source graph calls this body; the annotatable
+/// `ll_arraycopy_*_items_block` wrappers run the before-copy barrier, slow
+/// path, and `ptr::copy_nonoverlapping` themselves.
 pub extern "C" fn jit_ll_arraycopy(
     source: crate::PyObjectRef,
     dest: crate::PyObjectRef,
@@ -519,15 +502,15 @@ pub extern "C" fn jit_ll_arraycopy(
     }
 }
 
-/// rgc.py `ll_arraycopy` for the object `ItemsBlock` ARRAY.
+/// `rgc.py` `ll_arraycopy` for the object `ItemsBlock` ARRAY.
 ///
-/// `@specialize.ll()` gives every ARRAY its own `ll_arraycopy` graph, and its
-/// `length <= 1` head is rgc.py `copy_item` (`dest[di] = source[si]`): a
-/// getarrayitem plus the `setarrayitem` writeanalyze reads that ARRAY's
-/// effects off ("Hack to ensure that we get a proper
-/// effectinfo.write_descrs_arrays"). The store is [`items_block_set_ref`],
-/// the write-barriered `setarrayitem`. Longer copies run the shared
-/// barrier-plus-memcpy body, [`jit_ll_arraycopy`].
+/// `@specialize.ll()` gives every ARRAY its own `ll_arraycopy` graph. The
+/// `length <= 1` `copy_item` head remains an explicit get plus the
+/// write-barriered [`items_block_set_ref`] so effect analysis sees the ARRAY
+/// write. Longer copies ask `gc_writebarrier_before_copy`; a false result
+/// copies item by item through the same setter, and a true result uses
+/// `ptr::copy_nonoverlapping` (`raw_memcopy`). `jit_ll_arraycopy` is only the
+/// residual target the codewriter installs for OS_ARRAYCOPY.
 ///
 /// # Safety
 /// `source` and `dest` are live `ItemsBlock`s and both ranges are in bounds.
@@ -547,16 +530,36 @@ pub unsafe fn ll_arraycopy_items_block(
         }
         return;
     }
-    jit_ll_arraycopy(
-        source as PyObjectRef,
-        dest as PyObjectRef,
+    if !crate::gc_hook::gc_writebarrier_before_copy(
+        source as crate::gc_hook::GCREF,
+        dest as crate::gc_hook::GCREF,
         source_start,
         dest_start,
         length,
-    );
+    ) {
+        let mut i = 0i64;
+        while i < length {
+            let item = unsafe { *items_block_items_base(source).add((source_start + i) as usize) };
+            unsafe { items_block_set_ref(dest, (dest_start + i) as usize, item) };
+            i += 1;
+        }
+        return;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            items_block_items_base(source).add(source_start as usize),
+            items_block_items_base(dest).add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// [`ll_arraycopy_items_block`] for the `GcArray(Signed)` ARRAY.
+///
+/// The `length <= 1` head remains `copy_item` for effect analysis. Longer
+/// copies use `ptr::copy_nonoverlapping` (`raw_memcopy`) directly; integer
+/// items contain no GC pointers, so there is no before-copy barrier.
+/// `jit_ll_arraycopy` is only the residual target for OS_ARRAYCOPY.
 ///
 /// # Safety
 /// `source` and `dest` are live int `TypedItemsBlock`s and both ranges are in
@@ -581,20 +584,24 @@ pub unsafe fn ll_arraycopy_int_items_block(
         }
         return;
     }
-    jit_ll_arraycopy(
-        source as PyObjectRef,
-        dest as PyObjectRef,
-        source_start,
-        dest_start,
-        length,
-    );
+    unsafe {
+        let source_base = typed_items_block_items_base(source) as *const i64;
+        let dest_base = typed_items_block_items_base(dest) as *mut i64;
+        core::ptr::copy_nonoverlapping(
+            source_base.add(source_start as usize),
+            dest_base.add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// [`ll_arraycopy_items_block`] for the `GcArray(Float)` ARRAY.
 ///
-/// `source` and `dest` are [`FloatItemsBlock`] pointers: `do_fixed_list_ll_arraycopy`
-/// names the copy's ARRAY from `dest`'s type, and a `TypedItemsBlock` there
-/// names `GcArray(Signed)`.
+/// `source` and `dest` are [`FloatItemsBlock`] pointers. The `length <= 1`
+/// head remains `copy_item` for effect analysis. Longer copies use
+/// `ptr::copy_nonoverlapping` (`raw_memcopy`) directly; float items contain no
+/// GC pointers, so there is no before-copy barrier. `jit_ll_arraycopy` is only
+/// the residual target for OS_ARRAYCOPY.
 ///
 /// # Safety
 /// `source` and `dest` are live float items blocks and both ranges are in
@@ -621,13 +628,16 @@ pub unsafe fn ll_arraycopy_float_items_block(
         }
         return;
     }
-    jit_ll_arraycopy(
-        source as PyObjectRef,
-        dest as PyObjectRef,
-        source_start,
-        dest_start,
-        length,
-    );
+    unsafe {
+        let source_base =
+            typed_items_block_items_base(source as *mut TypedItemsBlock) as *const f64;
+        let dest_base = typed_items_block_items_base(dest as *mut TypedItemsBlock) as *mut f64;
+        core::ptr::copy_nonoverlapping(
+            source_base.add(source_start as usize),
+            dest_base.add(dest_start as usize),
+            length as usize,
+        );
+    }
 }
 
 /// rgc.py `ll_arraymove` for the object `ItemsBlock` ARRAY.
@@ -2939,6 +2949,86 @@ mod tests {
                 &[1.0, 2.0, 3.0, 4.0]
             );
             dealloc_typed_items_block(block as *mut TypedItemsBlock);
+        }
+    }
+
+    #[test]
+    fn ll_arraycopy_items_block_copies_distinct_blocks_and_lengths() {
+        let source_values = [
+            1usize as PyObjectRef,
+            2usize as PyObjectRef,
+            3usize as PyObjectRef,
+            4usize as PyObjectRef,
+        ];
+        for (source_start, length, expected) in [
+            (1, 0, [0usize, 0, 0, 0]),
+            (3, 1, [4usize, 0, 0, 0]),
+            (1, 3, [2usize, 3, 4, 0]),
+        ] {
+            let source = unsafe { alloc_list_items_block(&source_values) };
+            let dest = unsafe { alloc_list_items_block(&[std::ptr::null_mut(); 4]) };
+            unsafe { ll_arraycopy_items_block(source, dest, source_start, 0, length) };
+            let expected = expected.map(|value| value as PyObjectRef);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(items_block_items_base(dest), 4) },
+                &expected
+            );
+            unsafe {
+                dealloc_list_items_block(source);
+                dealloc_list_items_block(dest);
+            }
+        }
+    }
+
+    #[test]
+    fn ll_arraycopy_int_items_block_copies_distinct_blocks_and_lengths() {
+        unsafe {
+            for (source_start, length, expected) in [
+                (1, 0, [-1, -1, -1, -1]),
+                (3, 1, [4, -1, -1, -1]),
+                (1, 3, [2, 3, 4, -1]),
+            ] {
+                let source = alloc_typed_items_block(4, gc_int_array_gc_type_id());
+                let dest = alloc_typed_items_block(4, gc_int_array_gc_type_id());
+                let source_base = typed_items_block_items_base(source) as *mut i64;
+                let dest_base = typed_items_block_items_base(dest) as *mut i64;
+                for i in 0..4 {
+                    *source_base.add(i) = i as i64 + 1;
+                    *dest_base.add(i) = -1;
+                }
+                ll_arraycopy_int_items_block(source, dest, source_start, 0, length);
+                assert_eq!(std::slice::from_raw_parts(dest_base, 4), &expected);
+                dealloc_typed_items_block(source);
+                dealloc_typed_items_block(dest);
+            }
+        }
+    }
+
+    #[test]
+    fn ll_arraycopy_float_items_block_copies_distinct_blocks_and_lengths() {
+        unsafe {
+            for (source_start, length, expected) in [
+                (1, 0, [-1.0, -1.0, -1.0, -1.0]),
+                (3, 1, [4.0, -1.0, -1.0, -1.0]),
+                (1, 3, [2.0, 3.0, 4.0, -1.0]),
+            ] {
+                let source =
+                    alloc_typed_items_block(4, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+                let dest =
+                    alloc_typed_items_block(4, gc_float_array_gc_type_id()) as *mut FloatItemsBlock;
+                let source_base =
+                    typed_items_block_items_base(source as *mut TypedItemsBlock) as *mut f64;
+                let dest_base =
+                    typed_items_block_items_base(dest as *mut TypedItemsBlock) as *mut f64;
+                for i in 0..4 {
+                    *source_base.add(i) = i as f64 + 1.0;
+                    *dest_base.add(i) = -1.0;
+                }
+                ll_arraycopy_float_items_block(source, dest, source_start, 0, length);
+                assert_eq!(std::slice::from_raw_parts(dest_base, 4), &expected);
+                dealloc_typed_items_block(source as *mut TypedItemsBlock);
+                dealloc_typed_items_block(dest as *mut TypedItemsBlock);
+            }
         }
     }
 
