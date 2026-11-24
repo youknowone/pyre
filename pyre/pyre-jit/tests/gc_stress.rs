@@ -263,6 +263,33 @@ except BaseException:
     );
 }
 
+/// A helper that the inlined callee of a resumed generator body enters
+/// suspends that callee, not the generator frame (`pyjitpl.py`
+/// `perform_call` / `newframe`). Stamping the callee's pc on the generator
+/// frame re-walked the generator's CALL after its operand slots were already
+/// popped, and tracing raised "call on null callable" out of
+/// `dis.get_instructions`.
+#[test]
+fn inlined_callee_helper_suspends_the_callee_not_the_generator() {
+    run_on_worker(
+        r#"
+import pypyjit
+pypyjit.set_param("threshold=1,function_threshold=1")
+import dis
+
+def f():
+    for x in ():
+        pass
+
+found = next(x for x in dis.get_instructions(f) if x.opname == "FOR_ITER")
+assert found.opname == "FOR_ITER", found
+"#,
+        "inlined_callee_helper_suspension.py",
+        "inlined-callee helper suspension",
+        "a helper inside an inlined callee must not resume the generator frame at a callee pc",
+    );
+}
+
 /// Shared harness body for every GC-stress program. Compiles and runs `program`
 /// (using `name` as its `sys.argv[0]` / filename) with the same startup as
 /// `pyrex::real_main` and `run_source`, on the process's own GC. An uncaught
