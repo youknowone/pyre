@@ -6215,7 +6215,9 @@ impl Bookkeeper {
         if let Some(registry) = self.struct_fields.borrow().clone()
             && is_object_pointer_key_spelling(&registry, t)
             && let Some(rows) = registry.field_rows(t)
-            && let Some(inner) = rows.first()
+            && let Some(inner) = rows
+                .iter()
+                .find(|row| !crate::codewriter::call::type_str_leaf_is_void_zst(&row.ty))
         {
             return self.project_struct_field_type(&inner.ty);
         }
@@ -10792,6 +10794,46 @@ mod tests {
             !Rc::ptr_eq(&probe_class, &root_classdef),
             "ObjectKey probe must not alias PyObject"
         );
+    }
+
+    #[test]
+    fn transparent_gc_wrapper_projection_skips_leading_zst() {
+        use super::super::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::TransparentPointerKind;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "fixture::Object".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "fixture::MarkedObjectRef".to_string(),
+            vec![
+                ("marker".to_string(), "PhantomData<Infallible>".to_string()),
+                ("pointer".to_string(), "*mut fixture::Object".to_string()),
+            ],
+        );
+        reg.note_transparent_pointer_kind(
+            "fixture::MarkedObjectRef".into(),
+            TransparentPointerKind::GcObject,
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let root = bk
+            .getuniqueclassdef_for_struct_root("fixture::Object")
+            .expect("Object classdef");
+        let SomeValue::Instance(projected) =
+            bk.project_struct_field_type("fixture::MarkedObjectRef")
+        else {
+            panic!("transparent wrapper must project its pointer payload")
+        };
+        assert!(projected.can_be_none);
+        assert!(Rc::ptr_eq(
+            &projected.classdef.expect("wrapper aliases Object"),
+            &root,
+        ));
     }
 
     #[test]
