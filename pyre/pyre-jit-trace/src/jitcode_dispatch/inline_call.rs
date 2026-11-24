@@ -12494,6 +12494,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `sym.registers_r`.
             let _callee_bank_guard =
                 crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
+            // `perform_call` / `newframe`: this callee is its own framestack
+            // level, so a helper it enters must suspend it and not the
+            // enclosing driver frame. The callee runs on the Rust stack, so
+            // detach the enclosing driver for its walk; the result reaches
+            // this frame through the tail below (`finishframe` /
+            // `make_result_of_lastop`).
+            let _detached_driver = DetachedSubWalkDriver::detach();
             walk(body.code, inline_merge_pc.unwrap_or(0), &mut sub_wc)
         };
         // `blackhole_if_trace_too_long` raises out of `_interpret`. `popframe`
@@ -22657,6 +22664,46 @@ pub(crate) fn set_subwalk_driver(pointer: *mut ()) {
     SUBWALK_DRIVER.with(|slot| slot.set(pointer));
 }
 
+/// The enclosing sub-walk driver, and its list-append suspend bookmarks,
+/// detached for an inlined callee that is walked on the Rust stack below
+/// the driver's active frame. Reinstalled on drop.
+///
+/// `pyjitpl.py` `perform_call` / `newframe` make the callee its own
+/// framestack level: a helper the callee enters suspends the callee
+/// (`ChangeFrame`), and `finishframe` / `make_result_of_lastop` hand the
+/// helper's result back to the callee. While the enclosing driver stays
+/// installed, that helper instead publishes to it, the `SubWalkSuspended`
+/// unwinds the callee walk, and the driver stamps a callee pc on the frame
+/// that made the call. Detached, the helper opens its own driver and
+/// finishes inside the callee, as it does under a callee inlined from the
+/// root walk.
+pub(crate) struct DetachedSubWalkDriver {
+    driver: *mut (),
+    list_append_suspend_bookmark: Vec<super::ListAppendSuspendBookmark>,
+}
+
+impl DetachedSubWalkDriver {
+    pub(crate) fn detach() -> Self {
+        Self {
+            driver: take_subwalk_driver(),
+            list_append_suspend_bookmark: super::take_list_append_suspend_bookmark(),
+        }
+    }
+}
+
+impl Drop for DetachedSubWalkDriver {
+    fn drop(&mut self) {
+        let displaced = SUBWALK_DRIVER.with(|slot| slot.replace(self.driver));
+        debug_assert!(
+            displaced.is_null() || std::thread::panicking(),
+            "a sub-walk driver opened under an inlined callee outlived its walk"
+        );
+        super::set_list_append_suspend_bookmark(std::mem::take(
+            &mut self.list_append_suspend_bookmark,
+        ));
+    }
+}
+
 static SUBWALK_DIRECT_RESUME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUBWALK_CALL_REPLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUBWALK_HEAP_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -24983,6 +25030,85 @@ mod subwalk_checkpoint_tests {
         // call opcode.  Empty code is that miss, not a void-return shape.
         assert_eq!(call_opcode_result_dst(&[], 0), None);
         assert_eq!(inline_call_subreturn_dst(&[], 0), None);
+    }
+
+    #[test]
+    fn inlined_callee_walk_detaches_the_enclosing_subwalk_driver() {
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                set_subwalk_driver(std::ptr::null_mut());
+                set_list_append_suspend_bookmark(Vec::new());
+            }
+        }
+        let _clear = ClearOnDrop;
+
+        fn empty_exchange() -> SubWalkExchange<'static, crate::state::PyreSym> {
+            SubWalkExchange {
+                pending: None,
+                completed: Vec::new(),
+                completed_cursor: 0,
+                active_frame_id: 0,
+                next_frame_id: 1,
+                step_trace_position: None,
+                step_effect_count: 0,
+                step_heap_writing: 0,
+                step_unjournaled: false,
+                step_heap_cache: None,
+                residual_step: false,
+                ancestor_frames: std::ptr::null(),
+                ancestor_len: 0,
+                active_caller_pc: 0,
+                step_iter_checkpoint: None,
+                step_send_ex_caller: None,
+            }
+        }
+
+        let mut outer = empty_exchange();
+        let expected = &mut outer as *mut SubWalkExchange<'_, crate::state::PyreSym> as *mut ();
+        let _outer_driver = SubWalkDriverGuard::install(&mut outer);
+        let bookmark = ListAppendSuspendBookmark {
+            pc: 7,
+            position: majit_metainterp::recorder::TracePosition {
+                _pos: 1,
+                _count: 2,
+                _index: 3,
+                snapshot_data_len: 4,
+                snapshot_array_data_len: 5,
+            },
+            promote_journal_before: 6,
+            len_before: 9,
+        };
+        set_list_append_suspend_bookmark(vec![bookmark.clone()]);
+
+        {
+            let _detached = DetachedSubWalkDriver::detach();
+            assert!(
+                !subwalk_driver_is_active(),
+                "a helper inside the inlined callee must not publish to the enclosing driver"
+            );
+            assert!(
+                take_list_append_suspend_bookmark().is_empty(),
+                "the enclosing driver's list-append bookmarks must not be visible to the callee"
+            );
+            // A helper the callee enters opens and closes its own driver;
+            // `SubWalkDriverGuard::install` asserts that drivers do not nest.
+            let mut inner = empty_exchange();
+            {
+                let _inner_driver = SubWalkDriverGuard::install(&mut inner);
+                assert!(subwalk_driver_is_active());
+            }
+            assert!(!subwalk_driver_is_active());
+        }
+
+        assert!(subwalk_driver_is_active());
+        let restored = take_subwalk_driver();
+        set_subwalk_driver(restored);
+        assert_eq!(
+            restored, expected,
+            "the enclosing driver must be reinstalled after the callee walk"
+        );
+        assert_eq!(take_list_append_suspend_bookmark(), vec![bookmark]);
     }
 }
 
