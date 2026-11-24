@@ -49,12 +49,13 @@ use std::sync::LazyLock;
 #[cfg(test)]
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey,
-    GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
+    AlwaysInline, Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
+    GraphKey, GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GCREF, GcKind, LowLevelType,
     LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, WeakContainer,
@@ -65,8 +66,8 @@ use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
 };
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 /// RPython `STR = GcForwardReference()` resolved via
@@ -3421,6 +3422,277 @@ pub(crate) fn build_ll_join_chars_look_inside_iff_helper_graph_for(
         vec!["length".to_string(), "chars".to_string()],
         func,
     ))
+}
+
+/// `STR` / `UNICODE` struct, its `chars` array type and that array's
+/// element type (`CHAR_TP` in `rstr.py _new_copy_contents_fun`).
+fn copy_contents_types(
+    str_ptr: &LowLevelType,
+) -> Result<(LowLevelType, LowLevelType, LowLevelType), TyperError> {
+    let str_struct = struct_lltype_from_strptr(str_ptr)?;
+    let chars_array_ty = match &str_struct {
+        LowLevelType::Struct(body) => body
+            ._flds
+            .get("chars")
+            .cloned()
+            .ok_or_else(|| TyperError::message("STR struct has no chars field"))?,
+        _ => {
+            return Err(TyperError::message(
+                "copy_string_contents: STR body is not a Struct",
+            ));
+        }
+    };
+    let char_tp = match &chars_array_ty {
+        LowLevelType::Array(arr) => arr.OF.clone(),
+        _ => {
+            return Err(TyperError::message(
+                "copy_string_contents: chars field is not an Array",
+            ));
+        }
+    };
+    Ok((str_struct, chars_array_ty, char_tp))
+}
+
+pub(crate) fn build_copy_contents_helper_graph(
+    name: &str,
+    str_ptr: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let (str_struct, chars_array_ty, char_tp) = copy_contents_types(str_ptr)?;
+    let offsetof_chars = llmemory::offsetof(&str_struct, "chars").map_err(TyperError::message)?;
+    let itemoffset_chars =
+        llmemory::itemoffsetof(&chars_array_ty, 0).map_err(TyperError::message)?;
+    let sizeof_char = llmemory::sizeof(&char_tp, None).map_err(TyperError::message)?;
+
+    let signed_offset = |off: llmemory::AddressOffset| {
+        constant_with_lltype(ConstValue::AddressOffset(off), LowLevelType::Signed)
+    };
+    let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            op,
+            args,
+            Hlvalue::Variable(result),
+        ));
+    };
+
+    let src = variable_with_lltype("src", str_ptr.clone());
+    let dst = variable_with_lltype("dst", str_ptr.clone());
+    let srcstart = variable_with_lltype("srcstart", LowLevelType::Signed);
+    let dststart = variable_with_lltype("dststart", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(src.clone()),
+        Hlvalue::Variable(dst.clone()),
+        Hlvalue::Variable(srcstart.clone()),
+        Hlvalue::Variable(dststart.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let ge0 = variable_with_lltype("ge0", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_ge",
+        vec![
+            Hlvalue::Variable(length.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        ge0.clone(),
+    );
+    let assert_void = variable_with_lltype("v", LowLevelType::Void);
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(ge0),
+            constant_with_lltype(
+                ConstValue::byte_str("copy_string_contents: negative length"),
+                LowLevelType::Void,
+            ),
+        ],
+        assert_void,
+    );
+
+    let src_adr = variable_with_lltype("src_adr", LowLevelType::Address);
+    push(
+        &startblock,
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(src.clone())],
+        src_adr.clone(),
+    );
+    let src_adr1 = variable_with_lltype("src_adr1", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(src_adr),
+            signed_offset(offsetof_chars.clone()),
+        ],
+        src_adr1.clone(),
+    );
+    let src_adr2 = variable_with_lltype("src_adr2", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(src_adr1),
+            signed_offset(itemoffset_chars.clone()),
+        ],
+        src_adr2.clone(),
+    );
+    let src_ofs = variable_with_lltype("src_ofs", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char.clone(), LowLevelType::Signed),
+            Hlvalue::Variable(srcstart),
+        ],
+        src_ofs.clone(),
+    );
+    let asrc = variable_with_lltype("asrc", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(src_adr2), Hlvalue::Variable(src_ofs)],
+        asrc.clone(),
+    );
+
+    let dst_adr = variable_with_lltype("dst_adr", LowLevelType::Address);
+    push(
+        &startblock,
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(dst.clone())],
+        dst_adr.clone(),
+    );
+    let dst_adr1 = variable_with_lltype("dst_adr1", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr), signed_offset(offsetof_chars)],
+        dst_adr1.clone(),
+    );
+    let dst_adr2 = variable_with_lltype("dst_adr2", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr1), signed_offset(itemoffset_chars)],
+        dst_adr2.clone(),
+    );
+    let dst_ofs = variable_with_lltype("dst_ofs", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char.clone(), LowLevelType::Signed),
+            Hlvalue::Variable(dststart),
+        ],
+        dst_ofs.clone(),
+    );
+    let adst = variable_with_lltype("adst", LowLevelType::Address);
+    push(
+        &startblock,
+        "adr_add",
+        vec![Hlvalue::Variable(dst_adr2), Hlvalue::Variable(dst_ofs)],
+        adst.clone(),
+    );
+
+    let nbytes = variable_with_lltype("nbytes", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_mul",
+        vec![
+            constant_with_lltype(sizeof_char, LowLevelType::Signed),
+            Hlvalue::Variable(length),
+        ],
+        nbytes.clone(),
+    );
+    let copied = variable_with_lltype("copied", LowLevelType::Void);
+    push(
+        &startblock,
+        "raw_memcopy",
+        vec![
+            Hlvalue::Variable(asrc),
+            Hlvalue::Variable(adst),
+            Hlvalue::Variable(nbytes),
+        ],
+        copied,
+    );
+    let kept_src = variable_with_lltype("kept", LowLevelType::Void);
+    push(
+        &startblock,
+        "keepalive",
+        vec![Hlvalue::Variable(src)],
+        kept_src,
+    );
+    let kept_dst = variable_with_lltype("kept", LowLevelType::Void);
+    push(
+        &startblock,
+        "keepalive",
+        vec![Hlvalue::Variable(dst)],
+        kept_dst,
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // `rstr.py _new_copy_contents_fun copy_string_contents`
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func._always_inline_ = AlwaysInline::True;
+    func.oopspec = Some("stroruni.copy_contents(src, dst, srcstart, dststart, length)".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["src", "dst", "srcstart", "dststart", "length"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        func,
+    ))
+}
+
+pub(crate) fn copy_contents_helper(
+    rtyper: &RPythonTyper,
+    str_ptr: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let (_, _, char_tp) = copy_contents_types(str_ptr)?;
+    let name = match &char_tp {
+        LowLevelType::Char => "copy_string_contents",
+        LowLevelType::UniChar => "copy_unicode_contents",
+        other => {
+            return Err(TyperError::message(format!(
+                "copy_contents unsupported chars element type {other:?}"
+            )));
+        }
+    };
+    let str_ptr_clone = str_ptr.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![
+            str_ptr.clone(),
+            str_ptr.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Void,
+        move |_r, _a, _res| build_copy_contents_helper_graph(name, &str_ptr_clone),
+    )
 }
 
 /// `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) selects
@@ -19769,5 +20041,80 @@ mod tests {
             },
             other => panic!("etype must be a Constant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copy_string_contents_helper_carries_the_stroruni_copy_contents_oopspec() {
+        let pygraph = build_copy_contents_helper_graph("copy_string_contents", &STRPTR)
+            .expect("build_copy_contents_helper_graph");
+        assert_eq!(
+            pygraph.func.oopspec.as_deref(),
+            Some("stroruni.copy_contents(src, dst, srcstart, dststart, length)")
+        );
+        let names = crate::codewriter::jtransform_opname::startblock_oopspec_argnames(
+            &pygraph.graph.borrow(),
+        );
+        assert_eq!(names, ["src", "dst", "srcstart", "dststart", "length"]);
+    }
+
+    #[test]
+    fn copy_string_contents_body_is_raw_memcopy_between_keepalives() {
+        fn assert_copy_contents_opnames(pygraph: &PyGraph) {
+            let opnames: Vec<String> = pygraph
+                .graph
+                .borrow()
+                .startblock
+                .borrow()
+                .operations
+                .iter()
+                .map(|op| op.opname.clone())
+                .collect();
+            assert_eq!(
+                opnames
+                    .iter()
+                    .filter(|n| n.as_str() == "raw_memcopy")
+                    .count(),
+                1,
+                "raw_memcopy once: {opnames:?}"
+            );
+            let memcopy_pos = opnames
+                .iter()
+                .position(|n| n == "raw_memcopy")
+                .expect("raw_memcopy");
+            let keepalive_positions: Vec<usize> = opnames
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() == "keepalive")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(keepalive_positions.len(), 2, "keepalive twice: {opnames:?}");
+            assert!(
+                keepalive_positions.iter().all(|&i| i > memcopy_pos),
+                "both keepalives after raw_memcopy: {opnames:?}"
+            );
+            assert_eq!(
+                opnames
+                    .iter()
+                    .filter(|n| n.as_str() == "cast_ptr_to_adr")
+                    .count(),
+                2,
+                "cast_ptr_to_adr twice: {opnames:?}"
+            );
+            assert!(
+                !opnames.iter().any(|n| n == "copystrcontent"),
+                "no copystrcontent: {opnames:?}"
+            );
+            assert!(
+                !opnames.iter().any(|n| n == "copyunicodecontent"),
+                "no copyunicodecontent: {opnames:?}"
+            );
+        }
+
+        let str_graph = build_copy_contents_helper_graph("copy_string_contents", &STRPTR)
+            .expect("copy_string_contents");
+        assert_copy_contents_opnames(&str_graph);
+        let uni_graph = build_copy_contents_helper_graph("copy_unicode_contents", &UNICODEPTR)
+            .expect("copy_unicode_contents");
+        assert_copy_contents_opnames(&uni_graph);
     }
 }
