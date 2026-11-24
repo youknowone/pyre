@@ -629,6 +629,34 @@ pub unsafe fn ll_arraycopy_float_items_block(
     );
 }
 
+/// rgc.py `ll_arraymove` for the object `ItemsBlock` ARRAY.
+///
+/// The `length <= 1` head is rgc.py `copy_item` (`array[dest_start] =
+/// array[source_start]`), kept as an explicit write-barriered store so the
+/// effect info sees the ARRAY write. Longer moves run [`jit_ll_arraymove`],
+/// which performs `gc_writebarrier_before_move` (`_contains_gcptr(TP.OF)`)
+/// and the overlap-safe memmove.
+///
+/// # Safety
+/// `array` is a live `ItemsBlock` and both ranges are in bounds.
+#[majit_macros::oopspec("list.ll_arraymove(array, source_start, dest_start, length)")]
+pub unsafe fn ll_arraymove_items_block(
+    array: *mut ItemsBlock,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `array[dest_start] = array[source_start]`.
+            let item = unsafe { *items_block_items_base(array).add(source_start as usize) };
+            unsafe { items_block_set_ref(array, dest_start as usize, item) };
+        }
+        return;
+    }
+    jit_ll_arraymove(array as PyObjectRef, source_start, dest_start, length);
+}
+
 /// [`ll_arraycopy_int_items_block`] for an overlapping `GcArray(Signed)` move.
 /// `rgc.py ll_arraymove`.
 ///
@@ -2718,6 +2746,16 @@ mod tests {
             );
             dealloc_typed_items_block(block as *mut TypedItemsBlock);
         }
+    }
+
+    #[test]
+    fn arraymove_of_one_item_is_a_barriered_store() {
+        let a = 0x1000usize as PyObjectRef;
+        let b = 0x2008usize as PyObjectRef;
+        let block = unsafe { alloc_list_items_block(&[a, b]) };
+        unsafe { ll_arraymove_items_block(block, 1, 0, 1) };
+        assert_eq!(unsafe { *items_block_items_base(block) }, b);
+        unsafe { dealloc_list_items_block(block) };
     }
 
     #[test]

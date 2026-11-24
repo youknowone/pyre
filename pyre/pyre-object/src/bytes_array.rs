@@ -181,7 +181,7 @@ impl BytesArray {
     /// it: the referenced set is unchanged and only which card page holds each
     /// pointer moves. A minor reaches a carded array through its dirty pages
     /// alone, so a young pointer shifted into a clean page would not be
-    /// scanned. The list side spells this `list_before_move_barrier`.
+    /// scanned. The list side spells this `ll_arraymove_items_block`.
     #[inline]
     fn before_move_barrier(&self) {
         if !self.block.is_null() {
