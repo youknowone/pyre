@@ -7333,6 +7333,11 @@ fn build_class_inner(
         };
         // If the metaclass call raised, propagate the original error rather
         // than silently producing a NULL class object.
+        // [3.15-spec] PyPy `build_class` rewrites a traceback-free TypeError
+        // from a metaclass other than `type` into "metaclass found to be
+        // ...". `builtin___build_class__` (Python/bltinmodule.c, v3.15.0)
+        // returns the error from `PyObject_VectorcallDict(meta, ...)`
+        // unchanged; the message is observable, so it is passed through.
         if result.is_null() {
             if let Some(err) = take_call_error() {
                 return Err(err);
@@ -7365,10 +7370,15 @@ fn build_class_inner(
         // `typeobject.py descr__new__`: `name = space.text_w(w_name)`; a lone
         // surrogate is `UnicodeEncodeError` ("surrogates not allowed"). Owned,
         // because the allocations below can move the name's payload.
-        // `_create_new_type`: `'\x00' in name` raises ValueError. The order
-        // against `_check_surrogate` is the one `type.__new__` uses
-        // (`builtins.rs`): a lone surrogate is reported first. U+0000 is a
-        // single 0x00 byte in WTF-8.
+        // `_create_new_type`: `'\x00' in name` raises ValueError.
+        // [3.15-spec] For a name holding both a NUL and a lone surrogate,
+        // PyPy tests the NUL first (ValueError). `type_new_set_name`
+        // (Objects/typeobject.c, v3.15.0) encodes with
+        // `PyUnicode_AsUTF8AndSize` before its `strlen` NUL test, and a run at
+        // v3.15.0 raises UnicodeEncodeError for `"a\0\ud800"`. The exception
+        // type is observable, so the surrogate check runs first, as in
+        // `type.__new__` (`builtins.rs`). U+0000 is a single 0x00 byte in
+        // WTF-8.
         crate::builtins::check_surrogate(pyre_object::gc_roots::shadow_stack_get(w_name_slot))?;
         if unsafe {
             pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(w_name_slot))
