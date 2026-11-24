@@ -662,11 +662,11 @@ impl WeakDict<StrKey> {
     /// `WeakValueDictRepr.ll_set`. A null `llvalue` is `None` and
     /// dispatches to `ll_set_null`.
     #[majit_macros::dont_look_inside]
-    pub fn ll_set(&mut self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
+    pub fn ll_set(d: *mut Self, llkey: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
         if !llvalue.is_null() {
-            self.ll_set_nonnull(llkey, llvalue)
+            Self::ll_set_nonnull(d, llkey, llvalue)
         } else {
-            self.ll_set_null(llkey);
+            Self::ll_set_null(d, llkey);
             true
         }
     }
@@ -675,11 +675,12 @@ impl WeakDict<StrKey> {
     /// stays true, and nulls the key with `WeakDictKey::dummy`
     /// (`r_key.convert_const(None)`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_null(&mut self, llkey: StrKey) {
+    pub fn ll_set_null(d: *mut Self, llkey: StrKey) {
+        let this = unsafe { &mut *d };
         let hash = llkey.ll_keyhash();
-        let i = ll_dict_lookup(self, llkey, hash) & (HIGHEST_BIT - 1);
-        if everused(self.entries, i) {
-            <Self as RDict>::mark_deleted(self.entries, i);
+        let i = ll_dict_lookup(this, llkey, hash) & (HIGHEST_BIT - 1);
+        if everused(this.entries, i) {
+            <Self as RDict>::mark_deleted(this.entries, i);
         }
     }
 
@@ -688,12 +689,16 @@ impl WeakDict<StrKey> {
     /// `llvalue` are livevars across that malloc (`framework.py`
     /// `push_roots`).
     #[majit_macros::dont_look_inside]
-    pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) -> bool {
+    pub fn ll_set_nonnull(
+        d: *mut Self,
+        key: StrKey,
+        llvalue: crate::pyobject::PyObjectRef,
+    ) -> bool {
         let _roots = crate::gc_roots::push_roots();
         // `write_barrier` first (not a collect), then `d` / `llvalue` /
         // `llkey` as one livevar set (`framework.py` `push_roots`) across
         // `weakref_create`.
-        barrier_weakdict(self as *mut WeakDict<StrKey>);
+        let (dict_slot, _) = pin_table_and_entries(d, std::ptr::null_mut());
         let has_key = !key.0.is_null();
         let val_slot = if has_key {
             crate::gc_roots::pin_roots(&[llvalue, key.0 as crate::pyobject::PyObjectRef])
@@ -712,7 +717,8 @@ impl WeakDict<StrKey> {
         } else {
             key
         };
-        self.ll_set_nonnull_valueref(key, valueref)
+        let d = pinned_dict(dict_slot, d);
+        unsafe { (*d).ll_set_nonnull_valueref(key, valueref) }
     }
 
     /// Lookup/insert half of `WeakValueDictRepr.ll_set_nonnull` after
@@ -802,7 +808,7 @@ mod tests {
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let key = str_key(b"abc");
         let obj = 0x1111 as crate::pyobject::PyObjectRef;
-        d.ll_set_nonnull(key, obj);
+        WeakDict::ll_set_nonnull(d, key, obj);
         assert_eq!(d.ll_get(key), Some(obj));
         assert!(d.ll_get(str_key(b"abd")).is_none());
         assert_eq!(d.count_valid(), 1);
@@ -851,7 +857,7 @@ mod tests {
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let gc_key = str_key(b"gc-weakref");
         let gc_obj = 0x4444 as crate::pyobject::PyObjectRef;
-        d.ll_set_nonnull(gc_key, gc_obj);
+        WeakDict::ll_set_nonnull(d, gc_key, gc_obj);
         assert_eq!(d.ll_get(gc_key), Some(gc_obj));
         assert_eq!(d.count_valid(), 1);
         assert_eq!(d.count_valid_immortal(), 0);
@@ -877,12 +883,30 @@ mod tests {
             let bytes = format!("k{n}");
             let key = str_key(bytes.as_bytes());
             let obj = (0x2000 + n) as crate::pyobject::PyObjectRef;
-            d.ll_set_nonnull(key, obj);
+            WeakDict::ll_set_nonnull(d, key, obj);
             objs.push((key, obj));
         }
         assert!(unsafe { (*d.entries).length } > DICT_INITSIZE);
         for (key, obj) in objs {
             assert_eq!(d.ll_get(key), Some(obj));
+        }
+    }
+
+    /// Repeated `ll_set_nonnull` resizes preserve every key and weak value.
+    #[test]
+    fn several_resizes_keep_all_live_weak_values() {
+        let d = crate::rweakvaldict::ll_new_weakdict::<StrKey>();
+        let mut objs = Vec::new();
+        for n in 0..128 {
+            let bytes = format!("many-k{n}");
+            let key = str_key(bytes.as_bytes());
+            let obj = (0x8000 + n) as crate::pyobject::PyObjectRef;
+            assert!(WeakDict::ll_set_nonnull(d, key, obj));
+            objs.push((key, obj));
+        }
+        assert!(unsafe { (*(*d).entries).length } > DICT_INITSIZE * 4);
+        for (key, obj) in objs {
+            assert_eq!(unsafe { (*d).ll_get(key) }, Some(obj));
         }
     }
 
@@ -901,8 +925,8 @@ mod tests {
         assert_eq!(ll_strhash(other.0), first);
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let obj = 0x3333 as crate::pyobject::PyObjectRef;
-        d.ll_set_nonnull(key, obj);
-        d.ll_set_nonnull(other, obj);
+        WeakDict::ll_set_nonnull(d, key, obj);
+        WeakDict::ll_set_nonnull(d, other, obj);
         assert_eq!(d.count_valid(), 1);
     }
 
@@ -933,7 +957,7 @@ mod tests {
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let key = str_key(b"set-live");
         let obj = 0x4444 as crate::pyobject::PyObjectRef;
-        d.ll_set(key, obj);
+        WeakDict::ll_set(d, key, obj);
         assert_eq!(d.ll_get(key), Some(obj));
         assert_eq!(d.count_valid(), 1);
     }
@@ -946,10 +970,10 @@ mod tests {
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let key = str_key(b"set-null");
         let obj = 0x5555 as crate::pyobject::PyObjectRef;
-        d.ll_set(key, obj);
+        WeakDict::ll_set(d, key, obj);
         assert_eq!(d.ll_get(key), Some(obj));
 
-        d.ll_set(key, std::ptr::null_mut());
+        WeakDict::ll_set(d, key, std::ptr::null_mut());
         assert!(d.ll_get(key).is_none());
         assert_eq!(d.count_valid(), 0);
 
@@ -963,7 +987,7 @@ mod tests {
 
         let other = str_key(b"set-null-other");
         let other_obj = 0x5556 as crate::pyobject::PyObjectRef;
-        d.ll_set(other, other_obj);
+        WeakDict::ll_set(d, other, other_obj);
         assert_eq!(d.ll_get(other), Some(other_obj));
         assert!(d.ll_get(key).is_none());
     }
@@ -973,7 +997,7 @@ mod tests {
     fn ll_set_null_on_unused_key_does_not_occupy_a_slot() {
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let key = str_key(b"never-used");
-        d.ll_set_null(key);
+        WeakDict::ll_set_null(d, key);
         assert!(d.ll_get(key).is_none());
         assert_eq!(d.count_valid(), 0);
         let i = ll_dict_lookup(d, key, key.ll_keyhash()) & (HIGHEST_BIT - 1);
@@ -993,7 +1017,7 @@ mod tests {
 
         let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
         let obj = 0x6666 as crate::pyobject::PyObjectRef;
-        d.ll_set_nonnull(key, obj);
+        WeakDict::ll_set_nonnull(d, key, obj);
         let i = ll_dict_lookup(d, key, computed) & (HIGHEST_BIT - 1);
         assert_eq!(ll_hash(d.entries, i), computed);
         assert_eq!(d.ll_get(key), Some(obj));
