@@ -803,10 +803,9 @@ impl BlackholeInterpreter {
     }
 
     fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
-        // `blackhole.py` `BlackholeInterpreter.setposition` reads
-        // `jitcode.num_regs_*` / `jitcode.constants_*` as fields
-        // (`JitCode.setup`). `Arc<JitCode>` on `self.jitcode` pins them.
-        let body = jitcode.body();
+        // SAFETY: `setposition_ref` receives a registry-resolved Arc;
+        // resolution cannot return an unset shell (`JitCode.setup`).
+        let body = unsafe { jitcode.body_assume_published() };
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
             body.c_num_regs_i as usize,
@@ -1166,7 +1165,11 @@ impl BlackholeInterpreter {
         // blackhole.py: `for i in range(self.jitcode.num_regs_r()):
         // self.registers_r[i] = NULL`. The `min` keeps the old per-index
         // guard's no-panic behaviour for a bank shorter than the count.
-        let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
+        // SAFETY: `self.jitcode` is always published: `Default` seats
+        // `JitCode::default` (empty published body) and `release_interp`
+        // never clears it; a seated interp keeps the last
+        // `setposition_ref` jitcode (`BlackholeInterpBuilder.release_interp`).
+        let n_r = unsafe { self.jitcode.num_regs_r_assume_published() }.min(self.registers_r.len());
         self.registers_r[..n_r].fill(0);
         self.exception_last_value = 0;
         self.pending_exc = 0;
@@ -1181,7 +1184,13 @@ impl BlackholeInterpreter {
     /// There is no side table to disagree with the code stream, so the marker
     /// hook's register clear and a resume's register seeding read one source.
     pub fn get_current_position_info(&self) -> usize {
-        self.jitcode.get_live_vars_info(self.position, self.op_live)
+        // SAFETY: `blackhole_from_resumedata` called `setposition_ref`
+        // first; `setposition_ref` runs `init_register_files_from_runtime_jitcode`
+        // on a published body (`JitCode.setup`).
+        unsafe {
+            self.jitcode
+                .get_live_vars_info_assume_published(self.position, self.op_live)
+        }
     }
 
     /// Jitcode pc of the last `-live-` marker, if this frame has executed one
@@ -1203,7 +1212,9 @@ impl BlackholeInterpreter {
     /// (`jtransform.py handle_regular_call` / `handle_residual_call`),
     /// and `inline_call_typed` closes on the destination byte.
     fn call_result_reg(&self, _kind: BhReturnType) -> usize {
-        self.jitcode.code[self.position - 1] as usize
+        // SAFETY: the resumed call bytecode ends in the destination
+        // operand (`blackhole.py _setup_return_value_*`).
+        unsafe { self.jitcode.result_reg_assume_published(self.position) }
     }
 
     /// blackhole.py _setup_return_value_i
@@ -1212,23 +1223,36 @@ impl BlackholeInterpreter {
     /// 'xxx_call_yyy' instructions from the caller frame.
     /// blackhole.py _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
-        // blackhole.py:1655-1656
-        let reg_idx = self.call_result_reg(BhReturnType::Int);
-        self.registers_i[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Int);
+        debug_assert!(reg < self.registers_i.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants;
+        // the destination byte is a register index in that bank
+        // (`blackhole.py _setup_return_value_i`).
+        unsafe {
+            *self.registers_i.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
-        // blackhole.py:1658-1659
-        let reg_idx = self.call_result_reg(BhReturnType::Ref);
-        self.registers_r[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Ref);
+        debug_assert!(reg < self.registers_r.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants
+        // (`blackhole.py _setup_return_value_r`).
+        unsafe {
+            *self.registers_r.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
-        // blackhole.py:1661-1662
-        let reg_idx = self.call_result_reg(BhReturnType::Float);
-        self.registers_f[reg_idx] = result;
+        let reg = self.call_result_reg(BhReturnType::Float);
+        debug_assert!(reg < self.registers_f.len());
+        // SAFETY: `setposition_ref` sized the bank to num_regs + constants
+        // (`blackhole.py _setup_return_value_f`).
+        unsafe {
+            *self.registers_f.get_unchecked_mut(reg) = result;
+        }
     }
 
     /// blackhole.py _done_with_this_frame
@@ -5588,23 +5612,48 @@ mod tests {
         /// result register `inline_call_typed` now closes on.
         #[test]
         fn setup_return_value_i_reads_inline_calls_int_return_slot() {
+            let last_i = 7u16;
             let mut b = JitCodeBuilder::default();
-            b.inline_call_r_i(0, &[], Some(7));
+            b.ensure_i_regs(last_i + 1);
+            b.inline_call_r_i(0, &[], Some(last_i));
             let jitcode = b.finish();
             // The call is the whole body, so the position the caller resumes at
             // is the end of the code.
             let resume_pos = jitcode.code.len();
             assert_eq!(
                 jitcode.code[resume_pos - 1],
-                7,
+                last_i as u8,
                 "inline call must end on the int result register",
             );
+            assert_eq!(jitcode.num_regs_i(), last_i as usize + 1);
 
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            let last_legal = bh.registers_i.len() - 1;
+            assert!(last_i as usize <= last_legal);
             bh.setup_return_value_i(42);
-            assert_eq!(bh.registers_i[7], 42);
+            assert_eq!(bh.registers_i[last_i as usize], 42);
+
+            let last_r = 7u16;
+            let mut b = JitCodeBuilder::default();
+            b.ensure_r_regs(last_r + 1);
+            b.inline_call_r_r(0, &[], Some(last_r));
+            let jitcode = b.finish();
+            let resume_pos = jitcode.code.len();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            bh.setup_return_value_r(99);
+            assert_eq!(bh.registers_r[last_r as usize], 99);
+
+            let last_f = 7u16;
+            let mut b = JitCodeBuilder::default();
+            b.ensure_f_regs(last_f + 1);
+            b.inline_call_irf_f(0, &[], &[], &[], Some(last_f));
+            let jitcode = b.finish();
+            let resume_pos = jitcode.code.len();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
+            bh.setup_return_value_f(123);
+            assert_eq!(bh.registers_f[last_f as usize], 123);
         }
 
         /// `BlackholeInterpreter.setposition` + `run` on a helper (non-portal)

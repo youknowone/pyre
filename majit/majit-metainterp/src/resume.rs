@@ -7964,10 +7964,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_i`: `write_an_int(index, next_int())`.
                 let tagged = cur.next_item() as i16;
-                bh.registers_i[reg_idx as usize] = self.decode_int_tagged(tagged, &mut cur);
+                let value = self.decode_int_tagged(tagged, &mut cur);
+                debug_assert!(reg_idx < bh.registers_i.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // integer bank; `setposition_ref` sized it to
+                // `num_regs_i + constants_i` before consumption
+                // (`resume.py write_an_int`).
+                unsafe {
+                    *bh.registers_i.get_unchecked_mut(reg_idx) = value;
+                }
             }
             offset = it.offset();
             cur.write_to_reader(&mut self.resumecodereader);
@@ -7978,11 +7986,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_r`: `write_a_ref(index, next_ref())`.
                 let tagged = cur.next_item() as i16;
                 let value = self.decode_ref_tagged(tagged, &mut cur);
-                bh.registers_r[reg_idx as usize] = value;
+                debug_assert!(reg_idx < bh.registers_r.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // ref bank; `setposition_ref` sized it to
+                // `num_regs_r + constants_r` before consumption
+                // (`resume.py write_a_ref`).
+                unsafe {
+                    *bh.registers_r.get_unchecked_mut(reg_idx) = value;
+                }
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
@@ -7996,10 +8011,18 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
-                let reg_idx = unsafe { it.next_index() };
+                let reg_idx = unsafe { it.next_index() } as usize;
                 // resume.py `_callback_f`: `write_a_float(index, next_float())`.
                 let tagged = cur.next_item() as i16;
-                bh.registers_f[reg_idx as usize] = self.decode_float_tagged(tagged, &cur);
+                let value = self.decode_float_tagged(tagged, &cur);
+                debug_assert!(reg_idx < bh.registers_f.len());
+                // SAFETY: `LivenessIterator` indexes this jitcode's assembled
+                // float bank; `setposition_ref` sized it to
+                // `num_regs_f + constants_f` before consumption
+                // (`resume.py write_a_float`).
+                unsafe {
+                    *bh.registers_f.get_unchecked_mut(reg_idx) = value;
+                }
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
