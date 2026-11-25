@@ -904,18 +904,22 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 }
 
 /// A discovered reference-payload generic-enum instantiation: the enum's
-/// Charon def id and qualified name, the concrete type arguments in
-/// generic-parameter order (`["Tuple", "PyError"]`), and the `<…>` suffix
-/// the per-instantiation classdef carries (`<Tuple,PyError>`).
+/// Charon def id and qualified name, the intern payload rows in
+/// generic-parameter order (`["Tuple", "PyError"]`), the `<…>` suffix
+/// the per-instantiation classdef carries (`<Tuple,PyError>`), and the
+/// `render_adt_type_args` spellings [`concrete_adt_struct_id`] uses for
+/// the layout STRUCT.
 ///
-/// Ordered by `(name_path, suffix, args, def_id)` so intern registration
-/// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
+/// Ordered by `(name_path, suffix, args, layout_args, def_id)` so intern
+/// registration walks one stable sequence; `{base}{suffix}::{variant}` is
+/// first-writer.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+    layout_args: Vec<String>,
 }
 
 impl PartialOrd for RefEnumInst {
@@ -930,6 +934,7 @@ impl Ord for RefEnumInst {
             .cmp(&other.name_path)
             .then_with(|| self.suffix.cmp(&other.suffix))
             .then_with(|| self.args.cmp(&other.args))
+            .then_with(|| self.layout_args.cmp(&other.layout_args))
             .then_with(|| self.def_id.cmp(&other.def_id))
     }
 }
@@ -1032,11 +1037,17 @@ fn ref_enum_instantiation_of_adt(
         &std::collections::HashSet::<String>::new(),
         tombstoned,
     );
+    // Same type-arg spellings `resolve_adt_field` / `stamp_enum_variant_instance_layout`
+    // pass to `concrete_adt_struct_id`. Intern suffix keeps `&` on a scalar
+    // Ref (`charon_type_value_to_enum_arg`); the layout STRUCT does not
+    // (`render_adt_type_args` / `type_arg_referent_is_raw_storage`).
+    let layout_args = render_adt_type_args(adt, llbc, 0, tombstoned);
     Some(RefEnumInst {
         def_id,
         name_path,
         args,
         suffix,
+        layout_args,
     })
 }
 
@@ -1763,18 +1774,28 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
-            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
-            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
+            // `descr.py get_field_descr`: `parent_descr = get_size_descr(STRUCT)`.
+            // FieldRead `owner_id` is `concrete_adt_struct_id` of the variant
+            // template. NEW looks that STRUCT up through `struct_id_for_name`
+            // of `{base}{suffix}::{variant}`, so intern mints the same
+            // identity rather than `from_canonical_spelling` of the intern
+            // suffix (which keeps `&` on a scalar Ref).
+            let template =
+                majit_ir::descr::StructId::from_canonical(&format!("{canon_base}::{}", v.name));
+            let sid = if inst.layout_args.is_empty() {
+                template
+            } else {
+                template.instantiate(&format!("<{}>", inst.layout_args.join(",")))
+            };
             for base in &bases {
                 let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
-                // Layout id stays the crate-stripped spelling
-                // (`StructId::from_canonical_spelling`). Class identity
-                // is not published here: `Bookkeeper.getdesc` of a
-                // constructed generic is the template class object plus
+                // Layout id is the instance STRUCT (`concrete_adt_struct_id`).
+                // Class identity is not published here: `Bookkeeper.getdesc`
+                // of a constructed generic is the template class object plus
                 // its args (`intern_class_key_from_registry` reattaches
                 // them).
                 record_layout_struct_id(struct_ids, key, sid);

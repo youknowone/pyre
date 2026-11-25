@@ -6384,7 +6384,10 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
 ) -> Option<crate::jitcode::BhSizeSpec> {
-    bh_size_spec_for(cc, owner, None)
+    // `descr.py get_field_descr`: `parent_descr = get_size_descr(STRUCT)`.
+    // NEW and every field access key on the same STRUCT identity.
+    let owner_id = majit_ir::descr::struct_id_for_name(owner);
+    bh_size_spec_for(cc, owner, owner_id)
 }
 
 /// True when `owner_id` is a STRUCT whose layout must not be taken from
@@ -10051,6 +10054,106 @@ mod tests {
                 spec.size
             );
         }
+    }
+
+    /// `descr.py get_field_descr`: `parent_descr = get_size_descr(STRUCT)`.
+    /// A generic native-enum variant (`Bound<&f64>::Included`) has a Charon
+    /// variant-local layout (`__pos_0` at 0, size 8) and a distinct instance
+    /// STRUCT (`__pos_0` Float at 8, size 16). NEW mints through
+    /// `bh_size_spec_from_callcontrol` of the intern spelling; SETFIELD
+    /// through `fielddescrof` of that same `owner_id`.
+    #[test]
+    fn new_and_fielddescrof_share_generic_variant_instance_sizedescr() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let template_name = "core::ops::range::Bound::Included";
+        let template_id = majit_ir::descr::StructId::from_canonical(template_name);
+        let owner = "core::ops::range::Bound<&f64>::Included";
+        // Intern maps the intern suffix spelling onto `concrete_adt_struct_id`
+        // (`render_adt_type_args` strips a scalar Ref), matching FieldRead.
+        let owner_id = template_id.instantiate("<f64>");
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (template_name.to_string(), Some(template_id)),
+            (owner.to_string(), Some(owner_id)),
+        ]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "core::ops::range::Bound".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            template_name.to_string(),
+            vec![("__pos_0".to_string(), "f64".to_string())],
+        );
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "f64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            template_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Float,
+                    field_type: majit_ir::value::Type::Float,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".to_string(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Float,
+                    field_type: majit_ir::value::Type::Float,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Bound variant size");
+        let crate::jitcode::BhDescr::Field {
+            offset,
+            parent: Some(parent),
+            ..
+        } = fielddescrof(
+            &FieldDescriptor::new("__pos_0", Some(owner.to_string())).with_owner_id(Some(owner_id)),
+            &crate::model::ValueType::Float,
+            Some(&cc),
+            true,
+        )
+        else {
+            panic!("__pos_0 must carry a parent descriptor");
+        };
+        assert_eq!(offset, 8);
+        assert_eq!(spec.type_id, parent.type_id);
+        assert_eq!(spec.size, parent.size);
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.type_id, owner_id.as_u64());
     }
 
     /// `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the
