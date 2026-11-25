@@ -2477,8 +2477,13 @@ static THIN_STAMPED: std::sync::LazyLock<parking_lot::Mutex<ThinStampedTable>> =
         })
     });
 
-static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_COUNT] =
-    [const { std::sync::OnceLock::new() }; THIN_STAMPED_SLOT_COUNT];
+/// Published `(vtable, stamp)` pairs. Slot `i` is stored with `Release`
+/// before `intern_thin_stamped` returns the id a thin word can carry.
+/// `thin_stamped_at` loads the slot with `Acquire`, pairing with that
+/// `Release` (`descr_vtable_at` / `DESCR_VTABLE_SLOTS`). Unset is 0; a set
+/// slot carries bit 63.
+static THIN_STAMPED_SLOTS: [std::sync::atomic::AtomicU64; THIN_STAMPED_SLOT_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; THIN_STAMPED_SLOT_COUNT];
 
 /// Published vtable pointers. Slot `i` is stored with `Release` before
 /// `DESCR_VTABLE_LEN` advances to `i + 1`, and before `intern_descr_vtable`
@@ -2519,6 +2524,22 @@ fn descr_vtable_at(id: u8) -> usize {
     DESCR_VTABLE_SLOTS[id as usize].load(std::sync::atomic::Ordering::Acquire)
 }
 
+fn pack_thin_stamped(e: ThinStamped) -> u64 {
+    (u64::from(e.vtable) << 32) | u64::from(e.stamp) | (1 << 63)
+}
+
+fn unpack_thin_stamped(w: u64) -> Option<ThinStamped> {
+    if w == 0 {
+        None
+    } else {
+        let w = w & !(1 << 63);
+        Some(ThinStamped {
+            vtable: (w >> 32) as u8,
+            stamp: w as u32,
+        })
+    }
+}
+
 fn is_thin_descr(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
 }
@@ -2542,7 +2563,7 @@ fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
         return None;
     }
     let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
-    THIN_STAMPED_SLOTS[id].get().copied()
+    unpack_thin_stamped(THIN_STAMPED_SLOTS[id].load(std::sync::atomic::Ordering::Acquire))
 }
 
 fn thin_stamp(w: u64) -> u32 {
@@ -2621,7 +2642,8 @@ fn intern_thin_stamped(vtable: u8, stamp: u32) -> Option<u64> {
         vtable,
         stamp,
         |i, key| {
-            let _ = THIN_STAMPED_SLOTS[i].set(key);
+            THIN_STAMPED_SLOTS[i]
+                .store(pack_thin_stamped(key), std::sync::atomic::Ordering::Release);
         },
     )
 }
@@ -7946,6 +7968,8 @@ mod tests {
 
     #[test]
     fn intern_thin_stamped_reuses_id_and_roundtrips_fields() {
+        assert!(super::unpack_thin_stamped(0).is_none());
+
         let id_a = intern_thin_stamped(3, 0xABCDEF01).expect("intern first key");
         let id_a_again = intern_thin_stamped(3, 0xABCDEF01).expect("intern same key");
         assert_eq!(id_a, id_a_again);
@@ -7957,6 +7981,22 @@ mod tests {
         let e = thin_stamped_at(word).expect("reader path");
         assert_eq!(e.vtable, 3);
         assert_eq!(e.stamp, 0xABCDEF01);
+        let packed = super::pack_thin_stamped(e);
+        assert_ne!(packed, 0);
+        assert_eq!(
+            super::unpack_thin_stamped(packed).map(|x| (x.vtable, x.stamp)),
+            Some((3, 0xABCDEF01))
+        );
+
+        let packed_zero = super::pack_thin_stamped(super::ThinStamped {
+            vtable: 0,
+            stamp: 0,
+        });
+        assert_ne!(packed_zero, 0);
+        assert_eq!(
+            super::unpack_thin_stamped(packed_zero).map(|x| (x.vtable, x.stamp)),
+            Some((0, 0))
+        );
     }
 
     #[test]

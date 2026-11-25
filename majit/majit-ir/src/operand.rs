@@ -1630,15 +1630,24 @@ mod tests {
 
         let a = Operand::from_bound_op(&op_at(0, Type::Ref));
         assert!(a.ptr_info().is_none() && a.int_bound().is_none());
+        assert!(a.ptr_info_handle().is_none() && a.int_bound_handle().is_none());
+        assert!(a.ptr_info_mut().is_none() && a.int_bound_mut().is_none());
         a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         assert!(a.ptr_info().expect("ptr_info Some").is_nonnull());
+        assert!(a.ptr_info_handle().is_some());
         assert!(a.int_bound().is_none());
+        assert!(a.int_bound_handle().is_none());
+        assert!(a.int_bound_mut().is_none());
 
         let b = Operand::from_bound_op(&op_at(1, Type::Int));
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
         let ib = b.int_bound().expect("int_bound Some");
         assert!(ib.is_constant());
         assert_eq!(ib.get_constant_int(), 42);
+        assert!(b.int_bound_handle().is_some());
+        assert!(b.ptr_info().is_none());
+        assert!(b.ptr_info_handle().is_none());
+        assert!(b.ptr_info_mut().is_none());
 
         // Const has no _forwarded slot -> readers return None (no panic).
         assert!(Operand::const_(Const::Int(0)).ptr_info().is_none());
