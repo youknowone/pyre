@@ -3399,11 +3399,10 @@ where
     ///  - same-box (pyjitpl.py `if <not float> and b1 is b2`): `x <cmp> x`
     ///    is statically determined (FASTPATHS_SAME_BOXES), so neither the
     ///    compare nor a guard is recorded; gated off for float opcodes.
-    ///  - both-constant: `self.execute(<CMP>, b1, b2)` folds to a `Const` via
-    ///    `execute_and_record` when `_all_constants(b1, b2)` (pyjitpl.py)
-    ///    so nothing is recorded, and `opimpl_goto_if_not` then sees a `Const`
-    ///    condbox so `generate_guard` records no guard either (pyjitpl.py,
-    ///    2583).
+    ///  - both-constant: `taken` is already `eval_binop_i` of the concrete
+    ///    bits. Same skip as the same-box arm — `execute` would return a
+    ///    Const and `generate_guard` records nothing
+    ///    (`pyjitpl.py` `opimpl_goto_if_not_<cmp>` / `MetaInterp.generate_guard`).
     ///
     /// Only a non-constant, non-same-box operand pair materialises the
     /// compare + guard. The branch is followed identically in all cases
@@ -3449,7 +3448,9 @@ where
                 | OpCode::FloatGe
         );
         let same_box = !is_float && lhs.same_box(rhs);
-        if !same_box {
+        // Both-constant is the same skip as same-box: `taken` already holds
+        // the compare, and `generate_guard` would record nothing on a Const.
+        if !same_box && !(lhs.is_constant() && rhs.is_constant()) {
             let cond = ctx.execute_and_record(
                 Some(self.cpu.as_ref()),
                 opcode,
@@ -10655,6 +10656,81 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardFalse),
             "non-constant false branch must guard on the comparison",
+        );
+    }
+
+    /// Both registers `OpRef::ConstInt`: the fused compare records nothing
+    /// (`num_ops` / `RECORDED_OPS` stay put) and the cursor follows `taken`.
+    /// One non-const operand still records `IntLt` + `GuardTrue`/`GuardFalse`.
+    #[test]
+    fn fused_goto_if_not_int_lt_both_constint_records_nothing_and_follows_taken() {
+        let trace_both_const = |lhs: i64, rhs: i64| {
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            builder.load_const_i_value(0, lhs);
+            builder.load_const_i_value(1, rhs);
+            builder.goto_if_not_int_lt(0, 1, target);
+            builder.int_return(0);
+            builder.mark_label(target);
+            builder.int_return(1);
+            let jitcode = builder.finish();
+
+            let mut ctx = TraceCtx::for_test(0);
+            let before_ops = ctx.num_ops();
+            let before_recorded = ctx.profiler().get_counter(crate::counters::RECORDED_OPS);
+            let mut sym = DummySym;
+            let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+            assert_eq!(ctx.num_ops(), before_ops);
+            assert_eq!(
+                ctx.profiler().get_counter(crate::counters::RECORDED_OPS),
+                before_recorded,
+            );
+            match action {
+                TraceAction::Finish { finish_args, .. } => finish_args,
+                other => panic!("expected Finish after fused ConstInt compare, got {other:?}"),
+            }
+        };
+
+        // 5 < 3 is false → `!taken` jumps to the target return of rhs.
+        assert_eq!(trace_both_const(5, 3), vec![OpRef::ConstInt(3)]);
+        // 1 < 3 is true → fall through to the return of lhs.
+        assert_eq!(trace_both_const(1, 3), vec![OpRef::ConstInt(1)]);
+
+        let trace_one_nonconst = |lhs: i64| {
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            builder.load_const_i_value(1, 3);
+            builder.live(&mut asm, &[0], &[], &[]);
+            builder.goto_if_not_int_lt(0, 1, target);
+            builder.mark_label(target);
+            let jitcode = builder.finish();
+
+            let mut ctx = context_with_liveness(&[Type::Int], &asm);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Int, OpRef::input_arg_int(0), lhs)],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            trace_one_nonconst(5),
+            vec![OpCode::IntLt, OpCode::GuardFalse],
+        );
+        assert_eq!(
+            trace_one_nonconst(1),
+            vec![OpCode::IntLt, OpCode::GuardTrue],
         );
     }
 
