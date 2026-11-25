@@ -8871,17 +8871,7 @@ fn record_operator_tail_residual_inner<Sym: WalkSym>(
         })
         .collect();
     let funcptr = ctx.trace_ctx.const_int(tail.tail_call().0);
-    // `call.py getcalldescr`: an initializer is an arbitrary Python call,
-    // so the TypeCallNew tail gets the most general effects (it may force
-    // frames, write any field and invalidate quasi-immutables). The
-    // BinopLast tail only raises the unsupported-operand TypeError. Len
-    // is the same CanRaise as BinopLast: `index` / `_check_len_result`.
-    let ei = match tail {
-        crate::operator_continuation::OperatorTail::TypeCallNew => {
-            majit_ir::EffectInfo::MOST_GENERAL
-        }
-        _ => majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
-    };
+    let ei = tail.effect_info();
     let arg_types: Vec<Type> = vec![Type::Ref; args.len()];
     let descr = majit_metainterp::make_call_descr_with_effect(&arg_types, Type::Ref, ei.clone());
     let call_descr = descr
