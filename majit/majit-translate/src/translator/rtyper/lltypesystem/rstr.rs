@@ -3519,6 +3519,124 @@ pub(crate) fn build_copy_contents_helper_graph(
         assert_void,
     );
 
+    let chars_array_ptr_ty = chars_array_ptr_lltype_from_strptr(str_ptr)?;
+
+    let srcstart_ge0 = variable_with_lltype("srcstart_ge0", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_ge",
+        vec![
+            Hlvalue::Variable(srcstart.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        srcstart_ge0.clone(),
+    );
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(srcstart_ge0),
+            constant_with_lltype(
+                ConstValue::byte_str("copystrc: negative srcstart"),
+                LowLevelType::Void,
+            ),
+        ],
+        variable_with_lltype("v", LowLevelType::Void),
+    );
+
+    let src_len = emit_chars_length_ops(
+        &startblock,
+        Hlvalue::Variable(src.clone()),
+        chars_array_ptr_ty.clone(),
+    );
+    let src_end = variable_with_lltype("src_end", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_add",
+        vec![
+            Hlvalue::Variable(srcstart.clone()),
+            Hlvalue::Variable(length.clone()),
+        ],
+        src_end.clone(),
+    );
+    let src_ok = variable_with_lltype("src_ok", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_le",
+        vec![Hlvalue::Variable(src_end), src_len],
+        src_ok.clone(),
+    );
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(src_ok),
+            constant_with_lltype(
+                ConstValue::byte_str("copystrc: src ovf"),
+                LowLevelType::Void,
+            ),
+        ],
+        variable_with_lltype("v", LowLevelType::Void),
+    );
+
+    let dststart_ge0 = variable_with_lltype("dststart_ge0", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_ge",
+        vec![
+            Hlvalue::Variable(dststart.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        dststart_ge0.clone(),
+    );
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(dststart_ge0),
+            constant_with_lltype(
+                ConstValue::byte_str("copystrc: negative dststart"),
+                LowLevelType::Void,
+            ),
+        ],
+        variable_with_lltype("v", LowLevelType::Void),
+    );
+
+    let dst_len = emit_chars_length_ops(
+        &startblock,
+        Hlvalue::Variable(dst.clone()),
+        chars_array_ptr_ty,
+    );
+    let dst_end = variable_with_lltype("dst_end", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_add",
+        vec![
+            Hlvalue::Variable(dststart.clone()),
+            Hlvalue::Variable(length.clone()),
+        ],
+        dst_end.clone(),
+    );
+    let dst_ok = variable_with_lltype("dst_ok", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_le",
+        vec![Hlvalue::Variable(dst_end), dst_len],
+        dst_ok.clone(),
+    );
+    push(
+        &startblock,
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(dst_ok),
+            constant_with_lltype(
+                ConstValue::byte_str("copystrc: dst ovf"),
+                LowLevelType::Void,
+            ),
+        ],
+        variable_with_lltype("v", LowLevelType::Void),
+    );
+
     let src_adr = variable_with_lltype("src_adr", LowLevelType::Address);
     push(
         &startblock,
@@ -20108,6 +20226,35 @@ mod tests {
             &pygraph.graph.borrow(),
         );
         assert_eq!(names, ["src", "dst", "srcstart", "dststart", "length"]);
+    }
+
+    #[test]
+    fn copy_string_contents_emits_the_five_copystrc_debug_asserts() {
+        let pygraph = build_copy_contents_helper_graph("copy_string_contents", &STRPTR)
+            .expect("copy_string_contents");
+        let msgs: Vec<Vec<u8>> = pygraph
+            .graph
+            .borrow()
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .filter(|op| op.opname == "debug_assert")
+            .filter_map(|op| match &op.args[1] {
+                Hlvalue::Constant(c) => c.value.as_byte_str().map(|b| b.to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            msgs,
+            vec![
+                b"copy_string_contents: negative length".to_vec(),
+                b"copystrc: negative srcstart".to_vec(),
+                b"copystrc: src ovf".to_vec(),
+                b"copystrc: negative dststart".to_vec(),
+                b"copystrc: dst ovf".to_vec(),
+            ]
+        );
     }
 
     #[test]
