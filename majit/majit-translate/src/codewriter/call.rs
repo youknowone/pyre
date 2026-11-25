@@ -1879,6 +1879,27 @@ impl CallDescriptor {
         self
     }
 
+    /// `descr.py get_call_descr` result width and flag for an integer
+    /// `FUNC.RESULT` narrower or unsigned relative to the IR word.
+    pub fn with_int_result_layout(mut self, result_signed: bool, result_size: usize) -> Self {
+        debug_assert_eq!(self.result_type, type_to_argclass(Type::Int));
+        self.result_signed = result_signed;
+        self.result_size = result_size;
+        self.result_erased =
+            CallResultErasedKey::from_ir_layout(Type::Int, result_signed, result_size);
+        self
+    }
+
+    /// `descr.py CallDescr.is_result_signed`: `result_flag == FLAG_SIGNED`.
+    pub fn is_result_signed(&self) -> bool {
+        self.result_signed
+    }
+
+    /// `descr.py CallDescr.get_result_size`.
+    pub fn result_size(&self) -> usize {
+        self.result_size
+    }
+
     pub fn get_extra_info(&self) -> EffectInfo {
         self.extra_info.clone()
     }
@@ -12142,6 +12163,23 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
     }
 }
 
+/// `descr.py get_call_descr`: `result_size = symbolic.get_size(RESULT_ERASED)`
+/// and `get_type_flag(RESULT)` (FLAG_SIGNED / FLAG_UNSIGNED) for an integer
+/// `FUNC.RESULT`. `None` for every non-integer spelling.
+fn declared_int_result_layout(declared: &str) -> Option<(bool, usize)> {
+    Some(match declared {
+        "i8" => (true, 1),
+        "i16" => (true, 2),
+        "i32" => (true, 4),
+        "i64" | "isize" => (true, 8),
+        "u8" | "bool" => (false, 1),
+        "u16" => (false, 2),
+        "u32" | "char" => (false, 4),
+        "u64" | "usize" => (false, 8),
+        _ => return None,
+    })
+}
+
 impl CallControl {
     /// Return the completed `all_jitcodes[]` list in append order. Every
     /// entry must have both a body and a dense final `.index`.
@@ -14993,6 +15031,7 @@ impl CallControl {
         //   FUNC = op.args[0].concretetype.TO
         //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not Void]: raise
         //   if RESULT != FUNC.RESULT: raise
+        let mut declared_result_layout: Option<(bool, usize)> = None;
         match shape {
             CallShape::Direct(target) => {
                 // RPython call.py:223-228: NON_VOID_ARGS != FUNC.ARGS-without-void
@@ -15026,6 +15065,14 @@ impl CallControl {
                             "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
                         );
                     }
+                    declared_result_layout = graph
+                        .return_type
+                        .as_deref()
+                        .map(|declared| {
+                            crate::front::typestr::transparent_result_ok_type(declared)
+                                .unwrap_or(declared)
+                        })
+                        .and_then(declared_int_result_layout);
                 }
             }
             CallShape::Indirect(graphs) => {
@@ -15063,6 +15110,14 @@ impl CallControl {
                                  is {result_type:?}",
                         );
                     }
+                    declared_result_layout = witness_graph
+                        .return_type
+                        .as_deref()
+                        .map(|declared| {
+                            crate::front::typestr::transparent_result_ok_type(declared)
+                                .unwrap_or(declared)
+                        })
+                        .and_then(declared_int_result_layout);
                 }
             }
         }
@@ -15276,7 +15331,13 @@ impl CallControl {
         // Pyre's CallDescriptor stores the same structural cache key that
         // RPython's `cpu.calldescrof()` would use; the matching funcptr is
         // plumbed separately by callers.
-        CallDescriptor::from_signature(&arg_types, result_type, effectinfo)
+        let calldescr = CallDescriptor::from_signature(&arg_types, result_type, effectinfo);
+        match declared_result_layout {
+            Some((signed, size)) if result_type == Type::Int => {
+                calldescr.with_int_result_layout(signed, size)
+            }
+            _ => calldescr,
+        }
     }
 
     /// RPython: calldescr_canraise(calldescr) (call.py).
@@ -33459,6 +33520,43 @@ mod tests {
         let resolved = descr(&cc);
         assert!(resolved.extra_info.is_call_release_gil());
         assert_eq!(resolved.extra_info.call_release_gil_target, (0x1111, 5));
+    }
+
+    /// `descr.py get_call_descr`: integer `FUNC.RESULT` records
+    /// `symbolic.get_size(RESULT_ERASED)` and `get_type_flag(RESULT)`.
+    #[test]
+    fn getcalldescr_records_declared_int_result_width() {
+        use majit_ir::value::Type;
+        let descr = |leaf: &str, return_type: &str| {
+            let mut cc = CallControl::new();
+            let path = CallPath::from_segments(["posix", leaf]);
+            if return_type == "i64" {
+                register_int_result_graph(&mut cc, path, simple_graph(leaf));
+            } else {
+                cc.register_function_graph(path, simple_graph(leaf).with_return_type(return_type));
+            }
+            cc.find_all_graphs_for_tests();
+            let call = direct_call_op(CallTarget::function_path(["posix", leaf]));
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &call,
+                Vec::new(),
+                Type::Int,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+        };
+        let i32_descr = descr("ccall_i32", "i32");
+        assert_eq!(i32_descr.result_size(), 4);
+        assert!(i32_descr.is_result_signed());
+        let u8_descr = descr("ccall_u8", "u8");
+        assert_eq!(u8_descr.result_size(), 1);
+        assert!(!u8_descr.is_result_signed());
+        let i64_descr = descr("ccall_i64", "i64");
+        assert_eq!(i64_descr.result_size(), 8);
+        assert!(i64_descr.is_result_signed());
     }
 
     /// `call.py` `getcalldescr` indirect_call: a family member with
