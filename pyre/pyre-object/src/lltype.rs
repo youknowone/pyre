@@ -396,6 +396,43 @@ pub fn fat_vtable_word<T: ?Sized>(fat: *const T) -> *const () {
     words[1]
 }
 
+/// Rebuild a trait-object pointer from a data word and a vtable word.
+///
+/// `T` must be a trait object (`dyn DictStrategy` / `dyn SetStrategy`).
+/// Used by prebuilt holders so the data word is the holder while the
+/// vtable stays the one [`register_dyn_impl_vtable!`] published
+/// (`CallControl.getfunctionptr` / `rclass.getvtable`).
+///
+/// # Safety
+///
+/// `data` must be a valid pointer to a value that implements `T`'s
+/// trait, and `vtable` must be that impl's rustc vtable.
+pub unsafe fn fat_ptr_from_parts<T: ?Sized>(data: *const (), vtable: *const ()) -> *const T {
+    assert_eq!(
+        std::mem::size_of::<*const T>(),
+        2 * std::mem::size_of::<*const ()>(),
+        "fat_ptr_from_parts expects a trait-object pointer"
+    );
+    let words: [*const (); 2] = [data, vtable];
+    unsafe { std::mem::transmute_copy(&words) }
+}
+
+/// True when `vtable` is the rustc vtable [`register_dyn_impl_vtable!`]
+/// published for `trait_leaf` (`DictStrategy` / `SetStrategy`).
+/// `MetaInterpStaticData.bytecode_for_address` keys on this same pointer.
+pub fn is_registered_dyn_impl_vtable(vtable: *const (), trait_leaf: &str) -> bool {
+    let mut found = false;
+    for_each_dyn_impl_vtable(|desc| {
+        if desc.trait_leaf == trait_leaf && (desc.vtable_fn)() == vtable {
+            found = true;
+        }
+    });
+    found
+}
+
+#[doc(hidden)]
+pub use paste as __paste;
+
 /// Link-time registry of every `impl DictStrategy` / `impl SetStrategy`,
 /// populated by [`register_dyn_impl_vtable!`] so `dyn_impl_vtables` cannot
 /// go stale against a new impl. `distributed_slice` rejects `wasm32`, which
@@ -452,6 +489,11 @@ pub fn for_each_dyn_impl_vtable(mut visit: impl FnMut(DynImplVtableDesc)) {
 /// for T` (blanket instantiations included) so adding an impl needs no
 /// edit of the consumer table. `$static` is the unique link-section
 /// ident; `$ty` is the impl type.
+///
+/// Also emits one `#[inline(never)]` `<$static>_canonical_dyn` next to
+/// the impl. Registration and every live `dyn Trait` construction call
+/// that function so the pair has a single vtable
+/// (`CallControl.getfunctionptr` / `rclass.getvtable`).
 #[macro_export]
 macro_rules! register_dyn_impl_vtable {
     ($static:ident, $ty:ty, DictStrategy) => {
@@ -476,34 +518,48 @@ macro_rules! register_dyn_impl_vtable {
 #[macro_export]
 macro_rules! __register_dyn_impl_vtable {
     ($static:ident, $ty:ty, $trait_leaf:expr, $trait:path) => {
-        #[cfg(not(target_arch = "wasm32"))]
-        #[::linkme::distributed_slice($crate::lltype::PYRE_DYN_IMPL_VTABLES)]
-        #[allow(non_upper_case_globals)]
-        static $static: $crate::lltype::DynImplVtableDesc = $crate::lltype::DynImplVtableDesc {
-            impl_key: ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
-            trait_leaf: $trait_leaf,
-            vtable_fn: {
+        $crate::lltype::__paste::paste! {
+            /// One rustc vtable for this `(impl, trait)` pair.
+            /// `CallControl.get_jitcode_calldescr` `getfunctionptr(graph)`
+            /// and `MetaInterpStaticData.bytecode_for_address` key on the
+            /// function pointer this vtable holds.
+            #[inline(never)]
+            #[allow(non_snake_case)]
+            pub(crate) fn [<$static _canonical_dyn>](
+                p: *const $ty,
+            ) -> *const dyn $trait {
+                p as *const dyn $trait
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::linkme::distributed_slice($crate::lltype::PYRE_DYN_IMPL_VTABLES)]
+            #[allow(non_upper_case_globals)]
+            static $static: $crate::lltype::DynImplVtableDesc = $crate::lltype::DynImplVtableDesc {
+                impl_key: ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
+                trait_leaf: $trait_leaf,
+                vtable_fn: {
+                    fn vtable() -> *const () {
+                        let ptr: *const $ty = ::core::ptr::null();
+                        $crate::lltype::fat_vtable_word([<$static _canonical_dyn>](ptr))
+                    }
+                    vtable
+                },
+            };
+
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn $static() {
                 fn vtable() -> *const () {
                     let ptr: *const $ty = ::core::ptr::null();
-                    $crate::lltype::fat_vtable_word(ptr as *const dyn $trait)
+                    $crate::lltype::fat_vtable_word([<$static _canonical_dyn>](ptr))
                 }
-                vtable
-            },
-        };
-
-        #[cfg(target_arch = "wasm32")]
-        #[::ctor::ctor(unsafe)]
-        #[allow(non_snake_case)]
-        fn $static() {
-            fn vtable() -> *const () {
-                let ptr: *const $ty = ::core::ptr::null();
-                $crate::lltype::fat_vtable_word(ptr as *const dyn $trait)
+                $crate::lltype::register_dyn_impl_vtable(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
+                    $trait_leaf,
+                    vtable,
+                );
             }
-            $crate::lltype::register_dyn_impl_vtable(
-                ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
-                $trait_leaf,
-                vtable,
-            );
         }
     };
 }

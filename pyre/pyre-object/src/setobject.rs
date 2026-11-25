@@ -387,6 +387,23 @@ impl std::ops::Deref for SetStrategyRef {
     }
 }
 
+impl SetStrategyRef {
+    /// Holder whose `imp` vtable is the rustc vtable
+    /// [`crate::register_dyn_impl_vtable!`] published for this impl
+    /// (`CallControl.getfunctionptr` / `bytecode_for_address`).
+    #[inline]
+    pub fn new(kind: SetStrategyKind, imp: &'static dyn SetStrategy, owner: GCREF) -> Self {
+        debug_assert!(
+            crate::lltype::is_registered_dyn_impl_vtable(
+                crate::lltype::fat_vtable_word(imp),
+                "SetStrategy",
+            ),
+            "SetStrategyRef vtable is not the registered rustc vtable (`getfunctionptr`)"
+        );
+        Self { kind, imp, owner }
+    }
+}
+
 /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `SetStrategyRef`.
 pub static SET_STRATEGY_REF_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
     crate::lltype::TypeIdCell::auto();
@@ -425,25 +442,32 @@ pub fn stamp_prebuilt_set_strategy_ref(holder: &'static SetStrategyRef, tid: u32
 /// itself, so the word the JIT reads as `imp`'s data is the prebuilt
 /// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
 /// Every stateless strategy is zero-sized, so a reference to it is valid at
-/// the holder's address.
+/// the holder's address. The vtable word is copied from `strategy`, which
+/// must already have been coerced through that impl's `canonical_dyn`
+/// (`CallControl.getfunctionptr` / `rclass.getvtable`).
 ///
 /// # Safety
 ///
 /// `holder` must be the non-null, pointer-aligned address of a live immortal
 /// allocation (the prebuilt holder itself) that is never freed, since the
 /// returned reference is `'static`.
-pub unsafe fn prebuilt_set_strategy_imp<T: SetStrategy + 'static>(
-    _strategy: &'static T,
+pub unsafe fn prebuilt_set_strategy_imp(
+    strategy: &'static dyn SetStrategy,
     holder: usize,
 ) -> &'static dyn SetStrategy {
     assert_ne!(holder, 0);
     assert_eq!(
-        std::mem::size_of::<T>(),
+        std::mem::size_of_val(strategy),
         0,
         "a prebuilt strategy is stateless"
     );
     assert_eq!(holder % std::mem::align_of::<usize>(), 0);
-    unsafe { &*(holder as *const T) }
+    let vtable = crate::lltype::fat_vtable_word(strategy);
+    debug_assert!(
+        crate::lltype::is_registered_dyn_impl_vtable(vtable, "SetStrategy"),
+        "prebuilt SetStrategy vtable is not the registered rustc vtable (`getfunctionptr`)"
+    );
+    unsafe { &*crate::lltype::fat_ptr_from_parts::<dyn SetStrategy>(holder as *const (), vtable) }
 }
 
 /// Same-file `LOAD_GLOBAL` of the OnceLock plus `get_or_init`, matching
@@ -451,21 +475,22 @@ pub unsafe fn prebuilt_set_strategy_imp<T: SetStrategy + 'static>(
 /// not the lock. `get_or_init` lives in the accessor body so the translator
 /// folds it to `ConstRefAddr`.
 macro_rules! define_prebuilt_set_strategy_ref {
-    ($cell:ident, $accessor:ident, $kind:expr, $imp:expr) => {
+    ($cell:ident, $accessor:ident, $kind:expr, $imp:expr, $canonical_dyn:path) => {
         static $cell: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
         /// Process-wide `space.fromcache(StrategyCls)` holder. Prebuilt GC
         /// object (`malloc_typed_immortal`), matching `w_not_implemented`.
-        /// The holder's `imp` data word is the holder itself.
+        /// The holder's `imp` data word is the holder itself; the vtable
+        /// word is `$canonical_dyn`'s rustc vtable (`getfunctionptr`).
         #[inline]
         pub fn $accessor() -> &'static crate::setobject::SetStrategyRef {
             let addr = *$cell.get_or_init(|| {
-                let p = crate::lltype::malloc_typed_immortal(crate::setobject::SetStrategyRef {
-                    kind: $kind,
-                    imp: $imp,
-                    owner: ::std::ptr::null_mut(),
-                });
+                let imp: &'static dyn crate::setobject::SetStrategy =
+                    unsafe { &*$canonical_dyn($imp) };
+                let p = crate::lltype::malloc_typed_immortal(
+                    crate::setobject::SetStrategyRef::new($kind, imp, ::std::ptr::null_mut()),
+                );
                 unsafe {
-                    (*p).imp = crate::setobject::prebuilt_set_strategy_imp($imp, p as usize);
+                    (*p).imp = crate::setobject::prebuilt_set_strategy_imp(imp, p as usize);
                 }
                 p as usize
             });
@@ -490,7 +515,8 @@ define_prebuilt_set_strategy_ref!(
     OBJECT_SET_STRATEGY_REF,
     object_set_strategy_ref,
     SetStrategyKind::Object,
-    &OBJECT_SET_STRATEGY
+    &OBJECT_SET_STRATEGY,
+    DYN_IMPL_ObjectSetStrategy_canonical_dyn
 );
 
 /// `setobject.py EmptySetStrategy`. `get_empty_storage` is `erase(None)`.
@@ -505,7 +531,8 @@ define_prebuilt_set_strategy_ref!(
     EMPTY_SET_STRATEGY_REF,
     empty_set_strategy_ref,
     SetStrategyKind::Empty,
-    &EMPTY_SET_STRATEGY
+    &EMPTY_SET_STRATEGY,
+    DYN_IMPL_EmptySetStrategy_canonical_dyn
 );
 
 /// `setobject.py IntegerSetStrategy`. The erased box is [`IntSetStorage`]
@@ -521,7 +548,8 @@ define_prebuilt_set_strategy_ref!(
     INTEGER_SET_STRATEGY_REF,
     integer_set_strategy_ref,
     SetStrategyKind::Int,
-    &INTEGER_SET_STRATEGY
+    &INTEGER_SET_STRATEGY,
+    DYN_IMPL_IntegerSetStrategy_canonical_dyn
 );
 
 /// `setobject.py BytesSetStrategy`. The erased box is [`BytesSetStorage`]
@@ -538,7 +566,8 @@ define_prebuilt_set_strategy_ref!(
     BYTES_SET_STRATEGY_REF,
     bytes_set_strategy_ref,
     SetStrategyKind::Bytes,
-    &BYTES_SET_STRATEGY
+    &BYTES_SET_STRATEGY,
+    DYN_IMPL_BytesSetStrategy_canonical_dyn
 );
 
 /// `setobject.py AsciiSetStrategy`. The erased box is [`AsciiSetStorage`]
@@ -555,7 +584,8 @@ define_prebuilt_set_strategy_ref!(
     ASCII_SET_STRATEGY_REF,
     ascii_set_strategy_ref,
     SetStrategyKind::Ascii,
-    &ASCII_SET_STRATEGY
+    &ASCII_SET_STRATEGY,
+    DYN_IMPL_AsciiSetStrategy_canonical_dyn
 );
 
 /// `setobject.py IdentitySetStrategy`. The erased box is [`IdentitySetStorage`]
@@ -572,7 +602,8 @@ define_prebuilt_set_strategy_ref!(
     IDENTITY_SET_STRATEGY_REF,
     identity_set_strategy_ref,
     SetStrategyKind::Identity,
-    &IDENTITY_SET_STRATEGY
+    &IDENTITY_SET_STRATEGY,
+    DYN_IMPL_IdentitySetStrategy_canonical_dyn
 );
 
 /// Python set object.
@@ -6589,11 +6620,11 @@ mod tests {
     fn prebuilt_set_strategy_holders_carry_immortal_gc_header() {
         let holder: &'static SetStrategyRef = unsafe {
             &*majit_gc::header::alloc_with_gc_header_immortal(
-                SetStrategyRef {
-                    kind: SetStrategyKind::Object,
-                    imp: &OBJECT_SET_STRATEGY,
-                    owner: std::ptr::null_mut(),
-                },
+                SetStrategyRef::new(
+                    SetStrategyKind::Object,
+                    &*DYN_IMPL_ObjectSetStrategy_canonical_dyn(&OBJECT_SET_STRATEGY),
+                    std::ptr::null_mut(),
+                ),
                 set_strategy_ref_gc_type_id(),
             )
         };
@@ -6622,6 +6653,10 @@ mod tests {
                 holder.imp as *const dyn SetStrategy as *const u8 as usize,
                 holder as *const _ as usize
             );
+            assert!(crate::lltype::is_registered_dyn_impl_vtable(
+                crate::lltype::fat_vtable_word(holder.imp),
+                "SetStrategy",
+            ));
         }
     }
 

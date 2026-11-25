@@ -66,7 +66,8 @@ crate::define_prebuilt_dict_strategy_ref!(
     KWARGS_DICT_STRATEGY_REF,
     kwargs_dict_strategy_ref,
     crate::dictmultiobject::StrategyKind::Kwargs,
-    &KWARGS_DICT_STRATEGY
+    &KWARGS_DICT_STRATEGY,
+    DYN_IMPL_KwargsDictStrategy_canonical_dyn
 );
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays

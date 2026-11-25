@@ -2135,18 +2135,17 @@ pub fn w_module_dict_new() -> PyObjectRef {
     // holder's `owner` field, traced through `DictStrategyRef`'s own type
     // (`gctypelayout.py offsets_to_gc_pointers`), keeps the box alive, so
     // the unbounded lifetime of a raw-pointer deref expresses that GC
-    // ownership without leaking a process-global strategy.
-    let imp: &'static dyn DictStrategy = unsafe { &*strategy };
+    // ownership without leaking a process-global strategy. The vtable is
+    // the one `DYN_IMPL_ModuleDictStrategy_canonical_dyn` published
+    // (`getfunctionptr` / `rclass.getvtable`).
+    let imp: &'static dyn DictStrategy =
+        unsafe { &*crate::celldict::DYN_IMPL_ModuleDictStrategy_canonical_dyn(strategy) };
     debug_assert_eq!(
         imp as *const dyn DictStrategy as *const u8 as usize,
         strategy as usize
     );
     let strategy_ref = crate::gc_storage::gc_alloc_storage_box(
-        DictStrategyRef {
-            kind: StrategyKind::Module,
-            imp,
-            owner: strategy as GCREF,
-        },
+        DictStrategyRef::new(StrategyKind::Module, imp, strategy as GCREF),
         dict_strategy_ref_gc_type_id(),
     );
     let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
@@ -7399,6 +7398,27 @@ impl std::ops::Deref for DictStrategyRef {
     }
 }
 
+impl DictStrategyRef {
+    /// Holder whose `imp` vtable is the rustc vtable
+    /// [`crate::register_dyn_impl_vtable!`] published for this impl
+    /// (`CallControl.getfunctionptr` / `bytecode_for_address`).
+    #[inline]
+    pub fn new(
+        kind: StrategyKind,
+        imp: &'static dyn crate::dictmultiobject::DictStrategy,
+        owner: GCREF,
+    ) -> Self {
+        debug_assert!(
+            crate::lltype::is_registered_dyn_impl_vtable(
+                crate::lltype::fat_vtable_word(imp),
+                "DictStrategy",
+            ),
+            "DictStrategyRef vtable is not the registered rustc vtable (`getfunctionptr`)"
+        );
+        Self { kind, imp, owner }
+    }
+}
+
 /// `pypy/objspace/std/dictmultiobject.py+ ObjectDictStrategy`
 /// process-wide singleton.  PyPy's `space.fromcache(ObjectDictStrategy)`
 /// returns the same instance for every space, and `W_DictObject`'s
@@ -7438,25 +7458,32 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// itself, so the word the JIT reads as `imp`'s data is the prebuilt
 /// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
 /// Every stateless strategy is zero-sized, so a reference to it is valid at
-/// the holder's address.
+/// the holder's address. The vtable word is copied from `strategy`, which
+/// must already have been coerced through that impl's `canonical_dyn`
+/// (`CallControl.getfunctionptr` / `rclass.getvtable`).
 ///
 /// # Safety
 ///
 /// `holder` must be the non-null, pointer-aligned address of a live immortal
 /// allocation (the prebuilt holder itself) that is never freed, since the
 /// returned reference is `'static`.
-pub unsafe fn prebuilt_strategy_imp<T: DictStrategy + 'static>(
-    _strategy: &'static T,
+pub unsafe fn prebuilt_strategy_imp(
+    strategy: &'static dyn DictStrategy,
     holder: usize,
 ) -> &'static dyn DictStrategy {
     assert_ne!(holder, 0);
     assert_eq!(
-        std::mem::size_of::<T>(),
+        std::mem::size_of_val(strategy),
         0,
         "a prebuilt strategy is stateless"
     );
     assert_eq!(holder % std::mem::align_of::<usize>(), 0);
-    unsafe { &*(holder as *const T) }
+    let vtable = crate::lltype::fat_vtable_word(strategy);
+    debug_assert!(
+        crate::lltype::is_registered_dyn_impl_vtable(vtable, "DictStrategy"),
+        "prebuilt DictStrategy vtable is not the registered rustc vtable (`getfunctionptr`)"
+    );
+    unsafe { &*crate::lltype::fat_ptr_from_parts::<dyn DictStrategy>(holder as *const (), vtable) }
 }
 
 /// Same-file `LOAD_GLOBAL` of the OnceLock plus `get_or_init`, matching
@@ -7465,23 +7492,26 @@ pub unsafe fn prebuilt_strategy_imp<T: DictStrategy + 'static>(
 /// folds it to `ConstRefAddr`.
 #[macro_export]
 macro_rules! define_prebuilt_dict_strategy_ref {
-    ($cell:ident, $accessor:ident, $kind:expr, $imp:expr) => {
+    ($cell:ident, $accessor:ident, $kind:expr, $imp:expr, $canonical_dyn:path) => {
         static $cell: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
         /// Process-wide `space.fromcache(StrategyCls)` holder. Prebuilt GC
         /// object (`malloc_typed_immortal`), matching `w_not_implemented`.
-        /// The holder's `imp` data word is the holder itself.
+        /// The holder's `imp` data word is the holder itself; the vtable
+        /// word is `$canonical_dyn`'s rustc vtable (`getfunctionptr`).
         #[inline]
         pub fn $accessor() -> &'static $crate::dictmultiobject::DictStrategyRef {
             let addr = *$cell.get_or_init(|| {
+                let imp: &'static dyn $crate::dictmultiobject::DictStrategy =
+                    unsafe { &*$canonical_dyn($imp) };
                 let p = $crate::lltype::malloc_typed_immortal(
-                    $crate::dictmultiobject::DictStrategyRef {
-                        kind: $kind,
-                        imp: $imp,
-                        owner: ::std::ptr::null_mut(),
-                    },
+                    $crate::dictmultiobject::DictStrategyRef::new(
+                        $kind,
+                        imp,
+                        ::std::ptr::null_mut(),
+                    ),
                 );
                 unsafe {
-                    (*p).imp = $crate::dictmultiobject::prebuilt_strategy_imp($imp, p as usize);
+                    (*p).imp = $crate::dictmultiobject::prebuilt_strategy_imp(imp, p as usize);
                 }
                 p as usize
             });
@@ -7494,37 +7524,43 @@ define_prebuilt_dict_strategy_ref!(
     OBJECT_DICT_STRATEGY_REF,
     object_dict_strategy_ref,
     StrategyKind::Object,
-    &OBJECT_DICT_STRATEGY
+    &OBJECT_DICT_STRATEGY,
+    DYN_IMPL_ObjectDictStrategy_canonical_dyn
 );
 define_prebuilt_dict_strategy_ref!(
     EMPTY_DICT_STRATEGY_REF,
     empty_dict_strategy_ref,
     StrategyKind::Empty,
-    &EMPTY_DICT_STRATEGY
+    &EMPTY_DICT_STRATEGY,
+    DYN_IMPL_EmptyDictStrategy_canonical_dyn
 );
 define_prebuilt_dict_strategy_ref!(
     EMPTY_KWARGS_DICT_STRATEGY_REF,
     empty_kwargs_dict_strategy_ref,
     StrategyKind::EmptyKwargs,
-    &EMPTY_KWARGS_DICT_STRATEGY
+    &EMPTY_KWARGS_DICT_STRATEGY,
+    DYN_IMPL_EmptyKwargsDictStrategy_canonical_dyn
 );
 define_prebuilt_dict_strategy_ref!(
     BYTES_DICT_STRATEGY_REF,
     bytes_dict_strategy_ref,
     StrategyKind::Bytes,
-    &BYTES_DICT_STRATEGY
+    &BYTES_DICT_STRATEGY,
+    DYN_IMPL_BytesDictStrategy_canonical_dyn
 );
 define_prebuilt_dict_strategy_ref!(
     UNICODE_DICT_STRATEGY_REF,
     unicode_dict_strategy_ref,
     StrategyKind::Unicode,
-    &UNICODE_DICT_STRATEGY
+    &UNICODE_DICT_STRATEGY,
+    DYN_IMPL_UnicodeDictStrategy_canonical_dyn
 );
 define_prebuilt_dict_strategy_ref!(
     INT_DICT_STRATEGY_REF,
     int_dict_strategy_ref,
     StrategyKind::Int,
-    &INT_DICT_STRATEGY
+    &INT_DICT_STRATEGY,
+    DYN_IMPL_IntDictStrategy_canonical_dyn
 );
 
 /// `dictmultiobject.py EmptyDictStrategy`.
@@ -9470,11 +9506,11 @@ mod tests {
         assert_eq!(dict_strategy_ref_gc_type_id(), 0);
         let holder: &'static DictStrategyRef = unsafe {
             &*majit_gc::header::alloc_with_gc_header_immortal(
-                DictStrategyRef {
-                    kind: StrategyKind::Object,
-                    imp: &OBJECT_DICT_STRATEGY,
-                    owner: std::ptr::null_mut(),
-                },
+                DictStrategyRef::new(
+                    StrategyKind::Object,
+                    &*DYN_IMPL_ObjectDictStrategy_canonical_dyn(&OBJECT_DICT_STRATEGY),
+                    std::ptr::null_mut(),
+                ),
                 dict_strategy_ref_gc_type_id(),
             )
         };
@@ -9505,7 +9541,21 @@ mod tests {
                 holder.imp as *const dyn DictStrategy as *const u8 as usize,
                 holder as *const _ as usize
             );
+            assert!(crate::lltype::is_registered_dyn_impl_vtable(
+                crate::lltype::fat_vtable_word(holder.imp),
+                "DictStrategy",
+            ));
         }
+    }
+
+    #[test]
+    fn module_dict_strategy_vtable_matches_registered() {
+        let md = w_module_dict_new();
+        let imp = unsafe { w_dict_get_strategy(md) };
+        assert!(crate::lltype::is_registered_dyn_impl_vtable(
+            crate::lltype::fat_vtable_word(imp),
+            "DictStrategy",
+        ));
     }
 
     #[test]

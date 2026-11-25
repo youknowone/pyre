@@ -2382,6 +2382,15 @@ pub fn dyn_impl_key_matches(impl_path: &str, impl_key: &str) -> bool {
         || impl_key.ends_with(&format!("::{impl_path}"))
 }
 
+/// Registered rustc vtable for `(impl_key, trait_leaf)`, if present.
+/// `CallControl.getfunctionptr` / `bytecode_for_address` key on this pointer.
+pub fn dyn_impl_vtable_for(impl_key: &str, trait_leaf: &str) -> Option<*const ()> {
+    dyn_impl_vtables().iter().find_map(|entry| {
+        (entry.trait_leaf == trait_leaf && dyn_impl_key_matches(impl_key, entry.impl_key))
+            .then_some(entry.vtable)
+    })
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -8043,13 +8052,14 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
-        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        finditem_str_named_word, handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word,
-        interned_residual_inst_path, is_abi_unsound_argument_residual, is_exact_type_word,
-        is_list_write_barrier, is_plain_int1_word, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word,
-        ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtable_for,
+        dyn_impl_vtables, finditem_str_named_word, handle_alloc_error_word_jit_abi,
+        hash_str_hooked_bytes_word, interned_residual_inst_path, is_abi_unsound_argument_residual,
+        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
+        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
+        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
+        ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
@@ -9849,6 +9859,66 @@ mod tests {
                 tables.iter().any(|e| e.impl_key.ends_with(leaf)),
                 "{leaf} not registered"
             );
+        }
+    }
+
+    #[test]
+    fn live_strategy_holder_vtable_matches_registered() {
+        let dict_cases: &[(&str, *const ())] = &[
+            (
+                "IdentityDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::identitydict::identity_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "ObjectDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::dictmultiobject::object_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "IntDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::dictmultiobject::int_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "MapDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    crate::objspace::std::mapdict::map_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "ClassDictStrategySlot",
+                pyre_object::lltype::fat_vtable_word(
+                    crate::objspace::std::classdict::class_dict_strategy_ref().imp,
+                ),
+            ),
+        ];
+        for (leaf, live) in dict_cases {
+            let registered = dyn_impl_vtable_for(leaf, "DictStrategy")
+                .unwrap_or_else(|| panic!("{leaf} not registered"));
+            assert_eq!(*live, registered, "{leaf}");
+        }
+        let set_cases: &[(&str, *const ())] = &[
+            (
+                "ObjectSetStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::setobject::object_set_strategy_ref().imp,
+                ),
+            ),
+            (
+                "IntegerSetStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::setobject::integer_set_strategy_ref().imp,
+                ),
+            ),
+        ];
+        for (leaf, live) in set_cases {
+            let registered = dyn_impl_vtable_for(leaf, "SetStrategy")
+                .unwrap_or_else(|| panic!("{leaf} not registered"));
+            assert_eq!(*live, registered, "{leaf}");
         }
     }
 

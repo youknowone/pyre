@@ -6630,7 +6630,8 @@ pyre_object::define_prebuilt_dict_strategy_ref!(
     MAP_DICT_STRATEGY_REF,
     map_dict_strategy_ref,
     pyre_object::dictmultiobject::StrategyKind::Map,
-    &MAP_DICT_STRATEGY
+    &MAP_DICT_STRATEGY,
+    DYN_IMPL_MapDictStrategy_canonical_dyn
 );
 
 pyre_object::register_dyn_impl_vtable!(DYN_IMPL_MapDictStrategy, MapDictStrategy, DictStrategy);

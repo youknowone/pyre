@@ -284,7 +284,8 @@ crate::define_prebuilt_dict_strategy_ref!(
     IDENTITY_DICT_STRATEGY_REF,
     identity_dict_strategy_ref,
     crate::dictmultiobject::StrategyKind::Identity,
-    &IDENTITY_DICT_STRATEGY
+    &IDENTITY_DICT_STRATEGY,
+    DYN_IMPL_IdentityDictStrategy_canonical_dyn
 );
 
 impl IdentityDictStrategy {
