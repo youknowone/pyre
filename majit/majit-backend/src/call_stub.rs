@@ -874,6 +874,21 @@ fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
         .get_or_init(|| create_call_stub(&calldescr.arg_classes, calldescr.result_type))
 }
 
+/// `descr.py CallDescr.create_call_stub` `rffi.cast(lltype.Signed, res)`:
+/// a narrow integer FUNC.RESULT comes back sign- or zero-extended.
+#[inline(always)]
+fn cast_call_result_to_signed(raw: i64, result_signed: bool, result_size: usize) -> i64 {
+    match (result_size, result_signed) {
+        (1, true) => raw as i8 as i64,
+        (1, false) => raw as u8 as i64,
+        (2, true) => raw as i16 as i64,
+        (2, false) => raw as u16 as i64,
+        (4, true) => raw as i32 as i64,
+        (4, false) => raw as u32 as i64,
+        _ => raw,
+    }
+}
+
 /// `llmodel.py AbstractLLCPU.bh_call_i`: read the per-descr stub and call.
 ///
 /// # Safety
@@ -900,7 +915,11 @@ pub unsafe fn bh_call_i_with_descr(
             return result;
         }
     }
-    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+    let raw = unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) };
+    if calldescr.void_word_abi || calldescr.result_type != 'i' {
+        return raw;
+    }
+    cast_call_result_to_signed(raw, calldescr.result_signed, calldescr.result_size)
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_f` parallel of [`bh_call_i_with_descr`].
@@ -1605,5 +1624,19 @@ mod tests {
         assert_eq!(again, 321);
         assert!(descr.call_stub.get().is_some());
         assert!(descr.call_stub.get().and_then(|s| s.call_i_banks).is_some());
+    }
+
+    /// `descr.py CallDescr.create_call_stub` `rffi.cast(lltype.Signed, res)`:
+    /// a narrow integer FUNC.RESULT comes back sign- or zero-extended.
+    #[test]
+    fn cast_call_result_to_signed_extends_narrow_results() {
+        assert_eq!(cast_call_result_to_signed(0xffff_ffff, true, 4), -1);
+        assert_eq!(
+            cast_call_result_to_signed(0xffff_ffff, false, 4),
+            4294967295
+        );
+        assert_eq!(cast_call_result_to_signed(0x1ff, false, 1), 0xff);
+        assert_eq!(cast_call_result_to_signed(0x80, true, 1), -128);
+        assert_eq!(cast_call_result_to_signed(-5, true, 8), -5);
     }
 }
