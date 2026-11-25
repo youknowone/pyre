@@ -20659,6 +20659,140 @@ fn closure_layout_kind_is_record() {
     assert_eq!(identity.layout_kind, LayoutKind::Record);
 }
 
+fn cross_crate_header_struct(id: u64) -> serde_json::Value {
+    type_decl_struct(
+        id,
+        &["header_crate", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    )
+}
+
+fn cross_crate_opaque_header(id: u64) -> serde_json::Value {
+    let mut decl = type_decl_struct(id, &["header_crate", "object", "ObjectHeader"], vec![]);
+    decl["kind"] = serde_json::json!("Opaque");
+    decl
+}
+
+#[test]
+fn cross_crate_field0_header_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "thing", "W_Thing"],
+                vec![
+                    named_layout_field("ob", adt_node(0)),
+                    named_layout_field("x", interior_i64()),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_Thing")
+        .and_then(Option::as_ref)
+        .expect("W_Thing declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::ObjectHeaded);
+    let id = identity.id;
+    let aliases: Vec<_> = program
+        .struct_fields
+        .class_identity
+        .values()
+        .filter_map(Option::as_ref)
+        .filter(|identity| identity.id == id)
+        .collect();
+    assert!(
+        aliases.len() > 1,
+        "expected more than one alias for W_Thing; aliases={aliases:?}"
+    );
+    for alias in aliases {
+        assert_eq!(alias.layout_kind, LayoutKind::ObjectHeaded);
+    }
+}
+
+#[test]
+fn cross_crate_base_chain_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "thing", "W_Thing"],
+                vec![
+                    named_layout_field("ob", adt_node(0)),
+                    named_layout_field("x", interior_i64()),
+                ],
+            ),
+            type_decl_struct(
+                2,
+                &["thing_crate", "thing", "W_ThingUser"],
+                vec![named_layout_field("base", adt_node(1))],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let thing_identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_Thing")
+        .and_then(Option::as_ref)
+        .expect("W_Thing declaration identity");
+    assert_eq!(thing_identity.layout_kind, LayoutKind::ObjectHeaded);
+    let user_identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_ThingUser")
+        .and_then(Option::as_ref)
+        .expect("W_ThingUser declaration identity");
+    assert_eq!(user_identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn cross_crate_pointer_to_header_stays_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "handle", "Handle"],
+                vec![named_layout_field(
+                    "p",
+                    serde_json::json!({"RawPtr": [adt_node(0), "Mut"]}),
+                )],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let identity = program
+        .struct_fields
+        .class_identity
+        .get("handle::Handle")
+        .and_then(Option::as_ref)
+        .expect("Handle declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
 /// substituted callee signature. The caller has no Option local. A Fun
 /// RegularCall and a `CallKind::Trait` that `trait_impl_method` resolves

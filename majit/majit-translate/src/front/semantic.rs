@@ -1262,6 +1262,59 @@ impl StructFieldRegistry {
         self.unique_suffix_owner_key(owner).map(str::to_string)
     }
 
+    pub(crate) fn promote_cross_crate_object_headed_layouts(&mut self) {
+        use LayoutKind::{ObjectHeaded, Record};
+
+        loop {
+            let mut promoted_ids = Vec::new();
+
+            let identities: Vec<ClassIdentity> = self
+                .class_identity
+                .values()
+                .filter_map(Option::as_ref)
+                .cloned()
+                .collect();
+            for identity in &identities {
+                if identity.layout_kind != Record || promoted_ids.contains(&identity.id) {
+                    continue;
+                }
+                let Some(field0) = self
+                    .intern_field_rows(&identity.spelling)
+                    .and_then(|rows| rows.first())
+                else {
+                    continue;
+                };
+                let field0_ty = field0.ty.trim().to_owned();
+                if peel_one_row_indirection(&field0_ty).is_some() {
+                    continue;
+                }
+                let Some(field0_key) = self.resolved_owner_key(&field0_ty) else {
+                    continue;
+                };
+                let Some(field0_identity) = self
+                    .class_identity
+                    .get(&field0_key)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if field0_identity.layout_kind == ObjectHeaded {
+                    promoted_ids.push(identity.id);
+                }
+            }
+
+            if promoted_ids.is_empty() {
+                break;
+            }
+
+            for identity in self.class_identity.values_mut().filter_map(Option::as_mut) {
+                if promoted_ids.contains(&identity.id) {
+                    identity.layout_kind = ObjectHeaded;
+                }
+            }
+        }
+    }
+
     /// Seed a declared-`Gc` identity from a harvested or fixture name.
     /// Inserts the spelling and its leaf so annotation lookup from either
     /// hits (`note_declared_gc_owner`).

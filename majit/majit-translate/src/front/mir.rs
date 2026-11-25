@@ -786,6 +786,8 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             Some(&acc.struct_ids),
         );
         acc.fnptr_field_families = fnptr_field_families;
+        acc.struct_fields
+            .promote_cross_crate_object_headed_layouts();
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
