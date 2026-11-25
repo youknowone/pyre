@@ -4002,10 +4002,10 @@ pub(crate) fn complex_hash(obj: PyObjectRef, real: f64, imag: f64) -> i64 {
 
 // ── Public dispatch API ───────────────────────────────────────────────
 
-/// Check if w_type is a subtype of cls — delegates to the single MRO
-/// membership scan in `pyre_object::w_type_issubtype`.
+/// Check if w_type is a subtype of cls — typeobject.py
+/// `W_TypeObject.issubtype` ([`crate::baseobjspace::type_issubtype`]).
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    pyre_object::w_type_issubtype(w_type, cls)
+    crate::baseobjspace::type_issubtype(w_type, cls)
 }
 
 /// Comparison special-method dispatch.
