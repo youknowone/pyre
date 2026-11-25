@@ -20521,6 +20521,106 @@ fn w_int_layout_kind_is_object_headed() {
 }
 
 #[test]
+fn base_chain_layout_kind_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let w_object = type_decl_struct(
+        1,
+        &["fixture", "objectobject", "W_ObjectObject"],
+        vec![
+            named_layout_field("ob_header", adt_node(0)),
+            named_layout_field("x", interior_i64()),
+        ],
+    );
+    let w_user = type_decl_struct(
+        2,
+        &["fixture", "objectobject", "W_ObjectObjectUser"],
+        vec![
+            named_layout_field("base", adt_node(1)),
+            named_layout_field("storage", interior_i64()),
+        ],
+    );
+    let fields = layout_kind_fields(vec![header, w_object, w_user]);
+    let object_identity = fields
+        .class_identity
+        .get("objectobject::W_ObjectObject")
+        .and_then(Option::as_ref)
+        .expect("W_ObjectObject declaration identity");
+    assert_eq!(object_identity.layout_kind, LayoutKind::ObjectHeaded);
+    let user_identity = fields
+        .class_identity
+        .get("objectobject::W_ObjectObjectUser")
+        .and_then(Option::as_ref)
+        .expect("W_ObjectObjectUser declaration identity");
+    assert_eq!(user_identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn pointer_to_header_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let handle = type_decl_struct(
+        1,
+        &["fixture", "handle", "Handle"],
+        vec![named_layout_field("inner", option_shared_ref(adt_node(0)))],
+    );
+    let fields = layout_kind_fields(vec![header, handle]);
+    let identity = fields
+        .class_identity
+        .get("handle::Handle")
+        .and_then(Option::as_ref)
+        .expect("Handle declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
+fn unit_struct_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let empty = type_decl_struct(0, &["fixture", "unit", "Empty"], vec![]);
+    let fields = layout_kind_fields(vec![empty]);
+    let identity = fields
+        .class_identity
+        .get("unit::Empty")
+        .and_then(Option::as_ref)
+        .expect("Empty declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
+fn cache_base_chain_without_header_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let base = type_decl_struct(
+        0,
+        &["fixture", "cache", "Base"],
+        vec![named_layout_field("version", interior_i64())],
+    );
+    let cache = type_decl_struct(
+        1,
+        &["fixture", "cache", "Cache"],
+        vec![named_layout_field("base", adt_node(0))],
+    );
+    let fields = layout_kind_fields(vec![base, cache]);
+    let identity = fields
+        .class_identity
+        .get("cache::Cache")
+        .and_then(Option::as_ref)
+        .expect("Cache declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
 fn enum_layout_kind_uses_decl_identity() {
     use crate::front::semantic::LayoutKind;
 

@@ -3387,6 +3387,7 @@ impl CrateLoweringState {
             &raw_alloc_flavor_structs,
             program_exception_class_hints,
         );
+        let gc_seeds: Vec<_> = gc_struct_ids.iter().copied().collect();
         promote_cross_crate_stripped_keys(
             llbc,
             cross_tombstoned_leaves,
@@ -3395,6 +3396,7 @@ impl CrateLoweringState {
             &mut struct_field_attrs,
             &mut exact_layouts,
             &mut struct_ids,
+            &gc_seeds,
         );
         // Only leaves this pass withdrew. A crate-root decl
         // (`charon_corpus::ClassObject`) also stores an empty origin module,
@@ -7119,6 +7121,7 @@ fn derive_program_metadata(
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
     let ambiguous_leaves = ambiguous_adt_leaves(llbc);
+    let gc_seeds: Vec<_> = gc_struct_ids.iter().copied().collect();
 
     for (path, kind) in discover_transparent_scalar_kinds(llbc) {
         struct_fields
@@ -7262,7 +7265,7 @@ fn derive_program_metadata(
                 // layer keys `LLType::Struct` on and the runtime macro
                 // publishes.  Every name spelling (full-crate, stripped,
                 // bare leaf) resolves to it through the resolver table.
-                let layout_kind = type_decl_layout_kind(layout_td, llbc);
+                let layout_kind = type_decl_layout_kind(layout_td, llbc, &gc_seeds);
                 let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
                 record_struct_id(
                     &mut struct_ids,
@@ -8424,46 +8427,30 @@ pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir:
 
 /// Representation category of one Rust nominal aggregate.
 ///
-/// An aggregate is object-headed when a chain of by-value first fields
-/// named `ob_header` or `ob` reaches a struct whose first field is the
-/// `ob_type` class word (the `rclass.OBJECT.typeptr` analogue); references
-/// and raw pointers are linkage, not an embedded header.
-fn type_decl_layout_kind(td: &TypeDecl, llbc: &Llbc) -> crate::front::semantic::LayoutKind {
+/// A struct is [`LayoutKind::ObjectHeaded`] iff repeatedly following its
+/// by-value struct field 0 (`lltype.Struct._first_struct` inlined-parent
+/// relation) reaches a struct whose field 0 is named `ob_type`. Field-0
+/// names other than `ob_type` are irrelevant: `base`, `ob_header`, `ob`,
+/// and the rest are all followed. Enums return [`LayoutKind::Enum`];
+/// everything else returns [`LayoutKind::Record`].
+fn type_decl_layout_kind<'a>(
+    td: &'a TypeDecl,
+    llbc: &'a Llbc,
+    gc_seeds: &[majit_ir::descr::StructId],
+) -> crate::front::semantic::LayoutKind {
     use crate::front::semantic::LayoutKind;
-
     if matches!(td.kind, TypeDeclKind::Enum(_)) {
         return LayoutKind::Enum;
     }
-    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
-        return LayoutKind::Record;
-    }
-
     let mut current = td;
     loop {
         let TypeDeclKind::Struct(fields) = &current.kind else {
             return LayoutKind::Record;
         };
-        let Some(first) = fields.first() else {
-            return LayoutKind::Record;
-        };
-        if first.name.as_deref() == Some("ob_type") {
+        if fields.first().and_then(|f| f.name.as_deref()) == Some("ob_type") {
             return LayoutKind::ObjectHeaded;
         }
-        if !matches!(first.name.as_deref(), Some("ob_header" | "ob")) {
-            return LayoutKind::Record;
-        }
-        let Some(node) =
-            tyref_node(&first.ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))
-        else {
-            return LayoutKind::Record;
-        };
-        if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
-            return LayoutKind::Record;
-        }
-        let Some(def_id) = adt_node_def_id(node) else {
-            return LayoutKind::Record;
-        };
-        let Some(next) = llbc.type_by_id(def_id) else {
+        let Some(next) = struct_field0_type_decl(llbc, current, gc_seeds) else {
             return LayoutKind::Record;
         };
         current = next;
@@ -8489,11 +8476,11 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
 /// never a parent. A reference or raw pointer is not the inlined parent
 /// (`Struct.__init__` inlines a container only as the first field). `Ref`
 /// and `RawPtr` stay in place here; only an `Adt` node yields an id.
-fn struct_field0_type_id(
-    llbc: &Llbc,
+fn struct_field0_type_decl<'a>(
+    llbc: &'a Llbc,
     td: &TypeDecl,
     gc_seeds: &[majit_ir::descr::StructId],
-) -> Option<majit_ir::descr::StructId> {
+) -> Option<&'a TypeDecl> {
     if td.published_struct_copy {
         return None;
     }
@@ -8520,10 +8507,19 @@ fn struct_field0_type_id(
             {
                 return None;
             }
-            Some(inner_id)
+            Some(inner)
         }
         _ => None,
     }
+}
+
+/// `StructId` of [`struct_field0_type_decl`].
+fn struct_field0_type_id(
+    llbc: &Llbc,
+    td: &TypeDecl,
+    gc_seeds: &[majit_ir::descr::StructId],
+) -> Option<majit_ir::descr::StructId> {
+    struct_field0_type_decl(llbc, td, gc_seeds).map(struct_id_for_type_decl)
 }
 
 pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
@@ -8871,6 +8867,7 @@ fn promote_cross_crate_stripped_keys(
         crate::front::semantic::ExactLayout,
     >,
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    gc_seeds: &[majit_ir::descr::StructId],
 ) {
     if tombstoned.is_empty() {
         return;
@@ -8883,7 +8880,7 @@ fn promote_cross_crate_stripped_keys(
         }
         let old_sid = majit_ir::descr::StructId::from_canonical(&stripped);
         let new_sid = majit_ir::descr::StructId::from_canonical(&name);
-        let layout_kind = type_decl_layout_kind(td, llbc);
+        let layout_kind = type_decl_layout_kind(td, llbc, gc_seeds);
         if let Some(layout) = exact_layouts.remove(&old_sid) {
             exact_layouts.insert(new_sid, layout);
         }
