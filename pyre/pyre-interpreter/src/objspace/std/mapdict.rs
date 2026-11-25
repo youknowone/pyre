@@ -6899,11 +6899,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py:1268-1276 iterator order.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> pyre_object::PyObjectRef {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
@@ -6912,11 +6908,25 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);
         let nodes = dict_nodes_in_order(&inst);
-        let node = *nodes.get(index)?;
-        Some((
-            pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name),
-            plain_direct_read(node, &inst),
-        ))
+        let Some(node) = nodes.get(index).copied() else {
+            return pyre_object::PY_NULL;
+        };
+        pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name)
+    }
+
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> pyre_object::PyObjectRef {
+        let w_obj = mapdict_strategy_unerase(w_dict);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        ensure_mapdict_initialized(w_obj);
+        let inst = mapdict_carrier(w_obj);
+        let nodes = dict_nodes_in_order(&inst);
+        let Some(node) = nodes.get(index).copied() else {
+            return pyre_object::PY_NULL;
+        };
+        plain_direct_read(node, &inst)
     }
 
     /// mapdict.py `MapDictKeyIteratorReversed`.

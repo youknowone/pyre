@@ -5310,9 +5310,9 @@ pub unsafe fn w_dict_popitem(obj: PyObjectRef) -> Option<(PyObjectRef, PyObjectR
     w_dict_get_strategy(obj).popitem(obj)
 }
 
-/// `w_dict_get_strategy(obj).nth_item(obj, index)` — single-entry dispatch
-/// for a slot the caller already holds.  A walk wants [`w_dict_next_item`],
-/// which steps over the tombstones a delete leaves behind.
+/// Single-entry dispatch for a slot the caller already holds.  A walk wants
+/// [`w_dict_next_item`], which steps over the tombstones a delete leaves
+/// behind.
 ///
 /// # Safety
 /// `obj` must be a valid `W_DictObject` PyObjectRef.
@@ -5321,7 +5321,13 @@ pub unsafe fn w_dict_nth_item(
     index: usize,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_get_strategy(obj).nth_item(obj, index)
+    let s = w_dict_get_strategy(obj);
+    let k = s.nth_key(obj, index);
+    if k.is_null() {
+        None
+    } else {
+        Some((k, s.nth_value(obj, index)))
+    }
 }
 
 /// The next `(slot, key, value)` at or after `from`, and the slot to resume
@@ -5338,8 +5344,16 @@ pub unsafe fn w_dict_next_item(
 ) -> Option<(usize, PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     let strategy = w_dict_get_strategy(obj);
-    let slot = strategy.next_slot(obj, from)?;
-    let (key, value) = strategy.nth_item(obj, slot)?;
+    let slot = strategy.next_slot(obj, from);
+    if slot < 0 {
+        return None;
+    }
+    let slot = slot as usize;
+    let key = strategy.nth_key(obj, slot);
+    if key.is_null() {
+        return None;
+    }
+    let value = strategy.nth_value(obj, slot);
     Some((slot, key, value))
 }
 
@@ -5351,7 +5365,8 @@ pub unsafe fn w_dict_next_item(
 /// `obj` must be a valid `W_DictObject` PyObjectRef.
 pub unsafe fn w_dict_next_slot(obj: PyObjectRef, from: usize) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_get_strategy(obj).next_slot(obj, from)
+    let slot = w_dict_get_strategy(obj).next_slot(obj, from);
+    if slot < 0 { None } else { Some(slot as usize) }
 }
 
 /// [`w_dict_next_item`] descending, for `reversed(d)` —
@@ -5366,8 +5381,16 @@ pub unsafe fn w_dict_prev_item(
 ) -> Option<(usize, PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     let strategy = w_dict_get_strategy(obj);
-    let slot = strategy.prev_slot(obj, before)?;
-    let (key, value) = strategy.nth_item(obj, slot)?;
+    let slot = strategy.prev_slot(obj, before);
+    if slot < 0 {
+        return None;
+    }
+    let slot = slot as usize;
+    let key = strategy.nth_key(obj, slot);
+    if key.is_null() {
+        return None;
+    }
+    let value = strategy.nth_value(obj, slot);
     Some((slot, key, value))
 }
 
@@ -5690,29 +5713,6 @@ pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     items
 }
 
-/// Internal helper: single-entry accessor for `IntDictStrategy` — the
-/// `(newint(key), value)` pair in slot `index`, read in O(1).  Backs the dict
-/// view iterator's per-step fetch (`baseobjspace.rs` `next()`), replacing a
-/// full `w_dict_items_int_strategy` re-materialisation per step.
-///
-/// # Safety
-/// Same as [`w_dict_items_int_strategy`].
-pub unsafe fn w_dict_nth_item_int_strategy(
-    obj: PyObjectRef,
-    index: usize,
-) -> Option<(PyObjectRef, PyObjectRef)> {
-    lock_dict_refs!(_dict_guard, obj);
-    let (k, v) = w_dict_int_storage(obj)
-        .get_slot(index)
-        .map(|(&k, &v)| (k, v))?;
-    // Wrapping the key collects, and `v` is a bare local by then.
-    let roots = crate::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(v);
-    let w_key = crate::w_int_new(k);
-    Some((w_key, roots.get(value_slot)))
-}
-
 /// Internal helper: `IntDictStrategy::clear` body —
 /// `dictmultiobject.py self.unerase(w_dict.dstorage).clear()`.
 ///
@@ -5922,26 +5922,6 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
     items
 }
 
-/// Internal helper: single-entry accessor for `BytesDictStrategy`.
-///
-/// # Safety
-/// Same as [`w_dict_items_bytes_strategy`].
-pub unsafe fn w_dict_nth_item_bytes_strategy(
-    obj: PyObjectRef,
-    index: usize,
-) -> Option<(PyObjectRef, PyObjectRef)> {
-    lock_dict_refs!(_dict_guard, obj);
-    let entries = w_dict_bytes_storage(obj);
-    let (k, v) = entries.get_slot(index)?;
-    let block = k.0;
-    // `wrap` allocates, and `value` is a bare local by then.
-    let roots = crate::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(*v);
-    let w_key = crate::w_bytes_from_block(block);
-    Some((w_key, roots.get(value_slot)))
-}
-
 /// Internal helper: `BytesDictStrategy::clear` body.
 ///
 /// # Safety
@@ -6035,21 +6015,6 @@ pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef
         slot = i + 1;
     }
     items
-}
-
-/// Internal helper: single-entry accessor for `ObjectDictStrategy` /
-/// `UnicodeDictStrategy`, reading the slot directly.
-///
-/// # Safety
-/// `obj` must point to a valid `W_DictObject`.
-pub unsafe fn w_dict_nth_item_object_strategy(
-    obj: PyObjectRef,
-    index: usize,
-) -> Option<(PyObjectRef, PyObjectRef)> {
-    lock_dict_refs!(_dict_guard, obj);
-    let dict = &*(obj as *const W_DictObject);
-    let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    entries.get_slot(index).map(|(k, &v)| (k.0, v))
 }
 
 /// `rordereddict.py ll_call_lookup_function` — the `dict.lookup` oopspec
@@ -6241,47 +6206,39 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     }
 }
 
-/// [`w_module_dict_items_inner`] for one iteration position.
+/// [`w_module_dict_items_inner`] for one iteration key.
 ///
-/// The dict view's integer cursor asks for a single entry, and both storage
-/// halves are `IndexMap`s, so this reads that entry rather than building the
-/// whole list. Only the one name is wrapped.
+/// The dict view's integer cursor asks for a single entry, so this reads that
+/// slot rather than building the whole list. Only the one name is wrapped.
 ///
 /// `celldict.py getiterkeys`/`getitervalues` are lazy iterators
 /// upstream; the cursor stands in for them here because the GC-object layout
-/// cannot hold a live iterator ([`DictStrategy::nth_item`]).  Serving that
-/// cursor from the default `nth_item` — `self.items(w_dict).into_iter()
+/// cannot hold a live iterator ([`DictStrategy::nth_key`]).  Serving that
+/// cursor from the default `nth_key` — `self.items(w_dict).into_iter()
 /// .nth(index)` — makes the stand-in quadratic: [`w_module_dict_items_inner`]
-/// wraps EVERY name, so an `n`-entry dict costs `n` wraps per step: measured, a
-/// 350-name module dict walked ten times grew peak RSS by 156.8 MB where
-/// CPython grew none, and removing it took 10.3 MB off interpreter startup —
-/// `dir(module)` inside `importlib._bootstrap` pays this walk.  The wrap
-/// itself is [`crate::celldict::_wrapkey`], which interns rather than minting;
-/// what it costs on a repeat is a table hit, and the per-step count is still
-/// what this cursor exists to hold at one.
+/// wraps EVERY name, so an `n`-entry dict costs `n` wraps per step.
+/// The wrap itself is [`crate::celldict::_wrapkey`], which interns rather
+/// than minting; what it costs on a repeat is a table hit, and the per-step
+/// count is still what this cursor exists to hold at one.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
-pub unsafe fn w_module_dict_nth_item_inner(
-    obj: PyObjectRef,
-    index: usize,
-) -> Option<(PyObjectRef, PyObjectRef)> {
+pub unsafe fn w_module_dict_nth_key_inner(obj: PyObjectRef, index: usize) -> PyObjectRef {
     lock_dict_refs!(_module_guard, obj);
     if let Some(entries) = w_module_dict_object_storage(obj) {
-        return entries.get_slot(index).map(|(k, &v)| (k.0, v));
+        return match entries.get_slot(index) {
+            Some((k, _)) => k.0,
+            None => PY_NULL,
+        };
     }
     let strategy = &*w_module_dict_get_strategy(obj);
-    let key = strategy.nth_key(w_module_dict_module_storage(obj), index)?;
-    // Wrapping the name allocates, so root the wrapper and read the value
-    // back afterwards — the cell storage keeps it traced.
-    let roots = crate::gc_roots::push_roots();
-    let key_slot = roots.base();
-    let _ = roots.pin_root(crate::celldict::_wrapkey(key));
-    let value = strategy.nth_unwrapped_value(w_module_dict_module_storage(obj), index)?;
-    Some((roots.get(key_slot), value))
+    let Some(key) = strategy.nth_key(w_module_dict_module_storage(obj), index) else {
+        return PY_NULL;
+    };
+    crate::celldict::_wrapkey(key)
 }
 
-/// [`w_module_dict_nth_item_inner`]'s value half, which wraps no name —
+/// [`w_module_dict_nth_key_inner`]'s value half, which wraps no name —
 /// `dictmultiobject.py AbstractTypedStrategy.getitem` reads the typed storage
 /// value without
 /// wrapping its key, and here that skips the whole allocation.
@@ -7039,10 +6996,9 @@ pub trait DictStrategy {
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)>;
 
-    /// Fetch the `(key, value)` entry in slot `index`, wrapping only that one
-    /// key — O(1) per step for the typed strategies.  Answers `None` for a
-    /// slot past the end and for a tombstone, which is `entries.valid(i)`
-    /// (`rordereddict.py`).
+    /// Fetch the key in slot `index`, wrapping only that one key —
+    /// `entries[index].key` (`rordereddict.py`).  Returns `PY_NULL` on a miss
+    /// (past the end, or a tombstone).
     ///
     /// `index` is a slot, not the n-th live pair; [`Self::next_slot`] is what
     /// walks from one to the next.  Stands in for PyPy's `next_*_entry`
@@ -7054,12 +7010,11 @@ pub trait DictStrategy {
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        self.items(w_dict).into_iter().nth(index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match self.items(w_dict).into_iter().nth(index) {
+            Some((key, _)) => key,
+            None => PY_NULL,
+        }
     }
 
     /// Read the value at iteration position `index` without requiring a
@@ -7070,15 +7025,14 @@ pub trait DictStrategy {
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
-        match self.nth_item(w_dict, index) {
+        match self.items(w_dict).into_iter().nth(index) {
             Some((_, value)) => value,
             None => PY_NULL,
         }
     }
 
-    /// The first live slot at or after `from` — `_ll_dictnext`'s scan,
-    /// "while i < num_ever_used_items: if entries.valid(i)"
-    /// (`rordereddict.py`).
+    /// The first live slot at or after `from` — `_ll_dictnext`'s Signed
+    /// index (`rordereddict.py`), or `-1` when none remain.
     ///
     /// A delete leaves a tombstone rather than closing the hole, so a slot
     /// number is not an iteration position and a walk has to skip.  The
@@ -7087,20 +7041,26 @@ pub trait DictStrategy {
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        (from < self.length(w_dict)).then_some(from)
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        if from < self.length(w_dict) {
+            from as isize
+        } else {
+            -1
+        }
     }
 
     /// [`Self::next_slot`] descending, for `reversed(d)`: PyPy's
     /// `getiterreversed` is `objectmodel.reversed_dict`
     /// (`dictmultiobject.py`), itself a descending slot walk with the
     /// same `valid()` skip.  `before` is exclusive, so a fresh reverse walk
-    /// starts at `usize::MAX`.
+    /// starts at `usize::MAX`.  `_ll_dictnext_reversed`'s Signed index, or
+    /// `-1` when none remain.
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        before.min(self.length(w_dict)).checked_sub(1)
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        let n = before.min(self.length(w_dict));
+        if n == 0 { -1 } else { (n - 1) as isize }
     }
 
     /// `dictmultiobject.py DictStrategy.pop` — remove and
@@ -8219,20 +8179,32 @@ impl DictStrategy for ObjectDictStrategy {
         crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
     }
 
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_object_storage(w_dict).get_slot(index) {
+            Some((k, _)) => k.0,
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).next_valid_slot(from)
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_object_storage(w_dict).get_slot(index) {
+            Some((_, &v)) => v,
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).prev_valid_slot(before)
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        crate::rordereddict::ll_dictnext(
+            crate::dictmultiobject::w_dict_object_storage(w_dict),
+            from,
+        )
+    }
+
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        crate::rordereddict::ll_dictprev(
+            crate::dictmultiobject::w_dict_object_storage(w_dict),
+            before,
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.popitem`.
@@ -8405,20 +8377,22 @@ impl DictStrategy for BytesDictStrategy {
         crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict)
     }
 
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_dict_nth_item_bytes_strategy(w_dict, index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_bytes_storage(w_dict).get_slot(index) {
+            Some((k, _)) => crate::w_bytes_from_block(k.0),
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_bytes_storage(w_dict).next_valid_slot(from)
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        crate::rordereddict::ll_dictnext(crate::dictmultiobject::w_dict_bytes_storage(w_dict), from)
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_bytes_storage(w_dict).prev_valid_slot(before)
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        crate::rordereddict::ll_dictprev(
+            crate::dictmultiobject::w_dict_bytes_storage(w_dict),
+            before,
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.popitem`.
@@ -8672,20 +8646,32 @@ impl DictStrategy for UnicodeDictStrategy {
         crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
     }
 
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_object_storage(w_dict).get_slot(index) {
+            Some((k, _)) => k.0,
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).next_valid_slot(from)
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_object_storage(w_dict).get_slot(index) {
+            Some((_, &v)) => v,
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_object_storage(w_dict).prev_valid_slot(before)
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        crate::rordereddict::ll_dictnext(
+            crate::dictmultiobject::w_dict_object_storage(w_dict),
+            from,
+        )
+    }
+
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        crate::rordereddict::ll_dictprev(
+            crate::dictmultiobject::w_dict_object_storage(w_dict),
+            before,
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.popitem`.
@@ -8897,20 +8883,19 @@ impl DictStrategy for IntDictStrategy {
         crate::dictmultiobject::w_dict_items_int_strategy(w_dict)
     }
 
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_dict_nth_item_int_strategy(w_dict, index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match crate::dictmultiobject::w_dict_int_storage(w_dict).get_slot(index) {
+            Some((&k, _)) => crate::w_int_new(k),
+            None => PY_NULL,
+        }
     }
 
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_int_storage(w_dict).next_valid_slot(from)
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        crate::rordereddict::ll_dictnext(crate::dictmultiobject::w_dict_int_storage(w_dict), from)
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        crate::dictmultiobject::w_dict_int_storage(w_dict).prev_valid_slot(before)
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        crate::rordereddict::ll_dictprev(crate::dictmultiobject::w_dict_int_storage(w_dict), before)
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.popitem`.

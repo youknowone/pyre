@@ -21010,19 +21010,19 @@ pub(crate) fn set_iter_descr_next(obj: PyObjectRef) -> PyResult {
             );
             return Err(PyError::stop_iteration());
         };
-        let Some(key) =
-            pyre_object::w_set_key_at(pyre_object::gc_roots::shadow_stack_get(base + 1), slot)
-        else {
+        let key =
+            pyre_object::w_set_key_at(pyre_object::gc_roots::shadow_stack_get(base + 1), slot);
+        if key.is_null() {
             pyre_object::w_set_iter_set_set(
                 pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::PY_NULL,
             );
             return Err(PyError::stop_iteration());
-        };
+        }
         // Pin the yielded key, then read the iterator back: `pin_roots`
         // normalizes, and that query is a safepoint when another mutator
         // exists. `try_hash_w` inside `w_set_key_at` has the same window.
-        let key_slot = pyre_object::gc_roots::pin_roots(&[key.obj]);
+        let key_slot = pyre_object::gc_roots::pin_roots(&[key]);
         let obj = pyre_object::gc_roots::shadow_stack_get(base);
         pyre_object::w_set_iter_set_index(obj, index + 1);
         pyre_object::w_set_iter_set_slot(obj, slot + 1);

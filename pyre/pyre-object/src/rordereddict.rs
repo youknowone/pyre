@@ -892,41 +892,23 @@ impl<K, V, S> RDict<K, V, S> {
     /// entries.valid(i)".  A cursor stays valid across an unrelated delete
     /// because nothing renumbers; it goes stale only when [`Self::generation`]
     /// moves.
+    ///
+    /// The scan is [`ll_dictnext`]'s.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        let mut i = from;
-        while i < self.num_ever_used_items {
-            if self.entry_valid(i) {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+        let slot = ll_dictnext(self, from);
+        if slot < 0 { None } else { Some(slot as usize) }
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
     /// `before`, which is `ll_dictiter_reversed`'s walk.  A fresh reverse walk
     /// starts at `usize::MAX`.
     ///
-    /// [3.15-spec] A cursor above `num_ever_used_items` is clamped and the walk
-    /// continues into whatever the table holds now; `_ll_dictnext_reversed`
-    /// (`rordereddict.py`, PyPy issue 5596) stops there instead.  The
-    /// observable difference: after `clear` and a refill below the cursor,
-    /// `dictreviter_iter_lock_held` keeps walking and raises "dictionary keys
-    /// changed during iteration" once its count runs out
-    /// (`test_dict.test_reversed_dict_keys_changed_during_iteration`), which
-    /// the clamp reproduces through the `startlen` check in
-    /// `dict_iter_descr_next`; stopping would end the iteration silently.
+    /// The scan is [`ll_dictprev`]'s.
     #[inline]
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
-        let mut i = before.min(self.num_ever_used_items);
-        while i > 0 {
-            i -= 1;
-            if self.entry_valid(i) {
-                return Some(i);
-            }
-        }
-        None
+        let slot = ll_dictprev(self, before);
+        if slot < 0 { None } else { Some(slot as usize) }
     }
 
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
@@ -1216,17 +1198,61 @@ pub fn ll_dictnext<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
     }
 }
 
+/// `_ll_dictnext` (`rordereddict.py`). `look_inside_iff` (`jit.py`)
+/// applies `unroll_safe` on the orig.
+#[majit_macros::unroll_safe]
 fn ll_dictnext_orig<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
-    match d.next_valid_slot(from) {
-        Some(slot) => slot as isize,
-        None => -1,
+    let mut i = from;
+    while i < d.num_ever_used_items {
+        if d.entry_valid(i) {
+            return i as isize;
+        }
+        i += 1;
     }
+    -1
 }
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub fn ll_dictnext_trampoline<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
     ll_dictnext_orig(d, from)
+}
+
+/// `_ll_dictnext_reversed` (`rordereddict.py`). Last live slot strictly
+/// below `before`, or `-1`. look_inside_iff(isvirtual(d)).
+pub fn ll_dictprev<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual(d) {
+        ll_dictprev_orig(d, before)
+    } else {
+        ll_dictprev_trampoline(d, before)
+    }
+}
+
+/// [3.15-spec] A cursor above `num_ever_used_items` is clamped and the walk
+/// continues into whatever the table holds now; `_ll_dictnext_reversed`
+/// (`rordereddict.py`, PyPy issue 5596) stops there instead.  The
+/// observable difference: after `clear` and a refill below the cursor,
+/// `dictreviter_iter_lock_held` keeps walking and raises "dictionary keys
+/// changed during iteration" once its count runs out
+/// (`test_dict.test_reversed_dict_keys_changed_during_iteration`), which
+/// the clamp reproduces through the `startlen` check in
+/// `dict_iter_descr_next`; stopping would end the iteration silently.
+#[majit_macros::unroll_safe]
+fn ll_dictprev_orig<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    let mut i = before.min(d.num_ever_used_items);
+    while i > 0 {
+        i -= 1;
+        if d.entry_valid(i) {
+            return i as isize;
+        }
+    }
+    -1
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn ll_dictprev_trampoline<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    ll_dictprev_orig(d, before)
 }
 
 /// `ll_dict_contains`. look_inside_iff(isvirtual(d)).
