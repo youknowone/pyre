@@ -15980,7 +15980,7 @@ mod tests {
         let ops_after_prepare = ctx.num_ops();
         let mut resume_later = resume_data.clone();
         resume_later.virtualref_values =
-            vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)];
+            vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)].into();
         let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
             &mut sym,
             &mut ctx,
@@ -16108,7 +16108,7 @@ mod tests {
         let ops_after_prepare = ctx.num_ops();
         let mut resume_later = resume_data.clone();
         resume_later.virtualref_values =
-            vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)];
+            vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)].into();
         let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
             &mut sym,
             &mut ctx,
