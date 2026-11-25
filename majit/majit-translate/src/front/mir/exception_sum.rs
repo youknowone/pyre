@@ -1314,11 +1314,17 @@ fn exception_sum_predicate() {
     assert!(exception_sum_of_result(&bare_s, &llbc, carrier_spec()).is_none());
     assert!(!tyref_is_result_of_carrier(&bare_s, &llbc, carrier_spec()));
 
-    assert_eq!(token(&llbc, "exception_sum_f").as_deref(), Some("u64"));
-    assert_eq!(token(&llbc, "exception_sum_g").as_deref(), Some("u64"));
-    assert_eq!(token(&llbc, "exception_sum_own").as_deref(), Some("u64"));
-    assert_eq!(token(&llbc, "exception_sum_call_h").as_deref(), Some("u64"));
-    assert_eq!(token(&llbc, "exception_sum_match").as_deref(), Some("u64"));
+    assert_eq!(token(&llbc, "exception_sum_f").as_deref(), Some("usize"));
+    assert_eq!(token(&llbc, "exception_sum_g").as_deref(), Some("usize"));
+    assert_eq!(token(&llbc, "exception_sum_own").as_deref(), Some("usize"));
+    assert_eq!(
+        token(&llbc, "exception_sum_call_h").as_deref(),
+        Some("usize")
+    );
+    assert_eq!(
+        token(&llbc, "exception_sum_match").as_deref(),
+        Some("usize")
+    );
     assert_eq!(token(&llbc, "exception_sum_k").as_deref(), Some("ref"));
     assert_eq!(token(&llbc, "exception_sum_t").as_deref(), Some("ref"));
 }

@@ -4804,12 +4804,16 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
             Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone())
         }
         Some("bool") => Some(LowLevelType::Bool),
-        Some("i64") => Some(LowLevelType::Signed),
+        Some(s) if crate::front::mir::int_result_token_kind(s) == Some(true) => {
+            Some(LowLevelType::Signed)
+        }
         // `raw:<owner>` is a pointer-to-Raw-T. The lltype here is only the
         // gate's admission shell (`getkind` Signed). The stub's annotation
         // is `SomePtr`, resolved once layouts are on the bookkeeper.
         Some(s) if raw_owner_return_root(s).is_some() => Some(LowLevelType::Signed),
-        Some("u64") => Some(LowLevelType::Unsigned),
+        Some(s) if crate::front::mir::int_result_token_kind(s) == Some(false) => {
+            Some(LowLevelType::Unsigned)
+        }
         Some("f32") => Some(LowLevelType::SingleFloat),
         Some("f64") => Some(LowLevelType::Float),
         _ => None,

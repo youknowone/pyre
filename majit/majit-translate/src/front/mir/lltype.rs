@@ -5404,9 +5404,41 @@ pub(in crate::front::mir) fn tyref_exception_class_key(ty: &TyRef, llbc: &Llbc) 
 /// every aggregate onto a GC reference, which the call-signature validator
 /// must not start enforcing for ordinary struct returns. `"()"` is Void,
 /// the declared result of a `fn(...) -> ()` (and of `Result<(), PyError>`
-/// after the `Ok` projection).
+/// after the `Ok` projection). Integer widths are the precise scalar
+/// spellings [`dont_look_inside_return_token`] stamps (`getcalldescr`
+/// `FUNC.RESULT` / `get_call_descr` `symbolic.get_size`).
 pub(in crate::front::mir) fn scalar_result_token(token: &str) -> bool {
-    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64" | "()")
+    matches!(
+        token,
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "char"
+            | "f32"
+            | "f64"
+            | "()"
+    )
+}
+
+/// Signedness of an integer FUNC.RESULT token. `Some(true)` is signed
+/// (`i8`/`i16`/`i32`/`i64`/`isize`); `Some(false)` is unsigned
+/// (`u8`/`u16`/`u32`/`u64`/`usize`/`char`). Other tokens are `None`.
+/// Annotation stays `SomeInteger` signed/unsigned; descr width is
+/// `get_call_descr` / `declared_int_result_layout`.
+pub(crate) fn int_result_token_kind(token: &str) -> Option<bool> {
+    match token {
+        "i8" | "i16" | "i32" | "i64" | "isize" => Some(true),
+        "u8" | "u16" | "u32" | "u64" | "usize" | "char" => Some(false),
+        _ => None,
+    }
 }
 
 /// FUNC.RESULT token for a non-unit tuple return: `Tuple<t0,t1,…>` of
@@ -5457,13 +5489,15 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
 /// and the legacy walker converge by construction.
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
-/// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
-/// `u64`/`f64` → int/float), plus the `ref` sentinel for any pointer /
-/// reference / opaque-ADT return (codewriter wildcards it to
+/// `return_type_string_to_value_type` already recognizes (`bool`/`i32`/
+/// `i64`/`u8`/`u64`/`f64` → int/float), plus the `ref` sentinel for any
+/// pointer / reference / opaque-ADT return (codewriter wildcards it to
 /// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  A
 /// declared unit return stamps `"()"` (`extfunc.py` `register_external`
 /// `result=None` is declared `None`). `None` is only an unknown /
-/// unspellable result (`ValueType::Unknown` / `State`).
+/// unspellable result (`ValueType::Unknown` / `State`). Integer
+/// FUNC.RESULT is the precise scalar (`get_call_descr`
+/// `symbolic.get_size`).
 pub(in crate::front::mir) fn dont_look_inside_return_token(
     output: &TyRef,
     llbc: &Llbc,
@@ -5566,9 +5600,22 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             ) {
                 return Some(format!("raw:{root}"));
             }
-            "i64"
+            // `getcalldescr` reads FUNC.RESULT; `get_call_descr` takes
+            // `symbolic.get_size(RESULT)`. Stamp the precise scalar
+            // (`rffi.INT` is I32), not a collapsed i64.
+            return Some(
+                tyref_node(kind_src, llbc)
+                    .and_then(|node| json_ty_scalar_element_spelling(node, llbc))
+                    .unwrap_or_else(|| "i64".to_string()),
+            );
         }
-        ValueType::Unsigned => "u64",
+        ValueType::Unsigned => {
+            return Some(
+                tyref_node(kind_src, llbc)
+                    .and_then(|node| json_ty_scalar_element_spelling(node, llbc))
+                    .unwrap_or_else(|| "u64".to_string()),
+            );
+        }
         ValueType::Int128 => "i128",
         ValueType::UInt128 => "u128",
         ValueType::Float => "f64",
