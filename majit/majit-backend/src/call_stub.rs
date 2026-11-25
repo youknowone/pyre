@@ -874,6 +874,22 @@ fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
         .get_or_init(|| create_call_stub(&calldescr.arg_classes, calldescr.result_type))
 }
 
+/// `llmodel.py AbstractLLCPU.bh_call_i` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_i_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_i(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) -> i64 {
+    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+}
+
 /// `llmodel.py AbstractLLCPU.bh_call_i`: read the per-descr stub and call.
 ///
 /// # Safety
@@ -900,7 +916,23 @@ pub unsafe fn bh_call_i_with_descr(
             return result;
         }
     }
-    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+    unsafe { call_stub_i(func, args_i, args_r, args_f, calldescr) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_f` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_f_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_f(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) -> f64 {
+    unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_f` parallel of [`bh_call_i_with_descr`].
@@ -928,7 +960,23 @@ pub unsafe fn bh_call_f_with_descr(
             return f64::from_bits(bits as u64);
         }
     }
-    unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
+    unsafe { call_stub_f(func, args_i, args_r, args_f, calldescr) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_v` after `isinstance`: the
+/// descr's call stub, without the wasm residual-host-call hook.
+///
+/// # Safety
+/// Same as [`bh_call_v_with_descr`].
+#[inline(always)]
+pub unsafe fn call_stub_v(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) {
+    unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
 }
 
 /// `llmodel.py AbstractLLCPU.bh_call_v` parallel of [`bh_call_i_with_descr`].
@@ -966,7 +1014,7 @@ pub unsafe fn bh_call_v_with_descr(
             return;
         }
     }
-    unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
+    unsafe { call_stub_v(func, args_i, args_r, args_f, calldescr) }
 }
 
 /// Build the C-ABI class sequence and positional argument list from
@@ -1519,6 +1567,52 @@ mod tests {
             bh_call_i_with_descr(7, Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None, &descr)
         };
         assert_eq!(result, 42);
+    }
+
+    /// `call_stub_i` is the descr's stub. An installed residual-host-call
+    /// hook is visible only through `bh_call_i_with_descr`.
+    #[test]
+    fn call_stub_i_skips_the_installed_host_hook() {
+        let _hook_test = hold_hook_test_lock();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                set_residual_host_call(None);
+            }
+        }
+        let _clear = Clear;
+        extern "C" fn eight_ints(
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+            g: i64,
+            h: i64,
+        ) -> i64 {
+            a + b + c + d + e + f + g + h
+        }
+        set_residual_host_call(Some(|_func, args, _classes, result, signed, size| {
+            assert_eq!(args, &[1, 5, 2, 6, 3, 7, 4, 8]);
+            assert_eq!(result, 'i');
+            assert!(signed);
+            assert_eq!(size, 8);
+            Some(42)
+        }));
+        let descr = BhCallDescr::from_arg_classes(
+            "iriririr".to_string(),
+            'i',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let func = eight_ints as *const () as usize;
+        let from_stub =
+            unsafe { call_stub_i(func, Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None, &descr) };
+        assert_eq!(from_stub, 36);
+        let from_hook = unsafe {
+            bh_call_i_with_descr(func, Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None, &descr)
+        };
+        assert_eq!(from_hook, 42);
     }
 
     /// `'L'` is an i64 return stored in the float bank. The host result is the
