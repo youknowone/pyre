@@ -2482,6 +2482,16 @@ impl Bookkeeper {
     /// raw-word owner promotes the named-field `SomePtr` to the
     /// `SomeInstance` `robjmodel_instantiate` writes for that class.
     pub fn by_value_payload_annotation(self: &Rc<Self>, ty: &str) -> SomeValue {
+        let pointee = Self::pointee_spelling(ty);
+        if self.record_declaration(pointee).is_some()
+            && let Some(classdef) = self.classdef_for_known_struct_root(pointee)
+        {
+            return SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+        }
         let s_value = self.project_struct_field_type(ty);
         if self.payload_ptr_promotes_to_instance(ty, &s_value) {
             self.struct_instance_annotation(ty).unwrap_or(s_value)
@@ -2564,19 +2574,25 @@ impl Bookkeeper {
         Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
     }
 
+    /// Field type spelling with its reference / raw-pointer prefix
+    /// removed, naming the pointed-to struct.
+    fn pointee_spelling(field_ty: &str) -> &str {
+        field_ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches("*const ")
+            .trim_start_matches("*mut ")
+            .trim()
+    }
+
     /// SomeInstance of a registered named struct — the shell
     /// `robjmodel_instantiate` writes for a class that is not a
     /// `raw_word_owner`. Variant payloads (`__pos_N`) of such a class
     /// use this so the constructor does not union Instance with the
     /// SomePtr `project_struct_field_type` would mint.
     fn struct_instance_annotation(self: &Rc<Self>, field_ty: &str) -> Option<SomeValue> {
-        let stripped = field_ty
-            .trim()
-            .trim_start_matches('&')
-            .trim_start_matches("mut ")
-            .trim_start_matches("*const ")
-            .trim_start_matches("*mut ")
-            .trim();
+        let stripped = Self::pointee_spelling(field_ty);
         let named_root = majit_ir::descr::strip_generic_args(stripped);
         if crate::front::semantic::is_list_family_spelling(stripped)
             || crate::front::semantic::is_list_family_spelling(named_root.as_ref())
@@ -8366,6 +8382,12 @@ fn struct_root_declaration_identity<'a>(
     None
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecordDeclaration {
+    pub rows: Vec<crate::front::semantic::FieldRow>,
+    pub object_type: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+}
+
 impl Bookkeeper {
     /// Host declaration/layout category for a class intern spelling.
     ///
@@ -8380,6 +8402,37 @@ impl Bookkeeper {
         let registry = self.struct_fields.borrow();
         let registry = registry.as_ref()?;
         struct_root_declaration_identity(registry, root).map(|identity| identity.layout_kind)
+    }
+
+    pub(crate) fn record_declaration(&self, root: &str) -> Option<RecordDeclaration> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Struct};
+
+        let registry_guard = self.struct_fields.borrow();
+        let registry = registry_guard.as_ref()?;
+        let identity = struct_root_declaration_identity(registry, root)?.clone();
+        if identity.layout_kind != crate::front::semantic::LayoutKind::Record
+            || !registry.has_exact_layout(identity.id)
+        {
+            return None;
+        }
+        let rows = registry.intern_field_rows(&identity.spelling)?.to_vec();
+        let layouts_guard = self.struct_layouts.borrow();
+        let layouts = layouts_guard.as_ref()?;
+        let layout = layouts.borrow().get(&identity.id)?.clone();
+        let object_type = if rows.is_empty() {
+            LowLevelType::Struct(Box::new(Struct::registry_fields(
+                &identity.spelling,
+                Vec::new(),
+                layout.gckind,
+            )))
+        } else {
+            let mut building = Default::default();
+            owner_ll_container(registry, layouts, &identity.spelling, &mut building)?
+        };
+        if !matches!(object_type, LowLevelType::Struct(_)) {
+            return None;
+        }
+        Some(RecordDeclaration { rows, object_type })
     }
 }
 
@@ -22588,6 +22641,7 @@ mod tests {
         // pyre-synthesized method PBC — must accept the family and resolve
         // its owner + bound-`self` InstanceRepr (the vtable dispatch seed).
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
         let repr = MethodsPBCRepr::new(&rtyper, pbc)
             .expect("MethodsPBCRepr must accept the pyre-synthesized method family");
         assert_eq!(repr.methodname, "shared");

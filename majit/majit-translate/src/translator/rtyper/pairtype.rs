@@ -124,6 +124,8 @@ pub enum ReprClassId {
     ClassesPBCRepr,
     /// `rclass.py InstanceRepr(Repr)`.
     InstanceRepr,
+    /// Headerless declaration-backed record with pointer identity.
+    RecordRepr,
     /// `rtuple.py TupleRepr`.
     TupleRepr,
     /// `lltypesystem/rlist.py FixedSizeListRepr(
@@ -251,6 +253,7 @@ impl ReprClassId {
             ControlledInstanceRepr => &[ControlledInstanceRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             InstanceRepr => &[InstanceRepr, Repr],
+            RecordRepr => &[RecordRepr, Repr],
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
             ListRepr => &[ListRepr, Repr],
             RustVecRepr => &[RustVecRepr, Repr],
@@ -367,6 +370,9 @@ fn dispatch_convert_from_to(
         // other.
         (InstanceRepr, InstanceRepr) => {
             super::rclass::pair_instance_instance_convert_from_to(r_from, r_to, v, llops)
+        }
+        (RecordRepr, RecordRepr) => {
+            super::rclass::pair_record_record_convert_from_to(r_from, r_to, v)
         }
         // rgcref.py — `pairtype(GCRefRepr, Repr).convert_from_to` for a
         // Gc-opaque pointer the annotator merged into the classdef-less
@@ -848,6 +854,12 @@ fn dispatch_rtype_op(
         }
         (InstanceRepr, InstanceRepr, "ne") => {
             committed(super::rclass::pair_instance_instance_rtype_ne(r1, r2, hop))
+        }
+        (RecordRepr, RecordRepr, "eq") => {
+            committed(super::rclass::pair_record_record_rtype_is_(r1, r2, hop))
+        }
+        (RecordRepr, RecordRepr, "ne") => {
+            committed(super::rclass::pair_record_record_rtype_ne(r1, r2, hop))
         }
 
         // rint.py — IntegerRepr/IntegerRepr pair arithmetic and
@@ -1401,6 +1413,7 @@ fn dispatch_rtype_is_(
         // .rtype_is_`: convert both sides to the common-base instance
         // repr (cast_pointer upcast), then pointer identity via the
         // generic `(Repr, Repr)` arm.
+        (RecordRepr, RecordRepr) => super::rclass::pair_record_record_rtype_is_(r1, r2, hop),
         (InstanceRepr, InstanceRepr) => {
             super::rclass::pair_instance_instance_rtype_is_(r1, r2, hop)
         }

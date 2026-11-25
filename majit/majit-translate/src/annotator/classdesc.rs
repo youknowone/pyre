@@ -2856,6 +2856,12 @@ impl ClassDef {
             .unwrap_or(crate::front::semantic::LayoutKind::ObjectHeaded)
     }
 
+    pub(crate) fn record_declaration(
+        &self,
+    ) -> Option<crate::annotator::bookkeeper::RecordDeclaration> {
+        self.bookkeeper.upgrade()?.record_declaration(&self.name)
+    }
+
     /// RPython `ClassDef.getmro(self)` (classdesc.py).
     ///
     /// Walks `basedef` chain bottom-up. Returns owning `Rc`s so

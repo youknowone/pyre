@@ -568,6 +568,11 @@ pub struct StructFieldRegistry {
     /// Empty on a hand-built fixture that never published identities.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_identity: HashMap<String, Option<ClassIdentity>>,
+    /// Declaration identities for which Charon supplied an exact layout.
+    /// Sorted once at harvest completion; representation selection uses
+    /// binary search and never keys policy by a type name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exact_layout_ids: Vec<majit_ir::descr::StructId>,
     /// Suffix buckets for the key set of `fields`. Built on the first query
     /// that needs them and reused while the key-set fingerprint still
     /// matches. Replacing the rows of an existing key does not change the
@@ -923,6 +928,10 @@ impl StructFieldRegistry {
             .map(|(bare, _)| bare)
             .unwrap_or(class_root);
         self.raw_word_owners.contains(lookup) || self.raw_word_owners.contains(class_root)
+    }
+
+    pub(crate) fn has_exact_layout(&self, id: majit_ir::descr::StructId) -> bool {
+        self.exact_layout_ids.binary_search(&id).is_ok()
     }
 
     /// True when the harvested row for `owner.field_name` came from a

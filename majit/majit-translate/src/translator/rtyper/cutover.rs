@@ -9440,7 +9440,6 @@ fn lltype_for_named_ref(
 ) -> LowLevelType {
     use crate::annotator::model::SomeValue;
     use crate::translator::rtyper::lltypesystem::lltype::GCREF;
-    use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
     use crate::translator::rtyper::rmodel::Repr;
     let Some(rtyper) = rtyper else {
         return GCREF.clone();
@@ -9476,13 +9475,16 @@ fn lltype_for_named_ref(
             .getuniqueclassdef_for_struct_root(&intern_root)
         {
             Ok(classdef) => {
-                let repr =
-                    getinstancerepr(rtyper, Some(&classdef), Flavor::Gc).unwrap_or_else(|e| {
-                        panic!("lltype_for_named_ref: getinstancerepr({name}): {e}")
-                    });
-                Repr::setup(repr.as_ref()).unwrap_or_else(|e| {
-                    panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}")
-                });
+                let annotation = SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                ));
+                let repr = rtyper
+                    .getrepr(&annotation)
+                    .unwrap_or_else(|e| panic!("lltype_for_named_ref: getrepr({name}): {e}"));
+                Repr::setup(repr.as_ref())
+                    .unwrap_or_else(|e| panic!("lltype_for_named_ref: repr setup({name}): {e}"));
                 return repr.lowleveltype().clone();
             }
             Err(_) => return GCREF.clone(),
@@ -9494,10 +9496,16 @@ fn lltype_for_named_ref(
     let Some(classdef) = inst.classdef.as_ref() else {
         return GCREF.clone();
     };
-    let repr = getinstancerepr(rtyper, Some(classdef), Flavor::Gc)
-        .unwrap_or_else(|e| panic!("lltype_for_named_ref: getinstancerepr({name}): {e}"));
+    let annotation = SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+        Some(classdef.clone()),
+        inst.can_be_none,
+        inst.flags.clone(),
+    ));
+    let repr = rtyper
+        .getrepr(&annotation)
+        .unwrap_or_else(|e| panic!("lltype_for_named_ref: getrepr({name}): {e}"));
     Repr::setup(repr.as_ref())
-        .unwrap_or_else(|e| panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}"));
+        .unwrap_or_else(|e| panic!("lltype_for_named_ref: repr setup({name}): {e}"));
     repr.lowleveltype().clone()
 }
 

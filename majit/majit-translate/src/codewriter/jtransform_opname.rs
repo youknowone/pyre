@@ -7129,6 +7129,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closure_environment_emits_no_class_guard() {
+        let body = Struct::registry_fields(
+            "fixture::owner::closure",
+            vec![("__pos_0".into(), LowLevelType::Signed)],
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+        );
+        let pointer = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(body),
+        }));
+        let environment = variable_with_lltype("environment", pointer);
+        let startblock = Block::shared(vec![Hlvalue::Variable(environment.clone())]);
+        let capture = variable_with_lltype("capture", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "closure_environment_field",
+            startblock.clone(),
+            Hlvalue::Variable(capture.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(environment),
+                constant_with_lltype(ConstValue::byte_str("__pos_0"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(capture.clone()),
+        ));
+        close_return(&startblock, &graph, capture);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let operations: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
+            "record owner must not produce guard_class: {operations:?}"
+        );
+        let field = operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(field),
+            _ => None,
+        });
+        let field = field.expect("closure capture remains a FieldRead");
+        assert_eq!(field.owner_root.as_deref(), Some("fixture::owner::closure"));
+        assert_eq!(field.name, "__pos_0");
+        assert!(!field.owner_typeptr_hint);
+    }
+
     /// `Ptr(ForwardReference(<resolved GcStruct m::W_X>))` with
     /// `_hints['fieldnames']` mapping `inst_name` → `name`.  Models
     /// `InstanceRepr.object_type` after `_setup_repr.become`.

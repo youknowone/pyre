@@ -517,6 +517,11 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            acc.struct_fields
+                .exact_layout_ids
+                .extend(prog.struct_fields.exact_layout_ids);
+            acc.struct_fields.exact_layout_ids.sort_unstable();
+            acc.struct_fields.exact_layout_ids.dedup();
             for (key, kind) in prog.struct_fields.transparent_scalar_kinds {
                 acc.struct_fields
                     .transparent_scalar_kinds
@@ -8197,6 +8202,8 @@ fn derive_program_metadata(
     struct_fields
         .gc_struct_ids
         .extend(gc_struct_ids.iter().copied());
+    struct_fields.exact_layout_ids = exact_layouts.keys().copied().collect();
+    struct_fields.exact_layout_ids.sort_unstable();
 
     (
         known_struct_names,
@@ -8435,7 +8442,7 @@ pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir:
 /// names other than `ob_type` are irrelevant: `base`, `ob_header`, `ob`,
 /// and the rest are all followed. Enums return [`LayoutKind::Enum`];
 /// everything else returns [`LayoutKind::Record`].
-fn type_decl_layout_kind<'a>(
+pub(in crate::front::mir) fn type_decl_layout_kind<'a>(
     td: &'a TypeDecl,
     llbc: &'a Llbc,
     gc_seeds: &[majit_ir::descr::StructId],
@@ -11741,4 +11748,4 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 mod exception_sum;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

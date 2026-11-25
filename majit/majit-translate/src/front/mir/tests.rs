@@ -29,6 +29,70 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -
     )
 }
 
+#[test]
+fn result_err_record_payload_keeps_record_repr() {
+    use crate::front::semantic::LayoutKind;
+    use crate::model::ValueType;
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![opaque_type_decl(0, &["core", "io", "error", "Error"])],
+        vec![],
+    );
+    let ty: TyRef = serde_json::from_value(interior_adt(0)).unwrap();
+    let gc_struct_ids = harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc));
+    let paint = tyref_to_attr_value_type_with(
+        &ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &gc_struct_ids,
+        &raw,
+        None,
+    );
+    assert_eq!(paint, ValueType::Ref(Some("io::error::Error".to_string())));
+    let td = llbc.type_by_id(0).unwrap();
+    let mut seeds = gc_struct_ids.iter().copied().collect::<Vec<_>>();
+    seeds.sort_unstable();
+    assert_eq!(
+        super::type_decl_layout_kind(td, &llbc, &seeds),
+        LayoutKind::Record
+    );
+}
+
+#[test]
+fn foreign_record_result_valuetype_keeps_record_root() {
+    use crate::model::ValueType;
+    let mut error_decl = opaque_type_decl(0, &["core", "io", "error", "Error"]);
+    error_decl["layout"] = serde_json::json!([{
+        "key": "fixture",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            error_decl,
+            opaque_type_decl(1, &["lock_api", "mutex", "Mutex"]),
+        ],
+        vec![],
+    );
+    let error_ty: TyRef = serde_json::from_value(interior_adt(0)).unwrap();
+    assert_eq!(
+        super::foreign_opaque_method_result_valuetype(&error_ty, &llbc, None),
+        Some(ValueType::Ref(Some("io::error::Error".to_string())))
+    );
+    let mutex_ty: TyRef = serde_json::from_value(interior_adt(1)).unwrap();
+    assert_eq!(
+        super::foreign_opaque_method_result_valuetype(&mutex_ty, &llbc, None),
+        Some(ValueType::Ref(None))
+    );
+}
+
 mod reachable_mask_tests {
     use super::super::{forward_reachable_mask, lowered_reachable_mask, successor_blocks};
     use majit_charon_reader::{Llbc, ullbc::Unstructured};
@@ -18526,7 +18590,7 @@ pub(in crate::front::mir) fn result_enum(def_id: u64) -> serde_json::Value {
     })
 }
 
-pub(in crate::front::mir) fn llbc_with_types(
+pub(crate) fn llbc_with_types(
     crate_name: &str,
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
@@ -38234,7 +38298,7 @@ fn interior_span() -> serde_json::Value {
     })
 }
 
-pub(in crate::front::mir) fn interior_meta(path: &[&str], is_local: bool) -> serde_json::Value {
+pub(crate) fn interior_meta(path: &[&str], is_local: bool) -> serde_json::Value {
     serde_json::json!({
         "name": path.iter().map(|segment| {
             if *segment == "<Impl>" {
@@ -38255,7 +38319,7 @@ pub(in crate::front::mir) fn interior_meta(path: &[&str], is_local: bool) -> ser
     })
 }
 
-pub(in crate::front::mir) fn interior_i64() -> serde_json::Value {
+pub(crate) fn interior_i64() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})
 }
 
@@ -38263,7 +38327,7 @@ fn interior_f64() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Float": "F64"}})
 }
 
-pub(in crate::front::mir) fn interior_usize() -> serde_json::Value {
+pub(crate) fn interior_usize() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
 }
 
@@ -38275,7 +38339,7 @@ fn interior_u8() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
 }
 
-pub(in crate::front::mir) fn interior_adt(id: u64) -> serde_json::Value {
+pub(crate) fn interior_adt(id: u64) -> serde_json::Value {
     serde_json::json!({
         "Adt": {
             "id": id,
@@ -38421,7 +38485,7 @@ fn interior_c_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_jso
     }])
 }
 
-pub(in crate::front::mir) fn interior_struct(
+pub(crate) fn interior_struct(
     def_id: u64,
     path: &[&str],
     fields: &[(&str, serde_json::Value)],
