@@ -828,14 +828,12 @@ impl BlackholeInterpreter {
     ///
     /// `blackhole.py BlackholeInterpreter.cleanup_registers` NULLs only the
     /// first `num_regs_r()` REF registers and `exception_last_value`. It
-    /// never touches int/float registers and never clears constants. The
-    /// earlier whole-bank `fill(0)` wiped the constant area and forced
-    /// [`Self::setposition_ref`] to recopy it on every seating of the same
-    /// helper. Working int/float leftovers are overwritten by the next
-    /// `setposition` + argument copy the same way a pooled interp is.
+    /// never touches int/float registers and never clears constants. Working
+    /// int/float leftovers are overwritten by the next `setposition` +
+    /// argument copy the same way a pooled interp is.
     pub(crate) fn reset_for_inline_reuse(&mut self) {
         let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
-        self.registers_r[..n_r].fill(0);
+        Self::null_live_ref_prefix(&mut self.registers_r[..n_r]);
         self.tmpreg_i = 0;
         self.tmpreg_r = 0;
         self.tmpreg_f = 0;
@@ -1155,6 +1153,20 @@ impl BlackholeInterpreter {
         self.rooted
     }
 
+    /// Counted NULL stores over a live-ref prefix (`blackhole.py
+    /// BlackholeInterpreter.cleanup_registers` / generated
+    /// `pypy_g_BlackholeInterpreter_cleanup_registers`). Volatile stores
+    /// keep the loop as individual `RPyItem = NULL` writes.
+    #[inline(always)]
+    fn null_live_ref_prefix(registers_r: &mut [i64]) {
+        for i in 0..registers_r.len() {
+            // SAFETY: i < registers_r.len()
+            unsafe {
+                std::ptr::write_volatile(registers_r.get_unchecked_mut(i), 0);
+            }
+        }
+    }
+
     /// blackhole.py `BlackholeInterpreter.cleanup_registers`
     ///
     /// NULL `registers_r[0..num_regs_r())` and `exception_last_value`.
@@ -1170,7 +1182,7 @@ impl BlackholeInterpreter {
         // never clears it; a seated interp keeps the last
         // `setposition_ref` jitcode (`BlackholeInterpBuilder.release_interp`).
         let n_r = unsafe { self.jitcode.num_regs_r_assume_published() }.min(self.registers_r.len());
-        self.registers_r[..n_r].fill(0);
+        Self::null_live_ref_prefix(&mut self.registers_r[..n_r]);
         self.exception_last_value = 0;
         self.pending_exc = 0;
     }
@@ -7300,6 +7312,54 @@ mod tests {
             builder.release_interp(a);
             let reused = builder.acquire_interp();
             assert!(reused.nextblackholeinterp.is_none());
+        }
+
+        /// `cleanup_registers` NULLs only `registers_r[0..num_regs_r())`
+        /// (`blackhole.py BlackholeInterpreter.cleanup_registers`). Constants
+        /// and the int/float banks stay; `release_interp` then drops the
+        /// caller `Box` link and the idle virtualizable.
+        #[test]
+        fn cleanup_registers_nulls_the_live_ref_prefix_and_keeps_constants() {
+            let mut b = JitCodeBuilder::default();
+            b.ensure_r_regs(2);
+            b.ensure_i_regs(1);
+            b.ensure_f_regs(1);
+            b.add_const_r(0xC);
+            b.void_return();
+            let jitcode = std::sync::Arc::new(b.finish());
+            assert!(
+                jitcode.num_regs_r() == 2 && jitcode.num_regs_and_consts_r() >= 3,
+                "fixture: two live refs plus a constants_r slot"
+            );
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            assert!(bh.registers_r.len() >= 3);
+            assert!(!bh.registers_i.is_empty());
+            assert!(!bh.registers_f.is_empty());
+            bh.registers_r[0] = 0xA;
+            bh.registers_r[1] = 0xB;
+            bh.registers_r[2] = 0xC;
+            bh.registers_i[0] = 0xD;
+            bh.registers_f[0] = 0xE;
+            bh.virtualizable_ptr = 0x7f00_0000_1234;
+            bh.nextblackholeinterp = Some(builder.acquire_interp());
+
+            bh.cleanup_registers();
+            builder.release_interp(bh);
+
+            let pooled = builder
+                .blackholeinterps
+                .as_ref()
+                .expect("release_interp pools the interp");
+            assert_eq!(pooled.registers_r[0], 0);
+            assert_eq!(pooled.registers_r[1], 0);
+            assert_eq!(pooled.registers_r[2], 0xC);
+            assert_eq!(pooled.registers_i[0], 0xD);
+            assert_eq!(pooled.registers_f[0], 0xE);
+            assert_eq!(pooled.virtualizable_ptr, 0);
+            assert!(pooled.nextblackholeinterp.is_none());
         }
 
         /// Tier 2.1: ref-typed return propagation through

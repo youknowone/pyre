@@ -20,6 +20,10 @@ use crate::{TraceAction, TraceCtx};
 /// Residual-call argument lists. Eight slots cover the common helper arity
 /// (`MAX_HOST_CALL_ARITY` is 16); longer calls spill once.
 const CALL_INLINE: usize = 8;
+#[cfg(test)]
+const OPTRACE_PROBE_JITCODE: &str = "optrace_probe_jump_int_add";
+#[cfg(test)]
+static OPTRACE_SLOW_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 type CallOpRefs = SmallVec<[OpRef; CALL_INLINE]>;
 type CallI64s = SmallVec<[i64; CALL_INLINE]>;
 type CallTypes = SmallVec<[Type; CALL_INLINE]>;
@@ -2959,6 +2963,7 @@ where
         _sub_jitcodes: &[Arc<JitCode>],
         _fn_ptrs: &[JitCallTarget],
     ) -> Self {
+        crate::init_optrace_from_env();
         Self {
             frames,
             last_exception_box: None,
@@ -4279,8 +4284,9 @@ where
                         }
                         majit_jitcode::jitcode::read_label_at(code, pc + 1)
                     };
+                    // `pyjitpl.py` `MIFrame.run_one_step` `op_goto`: set pc
+                    // and continue. No debug tracer. LIVE already skips.
                     frame.code_cursor = target;
-                    self.optrace_step();
                     continue;
                 }
                 _ => {}
@@ -4297,22 +4303,37 @@ where
     }
 
     /// Print the current opcode when `optrace_enabled`. Never aborts the walk.
+    #[inline(always)]
     fn optrace_step(&mut self) {
         if crate::optrace_enabled() {
-            let fr = self.frames.current_mut();
-            let cur = fr.code_cursor;
-            let anchor_pc = fr.pc;
-            let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
-            let name = fr.jitcode.name.clone();
-            eprintln!(
-                "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
-                self.frames.len(),
-                cur,
-                anchor_pc,
-                opcode,
-                name
-            );
+            self.optrace_step_slow();
         }
+    }
+
+    #[inline(never)]
+    fn optrace_step_slow(&mut self) {
+        #[cfg(test)]
+        if self
+            .frames
+            .frames
+            .last()
+            .is_some_and(|fr| fr.jitcode.name() == OPTRACE_PROBE_JITCODE)
+        {
+            OPTRACE_SLOW_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let fr = self.frames.current_mut();
+        let cur = fr.code_cursor;
+        let anchor_pc = fr.pc;
+        let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+        let name = fr.jitcode.name.clone();
+        eprintln!(
+            "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+            self.frames.len(),
+            cur,
+            anchor_pc,
+            opcode,
+            name
+        );
     }
 
     /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
@@ -7396,6 +7417,72 @@ mod tests {
         stack: &mut MIFrameStack,
     ) -> JitCodeMachine<'_, DummySym, ClosureRuntime<fn(usize) -> usize>> {
         JitCodeMachine::with_framestack(stack, &[], &[])
+    }
+
+    fn walk_jump_then_int_add() {
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name(super::OPTRACE_PROBE_JITCODE);
+        let add = builder.new_label();
+        builder.jump(add);
+        builder.mark_label(add);
+        builder.record_binop_i(2, OpCode::IntAdd, 0, 1);
+        builder.void_return();
+        let jitcode = Arc::new(builder.finish());
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Int, Type::Int]);
+        let mut standalone = StandaloneFrameStack::new();
+        let mut frame = standalone
+            .frames
+            .take_frame(jitcode, 0, None, Some(&mut ctx));
+        frame.setup_call(&[
+            (JitArgKind::Int, OpRef::input_arg_int(0), 1),
+            (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+        ]);
+        ctx.stamp_argboxes(&[
+            (JitArgKind::Int, OpRef::input_arg_int(0), 1),
+            (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+        ]);
+        standalone.frames.push(frame);
+
+        let runtime = ClosureRuntime::new(|_pc: usize| 0usize);
+        let mut sym = DummySym;
+        let mut machine = JitCodeMachine::with_framestack(&mut standalone.frames, &[], &[]);
+        let _ = machine.run_to_end(&mut ctx, &mut sym, &runtime);
+    }
+
+    /// `MIFrame.run_one_step` `op_goto` continues with no debug tracer.
+    /// LIVE already skips; the disabled path is a Relaxed load and JUMP
+    /// does not enter `optrace_step_slow`.
+    #[test]
+    fn optrace_disabled_skips_jump_and_the_slow_path() {
+        super::OPTRACE_SLOW_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !crate::optrace_enabled(),
+            "MAJIT_OPTRACE is unset in this process"
+        );
+        walk_jump_then_int_add();
+        assert_eq!(
+            super::OPTRACE_SLOW_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "disabled walk must not enter optrace_step_slow"
+        );
+
+        let prev = crate::optrace_enabled();
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::set_optrace_enabled_for_test(self.0);
+            }
+        }
+        let _restore = Restore(prev);
+        crate::set_optrace_enabled_for_test(true);
+        super::OPTRACE_SLOW_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        walk_jump_then_int_add();
+        assert_eq!(
+            super::OPTRACE_SLOW_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "enabled walk prints INT_ADD and VOID_RETURN; JUMP is skipped"
+        );
     }
 
     /// Abort / too-long / Continue before the first merge point still have

@@ -22833,6 +22833,7 @@ impl MetaInterpStaticData {
     }
 
     pub fn new() -> Self {
+        crate::init_optrace_from_env();
         // `pyjitpl.py` `compile.make_and_attach_done_descrs([self, cpu])`.
         // RPython passes `[self, cpu]` — the same `Arc<DoneWithThisFrameDescr*>`
         // lands on both the metainterp and the backend so FINISH-descr
