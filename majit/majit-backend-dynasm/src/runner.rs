@@ -4375,9 +4375,9 @@ impl Backend for DynasmBackend {
     fn bh_call_i(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
@@ -4394,9 +4394,9 @@ impl Backend for DynasmBackend {
     fn bh_call_r(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
@@ -4414,9 +4414,9 @@ impl Backend for DynasmBackend {
     fn bh_call_f(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
@@ -4435,9 +4435,9 @@ impl Backend for DynasmBackend {
     fn bh_call_v(
         &self,
         func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");

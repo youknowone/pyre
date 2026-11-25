@@ -1897,39 +1897,36 @@ impl BhCallStub {
     #[inline(always)]
     fn place<'a>(
         &self,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
         buf: &'a mut [i64; super::insns::MAX_HOST_CALL_ARITY],
     ) -> &'a [i64] {
         debug_assert_eq!(
-            args_i.map_or(0, <[i64]>::len),
+            args_i.len(),
             self.expect_i as usize,
             "BhCallDescr.verify_types: arg_classes has {} int slots, args_i has {}",
             self.expect_i,
-            args_i.map_or(0, <[i64]>::len),
+            args_i.len(),
         );
         debug_assert_eq!(
-            args_r.map_or(0, <[i64]>::len),
+            args_r.len(),
             self.expect_r as usize,
             "BhCallDescr.verify_types: arg_classes has {} ref slots, args_r has {}",
             self.expect_r,
-            args_r.map_or(0, <[i64]>::len),
+            args_r.len(),
         );
         debug_assert_eq!(
-            args_f.map_or(0, <[i64]>::len),
+            args_f.len(),
             self.expect_f as usize,
             "BhCallDescr.verify_types: arg_classes has {} float slots, args_f has {}",
             self.expect_f,
-            args_f.map_or(0, <[i64]>::len),
+            args_f.len(),
         );
         let n = self.arity as usize;
         // descr.py `create_call_stub` indexes `args_i[k]` / `args_r[k]` /
-        // `args_f[k]` directly. Unwrap the banks once; a per-slot `expect`
-        // is not in the generated stub.
-        let args_i = args_i.unwrap_or(&[]);
-        let args_r = args_r.unwrap_or(&[]);
-        let args_f = args_f.unwrap_or(&[]);
+        // `args_f[k]` directly. A per-slot `expect` is not in the generated
+        // stub. An unused bank is `&[]`.
         for i in 0..n {
             let slot = self.slots[i];
             let idx = (slot & 0x3f) as usize;
@@ -2021,13 +2018,10 @@ impl BhCallStub {
     pub unsafe fn call_i(
         &self,
         func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
     ) -> i64 {
-        let args_i = args_i.unwrap_or(&[]);
-        let args_r = args_r.unwrap_or(&[]);
-        let args_f = args_f.unwrap_or(&[]);
         debug_assert_eq!(args_i.len(), self.expect_i as usize);
         debug_assert_eq!(args_r.len(), self.expect_r as usize);
         debug_assert_eq!(args_f.len(), self.expect_f as usize);
@@ -2055,9 +2049,9 @@ impl BhCallStub {
     pub unsafe fn call_f(
         &self,
         func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
     ) -> f64 {
         let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
         let args = self.place(args_i, args_r, args_f, &mut buf);
@@ -2068,13 +2062,7 @@ impl BhCallStub {
     ///
     /// # Safety
     /// `func` must match the ABI this stub was selected for.
-    pub unsafe fn call_v(
-        &self,
-        func: usize,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
-    ) {
+    pub unsafe fn call_v(&self, func: usize, args_i: &[i64], args_r: &[i64], args_f: &[i64]) {
         let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
         let args = self.place(args_i, args_r, args_f, &mut buf);
         unsafe { (self.call_stub_v)(func, args) }

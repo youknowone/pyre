@@ -10139,8 +10139,8 @@ fn bh_call_r_for_oopspec(
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
     oopspec: majit_ir::OopSpecIndex,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
+    args_i: &[i64],
+    args_r: &[i64],
 ) -> majit_ir::GcRef {
     let cic = callinfocollection.expect(
         "TraceCtx.callinfocollection missing — concrete VStr/VUni materialization \
@@ -10153,7 +10153,7 @@ fn bh_call_r_for_oopspec(
         .as_call_descr()
         .expect("VStr/VUni oopspec calldescr must be CallDescr");
     let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
-    backend.bh_call_r(func as i64, args_i, args_r, None, &bh_calldescr)
+    backend.bh_call_r(func as i64, args_i, args_r, &[], &bh_calldescr)
 }
 
 /// The block a resumed `PyFrame` virtual is materialized into while a bridge
@@ -10544,13 +10544,8 @@ fn materialize_concrete_virtual_ptr(
             };
             // resume.py concat_strings DirectReader concat_* resolves funcptr
             // via callinfocollection.funcptr_for_oopspec, not a placeholder.
-            let gcref = bh_call_r_for_oopspec(
-                backend,
-                callinfocollection,
-                oopspec,
-                None,
-                Some(&[str1, str2]),
-            );
+            let gcref =
+                bh_call_r_for_oopspec(backend, callinfocollection, oopspec, &[], &[str1, str2]);
             cache.set_concrete_ptr(vidx, gcref);
             gcref
         }
@@ -10606,8 +10601,8 @@ fn materialize_concrete_virtual_ptr(
                 backend,
                 callinfocollection,
                 oopspec,
-                Some(&[start, stop]),
-                Some(&[strbox]),
+                &[start, stop],
+                &[strbox],
             );
             cache.set_concrete_ptr(vidx, gcref);
             gcref
@@ -10686,7 +10681,7 @@ fn materialize_concrete_virtual_int(
                 cd.result_class(),
                 cd.get_extra_info().clone(),
             );
-            let buffer = backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &bh);
+            let buffer = backend.bh_call_i(*func, &[*size as i64], &[], &[], &bh);
             // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_concrete_int(vidx, buffer);
             // resume.py:705-708 iterate by len(self.offsets) unconditionally

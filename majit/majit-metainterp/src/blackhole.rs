@@ -1024,7 +1024,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_r(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// Set an integer register value.
@@ -2501,8 +2501,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(func, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(func, &[], args_r, &[], calldescr)
     }
 
     /// blackhole.py:1227-1229
@@ -2512,8 +2511,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(func, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(func, &[], args_r, &[], calldescr)
     }
 
     /// blackhole.py:1230-1232
@@ -2523,8 +2521,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(func, None, Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(func, &[], args_r, &[], calldescr);
     }
 
     /// blackhole.py:1234-1236
@@ -2535,8 +2532,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(func, args_i, args_r, &[], calldescr)
     }
 
     /// blackhole.py:1237-1239
@@ -2547,8 +2543,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(func, args_i, args_r, &[], calldescr)
     }
 
     /// blackhole.py:1240-1242
@@ -2559,8 +2554,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(func, args_i, args_r, &[], calldescr);
     }
 
     /// blackhole.py:1244-1246
@@ -2573,7 +2567,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
-            .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_i(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1247-1249
@@ -2586,7 +2580,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
-            .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_r(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1250-1252
@@ -2599,7 +2593,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
-            .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_f(func, args_i, args_r, args_f, calldescr)
     }
 
     /// blackhole.py:1253-1255
@@ -2612,7 +2606,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
-            .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
+            .bh_call_v(func, args_i, args_r, args_f, calldescr);
     }
 
     // ── bhimpl_inline_call_* (`blackhole.py` `bhimpl_inline_call_*`) ──
@@ -2633,8 +2627,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(fnaddr, &[], args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_r_r`
     pub fn bhimpl_inline_call_r_r(
@@ -2643,8 +2636,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(fnaddr, &[], args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_r_v`
     pub fn bhimpl_inline_call_r_v(
@@ -2653,8 +2645,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(fnaddr, &[], args_r, &[], calldescr);
     }
     /// blackhole.py `bhimpl_inline_call_ir_i`
     pub fn bhimpl_inline_call_ir_i(
@@ -2664,8 +2655,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
-        self.cpu()
-            .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_i(fnaddr, args_i, args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_ir_r`
     pub fn bhimpl_inline_call_ir_r(
@@ -2675,8 +2665,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.cpu()
-            .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
+        self.cpu().bh_call_r(fnaddr, args_i, args_r, &[], calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_ir_v`
     pub fn bhimpl_inline_call_ir_v(
@@ -2686,8 +2675,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
-        self.cpu()
-            .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
+        self.cpu().bh_call_v(fnaddr, args_i, args_r, &[], calldescr);
     }
     /// blackhole.py `bhimpl_inline_call_irf_i`
     pub fn bhimpl_inline_call_irf_i(
@@ -2699,7 +2687,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
-            .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_i(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_r`
     pub fn bhimpl_inline_call_irf_r(
@@ -2711,7 +2699,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
-            .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_r(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_f`
     pub fn bhimpl_inline_call_irf_f(
@@ -2723,7 +2711,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
-            .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
+            .bh_call_f(fnaddr, args_i, args_r, args_f, calldescr)
     }
     /// blackhole.py `bhimpl_inline_call_irf_v`
     pub fn bhimpl_inline_call_irf_v(
@@ -2735,7 +2723,7 @@ impl BlackholeInterpreter {
         calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
-            .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
+            .bh_call_v(fnaddr, args_i, args_r, args_f, calldescr);
     }
 
     // ── bhimpl_recursive_call_{i,f,v} (blackhole.py bhimpl_recursive_call_i) ──
@@ -2763,7 +2751,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_i(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// blackhole.py:1117-1124
@@ -2785,7 +2773,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+            .bh_call_f(fnptr, &all_i, &all_r, &all_f, &calldescr)
     }
 
     /// blackhole.py:1125-1132
@@ -2807,7 +2795,7 @@ impl BlackholeInterpreter {
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         );
         self.cpu()
-            .bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
+            .bh_call_v(fnptr, &all_i, &all_r, &all_f, &calldescr);
     }
 }
 
@@ -14437,8 +14425,7 @@ fn handler_conditional_call_ir_v(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        bh.cpu()
-            .bh_call_v(func, Some(ai), Some(ar), None, calldescr);
+        bh.cpu().bh_call_v(func, ai, ar, &[], calldescr);
         check_residual_call_exception_after(bh, p)?;
     }
     Ok(p)
@@ -14459,9 +14446,7 @@ fn handler_conditional_call_value_ir_i(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        value = bh
-            .cpu()
-            .bh_call_i(func, Some(ai), Some(ar), None, calldescr);
+        value = bh.cpu().bh_call_i(func, ai, ar, &[], calldescr);
         check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_i[code[p] as usize] = value;
@@ -14488,10 +14473,7 @@ fn handler_conditional_call_value_ir_r(
         }
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
-        value = bh
-            .cpu()
-            .bh_call_r(func, Some(ai), Some(ar), None, calldescr)
-            .0 as i64;
+        value = bh.cpu().bh_call_r(func, ai, ar, &[], calldescr).0 as i64;
         check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_r[code[p] as usize] = value;
