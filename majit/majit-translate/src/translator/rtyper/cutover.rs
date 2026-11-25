@@ -23088,9 +23088,9 @@ mod tests {
             &[object],
             crate::HostStaticAddrs::default(),
             &["identitydict", "rordereddict", "rordereddict_entries"],
-            &["nth_item"],
+            &["nth_key"],
         )
-        .expect("lower identitydict nth_item");
+        .expect("lower identitydict nth_key");
 
         let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
         let entry_at = program

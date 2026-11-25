@@ -396,9 +396,9 @@ fn identitykey_get_slot_does_not_cast_objectkey_entry() {
         std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["identitydict", "rordereddict", "rordereddict_entries"],
-        &["nth_item"],
+        &["nth_key"],
     )
-    .expect("lower identitydict nth_item");
+    .expect("lower identitydict nth_key");
 
     let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
     let slots: Vec<_> = program
@@ -456,9 +456,9 @@ fn identitykey_entry_at_does_not_recast_monomorph_entry() {
         std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["identitydict", "rordereddict", "rordereddict_entries"],
-        &["nth_item"],
+        &["nth_key"],
     )
-    .expect("lower identitydict nth_item");
+    .expect("lower identitydict nth_key");
 
     let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
     let specs: Vec<_> = program
