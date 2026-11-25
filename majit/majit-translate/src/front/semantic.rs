@@ -505,6 +505,21 @@ pub(crate) fn list_family_bare_vec_spelling(spelling: &str) -> Option<String> {
     Some(format!("{prefix}Vec{args}"))
 }
 
+/// Host aggregate representation category carried by declaration identity.
+///
+/// This is the representation-selection input corresponding to
+/// `rclass.getinstancerepr`: `ObjectHeaded` keeps `rclass.InstanceRepr`,
+/// while a sum repr (at the same boundary as `rtagged.TaggedInstanceRepr`)
+/// or a headerless record repr (the shape of `rtuple.TupleRepr`) will be
+/// selected for the other kinds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LayoutKind {
+    ObjectHeaded,
+    Enum,
+    #[default]
+    Record,
+}
+
 /// Declaration identity for one harvested class spelling.
 ///
 /// `id` is the `StructId` of the type declaration (`lltype.Struct` analog).
@@ -513,11 +528,29 @@ pub(crate) fn list_family_bare_vec_spelling(spelling: &str) -> Option<String> {
 /// the crate-stripped `module::Type` harvest uses as the `struct_fields`
 /// key. `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)`; a name is
 /// never identity, so every alias of one declaration stores the same
-/// `spelling`.
+/// `spelling` and `layout_kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClassIdentity {
     pub id: majit_ir::descr::StructId,
     pub spelling: String,
+    /// Rust declaration/layout category. `serde(default)` keeps old cached
+    /// metadata readable; fresh Charon metadata always supplies the value.
+    #[serde(default)]
+    pub layout_kind: LayoutKind,
+}
+
+impl ClassIdentity {
+    pub fn new(
+        id: majit_ir::descr::StructId,
+        spelling: impl Into<String>,
+        layout_kind: LayoutKind,
+    ) -> Self {
+        Self {
+            id,
+            spelling: spelling.into(),
+            layout_kind,
+        }
+    }
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.

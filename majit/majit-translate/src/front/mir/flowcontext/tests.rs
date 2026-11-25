@@ -199,10 +199,11 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         // item `Struct` is not built and the cast stays the 1-arg form.
         let mut struct_fields = context.struct_field_registry();
         let pointee_root = "pyobject::PyObject";
-        let identity = crate::front::semantic::ClassIdentity {
-            id: majit_ir::descr::StructId::from_canonical(pointee_root),
-            spelling: pointee_root.to_string(),
-        };
+        let identity = crate::front::semantic::ClassIdentity::new(
+            majit_ir::descr::StructId::from_canonical(pointee_root),
+            pointee_root,
+            crate::front::semantic::LayoutKind::ObjectHeaded,
+        );
         for key in [
             "PyObject",
             "pyobject::PyObject",

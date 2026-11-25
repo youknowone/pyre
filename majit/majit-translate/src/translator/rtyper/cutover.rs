@@ -20198,10 +20198,11 @@ mod tests {
         for alias in ["pyre_object::rordereddict_entries::Entry", entry, "Entry"] {
             fields.class_identity.insert(
                 alias.to_string(),
-                Some(crate::front::semantic::ClassIdentity {
-                    id: entry_id,
-                    spelling: entry.to_string(),
-                }),
+                Some(crate::front::semantic::ClassIdentity::new(
+                    entry_id,
+                    entry,
+                    crate::front::semantic::LayoutKind::Record,
+                )),
             );
         }
         for alias in [
@@ -20211,10 +20212,11 @@ mod tests {
         ] {
             fields.class_identity.insert(
                 alias.to_string(),
-                Some(crate::front::semantic::ClassIdentity {
-                    id: gc_id,
-                    spelling: entries.to_string(),
-                }),
+                Some(crate::front::semantic::ClassIdentity::new(
+                    gc_id,
+                    entries,
+                    crate::front::semantic::LayoutKind::Record,
+                )),
             );
         }
         for name in [

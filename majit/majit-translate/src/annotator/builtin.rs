@@ -6819,10 +6819,11 @@ mod tests {
         ] {
             reg.class_identity.insert(
                 alias.to_string(),
-                Some(crate::front::semantic::ClassIdentity {
-                    id: entry_id,
-                    spelling: "rordereddict_entries::Entry".to_string(),
-                }),
+                Some(crate::front::semantic::ClassIdentity::new(
+                    entry_id,
+                    "rordereddict_entries::Entry",
+                    crate::front::semantic::LayoutKind::Record,
+                )),
             );
         }
         for alias in [
@@ -6832,10 +6833,11 @@ mod tests {
         ] {
             reg.class_identity.insert(
                 alias.to_string(),
-                Some(crate::front::semantic::ClassIdentity {
-                    id: gc_id,
-                    spelling: "rordereddict_entries::GcEntries".to_string(),
-                }),
+                Some(crate::front::semantic::ClassIdentity::new(
+                    gc_id,
+                    "rordereddict_entries::GcEntries",
+                    crate::front::semantic::LayoutKind::Record,
+                )),
             );
         }
         for name in [
@@ -7524,7 +7526,7 @@ mod tests {
     #[test]
     fn instantiate_of_raw_word_owner_setattr_payload_enum_field() {
         use crate::front::StructFieldRegistry;
-        use crate::front::semantic::{ClassIdentity, FieldRow};
+        use crate::front::semantic::{ClassIdentity, FieldRow, LayoutKind};
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
         let fmt = "module::struct::Fmt";
@@ -7572,17 +7574,11 @@ mod tests {
             .insert(some.to_string(), vec![FieldRow::positional("__pos_0", fmt)]);
         reg.class_identity.insert(
             code.to_string(),
-            Some(ClassIdentity {
-                id: code_id,
-                spelling: code.to_string(),
-            }),
+            Some(ClassIdentity::new(code_id, code, LayoutKind::Record)),
         );
         reg.class_identity.insert(
             eval_code.to_string(),
-            Some(ClassIdentity {
-                id: eval_id,
-                spelling: eval_code.to_string(),
-            }),
+            Some(ClassIdentity::new(eval_id, eval_code, LayoutKind::Record)),
         );
         reg.raw_word_owners.insert(fmt.to_string());
         reg.raw_word_owners.insert(code.to_string());
@@ -7940,10 +7936,11 @@ mod tests {
         let mut reg = StructFieldRegistry::default();
         let pyobj = "pyobject::PyObject";
         let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
-        let pyobj_identity = crate::front::semantic::ClassIdentity {
-            id: pyobj_id,
-            spelling: pyobj.to_string(),
-        };
+        let pyobj_identity = crate::front::semantic::ClassIdentity::new(
+            pyobj_id,
+            pyobj,
+            crate::front::semantic::LayoutKind::ObjectHeaded,
+        );
         reg.fields.insert(
             pyobj.to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
@@ -8129,10 +8126,11 @@ mod tests {
         let mut reg = StructFieldRegistry::default();
         let pyobj = "pyobject::PyObject";
         let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
-        let pyobj_identity = crate::front::semantic::ClassIdentity {
-            id: pyobj_id,
-            spelling: pyobj.to_string(),
-        };
+        let pyobj_identity = crate::front::semantic::ClassIdentity::new(
+            pyobj_id,
+            pyobj,
+            crate::front::semantic::LayoutKind::ObjectHeaded,
+        );
         reg.fields.insert(
             pyobj.to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],

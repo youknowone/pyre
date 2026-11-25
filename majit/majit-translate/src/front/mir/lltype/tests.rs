@@ -23169,10 +23169,11 @@ fn note_class_identity(reg: &mut crate::front::StructFieldRegistry, spelling: &s
     let id = majit_ir::descr::StructId::from_canonical(spelling);
     reg.class_identity.insert(
         spelling.to_string(),
-        Some(crate::front::semantic::ClassIdentity {
+        Some(crate::front::semantic::ClassIdentity::new(
             id,
-            spelling: spelling.to_string(),
-        }),
+            spelling,
+            crate::front::semantic::LayoutKind::Record,
+        )),
     );
 }
 

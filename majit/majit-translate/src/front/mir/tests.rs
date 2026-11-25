@@ -20478,6 +20478,87 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
     );
 }
 
+fn layout_kind_fields(types: Vec<serde_json::Value>) -> crate::front::StructFieldRegistry {
+    let llbc = llbc_with_types("fixture", types, vec![]);
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    fields
+}
+
+fn named_layout_field(name: &str, ty: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": name, "ty": ty, "attr_info": null})
+}
+
+#[test]
+fn w_int_layout_kind_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let w_int = type_decl_struct(
+        1,
+        &["fixture", "intobject", "W_IntObject"],
+        vec![
+            named_layout_field("ob_header", adt_node(0)),
+            named_layout_field("intval", interior_i64()),
+        ],
+    );
+    let fields = layout_kind_fields(vec![header, w_int]);
+    let identity = fields
+        .class_identity
+        .get("intobject::W_IntObject")
+        .and_then(Option::as_ref)
+        .expect("W_IntObject declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn enum_layout_kind_uses_decl_identity() {
+    use crate::front::semantic::LayoutKind;
+
+    let fields = layout_kind_fields(vec![option_enum(0)]);
+    let full = fields
+        .class_identity
+        .get("core::option::Option")
+        .and_then(Option::as_ref)
+        .expect("full Option declaration identity");
+    let stripped = fields
+        .class_identity
+        .get("option::Option")
+        .and_then(Option::as_ref)
+        .expect("crate-stripped Option declaration identity");
+    assert_eq!(full.id, stripped.id);
+    assert_eq!(full.layout_kind, LayoutKind::Enum);
+    assert_eq!(stripped.layout_kind, LayoutKind::Enum);
+}
+
+#[test]
+fn closure_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let closure = type_decl_struct(
+        0,
+        &["fixture", "owner", "{closure#0}"],
+        vec![named_layout_field("__pos_0", interior_i64())],
+    );
+    let fields = layout_kind_fields(vec![closure]);
+    let identity = fields
+        .class_identity
+        .values()
+        .filter_map(Option::as_ref)
+        .find(|identity| identity.spelling.ends_with("{closure#0}"))
+        .expect("closure declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
 /// substituted callee signature. The caller has no Option local. A Fun
 /// RegularCall and a `CallKind::Trait` that `trait_impl_method` resolves

@@ -9946,10 +9946,11 @@ mod tests {
         fields.note_declared_gc_name(registry_key);
         fields.class_identity.insert(
             "PyObject".to_string(),
-            Some(crate::front::semantic::ClassIdentity {
-                id: majit_ir::descr::StructId::from_canonical("PyObject"),
-                spelling: "PyObject".to_string(),
-            }),
+            Some(crate::front::semantic::ClassIdentity::new(
+                majit_ir::descr::StructId::from_canonical("PyObject"),
+                "PyObject",
+                crate::front::semantic::LayoutKind::ObjectHeaded,
+            )),
         );
         bk.set_struct_fields(Rc::new(fields));
 
@@ -10401,10 +10402,11 @@ mod tests {
         let mut fields = crate::front::StructFieldRegistry::default();
         let pyobj = "pyobject::PyObject";
         let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
-        let pyobj_identity = crate::front::semantic::ClassIdentity {
-            id: pyobj_id,
-            spelling: pyobj.to_string(),
-        };
+        let pyobj_identity = crate::front::semantic::ClassIdentity::new(
+            pyobj_id,
+            pyobj,
+            crate::front::semantic::LayoutKind::ObjectHeaded,
+        );
         fields.fields.insert(
             "PyObject".to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],

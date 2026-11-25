@@ -2842,6 +2842,20 @@ impl ClassDef {
         format!("<ClassDef '{}'>", self.name)
     }
 
+    /// Structural host-layout input for representation selection.
+    ///
+    /// Host-backed ClassDefs read the declaration identity harvested from
+    /// Charon. Upstream-internal ClassDefs have no such declaration; keep
+    /// their existing `rclass.getinstancerepr` behaviour by returning
+    /// `ObjectHeaded`. The read stays lazy so metadata installed after this
+    /// ClassDef was minted is observed without a mutable late-set field.
+    pub fn layout_kind(&self) -> crate::front::semantic::LayoutKind {
+        self.bookkeeper
+            .upgrade()
+            .and_then(|bookkeeper| bookkeeper.class_layout_kind(&self.name))
+            .unwrap_or(crate::front::semantic::LayoutKind::ObjectHeaded)
+    }
+
     /// RPython `ClassDef.getmro(self)` (classdesc.py).
     ///
     /// Walks `basedef` chain bottom-up. Returns owning `Rc`s so

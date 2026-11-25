@@ -2447,6 +2447,11 @@ pub struct InstanceRepr {
     /// upstream's sentinel for the root instance that carries
     /// `object_type = OBJECT_BY_FLAVOR[...]` directly.
     classdef: Option<Rc<RefCell<ClassDef>>>,
+    /// Representation-boundary input captured by `rclass.getinstancerepr`.
+    /// Every kind still selects `InstanceRepr`; a record repr in the
+    /// `rtuple.TupleRepr` shape and a sum repr placed like
+    /// `rtagged.TaggedInstanceRepr` will branch on it.
+    layout_kind: crate::front::semantic::LayoutKind,
     /// RPython `self.object_type = OBJECT_BY_FLAVOR[LLFLAVOR[gcflavor]]`
     /// when classdef is None (rclass.py), otherwise a fresh
     /// `ForwardReference` (rclass.py). The FR target resolves
@@ -2512,10 +2517,14 @@ impl InstanceRepr {
         classdef: Option<&Rc<RefCell<ClassDef>>>,
         gcflavor: Flavor,
     ) -> Self {
+        let layout_kind = classdef
+            .map(|classdef| classdef.borrow().layout_kind())
+            .unwrap_or(crate::front::semantic::LayoutKind::ObjectHeaded);
         let (object_type, lowleveltype) = build_instance_types(classdef, gcflavor);
         InstanceRepr {
             rtyper: Rc::downgrade(rtyper),
             classdef: classdef.cloned(),
+            layout_kind,
             object_type,
             lowleveltype,
             gcflavor,
@@ -2543,6 +2552,11 @@ impl InstanceRepr {
     /// `None` for root instances, `Some(Rc<RefCell<ClassDef>>)` otherwise.
     pub fn classdef(&self) -> Option<Rc<RefCell<ClassDef>>> {
         self.classdef.clone()
+    }
+
+    /// Structural representation input captured by `rclass.getinstancerepr`.
+    pub fn layout_kind(&self) -> crate::front::semantic::LayoutKind {
+        self.layout_kind
     }
 
     /// RPython `InstanceRepr.object_type` (rclass.py).
@@ -7730,6 +7744,61 @@ mod tests {
         let first = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("first");
         let second = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("second");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn classdef_layout_kind_distinguishes_object_enum_record() {
+        use crate::front::semantic::{ClassIdentity, LayoutKind};
+
+        let annotator =
+            crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let bookkeeper = annotator.bookkeeper.clone();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        for (name, kind, rows) in [
+            (
+                "object::ObjectHeader",
+                LayoutKind::ObjectHeaded,
+                vec![("ob_type".to_string(), "*const PyType".to_string())],
+            ),
+            (
+                "fixture::Choice",
+                LayoutKind::Enum,
+                vec![("__discriminant".to_string(), "u8".to_string())],
+            ),
+            (
+                "fixture::Record",
+                LayoutKind::Record,
+                vec![("value".to_string(), "i64".to_string())],
+            ),
+        ] {
+            let id = majit_ir::descr::StructId::from_canonical(name);
+            fields.fields.insert(name.to_string(), rows);
+            fields
+                .class_identity
+                .insert(name.to_string(), Some(ClassIdentity::new(id, name, kind)));
+        }
+        bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let rtyper = fresh_rtyper();
+        for (name, expected) in [
+            ("object::ObjectHeader", LayoutKind::ObjectHeaded),
+            ("fixture::Choice", LayoutKind::Enum),
+            ("fixture::Record", LayoutKind::Record),
+        ] {
+            let classdef = bookkeeper
+                .getuniqueclassdef_for_struct_root(name)
+                .expect("host ClassDef");
+            assert_eq!(classdef.borrow().layout_kind(), expected, "{name}");
+            let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("InstanceRepr");
+            assert_eq!(repr.layout_kind(), expected, "{name}");
+        }
+
+        let internal = ClassDef::new_standalone("object", None);
+        assert_eq!(
+            internal.borrow().layout_kind(),
+            LayoutKind::ObjectHeaded,
+            "a ClassDef with no host declaration keeps ObjectHeaded"
+        );
     }
 
     #[test]
