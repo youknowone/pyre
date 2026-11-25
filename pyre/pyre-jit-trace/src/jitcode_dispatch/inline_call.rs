@@ -26280,9 +26280,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // Rich COMPARE lowers to `inline_call_ir_r` of `compare_value_from_tag`,
     // so the residual COMPARE gate never sees `p < q`.  Re-run its
     // user-dunder admission before the callee walk, as the BINARY block
-    // above does.
+    // above does.  Only a constant tag selects the dunder: a variable tag
+    // is left to the callee walk, whose switch on it records the guard
+    // (`pyjitpl.py MIFrame.opimpl_switch`).
     if dst_bank == 'r'
         && ref_args.len() == 2
+        && int_args.first().is_some_and(|tag| tag.is_constant())
         && super::specialize::jitcode_is_compare_value_from_tag(
             ctx.raw_descrs,
             sub_index,

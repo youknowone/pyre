@@ -7331,29 +7331,19 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
     })
 }
 
-fn jitcode_name_is_compare_value_from_tag(name: &str) -> bool {
-    name.ends_with("compare_value_from_tag")
-}
-
 /// True when `sub_body` is the `compare_value_from_tag` helper the
-/// codewriter inlines for rich COMPARE.  The per-index name table can
-/// miss a helper that `pathed_jitcode_cached` still owns, so the
-/// pathed jitcode's index or code pointer is matched as well, the same
-/// way `jitcode_is_binary_value_from_tag` matches its helper.
+/// codewriter inlines for rich COMPARE.  The target is identified by the
+/// pathed jitcode's index or code pointer, never by a name suffix
+/// (`jtransform.py handle_regular_call` names the callee graph itself).
 pub(crate) fn jitcode_is_compare_value_from_tag(
     pool: super::RawDescrPool<'_>,
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
 ) -> bool {
-    if pool
-        .inline_callee_name(sub_index)
-        .is_some_and(jitcode_name_is_compare_value_from_tag)
-    {
-        return true;
-    }
     crate::jitcode_runtime::pathed_jitcode_cached(COMPARE_OP_DESCENT.path).is_some_and(|jc| {
         (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
             || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+            || sub_body.jitcode_index == Some(jc.index())
     })
 }
 
