@@ -2834,6 +2834,7 @@ fn is_primitive_lowleveltype(lltype: &LowLevelType) -> bool {
             | LowLevelType::LongFloat
             | LowLevelType::Char
             | LowLevelType::UniChar
+            | LowLevelType::Address
             | LowLevelType::Number(_)
     )
 }

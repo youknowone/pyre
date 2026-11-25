@@ -744,6 +744,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "llmemory.cast_adr_to_int",
         llmemory_cast_adr_to_int,
     );
+    analyzer_for(&mut reg, "llmemory.raw_memmove", llmemory_raw_memmove);
+    analyzer_for(&mut reg, "llmemory.raw_memcopy", llmemory_raw_memcopy);
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -3137,6 +3139,74 @@ fn llmemory_cast_ptr_to_adr(
     Ok(SomeValue::Address(SomeAddress::new()))
 }
 
+/// `llmemory.py` `RawMemmoveEntry.compute_result_annotation`.
+fn llmemory_raw_memmove(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 3 {
+        return Err(AnnotatorError::new(
+            "raw_memmove expects (source, dest, size)",
+        ));
+    }
+    if !matches!(
+        arg_at(args_s, 0, "llmemory.raw_memmove"),
+        SomeValue::Address(_)
+    ) {
+        return Err(AnnotatorError::new(
+            "raw_memmove: source is not SomeAddress",
+        ));
+    }
+    if !matches!(
+        arg_at(args_s, 1, "llmemory.raw_memmove"),
+        SomeValue::Address(_)
+    ) {
+        return Err(AnnotatorError::new("raw_memmove: dest is not SomeAddress"));
+    }
+    if !matches!(
+        arg_at(args_s, 2, "llmemory.raw_memmove"),
+        SomeValue::Integer(_)
+    ) {
+        return Err(AnnotatorError::new("raw_memmove: size is not SomeInteger"));
+    }
+    Ok(s_none())
+}
+
+/// `llmemory.py` `ann_raw_memcopy`.
+fn llmemory_raw_memcopy(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 3 {
+        return Err(AnnotatorError::new(
+            "raw_memcopy expects (source, dest, size)",
+        ));
+    }
+    if !matches!(
+        arg_at(args_s, 0, "llmemory.raw_memcopy"),
+        SomeValue::Address(_)
+    ) {
+        return Err(AnnotatorError::new(
+            "raw_memcopy: source is not SomeAddress",
+        ));
+    }
+    if !matches!(
+        arg_at(args_s, 1, "llmemory.raw_memcopy"),
+        SomeValue::Address(_)
+    ) {
+        return Err(AnnotatorError::new("raw_memcopy: dest is not SomeAddress"));
+    }
+    if !matches!(
+        arg_at(args_s, 2, "llmemory.raw_memcopy"),
+        SomeValue::Integer(_)
+    ) {
+        return Err(AnnotatorError::new("raw_memcopy: size is not SomeInteger"));
+    }
+    Ok(s_none())
+}
+
 /// Upstream `ann_cast_adr_to_int(s, s_mode=None)` (`llmemory.py`).
 ///
 /// ```python
@@ -5213,6 +5283,8 @@ mod tests {
         assert!(is_registered("std.slice.from_raw_parts_mut"));
         assert!(is_registered("llmemory.cast_ptr_to_adr"));
         assert!(is_registered("llmemory.cast_adr_to_int"));
+        assert!(is_registered("llmemory.raw_memmove"));
+        assert!(is_registered("llmemory.raw_memcopy"));
     }
 
     #[test]
@@ -9212,6 +9284,40 @@ mod tests {
         let out = llmemory_cast_ptr_to_adr(&bk(), &[Some(s_inst)], &no_kwds())
             .expect("non-interior pointer annotates");
         assert!(matches!(out, SomeValue::Address(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn ann_raw_memmove_returns_s_none_for_two_addresses_and_int() {
+        let s_addr = SomeValue::Address(SomeAddress::new());
+        let s_int = SomeValue::Integer(SomeInteger::default());
+        let out = llmemory_raw_memmove(
+            &bk(),
+            &[Some(s_addr.clone()), Some(s_addr), Some(s_int)],
+            &no_kwds(),
+        )
+        .expect("RawMemmoveEntry.compute_result_annotation");
+        assert!(
+            matches!(out, SomeValue::None_(_)),
+            "raw_memmove annotates s_None, got {out:?}"
+        );
+        assert!(is_registered("llmemory.raw_memmove"));
+    }
+
+    #[test]
+    fn ann_raw_memcopy_returns_s_none_for_two_addresses_and_int() {
+        let s_addr = SomeValue::Address(SomeAddress::new());
+        let s_int = SomeValue::Integer(SomeInteger::default());
+        let out = llmemory_raw_memcopy(
+            &bk(),
+            &[Some(s_addr.clone()), Some(s_addr), Some(s_int)],
+            &no_kwds(),
+        )
+        .expect("ann_raw_memcopy");
+        assert!(
+            matches!(out, SomeValue::None_(_)),
+            "raw_memcopy annotates s_None, got {out:?}"
+        );
+        assert!(is_registered("llmemory.raw_memcopy"));
     }
 
     #[test]

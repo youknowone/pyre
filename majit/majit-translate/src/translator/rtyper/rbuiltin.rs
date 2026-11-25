@@ -4037,18 +4037,7 @@ pub fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// Address / Signed operands as `rtype_raw_memcopy`, emitting
 /// `raw_memmove`.
 pub fn rtype_raw_memmove(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    use crate::annotator::model::SomeValue;
     use crate::translator::rtyper::rtyper::GenopResult;
-
-    let args_s = hop.args_s.borrow();
-    for s_addr in args_s.iter().take(2) {
-        if let SomeValue::Address(s) = s_addr
-            && s.is_null_address()
-        {
-            return Err(TyperError::message("raw_memmove() with a constant NULL"));
-        }
-    }
-    drop(args_s);
 
     let vlist = hop.inputargs(vec![
         ConvertedTo::LowLevelType(&LowLevelType::Address),
@@ -7922,6 +7911,55 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `llmemory.raw_memmove`"
+        );
+    }
+
+    #[test]
+    fn rtype_raw_memmove_accepts_constant_null_addresses() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::llmemory::SomeAddress;
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rmodel::address_repr;
+        use std::sync::Arc;
+
+        let hop = dummy_hop();
+        let null = Constant::with_concretetype(
+            ConstValue::LLAddress(_address::Null),
+            LowLevelType::Address,
+        );
+        for _ in 0..2 {
+            hop.args_v
+                .borrow_mut()
+                .push(Hlvalue::Constant(null.clone()));
+            let mut s = SomeValue::Address(SomeAddress::new());
+            s.set_const_box(null.clone());
+            hop.args_s.borrow_mut().push(s);
+            hop.args_r
+                .borrow_mut()
+                .push(Some(address_repr() as Arc<dyn Repr>));
+        }
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(0),
+                LowLevelType::Signed,
+            )));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(signed_repr() as Arc<dyn Repr>));
+
+        rtype_raw_memmove(&hop, &HashMap::new())
+            .expect("RawMemmoveEntry.specialize_call has no constant-NULL check");
+        let llops = hop.llops.borrow();
+        assert!(
+            llops.ops.iter().any(|op| op.opname == "raw_memmove"),
+            "raw_memmove missing from {:?}",
+            llops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
     }
 
