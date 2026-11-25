@@ -1,5 +1,4 @@
 use indexmap::IndexMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.
 ///
@@ -23,7 +22,7 @@ use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
 use majit_gc::GcAllocator;
-use majit_gc::shadow_stack::{ShadowStackSlot, shadow_stack_slot};
+use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::{FailDescr, GcRef, InputArgRc, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -426,54 +425,27 @@ impl EntryWords<'_> {
     }
 }
 
-/// One word-stack slot for the GC local `llmodel.py execute_token`
-/// assigns `ll_frame = func(...)` to.
-///
-/// `gen_footer_shadowstack` has already popped the JF root, so this
-/// slot is that local until [`DynasmBackend::deadframe_from_run`] takes
-/// the owner-root `JitFrameDeadFrame`. Drop is LIFO (`ListRootGuard::drop`).
+/// The GC local `llmodel.py execute_token` assigns `ll_frame = func(...)` to.
 struct RanFrameRoot {
-    slot: ShadowStackSlot,
-    depth: usize,
-    _not_send: PhantomData<*const ()>,
+    root: ShadowRoot,
 }
 
 impl RanFrameRoot {
     #[inline]
     fn new(value: GcRef) -> Self {
-        let slot = shadow_stack_slot();
-        let depth = slot.push(value);
         Self {
-            slot,
-            depth,
-            _not_send: PhantomData,
+            root: ShadowRoot::new(value),
         }
     }
 
     #[inline(always)]
     fn get(&self) -> GcRef {
-        self.slot.get(self.depth)
+        self.root.get()
     }
-}
 
-impl Drop for RanFrameRoot {
     #[inline]
-    fn drop(&mut self) {
-        // `gc_pop_roots`: this local is the top of the stack again. Root
-        // scopes nest; a guard dropped under a newer one would unregister
-        // that one's roots (`ListRootGuard::drop`).
-        let depth = self.slot.depth();
-        if depth != self.depth + 1 {
-            if std::thread::panicking() {
-                majit_gc::shadow_stack::try_pop_to(self.depth);
-                return;
-            }
-            panic!(
-                "RanFrameRoot dropped out of LIFO order: depth {depth}, expected {}",
-                self.depth + 1
-            );
-        }
-        self.slot.pop_to(self.depth);
+    fn into_shadow_root(self) -> ShadowRoot {
+        self.root
     }
 }
 
@@ -3083,26 +3055,28 @@ impl DynasmBackend {
             );
         }
 
-        let dead = if ran.gc_object {
-            DeadFrame::JitFrame(JitFrameDeadFrame::new(
-                GcRef(tip as usize),
-                descr,
-                None,
-                None,
-            ))
+        let RanFrame {
+            head,
+            tip: _,
+            gc_object,
+            _ll_frame,
+        } = ran;
+        if gc_object {
+            let root = _ll_frame
+                .expect("a collector jitframe return must carry its live root")
+                .into_shadow_root();
+            debug_assert_eq!(root.get().0, tip as usize);
+            DeadFrame::JitFrame(JitFrameDeadFrame::from_shadow_root(root, descr, None))
         } else {
+            debug_assert!(_ll_frame.is_none());
             // The bound is the returned frame's own `jf_frame` length:
             // `_check_frame_depth` may have reallocated a deeper tip than the
             // `num_slots` the entry frame was built with.
             let num_slots = unsafe { JitFrame::frame_length(tip) } as usize;
             DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::owning(ran.head, tip, num_slots, descr, None)
+                LibcJitFrameDeadFrame::owning(head, tip, num_slots, descr, None)
             })
-        };
-        // Word slot is the top of the shadow stack; the owner-root
-        // DeadFrame is independent (`JitFrameDeadFrame::new`).
-        drop(ran);
-        dead
+        }
     }
 
     /// `DoneWithThisFrameDescrInt.get_result` on a frame `make_execute_token`
@@ -5300,6 +5274,51 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 9);
+    }
+
+    fn walked_root_count() -> usize {
+        let mut n = 0;
+        majit_gc::shadow_stack::walk_roots(|_| n += 1);
+        n
+    }
+
+    /// A collector guard exit keeps one owner root on the DeadFrame and
+    /// none on the word stack; drop returns both counts to baseline.
+    #[test]
+    fn gc_guard_failure_owner_root_returns_to_baseline() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::new();
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        register_jitframe_type(&mut gc);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.set_fail_arg_types(vec![Type::Int]);
+        guard.setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::const_int(1)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(1620);
+        rebind_trace_arg_boxes(&inputargs, &ops);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let depth0 = majit_gc::shadow_stack::depth();
+        let baseline = walked_root_count();
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(!backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(majit_gc::shadow_stack::depth(), depth0);
+        assert_eq!(walked_root_count(), baseline + 1);
+        drop(frame);
+        assert_eq!(walked_root_count(), baseline);
+        assert_eq!(majit_gc::shadow_stack::depth(), depth0);
     }
 
     #[test]
