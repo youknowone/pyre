@@ -5088,7 +5088,7 @@ impl OptContext {
         if self.inputarg_base == 0 || !arg.is_inputarg() {
             return None;
         }
-        let slot = arg.to_opref().raw();
+        let slot = arg.inputarg_index()?;
         if slot >= self.num_inputs {
             return None;
         }

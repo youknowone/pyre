@@ -2137,6 +2137,15 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             r.raw().saturating_add(1)
         }
     }
+    /// Constants have no position in the live-box namespace
+    /// (`resoperation.py AbstractValue.is_constant`).
+    fn operand_high_water(a: &Operand) -> u32 {
+        if a.is_none() || a.is_constant() {
+            0
+        } else {
+            opref_high_water(a.to_opref())
+        }
+    }
     let from_inputargs = inputargs
         .iter()
         .map(|ia| ia.as_ref().index.saturating_add(1))
@@ -2148,11 +2157,11 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             let op = op.as_ref();
             let mut hw = opref_high_water(op.pos().get());
             for a in op.args_slice().iter() {
-                hw = hw.max(opref_high_water(a.to_opref()));
+                hw = hw.max(operand_high_water(a));
             }
             if let Some(fa) = op.guard_fail_args() {
                 for a in fa.iter() {
-                    hw = hw.max(opref_high_water(a.to_opref()));
+                    hw = hw.max(operand_high_water(a));
                 }
             }
             hw
@@ -31417,6 +31426,30 @@ mod tests {
 
         assert_eq!(rebuilt.len(), 1);
         assert!(InputArgRc::ptr_eq(&rebuilt[0], &exported_root));
+    }
+
+    #[test]
+    fn compute_next_global_opref_skips_constant_and_none_args() {
+        let producer = OpRc::new(Op::new(OpCode::SameAsI, &[]));
+        producer.pos().set(OpRef::op_typed(4, Type::Int));
+        let add = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_op(&producer),
+                Operand::const_from_value(Value::Int(1)),
+            ],
+        ));
+        add.pos().set(OpRef::op_typed(7, Type::Int));
+        let only_consts = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[Operand::const_from_value(Value::Int(9)), Operand::none()],
+        ));
+        only_consts.pos().set(OpRef::op_typed(0, Type::Int));
+        let hw = compute_next_global_opref::<OpRc, InputArg>(&[], &[add, only_consts.clone()]);
+        assert_eq!(hw, 8);
+        let ia = InputArg::from_type(Type::Int, 2);
+        let hw_ia = compute_next_global_opref(&[ia], &[only_consts]);
+        assert_eq!(hw_ia, 3);
     }
 
     /// A resume that starts while another resume is running (a residual call
