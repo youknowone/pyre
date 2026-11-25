@@ -158,6 +158,7 @@ mod hook_test_owner {
 
     /// Take [`HOOK_TEST_LOCK`] and hide hook effects from every other thread
     /// until the guard drops. Drop clears the nursery and stable alloc hooks
+    /// and the process-global MemoryError raise / `rpyexc_occurred` hooks
     /// so a panic cannot leave them installed.
     ///
     /// A test thread keeps the GIL from its first runtime entry until it
@@ -178,6 +179,8 @@ mod hook_test_owner {
         fn drop(&mut self) {
             super::clear_gc_alloc_hook();
             super::clear_gc_alloc_stable_hook();
+            majit_gc::set_active_exception_occurred(None);
+            majit_gc::set_active_raise_memory_error(None);
             HOOK_TEST_OWNER.store(0, std::sync::atomic::Ordering::Release);
         }
     }
