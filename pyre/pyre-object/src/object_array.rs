@@ -2,6 +2,8 @@ use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ops::{Index, IndexMut};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+use majit_rlib::objectmodel::keepalive_until_here;
+
 use crate::pyobject::PyObject;
 use crate::{PY_NULL, PyObjectRef};
 
@@ -546,11 +548,20 @@ pub unsafe fn ll_arraycopy_items_block(
         return;
     }
     unsafe {
+        // rgc.py `ll_arraycopy`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
         core::ptr::copy_nonoverlapping(
-            items_block_items_base(source).add(source_start as usize),
-            items_block_items_base(dest).add(dest_start as usize),
+            (source as *mut u8)
+                .add(ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<PyObjectRef>()
+                .add(source_start as usize),
+            (dest as *mut u8)
+                .add(ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<PyObjectRef>()
+                .add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(source);
+        keepalive_until_here(dest);
     }
 }
 
@@ -585,13 +596,20 @@ pub unsafe fn ll_arraycopy_int_items_block(
         return;
     }
     unsafe {
-        let source_base = typed_items_block_items_base(source) as *const i64;
-        let dest_base = typed_items_block_items_base(dest) as *mut i64;
+        // rgc.py `ll_arraycopy`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
         core::ptr::copy_nonoverlapping(
-            source_base.add(source_start as usize),
-            dest_base.add(dest_start as usize),
+            (source as *mut u8)
+                .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<i64>()
+                .add(source_start as usize),
+            (dest as *mut u8)
+                .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<i64>()
+                .add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(source);
+        keepalive_until_here(dest);
     }
 }
 
@@ -629,14 +647,20 @@ pub unsafe fn ll_arraycopy_float_items_block(
         return;
     }
     unsafe {
-        let source_base =
-            typed_items_block_items_base(source as *mut TypedItemsBlock) as *const f64;
-        let dest_base = typed_items_block_items_base(dest as *mut TypedItemsBlock) as *mut f64;
+        // rgc.py `ll_arraycopy`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
         core::ptr::copy_nonoverlapping(
-            source_base.add(source_start as usize),
-            dest_base.add(dest_start as usize),
+            (source as *mut u8)
+                .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<f64>()
+                .add(source_start as usize),
+            (dest as *mut u8)
+                .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+                .cast::<f64>()
+                .add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(source);
+        keepalive_until_here(dest);
     }
 }
 
@@ -669,12 +693,16 @@ pub unsafe fn ll_arraymove_items_block(
     }
     crate::gc_hook::gc_writebarrier_before_move(array as crate::gc_hook::GCREF);
     unsafe {
-        let base = items_block_items_base(array);
+        // rgc.py `ll_arraymove`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
+        let base = (array as *mut u8)
+            .add(ITEMS_BLOCK_ITEMS_OFFSET)
+            .cast::<PyObjectRef>();
         core::ptr::copy(
             base.add(source_start as usize),
             base.add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(array);
     }
 }
 
@@ -709,12 +737,16 @@ pub unsafe fn ll_arraymove_int_items_block(
         return;
     }
     unsafe {
-        let base = typed_items_block_items_base(array) as *mut i64;
+        // rgc.py `ll_arraymove`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
+        let base = (array as *mut u8)
+            .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+            .cast::<i64>();
         core::ptr::copy(
             base.add(source_start as usize),
             base.add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(array);
     }
 }
 
@@ -754,12 +786,16 @@ pub unsafe fn ll_arraymove_float_items_block(
         return;
     }
     unsafe {
-        let base = typed_items_block_items_base(array as *mut TypedItemsBlock) as *mut f64;
+        // rgc.py `ll_arraymove`: `cast_ptr_to_adr` + `itemoffsetof(TP, 0)` + `sizeof(ITEM) * index`.
+        let base = (array as *mut u8)
+            .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+            .cast::<f64>();
         core::ptr::copy(
             base.add(source_start as usize),
             base.add(dest_start as usize),
             length as usize,
         );
+        keepalive_until_here(array);
     }
 }
 

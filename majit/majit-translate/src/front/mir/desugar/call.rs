@@ -6963,6 +6963,20 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `objectmodel.py keepalive_until_here` / `rtype_keepalive_until_here`.
+                // The identity alias hook cannot emit an op; plant the host
+                // keepalive call and no other residual.
+                if fmt_path_ends_with(&segments, &["objectmodel", "keepalive_until_here"])
+                    && let Some(owner) = args.first()
+                {
+                    let unit = self.emit_keepalive(mir_bb, owner.clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(unit));
+                    let bb_id = self.emit_bb(mir_bb);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias = if let Some(payload) =
                     self.expect_on_const_ok(&segments, &args, &arg_locals)
                 {

@@ -5948,6 +5948,71 @@ fn window_param_block_index(graph: &crate::model::FunctionGraph) -> Option<usize
     })
 }
 
+/// A MIR call to `majit_rlib::objectmodel::keepalive_until_here(x)` lowers
+/// to exactly one `rpython::rlib::objectmodel::keepalive_until_here` call.
+#[test]
+fn keepalive_until_here_call_lowers_to_objectmodel_path() {
+    use crate::model::{CallTarget, OpKind};
+
+    let ptr_ty = window_mut_u8_ptr();
+    let unit = serde_json::json!({"Tuple": []});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let keepalive = window_opaque_fun(
+        1,
+        &["majit_rlib", "objectmodel", "keepalive_until_here"],
+        vec![ptr_ty.clone()],
+        unit.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "call_keepalive"], true),
+        "signature": {"is_unsafe": false, "inputs": [ptr_ty], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit),
+                window_local(1, &ptr_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &ptr_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, keepalive]);
+    let graph =
+        crate::test_support::lower_function(&llbc, "call_keepalive").expect("lower call_keepalive");
+    let keepalives: Vec<_> = window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments
+                .iter()
+                .map(String::as_str)
+                .eq(super::KEEPALIVE_UNTIL_HERE_PATH.split("::")),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        keepalives.len(),
+        1,
+        "exactly one rpython::rlib::objectmodel::keepalive_until_here; graph={}",
+        graph.dump()
+    );
+}
+
 /// Converting a STR view to `(data, len)` for a window callee plants
 /// `keepalive` (`objectmodel.keepalive_until_here`) on the STR header
 /// after that call (`get_raw_address_of_string`).
