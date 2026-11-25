@@ -19135,7 +19135,10 @@ fn effect_transduce_op(
                     None,
                 )
             } else {
-                OpKind::New { owner }
+                OpKind::New {
+                    owner,
+                    owner_id: None,
+                }
             };
             out.push_op_with_result_var(block, kind, result);
         }
@@ -28111,6 +28114,7 @@ mod tests {
         let alloc_kinds = [
             OpKind::New {
                 owner: "W_IntObject".to_string(),
+                owner_id: None,
             },
             OpKind::NewWithVtable {
                 owner: "W_FloatObject".to_string(),
@@ -28516,6 +28520,7 @@ mod tests {
                 entry,
                 OpKind::New {
                     owner: "W_ValueError".to_string(),
+                    owner_id: None,
                 },
                 true,
             )
@@ -33441,6 +33446,7 @@ mod tests {
             result: None,
             kind: OpKind::New {
                 owner: "Vec".to_string(),
+                owner_id: None,
             },
         });
         alloc_graph.set_return(start, None);
@@ -34373,6 +34379,7 @@ mod tests {
                 entry,
                 OpKind::New {
                     owner: "Fresh".to_string(),
+                    owner_id: None,
                 },
                 true,
             )

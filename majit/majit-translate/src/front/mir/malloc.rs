@@ -1002,8 +1002,20 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         }
         let has_vtable =
             crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
+        let owner_id = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { base, field, .. }
+                    if base == &result && field.owner_root.as_deref() == Some(owner.as_str()) =>
+                {
+                    field.owner_id
+                }
+                _ => None,
+            });
         graph.blocks[block_idx].operations[op_idx].kind =
-            crate::model::malloc_opkind(owner.clone(), has_vtable);
+            crate::model::malloc_opkind(owner.clone(), has_vtable, owner_id);
         materialize_whole_value_copies_in_block(
             graph, block_idx, op_idx, &result, &owner, has_vtable,
         );
@@ -1402,9 +1414,14 @@ pub(in crate::front::mir) fn emit_materialized_struct_copy(
         }
     }
     let result = graph.alloc_value_var();
+    let owner_id = fields.iter().find_map(|(field, _, _)| {
+        (field.owner_root.as_deref() == Some(owner))
+            .then_some(field.owner_id)
+            .flatten()
+    });
     out.push(crate::model::SpaceOperation {
         result: Some(result.clone()),
-        kind: crate::model::malloc_opkind(owner.to_string(), has_vtable),
+        kind: crate::model::malloc_opkind(owner.to_string(), has_vtable, owner_id),
     });
     for (field, value, ty) in fields {
         // Keep the typeptr store on the copy. `fuse_boxing_alloc`
