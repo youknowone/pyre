@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=11
+# pyre-check: jitstats-band=guard_failures=24
+# guard_failures follows the minor-collection schedule: 600 on darwin arm64 at
+# check.py's 4MB PYPY_GC_NURSERY pin (5/5 runs), 616 at PYPY_GC_NURSERY=4536K
+# and 619 at 4539K, with 4 loops / 2 bridges unchanged. CI macos-latest
+# cranelift reads 616 and ubuntu cranelift 619 at the same pin.
 # ubuntu dynasm 3.9x, cranelift 9.3x; floor 2.75x.
 # A frame that catches an exception a residual call raised contributes its own
 # traceback node, including once its `except` is reached from inside its own
