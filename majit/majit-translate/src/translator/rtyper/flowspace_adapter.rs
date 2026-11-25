@@ -2869,9 +2869,9 @@ fn declared_llop(
 ///
 /// `GraphFunc` carries `_jit_llop_` only; it has no declared result type.
 /// `FunctionEntry.declared_funcptr_type` is the callee `FuncType` when
-/// populate could project one. A missing projection is Void — use the
-/// projected `FuncType.result`, falling back to Void only when no
-/// projection exists.
+/// populate could project one. `Entry.compute_result_annotation` asserts
+/// `RESULTTYPE.is_constant()`; a missing projection is an error, matching
+/// `rtype_llop` `"RESULTTYPE missing"`.
 fn translate_catalogued_llop_call(
     opname: &str,
     target: &crate::model::CallTarget,
@@ -2893,7 +2893,7 @@ fn translate_catalogued_llop_call(
                 .as_ref()
                 .map(|ft| ft.result.clone())
         })
-        .unwrap_or(LowLevelType::Void);
+        .ok_or_else(|| TyperError::message(format!("jit_llop {opname}: RESULTTYPE missing")))?;
     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
         HostObject::new_builtin_callable(format!(
             "rpython.rtyper.lltypesystem.lloperation.llop.{opname}"
@@ -12039,6 +12039,65 @@ mod tests {
         assert_eq!(lowered.args[2..].len(), 5);
         assert_eq!(&lowered.args[2..], mapped_operands.as_slice());
         assert_eq!(lowered.result, mapped_result);
+    }
+
+    #[test]
+    fn translate_catalogued_llop_call_missing_funcptr_type_is_err() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_catalogued_llop_missing_resulttype_fixture");
+        let vars = mint_vars(&mut graph, 7);
+        for i in 1..6 {
+            value_map.insert(vars[i].clone(), Hlvalue::Variable(Variable::new()));
+        }
+        value_map.insert(vars[6].clone(), Hlvalue::Variable(Variable::new()));
+        let registry = empty_call_registry();
+        let mut func = GraphFunc::new(
+            "gc_writebarrier_before_copy",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_llop_ = Some("gc_writebarrier_before_copy".into());
+        registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["gc_hook", "gc_writebarrier_before_copy"]),
+            Signature::new(
+                vec![
+                    "source".into(),
+                    "dest".into(),
+                    "source_start".into(),
+                    "dest_start".into(),
+                    "length".into(),
+                ],
+                None,
+                None,
+            ),
+            func,
+        );
+        let op = SpaceOperation {
+            result: Some(vars[6].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["gc_hook".into(), "gc_writebarrier_before_copy".into()],
+                    resolved_path: None,
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![
+                    vars[1].clone(),
+                    vars[2].clone(),
+                    vars[3].clone(),
+                    vars[4].clone(),
+                    vars[5].clone(),
+                ]),
+                result_ty: ValueType::Bool,
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &registry);
+        let err = translated.expect_err("missing FuncType is RESULTTYPE missing");
+        assert!(err.to_string().contains("RESULTTYPE missing"), "got {err}");
     }
 
     #[test]
