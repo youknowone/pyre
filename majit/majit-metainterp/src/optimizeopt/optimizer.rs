@@ -3677,16 +3677,13 @@ impl Optimizer {
         // RPython parity: store_final_boxes_in_guard handles virtual tagging
         // and rd_numb production inline. No post-pass rescan needed.
 
-        // Finalize cascade removed. PyPy walks args ONCE at op-emit
-        // time via `_emit_operation:614-625 force_box`; never re-walks. The
-        // cited `compile.py:emit_op:403-423` is a virtualizable-only patcher
-        // (5 callers all inside `patch_new_loop_to_load_virtualizable_fields`),
-        // not a general finalize pass. Pyre's emit-time arg walking happens
-        // in two PyPy-parity locations:
-        //   1. `propagate_from_pass_range` — incoming op args
-        //      resolved via `ctx.get_box_replacement` BEFORE pass dispatch.
-        //   2. `Optimizer::emit_operation` — `force_box` on every
-        //      arg unconditionally (PyPy `optimizer.py` parity).
+        // Finalize cascade removed. optimizer.py Optimizer._emit_operation
+        // walks args once at emit via force_box; never re-walks. The
+        // cited compile.py emit_op is a virtualizable-only patcher
+        // (callers all inside patch_new_loop_to_load_virtualizable_fields),
+        // not a general finalize pass. emit_operation_inner force_boxes
+        // every arg. Passes read args through walkers;
+        // send_extra_operation dispatches the op unchanged.
         // After emit, args are frozen on the op. Postprocess setting
         // `box._forwarded = Const` (e.g., `make_constant` from
         // `optimize_GUARD_FALSE`) must NOT retroactively rewrite already-
@@ -3717,10 +3714,9 @@ impl Optimizer {
 
         // Second finalize cascade also removed, on the same rationale:
         // each extra op runs through `propagate_from_pass_range`
-        // which resolves its incoming args at input time via
-        // `ctx.get_box_replacement`, and through `Optimizer::emit_operation`
-        // which `force_box`es every arg. No retroactive walking of pre-existing
-        // new_operations is needed.
+        // (`send_extra_operation` dispatches the op unchanged) and
+        // `Optimizer::emit_operation` which `force_box`es every arg. No
+        // retroactive walking of pre-existing new_operations is needed.
         // RPython: no equivalent filter — Box identity guarantees all
         // references are valid. The retain filter was a majit safety net
         // but incorrectly dropped valid ops (e.g., IntAddOvf referencing
@@ -4777,54 +4773,11 @@ impl Optimizer {
         // `Op.type_` once the op lands in `new_operations`, so an external
         // type side-table refresh is redundant.
 
-        // Resolve forwarded arguments. PyPy `_emit_operation`
-        // (optimizer.py) walks args via force_box at the entry to
-        // emission; pyre's pre-pass walk via `ctx.get_box_replacement` is
-        // the structural analog (force_box is invoked separately at
-        // `Optimizer::emit_operation` for the post-pass refresh).
-        // fail_args are NOT walked here — PyPy snapshots them once at
-        // `store_final_boxes_in_guard` time via the numbering layer (which
-        // encodes Const entries as TAGCONST in rd_numb, leaving fail_args
-        // as TAGBOX-only references). Re-walking fail_args at pass entry
-        // would be a pyre-only layer that could substitute Const refs
-        // post-`make_equal_to(_, const_target)` and de-sync from the
-        // numbering snapshot.
-        // optimizer.py force_box loop parity: resolve each arg
-        // through its forwarding chain. Store the CANONICAL terminal box
-        // (carrying the live _forwarded chain), not a fresh from_opref box,
-        // so passes can read PtrInfo / IntBound / known-class directly off
-        // op.arg(i) — matching RPython where get_box_replacement returns the
-        // Box object itself. A from_opref box is unbound and drops the chain.
-        //
-        // `optimizer.py _emit_operation` writes the resolution back
-        // with `op.setarg(i, arg)` — into the operation's own slot, because
-        // upstream's operation IS the box the passes forward. Written back
-        // onto `op_rc` here for the same reason. Two things make that sound:
-        //
-        //  - No pass reads `op_rc`'s arguments. A pass reaches `op_rc` only as
-        //    `Operand::from_bound_op(op_rc)`, the `make_equal_to` forwarding
-        //    host, so what the second parameter carries is identity, which
-        //    resolving in place does not change; the argument view every pass
-        //    reads is `current_op` below.
-        //  - The caller has handed its argument slots over. The unroll and
-        //    bridge entries walk `TraceIterator`, whose `next` mints a fresh
-        //    operation per step, so those ops are the pass's own outright;
-        //    `optimize_with_constants_and_inputs_oprc` threads the recorder's
-        //    own ops and documents the transfer on its own signature.
-        for i in 0..op_rc.num_args() {
-            // `optimizer.py Optimizer.get_box_replacement(op.getarg(i))`.
-            // A slot that already holds its chain terminal keeps it:
-            // `setarg` of the same box changes nothing.
-            let replaced = {
-                let arg = &op_rc.args_slice()[i];
-                arg.with_box_replacement(|terminal| {
-                    (!terminal.same_box(arg)).then(|| terminal.clone())
-                })
-            };
-            if let Some(resolved) = replaced {
-                op_rc.setarg(i, resolved);
-            }
-        }
+        // optimizer.py Optimizer.send_extra_operation hands `op` to the
+        // pass chain unchanged; each reader walks (`get_box_replacement` /
+        // `getptrinfo` / `getintbound` / `force_box` / `ensure_ptr_info_arg0`).
+        // optimizer.py Optimizer._emit_operation is the single force_box +
+        // setarg loop, in emit_operation_inner.
 
         // Borrowed until a pass replaces the operation; `Replace` and
         // `Restart` mint their own, and only those need an owned copy.
@@ -5014,7 +4967,7 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
-        // recorder input op verbatim (args re-resolved) or an Emit-minted
+        // recorder input op verbatim or an Emit-minted
         // producer, so emit may append that same Rc — no second ResOperation().
         // That append is `Optimizer.emit` (`reuse = true`). A replaced op is a
         // new `ResOperation` and stays on `emit_operation_inner(..., false)`.
@@ -7706,6 +7659,33 @@ mod tests {
                 ),
                 (OpCode::GuardNonnull, vec![OpRef::ref_op(10)], true),
             ]
+        );
+    }
+
+    #[test]
+    fn test_guard_nonnull_removed_on_forwarded_nonnull_arg() {
+        // rewrite.py optimize_GUARD_NONNULL: getptrinfo(op.getarg(0)) walks
+        // get_box_replacement, then is_nonnull → return (remove). A is
+        // make_equal_to'd onto B; B carries NonNull. The pass chain sees
+        // the raw A slot; the walker still finds B.
+        let mut opt = Optimizer::default_pipeline();
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref, Type::Ref]);
+        let box_b = rooted_resop_operand(Type::Ref, 1);
+        let box_a = rooted_resop_operand(Type::Ref, 2);
+        ctx.set_ptr_info(&box_b, PtrInfo::nonnull());
+        ctx.make_equal_to(&box_a, &box_b);
+        let guard = OpRc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&box_a)));
+        opt.send_extra_operation(&guard, &mut ctx)
+            .expect("GUARD_NONNULL of a forwarded NonNull box is valid");
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::GuardNonnull),
+            "GUARD_NONNULL(A) with A make_equal_to B (NonNull) is removed; got {:?}",
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>(),
         );
     }
 
