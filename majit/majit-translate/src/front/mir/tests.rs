@@ -29,6 +29,70 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -
     )
 }
 
+#[test]
+fn result_err_record_payload_keeps_record_repr() {
+    use crate::front::semantic::LayoutKind;
+    use crate::model::ValueType;
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![opaque_type_decl(0, &["core", "io", "error", "Error"])],
+        vec![],
+    );
+    let ty: TyRef = serde_json::from_value(interior_adt(0)).unwrap();
+    let gc_struct_ids = harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc));
+    let paint = tyref_to_attr_value_type_with(
+        &ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &gc_struct_ids,
+        &raw,
+        None,
+    );
+    assert_eq!(paint, ValueType::Ref(Some("io::error::Error".to_string())));
+    let td = llbc.type_by_id(0).unwrap();
+    let mut seeds = gc_struct_ids.iter().copied().collect::<Vec<_>>();
+    seeds.sort_unstable();
+    assert_eq!(
+        super::type_decl_layout_kind(td, &llbc, &seeds),
+        LayoutKind::Record
+    );
+}
+
+#[test]
+fn foreign_record_result_valuetype_keeps_record_root() {
+    use crate::model::ValueType;
+    let mut error_decl = opaque_type_decl(0, &["core", "io", "error", "Error"]);
+    error_decl["layout"] = serde_json::json!([{
+        "key": "fixture",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            error_decl,
+            opaque_type_decl(1, &["lock_api", "mutex", "Mutex"]),
+        ],
+        vec![],
+    );
+    let error_ty: TyRef = serde_json::from_value(interior_adt(0)).unwrap();
+    assert_eq!(
+        super::foreign_opaque_method_result_valuetype(&error_ty, &llbc, None),
+        Some(ValueType::Ref(Some("io::error::Error".to_string())))
+    );
+    let mutex_ty: TyRef = serde_json::from_value(interior_adt(1)).unwrap();
+    assert_eq!(
+        super::foreign_opaque_method_result_valuetype(&mutex_ty, &llbc, None),
+        Some(ValueType::Ref(None))
+    );
+}
+
 mod reachable_mask_tests {
     use super::super::{forward_reachable_mask, lowered_reachable_mask, successor_blocks};
     use majit_charon_reader::{Llbc, ullbc::Unstructured};
@@ -5882,6 +5946,71 @@ fn window_param_block_index(graph: &crate::model::FunctionGraph) -> Option<usize
             _ => false,
         })
     })
+}
+
+/// A MIR call to `majit_rlib::objectmodel::keepalive_until_here(x)` lowers
+/// to exactly one `rpython::rlib::objectmodel::keepalive_until_here` call.
+#[test]
+fn keepalive_until_here_call_lowers_to_objectmodel_path() {
+    use crate::model::{CallTarget, OpKind};
+
+    let ptr_ty = window_mut_u8_ptr();
+    let unit = serde_json::json!({"Tuple": []});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let keepalive = window_opaque_fun(
+        1,
+        &["majit_rlib", "objectmodel", "keepalive_until_here"],
+        vec![ptr_ty.clone()],
+        unit.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "call_keepalive"], true),
+        "signature": {"is_unsafe": false, "inputs": [ptr_ty], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit),
+                window_local(1, &ptr_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &ptr_ty)}]}, "dest": window_place(serde_json::json!({"Local": 0}), &unit), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, keepalive]);
+    let graph =
+        crate::test_support::lower_function(&llbc, "call_keepalive").expect("lower call_keepalive");
+    let keepalives: Vec<_> = window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments
+                .iter()
+                .map(String::as_str)
+                .eq(super::KEEPALIVE_UNTIL_HERE_PATH.split("::")),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        keepalives.len(),
+        1,
+        "exactly one rpython::rlib::objectmodel::keepalive_until_here; graph={}",
+        graph.dump()
+    );
 }
 
 /// Converting a STR view to `(data, len)` for a window callee plants
@@ -18526,7 +18655,7 @@ pub(in crate::front::mir) fn result_enum(def_id: u64) -> serde_json::Value {
     })
 }
 
-pub(in crate::front::mir) fn llbc_with_types(
+pub(crate) fn llbc_with_types(
     crate_name: &str,
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
@@ -20476,6 +20605,321 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
         int_rows.contains(&"__pos_0"),
         "ordinary payload stays; rows={int_rows:?}"
     );
+}
+
+fn layout_kind_fields(types: Vec<serde_json::Value>) -> crate::front::StructFieldRegistry {
+    let llbc = llbc_with_types("fixture", types, vec![]);
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    fields
+}
+
+fn named_layout_field(name: &str, ty: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": name, "ty": ty, "attr_info": null})
+}
+
+#[test]
+fn w_int_layout_kind_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let w_int = type_decl_struct(
+        1,
+        &["fixture", "intobject", "W_IntObject"],
+        vec![
+            named_layout_field("ob_header", adt_node(0)),
+            named_layout_field("intval", interior_i64()),
+        ],
+    );
+    let fields = layout_kind_fields(vec![header, w_int]);
+    let identity = fields
+        .class_identity
+        .get("intobject::W_IntObject")
+        .and_then(Option::as_ref)
+        .expect("W_IntObject declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn base_chain_layout_kind_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let w_object = type_decl_struct(
+        1,
+        &["fixture", "objectobject", "W_ObjectObject"],
+        vec![
+            named_layout_field("ob_header", adt_node(0)),
+            named_layout_field("x", interior_i64()),
+        ],
+    );
+    let w_user = type_decl_struct(
+        2,
+        &["fixture", "objectobject", "W_ObjectObjectUser"],
+        vec![
+            named_layout_field("base", adt_node(1)),
+            named_layout_field("storage", interior_i64()),
+        ],
+    );
+    let fields = layout_kind_fields(vec![header, w_object, w_user]);
+    let object_identity = fields
+        .class_identity
+        .get("objectobject::W_ObjectObject")
+        .and_then(Option::as_ref)
+        .expect("W_ObjectObject declaration identity");
+    assert_eq!(object_identity.layout_kind, LayoutKind::ObjectHeaded);
+    let user_identity = fields
+        .class_identity
+        .get("objectobject::W_ObjectObjectUser")
+        .and_then(Option::as_ref)
+        .expect("W_ObjectObjectUser declaration identity");
+    assert_eq!(user_identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn pointer_to_header_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let header = type_decl_struct(
+        0,
+        &["fixture", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    );
+    let handle = type_decl_struct(
+        1,
+        &["fixture", "handle", "Handle"],
+        vec![named_layout_field("inner", option_shared_ref(adt_node(0)))],
+    );
+    let fields = layout_kind_fields(vec![header, handle]);
+    let identity = fields
+        .class_identity
+        .get("handle::Handle")
+        .and_then(Option::as_ref)
+        .expect("Handle declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
+fn unit_struct_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let empty = type_decl_struct(0, &["fixture", "unit", "Empty"], vec![]);
+    let fields = layout_kind_fields(vec![empty]);
+    let identity = fields
+        .class_identity
+        .get("unit::Empty")
+        .and_then(Option::as_ref)
+        .expect("Empty declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
+fn cache_base_chain_without_header_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let base = type_decl_struct(
+        0,
+        &["fixture", "cache", "Base"],
+        vec![named_layout_field("version", interior_i64())],
+    );
+    let cache = type_decl_struct(
+        1,
+        &["fixture", "cache", "Cache"],
+        vec![named_layout_field("base", adt_node(0))],
+    );
+    let fields = layout_kind_fields(vec![base, cache]);
+    let identity = fields
+        .class_identity
+        .get("cache::Cache")
+        .and_then(Option::as_ref)
+        .expect("Cache declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+#[test]
+fn enum_layout_kind_uses_decl_identity() {
+    use crate::front::semantic::LayoutKind;
+
+    let fields = layout_kind_fields(vec![option_enum(0)]);
+    let full = fields
+        .class_identity
+        .get("core::option::Option")
+        .and_then(Option::as_ref)
+        .expect("full Option declaration identity");
+    let stripped = fields
+        .class_identity
+        .get("option::Option")
+        .and_then(Option::as_ref)
+        .expect("crate-stripped Option declaration identity");
+    assert_eq!(full.id, stripped.id);
+    assert_eq!(full.layout_kind, LayoutKind::Enum);
+    assert_eq!(stripped.layout_kind, LayoutKind::Enum);
+}
+
+#[test]
+fn closure_layout_kind_is_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let closure = type_decl_struct(
+        0,
+        &["fixture", "owner", "{closure#0}"],
+        vec![named_layout_field("__pos_0", interior_i64())],
+    );
+    let fields = layout_kind_fields(vec![closure]);
+    let identity = fields
+        .class_identity
+        .values()
+        .filter_map(Option::as_ref)
+        .find(|identity| identity.spelling.ends_with("{closure#0}"))
+        .expect("closure declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
+}
+
+fn cross_crate_header_struct(id: u64) -> serde_json::Value {
+    type_decl_struct(
+        id,
+        &["header_crate", "object", "ObjectHeader"],
+        vec![named_layout_field("ob_type", interior_i64())],
+    )
+}
+
+fn cross_crate_opaque_header(id: u64) -> serde_json::Value {
+    let mut decl = type_decl_struct(id, &["header_crate", "object", "ObjectHeader"], vec![]);
+    decl["kind"] = serde_json::json!("Opaque");
+    decl
+}
+
+#[test]
+fn cross_crate_field0_header_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "thing", "W_Thing"],
+                vec![
+                    named_layout_field("ob", adt_node(0)),
+                    named_layout_field("x", interior_i64()),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_Thing")
+        .and_then(Option::as_ref)
+        .expect("W_Thing declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::ObjectHeaded);
+    let id = identity.id;
+    let aliases: Vec<_> = program
+        .struct_fields
+        .class_identity
+        .values()
+        .filter_map(Option::as_ref)
+        .filter(|identity| identity.id == id)
+        .collect();
+    assert!(
+        aliases.len() > 1,
+        "expected more than one alias for W_Thing; aliases={aliases:?}"
+    );
+    for alias in aliases {
+        assert_eq!(alias.layout_kind, LayoutKind::ObjectHeaded);
+    }
+}
+
+#[test]
+fn cross_crate_base_chain_is_object_headed() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "thing", "W_Thing"],
+                vec![
+                    named_layout_field("ob", adt_node(0)),
+                    named_layout_field("x", interior_i64()),
+                ],
+            ),
+            type_decl_struct(
+                2,
+                &["thing_crate", "thing", "W_ThingUser"],
+                vec![named_layout_field("base", adt_node(1))],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let thing_identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_Thing")
+        .and_then(Option::as_ref)
+        .expect("W_Thing declaration identity");
+    assert_eq!(thing_identity.layout_kind, LayoutKind::ObjectHeaded);
+    let user_identity = program
+        .struct_fields
+        .class_identity
+        .get("thing::W_ThingUser")
+        .and_then(Option::as_ref)
+        .expect("W_ThingUser declaration identity");
+    assert_eq!(user_identity.layout_kind, LayoutKind::ObjectHeaded);
+}
+
+#[test]
+fn cross_crate_pointer_to_header_stays_record() {
+    use crate::front::semantic::LayoutKind;
+
+    let crate_a = llbc_with_types("header_crate", vec![cross_crate_header_struct(0)], vec![]);
+    let crate_b = llbc_with_types(
+        "thing_crate",
+        vec![
+            cross_crate_opaque_header(0),
+            type_decl_struct(
+                1,
+                &["thing_crate", "handle", "Handle"],
+                vec![named_layout_field(
+                    "p",
+                    serde_json::json!({"RawPtr": [adt_node(0), "Mut"]}),
+                )],
+            ),
+        ],
+        vec![],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbcs(&[crate_a, crate_b])
+        .expect("merged program");
+    let identity = program
+        .struct_fields
+        .class_identity
+        .get("handle::Handle")
+        .and_then(Option::as_ref)
+        .expect("Handle declaration identity");
+    assert_eq!(identity.layout_kind, LayoutKind::Record);
 }
 
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
@@ -38027,7 +38471,7 @@ fn interior_span() -> serde_json::Value {
     })
 }
 
-pub(in crate::front::mir) fn interior_meta(path: &[&str], is_local: bool) -> serde_json::Value {
+pub(crate) fn interior_meta(path: &[&str], is_local: bool) -> serde_json::Value {
     serde_json::json!({
         "name": path.iter().map(|segment| {
             if *segment == "<Impl>" {
@@ -38048,7 +38492,7 @@ pub(in crate::front::mir) fn interior_meta(path: &[&str], is_local: bool) -> ser
     })
 }
 
-pub(in crate::front::mir) fn interior_i64() -> serde_json::Value {
+pub(crate) fn interior_i64() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})
 }
 
@@ -38056,7 +38500,7 @@ fn interior_f64() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Float": "F64"}})
 }
 
-pub(in crate::front::mir) fn interior_usize() -> serde_json::Value {
+pub(crate) fn interior_usize() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
 }
 
@@ -38068,7 +38512,7 @@ fn interior_u8() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
 }
 
-pub(in crate::front::mir) fn interior_adt(id: u64) -> serde_json::Value {
+pub(crate) fn interior_adt(id: u64) -> serde_json::Value {
     serde_json::json!({
         "Adt": {
             "id": id,
@@ -38214,7 +38658,7 @@ fn interior_c_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_jso
     }])
 }
 
-pub(in crate::front::mir) fn interior_struct(
+pub(crate) fn interior_struct(
     def_id: u64,
     path: &[&str],
     fields: &[(&str, serde_json::Value)],

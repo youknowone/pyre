@@ -517,6 +517,11 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            acc.struct_fields
+                .exact_layout_ids
+                .extend(prog.struct_fields.exact_layout_ids);
+            acc.struct_fields.exact_layout_ids.sort_unstable();
+            acc.struct_fields.exact_layout_ids.dedup();
             for (key, kind) in prog.struct_fields.transparent_scalar_kinds {
                 acc.struct_fields
                     .transparent_scalar_kinds
@@ -786,6 +791,8 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             Some(&acc.struct_ids),
         );
         acc.fnptr_field_families = fnptr_field_families;
+        acc.struct_fields
+            .promote_cross_crate_object_headed_layouts();
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -2189,6 +2196,7 @@ fn register_remaining_opaque_type_decls(
             name.clone(),
             sid,
             &canonical_name,
+            crate::front::semantic::LayoutKind::Record,
         );
         record_struct_id(
             struct_ids,
@@ -2196,6 +2204,7 @@ fn register_remaining_opaque_type_decls(
             canonical_name.clone(),
             sid,
             &canonical_name,
+            crate::front::semantic::LayoutKind::Record,
         );
         known_struct_names.insert(name);
         known_struct_names.insert(canonical_name);
@@ -3015,6 +3024,7 @@ fn register_ordereddict_entry_rows(
             qualified,
             sid,
             &canonical_qualified,
+            crate::front::semantic::LayoutKind::Record,
         );
         if canonical_path != entry_path {
             struct_fields
@@ -3028,6 +3038,7 @@ fn register_ordereddict_entry_rows(
                 canonical_qualified.clone(),
                 sid,
                 &canonical_qualified,
+                crate::front::semantic::LayoutKind::Record,
             );
         }
         if subst.is_empty() {
@@ -3384,6 +3395,7 @@ impl CrateLoweringState {
             &raw_alloc_flavor_structs,
             program_exception_class_hints,
         );
+        let gc_seeds: Vec<_> = gc_struct_ids.iter().copied().collect();
         promote_cross_crate_stripped_keys(
             llbc,
             cross_tombstoned_leaves,
@@ -3392,6 +3404,7 @@ impl CrateLoweringState {
             &mut struct_field_attrs,
             &mut exact_layouts,
             &mut struct_ids,
+            &gc_seeds,
         );
         // Only leaves this pass withdrew. A crate-root decl
         // (`charon_corpus::ClassObject`) also stores an empty origin module,
@@ -5843,6 +5856,7 @@ fn record_struct_id(
     name: String,
     id: majit_ir::descr::StructId,
     identity_spelling: &str,
+    layout_kind: crate::front::semantic::LayoutKind,
 ) {
     record_layout_struct_id(table, name.clone(), id);
     // rlist.py ListRepr / listdef.py ListDef: field rows of the `{buf,len}`
@@ -5869,10 +5883,11 @@ fn record_struct_id(
             }
         })
         .or_insert_with(|| {
-            Some(crate::front::semantic::ClassIdentity {
+            Some(crate::front::semantic::ClassIdentity::new(
                 id,
-                spelling: identity_spelling.to_string(),
-            })
+                identity_spelling,
+                layout_kind,
+            ))
         });
 }
 
@@ -6216,6 +6231,7 @@ fn register_ambiguous_opaque_or_union_identity(
         name.clone(),
         sid,
         &canonical_name,
+        crate::front::semantic::LayoutKind::Record,
     );
     record_struct_id(
         struct_ids,
@@ -6223,6 +6239,7 @@ fn register_ambiguous_opaque_or_union_identity(
         canonical_name.clone(),
         sid,
         &canonical_name,
+        crate::front::semantic::LayoutKind::Record,
     );
     record_struct_id(
         struct_ids,
@@ -6230,6 +6247,7 @@ fn register_ambiguous_opaque_or_union_identity(
         leaf.clone(),
         sid,
         &canonical_name,
+        crate::front::semantic::LayoutKind::Record,
     );
     let segs: Vec<&str> = name.split("::").collect();
     let module = if segs.len() >= 2 {
@@ -7112,6 +7130,7 @@ fn derive_program_metadata(
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
     let ambiguous_leaves = ambiguous_adt_leaves(llbc);
+    let gc_seeds: Vec<_> = gc_struct_ids.iter().copied().collect();
 
     for (path, kind) in discover_transparent_scalar_kinds(llbc) {
         struct_fields
@@ -7255,6 +7274,7 @@ fn derive_program_metadata(
                 // layer keys `LLType::Struct` on and the runtime macro
                 // publishes.  Every name spelling (full-crate, stripped,
                 // bare leaf) resolves to it through the resolver table.
+                let layout_kind = type_decl_layout_kind(layout_td, llbc, &gc_seeds);
                 let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
                 record_struct_id(
                     &mut struct_ids,
@@ -7262,6 +7282,7 @@ fn derive_program_metadata(
                     name.clone(),
                     sid,
                     &canonical_name,
+                    layout_kind,
                 );
                 record_struct_id(
                     &mut struct_ids,
@@ -7269,6 +7290,7 @@ fn derive_program_metadata(
                     canonical_name.clone(),
                     sid,
                     &canonical_name,
+                    layout_kind,
                 );
                 record_struct_id(
                     &mut struct_ids,
@@ -7276,6 +7298,7 @@ fn derive_program_metadata(
                     leaf.clone(),
                     sid,
                     &canonical_name,
+                    layout_kind,
                 );
                 // Exact field byte offsets from Charon's resolved layout
                 // (the true Rust layout, not the heuristic).  Field index
@@ -7512,6 +7535,7 @@ fn derive_program_metadata(
                         name.clone(),
                         base_sid,
                         &canon_base,
+                        crate::front::semantic::LayoutKind::Enum,
                     );
                     record_struct_id(
                         &mut struct_ids,
@@ -7519,6 +7543,7 @@ fn derive_program_metadata(
                         leaf.clone(),
                         base_sid,
                         &canon_base,
+                        crate::front::semantic::LayoutKind::Enum,
                     );
                     record_struct_id(
                         &mut struct_ids,
@@ -7526,6 +7551,7 @@ fn derive_program_metadata(
                         canon_base.clone(),
                         base_sid,
                         &canon_base,
+                        crate::front::semantic::LayoutKind::Enum,
                     );
                 }
                 // Per-variant field rows + exact offsets under
@@ -7835,6 +7861,7 @@ fn derive_program_metadata(
                             variant_qual.clone(),
                             vsid,
                             &variant_canon,
+                            crate::front::semantic::LayoutKind::Enum,
                         );
                         record_struct_id(
                             &mut struct_ids,
@@ -7842,6 +7869,7 @@ fn derive_program_metadata(
                             variant_leaf.clone(),
                             vsid,
                             &variant_canon,
+                            crate::front::semantic::LayoutKind::Enum,
                         );
                         record_struct_id(
                             &mut struct_ids,
@@ -7849,6 +7877,7 @@ fn derive_program_metadata(
                             variant_canon.clone(),
                             vsid,
                             &variant_canon,
+                            crate::front::semantic::LayoutKind::Enum,
                         );
                         if explicit_sum_shell {
                             let exact = crate::front::semantic::ExactLayout {
@@ -8008,6 +8037,7 @@ fn derive_program_metadata(
                 key.to_string(),
                 sid,
                 "bytecode::Constants",
+                crate::front::semantic::LayoutKind::Record,
             );
         }
         struct_origins
@@ -8050,6 +8080,7 @@ fn derive_program_metadata(
                 key.to_string(),
                 sid,
                 &num_complex_canon,
+                crate::front::semantic::LayoutKind::Record,
             );
         }
         struct_origins.insert("Complex".to_string(), "num_complex".to_string());
@@ -8090,6 +8121,7 @@ fn derive_program_metadata(
                 key.to_string(),
                 sid,
                 alloc_vec_path,
+                crate::front::semantic::LayoutKind::Record,
             );
         }
         let word = crate::layout::target_word_size() as u64;
@@ -8131,6 +8163,7 @@ fn derive_program_metadata(
                 key.to_string(),
                 sid,
                 "alloc::layout::Layout",
+                crate::front::semantic::LayoutKind::Record,
             );
         }
         let word = crate::layout::target_word_size() as u64;
@@ -8171,6 +8204,8 @@ fn derive_program_metadata(
     struct_fields
         .gc_struct_ids
         .extend(gc_struct_ids.iter().copied());
+    struct_fields.exact_layout_ids = exact_layouts.keys().copied().collect();
+    struct_fields.exact_layout_ids.sort_unstable();
 
     (
         known_struct_names,
@@ -8401,6 +8436,38 @@ pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir:
     majit_ir::descr::StructId::from_canonical(td.item_meta.name_path_stripped())
 }
 
+/// Representation category of one Rust nominal aggregate.
+///
+/// A struct is [`LayoutKind::ObjectHeaded`] iff repeatedly following its
+/// by-value struct field 0 (`lltype.Struct._first_struct` inlined-parent
+/// relation) reaches a struct whose field 0 is named `ob_type`. Field-0
+/// names other than `ob_type` are irrelevant: `base`, `ob_header`, `ob`,
+/// and the rest are all followed. Enums return [`LayoutKind::Enum`];
+/// everything else returns [`LayoutKind::Record`].
+pub(in crate::front::mir) fn type_decl_layout_kind<'a>(
+    td: &'a TypeDecl,
+    llbc: &'a Llbc,
+    gc_seeds: &[majit_ir::descr::StructId],
+) -> crate::front::semantic::LayoutKind {
+    use crate::front::semantic::LayoutKind;
+    if matches!(td.kind, TypeDeclKind::Enum(_)) {
+        return LayoutKind::Enum;
+    }
+    let mut current = td;
+    loop {
+        let TypeDeclKind::Struct(fields) = &current.kind else {
+            return LayoutKind::Record;
+        };
+        if fields.first().and_then(|f| f.name.as_deref()) == Some("ob_type") {
+            return LayoutKind::ObjectHeaded;
+        }
+        let Some(next) = struct_field0_type_decl(llbc, current, gc_seeds) else {
+            return LayoutKind::Record;
+        };
+        current = next;
+    }
+}
+
 /// `true` when `path` is majit-gc's `GcType` declaration.
 ///
 /// The crate is the first `name_path` segment and the name is the last,
@@ -8420,11 +8487,11 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
 /// never a parent. A reference or raw pointer is not the inlined parent
 /// (`Struct.__init__` inlines a container only as the first field). `Ref`
 /// and `RawPtr` stay in place here; only an `Adt` node yields an id.
-fn struct_field0_type_id(
-    llbc: &Llbc,
+fn struct_field0_type_decl<'a>(
+    llbc: &'a Llbc,
     td: &TypeDecl,
     gc_seeds: &[majit_ir::descr::StructId],
-) -> Option<majit_ir::descr::StructId> {
+) -> Option<&'a TypeDecl> {
     if td.published_struct_copy {
         return None;
     }
@@ -8451,10 +8518,19 @@ fn struct_field0_type_id(
             {
                 return None;
             }
-            Some(inner_id)
+            Some(inner)
         }
         _ => None,
     }
+}
+
+/// `StructId` of [`struct_field0_type_decl`].
+fn struct_field0_type_id(
+    llbc: &Llbc,
+    td: &TypeDecl,
+    gc_seeds: &[majit_ir::descr::StructId],
+) -> Option<majit_ir::descr::StructId> {
+    struct_field0_type_decl(llbc, td, gc_seeds).map(struct_id_for_type_decl)
 }
 
 pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
@@ -8802,6 +8878,7 @@ fn promote_cross_crate_stripped_keys(
         crate::front::semantic::ExactLayout,
     >,
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    gc_seeds: &[majit_ir::descr::StructId],
 ) {
     if tombstoned.is_empty() {
         return;
@@ -8814,6 +8891,7 @@ fn promote_cross_crate_stripped_keys(
         }
         let old_sid = majit_ir::descr::StructId::from_canonical(&stripped);
         let new_sid = majit_ir::descr::StructId::from_canonical(&name);
+        let layout_kind = type_decl_layout_kind(td, llbc, gc_seeds);
         if let Some(layout) = exact_layouts.remove(&old_sid) {
             exact_layouts.insert(new_sid, layout);
         }
@@ -8829,6 +8907,7 @@ fn promote_cross_crate_stripped_keys(
             Some(crate::front::semantic::ClassIdentity {
                 id: new_sid,
                 spelling: name.clone(),
+                layout_kind,
             }),
         );
         struct_fields.class_identity.remove(&stripped);
@@ -8840,6 +8919,7 @@ fn promote_cross_crate_stripped_keys(
                 Some(crate::front::semantic::ClassIdentity {
                     id: new_sid,
                     spelling: name.clone(),
+                    layout_kind,
                 }),
             );
         }
@@ -8867,6 +8947,7 @@ fn promote_cross_crate_stripped_keys(
                 Some(crate::front::semantic::ClassIdentity {
                     id: new_vsid,
                     spelling: new_key.clone(),
+                    layout_kind,
                 }),
             );
             struct_fields.class_identity.remove(&old_key);
@@ -8878,6 +8959,7 @@ fn promote_cross_crate_stripped_keys(
                     Some(crate::front::semantic::ClassIdentity {
                         id: new_vsid,
                         spelling: new_key,
+                        layout_kind,
                     }),
                 );
             }
@@ -11669,4 +11751,4 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 mod exception_sum;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

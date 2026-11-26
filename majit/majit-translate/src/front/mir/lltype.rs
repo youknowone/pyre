@@ -1,6 +1,7 @@
 //! Charon type → lltype / rtyper type mapping, and trait/impl resolution.
 
 use super::*;
+use crate::front::semantic::LayoutKind;
 
 /// Free-function version of [`Lowering::impl_method_owner`] for callers
 /// that only have the `Llbc` + `FunDecl` and do not want to instantiate
@@ -1758,7 +1759,23 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                     {
                         Some(ValueType::Ref(Some(ast)))
                     } else {
-                        Some(ValueType::Ref(opaque_root))
+                        // `exact_layout_ids` is filled from Charon's
+                        // `layout_for_target`. A layout-bearing Opaque
+                        // residual intern's the record class root;
+                        // an Opaque without that layout stays classdef-less.
+                        let target = std::env::var("TARGET").unwrap_or_default();
+                        let record_root = if td.layout_for_target(llbc, &target).is_some() {
+                            let inputs = value_type_inputs(llbc);
+                            tyref_record_class_root_with(
+                                output,
+                                llbc,
+                                no_tombstoned_leaves(),
+                                &inputs.gc_struct_ids,
+                            )
+                        } else {
+                            None
+                        };
+                        Some(ValueType::Ref(opaque_root.or(record_root)))
                     }
                 }
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
@@ -6022,6 +6039,24 @@ pub(in crate::front::mir) fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llb
     tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", false)
 }
 
+fn tyref_record_class_root_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Opaque) {
+        return None;
+    }
+    let root = adt_node_class_root_with(node, llbc, tombstoned)?;
+    let mut gc_seeds = gc_struct_ids.iter().copied().collect::<Vec<_>>();
+    gc_seeds.sort_unstable();
+    (super::type_decl_layout_kind(td, llbc, &gc_seeds) == LayoutKind::Record).then_some(root)
+}
+
 pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     ty: &TyRef,
     llbc: &Llbc,
@@ -6228,6 +6263,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
         gc_struct_ids,
         raw_alloc_flavor_structs,
     ) {
+        return ValueType::Ref(Some(root));
+    }
+    if let Some(root) = tyref_record_class_root_with(ty, llbc, tombstoned, gc_struct_ids) {
         return ValueType::Ref(Some(root));
     }
     // A raw `*u8` / `CCHARP` field stays `Ref(None)` here so FORCE is

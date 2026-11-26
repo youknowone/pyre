@@ -858,7 +858,7 @@ fn transduce_op(
             let field_name = field_name_of(&op.args[1]);
             // `Transformer.handle_getfield_typeptr`: a Constant receiver
             // folds to `same_as` of `op.args[0].value.typeptr`.
-            if field_name == "typeptr"
+            if is_typeptr_getset(op)
                 && let Hlvalue::Constant(c) = &op.args[0]
             {
                 let ConstValue::LLPtr(ptr) = &c.value else {
@@ -2316,9 +2316,28 @@ fn struct_owner_spelling(s: &Struct) -> String {
 }
 
 /// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
+fn owner_typeptr_hint_of_struct(s: &Struct) -> bool {
+    matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true)))
+}
+
 fn owner_typeptr_hint_of(base: &FVar) -> bool {
-    owner_struct_of(base)
-        .is_some_and(|s| matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true))))
+    owner_struct_of(base).is_some_and(|s| owner_typeptr_hint_of_struct(&s))
+}
+
+fn owner_typeptr_hint_of_hlvalue(base: &Hlvalue) -> bool {
+    match base {
+        Hlvalue::Variable(v) => owner_typeptr_hint_of(v),
+        Hlvalue::Constant(c) => c
+            .concretetype
+            .as_ref()
+            .and_then(owner_struct_of_lltype)
+            .is_some_and(|s| owner_typeptr_hint_of_struct(&s)),
+    }
+}
+
+/// `jtransform.py Transformer.is_typeptr_getset`
+fn is_typeptr_getset(op: &crate::flowspace::model::SpaceOperation) -> bool {
+    field_name_of(&op.args[1]) == "typeptr" && owner_typeptr_hint_of_hlvalue(&op.args[0])
 }
 
 /// `FieldDescriptor` for a non-Void `getfield` / `setfield`.  Upstream
@@ -2385,7 +2404,13 @@ fn field_descriptor_of_hlvalue(
             let owner_id = owner_root
                 .as_deref()
                 .and_then(majit_ir::descr::struct_id_for_name);
-            crate::model::FieldDescriptor::new(field_name, owner_root).with_owner_id(owner_id)
+            crate::model::FieldDescriptor::new(field_name, owner_root)
+                .with_owner_typeptr_hint(
+                    owner
+                        .as_ref()
+                        .is_some_and(|s| owner_typeptr_hint_of_struct(s)),
+                )
+                .with_owner_id(owner_id)
         }
     }
 }
@@ -7129,6 +7154,96 @@ mod tests {
         );
     }
 
+    /// A constant `GcStruct` field named `typeptr` without `_hints['typeptr']`
+    /// stays a `FieldRead`. `is_typeptr_getset` requires the hint.
+    #[test]
+    fn lower_graph_unhinted_constant_typeptr_field_stays_field_read() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        let body = LowLevelType::Struct(Box::new(Struct::gc(
+            "S",
+            vec![("typeptr".into(), LowLevelType::Signed)],
+        )));
+        let mut inst = malloc(body.clone(), None, MallocFlavor::Gc, true).expect("malloc S");
+        inst.setattr("typeptr", LowLevelValue::Signed(7))
+            .expect("set typeptr");
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr::from_container_type(body).expect("Ptr(S)")));
+        let receiver = constant_with_lltype(ConstValue::LLPtr(Box::new(inst)), ptr_ty);
+        let start = Block::shared(vec![]);
+        let result = variable_with_lltype("tp", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "unhinted_constant_typeptr",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                receiver,
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "typeptr" && !field.owner_typeptr_hint)),
+            "unhinted constant typeptr stays FieldRead: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn closure_environment_emits_no_class_guard() {
+        let body = Struct::registry_fields(
+            "fixture::owner::closure",
+            vec![("__pos_0".into(), LowLevelType::Signed)],
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+        );
+        let pointer = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(body),
+        }));
+        let environment = variable_with_lltype("environment", pointer);
+        let startblock = Block::shared(vec![Hlvalue::Variable(environment.clone())]);
+        let capture = variable_with_lltype("capture", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "closure_environment_field",
+            startblock.clone(),
+            Hlvalue::Variable(capture.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(environment),
+                constant_with_lltype(ConstValue::byte_str("__pos_0"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(capture.clone()),
+        ));
+        close_return(&startblock, &graph, capture);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let operations: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
+            "record owner must not produce guard_class: {operations:?}"
+        );
+        let field = operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(field),
+            _ => None,
+        });
+        let field = field.expect("closure capture remains a FieldRead");
+        assert_eq!(field.owner_root.as_deref(), Some("fixture::owner::closure"));
+        assert_eq!(field.name, "__pos_0");
+        assert!(!field.owner_typeptr_hint);
+    }
+
     /// `Ptr(ForwardReference(<resolved GcStruct m::W_X>))` with
     /// `_hints['fieldnames']` mapping `inst_name` → `name`.  Models
     /// `InstanceRepr.object_type` after `_setup_repr.become`.
@@ -8307,9 +8422,10 @@ mod tests {
         let vtable_ptr_ty = LowLevelType::Ptr(Box::new(
             Ptr::from_container_type(vtable_container).expect("Ptr(vtable)"),
         ));
-        let object_container = LowLevelType::Struct(Box::new(Struct::gc(
+        let object_container = LowLevelType::Struct(Box::new(Struct::gc_with_hints(
             "object",
             vec![("typeptr".into(), vtable_ptr_ty.clone())],
+            vec![("typeptr".into(), ConstValue::Bool(true))],
         )));
         let mut inst =
             malloc(object_container.clone(), None, MallocFlavor::Gc, true).expect("malloc object");
@@ -8358,6 +8474,56 @@ mod tests {
             }
             other => panic!("typeptr fold defines the result with a const/copy: {other:?}"),
         }
+    }
+
+    #[test]
+    fn constant_receiver_unhinted_typeptr_field_stays_field_read() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        let vtable_container = LowLevelType::Struct(Box::new(Struct::new(
+            "vtable",
+            vec![("subclassrange_min".into(), LowLevelType::Signed)],
+        )));
+        let vtable =
+            malloc(vtable_container.clone(), None, MallocFlavor::Raw, true).expect("malloc vtable");
+        let vtable_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(vtable_container).expect("Ptr(vtable)"),
+        ));
+        let object_container = LowLevelType::Struct(Box::new(Struct::gc(
+            "object",
+            vec![("typeptr".into(), vtable_ptr_ty.clone())],
+        )));
+        let mut inst =
+            malloc(object_container.clone(), None, MallocFlavor::Gc, true).expect("malloc object");
+        inst.setattr("typeptr", LowLevelValue::Ptr(Box::new(vtable)))
+            .expect("set typeptr");
+        let inst_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(object_container).expect("Ptr(object)"),
+        ));
+        let receiver = constant_with_lltype(ConstValue::LLPtr(Box::new(inst)), inst_ptr_ty);
+        let start = Block::shared(vec![]);
+        let cls = variable_with_lltype("cls", vtable_ptr_ty);
+        let graph = FlowGraph::with_return_var(
+            "constant_receiver_unhinted_typeptr",
+            start.clone(),
+            Hlvalue::Variable(cls.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                receiver,
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(cls.clone()),
+        ));
+        close_return(&start, &graph, cls);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "typeptr" && !field.owner_typeptr_hint)),
+            "unhinted constant typeptr stays FieldRead: {ops:?}"
+        );
     }
 
     #[test]

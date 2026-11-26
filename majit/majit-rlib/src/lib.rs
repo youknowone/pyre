@@ -25,6 +25,7 @@ pub mod jit;
 pub mod jit_libffi;
 pub mod lltypesystem;
 pub mod nonconst;
+pub mod objectmodel;
 pub mod rarithmetic;
 pub mod rbigint;
 #[cfg(any(unix, windows))]

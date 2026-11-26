@@ -65,15 +65,16 @@ thread_local! {
         crate::tool::flattenrec::FlattenRecursion::new();
 }
 
-use crate::annotator::classdesc::ClassDef;
+use crate::annotator::classdesc::{ClassDef, ClassDesc, ClassDictEntry};
 use crate::annotator::description::{ClassDefKey, DescEntry};
-use crate::annotator::model::{DescKind, SomePBC, SomeValue};
+use crate::annotator::model::{DescKind, SomeInstance, SomePBC, SomeValue};
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
+use crate::front::semantic::LayoutKind;
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
+    self, _ptr, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -512,7 +513,7 @@ fn classdesc_get_param(
     default
 }
 
-pub(super) fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, TyperError> {
+pub(crate) fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, TyperError> {
     let alloc_flavor =
         classdesc_get_param(classdef, "_alloc_flavor_", ConstValue::byte_str("gc"), true);
     let Some(alloc_flavor) = alloc_flavor.as_text() else {
@@ -2447,6 +2448,10 @@ pub struct InstanceRepr {
     /// upstream's sentinel for the root instance that carries
     /// `object_type = OBJECT_BY_FLAVOR[...]` directly.
     classdef: Option<Rc<RefCell<ClassDef>>>,
+    /// Representation-boundary input captured by `rclass.getinstancerepr`.
+    /// Object-headed classes and classes rejected by the record gate use
+    /// this representation. Enum classes retain the compatibility path.
+    layout_kind: crate::front::semantic::LayoutKind,
     /// RPython `self.object_type = OBJECT_BY_FLAVOR[LLFLAVOR[gcflavor]]`
     /// when classdef is None (rclass.py), otherwise a fresh
     /// `ForwardReference` (rclass.py). The FR target resolves
@@ -2512,10 +2517,14 @@ impl InstanceRepr {
         classdef: Option<&Rc<RefCell<ClassDef>>>,
         gcflavor: Flavor,
     ) -> Self {
+        let layout_kind = classdef
+            .map(|classdef| classdef.borrow().layout_kind())
+            .unwrap_or(crate::front::semantic::LayoutKind::ObjectHeaded);
         let (object_type, lowleveltype) = build_instance_types(classdef, gcflavor);
         InstanceRepr {
             rtyper: Rc::downgrade(rtyper),
             classdef: classdef.cloned(),
+            layout_kind,
             object_type,
             lowleveltype,
             gcflavor,
@@ -2543,6 +2552,11 @@ impl InstanceRepr {
     /// `None` for root instances, `Some(Rc<RefCell<ClassDef>>)` otherwise.
     pub fn classdef(&self) -> Option<Rc<RefCell<ClassDef>>> {
         self.classdef.clone()
+    }
+
+    /// Structural representation input captured by `rclass.getinstancerepr`.
+    pub fn layout_kind(&self) -> crate::front::semantic::LayoutKind {
+        self.layout_kind
     }
 
     /// RPython `InstanceRepr.object_type` (rclass.py).
@@ -3667,6 +3681,639 @@ fn is_native_quasi_immut_watcher(s_value: &SomeValue, lowleveltype: &LowLevelTyp
             .unwrap_or(n.as_str())
             == "QuasiImmut"
     })
+}
+
+#[derive(Debug, Clone)]
+struct RecordField {
+    name: String,
+    storage_type: LowLevelType,
+    external_repr: Option<Arc<dyn Repr>>,
+    internal_repr: Option<Arc<dyn Repr>>,
+}
+
+#[derive(Debug)]
+pub struct RecordRepr {
+    rtyper: Weak<RPythonTyper>,
+    classdef: Rc<RefCell<ClassDef>>,
+    declared_body: Struct,
+    object_type: LowLevelType,
+    lowleveltype: LowLevelType,
+    gcflavor: Flavor,
+    fields: RefCell<Vec<RecordField>>,
+    iprebuiltinstances: RefCell<IndexMap<HostObject, _ptr>>,
+    state: ReprState,
+}
+
+fn record_pointer_annotation_gckind(annotation: &SomeValue) -> Result<Option<GcKind>, TyperError> {
+    let gckind = match annotation {
+        SomeValue::Instance(instance) => match instance.classdef.as_ref() {
+            Some(classdef) => match getgcflavor(classdef)? {
+                Flavor::Gc => GcKind::Gc,
+                Flavor::Raw => GcKind::Raw,
+            },
+            None => GcKind::Gc,
+        },
+        SomeValue::Exception(_) => GcKind::Gc,
+        SomeValue::String(_)
+        | SomeValue::UnicodeString(_)
+        | SomeValue::ByteArray(_)
+        | SomeValue::List(_)
+        | SomeValue::Tuple(_)
+        | SomeValue::Dict(_)
+        | SomeValue::Iterator(_)
+        | SomeValue::WeakRef(_)
+        | SomeValue::StringBuilder(_)
+        | SomeValue::UnicodeBuilder(_)
+        | SomeValue::RustVec(_) => GcKind::Gc,
+        _ => return Ok(None),
+    };
+    Ok(Some(gckind))
+}
+
+fn record_field_carrier_matches(
+    annotation: &SomeValue,
+    declared_type: &LowLevelType,
+) -> Result<bool, TyperError> {
+    if let Ok(annotation_type) =
+        crate::translator::rtyper::llannotation::annotation_to_lltype(annotation, None)
+    {
+        return Ok(&annotation_type == declared_type);
+    }
+    let Some(gckind) = record_pointer_annotation_gckind(annotation)? else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        declared_type,
+        LowLevelType::Ptr(pointer) if pointer.TO._gckind() == gckind
+    ))
+}
+
+impl RecordRepr {
+    pub fn new(
+        rtyper: &Rc<RPythonTyper>,
+        classdef: &Rc<RefCell<ClassDef>>,
+        declaration: crate::annotator::bookkeeper::RecordDeclaration,
+        gcflavor: Flavor,
+    ) -> Result<Option<Self>, TyperError> {
+        if classdef.borrow().layout_kind() != LayoutKind::Record {
+            return Err(TyperError::message(
+                "RecordRepr requires LayoutKind::Record",
+            ));
+        }
+        let LowLevelType::Struct(declared_body) = declaration.object_type else {
+            return Err(TyperError::message(
+                "RecordRepr requires a declaration-backed Struct",
+            ));
+        };
+        let mut declared_body = *declared_body;
+        declared_body._gckind = match gcflavor {
+            Flavor::Gc => GcKind::Gc,
+            Flavor::Raw => GcKind::Raw,
+        };
+        for row in &declaration.rows {
+            let declared_type = declared_body._flds.get(&row.name).ok_or_else(|| {
+                TyperError::message(format!(
+                    "RecordRepr declaration field {:?} has no lltype",
+                    row.name
+                ))
+            })?;
+            if let Some(annotation) = ClassDef::about_attribute(classdef, &row.name)
+                && !record_field_carrier_matches(&annotation, declared_type)?
+            {
+                return Ok(None);
+            }
+        }
+        let forward = match gcflavor {
+            Flavor::Gc => ForwardReference::gc(),
+            Flavor::Raw => ForwardReference::new(),
+        };
+        let object_type = LowLevelType::ForwardReference(Box::new(forward.clone()));
+        let lowleveltype = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(forward),
+        }));
+        Ok(Some(Self {
+            rtyper: Rc::downgrade(rtyper),
+            classdef: classdef.clone(),
+            declared_body,
+            object_type,
+            lowleveltype,
+            gcflavor,
+            fields: RefCell::new(Vec::new()),
+            iprebuiltinstances: RefCell::new(IndexMap::new()),
+            state: ReprState::new(),
+        }))
+    }
+
+    pub fn classdef(&self) -> Rc<RefCell<ClassDef>> {
+        self.classdef.clone()
+    }
+
+    pub fn object_type(&self) -> &LowLevelType {
+        &self.object_type
+    }
+
+    pub fn gcflavor(&self) -> Flavor {
+        self.gcflavor
+    }
+
+    fn field(&self, attr: &str) -> Result<RecordField, TyperError> {
+        self.fields
+            .borrow()
+            .iter()
+            .find(|field| field.name == attr)
+            .cloned()
+            .ok_or_else(|| {
+                TyperError::message(format!(
+                    "RecordRepr field {attr:?} is absent from {}",
+                    self.classdef.borrow().name
+                ))
+            })
+    }
+
+    fn field_type(&self, attr: &str) -> Result<LowLevelType, TyperError> {
+        Ok(self.field(attr)?.storage_type)
+    }
+
+    pub fn getfield(
+        &self,
+        vrecord: Hlvalue,
+        attr: &str,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        let field_type = self.field_type(attr)?;
+        let cname = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::byte_str(attr),
+            LowLevelType::Void,
+        ));
+        Ok(llops
+            .genop(
+                "getfield",
+                vec![vrecord, cname],
+                GenopResult::LLType(field_type),
+            )
+            .expect("getfield with a non-Void result yields a Variable"))
+    }
+
+    pub fn setfield(
+        &self,
+        vrecord: Hlvalue,
+        attr: &str,
+        value: Hlvalue,
+        llops: &mut LowLevelOpList,
+    ) -> Result<(), TyperError> {
+        self.field_type(attr)?;
+        let cname = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::byte_str(attr),
+            LowLevelType::Void,
+        ));
+        llops.genop("setfield", vec![vrecord, cname, value], GenopResult::Void);
+        Ok(())
+    }
+
+    pub fn new_instance(
+        &self,
+        llops: &mut LowLevelOpList,
+        nonmovable: bool,
+    ) -> Result<Hlvalue, TyperError> {
+        let ctype = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LowLevelType(Box::new(self.object_type.become_container())),
+            LowLevelType::Void,
+        ));
+        let mut flags = IndexMap::from([(
+            ConstValue::byte_str("flavor"),
+            ConstValue::byte_str(self.gcflavor.llflavor()),
+        )]);
+        if nonmovable {
+            flags.insert(ConstValue::byte_str("nonmovable"), ConstValue::Bool(true));
+        }
+        let cflags = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Dict(Arc::new(flags)),
+            LowLevelType::Void,
+        ));
+        Ok(Hlvalue::Variable(
+            llops
+                .genop(
+                    "malloc",
+                    vec![ctype, cflags],
+                    GenopResult::LLType(self.lowleveltype.clone()),
+                )
+                .expect("malloc with a non-Void result yields a Variable"),
+        ))
+    }
+
+    fn null_record(&self) -> Result<_ptr, TyperError> {
+        lltype::nullptr(self.object_type.become_container()).map_err(TyperError::message)
+    }
+
+    fn create_instance(&self) -> Result<_ptr, TyperError> {
+        let flavor = match self.gcflavor {
+            Flavor::Gc => lltype::MallocFlavor::Gc,
+            Flavor::Raw => lltype::MallocFlavor::Raw,
+        };
+        lltype::malloc(self.object_type.become_container(), None, flavor, true)
+            .map_err(TyperError::message)
+    }
+
+    fn initialize_prebuilt_data(
+        &self,
+        host: &HostObject,
+        result: &mut _ptr,
+    ) -> Result<(), TyperError> {
+        use crate::flowspace::model::{HostGetAttrError, host_getattr};
+        let classdesc = self.classdef.borrow().classdesc.clone();
+        for field in self.fields.borrow().iter() {
+            let llvalue = match (&field.external_repr, &field.internal_repr) {
+                (Some(_external), Some(internal)) => {
+                    let source = match host_getattr(host, &field.name) {
+                        Ok(value) => Some(DescOrConst::Const(Constant::new(value))),
+                        Err(HostGetAttrError::Missing) => {
+                            ClassDesc::read_attribute(&classdesc, &field.name).map(|entry| {
+                                match entry {
+                                    ClassDictEntry::Constant(value) => DescOrConst::Const(value),
+                                    ClassDictEntry::Desc(desc) => DescOrConst::Desc(desc),
+                                }
+                            })
+                        }
+                        Err(HostGetAttrError::Unsupported) => {
+                            return Err(TyperError::message(format!(
+                                "RecordRepr.initialize_prebuilt_data: unsupported getattr({:?})",
+                                field.name
+                            )));
+                        }
+                    };
+                    match source {
+                        Some(source) => {
+                            let internal_constant = internal.convert_desc_or_const(&source)?;
+                            constant_to_lowlevel_value(&internal_constant)?
+                        }
+                        None => field.storage_type._defl(),
+                    }
+                }
+                (None, None) => field.storage_type._defl(),
+                _ => unreachable!("RecordField boundary reprs are paired"),
+            };
+            result
+                .setattr(&field.name, llvalue)
+                .map_err(TyperError::message)?;
+        }
+        Ok(())
+    }
+
+    fn convert_const_exact(&self, host: &HostObject) -> Result<Constant, TyperError> {
+        if let Some(value) = self.iprebuiltinstances.borrow().get(host).cloned() {
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(value)),
+                self.lowleveltype.clone(),
+            ));
+        }
+        Repr::setup(self as &dyn Repr)?;
+        let mut result = self.create_instance()?;
+        self.iprebuiltinstances
+            .borrow_mut()
+            .insert(host.clone(), result.clone());
+        self.initialize_prebuilt_data(host, &mut result)?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(result)),
+            self.lowleveltype.clone(),
+        ))
+    }
+
+    fn constant_result(&self, hop: &HighLevelOp, opname: &str) -> RTypeResult {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let s_result =
+            hop.s_result.borrow().clone().ok_or_else(|| {
+                TyperError::message(format!("RecordRepr.{opname}: s_result missing"))
+            })?;
+        if !s_result.is_constant() {
+            return Err(TyperError::message(format!(
+                "RecordRepr.{opname}: exact record class test did not fold"
+            )));
+        }
+        let r_result =
+            hop.r_result.borrow().clone().ok_or_else(|| {
+                TyperError::message(format!("RecordRepr.{opname}: r_result missing"))
+            })?;
+        let value = s_result.const_().expect("constant result has a value");
+        HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), value)
+            .map(Hlvalue::Constant)
+            .map(Some)
+    }
+}
+
+impl Repr for RecordRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lowleveltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "RecordRepr"
+    }
+
+    fn gc_flavor_str(&self) -> Option<&'static str> {
+        Some(self.gcflavor.llflavor())
+    }
+
+    fn repr_class_id(&self) -> ReprClassId {
+        ReprClassId::RecordRepr
+    }
+
+    fn _setup_repr(&self) -> Result<(), TyperError> {
+        {
+            let classdef = self.classdef.borrow();
+            if classdef.basedef.is_some()
+                || classdef
+                    .subdefs
+                    .iter()
+                    .any(|subdef| subdef.upgrade().is_some())
+            {
+                return Err(TyperError::message(format!(
+                    "RecordRepr {} cannot participate in a class hierarchy",
+                    classdef.name
+                )));
+            }
+        }
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("RecordRepr._setup_repr: RPythonTyper weak ref expired")
+        })?;
+        let mut fields = Vec::with_capacity(self.declared_body._names.len());
+        let mut logical_fields = Vec::with_capacity(self.declared_body._names.len());
+        for name in &self.declared_body._names {
+            let declared_type = self.declared_body._flds.get(name).cloned().ok_or_else(|| {
+                TyperError::message(format!(
+                    "RecordRepr declaration field {name:?} has no lltype"
+                ))
+            })?;
+            let (storage_type, external_repr, internal_repr) =
+                match ClassDef::about_attribute(&self.classdef, name) {
+                    Some(annotation) => {
+                        debug_assert!(record_field_carrier_matches(&annotation, &declared_type)?);
+                        let external = rtyper.getrepr(&annotation)?;
+                        let (external, internal) = externalvsinternal(&rtyper, external, false)?;
+                        (
+                            internal.lowleveltype().clone(),
+                            Some(external),
+                            Some(internal),
+                        )
+                    }
+                    None => (declared_type, None, None),
+                };
+            logical_fields.push((name.clone(), storage_type.clone()));
+            fields.push(RecordField {
+                name: name.clone(),
+                storage_type,
+                external_repr,
+                internal_repr,
+            });
+        }
+        let body = Struct::registry_fields(
+            &self.declared_body._name,
+            logical_fields,
+            self.declared_body._gckind,
+        );
+        let LowLevelType::ForwardReference(forward) = &self.object_type else {
+            return Err(TyperError::message(
+                "RecordRepr.object_type must be ForwardReference",
+            ));
+        };
+        forward
+            .r#become(LowLevelType::Struct(Box::new(body)))
+            .map_err(TyperError::message)?;
+        *self.fields.borrow_mut() = fields;
+        Ok(())
+    }
+
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        if hop
+            .s_result
+            .borrow()
+            .as_ref()
+            .is_some_and(SomeObjectTrait::is_constant)
+        {
+            return self.constant_result(hop, "rtype_getattr");
+        }
+        let attr = hop.args_s.borrow()[1]
+            .const_()
+            .and_then(ConstValue::as_pystr)
+            .ok_or_else(|| {
+                TyperError::message("RecordRepr.rtype_getattr: attribute name must be constant")
+            })?
+            .to_string();
+        let void = LowLevelType::Void;
+        let args = hop.inputargs(vec![ConvertedTo::Repr(self), ConvertedTo::from(&void)])?;
+        if matches!(
+            hop.s_result.borrow().as_ref(),
+            Some(SomeValue::BuiltinMethod(_))
+        ) {
+            return Ok(Some(args[0].clone()));
+        }
+        if let Some(r_result) = hop.r_result.borrow().clone()
+            && let Some(r_method) = (r_result.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<crate::translator::rtyper::rpbc::MethodsPBCRepr>(
+            )
+        {
+            return r_method
+                .get_method_from_instance(self, args[0].clone(), &mut hop.llops.borrow_mut())
+                .map(Some);
+        }
+        let field = self.field(&attr)?;
+        let internal = field.internal_repr.as_ref().ok_or_else(|| {
+            TyperError::message(format!("RecordRepr field {attr:?} has no annotation repr"))
+        })?;
+        let external = field.external_repr.as_ref().expect("paired boundary repr");
+        let result = self.getfield(args[0].clone(), &attr, &mut hop.llops.borrow_mut())?;
+        hop.llops
+            .borrow_mut()
+            .convertvar(
+                Hlvalue::Variable(result),
+                internal.as_ref(),
+                external.as_ref(),
+            )
+            .map(Some)
+    }
+
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let attr = hop.args_s.borrow()[1]
+            .const_()
+            .and_then(ConstValue::as_pystr)
+            .ok_or_else(|| {
+                TyperError::message("RecordRepr.rtype_setattr: attribute name must be constant")
+            })?
+            .to_string();
+        let field = self.field(&attr)?;
+        let external = field.external_repr.as_ref().ok_or_else(|| {
+            TyperError::message(format!("RecordRepr field {attr:?} has no annotation repr"))
+        })?;
+        let internal = field.internal_repr.as_ref().expect("paired boundary repr");
+        let void = LowLevelType::Void;
+        let args = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::from(&void),
+            ConvertedTo::Repr(external.as_ref()),
+        ])?;
+        let value = hop.llops.borrow_mut().convertvar(
+            args[2].clone(),
+            external.as_ref(),
+            internal.as_ref(),
+        )?;
+        self.setfield(args[0].clone(), &attr, value, &mut hop.llops.borrow_mut())?;
+        Ok(None)
+    }
+
+    fn rtype_type(&self, hop: &HighLevelOp) -> RTypeResult {
+        self.constant_result(hop, "rtype_type")
+    }
+
+    fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
+        self.constant_result(hop, "rtype_isinstance")
+    }
+
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let args = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(hop.genop("ptr_nonzero", args, GenopResult::LLType(LowLevelType::Bool)))
+    }
+
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        if method_name == "as_ref" || method_name == "as_mut" {
+            return hop.inputarg(self, 0).map(Some);
+        }
+        Err(TyperError::message(format!(
+            "missing {}.rtype_method_{method_name}",
+            self.class_name()
+        )))
+    }
+
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_inst_hash",
+                vec![self.lowleveltype.clone()],
+                LowLevelType::Signed,
+                |_rtyper, args, _result| build_ll_inst_hash_helper_graph("ll_inst_hash", &args[0]),
+            )
+            .map(Some)
+    }
+
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if matches!(value, ConstValue::None)
+            || matches!(value, ConstValue::LLPtr(ptr) if !ptr.nonzero())
+        {
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(self.null_record()?)),
+                self.lowleveltype.clone(),
+            ));
+        }
+        let host = match value {
+            ConstValue::HostObject(host) if host.is_bound_method() => host
+                .bound_method_self()
+                .cloned()
+                .ok_or_else(|| TyperError::message("bound method has no im_self"))?,
+            ConstValue::HostObject(host) => host.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "RecordRepr.convert_const: expected HostObject or null, got {other:?}"
+                )));
+            }
+        };
+        let annotator = self
+            .rtyper
+            .upgrade()
+            .and_then(|rtyper| rtyper.annotator.upgrade())
+            .ok_or_else(|| TyperError::message("RecordRepr.convert_const: annotator dropped"))?;
+        let host_class = host
+            .class_of()
+            .ok_or_else(|| TyperError::message("RecordRepr.convert_const: host has no class"))?;
+        let host_classdef = annotator
+            .bookkeeper
+            .getuniqueclassdef(&host_class)
+            .map_err(|error| TyperError::message(error.to_string()))?;
+        if !Rc::ptr_eq(&host_classdef, &self.classdef) {
+            return Err(TyperError::message(format!(
+                "RecordRepr.convert_const: {:?} is not an exact instance of {}",
+                host.qualname(),
+                self.classdef.borrow().name,
+            )));
+        }
+        self.convert_const_exact(&host)
+    }
+}
+
+pub(super) fn pair_record_record_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    value: &Hlvalue,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let Some(from) = (r_from as &dyn std::any::Any).downcast_ref::<RecordRepr>() else {
+        return Ok(None);
+    };
+    let Some(to) = (r_to as &dyn std::any::Any).downcast_ref::<RecordRepr>() else {
+        return Ok(None);
+    };
+    if Rc::ptr_eq(&from.classdef, &to.classdef) && from.lowleveltype == to.lowleveltype {
+        Ok(Some(value.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn pair_record_record_rtype_is_(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> Result<Option<Hlvalue>, TyperError> {
+    if pair_record_record_convert_from_to(
+        r1,
+        r2,
+        hop.args_v
+            .borrow()
+            .first()
+            .ok_or_else(|| TyperError::message("record identity missing lhs"))?,
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    crate::translator::rtyper::pairtype::pair_repr_repr_rtype_is_(r1, r2, hop).map(Some)
+}
+
+pub(super) fn pair_record_record_rtype_ne(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let Some(equal) = pair_record_record_rtype_is_(r1, r2, hop)? else {
+        return Ok(None);
+    };
+    Ok(hop.genop(
+        "bool_not",
+        vec![equal],
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
 }
 
 impl Repr for InstanceRepr {
@@ -4982,9 +5629,29 @@ pub fn rtype_new_instance(
     classcallhop: Option<&crate::translator::rtyper::rtyper::HighLevelOp>,
     nonmovable: bool,
 ) -> Result<Hlvalue, TyperError> {
-    let rinstance = getinstancerepr(rtyper, classdef, Flavor::Gc)?;
-    Repr::setup(rinstance.as_ref() as &dyn Repr)?;
-    rinstance.new_instance(llops, classcallhop, nonmovable)
+    let annotation =
+        SomeValue::Instance(SomeInstance::new(classdef.cloned(), false, BTreeMap::new()));
+    let repr = rtyper.getrepr(&annotation)?;
+    Repr::setup(repr.as_ref())?;
+    if (repr.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<InstanceRepr>()
+        .is_some()
+    {
+        let cached = getinstancerepr(rtyper, classdef, Flavor::Gc)?;
+        return cached.new_instance(llops, classcallhop, nonmovable);
+    }
+    if let Some(record) = (repr.as_ref() as &dyn std::any::Any).downcast_ref::<RecordRepr>() {
+        if classcallhop.is_some() {
+            return Err(TyperError::message(
+                "RecordRepr does not implement class-call initialization",
+            ));
+        }
+        return record.new_instance(llops, nonmovable);
+    }
+    Err(TyperError::message(format!(
+        "rtype_new_instance: unsupported repr {}",
+        repr.class_name()
+    )))
 }
 
 /// RPython `InstanceRepr.has_special_memory_pressure(self, tp)`
@@ -5305,7 +5972,7 @@ pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 // Unit tests
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
@@ -7733,6 +8400,76 @@ mod tests {
     }
 
     #[test]
+    fn classdef_layout_kind_distinguishes_object_enum_record() {
+        use crate::front::semantic::{ClassIdentity, LayoutKind};
+
+        let annotator =
+            crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let bookkeeper = annotator.bookkeeper.clone();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        for (name, kind, rows) in [
+            (
+                "object::ObjectHeader",
+                LayoutKind::ObjectHeaded,
+                vec![("ob_type".to_string(), "*const PyType".to_string())],
+            ),
+            (
+                "fixture::Choice",
+                LayoutKind::Enum,
+                vec![("__discriminant".to_string(), "u8".to_string())],
+            ),
+            (
+                "fixture::Record",
+                LayoutKind::Record,
+                vec![("value".to_string(), "i64".to_string())],
+            ),
+        ] {
+            let id = majit_ir::descr::StructId::from_canonical(name);
+            fields.fields.insert(name.to_string(), rows);
+            fields
+                .class_identity
+                .insert(name.to_string(), Some(ClassIdentity::new(id, name, kind)));
+        }
+        bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let rtyper = fresh_rtyper();
+        for (name, expected) in [
+            ("object::ObjectHeader", LayoutKind::ObjectHeaded),
+            ("fixture::Choice", LayoutKind::Enum),
+            ("fixture::Record", LayoutKind::Record),
+        ] {
+            let classdef = bookkeeper
+                .getuniqueclassdef_for_struct_root(name)
+                .expect("host ClassDef");
+            assert_eq!(classdef.borrow().layout_kind(), expected, "{name}");
+            let annotation = SomeValue::Instance(SomeInstance::new(
+                Some(classdef.clone()),
+                false,
+                BTreeMap::new(),
+            ));
+            let repr = rtyper.getrepr(&annotation).expect("selected repr");
+            match expected {
+                LayoutKind::Record if classdef.borrow().record_declaration().is_some() => {
+                    assert_eq!(repr.repr_class_id(), ReprClassId::RecordRepr, "{name}");
+                }
+                LayoutKind::ObjectHeaded | LayoutKind::Enum | LayoutKind::Record => {
+                    let instance = (repr.as_ref() as &dyn std::any::Any)
+                        .downcast_ref::<InstanceRepr>()
+                        .expect("InstanceRepr compatibility path");
+                    assert_eq!(instance.layout_kind(), expected, "{name}");
+                }
+            }
+        }
+
+        let internal = ClassDef::new_standalone("object", None);
+        assert_eq!(
+            internal.borrow().layout_kind(),
+            LayoutKind::ObjectHeaded,
+            "a ClassDef with no host declaration keeps ObjectHeaded"
+        );
+    }
+
+    #[test]
     fn getinstancerepr_reads_alloc_flavor_from_classdesc() {
         let rtyper = fresh_rtyper();
         let classdef = ClassDef::new_standalone("pkg.RawC", None);
@@ -8551,5 +9288,671 @@ mod tests {
         .expect("conversion does not error");
         assert!(converted.is_none());
         assert!(llops.ops.is_empty());
+    }
+
+    pub(crate) fn record_repr_fixture_with_setup(
+        name: &str,
+        fields: Vec<(&str, serde_json::Value)>,
+        extra_declarations: Vec<serde_json::Value>,
+        flavor: Flavor,
+        setup: bool,
+    ) -> (
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<RPythonTyper>,
+        Rc<RefCell<ClassDef>>,
+        Arc<dyn Repr>,
+        crate::front::semantic::ExactLayout,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        use crate::front::mir::tests::{interior_struct, llbc_with_types};
+        use crate::front::semantic::LayoutKind;
+
+        let path: Vec<&str> = name.split("::").collect();
+        let offsets: Vec<u64> = (0..fields.len()).map(|index| index as u64 * 8).collect();
+        let mut declarations = vec![interior_struct(
+            0,
+            &path,
+            &fields,
+            fields.len() as u64 * 8,
+            &offsets,
+            false,
+        )];
+        declarations.extend(extra_declarations);
+        let llbc = llbc_with_types("fixture", declarations, vec![]);
+        let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+            .expect("Charon record fixture");
+        let identity = program
+            .struct_fields
+            .class_identity
+            .values()
+            .filter_map(Option::as_ref)
+            .find(|identity| {
+                identity.spelling == name
+                    || name.ends_with(&identity.spelling)
+                    || identity.spelling.ends_with(name)
+            })
+            .expect("record ClassIdentity")
+            .clone();
+        assert_eq!(identity.layout_kind, LayoutKind::Record);
+        let layout = program
+            .exact_layouts
+            .get(&identity.id)
+            .expect("record ExactLayout")
+            .clone();
+        let mut call_control =
+            crate::call::CallControl::with_struct_layouts(program.struct_layouts.clone());
+        call_control.set_struct_fields(program.struct_fields.clone());
+        let field_pairs: Vec<(String, String)> = program
+            .struct_fields
+            .intern_field_rows(&identity.spelling)
+            .expect("record field rows")
+            .iter()
+            .map(|row| (row.name.clone(), row.ty.clone()))
+            .collect();
+        let mut fixture_layout = crate::layout::struct_layout_from_rows_and_exact(
+            &field_pairs,
+            &layout.field_offsets,
+            layout.size,
+            &program.known_struct_names,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &program.raw_alloc_flavor_structs,
+        );
+        fixture_layout.gckind = if flavor == Flavor::Gc {
+            GcKind::Gc
+        } else {
+            GcKind::Raw
+        };
+        call_control.set_struct_layout(identity.id, fixture_layout);
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        ann.bookkeeper
+            .set_struct_fields(Rc::new(program.struct_fields));
+        ann.bookkeeper
+            .set_struct_layouts(call_control.struct_layouts_handle());
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root(&identity.spelling)
+            .expect("record classdef");
+        if flavor == Flavor::Raw {
+            classdef
+                .borrow()
+                .classdesc
+                .borrow()
+                .pyobj
+                .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        }
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let registry =
+            crate::test_support::register_struct_ids_serialized(program.struct_ids.clone());
+        let annotation = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            BTreeMap::new(),
+        ));
+        let repr = rtyper.getrepr(&annotation).expect("record repr");
+        if setup {
+            Repr::setup(repr.as_ref()).expect("record setup");
+        }
+        (ann, rtyper, classdef, repr, layout, registry)
+    }
+
+    pub(crate) fn record_repr_fixture(
+        name: &str,
+        fields: Vec<(&str, serde_json::Value)>,
+        extra_declarations: Vec<serde_json::Value>,
+        flavor: Flavor,
+    ) -> (
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<RPythonTyper>,
+        Rc<RefCell<ClassDef>>,
+        Arc<dyn Repr>,
+        crate::front::semantic::ExactLayout,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        record_repr_fixture_with_setup(name, fields, extra_declarations, flavor, true)
+    }
+
+    fn as_record(repr: &Arc<dyn Repr>) -> &RecordRepr {
+        (repr.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<RecordRepr>()
+            .expect("RecordRepr")
+    }
+
+    #[test]
+    fn plain_struct_repr_has_no_object_super() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, _rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::Record",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        assert_eq!(repr.repr_class_id(), ReprClassId::RecordRepr);
+        let record = as_record(&repr);
+        let LowLevelType::ForwardReference(forward) = record.object_type() else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert_eq!(body._gckind, GcKind::Gc);
+        assert!(body._flds.get("super").is_none());
+        assert!(body._flds.get("typeptr").is_none());
+        assert_eq!(body._names, vec!["value"]);
+    }
+
+    #[test]
+    fn plain_struct_constructor_emits_no_typeptr() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::Record",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        as_record(&repr)
+            .new_instance(&mut llops, false)
+            .expect("record allocation");
+        assert_eq!(llops.ops.len(), 1, "ops={:?}", llops.ops);
+        assert_eq!(llops.ops[0].opname, "malloc");
+        assert!(llops.ops.iter().all(|op| {
+            !op.args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    Hlvalue::Constant(c) if c.value == ConstValue::byte_str("typeptr")
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn plain_struct_fields_use_exact_offsets() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, _classdef, repr, layout, _registry) = record_repr_fixture(
+            "fixture::Padded",
+            vec![("byte", interior_i64()), ("word", interior_i64())],
+            vec![],
+            Flavor::Raw,
+        );
+        assert_eq!(layout.field_offsets.get("byte"), Some(&0));
+        assert_eq!(layout.field_offsets.get("word"), Some(&8));
+        let record = as_record(&repr);
+        let LowLevelType::ForwardReference(forward) = record.object_type() else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert_eq!(body._gckind, GcKind::Raw);
+        assert_eq!(body._names, vec!["byte", "word"]);
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let base = record.new_instance(&mut llops, false).expect("allocate");
+        record
+            .getfield(base, "word", &mut llops)
+            .expect("read word");
+        let field = &llops.ops.last().expect("getfield").args[1];
+        assert!(matches!(
+            field,
+            Hlvalue::Constant(c) if c.value == ConstValue::byte_str("word")
+        ));
+        assert!(body._hints.get("fieldnames").is_none());
+    }
+
+    #[test]
+    fn closure_environment_rtyper_emits_no_typeptr() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::owner::closure",
+            vec![("__pos_0", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let record = as_record(&repr);
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let base = record.new_instance(&mut llops, false).expect("allocate");
+        record
+            .getfield(base, "__pos_0", &mut llops)
+            .expect("capture read");
+        assert!(llops.ops.iter().all(|op| op.opname != "guard_class"));
+        assert!(llops.ops.iter().all(|op| {
+            !op.args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    Hlvalue::Constant(c) if c.value == ConstValue::byte_str("typeptr")
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn record_identity_policy_follows_source_repr() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::IdentityRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let record = as_record(&repr);
+        let LowLevelType::ForwardReference(forward) = record.object_type() else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert!(!matches!(
+            body._hints.get("immutable"),
+            Some(&ConstValue::Bool(true))
+        ));
+        assert!(!matches!(
+            body._hints.get("noidentity"),
+            Some(&ConstValue::Bool(true))
+        ));
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let left = record.new_instance(&mut llops, false).expect("left");
+        let right = record.new_instance(&mut llops, false).expect("right");
+        llops.genop(
+            "ptr_eq",
+            vec![left, right],
+            GenopResult::LLType(LowLevelType::Bool),
+        );
+        assert_eq!(llops.ops.last().expect("identity op").opname, "ptr_eq");
+    }
+
+    #[test]
+    fn record_repr_gate_rejects_classdef_with_basedef() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, classdef, _repr, _layout, _registry) = record_repr_fixture(
+            "fixture::DerivedRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let base = ClassDef::new_standalone("fixture::Base", None);
+        classdef.borrow_mut().basedef = Some(base);
+        let annotation =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, BTreeMap::new()));
+        let repr = crate::translator::rtyper::rmodel::rtyper_makerepr(&annotation, &rtyper)
+            .expect("fallback repr");
+        assert_eq!(repr.repr_class_id(), ReprClassId::InstanceRepr);
+    }
+
+    #[test]
+    fn record_repr_fields_come_from_declaration_rows() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, classdef, _cached_repr, _layout, _registry) = record_repr_fixture(
+            "fixture::RowsOnly",
+            vec![("native", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        assert!(classdef.borrow().attrs.get("native").is_some());
+        classdef.borrow_mut().attrs.clear();
+        let annotation =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, BTreeMap::new()));
+        let repr = crate::translator::rtyper::rmodel::rtyper_makerepr(&annotation, &rtyper)
+            .expect("record repr from rows");
+        Repr::setup(repr.as_ref()).expect("record setup with empty attrs");
+        assert_eq!(
+            as_record(&repr).field_type("native").expect("native"),
+            LowLevelType::Signed
+        );
+        let LowLevelType::ForwardReference(forward) = as_record(&repr).object_type() else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert_eq!(body._names, vec!["native"]);
+    }
+
+    #[test]
+    fn record_repr_keeps_atomic_field_type() {
+        use crate::front::mir::tests::{interior_meta, interior_usize};
+        let atomic_field = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [interior_usize()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let atomic = serde_json::json!({
+            "def_id": 1,
+            "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+            "kind": "Opaque",
+            "layout": null
+        });
+        let (_ann, _rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::AtomicRecord",
+            vec![("len", atomic_field), ("other", interior_usize())],
+            vec![atomic],
+            Flavor::Gc,
+        );
+        let record = as_record(&repr);
+        assert_eq!(
+            record.field_type("len").expect("atomic len"),
+            LowLevelType::Unsigned
+        );
+        let LowLevelType::ForwardReference(forward) = record.object_type() else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert_eq!(body._flds.get("len"), Some(&LowLevelType::Unsigned));
+    }
+
+    #[test]
+    fn gc_record_lowleveltype_is_gc_struct() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, _rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::GcRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let record = as_record(&repr);
+        let LowLevelType::Ptr(ptr) = record.lowleveltype() else {
+            panic!()
+        };
+        let PtrTarget::ForwardReference(forward) = &ptr.TO else {
+            panic!()
+        };
+        let Some(LowLevelType::Struct(body)) = forward.resolved() else {
+            panic!()
+        };
+        assert_eq!(body._gckind, GcKind::Gc);
+        assert_eq!(
+            crate::model::getkind(record.lowleveltype()),
+            crate::model::ConcreteType::GcRef
+        );
+    }
+
+    #[test]
+    fn prebuilt_gc_record_constant_is_ref_kind() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, _rtyper, classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::PrebuiltGcRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let host =
+            HostObject::new_instance(classdef.borrow().classdesc.borrow().pyobj.clone(), vec![]);
+        host.instance_set("value", ConstValue::Int(7)).unwrap();
+        let first = repr
+            .convert_const(&ConstValue::HostObject(host.clone()))
+            .unwrap();
+        let second = repr.convert_const(&ConstValue::HostObject(host)).unwrap();
+        let (ConstValue::LLPtr(first), ConstValue::LLPtr(second)) = (&first.value, &second.value)
+        else {
+            panic!()
+        };
+        assert!(first.nonzero());
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::model::getkind(repr.lowleveltype()),
+            crate::model::ConcreteType::GcRef
+        );
+    }
+
+    #[test]
+    fn record_field_external_repr_converts_to_row_storage() {
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::BoundaryRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let record = as_record(&repr);
+        let field = record.field("value").unwrap();
+        assert_eq!(
+            field.external_repr.as_ref().unwrap().lowleveltype(),
+            &LowLevelType::Signed
+        );
+        assert_eq!(
+            field.internal_repr.as_ref().unwrap().lowleveltype(),
+            &field.storage_type
+        );
+        let value = Variable::new();
+        value.set_concretetype(Some(LowLevelType::Signed));
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let converted = llops
+            .convertvar(
+                Hlvalue::Variable(value),
+                field.external_repr.as_ref().unwrap().as_ref(),
+                field.internal_repr.as_ref().unwrap().as_ref(),
+            )
+            .unwrap();
+        let ctype = match &converted {
+            Hlvalue::Variable(variable) => variable.concretetype(),
+            Hlvalue::Constant(constant) => constant.concretetype.clone(),
+        };
+        assert_eq!(ctype, Some(LowLevelType::Signed));
+    }
+
+    #[test]
+    fn record_gate_rejects_irreconcilable_field() {
+        use crate::annotator::model::SomeInstance;
+        use crate::front::mir::tests::interior_i64;
+        let (_ann, rtyper, classdef, _repr, _layout, _registry) = record_repr_fixture(
+            "fixture::RejectedRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        classdef
+            .borrow_mut()
+            .attrs
+            .get_mut("value")
+            .unwrap()
+            .s_value = SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()));
+        let declaration = classdef.borrow().record_declaration().unwrap();
+        let candidate = RecordRepr::new(&rtyper, &classdef, declaration, Flavor::Gc).unwrap();
+        assert!(candidate.is_none());
+        let annotation =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, BTreeMap::new()));
+        let repr =
+            crate::translator::rtyper::rmodel::rtyper_makerepr(&annotation, &rtyper).unwrap();
+        assert_eq!(repr.repr_class_id(), ReprClassId::InstanceRepr);
+    }
+
+    #[test]
+    fn record_gate_survives_recursive_field_repr() {
+        use crate::front::mir::tests::interior_adt;
+
+        let previous = serde_json::json!({
+            "RawPtr": [interior_adt(0), "Mut"]
+        });
+        let (_ann, _rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture_with_setup(
+            "fixture::ProfilerContext",
+            vec![("previous", previous)],
+            vec![],
+            Flavor::Gc,
+            false,
+        );
+        assert_eq!(repr.repr_class_id(), ReprClassId::RecordRepr);
+        Repr::setup(repr.as_ref()).expect("recursive record setup");
+        let record = as_record(&repr);
+        let field = record.field("previous").expect("previous field");
+        assert_eq!(
+            field
+                .external_repr
+                .as_ref()
+                .expect("external repr")
+                .repr_class_id(),
+            ReprClassId::RecordRepr
+        );
+        assert_eq!(
+            field
+                .internal_repr
+                .as_ref()
+                .expect("internal repr")
+                .lowleveltype(),
+            &field.storage_type
+        );
+    }
+
+    #[test]
+    fn record_lowleveltype_is_forward_reference_until_setup() {
+        use crate::front::mir::tests::interior_i64;
+
+        let (_ann, _rtyper, _classdef, repr, _layout, _registry) = record_repr_fixture_with_setup(
+            "fixture::DeferredRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            Flavor::Gc,
+            false,
+        );
+        let record = as_record(&repr);
+        let LowLevelType::Ptr(pointer) = record.lowleveltype() else {
+            panic!()
+        };
+        let PtrTarget::ForwardReference(pointer_forward) = &pointer.TO else {
+            panic!()
+        };
+        assert!(pointer_forward.resolved().is_none());
+        let LowLevelType::ForwardReference(object_forward) = record.object_type() else {
+            panic!()
+        };
+        assert!(object_forward.resolved().is_none());
+
+        Repr::setup(repr.as_ref()).expect("record setup");
+        assert!(matches!(
+            pointer_forward.resolved(),
+            Some(LowLevelType::Struct(_))
+        ));
+        assert!(matches!(
+            object_forward.resolved(),
+            Some(LowLevelType::Struct(_))
+        ));
+    }
+
+    #[test]
+    fn result_err_record_payload_setattr_keeps_record_field_repr() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let (ann, rtyper, error_classdef, error_repr, _layout, _registry) = record_repr_fixture(
+            "io::error::Error",
+            vec![("__pos_0", crate::front::mir::tests::interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+
+        let payload = ann
+            .bookkeeper
+            .by_value_payload_annotation("&io::error::Error");
+        let SomeValue::Instance(payload_instance) = &payload else {
+            panic!("record payload must be SomeInstance, got {payload:?}");
+        };
+        let payload_classdef = payload_instance
+            .classdef
+            .as_ref()
+            .expect("record payload keeps its ClassDef");
+        assert!(Rc::ptr_eq(payload_classdef, &error_classdef));
+
+        let err_class = HostObject::new_class("result::Result::Err", vec![]);
+        let err_classdef = ann
+            .bookkeeper
+            .getuniqueclassdef(&err_class)
+            .expect("Err classdef");
+        ClassDef::generalize_attr(&err_classdef, "__pos_0", Some(payload))
+            .expect("install Err payload");
+        err_classdef
+            .borrow_mut()
+            .attrs
+            .get_mut("__pos_0")
+            .expect("Err payload attribute")
+            .modified(Some(&err_classdef))
+            .expect("constructor setattr marks payload mutable");
+
+        let err_repr =
+            getinstancerepr(&rtyper, Some(&err_classdef), Flavor::Gc).expect("Err InstanceRepr");
+        Repr::setup(err_repr.as_ref()).expect("setup Err InstanceRepr");
+        let field_repr = err_repr
+            .fields()
+            .get("__pos_0")
+            .expect("Err payload field")
+            .1
+            .clone();
+        assert_eq!(field_repr.repr_class_id(), ReprClassId::RecordRepr);
+        assert_eq!(field_repr.lowleveltype(), error_repr.lowleveltype());
+
+        let receiver = Variable::new();
+        receiver.set_concretetype(Some(err_repr.lowleveltype().clone()));
+        let value = Variable::new();
+        value.set_concretetype(Some(error_repr.lowleveltype().clone()));
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let converted = llops
+            .convertvar(
+                Hlvalue::Variable(value),
+                error_repr.as_ref(),
+                field_repr.as_ref(),
+            )
+            .expect("record payload conversion");
+        err_repr
+            .setfield(
+                Hlvalue::Variable(receiver),
+                "__pos_0",
+                converted,
+                &mut llops,
+                false,
+                &Flags::default(),
+            )
+            .expect("setattr payload");
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "setfield");
+    }
+
+    #[test]
+    fn record_method_as_ref_passes_receiver() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRefCell;
+
+        let (_ann, rtyper, classdef, repr, _layout, _registry) = record_repr_fixture(
+            "fixture::OwnedFd",
+            vec![("__pos_0", crate::front::mir::tests::interior_i64())],
+            vec![],
+            Flavor::Gc,
+        );
+        let receiver = Variable::new();
+        receiver.set_concretetype(Some(repr.lowleveltype().clone()));
+        let receiver_value = Hlvalue::Variable(receiver.clone());
+        let result = Variable::new();
+        result.set_concretetype(Some(repr.lowleveltype().clone()));
+        let operation = SpaceOperation::new(
+            "simple_call",
+            vec![receiver_value.clone()],
+            Hlvalue::Variable(result),
+        );
+        let llops = Rc::new(StdRefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper, operation, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(receiver_value.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                true,
+                std::collections::BTreeMap::new(),
+            )));
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+
+        let passed = repr
+            .rtype_method("as_ref", &hop)
+            .expect("RecordRepr.as_ref")
+            .expect("as_ref returns its receiver");
+        assert_eq!(passed, receiver_value);
+        assert!(hop.llops.borrow().ops.is_empty());
     }
 }

@@ -505,6 +505,21 @@ pub(crate) fn list_family_bare_vec_spelling(spelling: &str) -> Option<String> {
     Some(format!("{prefix}Vec{args}"))
 }
 
+/// Host aggregate representation category carried by declaration identity.
+///
+/// This is the representation-selection input corresponding to
+/// `rclass.getinstancerepr`: `ObjectHeaded` keeps `rclass.InstanceRepr`,
+/// while a sum repr (at the same boundary as `rtagged.TaggedInstanceRepr`)
+/// or a headerless record repr (the shape of `rtuple.TupleRepr`) will be
+/// selected for the other kinds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LayoutKind {
+    ObjectHeaded,
+    Enum,
+    #[default]
+    Record,
+}
+
 /// Declaration identity for one harvested class spelling.
 ///
 /// `id` is the `StructId` of the type declaration (`lltype.Struct` analog).
@@ -513,11 +528,29 @@ pub(crate) fn list_family_bare_vec_spelling(spelling: &str) -> Option<String> {
 /// the crate-stripped `module::Type` harvest uses as the `struct_fields`
 /// key. `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)`; a name is
 /// never identity, so every alias of one declaration stores the same
-/// `spelling`.
+/// `spelling` and `layout_kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClassIdentity {
     pub id: majit_ir::descr::StructId,
     pub spelling: String,
+    /// Rust declaration/layout category. `serde(default)` keeps old cached
+    /// metadata readable; fresh Charon metadata always supplies the value.
+    #[serde(default)]
+    pub layout_kind: LayoutKind,
+}
+
+impl ClassIdentity {
+    pub fn new(
+        id: majit_ir::descr::StructId,
+        spelling: impl Into<String>,
+        layout_kind: LayoutKind,
+    ) -> Self {
+        Self {
+            id,
+            spelling: spelling.into(),
+            layout_kind,
+        }
+    }
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -535,6 +568,11 @@ pub struct StructFieldRegistry {
     /// Empty on a hand-built fixture that never published identities.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_identity: HashMap<String, Option<ClassIdentity>>,
+    /// Declaration identities for which Charon supplied an exact layout.
+    /// Sorted once at harvest completion; representation selection uses
+    /// binary search and never keys policy by a type name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exact_layout_ids: Vec<majit_ir::descr::StructId>,
     /// Suffix buckets for the key set of `fields`. Built on the first query
     /// that needs them and reused while the key-set fingerprint still
     /// matches. Replacing the rows of an existing key does not change the
@@ -892,6 +930,10 @@ impl StructFieldRegistry {
         self.raw_word_owners.contains(lookup) || self.raw_word_owners.contains(class_root)
     }
 
+    pub(crate) fn has_exact_layout(&self, id: majit_ir::descr::StructId) -> bool {
+        self.exact_layout_ids.binary_search(&id).is_ok()
+    }
+
     /// True when the harvested row for `owner.field_name` came from a
     /// `FieldDecl` whose `name` was `None`. False for a declared name,
     /// including a declared `__pos_N`, and when the owner has no such row.
@@ -1227,6 +1269,59 @@ impl StructFieldRegistry {
             return Some(canonical);
         }
         self.unique_suffix_owner_key(owner).map(str::to_string)
+    }
+
+    pub(crate) fn promote_cross_crate_object_headed_layouts(&mut self) {
+        use LayoutKind::{ObjectHeaded, Record};
+
+        loop {
+            let mut promoted_ids = Vec::new();
+
+            let identities: Vec<ClassIdentity> = self
+                .class_identity
+                .values()
+                .filter_map(Option::as_ref)
+                .cloned()
+                .collect();
+            for identity in &identities {
+                if identity.layout_kind != Record || promoted_ids.contains(&identity.id) {
+                    continue;
+                }
+                let Some(field0) = self
+                    .intern_field_rows(&identity.spelling)
+                    .and_then(|rows| rows.first())
+                else {
+                    continue;
+                };
+                let field0_ty = field0.ty.trim().to_owned();
+                if peel_one_row_indirection(&field0_ty).is_some() {
+                    continue;
+                }
+                let Some(field0_key) = self.resolved_owner_key(&field0_ty) else {
+                    continue;
+                };
+                let Some(field0_identity) = self
+                    .class_identity
+                    .get(&field0_key)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if field0_identity.layout_kind == ObjectHeaded {
+                    promoted_ids.push(identity.id);
+                }
+            }
+
+            if promoted_ids.is_empty() {
+                break;
+            }
+
+            for identity in self.class_identity.values_mut().filter_map(Option::as_mut) {
+                if promoted_ids.contains(&identity.id) {
+                    identity.layout_kind = ObjectHeaded;
+                }
+            }
+        }
     }
 
     /// Seed a declared-`Gc` identity from a harvested or fixture name.

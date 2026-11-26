@@ -514,6 +514,9 @@ fn build_semantic_program_via_active_frontend(
                 &mut program.enum_variant_by_discriminant,
                 Some(&program.struct_ids),
             );
+            program
+                .struct_fields
+                .promote_cross_crate_object_headed_layouts();
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;

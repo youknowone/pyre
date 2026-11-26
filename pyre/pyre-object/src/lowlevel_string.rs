@@ -153,6 +153,7 @@ pub unsafe fn copy_raw_to_string(ptrsrc: *const u8, dst: *mut u8, dststart: usiz
     // from here, no GC operations can happen
     let adst = unsafe { dst.add(LOWLEVEL_STRING_CHARS_OFFSET + dststart) };
     unsafe { std::ptr::copy_nonoverlapping(ptrsrc, adst, length) };
+    majit_rlib::objectmodel::keepalive_until_here(dst);
 }
 
 fn alloc_lowlevel_string(

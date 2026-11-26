@@ -27,7 +27,7 @@ use std::rc::Rc;
 use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper::{Bookkeeper, PositionKey};
 use crate::annotator::description::{CallFamily, CallTableRow, DescEntry, DescKey};
-use crate::annotator::model::{AnnotatorError, DescKind, SomeObjectTrait, SomePBC};
+use crate::annotator::model::{AnnotatorError, DescKind, SomeObjectTrait, SomePBC, SomeValue};
 use crate::call::CallControl;
 use crate::flowspace::argument::CallShape;
 use crate::flowspace::pygraph::PyGraph;
@@ -7502,11 +7502,10 @@ pub struct MethodsPBCRepr {
     /// `SomeInstance` directly so `redispatch_call` can write it into
     /// `hop2.args_s[0]` without rebuilding it.
     pub s_im_self: crate::annotator::model::SomeInstance,
-    /// RPython `self.r_im_self = getinstancerepr(rtyper, self.classdef)`
-    /// (rpbc.py:1155). Stored as concrete `Arc<InstanceRepr>` so
-    /// `redispatch_call` can call the InstanceRepr-specific
-    /// `getfield('__class__')` / `rclass()` accessors directly.
-    pub r_im_self: Arc<rclass::InstanceRepr>,
+    /// RPython `self.r_im_self = rtyper.getrepr(SomeInstance(self.classdef))`
+    /// (rpbc.py MethodsPBCRepr.__init__). A RecordRepr receiver uses the record pointer
+    /// directly; an InstanceRepr receiver still reads `__class__`.
+    pub r_im_self: Arc<dyn Repr>,
     /// RPython `self.lowleveltype = self.r_im_self.lowleveltype`
     /// (rpbc.py:1156) — the bound-`self` pointer's low-level type.
     /// Stored explicitly because `Repr::lowleveltype` returns
@@ -7520,6 +7519,7 @@ impl MethodsPBCRepr {
     /// (rpbc.py).
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
         use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeValue;
 
         // upstream: `mdescs = list(s_pbc.descriptions)`.
         let mut mdescs = Vec::with_capacity(s_pbc.descriptions.len());
@@ -7615,10 +7615,8 @@ impl MethodsPBCRepr {
         let s_im_self =
             crate::annotator::model::SomeInstance::new(Some(owner.clone()), false, flags);
 
-        // upstream: `self.r_im_self = getinstancerepr(rtyper, self.classdef)`
-        // — `getinstancerepr`'s `default_flavor` parameter (rclass.py)
-        // defaults to `'gc'`.
-        let r_im_self = rclass::getinstancerepr(rtyper, Some(&owner), rclass::Flavor::Gc)?;
+        // upstream: `self.r_im_self = rtyper.getrepr(self.s_im_self)`.
+        let r_im_self = rtyper.getrepr(&SomeValue::Instance(s_im_self.clone()))?;
 
         // upstream: `self.lowleveltype = self.r_im_self.lowleveltype`.
         let lltype = r_im_self.lowleveltype().clone();
@@ -7661,7 +7659,7 @@ impl MethodsPBCRepr {
         // upstream: `hop2.args_s[0] = self.s_im_self`.
         hop2.args_s.borrow_mut()[0] = SomeValue::Instance(self.s_im_self.clone());
         // upstream: `hop2.args_r[0] = self.r_im_self`.
-        hop2.args_r.borrow_mut()[0] = Some(self.r_im_self.clone() as Arc<dyn Repr>);
+        hop2.args_r.borrow_mut()[0] = Some(self.r_im_self.clone());
 
         // upstream: `if call_args: ... adjust_shape(hop2, s_shape)`.
         if call_args {
@@ -7670,6 +7668,33 @@ impl MethodsPBCRepr {
             adjust_shape(&hop2, &s_shape)?;
         }
         Ok(hop2)
+    }
+
+    fn record_implfunc(
+        &self,
+        descriptions: impl Iterator<Item = DescEntry>,
+    ) -> Result<(SomeValue, Arc<dyn Repr>, Constant), TyperError> {
+        let entries = descriptions
+            .map(|entry| {
+                let method = entry
+                    .as_method()
+                    .ok_or_else(|| TyperError::message("MethodsPBCRepr: expected MethodDesc"))?;
+                Ok(DescEntry::Func(method.borrow().funcdesc.clone()))
+            })
+            .collect::<Result<Vec<_>, TyperError>>()?;
+        if entries.len() != 1 {
+            return Err(TyperError::message(
+                "single-class RecordRepr method must have one implementation",
+            ));
+        }
+        let s_func = SomeValue::PBC(SomePBC::new(entries.clone(), false));
+        let rtyper = self
+            .rtyper
+            .upgrade()
+            .ok_or_else(|| TyperError::message("MethodsPBCRepr: rtyper weak ref dropped"))?;
+        let r_func = rtyper.getrepr(&s_func)?;
+        let constant = r_func.convert_desc(&entries[0])?;
+        Ok((s_func, r_func, constant))
     }
 
     /// RPython `MethodsPBCRepr.redispatch_call(self, hop, call_args)`
@@ -7710,8 +7735,26 @@ impl MethodsPBCRepr {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::rclass::ClassReprArc;
 
+        if self.r_im_self.repr_class_id() == ReprClassId::RecordRepr {
+            let pbc = match hop.args_s.borrow().first().cloned() {
+                Some(SomeValue::PBC(pbc)) => pbc,
+                other => {
+                    return Err(TyperError::message(format!(
+                        "MethodsPBCRepr.redispatch_call: expected method PBC, got {other:?}"
+                    )));
+                }
+            };
+            let (s_func, _r_func, v_func) =
+                self.record_implfunc(pbc.descriptions.values().cloned())?;
+            let hop2 = self.add_instance_arg_to_hop(hop, call_args)?;
+            hop2.v_s_insertfirstarg(Hlvalue::Constant(v_func), s_func)?;
+            return hop2.dispatch();
+        }
+        let r_im_self = (self.r_im_self.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<rclass::InstanceRepr>()
+            .ok_or_else(|| TyperError::message("MethodsPBCRepr: invalid receiver repr"))?;
         // upstream: `r_class = self.r_im_self.rclass`.
-        let r_class_arc = self.r_im_self.rclass().ok_or_else(|| {
+        let r_class_arc = r_im_self.rclass().ok_or_else(|| {
             TyperError::message(
                 "MethodsPBCRepr.redispatch_call: r_im_self.rclass not populated — \
                  setup() must have run",
@@ -7780,8 +7823,16 @@ impl MethodsPBCRepr {
         // upstream: `v_cls = self.r_im_self.getfield(v_im_self,
         //                                            '__class__', hop.llops)`.
         let v_cls = {
+            let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                TyperError::message("MethodsPBCRepr.redispatch_call: rtyper weak ref dropped")
+            })?;
+            let r_im_self = rclass::getinstancerepr(
+                &rtyper,
+                r_im_self.classdef().as_ref(),
+                r_im_self.gcflavor(),
+            )?;
             let mut llops = hop.llops.borrow_mut();
-            self.r_im_self.getfield(
+            r_im_self.getfield(
                 v_im_self,
                 "__class__",
                 &mut llops,
@@ -7878,8 +7929,16 @@ impl MethodsPBCRepr {
     pub fn get_r_implfunc_arc_impl(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
         use crate::translator::rtyper::rclass::ClassReprArc;
 
+        if self.r_im_self.repr_class_id() == ReprClassId::RecordRepr {
+            let (_s_func, r_func, _constant) =
+                self.record_implfunc(self.s_pbc.descriptions.values().cloned())?;
+            return Ok((r_func, 1));
+        }
+        let r_im_self = (self.r_im_self.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<rclass::InstanceRepr>()
+            .ok_or_else(|| TyperError::message("MethodsPBCRepr: invalid receiver repr"))?;
         // upstream: `r_class = self.r_im_self.rclass`.
-        let r_class_arc = self.r_im_self.rclass().ok_or_else(|| {
+        let r_class_arc = r_im_self.rclass().ok_or_else(|| {
             TyperError::message(
                 "MethodsPBCRepr.get_r_implfunc: r_im_self.rclass not populated — \
                  setup() must have run",
@@ -7982,11 +8041,7 @@ impl Repr for MethodsPBCRepr {
         //   `InstanceRepr::null_instance` — produces a null `_ptr`
         //   whose container matches the target Ptr.
         if matches!(value, ConstValue::None) {
-            let null = self.r_im_self.null_instance()?;
-            return Ok(Constant::with_concretetype(
-                ConstValue::LLPtr(Box::new(null)),
-                self.lltype.clone(),
-            ));
+            return self.r_im_self.convert_const(value);
         }
         // upstream: `if getattr(method, 'im_func', None) is None:
         //              raise TyperError("not a bound method: %r" % method)`.
@@ -8010,7 +8065,7 @@ impl Repr for MethodsPBCRepr {
             TyperError::message("MethodsPBCRepr.convert_const: bound method has no self_obj")
         })?;
         let im_self_const = ConstValue::HostObject(im_self);
-        (self.r_im_self.as_ref() as &dyn Repr).convert_const(&im_self_const)
+        self.r_im_self.convert_const(&im_self_const)
     }
 
     /// RPython `MethodsPBCRepr.rtype_simple_call(self, hop)`
@@ -8945,6 +9000,50 @@ mod pbc_repr_tests {
         let s_pbc = SomePBC::new(vec![m], false);
         let r = rtyper.getrepr(&SomeValue::PBC(s_pbc)).unwrap();
         assert_eq!(r.repr_class_id(), ReprClassId::MethodsPBCRepr);
+    }
+
+    #[test]
+    fn record_bound_method_call_passes_receiver_without_class_word() {
+        use crate::flowspace::model::Variable;
+        use crate::front::mir::tests::interior_i64;
+        use crate::translator::rtyper::rclass::tests::record_repr_fixture;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let (ann, rtyper, classdef, record, _layout, _registry) = record_repr_fixture(
+            "fixture::MethodRecord",
+            vec![("value", interior_i64())],
+            vec![],
+            crate::translator::rtyper::rclass::Flavor::Gc,
+        );
+        let Some(funcdesc) = function_entry(&ann.bookkeeper, "method_impl").as_function() else {
+            unreachable!()
+        };
+        register_attr(&classdef, "method");
+        let method = method_entry(&ann.bookkeeper, &funcdesc, &classdef, "method");
+        classdef
+            .borrow_mut()
+            .attrs
+            .get_mut("method")
+            .unwrap()
+            .s_value = SomeValue::PBC(SomePBC::new(vec![method.clone()], false));
+        let methods = MethodsPBCRepr::new(&rtyper, SomePBC::new(vec![method], false)).unwrap();
+        assert_eq!(methods.r_im_self.repr_class_id(), ReprClassId::RecordRepr);
+        let receiver = Variable::new();
+        receiver.set_concretetype(Some(record.lowleveltype().clone()));
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        let passed = methods
+            .get_method_from_instance(
+                record.as_ref(),
+                Hlvalue::Variable(receiver.clone()),
+                &mut llops,
+            )
+            .unwrap();
+        assert_eq!(passed, Hlvalue::Variable(receiver));
+        assert!(llops.ops.is_empty());
+        let (_s_func, r_func, constant) = methods
+            .record_implfunc(methods.s_pbc.descriptions.values().cloned())
+            .unwrap();
+        assert_eq!(constant.concretetype.as_ref(), Some(r_func.lowleveltype()));
+        assert!(!llops.ops.iter().any(|op| op.opname == "getfield"));
     }
 
     #[test]

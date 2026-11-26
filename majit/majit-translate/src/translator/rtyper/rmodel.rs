@@ -3219,6 +3219,31 @@ pub fn rtyper_makerepr(
         // rclass.py — SomeInstance.rtyper_makerepr.
         SomeValue::Instance(s) => {
             let rtyper_rc = rtyper.self_rc()?;
+            if let Some(classdef) = s.classdef.as_ref() {
+                let declaration = {
+                    let classdef_ref = classdef.borrow();
+                    let has_live_subdefs = classdef_ref
+                        .subdefs
+                        .iter()
+                        .any(|subdef| subdef.upgrade().is_some());
+                    (classdef_ref.layout_kind() == crate::front::semantic::LayoutKind::Record
+                        && classdef_ref.basedef.is_none()
+                        && !has_live_subdefs)
+                        .then(|| classdef_ref.record_declaration())
+                        .flatten()
+                };
+                if let Some(declaration) = declaration {
+                    let flavor = crate::translator::rtyper::rclass::getgcflavor(classdef)?;
+                    if let Some(record) = crate::translator::rtyper::rclass::RecordRepr::new(
+                        &rtyper_rc,
+                        classdef,
+                        declaration,
+                        flavor,
+                    )? {
+                        return Ok(std::sync::Arc::new(record) as std::sync::Arc<dyn Repr>);
+                    }
+                }
+            }
             let r_inst = crate::translator::rtyper::rclass::getinstancerepr(
                 &rtyper_rc,
                 s.classdef.as_ref(),

@@ -2482,6 +2482,16 @@ impl Bookkeeper {
     /// raw-word owner promotes the named-field `SomePtr` to the
     /// `SomeInstance` `robjmodel_instantiate` writes for that class.
     pub fn by_value_payload_annotation(self: &Rc<Self>, ty: &str) -> SomeValue {
+        let pointee = Self::pointee_spelling(ty);
+        if self.record_declaration(pointee).is_some()
+            && let Some(classdef) = self.classdef_for_known_struct_root(pointee)
+        {
+            return SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+        }
         let s_value = self.project_struct_field_type(ty);
         if self.payload_ptr_promotes_to_instance(ty, &s_value) {
             self.struct_instance_annotation(ty).unwrap_or(s_value)
@@ -2564,19 +2574,25 @@ impl Bookkeeper {
         Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
     }
 
+    /// Field type spelling with its reference / raw-pointer prefix
+    /// removed, naming the pointed-to struct.
+    fn pointee_spelling(field_ty: &str) -> &str {
+        field_ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches("*const ")
+            .trim_start_matches("*mut ")
+            .trim()
+    }
+
     /// SomeInstance of a registered named struct — the shell
     /// `robjmodel_instantiate` writes for a class that is not a
     /// `raw_word_owner`. Variant payloads (`__pos_N`) of such a class
     /// use this so the constructor does not union Instance with the
     /// SomePtr `project_struct_field_type` would mint.
     fn struct_instance_annotation(self: &Rc<Self>, field_ty: &str) -> Option<SomeValue> {
-        let stripped = field_ty
-            .trim()
-            .trim_start_matches('&')
-            .trim_start_matches("mut ")
-            .trim_start_matches("*const ")
-            .trim_start_matches("*mut ")
-            .trim();
+        let stripped = Self::pointee_spelling(field_ty);
         let named_root = majit_ir::descr::strip_generic_args(stripped);
         if crate::front::semantic::is_list_family_spelling(stripped)
             || crate::front::semantic::is_list_family_spelling(named_root.as_ref())
@@ -8366,6 +8382,60 @@ fn struct_root_declaration_identity<'a>(
     None
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecordDeclaration {
+    pub rows: Vec<crate::front::semantic::FieldRow>,
+    pub object_type: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+}
+
+impl Bookkeeper {
+    /// Host declaration/layout category for a class intern spelling.
+    ///
+    /// This is deliberately a lazy read of `StructFieldRegistry` so a
+    /// ClassDef minted before `set_struct_fields` sees the same structural
+    /// declaration metadata on its next repr-selection lookup. No name-keyed
+    /// layout-kind table and no mutable late-set ClassDef field is involved.
+    pub(crate) fn class_layout_kind(
+        &self,
+        root: &str,
+    ) -> Option<crate::front::semantic::LayoutKind> {
+        let registry = self.struct_fields.borrow();
+        let registry = registry.as_ref()?;
+        struct_root_declaration_identity(registry, root).map(|identity| identity.layout_kind)
+    }
+
+    pub(crate) fn record_declaration(&self, root: &str) -> Option<RecordDeclaration> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Struct};
+
+        let registry_guard = self.struct_fields.borrow();
+        let registry = registry_guard.as_ref()?;
+        let identity = struct_root_declaration_identity(registry, root)?.clone();
+        if identity.layout_kind != crate::front::semantic::LayoutKind::Record
+            || !registry.has_exact_layout(identity.id)
+        {
+            return None;
+        }
+        let rows = registry.intern_field_rows(&identity.spelling)?.to_vec();
+        let layouts_guard = self.struct_layouts.borrow();
+        let layouts = layouts_guard.as_ref()?;
+        let layout = layouts.borrow().get(&identity.id)?.clone();
+        let object_type = if rows.is_empty() {
+            LowLevelType::Struct(Box::new(Struct::registry_fields(
+                &identity.spelling,
+                Vec::new(),
+                layout.gckind,
+            )))
+        } else {
+            let mut building = Default::default();
+            owner_ll_container(registry, layouts, &identity.spelling, &mut building)?
+        };
+        if !matches!(object_type, LowLevelType::Struct(_)) {
+            return None;
+        }
+        Some(RecordDeclaration { rows, object_type })
+    }
+}
+
 fn struct_root_matches_struct_ids(
     reg: &crate::front::StructFieldRegistry,
     root: &str,
@@ -10897,7 +10967,12 @@ mod tests {
             "option::Option<NonNull<PyObject>>".to_string(),
             vec![("__pos_0".to_string(), "i64".to_string())],
         );
-        harvest_class_identity(&mut reg, "option::Option", &["option::Option"]);
+        harvest_class_identity(
+            &mut reg,
+            "option::Option",
+            &["option::Option"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         reg.note_core_option_struct("option::Option");
         bk.set_struct_fields(Rc::new(reg));
         assert!(
@@ -11194,7 +11269,12 @@ mod tests {
             for alias in aliases {
                 reg.fields.insert(alias.to_string(), rows.clone());
             }
-            harvest_class_identity(&mut reg, identity, &aliases);
+            harvest_class_identity(
+                &mut reg,
+                identity,
+                &aliases,
+                crate::front::semantic::LayoutKind::Record,
+            );
             bk.set_struct_fields(Rc::new(reg));
 
             let first = bk.intern_class_by_qualname(order[0]);
@@ -11232,11 +11312,17 @@ mod tests {
         reg.fields.insert("Int".to_string(), rows.clone());
         reg.fields
             .insert("module::struct::Code::Int".to_string(), rows);
-        harvest_class_identity(&mut reg, "Int", &["Int"]);
+        harvest_class_identity(
+            &mut reg,
+            "Int",
+            &["Int"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         harvest_class_identity(
             &mut reg,
             "module::struct::Code::Int",
             &["module::struct::Code::Int"],
+            crate::front::semantic::LayoutKind::Record,
         );
         bk.set_struct_fields(Rc::new(reg));
         let bare = bk.intern_class_by_qualname("Int");
@@ -12949,7 +13035,12 @@ mod tests {
             ],
         );
         note_declared_gc(&mut reg, &["rordereddict_entries::GcEntries", "GcEntries"]);
-        harvest_class_identity(&mut reg, "PyObject", &["PyObject"]);
+        harvest_class_identity(
+            &mut reg,
+            "PyObject",
+            &["PyObject"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
 
         for spelling in [
@@ -13014,6 +13105,7 @@ mod tests {
                 "rordereddict_entries::GcEntries",
                 "GcEntries",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         harvest_class_identity(
             &mut reg,
@@ -13023,6 +13115,7 @@ mod tests {
                 "rordereddict_entries::Entry",
                 "Entry",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         note_declared_gc(
             &mut reg,
@@ -13185,6 +13278,7 @@ mod tests {
                 "rordereddict_entries::GcEntries",
                 "GcEntries",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         harvest_class_identity(
             &mut reg,
@@ -13194,6 +13288,7 @@ mod tests {
                 "rordereddict_entries::Entry",
                 "Entry",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         reg.fields.insert(
             "storage::SlotBlock".to_string(),
@@ -13581,7 +13676,12 @@ mod tests {
         for key in [full, identity] {
             reg.fields.insert(key.to_string(), items_rows.clone());
         }
-        harvest_class_identity(&mut reg, identity, &[full, identity, "ItemsBlock"]);
+        harvest_class_identity(
+            &mut reg,
+            identity,
+            &[full, identity, "ItemsBlock"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         reg.fields.insert(
             "pyobject::PyObject".to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
@@ -13631,7 +13731,12 @@ mod tests {
             } else {
                 &[identity]
             };
-            harvest_class_identity(&mut reg, identity, aliases);
+            harvest_class_identity(
+                &mut reg,
+                identity,
+                aliases,
+                crate::front::semantic::LayoutKind::Record,
+            );
             note_declared_gc(&mut reg, &[identity]);
             bk.set_struct_fields(Rc::new(reg));
             bk.project_struct_field_type("RDict")
@@ -14681,15 +14786,17 @@ mod tests {
         reg: &mut crate::front::StructFieldRegistry,
         identity: &str,
         aliases: &[&str],
+        layout_kind: crate::front::semantic::LayoutKind,
     ) {
         let id = majit_ir::descr::StructId::from_canonical(identity);
         for alias in aliases {
             reg.class_identity.insert(
                 (*alias).to_string(),
-                Some(crate::front::semantic::ClassIdentity {
+                Some(crate::front::semantic::ClassIdentity::new(
                     id,
-                    spelling: identity.to_string(),
-                }),
+                    identity,
+                    layout_kind,
+                )),
             );
         }
     }
@@ -14704,7 +14811,12 @@ mod tests {
         let rows = vec![("x".to_string(), "i64".to_string())];
         reg.fields.insert("T".to_string(), rows.clone());
         reg.fields.insert("m::T".to_string(), rows);
-        harvest_class_identity(&mut reg, "m::T", &["T", "m::T"]);
+        harvest_class_identity(
+            &mut reg,
+            "m::T",
+            &["T", "m::T"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
         let again = bk.intern_class_by_qualname("T");
         let qualified = bk.intern_class_by_qualname("m::T");
@@ -14741,8 +14853,18 @@ mod tests {
             shorter.to_string(),
             vec![("right".to_string(), "u8".to_string())],
         );
-        harvest_class_identity(&mut reg, longer, &[longer]);
-        harvest_class_identity(&mut reg, shorter, &[shorter]);
+        harvest_class_identity(
+            &mut reg,
+            longer,
+            &[longer],
+            crate::front::semantic::LayoutKind::Record,
+        );
+        harvest_class_identity(
+            &mut reg,
+            shorter,
+            &[shorter],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
 
         let again_longer = bk.intern_class_by_qualname(longer);
@@ -14788,7 +14910,12 @@ mod tests {
             let mut reg = StructFieldRegistry::default();
             reg.fields.insert(short.to_string(), rows.clone());
             reg.fields.insert(long.to_string(), rows.clone());
-            harvest_class_identity(&mut reg, short, &[short, long]);
+            harvest_class_identity(
+                &mut reg,
+                short,
+                &[short, long],
+                crate::front::semantic::LayoutKind::Record,
+            );
             bk.set_struct_fields(Rc::new(reg));
 
             let first = bk.intern_class_by_qualname(order[0]);
@@ -14827,8 +14954,18 @@ mod tests {
                 shorter.to_string(),
                 vec![("right".to_string(), "u8".to_string())],
             );
-            harvest_class_identity(&mut reg, longer, &[longer]);
-            harvest_class_identity(&mut reg, shorter, &[shorter]);
+            harvest_class_identity(
+                &mut reg,
+                longer,
+                &[longer],
+                crate::front::semantic::LayoutKind::Record,
+            );
+            harvest_class_identity(
+                &mut reg,
+                shorter,
+                &[shorter],
+                crate::front::semantic::LayoutKind::Record,
+            );
             bk.set_struct_fields(Rc::new(reg));
 
             let first = bk.intern_class_by_qualname(order[0]);
@@ -14860,7 +14997,12 @@ mod tests {
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(short.to_string(), rows.clone());
         reg.fields.insert(long.to_string(), rows);
-        harvest_class_identity(&mut reg, short, &[short, long]);
+        harvest_class_identity(
+            &mut reg,
+            short,
+            &[short, long],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
 
         let short_host = bk.intern_class_by_qualname(short);
@@ -14906,7 +15048,12 @@ mod tests {
             let bk = bk();
             let mut reg = StructFieldRegistry::default();
             reg.fields.insert("m::T".to_string(), rows.clone());
-            harvest_class_identity(&mut reg, "m::T", &["m::T"]);
+            harvest_class_identity(
+                &mut reg,
+                "m::T",
+                &["m::T"],
+                crate::front::semantic::LayoutKind::Record,
+            );
             bk.set_struct_fields(Rc::new(reg));
             let host = bk.intern_class_by_qualname("m::T");
             assert_eq!(
@@ -14927,7 +15074,12 @@ mod tests {
             let mut reg = StructFieldRegistry::default();
             reg.fields.insert("m::T".to_string(), rows.clone());
             reg.fields.insert("T".to_string(), rows);
-            harvest_class_identity(&mut reg, "m::T", &["m::T", "T"]);
+            harvest_class_identity(
+                &mut reg,
+                "m::T",
+                &["m::T", "T"],
+                crate::front::semantic::LayoutKind::Record,
+            );
             bk.set_struct_fields(Rc::new(reg));
             let host = bk.intern_class_by_qualname("m::T");
             let leaf = bk.intern_class_by_qualname("T");
@@ -14986,7 +15138,12 @@ mod tests {
         let rows = vec![("id".to_string(), "i64".to_string())];
         reg.fields.insert("cr::m::Key".to_string(), rows.clone());
         reg.fields.insert("m::Key".to_string(), rows);
-        harvest_class_identity(&mut reg, "m::Key", &["cr::m::Key", "m::Key"]);
+        harvest_class_identity(
+            &mut reg,
+            "m::Key",
+            &["cr::m::Key", "m::Key"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
         let prefixed = bk.intern_class_key("cr::m::Key");
         let stripped = bk.intern_class_key("m::Key");
@@ -15214,6 +15371,7 @@ mod tests {
                 "ops::range::RangeInclusive",
                 "RangeInclusive",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         bk.set_struct_fields(Rc::new(reg));
         let core = bk.intern_class_key("core::ops::range::RangeInclusive<i64>");
@@ -15253,6 +15411,7 @@ mod tests {
             &mut reg,
             "result::Result",
             &["core::result::Result", "result::Result", "Result"],
+            crate::front::semantic::LayoutKind::Record,
         );
         harvest_class_identity(
             &mut reg,
@@ -15262,6 +15421,7 @@ mod tests {
                 "result::Result::Ok",
                 "Result::Ok",
             ],
+            crate::front::semantic::LayoutKind::Record,
         );
         bk.set_struct_fields(Rc::new(reg));
         let leaf = bk.intern_class_key("Result<Vec<u8>,MemoryError>::Ok");
@@ -15290,6 +15450,7 @@ mod tests {
             &mut reg,
             "vec::Vec",
             &["alloc::vec::Vec", "vec::Vec", "Vec"],
+            crate::front::semantic::LayoutKind::Record,
         );
         bk.set_struct_fields(Rc::new(reg));
 
@@ -15343,6 +15504,7 @@ mod tests {
             &mut reg,
             "vec::Vec",
             &["alloc::vec::Vec", "vec::Vec", "Vec"],
+            crate::front::semantic::LayoutKind::Record,
         );
         bk.set_struct_fields(Rc::new(reg));
         // rlist.py ListRepr / listdef.py ListDef: list spellings are not
@@ -15373,6 +15535,7 @@ mod tests {
             &mut reg,
             "option::Option",
             &["core::option::Option", "option::Option", "Option"],
+            crate::front::semantic::LayoutKind::Record,
         );
         for inst in [
             "core::option::Option<i64>",
@@ -15418,7 +15581,12 @@ mod tests {
         let rows = vec![("__pos_0".to_string(), "i64".to_string())];
         for t in ["a::m::E::V", "b::m::E::V"] {
             reg.fields.insert(t.to_string(), rows.clone());
-            harvest_class_identity(&mut reg, t, &[t]);
+            harvest_class_identity(
+                &mut reg,
+                t,
+                &[t],
+                crate::front::semantic::LayoutKind::Record,
+            );
         }
         for key in ["a::m::E<i64>::V", "b::m::E<i64>::V", "m::E<i64>::V"] {
             reg.fields.insert(key.to_string(), rows.clone());
@@ -15452,7 +15620,12 @@ mod tests {
             "m::T".to_string(),
             vec![("x".to_string(), "i64".to_string())],
         );
-        harvest_class_identity(&mut reg, "m::T", &["m::T"]);
+        harvest_class_identity(
+            &mut reg,
+            "m::T",
+            &["m::T"],
+            crate::front::semantic::LayoutKind::Record,
+        );
         bk.set_struct_fields(Rc::new(reg));
         assert_eq!(bk.intern_class_key("T"), "m::T");
         let host = bk.intern_class_by_qualname("T");
@@ -22468,6 +22641,7 @@ mod tests {
         // pyre-synthesized method PBC — must accept the family and resolve
         // its owner + bound-`self` InstanceRepr (the vtable dispatch seed).
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
         let repr = MethodsPBCRepr::new(&rtyper, pbc)
             .expect("MethodsPBCRepr must accept the pyre-synthesized method family");
         assert_eq!(repr.methodname, "shared");

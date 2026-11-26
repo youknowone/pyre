@@ -205,10 +205,6 @@ pub fn raw_memcopy() -> Result<(), TyperError> {
     Err(deferred("raw_memcopy"))
 }
 
-pub fn ann_raw_memcopy() -> Result<(), TyperError> {
-    Err(deferred("ann_raw_memcopy"))
-}
-
 pub fn raw_memmove() -> Result<(), TyperError> {
     Err(deferred("raw_memmove"))
 }

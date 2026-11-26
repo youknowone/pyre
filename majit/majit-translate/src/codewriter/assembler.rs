@@ -18166,10 +18166,11 @@ mod tests {
             vec![("n".to_string(), "i64".to_string())],
         );
         let id = majit_ir::descr::StructId::from_canonical("argument::ArgErr");
-        let identity = crate::front::semantic::ClassIdentity {
+        let identity = crate::front::semantic::ClassIdentity::new(
             id,
-            spelling: "argument::ArgErr".to_string(),
-        };
+            "argument::ArgErr",
+            crate::front::semantic::LayoutKind::Record,
+        );
         reg.class_identity
             .insert("argument::ArgErr".to_string(), Some(identity.clone()));
         reg.class_identity

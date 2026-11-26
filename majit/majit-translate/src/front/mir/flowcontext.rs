@@ -5413,13 +5413,17 @@ impl<'a> Lowering<'a> {
     /// `objectmodel.keepalive_until_here` as the host call the annotator
     /// accepts (`robjmodel_keepalive_until_here`). `normalize_unary_op_name`
     /// rejects a unary op named `keepalive`.
-    pub(in crate::front::mir) fn emit_keepalive(&mut self, mir_bb: usize, owner: Variable) {
-        let _ = self.emit_path_call(
+    pub(in crate::front::mir) fn emit_keepalive(
+        &mut self,
+        mir_bb: usize,
+        owner: Variable,
+    ) -> Variable {
+        self.emit_path_call(
             mir_bb,
             KEEPALIVE_UNTIL_HERE_PATH,
             vec![owner],
             ValueType::Void,
-        );
+        )
     }
 
     /// Clear every atomic shadow slot of `dest`.
