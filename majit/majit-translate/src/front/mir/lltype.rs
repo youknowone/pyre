@@ -3165,17 +3165,15 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     if raw_ptr_pointee_is_nonempty_gcarray_item(node, llbc, gc_struct_ids) {
         return false;
     }
-    // A raw pointer to a pointer/atomic cell names that cell, not the
-    // object stored in it (`lltype.direct_fieldptr` returns a raw
-    // FixedSizeArray(FIELD, 1) pointer; `history.getkind` is int).
+    // Atomic cells are raw storage (`lltype.direct_fieldptr`). A pointer
+    // to a pointer can also spell rlist.py ll_items' GC array owner;
+    // raw field borrows mark their address at the producer instead.
     if let Some(pointee) = node
         .get("RawPtr")
         .and_then(serde_json::Value::as_array)
         .and_then(|parts| parts.first())
         .and_then(|pointee| type_node_peel_aliases(pointee, llbc))
-        && (pointee.get("RawPtr").is_some()
-            || pointee.get("Ref").is_some()
-            || tyref_atomic_arg(&TyRef::Other(pointee.clone().into()), llbc).is_some())
+        && tyref_atomic_arg(&TyRef::Other(pointee.clone().into()), llbc).is_some()
     {
         return true;
     }

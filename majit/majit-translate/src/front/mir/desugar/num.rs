@@ -402,11 +402,6 @@ impl<'a> Lowering<'a> {
         }
         // The accessor body collapses onto the GC block (`rlist.py` `ll_items`),
         // so its null arm stays in the same Ref bank as the block arm.
-        if graph_is_items_block_base_accessor(&self.graph.name)
-            && is_object_ref_items_ptr(&call.dest.ty, self.llbc)
-        {
-            return Ok(false);
-        }
         if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc)
             && !graph_is_items_block_base_accessor(&self.graph.name)
         {

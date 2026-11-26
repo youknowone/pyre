@@ -24983,12 +24983,12 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
     // Slot-pointer residual token (`dont_look_inside_return_token`).
     assert_eq!(
         mut_gcref_token.as_deref(),
-        Some("i64"),
+        Some("ref"),
         "*mut GCREF slot token"
     );
     assert_eq!(
         mut_mut_token.as_deref(),
-        Some("i64"),
+        Some("ref"),
         "*mut *mut GCREFOpaque slot token"
     );
 }

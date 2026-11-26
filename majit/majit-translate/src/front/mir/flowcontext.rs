@@ -2582,13 +2582,6 @@ impl<'a> Lowering<'a> {
 
     /// `tyref_to_value_type_with` over this lowering's sets, memoised per hash-cons id.
     pub(in crate::front::mir) fn value_type_of(&self, ty: &TyRef) -> ValueType {
-        // `rlist.py` `ll_items` returns the GC array itself. Its Rust
-        // pointer-to-item spelling is not a raw slot address in this body.
-        if graph_is_items_block_base_accessor(&self.graph.name)
-            && is_object_ref_items_ptr(ty, self.llbc)
-        {
-            return ValueType::Ref(None);
-        }
         let id = match ty {
             TyRef::Dedup { id } => Some(*id as usize),
             TyRef::Inline { value: (id, _) } => Some(*id as usize),

@@ -4592,8 +4592,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
-                ) && !(graph_is_items_block_base_accessor(&self.graph.name)
-                    && is_object_ref_items_ptr(&ty, self.llbc));
+                );
                 if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                     && matches!(dst_kind, ValueType::Str)
                     && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
