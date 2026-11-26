@@ -2859,11 +2859,9 @@ impl<'a> Lowering<'a> {
 
     /// One candidate type of [`Self::gcarray_item_field_word`].
     ///
-    /// Order matches `field_row_lltype`: `rstr.STRPTR`, then a
-    /// declared-GC class pointer (`llmemory.GCREF`,
-    /// `registered_gc_ptr_class_root_with`), then a class-identity
-    /// pointer that is not declared-GC (`rclass.OBJECTPTR`,
-    /// `spelling_has_class_identity`). A by-value struct is not a
+    /// Order matches `field_row_lltype`: `rstr.STRPTR`, a class-identity
+    /// pointer (`rclass.OBJECTPTR`), then an unclassed declared-GC
+    /// pointer (`llmemory.GCREF`). A by-value struct is not a
     /// pointer. A `#[repr(transparent)]` newtype whose unique non-ZST
     /// field is a thin `RawPtr` is that pointer
     /// ([`transparent_rawptr_field_ty`], `lltype.py` `Ptr`, one word;
@@ -2886,33 +2884,35 @@ impl<'a> Lowering<'a> {
         if self.ty_node_is_str_layout(pointee) {
             return Some(ItemFieldWord::Str);
         }
-        if let Some(root) = registered_gc_ptr_class_root_with(
+        if tyref_is_gcref_spelling(ty, self.llbc) {
+            return None;
+        }
+        let reg = self.struct_fields?;
+        let registered_root = registered_gc_ptr_class_root_with(
             ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-        ) {
-            if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
-                return None;
-            }
-            return Some(ItemFieldWord::GcRef { class_root: root });
-        }
-        if tyref_is_gcref_spelling(ty, self.llbc) {
-            return None;
-        }
-        let reg = self.struct_fields?;
-        let root = adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves)?;
+        );
+        let is_registered_gc = registered_root.is_some();
+        let root = registered_root
+            .or_else(|| adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves))?;
         if crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
             || reg.raw_word_owner_contains(&root)
         {
             return None;
         }
-        if self.pointee_declared_gc(reg, pointee, &root) {
-            return Some(ItemFieldWord::GcRef { class_root: root });
+        // Match the harvested field's representation. `externalvsinternal`
+        // selects OBJECTPTR for an InstanceRepr; the value-only gcref=True
+        // selection in DictRepr._setup_repr is not a generic field policy.
+        if spelling_has_class_identity(reg, &root)
+            && crate::annotator::bookkeeper::struct_root_has_no_classdef(&root, Some(reg)).is_none()
+        {
+            return Some(ItemFieldWord::ObjectPtr { class_root: root });
         }
-        spelling_has_class_identity(reg, &root)
-            .then_some(ItemFieldWord::ObjectPtr { class_root: root })
+        (is_registered_gc || self.pointee_declared_gc(reg, pointee, &root))
+            .then_some(ItemFieldWord::GcRef { class_root: root })
     }
 
     /// `field_row_lltype`'s str-family / rstr-layout test on a type node.
@@ -9285,10 +9285,22 @@ impl<'a> Lowering<'a> {
                 // (`lltype.py`) has no SomeInstance case, so mix-level
                 // code writes `cast_instance_to_base_ptr` first
                 // (`annlowlevel.py`; `rclass.py` `ll_cast_to_object`).
-                if self.harvested_objectptr_field(&owner_root, dest_ty) {
-                    value = self.emit_cast_instance_to_base_ptr_store(bb_id, value, &field_name)?;
-                } else {
-                    value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
+                // An ITEM has its own recast below (`rdict.py recast_key` /
+                // `recast_value`); applying the general field recast as well
+                // would convert the same operand twice.
+                let constant_objectptr = matches!(value, LinkArg::Const(_))
+                    && self.harvested_objectptr_field(&owner_root, dest_ty);
+                if constant_objectptr
+                    || self
+                        .gcarray_item_field_word(&owner_root, &[dest_ty, &field_ty])
+                        .is_none()
+                {
+                    if self.harvested_objectptr_field(&owner_root, dest_ty) {
+                        value =
+                            self.emit_cast_instance_to_base_ptr_store(bb_id, value, &field_name)?;
+                    } else {
+                        value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
+                    }
                 }
                 // `PyError.0 = pin_root(...)`: the declared field
                 // is `PyObjectRef`, the class row is the inner
@@ -9305,12 +9317,16 @@ impl<'a> Lowering<'a> {
                 // `LLStrEntry`) before `setfield` / `setinteriorfield`. Runs
                 // before the interior-write return so both stores see the
                 // cast.
-                value = self.recast_gcarray_item_field_store(
-                    bb_id,
-                    &owner_root,
-                    &[dest_ty, &field_ty],
-                    value,
-                );
+                // The general OBJECTPTR conversion above already validates
+                // constants and turns None into the typed null pointer.
+                if !constant_objectptr {
+                    value = self.recast_gcarray_item_field_store(
+                        bb_id,
+                        &owner_root,
+                        &[dest_ty, &field_ty],
+                        value,
+                    );
+                }
                 let owner_declared_gc = container_declared_gc(
                     &field_base_ty,
                     self.llbc,

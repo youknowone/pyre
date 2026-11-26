@@ -1863,13 +1863,13 @@ mod tests {
         );
     }
 
-    fn assert_item_gcref_ptr(got: &SomeValue) {
+    fn assert_item_objectptr(got: &SomeValue) {
         let SomeValue::Ptr(p) = got else {
-            panic!("item GCREF field is SomePtr(GCREF), got {got:?}");
+            panic!("item OBJECTPTR field is SomePtr(OBJECTPTR), got {got:?}");
         };
         assert_eq!(
             lltype::LowLevelType::from(p.ll_ptrtype.clone()),
-            (*crate::translator::rtyper::lltypesystem::lltype::GCREF).clone()
+            crate::translator::rtyper::rclass::OBJECTPTR.clone()
         );
     }
 
@@ -2086,17 +2086,18 @@ mod tests {
     }
 
     /// `Entry<i64, *mut class-root>` (`rordereddict.py` `DICTENTRY`):
-    /// the value field's internal lltype is `llmemory.GCREF`
-    /// (`rmodel.py` `externalvsinternal`, `gcref=True`).
-    /// `lltype.py` `SomePtr.getattr` is `SomePtr(GCREF)`. A
+    /// the value field's internal lltype is `rclass.OBJECTPTR`
+    /// (`rmodel.py` `externalvsinternal`, `gcref=False`).
+    /// `lltype.py` `SomePtr.getattr` is `SomePtr(OBJECTPTR)`. A
     /// `SomeInstance` store fails in `annotation_to_lltype`
     /// (`lltype.py` `SomePtr.setattr`); `rdict.py` `recast_value` is
     /// the separate `llops.convertvar`.
     #[test]
-    fn gcarray_item_class_root_value_getattr_is_gcref_setattr_rejects_instance() {
+    fn gcarray_item_class_root_value_getattr_is_objectptr_setattr_rejects_instance() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::classdesc::ClassDef;
-        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
         use std::rc::Rc;
 
         let root_name = "owner::GcClass";
@@ -2144,15 +2145,15 @@ mod tests {
         };
         assert_eq!(
             item_st.getattr_field_type("value"),
-            Some((*GCREF).clone()),
-            "declared-GC class-root value is GCREF"
+            Some(OBJECTPTR.clone()),
+            "declared-GC class-root value is OBJECTPTR"
         );
         let entry = SomePtr::new(*built);
         let attr = |name: &str| {
             crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
         };
 
-        assert_item_gcref_ptr(&entry.getattr(&attr("value")).unwrap());
+        assert_item_objectptr(&entry.getattr(&attr("value")).unwrap());
         let root = bk
             .getuniqueclassdef_for_struct_root(root_name)
             .expect("class root");
@@ -2189,7 +2190,7 @@ mod tests {
             TO: Box::new(LowLevelType::Struct(Box::new(st.clone()))),
             offsets: vec![],
         });
-        assert_item_gcref_ptr(&interior.getattr(&attr("value")).unwrap());
+        assert_item_objectptr(&interior.getattr(&attr("value")).unwrap());
         assert_no_lltype(&interior.setattr(&attr("value"), &same).unwrap_err());
         assert_no_lltype(&interior.setattr(&attr("value"), &other_value).unwrap_err());
     }
@@ -2198,14 +2199,15 @@ mod tests {
     /// `ll_to_annotation` of the sub-struct pointer `_ptr._expose`
     /// returns (`lltype.py` `SomePtr.getattr`). The item pointer is
     /// raw, so that is `SomePtr` of the key struct. A scalar field
-    /// stays an integer. A declared-GC class-root field is `GCREF`
-    /// internally and stays `SomePtr(GCREF)`. `SomeInteriorPtr.getattr`
+    /// stays an integer. A declared-GC class-root field is `OBJECTPTR`
+    /// internally and stays `SomePtr(OBJECTPTR)`. `SomeInteriorPtr.getattr`
     /// exposes the same key as `SomeInteriorPtr`
     /// (`_interior_ptr._expose`).
     #[test]
     fn gcarray_item_inlined_by_value_key_getattr_is_instance() {
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
         use std::rc::Rc;
 
         let root_name = "owner::GcClass";
@@ -2272,8 +2274,8 @@ mod tests {
         assert_eq!(key_st._name, key_name);
         assert_eq!(
             item_struct.getattr_field_type("value"),
-            Some((*GCREF).clone()),
-            "declared-GC class-root value is GCREF"
+            Some(OBJECTPTR.clone()),
+            "declared-GC class-root value is OBJECTPTR"
         );
         let entry = SomePtr::new(*built);
         let attr = |name: &str| {
@@ -2294,7 +2296,7 @@ mod tests {
             "scalar field stays an integer, got {count:?}"
         );
 
-        assert_item_gcref_ptr(&entry.getattr(&attr("value")).unwrap());
+        assert_item_objectptr(&entry.getattr(&attr("value")).unwrap());
 
         let interior = SomeInteriorPtr::new(lltype::InteriorPtr {
             PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(item_struct.clone()))),
@@ -2314,19 +2316,20 @@ mod tests {
             matches!(interior_count, SomeValue::Integer(_)),
             "interior scalar field stays an integer, got {interior_count:?}"
         );
-        assert_item_gcref_ptr(&interior.getattr(&attr("value")).unwrap());
+        assert_item_objectptr(&interior.getattr(&attr("value")).unwrap());
     }
 
     /// Offset-0 inlined struct (`lltype.py` `Struct._first_struct`):
-    /// the pointer leaf's lltype is `GCREF`. `SomePtr.getattr` of the
-    /// parent is `SomePtr(GCREF)` for an item and for a non-item shell.
+    /// the pointer leaf's lltype is `OBJECTPTR`. `SomePtr.getattr` of the
+    /// parent is `SomePtr(OBJECTPTR)` for an item and for a non-item shell.
     /// A `SomeInstance` store fails `annotation_to_lltype`. The scalar
     /// `hash` leaf stays `SomeInteger` and accepts an integer.
     #[test]
     fn gcarray_item_offset0_inlined_pointer_leaf_stays_someptr() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::classdesc::ClassDef;
-        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
         use std::rc::Rc;
 
         let root_name = "owner::GcClass";
@@ -2393,14 +2396,14 @@ mod tests {
         };
         assert_eq!(
             key_st.getattr_field_type("obj"),
-            Some((*GCREF).clone()),
-            "declared-GC pointer leaf is GCREF"
+            Some(OBJECTPTR.clone()),
+            "declared-GC pointer leaf is OBJECTPTR"
         );
         let entry = SomePtr::new(*built);
         let attr = |name: &str| {
             crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
         };
-        assert_item_gcref_ptr(&entry.getattr(&attr("obj")).unwrap());
+        assert_item_objectptr(&entry.getattr(&attr("obj")).unwrap());
         let root = bk
             .getuniqueclassdef_for_struct_root(root_name)
             .expect("class root");
@@ -2446,7 +2449,7 @@ mod tests {
             panic!("shell pointer is Ptr");
         };
         let shell = SomePtr::new(*shell_built);
-        assert_item_gcref_ptr(&shell.getattr(&attr("obj")).unwrap());
+        assert_item_objectptr(&shell.getattr(&attr("obj")).unwrap());
         assert_no_lltype(&shell.setattr(&attr("obj"), &same).unwrap_err());
     }
 }

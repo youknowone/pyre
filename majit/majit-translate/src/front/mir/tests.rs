@@ -52142,7 +52142,7 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
 /// `Entry<K, V>` (`rordereddict.py` `DICTENTRY`): a `#[repr(transparent)]`
 /// key whose unique non-ZST field is a `RawPtr` keeps that pointer as
 /// the row spelling. A declared-GC class-root pointee's field lltype is
-/// `llmemory.GCREF` (`rmodel.py` `externalvsinternal`, `gcref=True`).
+/// `rclass.OBJECTPTR` (`rmodel.py` `externalvsinternal`, `gcref=False`).
 /// A str-family pointee is
 /// `rstr.STRPTR`. A two-field key stays one inline `lltype.Struct`.
 /// The item name keeps [`render_adt_type_args`]. The unsuffixed template
@@ -52151,8 +52151,9 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
 /// `DICTENTRY` per key/value pair).
 #[test]
 fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
-    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
 
     let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
     let tv1 = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
@@ -52337,8 +52338,8 @@ fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
     let ptr_st = item_struct(ptr_item);
     assert_eq!(
         ptr_st.getattr_field_type("key"),
-        Some((*GCREF).clone()),
-        "declared-GC class-root key is GCREF"
+        Some(OBJECTPTR.clone()),
+        "class-root key keeps the instance base pointer"
     );
 
     let str_st = item_struct(str_item);
@@ -54686,10 +54687,9 @@ fn gcarray_item_class_leaf(root: &str) -> &str {
     root.rsplit("::").next().unwrap_or(root)
 }
 
-/// `(*item).value` where `value` is a declared-GC pointer stored as
-/// `llmemory.GCREF` (`field_row_lltype`). Read is getfield then
-/// `cast_instance` of that class (`annlowlevel.py` `cast_gcref_to_instance`
-/// through `cast_instance`).
+/// `(*item).value` where `value` is a classed declared-GC pointer stored
+/// as OBJECTPTR (`field_row_lltype`). Read is getfield then
+/// `cast_base_ptr_to_instance` (`annlowlevel.py` `cast_instance`).
 #[test]
 fn gcarray_item_gcref_field_read_is_getfield_then_cast_instance() {
     let ops = gcarray_item_ops("read_item_value");
@@ -54706,18 +54706,16 @@ fn gcarray_item_gcref_field_read_is_getfield_then_cast_instance() {
     );
 }
 
-/// Store of a high-level instance into the GCREF item field is
-/// `cast_instance_to_gcref` then setfield. The pointer narrow onto `Obj`
-/// may precede it; the stored word is the GCREF cast.
+/// A classed declared-GC field uses OBJECTPTR in the generic field row.
+/// Store the `cast_instance_to_base_ptr` result (`annlowlevel.py`).
 #[test]
-fn gcarray_item_gcref_field_store_is_cast_then_setfield() {
+fn gcarray_item_declared_gc_field_store_is_cast_to_base_ptr() {
     let ops = gcarray_item_ops("write_item_value");
     let var = gcarray_item_stored_var(&ops, "value");
     let kind = gcarray_item_producing(&ops, var);
-    assert_eq!(
-        crate::model::cast_instance_root(kind),
-        Some("GCREF"),
-        "setfield value is cast_instance_to_gcref; ops={ops:?}"
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "setfield value matches the classed OBJECTPTR field; got {kind:?}; ops={ops:?}"
     );
 }
 
@@ -54801,7 +54799,7 @@ fn gcarray_item_fn_ptr_call_casts_objectptr_arg() {
 }
 
 /// A declared-GC class pointer is OBJECTPTR in `FuncType.ARGS`
-/// (`fn_ptr_tyref_to_lltype`) and GCREF in a struct row
+/// (`fn_ptr_tyref_to_lltype`) and in a generic struct row
 /// (`field_row_lltype`). The call writes `cast_instance_to_base_ptr`.
 #[test]
 fn gcarray_item_fn_ptr_call_casts_declared_gc_arg_as_objectptr() {
@@ -54866,16 +54864,15 @@ fn gcarray_item_transparent_gcref_newtype_read_is_cast_instance() {
     );
 }
 
-/// Store of the newtype is `cast_instance_to_gcref` then setfield.
+/// The classed pointer newtype stores `cast_instance_to_base_ptr` then setfield.
 #[test]
-fn gcarray_item_transparent_gcref_newtype_store_is_cast_then_setfield() {
+fn gcarray_item_transparent_declared_gc_newtype_store_is_cast_to_base_ptr() {
     let ops = gcarray_item_ops("write_id_key");
     let var = gcarray_item_stored_var(&ops, "key");
     let kind = gcarray_item_producing(&ops, var);
-    assert_eq!(
-        crate::model::cast_instance_root(kind),
-        Some("GCREF"),
-        "setfield value is cast_instance_to_gcref; ops={ops:?}"
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "setfield value matches the classed OBJECTPTR field; got {kind:?}; ops={ops:?}"
     );
 }
 

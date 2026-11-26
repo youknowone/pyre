@@ -18182,7 +18182,9 @@ pub(in crate::front::mir) fn field_row_lltype(
         // field is `rclass.py` `InstanceRepr.lowleveltype` (`OBJECTPTR`);
         // `rordereddict.py` `get_ll_dict` uses `r_key.lowleveltype`.
         if spelling_is_declared_gc(&reg.gc_struct_ids, pointee)
-            && !spelling_has_class_identity(reg, pointee)
+            && (!spelling_has_class_identity(reg, pointee)
+                || crate::annotator::bookkeeper::struct_root_has_no_classdef(pointee, Some(reg))
+                    .is_some())
         {
             return Some((*GCREF).clone());
         }
