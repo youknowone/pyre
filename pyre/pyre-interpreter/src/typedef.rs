@@ -4064,7 +4064,10 @@ fn _new_baseint(w_value: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyEr
 /// `cls` is still live for [`tag_subclass_instance`] after the nursery
 /// allocation (`w_int_subclass_new` / `w_long_subclass_from_raw`), which is
 /// `allocate_instance`'s `instantiate` before `user_setup`.
-fn _as_subint(mut cls: PyObjectRef, mut w_value: PyObjectRef) -> PyObjectRef {
+fn _as_subint(
+    mut cls: PyObjectRef,
+    mut w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let obj = pyre_object::with_roots!(cls, w_value => {
         if unsafe { pyre_object::is_long(w_value) } {
             unsafe {
@@ -4077,7 +4080,12 @@ fn _as_subint(mut cls: PyObjectRef, mut w_value: PyObjectRef) -> PyObjectRef {
             pyre_object::intobject::w_int_subclass_new(int_val)
         }
     });
-    tag_subclass_instance(obj, cls)
+    // ExceptionTransformer.gen_exc_check: keep the allocation's null test
+    // in this leaf, before allocate_instance's user_setup writes fields.
+    if obj.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    Ok(tag_subclass_instance(obj, cls))
 }
 
 /// `intobject.py W_IntObject.descr_new` → `_new_int`.
@@ -4116,7 +4124,7 @@ pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         // fallthrough, across `_new_baseint`.
         let w_tmp = pyre_object::with_roots!(cls, w_value => _new_baseint(w_value))?;
         if let Some(w_tmp) = w_tmp {
-            return Ok(_as_subint(cls, w_tmp));
+            return _as_subint(cls, w_tmp);
         }
     }
     int_descr_new(&[cls, w_value])
@@ -4144,7 +4152,7 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
-    Ok(_as_subint(cls, value))
+    _as_subint(cls, value)
 }
 
 /// `float.__new__(cls, *args)` — PyPy: floatobject.py descr__new__.
@@ -39759,6 +39767,39 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int_subclass_failed_allocation_propagates_memory_error_before_user_setup() {
+        let _ctx = crate::PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        fn occurred() -> bool {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get() != 0)
+        }
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                majit_gc::set_active_exception_occurred(None);
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+            }
+        }
+        let _restore = Restore;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls = super::gettypeobject(&pyre_object::INT_TYPE);
+        let small = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(17));
+        let large =
+            pyre_object::gc_roots::pin_root(pyre_object::longobject::w_long_from_i64(i64::MAX));
+        let singleton = pyre_object::interp_exceptions::memory_error_singleton();
+        for value in [small, large] {
+            // The failed GC allocation leaves its prebuilt exception pending;
+            // malloc_typed_managed must return NULL rather than use raw malloc.
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(singleton as i64));
+            majit_gc::set_active_exception_occurred(Some(occurred));
+            let error = super::_as_subint(cls, value)
+                .expect_err("a failed int or long subclass allocation must not run user_setup");
+            assert!(matches!(error.kind, crate::PyErrorKind::MemoryError));
+            assert!(!majit_gc::gc_alloc_failed_pending());
+        }
+    }
+
     #[test]
     fn object_user_layout_splits_exact_object_from_user_instances() {
         use pyre_object::*;
