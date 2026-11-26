@@ -16859,6 +16859,137 @@ fn entry_family_holder_instantiation_splits_key_class() {
 }
 
 #[test]
+fn entry_family_holder_wrapper_splits_on_mir_and_registry() {
+    // `get_ll_dict` builds one DICT per key/value. A generic transparent
+    // wrapper around that holder is the same class object per
+    // instantiation (`bookkeeper.py` `getuniqueclassdef`). The MIR
+    // predicate sees the wrapper's field; harvested rows are the flattened
+    // inner holder. Both split. A field that names the holder at concrete
+    // arguments does not.
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let family = || named_adt(0, vec![tvar(0), tvar(1)]);
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let holder = named_adt(1, vec![tvar(0), tvar(1)]);
+    let mut wrapper = type_decl_struct(
+        2,
+        &["fixture", "W"],
+        vec![named_copy_field("inner", holder.clone())],
+    );
+    wrapper["layout"] = transparent_layout();
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "GcEntries"],
+                vec![],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "H"],
+                vec![
+                    named_copy_field("entries", raw_mut(family())),
+                    named_copy_field(
+                        "n",
+                        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+                    ),
+                ],
+            ),
+            wrapper,
+            type_decl_struct(
+                3,
+                &["fixture", "PtrW"],
+                vec![named_copy_field("inner", raw_mut(holder.clone()))],
+            ),
+            type_decl_struct(
+                4,
+                &["fixture", "FixedW"],
+                vec![named_copy_field(
+                    "inner",
+                    named_adt(1, vec![u64_ty.clone(), i64_ty.clone()]),
+                )],
+            ),
+        ],
+        vec![],
+    );
+    let tomb = std::collections::HashSet::new();
+    fn adt_of(node: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        node.get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .expect("Adt")
+    }
+    let suffix_of = |id: u64, leaf: &str| {
+        let node = named_adt(id, vec![u64_ty.clone(), i64_ty.clone()]);
+        assert_eq!(
+            super::entry_family_holder_struct_instantiation_suffix(
+                &format!("fixture::{leaf}"),
+                adt_of(&node),
+                &llbc,
+                &tomb,
+            )
+            .as_deref(),
+            Some("<u64,i64>"),
+            "{leaf}"
+        );
+        node
+    };
+    // `getuniqueclassdef` is one class per instantiation. A transparent
+    // wrapper stays that class: following the declared field would drop
+    // the use-site arguments and paint the unsuffixed inner template.
+    let h = suffix_of(1, "H");
+    let w = suffix_of(2, "W");
+    let ptr = suffix_of(3, "PtrW");
+    for (node, leaf) in [(&h, "H"), (&w, "W"), (&ptr, "PtrW")] {
+        let root = super::adt_node_class_root_with(node, &llbc, &tomb);
+        let spelling = root.as_deref().unwrap_or("");
+        assert!(
+            spelling.contains(leaf) && spelling.contains("<u64,i64>"),
+            "{leaf} got {root:?}"
+        );
+    }
+    let fixed = named_adt(4, vec![u64_ty.clone(), i64_ty.clone()]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::FixedW",
+            adt_of(&fixed),
+            &llbc,
+            &tomb,
+        ),
+        None,
+        "a holder instantiated at concrete arguments does not split the wrapper"
+    );
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "rordereddict_entries::GcEntries".to_string(),
+        vec![(
+            "items".to_string(),
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+        )],
+    );
+    reg.fields.insert(
+        "fixture::W".to_string(),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::W"));
+    assert!(reg.struct_root_rows_known("fixture::W<u64,i64>"));
+    reg.fields.insert(
+        "fixture::H".to_string(),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::H"));
+    assert!(reg.struct_root_rows_known("fixture::H<u64,i64>"));
+}
+
+#[test]
 fn tyref_enum_instantiation_suffix_unwraps_value_wrapper() {
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let wrapped = TyRef::Other(

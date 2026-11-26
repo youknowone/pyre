@@ -10021,8 +10021,9 @@ pub(crate) use self::lltype::{
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    struct_item_flexible_gcarray_block_annotation, type_arg_splits_per_instantiation,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

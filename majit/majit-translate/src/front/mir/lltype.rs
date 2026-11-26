@@ -10210,6 +10210,12 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
     let def_id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(def_id)?;
     // Pointer-shaped payloads stay on the wrapper (`PyError`).
+    // A by-value holder keeps this struct: `get_ll_dict` builds one
+    // `DICT` per key/value and `bookkeeper.py` `getuniqueclassdef` is
+    // that class object. Following the declared field drops the
+    // use-site arguments, so construction would name the unsuffixed
+    // inner template while flattened rows (`derive_program_metadata`)
+    // name this wrapper.
     if transparent_by_value_inner_fields(td, llbc).is_some()
         && let Some((index, _)) = transparent_nonzst_field(td, llbc)
         && let TypeDeclKind::Struct(fields) = &td.kind
@@ -10217,6 +10223,7 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
         && let Some(field_node) =
             tyref_node(&field.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
         && adt_node_def_id(field_node) != Some(def_id)
+        && !type_decl_holds_entry_family_typevar(td, llbc)
     {
         return adt_node_class_root_with(field_node, llbc, tombstoned);
     }
@@ -10569,23 +10576,46 @@ pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
 ) -> Option<String> {
     let _ = name_path;
     let td = llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return None;
-    };
-    if !fields
-        .iter()
-        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
-    {
+    if !type_decl_holds_entry_family_typevar(td, llbc) {
         return None;
     }
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
 }
 
+/// Template fields name an entry-family holder parametrized by this
+/// struct's own type variables (`field_ty_names_entry_family_typevar`).
+fn type_decl_holds_entry_family_typevar(td: &TypeDecl, llbc: &Llbc) -> bool {
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
+}
+
 /// Pointer / `Box` / `NonNull` / by-value field whose pointee ADT is the
-/// entry family and whose type arguments mention a type variable.
-/// Arrays and slices stay out: `DICTENTRYARRAY` is the array of
-/// `DICTENTRY`, not another struct that holds one.
+/// entry family and whose type arguments mention a type variable, or a
+/// struct that itself holds such a field.
+///
+/// `rordereddict.py` `get_ll_dict` builds one `DICT` per key/value, and
+/// that struct holds `Ptr(DICTENTRYARRAY)`. `bookkeeper.py`
+/// `getuniqueclassdef` is one class object for that struct, whichever
+/// way the translator reaches it. A transparent wrapper's declared field
+/// names the inner holder; `derive_program_metadata` flattens those rows
+/// onto the wrapper, so this walk follows the same by-value or pointer
+/// field. Arrays and slices stay out: `DICTENTRYARRAY` is the array of
+/// `DICTENTRY`, not another struct that holds one. Depth is bounded so a
+/// cyclic holder stops.
 fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
+    field_ty_names_entry_family_holder(ty, llbc, 0)
+}
+
+/// How many holder wrappers [`field_ty_names_entry_family_holder`] follows.
+/// Each step is one by-value or pointer field whose pointee is itself a
+/// holder (`get_ll_dict` / `getuniqueclassdef`).
+const HOLDER_WRAPPER_DEPTH: u32 = 8;
+
+fn field_ty_names_entry_family_holder(ty: &TyRef, llbc: &Llbc, depth: u32) -> bool {
     let Some(mut node) = tyref_node(ty, llbc) else {
         return false;
     };
@@ -10609,9 +10639,39 @@ fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
             node = pointee;
             continue;
         }
-        return adt_node_is_entry_family_of_typevar(peeled, llbc);
+        return adt_node_is_entry_family_holder(peeled, llbc, depth);
     }
     false
+}
+
+/// Entry family parametrized by a type variable, or a struct whose own
+/// type arguments are type variables and one of whose fields is that
+/// holder (`field_ty_names_entry_family_typevar`).
+fn adt_node_is_entry_family_holder(node: &serde_json::Value, llbc: &Llbc, depth: u32) -> bool {
+    if adt_node_is_entry_family_of_typevar(node, llbc) {
+        return true;
+    }
+    if depth >= HOLDER_WRAPPER_DEPTH {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    if !adt_node_type_subst(node, llbc)
+        .iter()
+        .any(|arg| super::json_mentions_typevar(arg, llbc, 0))
+    {
+        return false;
+    }
+    fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_holder(&field.ty, llbc, depth + 1))
 }
 
 fn type_node_is_array_or_slice(node: &serde_json::Value) -> bool {
@@ -16982,7 +17042,7 @@ pub(in crate::front::mir) fn enum_payload_instance_class_root(
 ///     (`native_result` `map_err`, `exceptiontransform.py` unit_ok).
 ///   - `""` — a degenerate/absent type-arg that would render a malformed
 ///     `<>` suffix.
-pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> bool {
+pub(crate) fn type_arg_splits_per_instantiation(arg: &str) -> bool {
     const DEFERRED: &[&str] = &["f32", "()", ""];
     if DEFERRED.contains(&arg) {
         return false;

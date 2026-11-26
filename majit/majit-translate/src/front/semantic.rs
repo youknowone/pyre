@@ -1074,17 +1074,38 @@ impl StructFieldRegistry {
         if head.is_empty() || head.contains('[') || head.contains('(') {
             return false;
         }
-        if entry_family_path_spelling(head) {
-            return true;
+        // `Bookkeeper.getdesc` keys one descriptor per class object. The
+        // row head resolves to that one registered identity; another type
+        // that shares the last segment is not this head. A bare head
+        // resolves only when its bare key is registered with one identity
+        // (`harden_duplicate_leaf_metadata` withdraws an ambiguous leaf).
+        // An unresolvable head is not the entry family.
+        let Some(path) = self.resolved_row_head_path(head) else {
+            return false;
+        };
+        entry_family_path_spelling(&path)
+    }
+
+    /// Qualified path of `head`'s one registered class identity.
+    ///
+    /// Exact key, then the same resolution as [`Self::resolved_owner_key`].
+    /// `class_identity` supplies the declaration spelling when harvest
+    /// wrote one (`Bookkeeper.getdesc`). `Some(None)` is two declarations
+    /// sharing the spelling and does not resolve. A bare head with no
+    /// registered bare key does not resolve, even when one qualified key
+    /// ends in that leaf.
+    fn resolved_row_head_path(&self, head: &str) -> Option<String> {
+        let bare = !head.contains("::");
+        if bare && !self.fields.contains_key(head) {
+            return None;
         }
-        let leaf = head.rsplit("::").next().unwrap_or(head);
-        self.with_keys_by_last_segment(leaf, |keys| {
-            keys.iter().any(|key| {
-                let bare = majit_ir::descr::strip_instantiation_suffix(key);
-                let bare = majit_ir::descr::strip_generic_args(bare);
-                entry_family_path_spelling(bare.as_ref())
-            })
-        })
+        let key = self.resolved_owner_key(head)?;
+        match self.class_identity.get(&key) {
+            Some(Some(identity)) => Some(identity.spelling.clone()),
+            Some(None) => None,
+            None if bare => None,
+            None => Some(key),
+        }
     }
 
     fn owner_set_contains(set: &std::collections::HashSet<String>, root: &str) -> bool {
@@ -2111,6 +2132,25 @@ mod tests {
     #[test]
     fn entry_family_holder_suffixed_root_is_known() {
         let mut reg = StructFieldRegistry::default();
+        let gc_rows = vec![(
+            "items".to_string(),
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+        )];
+        // Row head is one registered identity (`Bookkeeper.getdesc`).
+        // The bare leaf qualifies only with that key and one
+        // `class_identity` spelling of the family.
+        reg.fields.insert(
+            "pyre_object::rordereddict_entries::GcEntries".to_string(),
+            gc_rows.clone(),
+        );
+        reg.fields.insert("GcEntries".to_string(), gc_rows);
+        reg.class_identity.insert(
+            "GcEntries".to_string(),
+            Some(ClassIdentity {
+                id: majit_ir::descr::StructId::from_canonical("rordereddict_entries::GcEntries"),
+                spelling: "rordereddict_entries::GcEntries".to_string(),
+            }),
+        );
         reg.fields.insert(
             "fixture::QualTable".to_string(),
             vec![(
@@ -2122,13 +2162,6 @@ mod tests {
         assert!(
             reg.struct_root_rows_known("fixture::QualTable<u64,i64>"),
             "a qualified entry-family field splits the holder"
-        );
-        reg.fields.insert(
-            "pyre_object::rordereddict_entries::GcEntries".to_string(),
-            vec![(
-                "items".to_string(),
-                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
-            )],
         );
         reg.fields.insert(
             "pyre_object::rordereddict_entries::Entry".to_string(),
@@ -2215,6 +2248,62 @@ mod tests {
             "a leaf that only shares the entry family's last segment is not that family"
         );
         assert!(!other.struct_root_rows_known("counter::Entry<i64>"));
+    }
+
+    /// `Bookkeeper.getdesc`: a row head is one registered class, not every
+    /// key that shares its last segment. `other::GcEntries` is not the
+    /// entry family when `rordereddict_entries::GcEntries` is also
+    /// registered. A bare `GcEntries` whose key was withdrawn is not either.
+    #[test]
+    fn entry_family_row_head_is_one_registered_identity() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "other::GcEntries".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "rordereddict_entries::GcEntries".to_string(),
+            vec![(
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "fixture::OtherHolder".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut other::GcEntries<??TypeVar#0>".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "fixture::FamilyHolder".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "fixture::BareHolder".to_string(),
+            vec![(
+                "entries".to_string(),
+                "GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+            )],
+        );
+        assert!(
+            !reg.struct_root_rows_known("fixture::OtherHolder<i64>"),
+            "a qualified non-family head does not split its holder"
+        );
+        assert!(
+            reg.struct_root_rows_known("fixture::FamilyHolder<u64,i64>"),
+            "the registered family path splits its holder"
+        );
+        assert!(
+            !reg.struct_root_rows_known("fixture::BareHolder<u64,i64>"),
+            "an ambiguous bare head with the bare key withdrawn does not qualify"
+        );
+        assert!(!reg.template_holds_split_entry_family("fixture::OtherHolder"));
+        assert!(reg.template_holds_split_entry_family("fixture::FamilyHolder"));
+        assert!(!reg.template_holds_split_entry_family("fixture::BareHolder"));
     }
 
     fn free_fn(name: &str) -> SemanticFunction {
