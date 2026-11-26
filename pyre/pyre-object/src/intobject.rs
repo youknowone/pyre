@@ -288,19 +288,28 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
     crate::lltype::malloc_typed_managed(obj) as PyObjectRef
 }
 
-/// Allocate a `W_IntObject` for an `int` subclass instance, on the managed
-/// heap so it can be reclaimed.
+/// Allocate a `W_IntObjectUser` for an `int` subclass instance.
 ///
-/// [`w_int_new_unique`] is shared with the JIT's tagged-int unboxing paths
-/// and keeps their `malloc_typed` allocation; a subclass instance cannot
-/// use it, because `register_finalizer` drops anything outside the managed
-/// heap, so a boxed instance would never die and its `__del__` would never
-/// run. Allocation is unconditional rather than gated on
-/// [`crate::gc_interp::enabled`], matching the other subclass allocators
-/// ([`crate::bytesobject::w_bytes_subclass_from_bytes`],
-/// `w_str_subclass_from_wtf8`).
+/// `intobject.py` `_as_subint`: `allocate_instance(W_IntObject, w_inttype)`
+/// then `W_IntObject.__init__(w_obj, w_value.intval)`. The user layout is
+/// `typedef.py` `_getusercls`. [`w_int_new_unique`] stays the exact-layout
+/// box the tagged-int unboxing paths share; a subclass instance cannot use
+/// an unmanaged `malloc_typed`, because `register_finalizer` drops anything
+/// outside the managed heap and `__del__` would never run. Allocation is
+/// unconditional rather than gated on [`crate::gc_interp::enabled`],
+/// matching [`crate::bytesobject::w_bytes_subclass_from_bytes`] and
+/// `w_str_subclass_from_wtf8`.
+///
+/// `#[inline(never)]` so `fuse_boxing_alloc` sees `malloc_typed_managed` of
+/// a constant `INT_USER_TYPE` and emits `new_with_vtable` plus the
+/// `intval` / `map` / `storage` stores (`objectobject.rs`
+/// `alloc_user_object_instance`). `map` and `storage` are born null;
+/// `tag_subclass_instance` copies the type terminator into `map`. The
+/// nursery hook inside `malloc_typed_managed` (`try_gc_alloc`) does not
+/// collect, so the `w_class` word read before it stays valid.
+#[inline(never)]
 pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
-    let obj = W_IntObjectUser {
+    crate::lltype::malloc_typed_managed(W_IntObjectUser {
         base: W_IntObject {
             ob_header: PyObject {
                 ob_type: &crate::pyobject::INT_USER_TYPE as *const PyType,
@@ -310,24 +319,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         },
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_INT_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_IntObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_IntObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    }) as PyObjectRef
 }
 
 /// Return the address of INT_TYPE for JIT type-id validation.
