@@ -1151,6 +1151,7 @@ impl<'a> Lowering<'a> {
             result: Some(res.clone()),
             kind: OpKind::New {
                 owner: "Interior".to_string(),
+                owner_id: None,
             },
         });
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {

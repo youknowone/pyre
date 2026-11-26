@@ -399,7 +399,7 @@ fn objectkey_unit_entries_item_ptr_is_interior_ptr() {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior"),),
+                .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"),),
             "{} must malloc Interior(array, 0), ops {:?}",
             spec.name,
             op_kinds(spec.graph())
@@ -914,7 +914,7 @@ fn dict_get_set_graphs_drop_interior_malloc() {
             block
                 .operations
                 .iter()
-                .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior"))
+                .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"))
         });
         assert!(!interior_new, "{} still mallocs Interior", f.name);
     }

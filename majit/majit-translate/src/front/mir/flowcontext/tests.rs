@@ -254,7 +254,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         for block in &graph.blocks {
             for op in &block.operations {
                 match &op.kind {
-                    OpKind::New { owner } if owner == "Interior" => saw_interior = true,
+                    OpKind::New { owner, .. } if owner == "Interior" => saw_interior = true,
                     OpKind::FieldWrite { field, .. }
                         if field.owner_root.as_deref() == Some("Interior")
                             && field.name == "ptr" =>
@@ -2006,6 +2006,7 @@ fn push_interior_malloc(graph: &mut FunctionGraph, block: crate::model::BlockId)
             block,
             OpKind::New {
                 owner: "Interior".to_string(),
+                owner_id: None,
             },
             true,
         )
@@ -2058,7 +2059,7 @@ fn graph_has_interior_new(graph: &FunctionGraph) -> bool {
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior"))
+        .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"))
 }
 
 /// `LLTypeMallocRemover.flatten` / `flowin_op` for

@@ -405,7 +405,7 @@ struct InteriorMallocSite {
 fn next_interior_malloc(graph: &FunctionGraph, skipped: &[Variable]) -> Option<InteriorMallocSite> {
     for (block_idx, block) in graph.blocks.iter().enumerate() {
         for op in &block.operations {
-            let OpKind::New { owner } = &op.kind else {
+            let OpKind::New { owner, .. } = &op.kind else {
                 continue;
             };
             if owner != "Interior" {
@@ -429,7 +429,7 @@ fn next_interior_malloc(graph: &FunctionGraph, skipped: &[Variable]) -> Option<I
 fn interior_malloc_remains(graph: &FunctionGraph, result: &Variable) -> bool {
     graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| {
-            matches!(&op.kind, OpKind::New { owner } if owner == "Interior")
+            matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior")
                 && op.result.as_ref() == Some(result)
         })
     })
@@ -459,7 +459,7 @@ fn interior_lifetime_is_removable(
         else {
             return false;
         };
-        if !matches!(&op.kind, OpKind::New { owner } if owner == "Interior") {
+        if !matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior") {
             return false;
         }
     }
@@ -604,7 +604,8 @@ fn try_inline_interior_lifetime(
             .iter()
             .filter_map(|op| {
                 let produced = op.result.as_ref()?;
-                let still_malloc = matches!(&op.kind, OpKind::New { owner } if owner == "Interior");
+                let still_malloc =
+                    matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior");
                 if still_malloc && vars.iter().any(|candidate| candidate == produced) {
                     Some(produced.clone())
                 } else {
@@ -1387,7 +1388,7 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         // (`rewrite_op_malloc`) so `setconcretetype` has a defining op.
         graph.blocks[block_idx].operations = original_ops;
         graph.blocks[block_idx].operations[op_idx].kind =
-            crate::model::malloc_opkind(owner.clone(), has_vtable);
+            crate::model::malloc_opkind(owner.clone(), has_vtable, owner_id);
         materialize_whole_value_copies_in_block(
             graph, block_idx, op_idx, &result, &owner, has_vtable,
         );
@@ -2029,7 +2030,7 @@ fn struct_value_def(ops: &[SpaceOperation], var: &Variable) -> Option<StructValu
             continue;
         }
         return Some(match &op.kind {
-            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
+            OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. } => {
                 StructValueDef::Struct(owner.clone())
             }
             OpKind::Call {

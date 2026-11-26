@@ -50675,7 +50675,7 @@ fn dictentry_entry_at_by_value_key_copies_indexed_item() {
     assert!(
         ops.iter().any(|op| matches!(
             &op.kind,
-            OpKind::New { owner } if owner == "TwoFieldKey" || owner.ends_with("::TwoFieldKey")
+            OpKind::New { owner, .. } if owner == "TwoFieldKey" || owner.ends_with("::TwoFieldKey")
         )),
         "the key is rebuilt by value; ops={ops:?}"
     );
@@ -55025,7 +55025,7 @@ fn gcarray_item_by_value_struct_pointer_leaf_is_item_cast() {
     // `New` plus the leaf stores (`rewrite_op_malloc`).
     assert!(
         read.iter().any(
-            |op| matches!(&op.kind, OpKind::New { owner } if owner == "PairKey" || owner.ends_with("::PairKey"))
+            |op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "PairKey" || owner.ends_with("::PairKey"))
         ),
         "by-value key is the aggregate New; ops={read:?}"
     );
@@ -55159,7 +55159,7 @@ fn gcarray_item_shared_borrow_of_by_value_key_is_leaf_copy() {
         ops.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::New { owner } if owner == "PairKey" || owner.ends_with("::PairKey")
+                OpKind::New { owner, .. } if owner == "PairKey" || owner.ends_with("::PairKey")
             )
         })
     }
@@ -55347,7 +55347,7 @@ fn gcarray_item_pointer_returned_from_helper_is_getinteriorfield() {
     assert!(
         hops.iter().any(|op| matches!(
             &op.kind,
-            OpKind::New { owner } if owner == "Interior"
+            OpKind::New { owner, .. } if owner == "Interior"
         )),
         "ptr::add mallocs Interior; ops={hops:?}"
     );
@@ -55424,7 +55424,7 @@ fn producer_is_interior_new(ops: &[&SpaceOperation], var: &Variable) -> bool {
             return false;
         };
         match &op.kind {
-            OpKind::New { owner } if owner == "Interior" => return true,
+            OpKind::New { owner, .. } if owner == "Interior" => return true,
             OpKind::UnaryOp { op, operand, .. } if op == "same_as" => cur = operand.clone(),
             _ => return false,
         }
@@ -55443,7 +55443,7 @@ fn assert_interior_container_store(graph: &FunctionGraph, path: &str) {
     );
     assert!(
         !ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior")),
+            .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior")),
         "non-escaping Interior malloc must be removed; ops={ops:?}"
     );
     assert!(

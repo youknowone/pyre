@@ -23261,7 +23261,7 @@ mod tests {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior"))
+                .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"))
         };
         let calls_leaf = |f: &crate::front::semantic::SemanticFunction, leaf: &str| {
             call_leaves(f).iter().any(|name| name == leaf)
