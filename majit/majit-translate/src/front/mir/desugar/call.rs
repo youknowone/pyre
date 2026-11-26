@@ -7404,10 +7404,13 @@ impl<'a> Lowering<'a> {
                 // instance. Wrap here so `SomePtr.call` sees
                 // already-converted arguments. A dyn vtable slot
                 // (`indirect`) is `ClassRepr.getclsfield`, not that call.
+                // A harvested field family is SomePBC: rpbc.py
+                // FunctionReprBase.call takes the source-level annotations.
+                // Erasing its instance arguments to OBJECTPTR here would
+                // feed SomePtr into source graphs that accept SomeInstance.
                 if indirect.is_none()
-                    && (eval_hook_graphs.is_some()
-                        || fn_ptr_family.is_some()
-                        || fnptr_field.is_some())
+                    && fnptr_field.is_none()
+                    && (eval_hook_graphs.is_some() || fn_ptr_family.is_some())
                 {
                     args = self.wrap_stored_fn_ptr_call_args(
                         mir_bb,

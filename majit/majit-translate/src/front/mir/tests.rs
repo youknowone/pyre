@@ -54865,54 +54865,22 @@ fn gcarray_item_indirect_arg0(ops: &[SpaceOperation]) -> &Variable {
         .unwrap_or_else(|| panic!("missing IndirectCall; ops={ops:?}"))
 }
 
-/// `fn(*mut Plain)` ARGS[i] is OBJECTPTR. The call site writes
-/// `cast_instance_to_base_ptr` before the call (`annlowlevel.py`).
+/// Harvested field families are SomePBC. FunctionReprBase.call keeps the
+/// source argument annotation until rtyping, even if FuncType uses OBJECTPTR.
 #[test]
-fn gcarray_item_fn_ptr_call_casts_objectptr_arg() {
-    let ops = gcarray_item_ops("call_plain");
-    let arg = gcarray_item_indirect_arg0(&ops);
-    let kind = gcarray_item_producing(&ops, arg);
-    assert!(
-        gcarray_item_is_base_ptr(kind),
-        "OBJECTPTR argument is cast_instance_to_base_ptr; got {kind:?}\nops={ops:?}"
-    );
-}
-
-/// A declared-GC class pointer is OBJECTPTR in `FuncType.ARGS`
-/// (`fn_ptr_tyref_to_lltype`) and in a generic struct row
-/// (`field_row_lltype`). The call writes `cast_instance_to_base_ptr`.
-#[test]
-fn gcarray_item_fn_ptr_call_casts_declared_gc_arg_as_objectptr() {
-    let ops = gcarray_item_ops("call_obj");
-    let arg = gcarray_item_indirect_arg0(&ops);
-    let kind = gcarray_item_producing(&ops, arg);
-    assert!(
-        gcarray_item_is_base_ptr(kind),
-        "declared-GC call argument is OBJECTPTR; got {kind:?}\nops={ops:?}"
-    );
-    assert_ne!(
-        crate::model::cast_instance_root(kind),
-        Some("GCREF"),
-        "FUNC.ARGS is not the field-row GCREF; ops={ops:?}"
-    );
-}
-
-/// `*mut GCREFOpaque` is `llmemory.GCREF`. The call writes
-/// `cast_instance_to_gcref`.
-#[test]
-fn gcarray_item_fn_ptr_call_casts_gcref_arg() {
-    let ops = gcarray_item_ops("call_gcref");
-    let arg = gcarray_item_indirect_arg0(&ops);
-    let kind = gcarray_item_producing(&ops, arg);
-    assert_eq!(
-        crate::model::cast_instance_root(kind),
-        Some("GCREF"),
-        "GCREF argument is cast_instance_to_gcref; got {kind:?}\nops={ops:?}"
-    );
-    assert!(
-        !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
-        "GCREF call does not emit cast_instance_to_base_ptr; ops={ops:?}"
-    );
+fn gcarray_item_fnptr_field_family_keeps_classed_arg() {
+    for name in ["call_plain", "call_obj", "call_gcref"] {
+        let ops = gcarray_item_ops(name);
+        let arg = gcarray_item_indirect_arg0(&ops);
+        assert!(
+            matches!(gcarray_item_producing(&ops, arg), OpKind::Input { .. }),
+            "a closed family receives the source argument, not an erased pointer: {name}, {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
+            "OBJECTPTR is selected by FunctionReprBase.call after annotation: {name}, {ops:?}"
+        );
+    }
 }
 
 fn gcarray_item_ops_have_no_instance_cast(ops: &[SpaceOperation]) {
@@ -57182,4 +57150,136 @@ fn declared_gc_path_spelling_does_not_borrow_a_colliding_gc_leaf() {
         "pyre_x::counter::Entry"
     ));
     assert!(super::spelling_path_is_declared_gc(&ids, "Entry"));
+}
+
+/// Regression: erasing obj before this PBC call joined Ptr(OBJECTPTR) with
+/// SomeInstance in every MapdictMixinAccess.get_storage source graph.
+#[test]
+fn mapdict_storage_slot_family_keeps_object_instance_argument() {
+    let Some(object) =
+        crate::test_support::load_ullbc_if_present(crate::runtime_names::artifacts::OBJECT_ULLBC)
+    else {
+        return;
+    };
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[object], crate::HostStaticAddrs::default(), &["mapdict"],
+        &["mapdict_typed_load_storage"],
+    ).expect("lower mapdict_typed_load_storage");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "mapdict_typed_load_storage")
+        .expect("mapdict_typed_load_storage")
+        .graph();
+    let ops = graph_ops(graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::IndirectCall {
+                family_key: Some(crate::model::IndirectFamilyKey::FnPtrField { .. }),
+                ..
+            }
+        )),
+        "the storage slot is a harvested PBC family: {}",
+        graph.dump()
+    );
+    assert!(
+        !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
+        "the PBC family's argument stays an instance: {}",
+        graph.dump()
+    );
+}
+
+/// An opaque fn input is still Ptr(FuncType), so SomePtr.call requires
+/// annlowlevel's instance-to-OBJECTPTR conversion before annotation.
+#[test]
+fn opaque_fnptr_call_still_erases_classed_argument() {
+    // The unknown-fnptr path is opt-in. Use a child harness so changing
+    // its environment cannot race the rest of this process's tests.
+    if !super::fnptr_indirect_enabled() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "front::mir::tests::opaque_fnptr_call_still_erases_classed_argument",
+            ])
+            .env("MAJIT_FNPTR_INDIRECT", "1")
+            .output()
+            .expect("run opaque-fnptr mode");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let obj = interior_adt(0);
+    let obj_ptr = interior_raw_mut(obj);
+    let fn_ty = gcarray_item_fn_ptr(obj_ptr.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "call_opaque",
+        2,
+        vec![fn_ty.clone(), obj_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("callback"), &fn_ty),
+            interior_local(2, Some("obj"), &obj_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                serde_json::json!({
+                    "span": interior_span(), "kind": {"Call": {
+                        "call": {"func": {"Dynamic": [
+                            {"Read": interior_place(1, &fn_ty)}, {"regions": []}
+                        ]}, "args": [{"Read": interior_place(2, &obj_ptr)}]},
+                        "dest": interior_place(0, &unit), "target": 1, "on_unwind": 2
+                    }}
+                }),
+            ),
+            interior_bb(vec![], interior_return()),
+            interior_bb(vec![], interior_unwind()),
+        ],
+    );
+    let llbc = llbc_with_declared_gc(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Obj"],
+            &[("pad", interior_i64())],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller],
+        &[0],
+    );
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("lower opaque fn pointer");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "call_opaque")
+        .unwrap()
+        .graph();
+    let ops = graph_ops(graph);
+    let arg = ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::IndirectCall {
+                args,
+                family_key: None,
+                ..
+            } => args.first(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("opaque call has no closed family: {}", graph.dump()));
+    assert!(
+        ops.iter()
+            .any(|op| op.result.as_ref() == Some(arg) && gcarray_item_is_base_ptr(&op.kind)),
+        "the opaque call still consumes OBJECTPTR: {}",
+        graph.dump()
+    );
 }
