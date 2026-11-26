@@ -2823,10 +2823,10 @@ fn enum_base_leaf_is_option(owner: &str) -> bool {
 /// The registry probe is `CallRegistry::lookup_existing`: a pure
 /// identity test (`extregistry.is_registered`), never a materializing
 /// lookup.
-fn declared_llop(
+fn callee_registry_entry(
     target: &crate::model::CallTarget,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
-) -> Option<String> {
+) -> Option<Rc<crate::translator::rtyper::call_registry::FunctionEntry>> {
     use crate::model::CallTarget;
     use crate::translator::rtyper::call_registry::FunctionPathKey;
     let key = match target {
@@ -2848,8 +2848,14 @@ fn declared_llop(
         }
         _ => return None,
     };
-    let entry = call_registry.lookup_existing(&key)?;
-    entry
+    call_registry.lookup_existing(&key)
+}
+
+fn declared_llop(
+    target: &crate::model::CallTarget,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Option<String> {
+    callee_registry_entry(target, call_registry)?
         .function_desc
         .borrow()
         .base
@@ -2857,6 +2863,50 @@ fn declared_llop(
         .as_ref()
         .and_then(HostObject::user_function)
         .and_then(|func| func._jit_llop_.clone())
+}
+
+/// `lloperation.py` `_LLOpEntry`: `simple_call(llop.<opname>, RESULTTYPE, *args)`.
+///
+/// `GraphFunc` carries `_jit_llop_` only; it has no declared result type.
+/// `FunctionEntry.declared_funcptr_type` is the callee `FuncType` when
+/// populate could project one. A missing projection is Void — use the
+/// projected `FuncType.result`, falling back to Void only when no
+/// projection exists.
+fn translate_catalogued_llop_call(
+    opname: &str,
+    target: &crate::model::CallTarget,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    arg_hls: Vec<Hlvalue>,
+    result: Hlvalue,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
+    if !ll_operations().contains_key(opname) {
+        return Err(TyperError::message(format!(
+            "jit_llop {opname}: not in LL_OPERATIONS"
+        )));
+    }
+    let result_lltype = callee_registry_entry(target, call_registry)
+        .and_then(|entry| {
+            entry
+                .declared_funcptr_type
+                .borrow()
+                .as_ref()
+                .map(|ft| ft.result.clone())
+        })
+        .unwrap_or(LowLevelType::Void);
+    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+        HostObject::new_builtin_callable(format!(
+            "rpython.rtyper.lltypesystem.lloperation.llop.{opname}"
+        )),
+    )));
+    let resulttype = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+        result_lltype,
+    ))));
+    let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+    call_args.push(callable);
+    call_args.push(resulttype);
+    call_args.extend(arg_hls);
+    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
 }
 
 /// A `CallTarget::FunctionPath` [`translate_op`] rewrites to a high-level
@@ -2884,7 +2934,6 @@ enum FunctionPathHighLevel<'a> {
     CastPointer,
     CastInstance,
     CastAddress,
-    LlArraymove,
     BuiltinShim(&'static str),
     StringBuilderNew,
     StringBuilderAppend,
@@ -3064,9 +3113,6 @@ fn function_path_high_level_kind<'a>(
     }
     if is_single_segment(segments, shims::CAST_ADDRESS) {
         return Some(FunctionPathHighLevel::CastAddress);
-    }
-    if is_single_segment(segments, shims::LL_ARRAYMOVE) {
-        return Some(FunctionPathHighLevel::LlArraymove);
     }
     if let Some(builtin) = function_path_builtin_shim(segments) {
         return Some(FunctionPathHighLevel::BuiltinShim(builtin));
@@ -3322,27 +3368,6 @@ fn emit_function_path_high_level_op(
                 .ok_or_else(|| {
                     TyperError::message(
                         "__cast_address_intrinsic missing from HOST_ENV bootstrap".to_string(),
-                    )
-                })?;
-            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                callable_host,
-            ))));
-            call_args.extend(arg_hls);
-            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
-        }
-        FunctionPathHighLevel::LlArraymove => {
-            if arg_hls.len() != 4 {
-                return Err(TyperError::message(format!(
-                    "__majit_ll_arraymove requires exactly four args, got {}",
-                    arg_hls.len()
-                )));
-            }
-            let callable_host = HOST_ENV
-                .lookup_builtin(shims::LL_ARRAYMOVE)
-                .ok_or_else(|| {
-                    TyperError::message(
-                        "__majit_ll_arraymove missing from HOST_ENV bootstrap".to_string(),
                     )
                 })?;
             let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
@@ -4523,6 +4548,15 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    if let Some(opname) = declared_llop(target, call_registry) {
+                        return translate_catalogued_llop_call(
+                            &opname,
+                            target,
+                            call_registry,
+                            arg_hls,
+                            result,
+                        );
+                    }
                     // Fail-closed on an UNFUSED
                     // `lltype::malloc[_typed/_managed/_stable]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
@@ -5058,6 +5092,12 @@ pub fn translate_op(
                     call_args.push(callable);
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                }
+                CallTarget::Method { .. } if declared_llop(target, call_registry).is_some() => {
+                    let opname = declared_llop(target, call_registry).ok_or_else(|| {
+                        TyperError::message("declared llop missing after translate_op Method guard")
+                    })?;
+                    translate_catalogued_llop_call(&opname, target, call_registry, arg_hls, result)
                 }
                 CallTarget::Method {
                     name,
@@ -5780,16 +5820,17 @@ fn legacy_const_define_hlvalue(
             if args.is_empty() && crate::model::fn_const_segments(target).is_some() =>
         {
             let segments = crate::model::fn_const_segments(target).expect("guard checked");
+            let resolved = crate::model::fn_const_resolved_path(target).expect("guard checked");
             let call_registry = call_registry.ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} requires a CallRegistry to materialise getfunctionptr",
                     segments
                 ))
             })?;
-            let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
-                segments.to_vec(),
+            let key = crate::translator::rtyper::call_registry::FunctionPathKey::for_call_registry(
+                &resolved,
             );
-            let entry = call_registry.lookup_with_leaf_match(&key).ok_or_else(|| {
+            let entry = call_registry.lookup(&key).ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} did not resolve to a registered callee",
                     key.segments()
@@ -11901,6 +11942,104 @@ mod tests {
     }
 
     #[test]
+    fn translate_catalogued_llop_call_uses_declared_bool_resulttype() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_catalogued_llop_bool_fixture");
+        let vars = mint_vars(&mut graph, 7);
+        let mapped_operands: Vec<Hlvalue> = (1..6)
+            .map(|i| {
+                let mapped = Hlvalue::Variable(Variable::new());
+                value_map.insert(vars[i].clone(), mapped.clone());
+                mapped
+            })
+            .collect();
+        let mapped_result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[6].clone(), mapped_result.clone());
+        let registry = empty_call_registry();
+        let mut func = GraphFunc::new(
+            "gc_writebarrier_before_copy",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_llop_ = Some("gc_writebarrier_before_copy".into());
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["gc_hook", "gc_writebarrier_before_copy"]),
+            Signature::new(
+                vec![
+                    "source".into(),
+                    "dest".into(),
+                    "source_start".into(),
+                    "dest_start".into(),
+                    "length".into(),
+                ],
+                None,
+                None,
+            ),
+            func,
+        );
+        entry.set_declared_funcptr_type(FuncType {
+            args: vec![
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+            result: LowLevelType::Bool,
+        });
+        let op = SpaceOperation {
+            result: Some(vars[6].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["gc_hook".into(), "gc_writebarrier_before_copy".into()],
+                    resolved_path: None,
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![
+                    vars[1].clone(),
+                    vars[2].clone(),
+                    vars[3].clone(),
+                    vars[4].clone(),
+                    vars[5].clone(),
+                ]),
+                result_ty: ValueType::Bool,
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("catalogued Bool-result llop must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        assert_eq!(lowered.args.len(), 7);
+        let Hlvalue::Constant(callable) = &lowered.args[0] else {
+            panic!("llop callable must be constant");
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("llop callable must be a HostObject");
+        };
+        assert_eq!(
+            host.qualname(),
+            "rpython.rtyper.lltypesystem.lloperation.llop.gc_writebarrier_before_copy"
+        );
+        let Hlvalue::Constant(resulttype) = &lowered.args[1] else {
+            panic!("RESULTTYPE must be constant");
+        };
+        match &resulttype.value {
+            ConstValue::LowLevelType(ll) => assert_eq!(**ll, LowLevelType::Bool),
+            other => panic!("RESULTTYPE must be LowLevelType(Bool), got {other:?}"),
+        }
+        assert_eq!(lowered.args[2..].len(), 5);
+        assert_eq!(&lowered.args[2..], mapped_operands.as_slice());
+        assert_eq!(lowered.result, mapped_result);
+    }
+
+    #[test]
     fn translate_op_same_named_method_without_jit_llop_is_ordinary_getattr() {
         use crate::flowspace::argument::Signature;
         use crate::flowspace::model::GraphFunc;
@@ -13469,6 +13608,91 @@ mod tests {
             host, &mymod_entry.host_object,
             "must not resolve to the colliding-leaf sibling"
         );
+    }
+
+    /// Residual-only nested FunDecl: `register_unsafe_fn_stubs` registers
+    /// the identity and aliases the harvest display onto the same
+    /// FunctionDesc (`Bookkeeper.getdesc`). A `__fn_const` that names the
+    /// identity must resolve (`FunctionsPBCRepr.convert_const`).
+    #[test]
+    fn legacy_const_define_hlvalue_resolves_residual_nested_identity() {
+        use crate::flowspace::argument::Signature;
+        use crate::model::CallTarget;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::register_unsafe_fn_stubs;
+
+        let registry = empty_call_registry();
+        let identity = crate::parse::CallPath::from_segments(["c", "parent#2", "f"]);
+        let harvest = vec!["parent".to_string(), "f".to_string()];
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let specs = vec![
+            (
+                identity.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                Some(vec![LowLevelType::Signed]),
+            ),
+            (
+                harvest,
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                Some(vec![LowLevelType::Signed]),
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+        let ident_key = FunctionPathKey::from(&identity);
+        let harvest_key = FunctionPathKey::from_segments(["parent", "f"]);
+        let ident_entry = registry
+            .lookup(&ident_key)
+            .expect("identity must be registered");
+        let harvest_entry = registry
+            .lookup(&harvest_key)
+            .expect("harvest display is an alias of the same funcobj");
+        assert!(
+            Rc::ptr_eq(&ident_entry, &harvest_entry),
+            "harvest must alias the identity entry, not mint a second funcobj"
+        );
+
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::model::FN_CONST_HEAD.to_string(),
+                        "parent".to_string(),
+                        "f".to_string(),
+                    ],
+                    resolved_path: Some(identity),
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: Vec::new(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match legacy_const_define_hlvalue(&op, Some(&registry))
+            .expect("residual nested fn_const must resolve")
+        {
+            Some(Hlvalue::Constant(c)) => {
+                let ConstValue::HostObject(ref host) = c.value else {
+                    panic!(
+                        "fn const folds to CallRegistry host_object, got {:?}",
+                        c.value
+                    );
+                };
+                assert_eq!(
+                    host, &ident_entry.host_object,
+                    "__fn_const HostObject is the identity-registered pyobj"
+                );
+            }
+            other => panic!("expected Constant(HostObject), got {other:?}"),
+        }
     }
 
     #[test]
@@ -15276,7 +15500,7 @@ mod tests {
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
             let registry = std::rc::Rc::new(empty_call_registry());
-            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry
                 .lookup(&FunctionPathKey::from_segments(segments))
@@ -15356,7 +15580,7 @@ mod tests {
         let mut graphs = GraphStore::default();
         graphs.insert(CallPath::from_segments(segments.clone()), body);
         let registry = std::rc::Rc::new(empty_call_registry());
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &[], &registry)
             .expect("populate");
         assert!(
             registry

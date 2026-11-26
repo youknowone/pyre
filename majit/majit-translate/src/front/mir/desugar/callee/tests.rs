@@ -1,5 +1,6 @@
 use super::{
-    FnPtrFamily, discover_fnptr_field_families, fn_ptr_family_for, profilefunc_graphs_for_call,
+    FnPtrFamily, collect_fnptr_family_inputs, discover_fnptr_field_families, fn_ptr_family_for,
+    profilefunc_graphs_for_call, publish_fnptr_field_families_across, resolve_fnptr_field_families,
 };
 
 use majit_charon_reader::Llbc;
@@ -476,8 +477,9 @@ fn fnptr_field_family_unions_static_and_runtime_stores() {
     );
 }
 
-/// A runtime store of a parameter is not a recoverable FunDecl, so the
-/// family is unpublished even when a static also stores `f`.
+/// A runtime store of a parameter with no Regular call site is not a
+/// recoverable FunDecl, so the family is unpublished even when a static
+/// also stores `f`.
 #[test]
 fn fnptr_field_family_unpublished_when_a_store_is_not_a_fndef() {
     let table = adt_ty(0);
@@ -616,6 +618,221 @@ fn fnptr_field_family_unions_diamond_local_assigns() {
         family_members(&rows, "mod::Table", "slot"),
         ["c::mod::f", "c::mod::g"],
         "diamond union of f and g: {rows:?}"
+    );
+}
+
+fn table_param_constructor(def_id: u64, path: &[&str], type_id: u64) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [fn_ty.clone()],
+            "output": struct_ty.clone()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                local_ty(0, &struct_ty),
+                local_ty(1, &fn_ty)
+            ]},
+            "body": [{
+                "statements": [assign_local(
+                    0,
+                    &struct_ty,
+                    serde_json::json!({"Aggregate": [{"Adt": [type_id, null]}, [
+                        move_local(1, &fn_ty)
+                    ]]})
+                )],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })
+}
+
+fn call_ctor_with_fn(
+    def_id: u64,
+    path: &[&str],
+    ctor_id: u64,
+    stored_fun: u64,
+    type_id: u64,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty),
+                local_ty(2, &struct_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [assign_local(
+                        1,
+                        &fn_ty,
+                        fn_def_to_fn_ptr(fn_def_const(stored_fun))
+                    )],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": ctor_id},
+                                "generics": empty_generics()
+                            }},
+                            "args": [move_local(1, &fn_ty)]
+                        },
+                        "dest": typed_local(2, &struct_ty),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// A constructor that stores its fn-pointer parameter closes the family
+/// over FunDecls passed at Regular call sites (`FunctionDesc.pycall`
+/// unions arguments over call sites). A Dynamic read+call through the
+/// field follows both members (`FunctionReprBase.call` `c_graphs`).
+#[test]
+fn fnptr_field_family_unions_constructor_parameter_call_sites() {
+    let table = adt_ty(0);
+    let table_ptr = serde_json::json!({"RawPtr": [table.clone(), "Const"]});
+    let fn_ty = fnptr_ty();
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                {"kind": {"Local": 1}, "ty": table_ptr.clone()},
+                "Deref"
+            ]}, "ty": table},
+            {"Field": [null, 0]}
+        ]},
+        "ty": fn_ty.clone()
+    });
+    let harvested = dynamic_call_fun(
+        30,
+        &["c", "mod", "harvested_caller"],
+        vec![assign_local(
+            2,
+            &fn_ty,
+            serde_json::json!({"Use": [{"Read": field_place}, "No"]}),
+        )],
+        copy_local(2, &fn_ty),
+        vec![
+            local_ty(0, &unit_ty()),
+            local_ty(1, &table_ptr),
+            local_ty(2, &fn_ty),
+        ],
+        1,
+        vec![table_ptr],
+    );
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make"], 0),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            call_ctor_with_fn(23, &["c", "mod", "call_g"], 21, 2, 0),
+            harvested,
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "constructor parameter call sites union f and g: {rows:?}"
+    );
+    let cg = crate::memory::gctransform::framework::build(&llbc);
+    let harvested_callees = cg.callees.get(&30).expect("harvested caller");
+    assert!(
+        harvested_callees.contains(&1) && harvested_callees.contains(&2),
+        "read+call through the field follows both members: {harvested_callees:?}"
+    );
+    assert!(
+        !cg.indirect.contains(&30),
+        "harvested Dynamic is analyze_indirect_call, not top_result"
+    );
+}
+
+fn opaque_fun(
+    def_id: u64,
+    path: &[&str],
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+        "src": "Normal",
+        "body": "Opaque"
+    })
+}
+
+/// Constructor stores live in one artefact and Regular call sites in
+/// another (`FunctionDesc.pycall` unions arguments over the program).
+#[test]
+fn fnptr_field_family_unions_constructor_parameter_across_artefacts() {
+    let ctor = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![table_param_constructor(21, &["c", "mod", "make"], 0)],
+        vec![],
+    );
+    let callers = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            opaque_fun(21, &["c", "mod", "make"], vec![fnptr_ty()], adt_ty(0)),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            call_ctor_with_fn(23, &["c", "mod", "call_g"], 21, 2, 0),
+        ],
+        vec![],
+    );
+    let ctor_only = discover_fnptr_field_families(&ctor);
+    assert!(
+        family_members(&ctor_only, "mod::Table", "slot").is_empty(),
+        "constructor artefact has no Regular call sites: {ctor_only:?}"
+    );
+    let mut inputs = collect_fnptr_family_inputs(&ctor);
+    inputs.merge(collect_fnptr_family_inputs(&callers));
+    let rows = resolve_fnptr_field_families(&inputs);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "call sites in the other artefact union f and g: {rows:?}"
+    );
+    let published = publish_fnptr_field_families_across(&[&ctor, &callers]);
+    assert_eq!(
+        family_members(&published, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"]
+    );
+    assert_eq!(
+        family_members(
+            &discover_fnptr_field_families(&callers),
+            "mod::Table",
+            "slot"
+        ),
+        ["c::mod::f", "c::mod::g"],
+        "seeded artefact sees the program-wide family"
     );
 }
 
@@ -1109,6 +1326,451 @@ fn identity_path_for_fun_decl_uses_the_call_leaf_and_specialization() {
     assert_ne!(spec.segments, base.segments);
 }
 
+/// One Charon `NameSeg` in an `inherent_adt_impl_make_llbc` family fixture.
+#[derive(Clone, Copy)]
+enum FixtureSeg<'a> {
+    Ident(&'a str),
+    /// Inherent `impl Self` whose TypeDecl is `id`.
+    Inherent(u64),
+    /// `impl Trait for Self` (`Trait` is the `trait_impls` row).
+    TraitImpl {
+        self_ty: u64,
+        trait_impl: u64,
+    },
+}
+
+/// JSON LLBC: inherent `fn make` methods whose Self is an ADT TypeDecl.
+/// `types` is `(def_id, ident path)`; `methods` is
+/// `(fun def_id, impl-module idents, self TypeDecl id)`.
+fn inherent_adt_impl_make_llbc(types: &[(u64, &[&str])], methods: &[(u64, &[&str], u64)]) -> Llbc {
+    let types: Vec<(u64, Vec<FixtureSeg<'_>>)> = types
+        .iter()
+        .map(|(id, path)| (*id, path.iter().copied().map(FixtureSeg::Ident).collect()))
+        .collect();
+    let funs: Vec<(u64, Vec<FixtureSeg<'_>>)> = methods
+        .iter()
+        .map(|(def_id, module, self_id)| {
+            let mut segs: Vec<FixtureSeg<'_>> =
+                module.iter().copied().map(FixtureSeg::Ident).collect();
+            segs.push(FixtureSeg::Inherent(*self_id));
+            segs.push(FixtureSeg::Ident("make"));
+            (*def_id, segs)
+        })
+        .collect();
+    fixture_adt_llbc(&types, &funs, &[], &[])
+}
+
+/// Sparse `type_decls` / `fun_decls` / `trait_decls` / `trait_impls`
+/// indexed by `def_id`. `traits` is `(id, ident path)`; `trait_impls`
+/// is `(impl_id, trait_id, self TypeDecl id)`.
+fn fixture_adt_llbc(
+    types: &[(u64, Vec<FixtureSeg<'_>>)],
+    funs: &[(u64, Vec<FixtureSeg<'_>>)],
+    traits: &[(u64, &[&str])],
+    trait_impls: &[(u64, u64, u64)],
+) -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics.clone(), "builtin": null}
+        })
+    };
+    let ty = |id: u64| serde_json::json!({"Value": [id, adt(id)]});
+    let seg_json = |seg: FixtureSeg<'_>| match seg {
+        FixtureSeg::Ident(s) => ident(s),
+        FixtureSeg::Inherent(id) => serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": ty(id),
+            "kind": "InherentImplBlock"
+        }}}),
+        FixtureSeg::TraitImpl {
+            self_ty,
+            trait_impl,
+        } => serde_json::json!({"Impl": {
+            "Ty": {"skip_binder": ty(self_ty), "kind": "TraitImpl"},
+            "Trait": trait_impl
+        }}),
+    };
+    let fill = |rows: Vec<(u64, serde_json::Value)>| {
+        let n = rows
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .map(|id| id + 1)
+            .unwrap_or(0);
+        let mut out = vec![serde_json::Value::Null; n as usize];
+        for (id, value) in rows {
+            out[id as usize] = value;
+        }
+        out
+    };
+    let type_decls = fill(
+        types
+            .iter()
+            .map(|(id, path)| {
+                (
+                    *id,
+                    serde_json::json!({
+                        "def_id": id,
+                        "item_meta": meta(path.iter().copied().map(seg_json).collect()),
+                        "kind": {"Struct": []}
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let fun_decls = fill(
+        funs.iter()
+            .map(|(def_id, path)| {
+                (
+                    *def_id,
+                    serde_json::json!({
+                        "def_id": def_id,
+                        "item_meta": meta(path.iter().copied().map(seg_json).collect()),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [],
+                            "output": {"Scalar": "Bool"}
+                        },
+                        "body": {"Unstructured": {
+                            "span": span.clone(),
+                            "locals": {"arg_count": 0, "locals": []},
+                            "body": []
+                        }}
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let trait_decls = fill(
+        traits
+            .iter()
+            .map(|(id, path)| {
+                (
+                    *id,
+                    serde_json::json!({
+                        "def_id": id,
+                        "item_meta": meta(path.iter().copied().map(ident).collect()),
+                        "methods": []
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let trait_impl_decls = fill(
+        trait_impls
+            .iter()
+            .map(|(impl_id, trait_id, self_ty)| {
+                (
+                    *impl_id,
+                    serde_json::json!({
+                        "impl_trait": {
+                            "id": trait_id,
+                            "generics": {"types": [adt(*self_ty)], "const_generics": []}
+                        },
+                        "methods": []
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "c",
+            "type_decls": type_decls,
+            "fun_decls": fun_decls,
+            "global_decls": [],
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impl_decls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("inherent ADT impl fixture parses")
+}
+
+fn identity_segs(llbc: &Llbc, id: u64) -> Vec<String> {
+    super::registered_path_for_fun_decl(llbc, llbc.fn_by_id(id).expect("fun")).segments
+}
+
+/// Two inherent impls in one module whose Self types are `a::T` and
+/// `b::T` (non-generic). Harvest `for_impl_method` already names the
+/// TypeDecl (`a::T::make` / `b::T::make`). The FunDecl identity is the
+/// TypeDecl path plus the method (`c::a::T::make` / `c::b::T::make`);
+/// last-Ident-only Self (`T`) would collapse both onto `c::m::T::make`
+/// (`Bookkeeper.getdesc` keys the function object).
+///
+/// `fnptr_family_llbc` / `unit_fun` mint Ident-only `item_meta` paths
+/// and cannot carry an Impl payload; this fixture is the same JSON
+/// shape as `lltype/tests.rs`
+/// `spec_segments_distinguishes_impls_that_share_a_self_leaf`.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_inherent_impls_that_share_a_self_leaf() {
+    let llbc = inherent_adt_impl_make_llbc(
+        &[(0, &["c", "a", "T"]), (1, &["c", "b", "T"])],
+        &[(1, &["c", "m"], 0), (2, &["c", "m"], 1)],
+    );
+    let a = llbc.fn_by_id(1).expect("impl a::T");
+    let b = llbc.fn_by_id(2).expect("impl b::T");
+    let a_harvest = super::harvest_path_for_fun_decl(&llbc, a).segments;
+    let b_harvest = super::harvest_path_for_fun_decl(&llbc, b).segments;
+    assert_eq!(
+        a_harvest,
+        crate::parse::CallPath::for_impl_method("a::T", "make").segments
+    );
+    assert_eq!(
+        b_harvest,
+        crate::parse::CallPath::for_impl_method("b::T", "make").segments
+    );
+    assert_ne!(a_harvest, b_harvest, "harvest a::T vs b::T collapsed");
+    let a_id = super::registered_path_for_fun_decl(&llbc, a).segments;
+    let b_id = super::registered_path_for_fun_decl(&llbc, b).segments;
+    assert_ne!(
+        a_id, b_id,
+        "identity a::T vs b::T collapsed: {a_id:?} {b_id:?}"
+    );
+    assert_eq!(
+        a_id,
+        ["c", "a", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        b_id,
+        ["c", "b", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Suffix-overlap of the impl module with Self's TypeDecl path is not
+/// an identity: `impl` in `c::x::m` for `c::m::T` and `impl` in `c::x`
+/// for `c::x::m::T` both became `c::x::m::T::make` under that rule.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_inherent_impls_whose_module_overlaps_self() {
+    let llbc = inherent_adt_impl_make_llbc(
+        &[(0, &["c", "m", "T"]), (1, &["c", "x", "m", "T"])],
+        &[(1, &["c", "x", "m"], 0), (2, &["c", "x"], 1)],
+    );
+    let in_xm = identity_segs(&llbc, 1);
+    let in_x = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_xm, in_x,
+        "identity c::m::T vs c::x::m::T collapsed: {in_xm:?} {in_x:?}"
+    );
+    assert_eq!(
+        in_xm,
+        ["c", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        in_x,
+        ["c", "x", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Same-module `impl T`: identity is the TypeDecl path plus the method,
+/// which matches the pre-250 spelling `c::m::T::make`.
+#[test]
+fn registered_path_for_fun_decl_same_module_inherent_impl_is_type_decl_path() {
+    let llbc = inherent_adt_impl_make_llbc(&[(0, &["c", "m", "T"])], &[(1, &["c", "m"], 0)]);
+    assert_eq!(
+        identity_segs(&llbc, 1),
+        ["c", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `impl A { fn build() { struct T; impl T { fn make() {} } } }` vs
+/// `impl B { fn build() { struct T; impl T { fn make() {} } } }`.
+/// TypeDecl paths carry the enclosing inherent Impl; Ident-only Self
+/// (`c::build::T::make`) collides (`Bookkeeper.getdesc` keys the
+/// function object).
+#[test]
+fn registered_path_for_fun_decl_distinguishes_nested_type_decls_in_inherent_impls() {
+    let llbc = fixture_adt_llbc(
+        &[
+            (0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")]),
+            (1, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("B")]),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(0),
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(1),
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+        ],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(2),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(3),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+        ],
+        &[],
+        &[],
+    );
+    let in_a = identity_segs(&llbc, 1);
+    let in_b = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_a, in_b,
+        "nested TypeDecl T in impl A vs impl B collapsed: {in_a:?} {in_b:?}"
+    );
+}
+
+/// Same nested `struct T; impl T { fn make }`, but the enclosing scope
+/// is `impl X for A { fn build() }` vs `impl Y for A { fn build() }`
+/// (same Self, different traits).
+#[test]
+fn registered_path_for_fun_decl_distinguishes_nested_type_decls_in_trait_impls() {
+    let llbc = fixture_adt_llbc(
+        &[
+            (0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")]),
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 0,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 1,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+        ],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(1),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(2),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+        ],
+        &[(0, &["c", "X"]), (1, &["c", "Y"])],
+        &[(0, 0, 0), (1, 1, 0)],
+    );
+    let in_x = identity_segs(&llbc, 1);
+    let in_y = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_x, in_y,
+        "nested TypeDecl T in impl X for A vs impl Y for A collapsed: {in_x:?} {in_y:?}"
+    );
+}
+
+/// FunDecl nested in a trait-impl method:
+/// `impl X for A { fn build() { fn helper() {} } }` vs
+/// `impl Y for A { fn build() { fn helper() {} } }`. The last Impl is
+/// the trait impl; `scope_owner_impl_seg` / last-Impl `render_trait_impl`
+/// must keep X vs Y.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_helpers_nested_in_trait_impl_methods() {
+    let llbc = fixture_adt_llbc(
+        &[(0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")])],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 0,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("helper"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 1,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("helper"),
+                ],
+            ),
+        ],
+        &[(0, &["c", "X"]), (1, &["c", "Y"])],
+        &[(0, 0, 0), (1, 1, 0)],
+    );
+    let in_x = identity_segs(&llbc, 1);
+    let in_y = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_x, in_y,
+        "helper nested in impl X for A vs impl Y for A collapsed: {in_x:?} {in_y:?}"
+    );
+}
+
 /// A monomorphized vtable keeps its method slots as `*const ()`, so the
 /// `dyn` call casts the slot into a temporary and calls that; the slot
 /// read is recovered from the temporary's single producer.
@@ -1194,7 +1856,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &usize_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "Vec index fold must accept a usize index"
     );
@@ -1203,7 +1866,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &ty(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "Vec index fold must accept a signed index"
     );
@@ -1212,7 +1876,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &ty(serde_json::json!({ "Adt": { "id": 7  } })),
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "a Range index types as Ref and must stay rejected"
     );

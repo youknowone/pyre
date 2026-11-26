@@ -6543,6 +6543,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "_ll_2_int_mod",
         crate::objspace::descroperation::_ll_2_int_mod,
     );
+    // `support.py` `_ll_1_gc_identityhash` / `_ll_1_gc_id`: residual
+    // targets of `jtransform.py rewrite_op_gc_identityhash` /
+    // `rewrite_op_gc_id` (`_do_builtin_call`). Body is
+    // `gc_hook::gc_identityhash` / `gc_hook::gc_id` (`lltype.identityhash` / `llop.gc_id`).
+    // Without these the codewriter falls back to `symbolic_fnaddr_for_path`.
+    cpa1!(
+        &mut entries,
+        "pyre_object::gc_hook::_ll_1_gc_identityhash",
+        "_ll_1_gc_identityhash",
+        pyre_object::gc_hook::_ll_1_gc_identityhash,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_object::gc_hook::_ll_1_gc_id",
+        "_ll_1_gc_id",
+        pyre_object::gc_hook::_ll_1_gc_id,
+    );
     // `ll_math.py ll_math_sqrt` raises; the residual ABI is the Ok `f64`
     // with `PyError` published out of band (`ResidualError`). One function
     // object (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`);
@@ -7379,11 +7396,6 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             iterobject::STR_ASCII_ITER_TYPE
         ),
         pytype_addr!("iterobject::STR_ITER_TYPE", iterobject::STR_ITER_TYPE),
-        pytype_addr!("iterobject::BYTES_ITER_TYPE", iterobject::BYTES_ITER_TYPE),
-        pytype_addr!(
-            "iterobject::BYTEARRAY_ITER_TYPE",
-            iterobject::BYTEARRAY_ITER_TYPE
-        ),
         pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
         pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
@@ -7518,6 +7530,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         (
             "pycode::CODE_TYPE",
             &crate::pycode::CODE_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTES_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTES_ITER_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTEARRAY_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE as *const _ as i64,
         ),
         (
             "pytraceback::PYTRACEBACK_TYPE",
@@ -7738,6 +7758,22 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
+        ),
+        // `mapdict.py` shared `DictTerminator` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock`; the refs row is the initialized
+        // `TerminatorForDicts` payload / `get_or_init` return
+        // (`bookkeeper.py immutablevalue` of that object).
+        (
+            "objspace::std::mapdict::TERMINATOR_FOR_DICTS",
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr(),
+        ),
+        // `nestedscope.py` `DUMMY_FAMILY` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock<usize>`; the refs row is the
+        // initialized `CellFamily` payload address / `get_or_init`
+        // return (`bookkeeper.py immutablevalue` of that object).
+        (
+            "nestedscope::dummy_family::DUMMY_FAMILY",
+            pyre_object::nestedscope::dummy_family_payload_addr(),
         ),
         (
             "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
@@ -9699,6 +9735,14 @@ mod tests {
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64
         );
         assert_eq!(
+            bindings["objspace::std::mapdict::TERMINATOR_FOR_DICTS"],
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr()
+        );
+        assert_eq!(
+            bindings["nestedscope::dummy_family::DUMMY_FAMILY"],
+            pyre_object::nestedscope::dummy_family_payload_addr()
+        );
+        assert_eq!(
             bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],
             crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64
         );
@@ -10398,6 +10442,38 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
+    }
+
+    /// `jtransform.py rewrite_op_gc_identityhash` / `rewrite_op_gc_id`
+    /// residualise to `_ll_1_gc_identityhash` / `_ll_1_gc_id`. A typo in
+    /// either the module path or the canonical seed name silently
+    /// residualizes to a symbolic hash.
+    #[test]
+    fn jit_trace_fnaddrs_covers_gc_identity_llop_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let identityhash = occupied_published_addr(
+            "pyre_object::gc_hook::_ll_1_gc_identityhash",
+            pyre_object::gc_hook::_ll_1_gc_identityhash as *const () as usize as i64,
+        );
+        assert_ne!(identityhash, 0, "_ll_1_gc_identityhash");
+        assert_eq!(
+            bindings["pyre_object::gc_hook::_ll_1_gc_identityhash"],
+            identityhash
+        );
+        assert_eq!(bindings["_ll_1_gc_identityhash"], identityhash);
+
+        let gc_id = occupied_published_addr(
+            "pyre_object::gc_hook::_ll_1_gc_id",
+            pyre_object::gc_hook::_ll_1_gc_id as *const () as usize as i64,
+        );
+        assert_ne!(gc_id, 0, "_ll_1_gc_id");
+        assert_eq!(bindings["pyre_object::gc_hook::_ll_1_gc_id"], gc_id);
+        assert_eq!(bindings["_ll_1_gc_id"], gc_id);
+        assert_ne!(
+            identityhash, gc_id,
+            "support.py keeps _ll_1_gc_identityhash and _ll_1_gc_id distinct"
+        );
     }
 
     /// `w_float_gc_alloc` is `dont_look_inside`; a typo in either spelling

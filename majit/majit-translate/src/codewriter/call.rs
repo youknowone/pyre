@@ -4013,65 +4013,17 @@ impl StoreCore {
         self.key_for(path).is_some()
     }
 
-    /// Whether `path` is a stored spelling of a built graph. A
-    /// crate-prefixed lookup that is not stored still resolves through
-    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
-    /// (`callable_graph_path`) is the stored spelling
-    /// (`call.py graphs_from`).
-    pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+    /// Whether `path` names a graphless external funcobj
+    /// (`LazyGraph::external` / `rffi.llexternal`). The header is not a
+    /// body; `register_unsafe_fn_stubs` owns its FunctionDesc.
+    pub(crate) fn is_external_funcobj(&self, path: &CallPath) -> bool {
         self.register_declared();
-        if !self.path_to_key.borrow().contains_key(path) {
+        let Some(slot) = self.slot_for(path) else {
             return false;
-        }
-        self.get(path).is_some()
-    }
-
-    /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
-    fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
-        let path = match target {
-            CallTarget::FunctionPath { .. } => {
-                if crate::model::fn_const_segments(target).is_some() {
-                    return None;
-                }
-                target.function_call_path()?
-            }
-            CallTarget::Method {
-                name,
-                receiver_root,
-                resolved_path,
-                ..
-            } => {
-                if let Some(path) = resolved_path {
-                    path.clone()
-                } else if let Some(receiver) = receiver_root.as_deref() {
-                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
-                    if !self.contains_key(&qualified) {
-                        return None;
-                    }
-                    qualified
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
         };
-        if self.contains_key(&path) {
-            return Some(path);
-        }
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
-            let stripped = path.with_segments(stripped_segs.iter().cloned());
-            if self.contains_key(&stripped) {
-                return Some(stripped);
-            }
-        }
-        None
-    }
-
-    /// Every registered alias spelling (one entry per `CallPath`, not per
-    /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
-    #[cfg(test)]
-    pub(crate) fn keys(&self) -> Vec<CallPath> {
-        self.iter().into_iter().map(|(path, _)| path).collect()
+        slot.source
+            .as_ref()
+            .is_some_and(|source| source.graph.is_external())
     }
 
     /// FunctionPath calls whose stamped `resolved_path` is not a graph
@@ -4133,6 +4085,67 @@ impl StoreCore {
         });
         rows.dedup();
         rows
+    }
+
+    /// Whether `path` is a stored spelling of a built graph. A
+    /// crate-prefixed lookup that is not stored still resolves through
+    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
+    /// (`callable_graph_path`) is the stored spelling
+    /// (`call.py graphs_from`).
+    pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+        self.register_declared();
+        if !self.path_to_key.borrow().contains_key(path) {
+            return false;
+        }
+        self.get(path).is_some()
+    }
+
+    /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
+    fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
+        let path = match target {
+            CallTarget::FunctionPath { .. } => {
+                if crate::model::fn_const_segments(target).is_some() {
+                    return None;
+                }
+                target.function_call_path()?
+            }
+            CallTarget::Method {
+                name,
+                receiver_root,
+                resolved_path,
+                ..
+            } => {
+                if let Some(path) = resolved_path {
+                    path.clone()
+                } else if let Some(receiver) = receiver_root.as_deref() {
+                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
+                    if !self.contains_key(&qualified) {
+                        return None;
+                    }
+                    qualified
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if self.contains_key(&path) {
+            return Some(path);
+        }
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+            let stripped = path.with_segments(stripped_segs.iter().cloned());
+            if self.contains_key(&stripped) {
+                return Some(stripped);
+            }
+        }
+        None
+    }
+
+    /// Every registered alias spelling (one entry per `CallPath`, not per
+    /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<CallPath> {
+        self.iter().into_iter().map(|(path, _)| path).collect()
     }
 
     /// `(alias path, shared graph)` for every registered spelling, each
@@ -5592,6 +5605,9 @@ pub struct CallControl {
     /// declarations Charon emits with no body at all; it does not stand in
     /// for a body some gate refused.
     pub unsafe_fn_stubs: Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
+    /// FunDecl identity plus display spellings. Consumed by
+    /// `cutover::alias_fun_decl_identities_onto_registered_display`.
+    pub fun_decl_identity_aliases: Vec<crate::translator::rtyper::cutover::FunDeclIdentityAlias>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
     /// …).  `impl_method_owner` declines the `CallTarget::Method` hint for
@@ -6274,6 +6290,7 @@ impl CallControl {
             field0_parents: HashSet::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
+            fun_decl_identity_aliases: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
             bookkeeper: std::cell::RefCell::new(None),
@@ -6289,6 +6306,61 @@ impl CallControl {
         let mut cc = Self::new();
         cc.struct_layouts = handle;
         cc
+    }
+
+    /// Residual FunDecls collected as signature-only stubs. Bind each
+    /// FunDecl identity onto its own harvest spelling when harvest is
+    /// free (`rffi.llexternal` graphless header). A harvest occupant is
+    /// another funcobj (`Bookkeeper.getdesc`); do not bind this identity
+    /// onto it, and do not occupy a later Type-split Method key. Collect
+    /// emits identity then harvest first; the first non-identity spelling
+    /// of this FunDecl is `harvest_path_for_fun_decl`. When harvest is
+    /// occupied, identity still names this residual as its own header.
+    pub(crate) fn publish_residual_fun_decl_identities(&mut self) {
+        let n = self.unsafe_fn_stubs.len();
+        let mut seen = HashSet::new();
+        for i in 0..n {
+            let Some(identity) = self.unsafe_fn_stubs[i].5.clone() else {
+                continue;
+            };
+            if !seen.insert(identity.clone()) {
+                continue;
+            }
+            let harvest = self.unsafe_fn_stubs[i..]
+                .iter()
+                .filter(|spec| spec.5.as_ref() == Some(&identity))
+                .map(|spec| CallPath::from_segments(spec.0.iter().cloned()))
+                .find(|path| path != &identity)
+                .unwrap_or_else(|| identity.clone());
+            self.publish_one_residual_fun_decl_identity(identity, harvest);
+        }
+    }
+
+    fn publish_one_residual_fun_decl_identity(&mut self, identity: CallPath, harvest: CallPath) {
+        let graphs = self.function_graphs_mut();
+        if graphs.names_funcobj(&identity) {
+            return;
+        }
+        let header_path = if identity != harvest && !graphs.names_funcobj(&harvest) {
+            harvest
+        } else {
+            // Free harvest is this residual's `llexternal` spelling.
+            // Occupied harvest is another funcobj; identity is still
+            // this FunDecl (`Bookkeeper.getdesc`). Not a Type-split
+            // Method key.
+            identity.clone()
+        };
+        let leaf = header_path.last_segment().unwrap_or("").to_string();
+        let mut header = FunctionGraph::new(leaf);
+        header.func.jit_look_inside = Some(false);
+        header.push_hint("dont_look_inside");
+        header.funcobj_identity = Some(identity.display_name());
+        let lazy = crate::model::LazyGraph::external(header);
+        graphs.insert_lazy(header_path.clone(), lazy, GraphTransform::default(), None);
+        if identity != header_path {
+            graphs.share_path(identity, &header_path);
+        }
+        graphs.mark_canonical_path(&header_path);
     }
 
     /// Copy `canraise` from `ll_math::llexternal` onto each raw `math_*`
@@ -8288,11 +8360,10 @@ impl CallControl {
         if let Some(path) = self.target_to_path(target) {
             return self.func_effects_with_crate_alias(&path);
         }
-        // `target_to_path` returns None for `__fn_const::path` so a
-        // residual function-pointer call would miss the
-        // `#[dont_look_inside_cannot_raise]` mark registered on `path`.
-        let segments = crate::model::fn_const_segments(target)?;
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        // `target_to_path` returns None for a `__fn_const` define (it is
+        // a Constant, not a call). Residual effect lookup still names
+        // the function object: identity → `GraphStore::canonical_path`.
+        let path = self.fn_const_canonical_path(target)?;
         self.func_effects_with_crate_alias(&path)
     }
 
@@ -12223,6 +12294,13 @@ impl CallControl {
             .or_else(|| self.target_to_path(target))
     }
 
+    /// Graph key of a function-item constant: FunDecl identity, then
+    /// this store's one spelling per graph (`GraphStore::canonical_path`).
+    fn fn_const_canonical_path(&self, target: &CallTarget) -> Option<CallPath> {
+        crate::model::fn_const_resolved_path(target)
+            .map(|path| self.function_graphs.canonical_path(&path))
+    }
+
     /// Convert a CallTarget to a CallPath for lookup.
     ///
     /// A direct call resolves by the canonical path the caller's FunDecl
@@ -12232,6 +12310,9 @@ impl CallControl {
         match target {
             CallTarget::FunctionPath { resolved_path, .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
+                    // A function-item value is a Constant, not a
+                    // `direct_call`. Graph / fnaddr consumers use
+                    // `fn_const_canonical_path` (identity → canonical).
                     return None;
                 }
                 // Unique FunDecl key first, harvest `segments` fallback.
@@ -12320,10 +12401,10 @@ impl CallControl {
         // would have missed byte-identical to the unguarded result. Only a fire
         // that refuses a resolved address changes the constant, keeping that
         // change attributable to a real refusal.
-        let wrapper_path = crate::model::fn_const_segments(target)
-            .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
-            .or_else(|| self.target_to_path(target))
-            .map(|path| self.function_graphs.canonical_path(&path));
+        let wrapper_path = self.fn_const_canonical_path(target).or_else(|| {
+            self.target_to_path(target)
+                .map(|path| self.function_graphs.canonical_path(&path))
+        });
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
@@ -12333,8 +12414,7 @@ impl CallControl {
             return binding(path.clone(), addr, true);
         }
 
-        if let Some(segments) = crate::model::fn_const_segments(target) {
-            let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        if let Some(path) = self.fn_const_canonical_path(target) {
             return from_table(path);
         }
         if let Some(path) = self.target_to_path(target) {
@@ -13073,10 +13153,8 @@ impl CallControl {
         // `target_to_path` drops `__fn_const` targets.  The residual for a
         // `dont_look_inside` helper is that fn-const trampoline, so effect
         // lookup has to see the path under the head.
-        self.target_to_path(target).or_else(|| {
-            crate::model::fn_const_segments(target)
-                .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
-        })
+        self.target_to_path(target)
+            .or_else(|| self.fn_const_canonical_path(target))
     }
 
     fn declares_cannot_raise(&self, target: &CallTarget) -> bool {
@@ -15111,16 +15189,14 @@ pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
 }
 
 pub(crate) fn symbolic_fnaddr_path_for_target(target: &CallTarget) -> String {
-    if let Some(segments) = crate::model::fn_const_segments(target) {
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+    if let Some(path) = crate::model::fn_const_resolved_path(target) {
         return path.canonical_key();
     }
     format!("target:{target}")
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
-    if let Some(segments) = crate::model::fn_const_segments(target) {
-        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+    if let Some(path) = crate::model::fn_const_resolved_path(target) {
         return symbolic_fnaddr_for_path(&path);
     }
     let symbolic = stable_symbolic_fnaddr(target);
@@ -16386,12 +16462,11 @@ pub fn effectinfo_from_writeanalyze(
     // sets `single_write_descr_array` (`effectinfo.py`) and
     // `_clear_caches_arraycopy` keeps `quasiimmut_seen`.
     //
-    // The residual helper `jit_ll_arraycopy` still has a graph
-    // (`pin_root`, memcpy). Writeanalyze of that body can name extra
-    // ARRAYs that are not dest[di] = source[si]. `do_fixed_list_ll_arraycopy`
-    // already holds dest in `extradescrs`; that ARRAY is the
-    // writeanalyze result of `copy_item`. Replace the write-array set
-    // with it so `single_write_descr_array` is dest.
+    // The residual target `jit_ll_arraycopy` is retargeted by address
+    // only; its writeanalyze is not the `copy_item` ARRAY.
+    // `do_fixed_list_ll_arraycopy` already holds dest in `extradescrs`;
+    // that ARRAY is the writeanalyze result of `copy_item`. Replace the
+    // write-array set with it so `single_write_descr_array` is dest.
     //
     // No dest ARRAY (`extradescrs` None) and no writeanalyze ARRAY is
     // unanalyzable: upstream `GraphAnalyzer.analyze` returns
@@ -19102,6 +19177,7 @@ fn effect_transduce_op(
             );
         }
         name @ ("gc_id"
+        | "gc_identityhash"
         | "gc_fq_register"
         | "debug_assert"
         | "gc_writebarrier"
@@ -19114,8 +19190,8 @@ fn effect_transduce_op(
             // `canraise.py RaiseAnalyzer.analyze_simple_operation` /
             // `collectanalyze.py CollectAnalyzer.analyze_simple_operation`
             // consult `LL_OPERATIONS[op.opname]`.
-            // `gc_id`: `LLOp(sideeffects=False, canmallocgc=True)` so
-            // `canraise=(MemoryError,)`.
+            // `gc_id` / `gc_identityhash`: `LLOp(sideeffects=False, canmallocgc=True)`
+            // so `canraise=(MemoryError,)`.
             // `gc_fq_register`: `LLOp()` so `canraise=()`.
             // `debug_assert`: `LLOp(tryfold=True)` so `canraise=()`.
             // `gc_writebarrier`: `LLOp(canrun=True)` so `canraise=()`.
@@ -19312,8 +19388,16 @@ fn effect_transduce_op(
                 false,
             );
         }
-        name @ ("raw_memcopy" | "raw_memclear") => {
-            // `lloperation.py`: `LLOp(revdb_protect=True)`.
+        name @ ("raw_memcopy"
+        | "raw_memmove"
+        | "raw_memclear"
+        | "gc_writebarrier_before_copy"
+        | "gc_writebarrier_before_move") => {
+            // `lloperation.py`: `raw_memcopy` / `raw_memmove` /
+            // `raw_memclear` are `LLOp(revdb_protect=True)`;
+            // `gc_writebarrier_before_copy` and
+            // `gc_writebarrier_before_move` record no struct/array
+            // field write (`writeanalyze.py` records none).
             // Generic llops keep the original argument list
             // (`SpaceOperation.args`); analyzers read the opname
             // (`GraphAnalyzer.analyze_simple_operation`).
@@ -19499,6 +19583,104 @@ mod tests {
             store.access_directly_desc_origin(&access_directly_path(&charon)),
             identity,
             "AccessDirect origin must be the declared identity"
+        );
+    }
+
+    /// Residual-only nested FunDecl: producer-time GraphStore publish
+    /// (`publish_residual_fun_decl_identities`) aliases the identity onto
+    /// a free harvest spelling. A host fnaddr bound under harvest is the
+    /// canonical address of that funcobj (`getfunctionptr`).
+    #[test]
+    fn fnaddr_binding_for_residual_nested_identity_uses_harvest_display() {
+        let identity = CallPath::from_segments(["c", "parent#2", "f"]);
+        let harvest = CallPath::from_segments(["parent", "f"]);
+        let mut cc = CallControl::new();
+        cc.unsafe_fn_stubs = vec![(
+            harvest.segments.clone(),
+            Signature::new(vec!["x".to_string()], None, None),
+            Some("i64".to_string()),
+            None,
+            None,
+            Some(identity.clone()),
+            None,
+        )];
+        cc.publish_residual_fun_decl_identities();
+        let addr = 0x1234_0000i64;
+        cc.register_function_fnaddr(harvest.clone(), addr);
+        let target = CallTarget::FunctionPath {
+            segments: vec![
+                crate::model::FN_CONST_HEAD.to_string(),
+                "parent".to_string(),
+                "f".to_string(),
+            ],
+            resolved_path: Some(identity.clone()),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+        let binding = cc.fnaddr_binding_for_target(&target);
+        assert!(
+            !binding.symbolic,
+            "identity must reach the harvest fnaddr through GraphStore aliasing, got {binding:?}"
+        );
+        assert_eq!(binding.addr, addr);
+        assert_eq!(
+            cc.function_graphs().canonical_path(&identity).segments,
+            harvest.segments
+        );
+    }
+
+    /// Harvest occupied, Type-split still free: residual identity must
+    /// not first-writer occupy the Method key.
+    #[test]
+    fn publish_residual_uses_harvest_not_type_split() {
+        let identity = CallPath::from_segments(["c", "parent#2", "into_iter"]);
+        let harvest = CallPath::from_segments(["parent", "into_iter"]);
+        let type_split = CallPath::from_segments(["Vec", "into_iter"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(harvest.clone(), FunctionGraph::new("into_iter"));
+        let sig = Signature::new(vec!["self".to_string()], None, None);
+        cc.unsafe_fn_stubs = vec![
+            (
+                identity.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+            (
+                harvest.segments.clone(),
+                sig.clone(),
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+            (
+                type_split.segments.clone(),
+                sig,
+                Some("i64".to_string()),
+                None,
+                None,
+                Some(identity.clone()),
+                None,
+            ),
+        ];
+        cc.publish_residual_fun_decl_identities();
+        assert!(
+            cc.function_graphs().names_funcobj(&identity),
+            "occupied harvest: identity still names this residual"
+        );
+        assert_eq!(
+            cc.function_graphs().canonical_path(&identity).segments,
+            identity.segments,
+            "occupied harvest must not alias identity onto the occupant"
+        );
+        assert!(
+            !cc.function_graphs().names_funcobj(&type_split),
+            "must not occupy the Type-split Method key"
         );
     }
 
@@ -19923,6 +20105,26 @@ mod tests {
             store.key_for(&second),
             "both spellings share one GraphKey"
         );
+    }
+
+    #[test]
+    fn insert_lazy_external_is_an_external_funcobj() {
+        let harvest = CallPath::from_segments(["rffi", "__rffi_fp_c_memcpy"]);
+        let identity = CallPath::from_segments(["majit_rlib", "rffi", "__rffi_fp_c_memcpy"]);
+        let mut header = FunctionGraph::new("__rffi_fp_c_memcpy");
+        header.func.jit_look_inside = Some(false);
+        header.funcobj_identity = Some(identity.display_name());
+        let mut store = GraphStore::new();
+        store.insert_lazy(
+            harvest.clone(),
+            crate::model::LazyGraph::external(header),
+            GraphTransform::default(),
+            None,
+        );
+        store.share_path(identity.clone(), &harvest);
+        assert!(store.is_external_funcobj(&harvest));
+        assert!(store.is_external_funcobj(&identity));
+        assert!(!store.is_external_funcobj(&CallPath::from_segments(["rffi", "c_memcpy"])));
     }
 
     /// Pre-annotator `inherit_split_portal_access_directly` has no origin
@@ -34810,6 +35012,57 @@ mod tests {
         ));
     }
 
+    /// `canraise.py analyze_simple_operation`: `gc_identityhash` is
+    /// `canmallocgc` so `canraise=(MemoryError,)`; `do_ignore_memory_error`
+    /// suppresses it.
+    #[test]
+    fn effect_graph_gc_identityhash_raises_only_memoryerror() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let ptr = variable_with_lltype("p", GCREF.clone());
+        let result = variable_with_lltype("h", LowLevelType::Signed);
+        let graph = rtyped_one_op(
+            "gih",
+            "gc_identityhash",
+            vec![crate::flowspace::model::Hlvalue::Variable(ptr)],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_identityhash"
+            )),
+            "gc_identityhash stays a simple llop: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["gih"]);
+        cc.register_function_graph(path.clone(), converted);
+        assert_eq!(
+            cc._canraise(
+                &CallTarget::function_path(["gih"]),
+                &mut AnalysisCache::default()
+            ),
+            CanRaise::MemoryErrorOnly
+        );
+        assert!(cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false
+        ));
+        assert!(!cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            true
+        ));
+    }
+
     /// `jtransform.py rewrite_op_malloc_varsize` takes `ARRAY.OF` for the
     /// array descr; Char items are the int bank, GC pointers the ref bank.
     #[test]
@@ -35180,6 +35433,123 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(converted_raise("rmc", graph), CanRaise::No);
+    }
+
+    /// `lloperation.py`: `raw_memmove` is `LLOp(revdb_protect=True)`;
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
+    #[test]
+    fn effect_graph_raw_memmove_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let src = variable_with_lltype("src", LowLevelType::Address);
+        let dest = variable_with_lltype("dst", LowLevelType::Address);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let args = vec![
+            crate::flowspace::model::Hlvalue::Variable(src),
+            crate::flowspace::model::Hlvalue::Variable(dest),
+            crate::flowspace::model::Hlvalue::Variable(n),
+        ];
+        let graph = rtyped_one_op("rmm", "raw_memmove", args.clone(), result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args } if opname == "raw_memmove" => {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(effect_linkarg).collect()),
+            "raw_memmove: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("rmm", graph), CanRaise::No);
+    }
+
+    /// `lloperation.py`: `gc_writebarrier_before_move` is a void llop;
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
+    /// `writeanalyze.py analyze_simple_operation` records no struct/array
+    /// field write.
+    #[test]
+    fn effect_graph_gc_writebarrier_before_move_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let array = variable_with_lltype("a", LowLevelType::Address);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let args = vec![crate::flowspace::model::Hlvalue::Variable(array)];
+        let graph = rtyped_one_op("wb", "gc_writebarrier_before_move", args.clone(), result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args }
+                    if opname == "gc_writebarrier_before_move" =>
+                {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(effect_linkarg).collect()),
+            "gc_writebarrier_before_move: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("wb", graph), CanRaise::No);
+    }
+
+    /// `lloperation.py`: `gc_writebarrier_before_copy` is a Bool llop;
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
+    /// `writeanalyze.py analyze_simple_operation` records no struct/array
+    /// field write.
+    #[test]
+    fn effect_graph_gc_writebarrier_before_copy_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let source = variable_with_lltype("src", LowLevelType::Address);
+        let dest = variable_with_lltype("dst", LowLevelType::Address);
+        let source_start = variable_with_lltype("si", LowLevelType::Signed);
+        let dest_start = variable_with_lltype("di", LowLevelType::Signed);
+        let length = variable_with_lltype("n", LowLevelType::Signed);
+        let result = variable_with_lltype("v", LowLevelType::Bool);
+        let args = vec![
+            crate::flowspace::model::Hlvalue::Variable(source),
+            crate::flowspace::model::Hlvalue::Variable(dest),
+            crate::flowspace::model::Hlvalue::Variable(source_start),
+            crate::flowspace::model::Hlvalue::Variable(dest_start),
+            crate::flowspace::model::Hlvalue::Variable(length),
+        ];
+        let graph = rtyped_one_op("wbc", "gc_writebarrier_before_copy", args.clone(), result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args }
+                    if opname == "gc_writebarrier_before_copy" =>
+                {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(effect_linkarg).collect()),
+            "gc_writebarrier_before_copy: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("wbc", graph), CanRaise::No);
     }
 
     fn converted_readwrite(

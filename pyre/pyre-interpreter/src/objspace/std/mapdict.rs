@@ -100,16 +100,17 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
         let w_class = unsafe { instance_getclass(obj) };
         pyre_object::gc_roots::shadow_stack_set(class_slot, w_class);
         // Hash before the wait: the pre-wait pointer may be stale afterwards.
-        let class_key = pyre_object::objlock::stripes_taken().then(|| {
-            pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-                class_slot,
-            ) as usize)
-        });
+        let class_key =
+            pyre_object::objlock::stripes_taken().then(|| {
+                pyre_object::gc_hook::gc_id(
+                    pyre_object::gc_roots::shadow_stack_get(class_slot) as usize
+                )
+            });
         let guard = lock_class_stripe(pyre_object::gc_roots::shadow_stack_get(class_slot));
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_class_now = unsafe { instance_getclass(obj) };
         let same_class = match class_key {
-            Some(k) => pyre_object::gc_hook::gc_identity_hash(w_class_now as usize) == k,
+            Some(k) => pyre_object::gc_hook::gc_id(w_class_now as usize) == k,
             None => w_class_now == pyre_object::gc_roots::shadow_stack_get(class_slot),
         };
         if same_class {
@@ -6574,6 +6575,10 @@ struct TerminatorForDicts(Cell<MapRef>);
 unsafe impl Send for TerminatorForDicts {}
 unsafe impl Sync for TerminatorForDicts {}
 
+/// Memo of `space.fromcache(get_terminator_for_dicts)`
+/// (`mapdict.py` `MapDictStrategy.get_empty_storage`). The translated
+/// interpreter has one object space, so that memo is a single prebuilt
+/// `DictTerminator`.
 static TERMINATOR_FOR_DICTS: OnceLock<TerminatorForDicts> = OnceLock::new();
 
 pub fn get_terminator_for_dicts() -> MapRef {
@@ -6581,6 +6586,15 @@ pub fn get_terminator_for_dicts() -> MapRef {
         .get_or_init(|| TerminatorForDicts(Cell::new(new_dict_terminator(pyre_object::PY_NULL))))
         .0
         .get()
+}
+
+/// Address of the initialized [`TERMINATOR_FOR_DICTS`] payload
+/// (`cache.py` `Cache.getorbuild` memo). The refs row is this object,
+/// not the `OnceLock` container.
+pub(crate) fn terminator_for_dicts_payload_addr() -> i64 {
+    TERMINATOR_FOR_DICTS
+        .get_or_init(|| TerminatorForDicts(Cell::new(new_dict_terminator(pyre_object::PY_NULL))))
+        as *const TerminatorForDicts as i64
 }
 
 /// Extra-root walk of [`TERMINATOR_FOR_DICTS`] (`mapdict.py` shared

@@ -25,6 +25,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -
         no_tombstoned_leaves(),
         &gc_struct_ids,
         &raw_alloc_flavor_structs,
+        None,
     )
 }
 
@@ -15421,6 +15422,7 @@ fn published_transparent_copy_peels_when_marker_is_path_phantomdata() {
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .is_none(),
         "a transparent scalar wrapper is the word, not inlined field leaves"
@@ -16978,14 +16980,14 @@ fn bytes_block_as_mut_utf8str_cast_result_is_strptr() {
     );
     assert!(
         matches!(
-            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor),
+            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor, None),
             crate::model::ValueType::Str
         ),
         "*const BytesBlock is ValueType::Str"
     );
     assert!(
         matches!(
-            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor),
+            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor, None),
             crate::model::ValueType::Str
         ),
         "*mut Utf8Str is ValueType::Str"
@@ -17954,6 +17956,7 @@ fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
             spec,
             &gc_struct_ids,
             &empty,
+            None,
         )
         .as_deref(),
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
@@ -17967,6 +17970,7 @@ fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
             &empty,
             &gc_struct_ids,
             &empty,
+            None,
         ),
         None,
         "GCREFOpaque must not intern a residual ClassDef"
@@ -24252,6 +24256,114 @@ fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
     );
 }
 
+/// `std::ptr::null_mut::<ItemsBlock>()` of the object-item GcArray recasts
+/// onto that block (`push_niche_null`). Residual `ptr_null_constant` is a
+/// classdef-less Instance because the ItemsBlock root is not a class;
+/// dest recast is `SomeList` so a NULL return unions with the live items
+/// arm (`annmodel.SomeList.noneify`, `rlist.py`
+/// `AbstractBaseListRepr.convert_const(None)`). A scalar `TypedItemsBlock`
+/// stays `cast_int_to_ptr` above.
+#[test]
+fn null_mut_of_items_block_recasts_list_root() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let usize_ty = interior_usize();
+    let pyobj = interior_struct(
+        1,
+        &["pyobject", "PyObject"],
+        &[("type_ptr", usize_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let items = interior_array_zero(interior_raw_mut(interior_adt(1)));
+    let block = interior_struct(
+        0,
+        &["object_array", "ItemsBlock"],
+        &[("capacity", usize_ty), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let ptr = interior_raw_mut(interior_adt(0));
+    let caller = interior_caller(
+        "null_items_block_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_types("fixture", vec![block, pyobj], vec![caller, null_mut]);
+    let graph = lower_interior(&llbc, "null_items_block_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let null = ops
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected dest-list null_mut; ops={ops:?}"));
+    let null_var = null.result.as_ref().expect("null_mut produces a result");
+    match &null.kind {
+        OpKind::Call { args, .. } => {
+            assert!(
+                args.is_empty(),
+                "ItemsBlock null_mut stays unspelled so dest recast can project SomeList, got {args:?}"
+            );
+        }
+        other => panic!("expected null_mut call, got {other:?}"),
+    }
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, null_var).is_some())
+        .unwrap_or_else(|| {
+            panic!("dest-list null_mut must recast onto the ItemsBlock pointee; ops={ops:?}")
+        });
+    let root = crate::model::cast_instance_root(&recast.kind).expect("recast names a root");
+    assert!(
+        majit_ir::descr::is_object_gcarray_items_block(root),
+        "recast root must be object ItemsBlock, got {root}"
+    );
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Ref(Some(root.to_string())),
+                "ItemsBlock recast is dest-list Ref, got {result_ty:?}"
+            );
+        }
+        other => panic!("expected recast call, got {other:?}"),
+    }
+    assert!(
+        ops.iter().all(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("cast_int_to_ptr"),
+            _ => true,
+        }),
+        "object ItemsBlock must not take the TypedItemsBlock GcArray nullptr; ops={ops:?}"
+    );
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;
@@ -26519,9 +26631,9 @@ fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } if segments == &[crate::runtime_names::shims::LL_ARRAYMOVE.to_string()]
+                    } if segments.last().is_some_and(|leaf| leaf == "ll_arraymove_items_block")
                 )),
-                "{function} must restore ptr::copy to RPython rgc.ll_arraymove"
+                "{function} must call object_array::ll_arraymove_items_block"
             );
             assert!(
                 !operations.iter().any(|operation| matches!(
@@ -40876,6 +40988,7 @@ fn closure_env_cell_address_field_descr_is_int_kinded() {
             &empty_ids,
             &empty_names,
             &empty_names,
+            None,
         );
         let (flag, intern_ty, _) = crate::codewriter::call::get_type_flag(&layout, &empty_names);
         assert_eq!(
@@ -47520,17 +47633,24 @@ fn one_word_handle_by_value_struct_decl_is_none() {
     let gc_struct_ids = std::collections::HashSet::new();
     let raw_alloc = std::collections::HashSet::<String>::new();
     assert!(
-        super::tyref_by_value_struct_decl(&handle_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
-            .is_none(),
+        super::tyref_by_value_struct_decl(
+            &handle_ty,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc,
+            None
+        )
+        .is_none(),
         "a unique sized pointer plus ZST markers is lltype.Ptr, not an inlined STRUCT"
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc, None),
         "*mut *mut i64",
         "the enclosing field row must carry the selected pointer repr"
     );
     assert!(
-        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc, None)
             .is_some(),
         "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
     );
@@ -47589,6 +47709,7 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         tomb,
         &gc_struct_ids,
         &raw_alloc,
+        None,
     );
     assert_eq!(
         src_leaves
@@ -47604,6 +47725,7 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         tomb,
         &gc_struct_ids,
         &raw_alloc,
+        None,
     );
     assert_eq!(
         dest_leaves

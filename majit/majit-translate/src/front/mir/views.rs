@@ -1724,6 +1724,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .ok_or_else(|| {
             LowerError::Unsupported(format!(
@@ -2079,8 +2080,8 @@ impl<'a> Lowering<'a> {
         // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
         // `fn_const`).
         if let Some(value) = promoted_const_copied_const(&body) {
-            let decoded = if let Some(segments) = self.fn_item_const_segments(&value) {
-                DecodedConst::FnPath(segments)
+            let decoded = if let Some(decoded) = self.fn_item_const_segments(&value) {
+                decoded
             } else {
                 match decode_constant(self.llbc, &value) {
                     Ok(decoded) => decoded,
@@ -3176,6 +3177,7 @@ impl<'a> Lowering<'a> {
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
                                 &self.raw_alloc_flavor_structs,
+                                self.struct_fields,
                             )
                         })
                         .ok_or_else(|| {
@@ -4931,6 +4933,7 @@ pub(in crate::front::mir) fn tyref_ref_pointee_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<ValueType> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
@@ -4940,6 +4943,7 @@ pub(in crate::front::mir) fn tyref_ref_pointee_value_type(
         tombstoned,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ))
 }
 

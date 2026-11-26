@@ -294,16 +294,14 @@ pub struct ClassAttr;
 /// `pypy/interpreter/typedef.py default_identity_hash`.
 ///
 /// Exact immutable builtin values use their value-derived unique id; ordinary
-/// objects use RPython's `compute_identity_hash`, whose translated minimark
-/// implementation is `mangle_hash(id_or_identityhash(obj))`.
+/// objects use RPython's `compute_identity_hash`, MiniMark `identityhash`.
 pub fn default_identity_hash_value(mut w_obj: PyObjectRef) -> i64 {
     if let Some(w_unique_id) =
         pyre_object::with_roots!(w_obj => crate::function::immutable_unique_id(w_obj))
     {
         return crate::builtins::hash_value(w_unique_id);
     }
-    let identity = pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64;
-    identity ^ (identity >> 4)
+    pyre_object::gc_hook::gc_identityhash(w_obj as usize) as i64
 }
 
 pub fn default_identity_hash(_space: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
@@ -1549,9 +1547,16 @@ pub fn init_typeobjects() {
                 "tuple_iterator",
                 init_tuple_iterator_type as fn(PyObjectRef),
             ),
-            // The str / bytes / bytearray / memoryview iterators run the
-            // shared `W_SeqIterObject` payload behind their own 3.14
-            // identities, so they take the sequence-iterator namespace.
+            // [3.15-spec] producer-specific iterator type names ↔
+            // `iterobject.py W_AbstractSeqIterObject.typedef` (`sequenceiterator`);
+            // evidence: lib-python/3/test/test_array.py MiscTest.test_disallow_instantiation;
+            // pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+            // v3.15.0 `PyUnicodeIter_Type.tp_name` `"str_iterator"`,
+            // `_PyUnicodeASCIIIter_Type.tp_name` `"str_ascii_iterator"`,
+            // `PyBytesIter_Type.tp_name` `"bytes_iterator"`,
+            // `PyByteArrayIter_Type.tp_name` `"bytearray_iterator"`,
+            // `_PyMemoryIter_Type.tp_name` `"memory_iterator"`,
+            // `arrayiter_spec.name` `"array.arrayiterator"`.
             (
                 &pyre_object::iterobject::STR_ASCII_ITER_TYPE as *const PyType,
                 "str_ascii_iterator",
@@ -1563,25 +1568,28 @@ pub fn init_typeobjects() {
                 init_str_iterator_type as fn(PyObjectRef),
             ),
             (
-                &pyre_object::iterobject::BYTES_ITER_TYPE as *const PyType,
+                &crate::objspace::std::iterobject::BYTES_ITER_TYPE as *const PyType,
                 "bytes_iterator",
                 init_bytes_iterator_type as fn(PyObjectRef),
             ),
             (
-                &pyre_object::iterobject::BYTEARRAY_ITER_TYPE as *const PyType,
+                &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE as *const PyType,
                 "bytearray_iterator",
                 init_bytearray_iterator_type as fn(PyObjectRef),
             ),
-            // `memory_iterator` carries only the iteration protocol: it has
-            // neither `__length_hint__` nor `__setstate__`, and pickling one
-            // raises `TypeError: cannot pickle 'memory_iterator' object`.
+            // [3.15-spec] `memory_iterator` has none of `__length_hint__` /
+            // `__setstate__` ↔ `W_AbstractSeqIterObject.typedef`; evidence:
+            // pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+            // `_PyMemoryIter_Type` at v3.15.0 has no `tp_methods`.
             (
                 &pyre_object::iterobject::MEMORY_ITER_TYPE as *const PyType,
                 "memory_iterator",
                 init_memory_iterator_type as fn(PyObjectRef),
             ),
-            // `array.arrayiterator` pickles like the other flavours but
-            // reports no `__length_hint__`.
+            // [3.15-spec] `array.arrayiterator` has `__reduce__`/`__setstate__`
+            // but no `__length_hint__` ↔ `W_AbstractSeqIterObject.typedef`;
+            // evidence: pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+            // `arrayiter_methods` at v3.15.0 is REDUCE + SETSTATE.
             (
                 &pyre_object::iterobject::ARRAY_ITER_TYPE as *const PyType,
                 "array.arrayiterator",
@@ -1593,7 +1601,7 @@ pub fn init_typeobjects() {
                 pytype,
                 &pyre_object::iterobject::ARRAY_ITER_TYPE as *const PyType,
             ) {
-                // CPython 3.14 Modules/arraymodule.c creates arrayiter_spec
+                // `arraymodule.c arrayiter_spec` at v3.15.0 is created
                 // through PyType_FromModuleAndSpec with IMMUTABLETYPE.
                 mark_cpython_heap_type(iterator_type, true);
             }
@@ -2376,11 +2384,13 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
         // receiver reaches those accessors as type confusion — reproducibly a
         // SIGSEGV for `type(iter(())).__length_hint__(None)`.
         "iterator" => pyre_object::is_seq_iter,
-        // Producer-specific identities over the same `W_SeqIterObject` payload.
-        "str_ascii_iterator" => pyre_object::is_seq_iter,
-        "str_iterator" => pyre_object::is_seq_iter,
-        "bytes_iterator" => pyre_object::is_seq_iter,
-        "bytearray_iterator" => pyre_object::is_seq_iter,
+        // Producer-specific identities: str uses `W_FastUnicodeIterObject`;
+        // bytes/bytearray use `W_StringIterObject`; the rest share
+        // the `W_SeqIterObject` payload.
+        "str_ascii_iterator" => pyre_object::is_str_iter,
+        "str_iterator" => pyre_object::is_str_iter,
+        "bytes_iterator" => crate::objspace::std::iterobject::is_string_iter,
+        "bytearray_iterator" => crate::objspace::std::iterobject::is_string_iter,
         "memory_iterator" => pyre_object::is_seq_iter,
         // Without the layout test every `array.array` descriptor reads a
         // foreign receiver through `W_Array`: the itemsize getter hands back
@@ -19174,8 +19184,8 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         let function_address =
                             unsafe { crate::gateway::builtin_code_get(code) } as *const () as usize;
                         let instance = unsafe { pyre_object::w_method_get_self(function) };
-                        let mut value = (pyre_object::gc_hook::gc_identity_hash(instance as usize)
-                            ^ pyre_object::gc_hook::gc_identity_hash(function_address))
+                        let mut value = (pyre_object::gc_hook::gc_id(instance as usize)
+                            ^ pyre_object::gc_hook::gc_id(function_address))
                             as i64;
                         if value == -1 {
                             value = -2;
@@ -19923,11 +19933,10 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                     let instance = unsafe { pyre_object::w_method_get_self(obj) };
                     let mut descr = descr_of(obj);
                     let instance_hash = pyre_object::with_roots!(descr => {
-                        pyre_object::gc_hook::gc_identity_hash(instance as usize)
+                        pyre_object::gc_hook::gc_id(instance as usize)
                     });
-                    let mut value = (instance_hash
-                        ^ pyre_object::gc_hook::gc_identity_hash(descr as usize))
-                        as i64;
+                    let mut value =
+                        (instance_hash ^ pyre_object::gc_hook::gc_id(descr as usize)) as i64;
                     if value == -1 {
                         value = -2;
                     }
@@ -21987,7 +21996,7 @@ fn instancemethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
         unsafe { pyre_object::instancemethod::w_instancemethod_get_func(roots.get(slot)) };
     let name = instancemethod_func_name(function);
     let live = roots.get(slot);
-    let addr = pyre_object::gc_hook::gc_identity_hash(live as usize);
+    let addr = pyre_object::gc_hook::gc_id(live as usize);
     let text = format!("<<instancemethod {name}> at 0x{addr:x}>");
     Ok(pyre_object::w_str_new_managed(&text))
 }
@@ -35781,11 +35790,10 @@ fn init_bytearray_iterator_type(ns: PyObjectRef) {
     init_sequence_iterator_type_with_next(ns, crate::baseobjspace::bytearray_iter_next_method);
 }
 
-/// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
-/// `__iter__` and `__next__` only.  The shared `W_SeqIterObject` payload
-/// carries the index and length a `__length_hint__` / `__setstate__` would
-/// read, but the type does not expose them, and `__reduce__` falls through to
-/// `object`'s, which refuses to pickle it.
+/// [3.15-spec] `memory_iterator` method surface is `__iter__`/`__next__` only ↔
+/// `W_AbstractSeqIterObject.typedef` (`__length_hint__`/`__setstate__`/`__reduce__`);
+/// evidence: pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+/// `_PyMemoryIter_Type` at v3.15.0 has no `tp_methods`.
 fn init_memory_iterator_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -35815,10 +35823,10 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
     );
 }
 
-/// `arrayiterator`'s Python 3.14 surface: the iteration protocol plus the
-/// `__reduce__` / `__setstate__` pickle pair, but no `__length_hint__` —
-/// `arrayiter_type` declares no `__length_hint__` slot even though the shared
-/// `W_SeqIterObject` payload could answer one.
+/// [3.15-spec] `array.arrayiterator` has `__reduce__`/`__setstate__` but no
+/// `__length_hint__` ↔ `W_AbstractSeqIterObject.typedef`; evidence:
+/// pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+/// `arrayiter_methods` at v3.15.0 (REDUCE + SETSTATE only).
 fn init_array_iterator_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();

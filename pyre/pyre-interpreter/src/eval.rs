@@ -1765,6 +1765,42 @@ pub struct RaiseCause {
     invalid: Option<PyError>,
 }
 
+/// Shadow-stack slots [`RaiseCause::pin`] claimed.
+pub struct RaiseCauseRoots {
+    cause_slot: Option<usize>,
+    invalid_slot: Option<usize>,
+}
+
+impl RaiseCause {
+    /// `framework.py` `push_roots` / `pop_roots`: `w_cause` and the
+    /// invalid `OperationError` (`PyError.message` rstr) stay live across
+    /// `space.call_function` (`instantiate_raised_class`).
+    pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> RaiseCauseRoots {
+        let cause_slot = if !self.w_cause.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(self.w_cause);
+            Some(slot)
+        } else {
+            None
+        };
+        let invalid_slot = self.invalid.as_mut().map(|err| err.pin(roots));
+        RaiseCauseRoots {
+            cause_slot,
+            invalid_slot,
+        }
+    }
+
+    /// `pop_roots`: reload each livevar the pin published.
+    pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, pinned: RaiseCauseRoots) {
+        if let Some(slot) = pinned.cause_slot {
+            self.w_cause = roots.get(slot);
+        }
+        if let (Some(err), Some(slot)) = (self.invalid.as_mut(), pinned.invalid_slot) {
+            err.reload(roots, slot);
+        }
+    }
+}
+
 /// Instantiate the `from` cause of a `raise X from Y` when it is an exception
 /// class, and answer it unchanged otherwise.
 ///
@@ -1845,7 +1881,16 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result
     // chain.  It must still become the context of a new exception raised by
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
-    crate::error::chain_context(exc, get_sys_exception());
+    let roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let mut cause = cause;
+    let cause_pins = cause.as_mut().map(|c| c.pin(&roots));
+    crate::error::chain_context(roots.get(exc_slot), get_sys_exception());
+    let exc = roots.get(exc_slot);
+    if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+        c.reload(&roots, pins);
+    }
     if let Some(RaiseCause { w_cause, invalid }) = cause
         && !w_cause.is_null()
     {
@@ -3916,6 +3961,8 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
+                || pyre_object::is_str_iter(iter)
+                || crate::objspace::std::iterobject::is_string_iter(iter)
                 || pyre_object::is_list_iter(iter)
                 || pyre_object::is_list_reverse_iter(iter)
                 || pyre_object::is_tuple_iter(iter)
@@ -3984,42 +4031,20 @@ impl IterOpcodeHandler for PyFrame {
                 self.set_locals_w(tos, result);
                 return Ok(());
             }
-            // str → list of 1-char strings → seq_iter
+            // str → `unicodeobject.py W_UnicodeObject.descr_iter` via
+            // `space.iter`. A subclass may override `__iter__`.
             if pyre_object::is_str(iter) {
-                // Walk code points through the WTF-8 view so iterating a
-                // surrogateescape / surrogatepass-decoded string yields its
-                // lone surrogates instead of panicking in w_str_get_value.
-                let _roots = pyre_object::gc_roots::push_roots();
-                let iter_slot = pyre_object::gc_roots::pin_roots(&[iter]);
-                let s =
-                    pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(iter_slot))
-                        .to_wtf8_buf();
-                let chars_base = pyre_object::gc_roots::shadow_stack_len();
-                for c in s.code_points() {
-                    let mut one = rustpython_wtf8::Wtf8Buf::new();
-                    one.push(c);
-                    let _ =
-                        pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(one));
-                }
-                let len = pyre_object::gc_roots::shadow_stack_len() - chars_base;
-                let mut chars = Vec::with_capacity(len);
-                for i in 0..len {
-                    chars.push(pyre_object::gc_roots::shadow_stack_get(chars_base + i));
-                }
-                let char_list = pyre_object::w_list_new(chars);
-                let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
+                let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.set_locals_w(tos, seq_iter);
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
-            // bytes/bytearray → seq_iter cursor over the bytes themselves, so
-            // GET_ITER stays O(1) and a bytearray mutated mid-loop is observed
-            // (baseobjspace::iter takes the same shape).
+            // bytes/bytearray → `stringmethods.py StringMethods.descr_iter`
+            // via `space.iter`. A subclass may override `__iter__`.
             if pyre_object::bytesobject::is_bytes_like(iter) {
-                let len = pyre_object::bytesobject::bytes_like_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.set_locals_w(tos, seq_iter);
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
             // dict → iterate over keys.
@@ -4049,13 +4074,12 @@ impl IterOpcodeHandler for PyFrame {
                 self.set_locals_w(tos, set_iter);
                 return Ok(());
             }
-            // array.array → seq_iter cursor (interp_array.py descr_iter
-            // returns space.newseqiter(self)).
+            // array.array → `interp_array.py W_ArrayBase.descr_iter` via
+            // `space.iter`. A subclass may override `__iter__`.
             if pyre_object::interp_array::is_array(iter) {
-                let len = pyre_object::interp_array::w_array_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
-                self.set_locals_w(tos, seq_iter);
+                self.set_locals_w(tos, result);
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__().
@@ -5002,33 +5026,32 @@ impl OpcodeStepExecutor for PyFrame {
                 // cause; report absence as `None` so the value is never
                 // `Some(null)` (mirrors the JIT paths call_jit.rs / trace_opcode.rs).
                 let c = normalize_raise_cause(raw_cause)?;
-                let cause = if c.w_cause.is_null() { None } else { Some(c) };
-                let w_value = self.pop();
+                let mut cause = if c.w_cause.is_null() { None } else { Some(c) };
+                // `normalize_raise_cause` calls a class cause
+                // (`space.call_function(w_cause)`), which can collect and move
+                // this frame. `PyFrame::pop` does not reload, so the second
+                // pop takes the live frame, as `framework.py` `pop_roots`
+                // reloads `self` after the call.
+                let w_value = self.live_mut().pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
-                        // Root the class and the normalized `cause` across the
-                        // instantiation. `instantiate_raised_class` allocates
-                        // (`malloc_fixedsize` → `collect_and_reserve`), and both
-                        // live only in this Rust local until `attach_raise_cause`
+                        // Root the class, the normalized `cause`, and the
+                        // invalid `OperationError` across the instantiation.
+                        // `instantiate_raised_class` allocates
+                        // (`malloc_fixedsize` → `collect_and_reserve`); those
+                        // live only in Rust locals until `attach_raise_cause`
                         // reads them. Re-read each slot afterwards.
                         let _roots = pyre_object::gc_roots::push_roots();
                         let value_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(w_value);
-                        let cause_slot = cause.as_ref().map(|c| {
-                            let slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(c.w_cause);
-                            slot
-                        });
+                        let cause_pins = cause.as_mut().map(|c| c.pin(&_roots));
                         let result = instantiate_raised_class(
                             pyre_object::gc_roots::shadow_stack_get(value_slot),
                         )?;
                         let _ = pyre_object::gc_roots::shadow_stack_get(value_slot);
-                        let cause = cause.map(|mut c| {
-                            if let Some(slot) = cause_slot {
-                                c.w_cause = pyre_object::gc_roots::shadow_stack_get(slot);
-                            }
-                            c
-                        });
+                        if let (Some(c), Some(pins)) = (cause.as_mut(), cause_pins) {
+                            c.reload(&_roots, pins);
+                        }
                         attach_raise_cause(result, cause)?;
                         Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
@@ -8124,5 +8147,181 @@ result = (
             "an unreferenced nursery object must not be promoted"
         );
         assert_ne!(forwarded, dead_before);
+    }
+
+    /// `pyopcode.py GET_ITER` → `space.iter`. The in-place hook is a Rust
+    /// entry point a Python program cannot call on its own.
+    unsafe fn get_iter_tos(frame: &mut PyFrame, iterable: PyObjectRef) -> PyResult {
+        frame.pushvalue(iterable);
+        frame.ensure_iter_value(iterable)?;
+        let tos = frame.valuestackdepth - 1;
+        Ok(locals_w!(frame)[tos])
+    }
+
+    fn exec_source(source: &str) -> crate::pyframe::FrameBox {
+        let (result, frame) = run_exec_frame(source);
+        result.unwrap_or_else(|err| panic!("exec failed: {err:?} {}", err.message_text()));
+        frame
+    }
+
+    fn global(frame: &PyFrame, name: &str) -> PyObjectRef {
+        unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
+            .unwrap_or_else(|| panic!("missing global {name}"))
+    }
+
+    // GET_ITER over a str must keep `unicodeobject.py descr_iter`'s lazy
+    // `W_FastUnicodeIterObject` (3.15-visible `str_iterator`), not a
+    // `sequenceiterator` over an eagerly built list of 1-char strings.
+    #[test]
+    fn test_get_iter_str_yields_code_points_on_lazy_str_iterator() {
+        let mut frame = exec_source(
+            r#"
+s = "a\u00e9\udc80"
+got = []
+for c in s:
+    got.append(c)
+ok = got == ["a", "\u00e9", "\udc80"]
+"#,
+        );
+        assert!(
+            crate::baseobjspace::is_true(global(&frame, "ok")).unwrap(),
+            "for-loop over the 3-code-point str must yield those code points"
+        );
+        unsafe {
+            let s = global(&frame, "s");
+            let it = get_iter_tos(&mut frame, s).expect("GET_ITER over str");
+            assert!(
+                std::ptr::eq((*it).ob_type, &STR_ITER_TYPE),
+                "GET_ITER over a non-ASCII str must return str_iterator"
+            );
+            assert!(
+                !std::ptr::eq((*it).ob_type, &SEQ_ITER_TYPE),
+                "GET_ITER over str must not materialise a sequenceiterator over a list"
+            );
+            let seq = pyre_object::w_fast_unicode_iter_seq(it);
+            assert!(
+                std::ptr::eq(seq, s),
+                "the lazy str iterator must walk the original string"
+            );
+        }
+    }
+
+    // `descroperation.py iter` / `builtin_iter_override`: a heap subtype
+    // that replaces `__iter__` is dispatched by GET_ITER.
+    #[test]
+    fn test_get_iter_honours_subclass_iter_override() {
+        let source = r#"
+class S(str):
+    def __iter__(self):
+        return iter(["s"])
+class B(bytes):
+    def __iter__(self):
+        return iter(["b"])
+class BA(bytearray):
+    def __iter__(self):
+        return iter(["ba"])
+s_obj = S("abc")
+b_obj = B(b"abc")
+ba_obj = BA(b"abc")
+s_got = []
+for c in s_obj:
+    s_got.append(c)
+b_got = []
+for c in b_obj:
+    b_got.append(c)
+ba_got = []
+for c in ba_obj:
+    ba_got.append(c)
+array_ok = True
+try:
+    import array
+    class A(array.array):
+        def __iter__(self):
+            return iter([7])
+    a_got = []
+    for x in A("b", b"\x01\x02"):
+        a_got.append(x)
+    array_ok = a_got == [7]
+except ImportError:
+    pass
+ok = s_got == ["s"] and b_got == ["b"] and ba_got == ["ba"] and array_ok
+"#;
+        let mut frame = exec_source(source);
+        assert!(
+            crate::baseobjspace::is_true(global(&frame, "ok")).unwrap(),
+            "for-loop must honour a subclass __iter__ override"
+        );
+        unsafe {
+            for name in ["s_obj", "b_obj", "ba_obj"] {
+                let obj = global(&frame, name);
+                let it = get_iter_tos(&mut frame, obj)
+                    .unwrap_or_else(|err| panic!("GET_ITER {name}: {err:?}"));
+                let first = crate::baseobjspace::next(it)
+                    .unwrap_or_else(|err| panic!("next after GET_ITER {name}: {err:?}"));
+                let text = pyre_object::w_str_get_wtf8(first);
+                let expected = match name {
+                    "s_obj" => "s",
+                    "b_obj" => "b",
+                    "ba_obj" => "ba",
+                    _ => unreachable!(),
+                };
+                assert_eq!(text.as_str(), Ok(expected), "ensure_iter_value {name}");
+            }
+        }
+    }
+
+    // `descroperation.py iter`: `__iter__ = None` marks the subclass
+    // non-iterable even though the lookup succeeds.
+    #[test]
+    fn test_get_iter_raises_typeerror_when_subclass_iter_is_none() {
+        let source = r#"
+class S(str):
+    __iter__ = None
+class B(bytes):
+    __iter__ = None
+class BA(bytearray):
+    __iter__ = None
+s_obj = S("abc")
+b_obj = B(b"abc")
+ba_obj = BA(b"abc")
+
+def raises_typeerror(obj):
+    try:
+        for _ in obj:
+            return False
+    except TypeError:
+        return True
+    return False
+
+array_ok = True
+try:
+    import array
+    class A(array.array):
+        __iter__ = None
+    array_ok = raises_typeerror(A("b", b"\x01"))
+except ImportError:
+    pass
+ok = (
+    raises_typeerror(s_obj)
+    and raises_typeerror(b_obj)
+    and raises_typeerror(ba_obj)
+    and array_ok
+)
+"#;
+        let mut frame = exec_source(source);
+        assert!(
+            crate::baseobjspace::is_true(global(&frame, "ok")).unwrap(),
+            "for-loop must raise TypeError when subclass __iter__ is None"
+        );
+        unsafe {
+            for name in ["s_obj", "b_obj", "ba_obj"] {
+                let obj = global(&frame, name);
+                frame.pushvalue(obj);
+                let err = frame
+                    .ensure_iter_value(obj)
+                    .expect_err("expected TypeError");
+                assert_eq!(err.kind, PyErrorKind::TypeError, "ensure_iter_value {name}");
+            }
+        }
     }
 }

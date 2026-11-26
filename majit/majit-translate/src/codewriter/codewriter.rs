@@ -290,6 +290,7 @@ impl CodeWriter {
                 &callcontrol.unsafe_fn_stubs,
                 &callcontrol.foreign_opaque_method_externals,
                 &callcontrol.atomic_load_decls,
+                &callcontrol.fun_decl_identity_aliases,
                 &registry,
             );
         if let Err(err) = populate_result {
@@ -2367,7 +2368,9 @@ mod opname_spine_prejit_tests {
     /// (`_handle_stroruni_call`, `jtransform.py`).
     #[test]
     fn opname_spine_direct_call_to_strconcat_helper_is_str_concat_residual() {
-        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = build_ll_strconcat_helper_graph(&rtyper, "ll_strconcat", STRPTR.clone())
             .expect("build_ll_strconcat_helper_graph");
         let ft = FuncType {
             args: vec![STRPTR.clone(), STRPTR.clone()],
@@ -2640,7 +2643,9 @@ mod opname_spine_prejit_tests {
                 "ll_strconcat".to_string(),
                 vec![STRPTR.clone(), STRPTR.clone()],
                 STRPTR.clone(),
-                move |_r, _a, _res| build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone()),
+                move |rtyper, _a, _res| {
+                    build_ll_strconcat_helper_graph(rtyper, "ll_strconcat", STRPTR.clone())
+                },
             )
             .expect("ll_strconcat helper");
         let concat_fn = functionptr_const(&rtyper, &concat).expect("ll_strconcat funcptr");

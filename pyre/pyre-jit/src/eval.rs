@@ -1556,8 +1556,10 @@ unsafe fn list_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
 /// off-heap `*const BufferView` (`memoryview.rs`), so the macro's empty
 /// `gc_ptr_offsets` reach none of the refs the collector must keep alive.
-/// Forward the root exporter `PyObjectRef` of a `Buffer`, descending through
-/// any `Sub` window to the leaf whose exporter actually owns the storage.
+/// Forward the root managed reference of a `Buffer`, descending through any
+/// `Sub` window to the leaf whose exporter owns the storage. For cpyext's
+/// `External` buffer this is the headerless carrier, not a Python object; the
+/// carrier's registered pointer offset forwards its exporter separately.
 fn trace_buffer_exporter(
     buf: &mut pyre_object::buffer::Buffer,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -2766,15 +2768,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::iterobject::W_SeqIterObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // The producer-specific str / bytes / bytearray / memoryview / array
-    // iterator identities carry the same `W_SeqIterObject` payload and traced
-    // `seq` edge, so they alias its vtable rather than minting ids of their
-    // own — the shape the six dict view iterators use below.
+    // The producer-specific memoryview / array iterator identities
+    // carry the same `W_SeqIterObject` payload and traced `seq` edge, so
+    // they alias its vtable rather than minting ids of their own — the
+    // shape the six dict view iterators use below.
+    // `str_iterator` / `str_ascii_iterator` use `W_FastUnicodeIterObject`.
+    // `bytes_iterator` / `bytearray_iterator` use interpreter
+    // `iterobject.py W_StringIterObject`.
     for tp in [
-        &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
-        &pyre_object::iterobject::STR_ITER_TYPE,
-        &pyre_object::iterobject::BYTES_ITER_TYPE,
-        &pyre_object::iterobject::BYTEARRAY_ITER_TYPE,
         &pyre_object::iterobject::MEMORY_ITER_TYPE,
         &pyre_object::iterobject::ARRAY_ITER_TYPE,
     ] {
@@ -5294,6 +5295,54 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::lazyimport::W_LazyImportObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `iterobject.py W_FastUnicodeIterObject` — AUTO-ID at the interpreter
+    // tail so earlier ids do not move.  `str_ascii_iterator` shares the
+    // payload and traced `seq` edge.
+    let fast_unicode_iter_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::iterobject::W_FastUnicodeIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    {
+        let tp = &pyre_object::iterobject::STR_ASCII_ITER_TYPE;
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            fast_unicode_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, fast_unicode_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_object::iterobject::W_FastUnicodeIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
+    // `iterobject.py W_StringIterObject` — AUTO-ID after
+    // `W_FastUnicodeIterObject`.  `bytearray_iterator` shares the payload
+    // and traced `seq` edge.
+    let string_iter_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::objspace::std::iterobject::W_StringIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    {
+        let tp = &pyre_interpreter::objspace::std::iterobject::BYTEARRAY_ITER_TYPE;
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            string_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, string_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_interpreter::objspace::std::iterobject::W_StringIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
     // The classes `pyre-module` registers close the rclass census, numbered
     // from `MODULE_FIRST_TYPE_ID` in the order its hooks list them.
     assert_eq!(
@@ -6133,6 +6182,24 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     pyre_object::rweakkeydict::WEAKKEYDICT_GC_TYPE_ID_CELL.set(weakkeydict_tid);
     pyre_object::rweakkeydict::set_weakkeydict_gc_type_id(weakkeydict_tid);
+    // `pypy.module.cpyext.buffer.CPyBuffer`: an interpreter-level BufferView,
+    // not a W_Root. Its exporter is the single managed pointer, and no typedef
+    // means `gc.get_objects()` expands past the carrier instead of returning it.
+    let cpybuffer_carrier_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::cpybuffer::CPYBUFFER_CARRIER_GC_TYPE_ID_CELL),
+        || {
+            majit_gc::trace::TypeInfo::with_gc_ptrs(
+                std::mem::size_of::<pyre_object::cpybuffer::CPyBufferCarrier>(),
+                vec![std::mem::offset_of!(
+                    pyre_object::cpybuffer::CPyBufferCarrier,
+                    w_obj
+                )],
+            )
+            .without_app_level_typedef()
+        },
+    );
+    pyre_object::cpybuffer::CPYBUFFER_CARRIER_GC_TYPE_ID_CELL.set(cpybuffer_carrier_tid);
+    pyre_object::cpybuffer::set_cpybuffer_carrier_gc_type_id(cpybuffer_carrier_tid);
     // Optional-module headerless GC instances (`OptionalModuleHooks.raw_gc_types`).
     // `func.py RawBytes` is the product case: a headerless GC instance whose
     // light destructor (`RawBytes.__del__`) frees the `str2charp` block. Same
@@ -9252,10 +9319,36 @@ fn get_printable_location_genentry(pycode: pyre_object::PyObjectRef) -> String {
 /// greenkey while another `MetaInterp` is tracing; a fire parks at 0.98
 /// and `send_ex` continues in the interpreter. With no extracted portal
 /// jitcode the enter returns the same way.
+///
+/// The enter ticks `increment_threshold` (`maybe_enter_jit`).
 fn genentry_merge_point_jit(
     w_gen: pyre_object::PyObjectRef,
     w_arg: pyre_object::PyObjectRef,
     pycode: pyre_object::PyObjectRef,
+) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    genentry_maybe_compile_and_run(w_gen, w_arg, pycode, false)
+}
+
+/// `warmspot.py ll_portal_runner` for `generatorentry_driver`:
+/// `maybe_compile_and_run(state.increment_function_threshold, *args)`
+/// before `portal_ptr`.
+fn genentry_function_entry_jit(
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+    pycode: pyre_object::PyObjectRef,
+) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    genentry_maybe_compile_and_run(w_gen, w_arg, pycode, true)
+}
+
+/// `warmstate.py maybe_compile_and_run(increment, *args)` on
+/// `generatorentry_driver`. `function_entry` picks
+/// `increment_function_threshold` (`ll_portal_runner`) over
+/// `increment_threshold` (the inserted `can_enter_jit`).
+fn genentry_maybe_compile_and_run(
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+    pycode: pyre_object::PyObjectRef,
+    function_entry: bool,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
     // `warmstate.py maybe_compile_and_run`: `increment_threshold == 0`
     // returns before hashing greens (`jit_is_off`).
@@ -9263,6 +9356,22 @@ fn genentry_merge_point_jit(
         return None;
     }
     if w_gen.is_null() || pycode.is_null() {
+        return None;
+    }
+    // `if increment_threshold == 0: return # jit is off`, on the increment
+    // this door passes, before `JitCell.get_uhash(*greenargs)`.
+    let increment_is_zero = driver_pair()
+        .0
+        .meta_interp()
+        .warm_state_ref_for_driver(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX)
+        .is_some_and(|warm| {
+            if function_entry {
+                warm.function_entry_jit_is_off()
+            } else {
+                warm.back_edge_jit_is_off()
+            }
+        });
+    if increment_is_zero {
         return None;
     }
     let roots = pyre_object::gc_roots::push_roots();
@@ -9287,8 +9396,7 @@ fn genentry_merge_point_jit(
     let pycode = pin.get() as pyre_object::PyObjectRef;
     // warmstate.py maybe_compile_and_run: a miss ticks
     // `JitCell.get_uhash(*greenargs)` and does not create a cell.
-    // `cell.flags & JC_TRACING` is read only when a cell was found
-    // (`back_edge_step` → AlreadyTracing).
+    // `cell.flags & JC_TRACING` is read only when a cell was found.
     let mut live = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
     let hash = live.get_uhash();
     pin.reload(&mut live);
@@ -9305,11 +9413,14 @@ fn genentry_merge_point_jit(
     let _pycode = pin.get() as pyre_object::PyObjectRef;
     let w_gen = roots.get(base + 1);
     let w_arg = roots.get(base + 2);
-    // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
-    // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
-    // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
-    // counting, and the tick is on the one runner `jitcounter`.
-    let (hot, _, procedure_token) = {
+    // `maybe_compile_and_run` on `generatorentry_driver`'s
+    // `jitdriver_sd.warmstate`: a compiled cell is `EnterJitAssembler` on
+    // every call, a `JC_TEMPORARY` cell keeps counting, and the tick is on
+    // the one runner `jitcounter`. `rewrite_can_enter_jit` inserts a
+    // `can_enter_jit` at the portal start (`increment_threshold`), and
+    // `ll_portal_runner` runs its own decision first
+    // (`increment_function_threshold`).
+    let (tracing, procedure_token) = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
         let reds = confirm_reds_if_installed(
@@ -9317,15 +9428,32 @@ fn genentry_merge_point_jit(
             jd_no,
             pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg),
         );
-        driver
-            .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
-    };
-    let tracing = match hot {
-        majit_metainterp::warmstate::HotResult::StartTracing => true,
-        majit_metainterp::warmstate::HotResult::RunCompiled => false,
-        majit_metainterp::warmstate::HotResult::NotHot
-        | majit_metainterp::warmstate::HotResult::AlreadyTracing => return None,
+        let meta = driver.meta_interp_mut();
+        if function_entry {
+            match meta.function_entry_step_on_driver(
+                jd_no,
+                resolved,
+                pin.save(),
+                0,
+                Some((live.values.as_slice(), live.types.as_slice())),
+                &reds,
+            ) {
+                FunctionEntryStep::Proceed => (true, None),
+                FunctionEntryStep::RunCompiled(token) => (false, Some(token)),
+                FunctionEntryStep::NotHot => return None,
+            }
+        } else {
+            match meta.maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds) {
+                (majit_metainterp::warmstate::HotResult::StartTracing, _, _) => (true, None),
+                (majit_metainterp::warmstate::HotResult::RunCompiled, _, token) => (false, token),
+                (
+                    majit_metainterp::warmstate::HotResult::NotHot
+                    | majit_metainterp::warmstate::HotResult::AlreadyTracing,
+                    _,
+                    _,
+                ) => return None,
+            }
+        }
     };
     let pycode = pin.get() as pyre_object::PyObjectRef;
     let w_gen = roots.get(base + 1);
@@ -12833,7 +12961,7 @@ fn generatorentry_ll_portal_runner(
 
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
-    if let Some(result) = genentry_merge_point_jit(w_gen, w_arg, pycode) {
+    if let Some(result) = genentry_function_entry_jit(w_gen, w_arg, pycode) {
         return result;
     }
     pycode = roots.get(base);

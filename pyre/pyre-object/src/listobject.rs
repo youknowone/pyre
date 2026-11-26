@@ -132,22 +132,37 @@ pub fn list_locks_after_fork_child() {
     LIST_LOCKS.after_fork_child();
 }
 
+/// `llmemory.itemoffsetof(ARRAY, 0)` of a length-prefixed `GcArray` whose
+/// item is `item_size` bytes: the length word rounded up to the item's
+/// alignment (a scalar or pointer aligns to its width, at most 8), the
+/// rule the codewriter's `arraydescrof` uses for the same ARRAY.
+const fn itemoffsetof(item_size: usize) -> usize {
+    let align = if item_size >= 8 {
+        8
+    } else {
+        item_size.next_power_of_two()
+    };
+    std::mem::size_of::<usize>().next_multiple_of(align)
+}
+
+const _: () = assert!(
+    itemoffsetof(std::mem::size_of::<PyObjectRef>())
+        == crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET
+);
+const _: () = assert!(itemoffsetof(8) == TYPED_ITEMS_BLOCK_ITEMS_OFFSET);
+
 /// Items and `len(p)` of one ARRAY. `rgc.py ll_arrayclear` /
 /// `ll_arrayfill` are `@specialize.ll()`: `len(p)` is the word at
 /// offset 0 (`TypeInfo.length_offset`), and items start at
-/// `llmemory.itemoffsetof(ARRAY, 0)`, a constant of the specialization:
-/// [`TYPED_ITEMS_BLOCK_ITEMS_OFFSET`] for the int/float item blocks and
-/// `object_array::ITEMS_BLOCK_ITEMS_OFFSET` for the object one (they differ
-/// on a 32-bit target, where the object block's header is one 4-byte word).
+/// `llmemory.itemoffsetof(ARRAY, 0)`, a constant of the specialization.
 /// Follow a forwarding word with `try_gc_current_object_address`.
-
 struct ArrayItems {
     address: usize,
     items: *mut u8,
     length: usize,
 }
 
-fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
+fn array_items(p: i64, item_size: usize) -> Option<ArrayItems> {
     if p == 0 {
         return None;
     }
@@ -157,7 +172,7 @@ fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
         return None;
     }
     let length = unsafe { *(address as *const usize) };
-    let items = unsafe { (address as *mut u8).add(items_offset) };
+    let items = unsafe { (address as *mut u8).add(itemoffsetof(item_size)) };
     Some(ArrayItems {
         address,
         items,
@@ -167,8 +182,8 @@ fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
 
 /// `rgc.py ll_arrayclear`: `raw_memclear` of `sizeof(ARRAY.OF) * length`.
 /// No write barrier: writing NULL never creates an old->young reference.
-fn ll_arrayclear_body(p: i64, items_offset: usize, item_size: usize) {
-    let Some(arr) = array_items(p, items_offset) else {
+fn ll_arrayclear_body(p: i64, item_size: usize) {
+    let Some(arr) = array_items(p, item_size) else {
         return;
     };
     let nbytes = arr
@@ -180,8 +195,8 @@ fn ll_arrayclear_body(p: i64, items_offset: usize, item_size: usize) {
 
 /// `rgc.py ll_arrayfill`: one `gc_writebarrier`, then
 /// `bare_setarrayitem` at `sizeof(T)` for every slot.
-fn ll_arrayfill_copy<T: Copy>(p: i64, items_offset: usize, item: T) {
-    let Some(arr) = array_items(p, items_offset) else {
+fn ll_arrayfill_copy<T: Copy>(p: i64, item: T) {
+    let Some(arr) = array_items(p, std::mem::size_of::<T>()) else {
         return;
     };
     unsafe {
@@ -201,79 +216,79 @@ fn ll_arrayfill_copy<T: Copy>(p: i64, items_offset: usize, item: T) {
 /// `rgc.py ll_arrayclear` for a 1-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i1(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 1);
+    ll_arrayclear_body(p, 1);
 }
 
 /// `rgc.py ll_arrayfill` for a 1-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 1-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i1(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u8);
+    ll_arrayfill_copy(p, item as u8);
 }
 
 /// `rgc.py ll_arrayclear` for a 2-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i2(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 2);
+    ll_arrayclear_body(p, 2);
 }
 
 /// `rgc.py ll_arrayfill` for a 2-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 2-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i2(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u16);
+    ll_arrayfill_copy(p, item as u16);
 }
 
 /// `rgc.py ll_arrayclear` for a 4-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i4(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+    ll_arrayclear_body(p, 4);
 }
 
 /// `rgc.py ll_arrayfill` for a 4-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 4-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i4(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u32);
+    ll_arrayfill_copy(p, item as u32);
 }
 
 /// `rgc.py ll_arrayclear` for an 8-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i8(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+    ll_arrayclear_body(p, 8);
 }
 
 /// `rgc.py ll_arrayfill` for an 8-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at an 8-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i8(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 /// `rgc.py ll_arrayclear` for `GcArray(Float)`.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_f(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+    ll_arrayclear_body(p, 8);
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(Float)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` for every slot.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_f(p: i64, item: f64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 /// `rgc.py ll_arrayclear` for `GcArray(SingleFloat)`.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_s(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+    ll_arrayclear_body(p, 4);
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(SingleFloat)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 4-byte stride. The residual ABI is the
 /// call stub's C `float` (`descr.py CallDescr.create_call_stub` `'S'`).
 pub extern "C" fn ll_arrayfill_s(p: i64, item: f32) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -304,22 +319,14 @@ fn register_ll_arrayfill_s() {
 /// zeroing.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_r(p: i64) {
-    ll_arrayclear_body(
-        p,
-        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<PyObjectRef>(),
-    );
+    ll_arrayclear_body(p, std::mem::size_of::<PyObjectRef>());
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(OBJECTPTR)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` for every slot.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_r(p: i64, item: i64) {
-    ll_arrayfill_copy(
-        p,
-        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        item as usize as PyObjectRef,
-    );
+    ll_arrayfill_copy(p, item as usize as PyObjectRef);
 }
 
 #[repr(u8)]
@@ -937,30 +944,36 @@ impl W_ListObject {
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let _ = prepare_list_ref_store(obj, crate::gc_roots::shadow_stack_get(root_base + 1));
         // The shift below moves items across card pages; generalize first.
-        // The barrier answers with the list's post-barrier address, so this is
-        // the reload the following store needs as well.  `value` is the same
-        // livevar: `prepare_list_ref_store` and the move-barrier are both
-        // safepoints, so the store takes the slot, not the pre-barrier local.
-        let obj = list_before_move_barrier(crate::gc_roots::shadow_stack_get(root_base));
+        // The barrier now lives in `ll_arraymove` (rgc.py `gc_writebarrier_before_move`).
+        // `value` is the same livevar: `prepare_list_ref_store` is a
+        // safepoint, so the store takes the slot, not the pre-barrier local.
+        let obj = crate::gc_roots::shadow_stack_get(root_base);
         let value = crate::gc_roots::shadow_stack_get(root_base + 1);
         let list = &mut *(obj as *mut W_ListObject);
-        let base = items_block_items_base(list.items);
-        let p = base.add(index);
-        std::ptr::copy(p, p.add(1), list.length_relaxed() - index);
+        // rlist.py ll_insert_nonneg: ll_arraymove(l.items, index, index + 1, length - index).
+        crate::object_array::ll_arraymove_items_block(
+            list.items,
+            index as i64,
+            index as i64 + 1,
+            (list.length_relaxed() - index) as i64,
+        );
         items_block_set_ref(list.items, index, value);
         list.set_length_relaxed(list.length_relaxed() + 1);
     }
 
     unsafe fn object_remove(&mut self, index: usize, empty_clears: bool) -> PyObjectRef {
         assert!(index < self.length_relaxed());
-        // `list_before_move_barrier` returns the list it was handed; the body
-        // continues on that word.
-        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
+        let obj = self as *mut W_ListObject as PyObjectRef;
         let this = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(this.items);
         let value = *base.add(index);
-        let p = base.add(index);
-        std::ptr::copy(p.add(1), p, this.length_relaxed() - index - 1);
+        // rlist.py ll_delitem_nonneg: ll_arraymove(l.items, index + 1, index, newlength - index).
+        crate::object_array::ll_arraymove_items_block(
+            this.items,
+            index as i64 + 1,
+            index as i64,
+            (this.length_relaxed() - index - 1) as i64,
+        );
         // `rlist.py ll_delitem_nonneg`: `ll_arraymove` then
         // `ll_setitem_fast(newlength, null)` then `_ll_resize_le`.
         let newlength = this.length_relaxed() - 1;
@@ -996,13 +1009,15 @@ impl W_ListObject {
         if count == 0 {
             return;
         }
-        // `list_before_move_barrier` returns the list it was handed; the body
-        // continues on that word.
-        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
+        let obj = self as *mut W_ListObject as PyObjectRef;
         let this = &mut *(obj as *mut W_ListObject);
-        let base = items_block_items_base(this.items);
-        let p = base.add(start);
-        std::ptr::copy(p.add(count), p, this.length_relaxed() - end);
+        // rlist.py ll_listdelslice_startstop: ll_arraymove(l.items, stop, start, length - stop).
+        crate::object_array::ll_arraymove_items_block(
+            this.items,
+            (start + count) as i64,
+            start as i64,
+            (this.length_relaxed() - end) as i64,
+        );
         let old_len = this.length_relaxed();
         this.set_length_relaxed(this.length_relaxed() - count);
         // `rlist.py ll_listdelslice_startstop`: `ll_arraymove` then
@@ -1042,37 +1057,36 @@ impl W_ListObject {
                 if crate::gc_hook::gc_alloc_failed_pending() {
                     return;
                 }
-                // `object_insert` / `object_remove`: `list_before_move_barrier`
-                // then `ptr::copy`. `rgc.py ll_arraycopy` /
-                // `incminimark.py writebarrier_before_move`.
-                let obj = list_before_move_barrier(obj);
                 let list = &mut *(obj as *mut W_ListObject);
-                let base = items_block_items_base(list.items);
-                std::ptr::copy(
-                    base.add(s + slicelength),
-                    base.add(s + len2),
-                    old_len - s - slicelength,
+                // rlist.py ll_listsetslice: ll_arraymove(l.items, s + slicelength, s + len2, old_len - s - slicelength).
+                crate::object_array::ll_arraymove_items_block(
+                    list.items,
+                    (s + slicelength) as i64,
+                    (s + len2) as i64,
+                    (old_len - s - slicelength) as i64,
                 );
                 list.set_length_relaxed(new_len);
             } else {
-                let obj = list_before_move_barrier(crate::gc_roots::shadow_stack_get(obj_slot));
+                let obj = crate::gc_roots::shadow_stack_get(obj_slot);
                 let list = &mut *(obj as *mut W_ListObject);
-                let base = items_block_items_base(list.items);
-                std::ptr::copy(
-                    base.add(s + slicelength),
-                    base.add(s + len2),
-                    old_len - s - slicelength,
+                // rlist.py ll_listsetslice: ll_arraymove(l.items, s + slicelength, s + len2, old_len - s - slicelength).
+                crate::object_array::ll_arraymove_items_block(
+                    list.items,
+                    (s + slicelength) as i64,
+                    (s + len2) as i64,
+                    (old_len - s - slicelength) as i64,
                 );
                 list.set_length_relaxed(new_len);
             }
         } else if slicelength > len2 {
-            let obj = list_before_move_barrier(crate::gc_roots::shadow_stack_get(obj_slot));
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
             let list = &mut *(obj as *mut W_ListObject);
-            let base = items_block_items_base(list.items);
-            std::ptr::copy(
-                base.add(s + slicelength),
-                base.add(s + len2),
-                old_len - s - slicelength,
+            // rlist.py ll_listsetslice: ll_arraymove(l.items, s + slicelength, s + len2, old_len - s - slicelength).
+            crate::object_array::ll_arraymove_items_block(
+                list.items,
+                (s + slicelength) as i64,
+                (s + len2) as i64,
+                (old_len - s - slicelength) as i64,
             );
             // Shrinking splice: `ll_setitem_fast` of null on the vacated tail.
             for i in new_len..old_len {
@@ -2104,29 +2118,6 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     }
 }
 
-/// Generalize the items block's cards before its items are permuted in place,
-/// and answer with the list at its post-barrier address.
-///
-/// A move stores no new reference, so `list_write_barrier` does not answer for
-/// it: the referenced set is unchanged and only which card page holds each
-/// pointer moves. A minor reaches a carded array through its dirty pages
-/// alone, so a young pointer shifted into a clean page would not be scanned.
-///
-/// The barrier reads the block's header, so the block is reached through the
-/// list here rather than handed over by the caller, and the caller continues on
-/// the returned list word.
-#[majit_macros::dont_look_inside]
-pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
-    // `write_barrier_from_array` / `write_barrier_before_move` is not a
-    // collection (`incminimark.py`); the list pointer is stable across it.
-    let list = unsafe { &*(obj as *const W_ListObject) };
-    let block = list_gc_ref_items_block(list);
-    if !block.is_null() {
-        crate::gc_hook::try_gc_write_barrier_before_move(block);
-    }
-    obj
-}
-
 /// Run the list's pre-write barrier and answer with `value`.
 ///
 /// `dont_look_inside`: the barrier residualizes via the registered fnaddr so
@@ -3058,8 +3049,8 @@ unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
     if !crate::objlock::stripes_taken() {
         return (w_list_lock(a), w_list_lock(b));
     }
-    let a_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(a) as usize);
-    let b_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(b) as usize);
+    let a_key = crate::gc_hook::gc_id(crate::mapdict::instance_getclass(a) as usize);
+    let b_key = crate::gc_hook::gc_id(crate::mapdict::instance_getclass(b) as usize);
     let a_index = crate::objlock::stripe_index(a_key);
     let b_index = crate::objlock::stripe_index(b_key);
     if a_index == b_index {
@@ -10688,6 +10679,25 @@ mod tests {
                 crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
                 3
             );
+        }
+    }
+
+    #[test]
+    fn object_remove_moves_the_tail() {
+        let items: Vec<PyObjectRef> = (0..5).map(w_int_new).collect();
+        let list = w_list_new_object(items);
+        unsafe {
+            assert!(w_list_uses_object_storage(list));
+            let removed = w_list_pop(list, 2, true).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(removed), 2);
+            assert_eq!(w_list_len(list), 4);
+            let expect = [0, 1, 3, 4];
+            for (i, v) in expect.iter().enumerate() {
+                assert_eq!(
+                    crate::intobject::w_int_get_value(w_list_getitem(list, i as i64).unwrap()),
+                    *v
+                );
+            }
         }
     }
 }

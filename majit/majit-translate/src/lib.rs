@@ -247,12 +247,13 @@ fn build_semantic_program_via_active_frontend(
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
+            let mut fun_decl_identity_aliases = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
             let mut eval_override_graphs = Vec::new();
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
-            let mut fnptr_field_families = Vec::new();
+            let mut fnptr_family_inputs = front::mir::FnPtrFamilyInputs::default();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut repr_transparent = std::collections::HashSet::new();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
@@ -393,11 +394,7 @@ fn build_semantic_program_via_active_frontend(
                         profilefunc_spellings.push(spelling);
                     }
                 }
-                for row in front::mir::discover_fnptr_field_families(&llbc) {
-                    if !fnptr_field_families.contains(&row) {
-                        fnptr_field_families.push(row);
-                    }
-                }
+                fnptr_family_inputs.merge(front::mir::collect_fnptr_family_inputs(&llbc));
                 prof.mark(&format!("    harvest {p}"));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
@@ -409,6 +406,8 @@ fn build_semantic_program_via_active_frontend(
                 profilefunc_graphs.clone(),
                 profilefunc_spellings.clone(),
             );
+            let fnptr_field_families =
+                front::mir::resolve_fnptr_field_families(&fnptr_family_inputs);
 
             let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
                 static_addrs,
@@ -449,6 +448,9 @@ fn build_semantic_program_via_active_frontend(
                 if !profilefunc_spellings.is_empty() {
                     llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
                 }
+                if !fnptr_field_families.is_empty() {
+                    front::mir::seed_fnptr_field_families(&llbc, fnptr_field_families.clone());
+                }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
@@ -461,27 +463,20 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
-                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                foreign_opaque_method_externals
-                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                let prog = graph_bodies.lower_prelinked_crate(
+                fun_decl_identity_aliases
+                    .extend(front::mir::collect_fun_decl_identity_aliases(&llbc));
+                // Stub FUNC.RESULT is computed after intern-row harvest
+                // inside `lower_prelinked_crate` so the classifier reads
+                // the same registry ordinary lowering uses.
+                let mut prog = graph_bodies.lower_prelinked_crate(
                     llbc,
                     module_paths,
                     &cross_tombstoned_leaves,
                     &gc_struct_ids,
                     &raw_alloc_flavor_structs,
                 );
+                unsafe_fn_stubs.append(&mut prog.unsafe_fn_stubs);
+                foreign_opaque_method_externals.append(&mut prog.foreign_opaque_method_externals);
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,
@@ -507,6 +502,7 @@ fn build_semantic_program_via_active_frontend(
                 exact_layouts: std::collections::HashMap::new(),
                 struct_ids: std::collections::HashMap::new(),
                 unsafe_fn_stubs: Vec::new(),
+                fun_decl_identity_aliases: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
                 fnptr_field_families: Vec::new(),
@@ -521,6 +517,7 @@ fn build_semantic_program_via_active_frontend(
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
+            program.fun_decl_identity_aliases = fun_decl_identity_aliases;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
             return (
@@ -914,9 +911,10 @@ fn unique_call_path_by_graph_key(
 }
 
 /// Bind `unique` as an alias of the harvest path this funcobj was just
-/// registered under. No-op when `unique` is already a spelling, when
+/// registered under. No-op when `unique` already names this funcobj, when
 /// `registered` names a different funcobj, or when `unique` is the harvest
-/// path itself.
+/// path itself. An identity that already names a different GraphKey is a
+/// FunDecl-identity collision (`bookkeeper.py Bookkeeper.getdesc`).
 fn alias_unique_call_path(
     call_control: &mut call::CallControl,
     unique: Option<&crate::parse::CallPath>,
@@ -930,7 +928,15 @@ fn alias_unique_call_path(
         return;
     }
     let graphs = call_control.function_graphs_mut();
-    if graphs.names_funcobj(unique) {
+    if let Some(occupant) = graphs.key_for(unique) {
+        if occupant != *expected_key {
+            panic!(
+                "FunDecl identity {} already names GraphKey {occupant:?}, \
+                 expected {expected_key:?} (bookkeeper.py Bookkeeper.getdesc: \
+                 two function objects must not share a desc)",
+                unique.display_name()
+            );
+        }
         return;
     }
     let Some(key) = graphs.key_for(registered) else {
@@ -990,7 +996,7 @@ fn harvest_call_paths(func: &front::semantic::SemanticFunction) -> Vec<crate::pa
 }
 
 fn register_function_graph_alias(
-    graphs: &mut std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
+    graphs: &mut indexmap::IndexMap<crate::parse::CallPath, call::GraphSource>,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
@@ -1023,7 +1029,7 @@ fn register_function_graph_alias(
 /// (`CallControl::lookup_function_fnaddr`); the host publishes the source
 /// path once (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`).
 fn pin_builtin_graphs(
-    graphs: &std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
+    graphs: &indexmap::IndexMap<crate::parse::CallPath, call::GraphSource>,
     bindings: &[(String, crate::parse::CallPath)],
     call_control: &mut call::CallControl,
 ) {
@@ -1889,10 +1895,10 @@ fn analyze_pipeline_from_module_paths(
         crate::model::LazyGraph,
         Option<u64>,
     )> = Vec::new();
-    let mut canonical_function_graphs: std::collections::HashMap<
+    let mut canonical_function_graphs: indexmap::IndexMap<
         crate::parse::CallPath,
         call::GraphSource,
-    > = std::collections::HashMap::new();
+    > = indexmap::IndexMap::new();
     // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
@@ -2210,6 +2216,7 @@ fn analyze_pipeline_from_module_paths(
     // `CallControl::unsafe_fn_stubs`.  Sourced from Charon and populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    call_control.fun_decl_identity_aliases = program.fun_decl_identity_aliases.clone();
     call_control.atomic_load_decls = program.atomic_load_decls.clone();
     // `rpython.rtyper.extregistry.register_external` parity for the three
     // shadow-stack operations `eval::FrameAnchor` reaches.  `majit_gc` is not
@@ -2240,11 +2247,15 @@ fn analyze_pipeline_from_module_paths(
             Some("u64".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],
             Signature::new(vec!["depth".into()], None, None),
             Some("gcref".into()),
+            None,
+            None,
             None,
             None,
         ),
@@ -2255,6 +2266,8 @@ fn analyze_pipeline_from_module_paths(
                 "try_pop_to".into(),
             ],
             Signature::new(vec!["depth".into()], None, None),
+            None,
+            None,
             None,
             None,
             None,
@@ -2274,6 +2287,8 @@ fn analyze_pipeline_from_module_paths(
             Some("u64".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec![
@@ -2282,6 +2297,8 @@ fn analyze_pipeline_from_module_paths(
                 "release_owner_root".into(),
             ],
             Signature::new(vec!["index".into()], None, None),
+            None,
+            None,
             None,
             None,
             None,
@@ -2296,6 +2313,8 @@ fn analyze_pipeline_from_module_paths(
             Some("gcref".into()),
             None,
             None,
+            None,
+            None,
         ),
         (
             vec![
@@ -2307,6 +2326,8 @@ fn analyze_pipeline_from_module_paths(
             None,
             None,
             None,
+            None,
+            None,
         ),
         // `framework.py` keeps the GC as a prebuilt constant, so a nursery
         // request always has a route. This query is the port's stand-in and
@@ -2315,6 +2336,8 @@ fn analyze_pipeline_from_module_paths(
             vec!["majit_gc".into(), "gc_allocator_installed".into()],
             Signature::new(vec![], None, None),
             Some("bool".into()),
+            None,
+            None,
             None,
             None,
         ),
@@ -2331,6 +2354,8 @@ fn analyze_pipeline_from_module_paths(
             Some("ref".into()),
             None,
             None,
+            None,
+            None,
         ),
         // `executioncontext.py enter` writes `f_backref` through this
         // diagnostic store probe. `majit_gc` is not extracted, so the
@@ -2345,6 +2370,8 @@ fn analyze_pipeline_from_module_paths(
                 None,
                 None,
             ),
+            None,
+            None,
             None,
             None,
             None,
@@ -3072,6 +3099,11 @@ fn analyze_pipeline_from_module_paths(
                 .mark_canonical_path(&harvest);
         }
     }
+    // Residual FunDecls collected as signature-only stubs. Each
+    // producer has the FunDecl: bind identity onto its own harvest
+    // when harvest is free. A harvest occupant is another funcobj
+    // (`Bookkeeper.getdesc`); do not infer from call-site harvest.
+    call_control.publish_residual_fun_decl_identities();
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
