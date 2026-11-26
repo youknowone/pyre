@@ -962,15 +962,16 @@ fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
     }
 }
 
-/// Box one element at byte offset `base` per the view's format.  The
-/// number of bytes read is the native size of the format character.
-/// PyPy's `buffer.py value_from_bytes` supplies the numeric decoding
+/// Box one `itemsize`-wide element at byte offset `base` per the view's
+/// format. PyPy's `BufferView.w_getitem` supplies the item-sized window,
+/// and `buffer.py value_from_bytes` supplies the numeric decoding
 /// shape; an unsupported one-character code is rejected.  `c` yields a
 /// length-1 bytes and `?` a bool.
 unsafe fn memoryview_unpack_element(
     fmt: &str,
     data: &[u8],
     base: usize,
+    itemsize: usize,
 ) -> Result<PyObjectRef, crate::PyError> {
     let Some((_, size)) = memoryview_native_fmtchar(fmt) else {
         return Err(crate::PyError::not_implemented(format!(
@@ -979,12 +980,24 @@ unsafe fn memoryview_unpack_element(
         )));
     };
     let size = size as usize;
-    let buf = data.get(base..base + size).ok_or_else(|| {
-        crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "memoryview: buffer is smaller than its format's item size".to_string(),
-        )
-    })?;
+    let buf = base
+        .checked_add(itemsize)
+        .and_then(|end| data.get(base..end))
+        .ok_or_else(|| {
+            crate::module::r#struct::struct_error("unpack str size too short for format")
+        })?;
+    // `UnpackFormatIterator.advance` / `finished` require exactly the
+    // native format's size within the exporter's item-sized window.
+    if buf.len() < size {
+        return Err(crate::module::r#struct::struct_error(
+            "unpack str size too short for format",
+        ));
+    }
+    if buf.len() > size {
+        return Err(crate::module::r#struct::struct_error(
+            "unpack str size too long for format",
+        ));
+    }
     Ok(match memoryview_format_code(fmt) {
         b'c' => pyre_object::bytesobject::w_bytes_from_bytes(buf),
         b'?' => w_bool_from(buf.iter().any(|&x| x != 0)),
@@ -1016,8 +1029,8 @@ unsafe fn memoryview_unpack_element(
             let w = pyre_object::interp_array::unpack_value(tc, buf);
             if w != pyre_object::PY_NULL {
                 w
-            } else if size <= size_of::<i64>() {
-                w_int_new(memoryview_unpack(data, size, base))
+            } else if itemsize <= size_of::<i64>() {
+                w_int_new(memoryview_unpack(buf, itemsize, 0))
             } else {
                 // An item wider than the fold above: its bytes, which is all
                 // the one caller still reaching here needs.  `==` compares
@@ -1189,7 +1202,7 @@ unsafe fn memoryview_value_list(mv: PyObjectRef) -> Result<PyObjectRef, crate::P
         let mut count = 0;
         let mut base = 0;
         while itemsize > 0 && base + itemsize <= data.len() {
-            let element = memoryview_unpack_element(fmt, &data, base)?;
+            let element = memoryview_unpack_element(fmt, &data, base, itemsize)?;
             let _ = pyre_object::gc_roots::pin_root(element);
             base += itemsize;
             count += 1;
@@ -1380,14 +1393,15 @@ unsafe fn memoryview_unpack_at(
     mv: PyObjectRef,
     indices: &[i64],
     fmt: &str,
+    itemsize: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let itemsize = usize::try_from(itemsize).map_err(|_| {
+        crate::module::r#struct::struct_error("unpack str size too short for format")
+    })?;
     unsafe {
         let element = pyre_object::memoryview::w_memoryview_view(mv).element_ptr(indices);
-        let Some((_, size)) = memoryview_native_fmtchar(fmt) else {
-            return memoryview_unpack_element(fmt, &[], 0);
-        };
-        let bytes = std::slice::from_raw_parts(element, size as usize);
-        memoryview_unpack_element(fmt, bytes, 0)
+        let bytes = std::slice::from_raw_parts(element, itemsize);
+        memoryview_unpack_element(fmt, bytes, 0, itemsize)
     }
 }
 
@@ -1436,6 +1450,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "invalid indexing of 0-dim memory",
                 ));
             }
+            let itemsize = w_memoryview_itemsize(mv);
             let i = pyre_object::with_roots!(mv => getindex_w(index))?;
             // memoryobject.py `descr_getitem`: `_decode_index` may invoke a
             // user `__index__` which releases the view.
@@ -1449,7 +1464,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             // not `length / itemsize`.
             let index = memoryview_check_dimension(mv, 0, i)?;
             let fmt = w_memoryview_format_str(mv);
-            return memoryview_unpack_at(mv, &[index], fmt);
+            return memoryview_unpack_at(mv, &[index], fmt, itemsize);
         }
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
@@ -1468,8 +1483,9 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 }
                 let indices =
                     pyre_object::with_roots!(mv => memoryview_start_from_tuple(mv, index))?;
+                let itemsize = w_memoryview_itemsize(mv);
                 let fmt = w_memoryview_format_str(mv);
-                return memoryview_unpack_at(mv, &indices, fmt);
+                return memoryview_unpack_at(mv, &indices, fmt, itemsize);
             }
             if all_slice {
                 return Err(crate::PyError::not_implemented(
@@ -1935,7 +1951,7 @@ unsafe fn memoryview_tolist_rec(
                 }
                 let at = *cursor;
                 *cursor += isz;
-                memoryview_unpack_element(fmt, data, at)?
+                memoryview_unpack_element(fmt, data, at, isz)?
             } else {
                 memoryview_tolist_rec(shape, fmt, data, isz, idim + 1, cursor)?
             };
@@ -1970,7 +1986,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                     "memoryview: unsupported format",
                 ));
             }
-            return memoryview_unpack_element(fmt, &data, 0);
+            return memoryview_unpack_element(fmt, &data, 0, isz);
         }
         let shape = pyre_object::memoryview::w_memoryview_native_shape(mv);
         let mut cursor = 0;
@@ -2506,7 +2522,7 @@ unsafe fn memoryview_unpack_compared(
 ) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         match native {
-            true => memoryview_unpack_element(fmt, data, base),
+            true => memoryview_unpack_element(fmt, data, base, itemsize),
             false => crate::module::r#struct::unpack_single(fmt, &data[base..base + itemsize]),
         }
     }

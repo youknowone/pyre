@@ -2541,7 +2541,12 @@ fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 pub struct AppReCache {
     space: crate::baseobjspace::SpaceHandle,
     w_re: crate::baseobjspace::SpaceAttr,
-    // `sre.c compile_template` caches `module_state->compile_template`.
+    // [3.15-spec] v3.15.0 Modules/_sre/sre.c `compile_template` reads
+    // `re._compile_template` once into `module_state->compile_template` and
+    // raises RuntimeError for a result whose type is not `Template_Type`
+    // ↔ PyPy interp_sre.py `W_SRE_Pattern.subx` calls
+    // `space.call_method(w_re, '_subx', ...)` on every call, calls a callable
+    // result, and appends anything else.
     w_compile_template: crate::baseobjspace::SpaceAttr,
 }
 
@@ -2701,6 +2706,12 @@ fn compile_template_retry(
 }
 
 /// `sre.c compile_template`: a result whose type is not `Template_Type` raises RuntimeError.
+/// [3.15-spec] v3.15.0 Modules/_sre/sre.c `compile_template` reads
+/// `re._compile_template` once into `module_state->compile_template` and
+/// raises RuntimeError for a result whose type is not `Template_Type`
+/// ↔ PyPy interp_sre.py `W_SRE_Pattern.subx` calls
+/// `space.call_method(w_re, '_subx', ...)` on every call, calls a callable
+/// result, and appends anything else.
 fn require_sre_template(w_result: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { is_sre_template(w_result) } {
         return Ok(w_result);
