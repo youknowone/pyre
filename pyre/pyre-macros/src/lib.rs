@@ -2346,8 +2346,9 @@ fn expand_pyre_class(
                 /// `w_subtype`, or the builtin type object) is the base layout.
                 /// A user subclass is `typedef.py` `_getusercls`: `SUser` with
                 /// mapdict `map` / `storage`, `ob_type` the user typeptr, and
-                /// `w_class` equal to `w_subtype`. The finalizer enqueue runs
-                /// when that class has `__del__`.
+                /// `w_class` from `layout_header_class` with the map
+                /// `user_setup` installs (`rclass.py` `instantiate`). The
+                /// finalizer enqueue runs when that class has `__del__`.
                 pub fn allocate_instance(
                     #payload_binding: Self,
                     w_subtype: ::pyre_object::PyObjectRef,
@@ -2382,18 +2383,34 @@ fn expand_pyre_class(
                         type_id,
                         ::std::mem::size_of::<#user_struct_name>(),
                     );
-                    let w_subtype = ::pyre_object::gc_roots::shadow_stack_get(__base);
                     #(#payload_restores)*
                     #(#instance_int_array_payload_reloads)*
+                    let w_subtype = ::pyre_object::gc_roots::shadow_stack_get(__base);
+                    let (map, header_class) = unsafe {
+                        ::pyre_object::objectobject::instantiate_user_layout(
+                            &#user_pytype_static as *const ::pyre_object::PyType,
+                            w_subtype,
+                        )
+                    };
+                    let map_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                    let _ = ::pyre_object::gc_roots::pin_root(
+                        map as ::pyre_object::PyObjectRef,
+                    );
+                    let header_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                    let _ = ::pyre_object::gc_roots::pin_root(header_class);
+                    let map = ::pyre_object::gc_roots::shadow_stack_get(map_slot)
+                        as ::pyre_object::mapdict::MapRef;
+                    let header_class =
+                        ::pyre_object::gc_roots::shadow_stack_get(header_slot);
                     let user = #user_struct_name {
                         base: Self {
                             ob: ::pyre_object::PyObject {
                                 ob_type: &#user_pytype_static as *const ::pyre_object::PyType,
-                                w_class: w_subtype,
+                                w_class: header_class,
                             },
                             ..payload
                         },
-                        map: ::std::ptr::null(),
+                        map,
                         storage: ::std::ptr::null_mut(),
                     };
                     let obj = if raw.is_null() {
