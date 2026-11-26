@@ -751,7 +751,7 @@ pub static W_BASE_EXCEPTION_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
 /// Closed tid of [`W_ExceptionExtended`]. Registered in `build_gc` immediately
 /// after the `_io.FileIO` user layout and before [`W_BaseExceptionUser`], so
 /// the extended user layout can parent on it. Constant before GC init:
-/// `try_gc_alloc_collecting_rooted` with no hook is `NoRoute` and the
+/// `try_gc_alloc_collecting` with no hook is `NoRoute` and the
 /// allocator falls through to `malloc_typed`.
 pub const W_EXCEPTION_EXTENDED_GC_TYPE_ID: u32 = 215;
 /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ExceptionExtended`.
@@ -1167,7 +1167,7 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// cluster whose type word is not a constant address does not lower — the word
 /// rides on the allocation or not at all, since a `setfield_gc` whose descr
 /// `is_typeptr()` is removed downstream. The primary allocation is hand-rolled
-/// through `try_gc_alloc_collecting_rooted` besides, which is not one of the
+/// through `try_gc_alloc_collecting` besides, which is not one of the
 /// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
@@ -1183,10 +1183,9 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// layout). At birth the only live GC child is `w_class`
 /// (`w_exception_base_defaults` / the extended-layout builder leave every
 /// other pointer `PY_NULL`; a USER `map` is also NULL until
-/// `_mapdict_init_empty`). That word is the rooted slot
-/// `try_gc_alloc_collecting_rooted` forwards across the minor; the shadow
-/// stack does not stand in for it. The collector rewrites the slot, so the
-/// word is stored back into `value` before `ptr::write`.
+/// `_mapdict_init_empty`). Publish that word on the shadow stack before the
+/// collecting malloc and store its reloaded value into `value` before
+/// `ptr::write`.
 /// A USER terminator stays on the shadow stack across this malloc; after
 /// the write, `_mapdict_init_empty` stores the reloaded map before `pin_root`.
 ///
@@ -1200,24 +1199,20 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(
     map_slot: Option<usize>,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let mut rooted_class = exception_header_w_class(&value);
-    let mut needs_write_barrier = true;
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(exception_header_w_class(&value));
     let tid = T::type_id();
     let raw = if tid != 0 {
-        crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
-                tid,
-                T::SIZE,
-                (&mut rooted_class as *mut PyObjectRef).cast(),
-                &mut needs_write_barrier,
-            )
-        })
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_collecting(
+            tid,
+            T::SIZE,
+        ))
         .allocated_or_raise()
         .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
     };
-    set_exception_header_w_class(&mut value, rooted_class);
+    set_exception_header_w_class(&mut value, crate::gc_roots::shadow_stack_get(class_slot));
     if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut T, value);
@@ -1229,12 +1224,7 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         let raw = crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF;
-        // A nursery header needs no creation barrier. The collecting
-        // allocator can still spill old (pinned nursery gap); only that
-        // placement remembers the `w_class` edge.
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier(raw);
         return crate::gc_roots::shadow_stack_get(slot);
     }
     if crate::gc_hook::gc_alloc_failed_pending() {

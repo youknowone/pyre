@@ -1843,7 +1843,7 @@ impl FrameBox {
     /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
     /// GC object whose lifetime is its reachability.  When the GC hook is
     /// installed this allocates a nursery `PYFRAME_GC_TYPE_ID` block
-    /// (`malloc_fixedsize`, through `try_gc_alloc_collecting_rooted`); the
+    /// (`malloc_fixedsize`, through `try_gc_alloc_collecting`); the
     /// collector reclaims the frame and its GC-managed locals and debug data
     /// once no root
     /// (the handle's own owner root while it lives, then `walk_pyframe_roots`
@@ -1972,7 +1972,6 @@ impl FrameBox {
         };
         let inputs = frame_root.publish(published);
         frame_root.normalize(inputs, published.len());
-        let mut needs_write_barrier = true;
         let raw = if nonmoving {
             pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
                 PYFRAME_GC_TYPE_ID,
@@ -1981,31 +1980,29 @@ impl FrameBox {
         } else {
             // `malloc_fixedsize` (`incminimark.py`): a nursery bump that runs
             // `collect_and_reserve` only when the nursery is full. Every input
-            // is already on `frame_root`; the hook's own slot carries the
-            // locals array, and the read-back below goes through `frame_root`
-            // like the other fields.
-            let mut allocation_root = frame_root.get(inputs + 2) as pyre_object::gc_hook::GCREF;
-            pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
-                pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+            // is already on `frame_root`, and the read-back below goes through
+            // that bracket after the ordinary collecting allocation.
+            pyre_object::gc_hook::GcAllocOutcome::from_hook(
+                pyre_object::gc_hook::try_gc_alloc_collecting(
                     PYFRAME_GC_TYPE_ID,
                     std::mem::size_of::<PyFrame>(),
-                    &mut allocation_root,
-                    &mut needs_write_barrier,
-                )
-            })
+                ),
+            )
             .allocated_or_raise()
             .unwrap_or(std::ptr::null_mut())
         };
         if !raw.is_null() {
-            // RPython allocation results stay live in the translated shadow
-            // stack while the caller initializes their fields.  Free-threaded
-            // pyre must expose the same root before entering the write-barrier
-            // GC operation: a contended barrier is an entry safepoint, so an
-            // unrooted fresh frame could otherwise be swept by another
-            // collector between this allocation and the barrier below.
-            let _ = frame_root.pin_root(raw as pyre_object::PyObjectRef);
-            // Read back through the bracket's own cell rather than
-            // `shadow_stack_get`, which resolves the thread-local per slot.
+            // Pin first: `pin_roots` may wait behind a foreign collection that
+            // moves the frame. Barrier before the stores so an old placement is
+            // already in the remembered set when the young references land
+            // (`framework.py` `transform_generic_set` then `setfield`;
+            // `incminimark.py` `remember_young_pointer`). The nursery is not
+            // zero-filled, so the payload is cleared before the pin (`framework.py`
+            // `gct_zero_gc_pointers_inside`): a collection during the pin traces
+            // an all-null frame. Every later use reads the slot.
+            unsafe { std::ptr::write_bytes(raw as *mut u8, 0, std::mem::size_of::<PyFrame>()) };
+            let frame_slot = frame_root.pin_roots(&[raw as pyre_object::PyObjectRef]);
+            pyre_object::gc_hook::try_gc_write_barrier_managed(frame_root.get(frame_slot) as _);
             frame.ob_header.w_class = frame_root.get(inputs);
             frame.pycode = frame_root.get(inputs + 1) as *const ();
             frame.locals_cells_stack_w =
@@ -2028,17 +2025,9 @@ impl FrameBox {
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as pyre_object::gc_hook::GCREF
             ));
-            let ptr = raw as *mut PyFrame;
+            let ptr = frame_root.get(frame_slot) as *mut PyFrame;
             unsafe {
                 std::ptr::write(ptr, frame);
-            }
-            // A nursery frame needs no barrier for the young objects it names,
-            // and the barrier's TRACK_YOUNG_PTRS test answers so. A frame the
-            // collecting malloc placed old (`needs_write_barrier`) must be
-            // remembered for the next minor tracer, as `generator.rs`'s
-            // `w_generator_or_coroutine_new` does for a stable generator.
-            if needs_write_barrier {
-                pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             }
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
@@ -5917,8 +5906,9 @@ impl PyFrame {
         let lineno = self.get_last_lineno();
         let roots = pyre_object::gc_roots::push_roots();
         let frame_slot = roots.pin_roots(&[self as *const PyFrame as pyre_object::PyObjectRef]);
+        let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
         let w_name =
-            unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
+            unsafe { crate::pycode::w_code_name_obj(frame.pycode as pyre_object::PyObjectRef) };
         let name = if !w_name.is_null() {
             unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
         } else {
@@ -8390,18 +8380,6 @@ x = 7
         payload as pyre_object::gc_hook::GCREF
     }
 
-    /// `GcAllocCollectingRootedHookFn` fake: a headered nursery block that
-    /// never collects, so `root` stays as given and no barrier is needed.
-    unsafe fn headered_young_alloc_rooted(
-        type_id: u32,
-        payload_size: usize,
-        _root: *mut pyre_object::gc_hook::GCREF,
-        needs_write_barrier: *mut bool,
-    ) -> pyre_object::gc_hook::GCREF {
-        unsafe { *needs_write_barrier = false };
-        headered_young_alloc(type_id, payload_size)
-    }
-
     fn young_frame_alloc_is_owned(addr: usize) -> bool {
         YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow().contains(&addr))
     }
@@ -8410,7 +8388,7 @@ x = 7
     impl Drop for ClearYoungFrameHooks {
         fn drop(&mut self) {
             pyre_object::gc_hook::clear_gc_alloc_young_nonmoving_hook();
-            pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+            pyre_object::gc_hook::clear_gc_alloc_collecting_hook();
             pyre_object::gc_hook::clear_gc_owns_object_hook();
             YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().clear());
         }
@@ -8460,7 +8438,7 @@ x = 7
                 .push(snapshot.locals_cells_stack_w as usize)
         });
         pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(headered_young_alloc);
-        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(headered_young_alloc_rooted);
+        pyre_object::gc_hook::register_gc_alloc_collecting_hook(headered_young_alloc);
         pyre_object::gc_hook::register_gc_owns_object_hook(young_frame_alloc_is_owned);
         let boxed = super::FrameBox::new(snapshot).expect("frame allocation");
         assert!(

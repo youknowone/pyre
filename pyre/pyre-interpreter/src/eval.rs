@@ -569,7 +569,7 @@ pub unsafe fn walk_enrolled_code_roots(
 /// Mark the GC-managed children of a `W_BaseException`.
 ///
 /// Exception allocation is a nursery `malloc_fixedsize`
-/// (`alloc_exception_nursery` → `try_gc_alloc_collecting_rooted`, which runs
+/// (`alloc_exception_nursery` → `try_gc_alloc_collecting`, which runs
 /// `collect_and_reserve` when the nursery is full). Immortal singletons and
 /// the GC-allocation-failure fallback still use `malloc_typed`
 /// (`interp_exceptions.rs`). For the `malloc_typed` family the collector
@@ -7842,7 +7842,6 @@ result = (
             pyre_object::gc_hook::clear_gc_alloc_hook();
             pyre_object::gc_hook::clear_gc_alloc_stable_hook();
             pyre_object::gc_hook::clear_gc_alloc_collecting_hook();
-            pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
             pyre_object::gc_hook::clear_gc_owns_object_hook();
             pyre_object::gc_hook::clear_gc_write_barrier_hook();
             pyre_object::gc_hook::clear_gc_write_barrier_managed_hook();

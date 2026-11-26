@@ -54,7 +54,7 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
 
 /// Last path component is the class-word leaf (`rclass.OBJECT.typeptr`;
 /// pyre's header spells it `ob_type`).
-fn is_typeptr_leaf(name: &str) -> bool {
+pub(crate) fn is_typeptr_leaf(name: &str) -> bool {
     let leaf = name.rsplit('.').next().unwrap_or(name);
     leaf == "typeptr" || leaf == "ob_type"
 }

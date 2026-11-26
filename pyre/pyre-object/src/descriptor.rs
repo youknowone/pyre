@@ -60,16 +60,10 @@ pub fn w_super_new(
             w_subtype,
         );
     }
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_SUPER_GC_TYPE_ID,
-            W_SUPER_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_collecting(
+        W_SUPER_GC_TYPE_ID,
+        W_SUPER_OBJECT_SIZE,
+    ))
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     let value = W_Super {
@@ -91,9 +85,7 @@ pub fn w_super_new(
     }
     unsafe {
         std::ptr::write(raw as *mut W_Super, value);
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
     }
     let obj = raw as PyObjectRef;
     crate::gc_hook::maybe_register_finalizer(obj);

@@ -3652,6 +3652,7 @@ fn option_of_voidpp_is_not_pointer_niche() {
 #[test]
 fn fn_ptr_ty_keeps_gcref_result() {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
 
     let gcrefopaque_adt = serde_json::json!({
         "Adt": {"id": 0, "generics": empty_generics()}
@@ -3696,13 +3697,14 @@ fn fn_ptr_ty_keeps_gcref_result() {
     assert_eq!(ft.args[0], LowLevelType::Unsigned);
     assert_eq!(ft.args[1], LowLevelType::Unsigned);
     assert_eq!(
-        ft.args[2], *GCREF,
-        "*mut GCREF FUNC arg is the GCREF root slot, not OBJECTPTR"
+        ft.args[2],
+        CArrayPtr(GCREF.clone()),
+        "*mut GCREF FUNC arg preserves the pointer-to-cell layer"
     );
     assert_eq!(
         ft.args[3],
-        LowLevelType::Signed,
-        "*mut bool FUNC arg is the slot address, not OBJECTPTR"
+        CArrayPtr(LowLevelType::Bool),
+        "*mut bool FUNC arg is CArrayPtr(Bool), not a Signed value"
     );
     assert_eq!(
         ft.result, *GCREF,
@@ -3733,8 +3735,9 @@ fn fn_ptr_ty_keeps_gcref_result() {
         "bare GCREFOpaque FUNC.RESULT is GCREF"
     );
 
-    // `AllocNurseryCollectingTypedRootedFn`: `*mut GcRef` / `GcRef`
-    // (`majit_ir::GcRef`) is the same GCREF word.
+    // `*mut GcRef` is a C pointer to a GCREF cell, same as `*mut GCREF`.
+    // `rffi.py` spells that `CArrayPtr(T)`.  The result is still the GCREF
+    // word (`llmemory.py` `GCREF`).
     let gcref_word = serde_json::json!({
         "Adt": {"id": 4, "generics": empty_generics()}
     });
@@ -3779,17 +3782,95 @@ fn fn_ptr_ty_keeps_gcref_result() {
     .expect("GcRef hook FnPtr lowers");
     assert_eq!(ft_gcref.args.len(), 4);
     assert_eq!(
-        ft_gcref.args[2], *GCREF,
-        "*mut GcRef FUNC arg is the GCREF root slot, not OBJECTPTR"
+        ft_gcref.args[2],
+        CArrayPtr(GCREF.clone()),
+        "*mut GcRef FUNC arg preserves the pointer-to-cell layer"
     );
     assert_eq!(
         ft_gcref.args[3],
-        LowLevelType::Signed,
-        "*mut bool FUNC arg is the slot address, not OBJECTPTR"
+        CArrayPtr(LowLevelType::Bool),
+        "*mut bool FUNC arg is CArrayPtr(Bool), not a Signed value"
     );
     assert_eq!(
         ft_gcref.result, *GCREF,
         "GcRef FUNC.RESULT is GCREF (`llmemory.py` GCREF)"
+    );
+
+    let mut_bool =
+        TyRef::Other(serde_json::json!({"Ref": [null, {"Scalar": "Bool"}, "Mut"]}).into());
+    let raw_bool = TyRef::Other(serde_json::json!({"RawPtr": [{"Scalar": "Bool"}, "Mut"]}).into());
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&mut_bool, &llbc_gcref),
+        Some(CArrayPtr(LowLevelType::Bool)),
+        "&mut bool is CArrayPtr(Bool)"
+    );
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&raw_bool, &llbc_gcref),
+        Some(CArrayPtr(LowLevelType::Bool)),
+        "*mut bool is CArrayPtr(Bool)"
+    );
+    assert_eq!(
+        super::tyref_cell_pointer_class_root(&mut_bool, &llbc_gcref).as_deref(),
+        Some("*mut bool"),
+    );
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        super::input_param_value_type(
+            ValueType::Bool,
+            &mut_bool,
+            &llbc_gcref,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Int,
+        "&mut bool parameter is the cell address, not SomeBool"
+    );
+    let gcref_word = TyRef::Other(serde_json::json!({"RawPtr": [gcrefopaque_adt, "Mut"]}).into());
+    let gcref_cell = TyRef::Other(
+        serde_json::json!({"RawPtr": [{"Adt": {"id": 3, "generics": empty_generics()}}, "Mut"]})
+            .into(),
+    );
+    assert!(
+        super::tyref_is_gcref_spelling(&gcref_word, &llbc_gcref),
+        "*mut GCREFOpaque is the GCREF word"
+    );
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&gcref_word, &llbc_gcref),
+        None,
+        "the GCREF word is not a cell pointer"
+    );
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&gcref_cell, &llbc_gcref),
+        Some(CArrayPtr(GCREF.clone())),
+        "*mut GCREF is CArrayPtr(GCREF)"
+    );
+    let shared_bool =
+        TyRef::Other(serde_json::json!({"Ref": [null, {"Scalar": "Bool"}, "Shared"]}).into());
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&shared_bool, &llbc_gcref),
+        None,
+        "shared &bool is the scalar"
+    );
+    assert_eq!(
+        super::input_param_value_type(
+            ValueType::Bool,
+            &shared_bool,
+            &llbc_gcref,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Bool
+    );
+    let mut_gcref = TyRef::Other(
+        serde_json::json!({"Ref": [null, {"Adt": {"id": 3, "generics": empty_generics()}}, "Mut"]})
+            .into(),
+    );
+    assert_eq!(
+        super::tyref_cell_pointer_lltype(&mut_gcref, &llbc_gcref),
+        None,
+        "&mut GCREF is the managed MutRef cell, not CArrayPtr"
     );
 }
 
@@ -13838,19 +13919,95 @@ fn by_value_struct_enum_payload_store_is_one_fieldwrite() {
         "MultiFieldStruct is an inlined STRUCT when stored as a Struct field"
     );
     assert!(
+        !matches!(
+            super::inline_struct_field_leaves(
+                &llbc,
+                no_tombstoned_leaves(),
+                &gc_struct_ids,
+                "PayloadShell::Variant",
+                "__pos_0",
+                &raw_alloc,
+                None,
+            ),
+            crate::model::InlineFieldShape::Inline(_)
+        ),
+        "an enum-variant owner is not an inlined Struct"
+    );
+    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+}
+
+#[test]
+fn inline_struct_field_typevar_first_field_is_unknown() {
+    let wrapper = struct_decl(
+        0,
+        ident_path(&["fixture", "Wrapper"]),
+        serde_json::json!([
+            {
+                "name": "first",
+                "ty": {"TypeVar": {"Bound": [0, 0]}},
+                "attr_info": null
+            },
+            {
+                "name": "payload",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![wrapper], vec![]);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(matches!(
         super::inline_struct_field_leaves(
             &llbc,
             no_tombstoned_leaves(),
             &gc_struct_ids,
-            "PayloadShell::Variant",
-            "__pos_0",
+            "Wrapper",
+            "first",
             &raw_alloc,
             None,
-        )
-        .is_none(),
-        "an enum-variant owner is not an inlined Struct"
+        ),
+        crate::model::InlineFieldShape::Unknown
+    ));
+}
+
+/// `lltype.Ptr` / `heaptracker.all_fielddescrs` treat a pointer field as
+/// one word; the pointee's type arguments do not make it an inlined Struct.
+#[test]
+fn inline_struct_field_raw_pointer_to_generic_is_not_inline() {
+    let wrapper = struct_decl(
+        0,
+        ident_path(&["fixture", "Wrapper"]),
+        serde_json::json!([
+            {
+                "name": "first",
+                "ty": {"RawPtr": [{"TypeVar": {"Bound": [0, 0]}}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "payload",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }
+        ]),
+        false,
     );
-    assert_variant_payload_store_is_pos0(&graph, "::Variant");
+    let llbc = llbc_with_types("fixture", vec![wrapper], vec![]);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(matches!(
+        super::inline_struct_field_leaves(
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            "Wrapper",
+            "first",
+            &raw_alloc,
+            None,
+        ),
+        crate::model::InlineFieldShape::NotInline
+    ));
 }
 
 /// Same FieldWrite shape for a one-word transparent handle in a fixture

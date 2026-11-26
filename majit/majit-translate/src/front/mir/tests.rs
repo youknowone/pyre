@@ -40105,7 +40105,8 @@ fn deref_store_through_mut_ref_field_of_bool_is_raw_store() {
 
 /// Parent of `let mut flag = true; (|| { flag = false; })(); observe(flag)`:
 /// the captured local is a Char-varsize cell (`rdtoa.py` `strtod` `end_ptr`),
-/// the env stores that address, and the read after `call_mut` is `raw_load`.
+/// the env stores the `CArrayPtr(Bool)` cast of that address
+/// (`lltype.py` `ann_cast_int_to_ptr`), and the read after `call_mut` is `raw_load`.
 #[test]
 fn parent_mut_bool_captured_in_closure_env_is_raw_cell() {
     let bool_ty = serde_json::json!({"Scalar": "Bool"});
@@ -40221,16 +40222,45 @@ fn parent_mut_bool_captured_in_closure_env_is_raw_cell() {
     });
     let cell_ptr =
         cell_ptr.unwrap_or_else(|| panic!("parent must allocate a Char-varsize cell; ops={ops:?}"));
-    assert!(
-        ops.iter().any(|op| matches!(
-            &op.kind,
+    let env_flag = ops
+        .iter()
+        .find_map(|op| match &op.kind {
             OpKind::FieldWrite {
                 value: LinkArg::Value(v),
                 ty: ValueType::Int,
                 ..
-            } if *v == cell_ptr
-        )),
-        "closure env must store the cell address as an int word; ops={ops:?}"
+            } => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("closure env must FieldWrite an int word; ops={ops:?}"));
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if op.result.as_ref() == Some(&env_flag)
+                && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                && args.len() == 2 =>
+            {
+                matches!(
+                    &args[0],
+                    LinkArg::Const(c)
+                        if matches!(
+                            c.value,
+                            crate::flowspace::model::ConstValue::LowLevelType(_)
+                        )
+                ) && matches!(&args[1], LinkArg::Value(v) if *v == cell_ptr)
+            }
+            _ => false,
+        }),
+        "closure env stores cast_int_to_ptr of the cell; ops={ops:?}"
+    );
+    use crate::translator::rtyper::lltypesystem::{lltype::LowLevelType, rffi::CArrayPtr};
+    assert_eq!(
+        env_flag.concretetype(),
+        Some(CArrayPtr(LowLevelType::Bool)),
+        "env flag is CArrayPtr(Bool); ops={ops:?}"
     );
     let call_idx = ops
         .iter()

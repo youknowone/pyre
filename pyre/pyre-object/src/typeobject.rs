@@ -695,24 +695,20 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     // `typeobject.py W_TypeObject` is `malloc_fixedsize` (nursery). A discarded
     // `type(name, (), {})` must die at the next minor so `add_subclass`'s
     // `weak_subclasses` scan reuses a dead slot (`W_TypeObject.add_subclass`)
-    // instead of appending forever. `try_gc_alloc_collecting_rooted` is the
+    // instead of appending forever. `try_gc_alloc_collecting` is the
     // host `do_malloc_fixedsize_clear`: nursery-full runs a minor, matching
     // lists / exceptions / weakrefs. Young-nonmoving rawmalloc does not fill
     // the nursery, so a loop of abandoned types never collected and the scan
     // grew with every `type()`. Builtin types stay on `w_type_alloc_builtin`.
     // `store_subclass_tag` barriers a `w_class` store, so an old instance that
-    // names a live nursery type is in the remembered set. Spill-old takes the
-    // barrier below (`needs_write_barrier`).
-    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_TYPE_GC_TYPE_ID,
-            W_TYPE_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    })
+    // names a live nursery type is in the remembered set. Spill-old runs the
+    // creation barrier on the pinned result before the stores. The nursery is
+    // not zero-filled, so the payload is cleared before the pin (`framework.py`
+    // `gct_zero_gc_pointers_inside`).
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_collecting(
+        W_TYPE_GC_TYPE_ID,
+        W_TYPE_OBJECT_SIZE,
+    ))
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
     // A mortal heap type's `name` is rstr `STR` (`typeobject.py self.name = name`,
@@ -723,24 +719,31 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     // / dict are pinned. `bh_alloc_str_nofill` does not collect, so the STR cannot
     // be swept before it is stored into the type below. `qualname` stays a
     // `NameStorage` box.
-    let (name, qualname) = if raw.is_null() {
+    let (name, qualname, raw) = if raw.is_null() {
         if crate::gc_hook::gc_alloc_failed_pending() {
             return crate::PY_NULL;
         }
         (
             crate::unicodeobject::alloc_utf8_payload(name.as_bytes(), false),
             crate::lltype::malloc_raw(name.to_string()),
+            raw,
         )
     } else {
+        unsafe { std::ptr::write_bytes(raw as *mut u8, 0, W_TYPE_OBJECT_SIZE) };
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         let name_utf8 = crate::unicodeobject::alloc_utf8_payload(name.as_bytes(), true);
         let _ = crate::gc_roots::pin_root(name_utf8 as PyObjectRef);
         let qualname = crate::gc_storage::gc_alloc_young_storage_box(
             name.to_string(),
             name_storage_gc_type_id(),
         );
-        let name_utf8 = crate::gc_roots::shadow_stack_get(save_point + 2)
+        crate::gc_hook::try_gc_write_barrier(
+            crate::gc_roots::shadow_stack_get(save_point + 2) as crate::gc_hook::GCREF
+        );
+        let raw = crate::gc_roots::shadow_stack_get(save_point + 2) as crate::gc_hook::GCREF;
+        let name_utf8 = crate::gc_roots::shadow_stack_get(save_point + 3)
             as *mut crate::unicodeobject::UnicodeValueStorage;
-        (name_utf8, qualname)
+        (name_utf8, qualname, raw)
     };
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).
@@ -824,14 +827,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
             false,
         )
     };
-    if gc_managed {
-        // A nursery header needs no creation barrier. The collecting
-        // allocator can still spill old (pinned nursery gap); only that
-        // placement remembers young `bases` / name boxes.
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
-        }
-    } else {
+    if !gc_managed {
         // Bulk construction wrote bases / dict / name boxes with no per-store
         // barrier. One barrier enrolls the prebuilt object
         // (`incminimark.py` `remember_young_pointer`).

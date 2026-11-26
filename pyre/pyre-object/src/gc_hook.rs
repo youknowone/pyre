@@ -466,10 +466,10 @@ majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 /// nursery allocator that runs a minor collection when the nursery is full. Only
 /// for callers that hold no unrooted GC pointer across the allocation and run at
 /// a JIT safepoint (gcmap-rooted). The elidable bigint payload helpers were the
-/// first; the rooted sibling now also carries every list header
-/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new`),
-/// heap-type MRO arrays (`alloc_mro_block_young_gc`), exact `super`
-/// (`w_super_new`), `w_weakref_new`, and builtin `str()`'s
+/// first. Callers that use this hook do so inside their own `push_roots`
+/// bracket: list headers (`w_list_new_with_strategy`), heap-type headers
+/// (`w_type_new`), heap-type MRO arrays (`alloc_mro_block_young_gc`), exact
+/// `super` (`w_super_new`), `w_weakref_new`, and builtin `str()`'s
 /// `w_str_from_wtf8_managed_collecting`.
 pub fn register_gc_alloc_collecting_hook(hook: GcAllocHookFn) {
     GC_ALLOC_COLLECTING_HOOK.set(Some(hook));
@@ -480,62 +480,24 @@ pub fn clear_gc_alloc_collecting_hook() {
     GC_ALLOC_COLLECTING_HOOK.set(None);
 }
 
-/// Root-aware collecting allocation callback. `root` is a caller-owned slot
-/// containing the one GC child manufactured before its parent allocation.
-pub type GcAllocCollectingRootedHookFn = unsafe fn(
-    type_id: u32,
-    payload_size: usize,
-    root: *mut GCREF,
-    needs_write_barrier: *mut bool,
-) -> GCREF;
-
-majit_gc::global_hook!(
-    static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
-);
-
-pub fn register_gc_alloc_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
-    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(Some(hook));
-}
-
-pub fn clear_gc_alloc_collecting_rooted_hook() {
-    GC_ALLOC_COLLECTING_ROOTED_HOOK.set(None);
-}
-
-/// Attempt a collecting allocation while preserving `root`.
+/// Attempt a collecting nursery allocation.
 ///
-/// Backends with the rooted fast path register the slot only if the nursery
-/// bump fails. The fallback retains the previous conservative behavior for
-/// backends that expose only the ordinary collecting hook.
-///
-/// # Safety
-/// `root` must remain a valid mutable GC-pointer slot until this call returns.
-/// `needs_write_barrier` must remain a valid mutable `bool` slot.
+/// Callers publish every live GC reference with `gc_roots::push_roots` /
+/// `pin_roots` before entering this helper and reload those slots afterwards.
+/// This is the source-level spelling of `framework.py` `gct_fv_gc_malloc`:
+/// `push_roots(hop)`, the ordinary `malloc_fixedsize` call, then
+/// `pop_roots(hop, livevars)`.  Placement is deliberately not returned;
+/// callers conservatively run the creation barrier, whose nursery check is
+/// the same decision the removed out-parameter attempted to expose.
 #[inline]
-pub unsafe fn try_gc_alloc_collecting_rooted(
-    type_id: u32,
-    payload_size: usize,
-    root: *mut GCREF,
-    needs_write_barrier: *mut bool,
-) -> Option<GCREF> {
+pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<GCREF> {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return None;
     }
-    if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
-        assert_gil_held_for_alloc();
-        return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
-    }
     let collecting = GC_ALLOC_COLLECTING_HOOK.get()?;
     assert_gil_held_for_alloc();
-    // Backends without placement reporting retain the conservative creation
-    // barrier. MiniMark's rooted hook clears this for a nursery result.
-    unsafe { *needs_write_barrier = true };
-    let pinned = unsafe { try_gc_add_root(root) };
-    let result = collecting(type_id, payload_size);
-    if pinned {
-        try_gc_remove_root(root);
-    }
-    Some(result)
+    Some(collecting(type_id, payload_size))
 }
 
 /// Signature of the host-side collection callback. Used by
@@ -1490,16 +1452,6 @@ mod tests {
         std::ptr::null_mut()
     }
 
-    unsafe fn nursery_rooted_hook(
-        type_id: u32,
-        payload_size: usize,
-        _root: *mut GCREF,
-        needs_write_barrier: *mut bool,
-    ) -> GCREF {
-        unsafe { *needs_write_barrier = false };
-        mock_hook(type_id, payload_size)
-    }
-
     unsafe fn nursery_placement_hook(
         type_id: u32,
         payload_size: usize,
@@ -1610,7 +1562,7 @@ mod tests {
     }
 
     // Per-thread for the same reason the allocation record is: while these
-    // hooks are installed, `try_gc_alloc_collecting_rooted`'s fallback pins and
+    // hooks are installed, `try_gc_alloc_collecting`'s fallback pins and
     // unpins the caller's slot, and that runs on whichever thread allocates.
     thread_local! {
         static LAST_ROOT_PTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1732,29 +1684,14 @@ mod tests {
     }
 
     #[test]
-    fn rooted_collecting_hook_reports_placement_conservatively() {
+    fn collecting_hook_uses_the_ordinary_allocator() {
         let _hook_lock = hook_test_guard();
         clear_gc_alloc_collecting_hook();
-        clear_gc_alloc_collecting_rooted_hook();
-        clear_gc_root_hooks();
-        let mut root = std::ptr::null_mut();
-        let mut needs_write_barrier = false;
-
+        assert!(try_gc_alloc_collecting(7, 24).is_none());
         register_gc_alloc_collecting_hook(mock_hook);
-        let result =
-            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
+        let result = try_gc_alloc_collecting(7, 24);
         assert_eq!(result, Some(last_mock_call().ptr));
-        assert!(needs_write_barrier);
-
-        register_gc_alloc_collecting_rooted_hook(nursery_rooted_hook);
-        needs_write_barrier = true;
-        let result =
-            unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
-        assert_eq!(result, Some(last_mock_call().ptr));
-        assert!(!needs_write_barrier);
-
         clear_gc_alloc_collecting_hook();
-        clear_gc_alloc_collecting_rooted_hook();
     }
 
     #[test]

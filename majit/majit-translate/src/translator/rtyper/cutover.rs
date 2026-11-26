@@ -5551,18 +5551,6 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &[],
         LowLevelType::Address,
     ),
-    // `GcAllocOutcome::allocated_or_abort` returns `Option<*mut u8>`.
-    // The frontend may spell the enum type as the sole path prefix.
-    (
-        &["GcAllocOutcome", "allocated_or_abort"],
-        &["self", "payload_size"],
-        LowLevelType::Address,
-    ),
-    (
-        &["GcAllocOutcome", "allocated_or_raise"],
-        &["self"],
-        LowLevelType::Address,
-    ),
     // `exceptiontransform.py` `rpyexc_occurred`: an opaque Bool-returning
     // helper (`build_func("RPyExceptionOccurred", rpyexc_occurred, [],
     // lltype.Bool)`).
@@ -5618,6 +5606,23 @@ pub(crate) fn register_runtime_residual_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in RUNTIME_RESIDUAL_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
     }
+    // `GcAllocOutcome::{allocated_or_abort, allocated_or_raise}` return
+    // `Option<GCREF>`. The residual successful payload is `llmemory.GCREF`
+    // ("similar to Address but GC-aware"), so `_rewrite_cmp_ptrs` keeps
+    // `ptr_iszero`. The frontend may spell the enum type as the sole path
+    // prefix.
+    register_opaque_external(
+        registry,
+        &["GcAllocOutcome", "allocated_or_abort"],
+        &["self", "payload_size"],
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    register_opaque_external(
+        registry,
+        &["GcAllocOutcome", "allocated_or_raise"],
+        &["self"],
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
     // `sys_exc_info_code` loads the process-global BuiltinCode pointer
     // (`function.py` `space._code_of_sys_exc_info`). Residual; the
     // result is a `PyObjectRef`.
@@ -24087,6 +24092,40 @@ mod tests {
             ),
             "set_gc_interp arms a breaker bit; jtransform must residualize it"
         );
+    }
+
+    #[test]
+    fn gc_alloc_outcome_residual_results_are_gcref() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_runtime_residual_externals(&registry);
+
+        for path in [
+            ["GcAllocOutcome", "allocated_or_abort"].as_slice(),
+            ["GcAllocOutcome", "allocated_or_raise"].as_slice(),
+        ] {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(path.iter().copied()))
+                .unwrap_or_else(|| panic!("{path:?} must be registered"));
+            let result = entry
+                .function_desc
+                .borrow()
+                .residual_signature_result()
+                .unwrap_or_else(|| panic!("{path:?} must declare a residual result"));
+
+            let SomeValue::Ptr(ptr) = result else {
+                panic!("{path:?} must return SomePtr(GCREF), got {result:?}");
+            };
+            assert_eq!(LowLevelType::from(ptr.ll_ptrtype.clone()), *GCREF);
+            assert_eq!(
+                lowleveltype_to_concrete(&LowLevelType::from(ptr.ll_ptrtype)).unwrap(),
+                ConcreteType::GcRef,
+            );
+        }
     }
 
     #[test]

@@ -757,6 +757,7 @@ mod tests {
             &HashSet::new(),
         );
         let mut compared = 0;
+        let mut accepted_declines = Vec::new();
         for f in &program.functions {
             let Some(fd) = f
                 .fun_decl_id
@@ -768,9 +769,24 @@ mod tests {
             let src = provider
                 .source_for_name_path(&name_path)
                 .unwrap_or_else(|| panic!("no unique GraphBodySource for {name_path}"));
-            let got = provider
-                .build(src)
-                .unwrap_or_else(|e| panic!("provider failed to build {name_path}: {e}"));
+            // Demand the program's graph first (`FunctionDesc.cachedgraph`).
+            // A body that does not lower is logged on `LoweringSkips`.
+            let eager_graph = f.lazy_graph().get();
+            let eager_declined = eager_graph.is_none()
+                && provider.tables.skipped.borrow().iter().any(|(name, _)| {
+                    name == name_path
+                        || name_path
+                            .rsplit_once("::")
+                            .is_some_and(|(_, leaf)| leaf == name)
+                });
+            let got = match provider.build(src) {
+                Ok(got) => got,
+                Err(_) if eager_declined => {
+                    accepted_declines.push(name_path.to_string());
+                    continue;
+                }
+                Err(e) => panic!("provider failed to build {name_path}: {e}"),
+            };
             // A clause specialization shares its generic's `FunDecl` under
             // its own name.
             if got.name != f.name {
@@ -780,6 +796,12 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 0, "corpus fixture lowered no bodies at all");
+        assert!(
+            accepted_declines
+                .iter()
+                .any(|n| n == "charon_corpus::gcref_raw_local_to_callback"),
+            "charon_corpus::gcref_raw_local_to_callback must be among the accepted declines; got {accepted_declines:?}"
+        );
     }
 
     /// A funcobj's harvested `_jit_*_` attributes land on it and on its

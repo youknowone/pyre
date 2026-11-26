@@ -487,6 +487,69 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             );
         }
     }
+    // One-level `*mut bool` / `*mut GCREF` (`rffi.py` `CArrayPtr`) of a
+    // function-local. Every call actual of that type, direct or
+    // through a fn pointer, is the cell address the callee's `CArrayPtr`
+    // formal reads (`input_param_value_type`). `Rvalue::RawPtr` of that
+    // cell is the `rffi.cast` producer (`rawstorage.py`).
+    for (bb_idx, block) in body.body().iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if !matches!(rvalue, Rvalue::RawPtr { .. }) {
+                continue;
+            }
+            if tyref_cell_pointer_lltype(&dest.ty, llbc).is_none() {
+                continue;
+            }
+            let Some(place) = borrowed_place_referent(rvalue) else {
+                continue;
+            };
+            let peeled = body_concrete_borrow_place(body, forward, place);
+            let PlaceKind::Local(id) = peeled.kind else {
+                continue;
+            };
+            bind_function_local_primitive_cell(
+                &mut locals,
+                &mut descr,
+                body,
+                arg_count,
+                id as usize,
+                llbc,
+            );
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        for arg in &call.args {
+            let Some(passed) = operand_tyref(arg) else {
+                continue;
+            };
+            if tyref_cell_pointer_lltype(passed, llbc).is_none() {
+                continue;
+            }
+            let Some(place) =
+                body_resolved_borrow_place(body, forward, operand_local(Some(arg)), llbc)
+            else {
+                continue;
+            };
+            let PlaceKind::Local(id) = place.kind else {
+                continue;
+            };
+            bind_function_local_primitive_cell(
+                &mut locals,
+                &mut descr,
+                body,
+                arg_count,
+                id as usize,
+                llbc,
+            );
+        }
+    }
     // Exclusive borrow of a function-local primitive stored into a
     // closure-env aggregate (`Rvalue::Aggregate`, `TypeDeclSrc::Closure`).
     // The callee writes through that address (`rewrite_op_raw_store`);

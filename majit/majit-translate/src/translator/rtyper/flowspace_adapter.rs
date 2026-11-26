@@ -6393,6 +6393,17 @@ pub(crate) fn derive_subject_inputcells(
                 ));
                 continue;
             }
+            // One-level `*mut bool` / `&mut bool` / `*mut GCREF` is
+            // `rffi.CArrayPtr(T)` (`fn_ptr_cell_pointer_lltype`). Before
+            // `undeclared_raw_ptr_nullable_annotation`, which would
+            // claim a `*mut ` spelling, and before the GCREF-word seed
+            // (`is_gcref_type_spelling` peels prefixes).
+            if let Some(root) = class_root.as_deref()
+                && let Some(llty) = crate::annotator::bookkeeper::fn_ptr_cell_pointer_lltype(root)
+            {
+                cells.push(lltype_to_annotation(llty));
+                continue;
+            }
             // A list-typed param (`Vec<T>`, `&[T]`, Charon `Slice<T>`) is
             // the annotator's list model regardless of the Input's
             // register bank: a one-word item slice can arrive as `Int`
@@ -9157,6 +9168,41 @@ mod tests {
             matches!(cells[0], SomeValue::Ptr(_)),
             "Unsigned + class_root CCHARP must seed SomePtr(CCHARP), got {:?}",
             cells[0],
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_mut_bool_cell_ptr_as_carrayptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        let mut graph = LegacyGraph::new("takes_bool_cell");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("*mut bool".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("*mut bool Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!(
+                "Int + class_root *mut bool must seed SomePtr(CArrayPtr(Bool)), got {:?}",
+                cells[0]
+            );
+        };
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone())),
+            CArrayPtr(LowLevelType::Bool),
         );
     }
 

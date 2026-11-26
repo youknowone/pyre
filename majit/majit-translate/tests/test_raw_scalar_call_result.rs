@@ -1286,12 +1286,21 @@ fn assert_no_raw_address(graph: &FunctionGraph, label: &str) {
 }
 
 fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload: bool) {
-    assert_address_spill_word(graph, "keyhash", 8, true, copy_out, return_is_reload);
+    assert_address_spill_word(
+        graph,
+        "keyhash",
+        ValueType::Int,
+        8,
+        true,
+        copy_out,
+        return_is_reload,
+    );
 }
 
 fn assert_address_spill_word(
     graph: &FunctionGraph,
     word_name: &str,
+    expected_item_ty: ValueType,
     itemsize: usize,
     is_item_signed: bool,
     copy_out: bool,
@@ -1325,11 +1334,12 @@ fn assert_address_spill_word(
             base,
             offset,
             value,
-            item_ty: ValueType::Int,
+            item_ty: store_ty,
             itemsize: store_size,
             is_item_signed: store_signed,
         } if base == ptr
             && value == word
+            && *store_ty == expected_item_ty
             && *store_size == itemsize
             && *store_signed == is_item_signed =>
         {
@@ -1388,10 +1398,14 @@ fn assert_address_spill_word(
             OpKind::RawLoad {
                 base,
                 offset,
-                item_ty: ValueType::Int,
+                item_ty: load_ty,
                 itemsize: load_size,
                 is_item_signed: load_signed,
-            } if base == ptr && *load_size == itemsize && *load_signed == is_item_signed => {
+            } if base == ptr
+                && *load_ty == expected_item_ty
+                && *load_size == itemsize
+                && *load_signed == is_item_signed =>
+            {
                 assert!(matches!(
                     defining_op(graph, offset),
                     Some(OpKind::ConstInt(0))
@@ -1413,11 +1427,14 @@ fn assert_address_spill_word(
         match returned {
             Some(OpKind::RawLoad {
                 base,
-                item_ty: ValueType::Int,
+                item_ty: load_ty,
                 itemsize: load_size,
                 is_item_signed: load_signed,
                 ..
-            }) if base == ptr && *load_size == itemsize && *load_signed == is_item_signed => {}
+            }) if base == ptr
+                && *load_ty == expected_item_ty
+                && *load_size == itemsize
+                && *load_signed == is_item_signed => {}
             other => panic!("the caller must observe the reloaded word, got {other:?}"),
         }
     } else {
@@ -1503,7 +1520,7 @@ fn raw_reborrow_of_bool_local_passed_as_pointer_reloads_the_word() {
         &raw_ptr(&word, "Mut"),
         Pass::RawReborrow { ret_local: 2 },
     );
-    assert_address_spill_word(&graph, "keyhash", 1, false, true, true);
+    assert_address_spill_word(&graph, "keyhash", ValueType::Bool, 1, false, true, true);
 }
 
 #[test]

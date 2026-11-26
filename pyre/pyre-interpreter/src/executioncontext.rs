@@ -4152,7 +4152,7 @@ impl UserDelAction {
             return;
         };
         // A heap type is born nursery
-        // (`try_gc_alloc_collecting_rooted`) and `lookup_in_type` /
+        // (`try_gc_alloc_collecting`) and `lookup_in_type` /
         // `begin_finalizer` / the `__del__` call all collect, so the type sits
         // on the same shadow stack as the receiver rather than in a raw local.
         let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());

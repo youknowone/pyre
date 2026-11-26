@@ -628,14 +628,30 @@ fn front_graph_carries_no_synthesized_exception_edges() {
 
     let llbc = load_corpus();
     let mut checked = 0usize;
+    let mut skipped_gcref_raw_local = false;
     common::with_lowering(llbc, |context| {
         for fd in llbc.iter_local_fns() {
             let Some(body): Option<Unstructured> = fd.unstructured() else {
                 continue;
             };
-            let graph = lower_fun_decl(context, fd).unwrap_or_else(|e| {
-                panic!("{} failed to lower: {e}", fd.item_meta.name_path_str())
-            });
+            let graph = match lower_fun_decl(context, fd) {
+                Ok(graph) => graph,
+                Err(LowerError::Unsupported(ref msg))
+                    if fd.item_meta.name_path_str()
+                        == "charon_corpus::gcref_raw_local_to_callback"
+                        && msg.contains(
+                            "raw address of a bare GCREF local has no traced cell storage",
+                        ) =>
+                {
+                    assert!(
+                        !skipped_gcref_raw_local,
+                        "gcref_raw_local_to_callback skip must happen exactly once"
+                    );
+                    skipped_gcref_raw_local = true;
+                    continue;
+                }
+                Err(e) => panic!("{} failed to lower: {e}", fd.item_meta.name_path_str()),
+            };
 
             // Invariant A.  The iterator `next`-diamond rewrite
             // (`front::iter_next`) is the one sanctioned synthesized
@@ -712,6 +728,10 @@ fn front_graph_carries_no_synthesized_exception_edges() {
         assert!(
             checked >= 4,
             "expected to lower at least the 4 corpus shapes, got {checked}",
+        );
+        assert!(
+            skipped_gcref_raw_local,
+            "charon_corpus::gcref_raw_local_to_callback must be skipped as Unsupported"
         );
     });
 }
@@ -1238,7 +1258,7 @@ fn header_read_narrows_to_a_typed_field_read() {
 /// resolved cases differ by that input alone.
 #[test]
 fn boxing_cluster_fuses_once_the_class_address_resolves() {
-    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, InlineFieldShape, OpKind, ValueType};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
     let attrs = std::collections::HashMap::from([
@@ -1263,7 +1283,12 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
     // Without a resolvable class address the cluster is left alone.
     let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
     assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        majit_translate::model::fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &|_, _| InlineFieldShape::NotInline,
+            &std::collections::HashMap::new(),
+        ),
         0,
         "an unresolvable class-static address declines the fuse, silently",
     );
@@ -1292,7 +1317,12 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
     );
 
     assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        majit_translate::model::fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &|_, _| InlineFieldShape::NotInline,
+            &std::collections::HashMap::new(),
+        ),
         1,
         "the cluster fuses once the class address is a constant",
     );

@@ -841,6 +841,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // `*const Utf8Str` / `*mut Utf8Str` / `*const BytesBlock` are
         // `Ptr(STR)` from the pointee declaration (`rstr.py` `STR`).
         stamp_rstr_str_ptr_from_pointee(&var, &local.ty, llbc);
+        stamp_cell_pointer(&var, &local.ty, llbc);
         let ty = tyref_to_value_type_with(
             &local.ty,
             llbc,
@@ -1000,37 +1001,43 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
                 // `char` is the same Int bank (`getkind` of UniChar);
                 // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
-                _ => tyref_niche_option_gc_payload_spelling(
-                    &local.ty,
-                    llbc,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-                .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
-                .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
-                .or_else(|| tyref_char_class_root(&local.ty, llbc))
-                .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
-                .or_else(|| {
-                    tyref_rust_vec_item_kind(&local.ty, llbc)
-                        .map(|_| tyref_to_ast_string(&local.ty, llbc))
-                })
-                .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
-                .or_else(|| {
-                    niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
-                })
-                .or_else(|| {
-                    if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
-                        None
-                    } else {
-                        raw_address_owner_root(
+                // A one-level bool / GCREF cell pointer is Int-banked
+                // (`CArrayPtr(T)`); carry `"*mut bool"` / `"*mut GCREF"`
+                // so `derive_subject_inputcells` seeds `SomePtr`.
+                _ => tyref_cell_pointer_class_root(&local.ty, llbc)
+                    .or_else(|| {
+                        tyref_niche_option_gc_payload_spelling(
                             &local.ty,
                             llbc,
-                            tombstoned_leaves,
                             gc_struct_ids,
                             raw_alloc_flavor_structs,
                         )
-                    }
-                }),
+                    })
+                    .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                    .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
+                    .or_else(|| tyref_char_class_root(&local.ty, llbc))
+                    .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
+                    .or_else(|| {
+                        tyref_rust_vec_item_kind(&local.ty, llbc)
+                            .map(|_| tyref_to_ast_string(&local.ty, llbc))
+                    })
+                    .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                    .or_else(|| {
+                        niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                    })
+                    .or_else(|| {
+                        if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
+                            None
+                        } else {
+                            raw_address_owner_root(
+                                &local.ty,
+                                llbc,
+                                tombstoned_leaves,
+                                gc_struct_ids,
+                                raw_alloc_flavor_structs,
+                            )
+                        }
+                    }),
             }
         };
         if let Some((root, _)) = cell_stamp {
@@ -1587,7 +1594,8 @@ fn exception_transformed_formal_class_root(
     raw_alloc: &std::collections::HashSet<String>,
     struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
-    tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc)
+    tyref_cell_pointer_class_root(ty, llbc)
+        .or_else(|| tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc))
         .or_else(|| tyref_raw_ptr_to_str_family_spelling(ty, llbc))
         .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(ty, llbc))
         .or_else(|| tyref_ref_param_class_root(ty, llbc, tombstoned, None, struct_fields))
@@ -1760,6 +1768,7 @@ impl<'a> Lowering<'a> {
             // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
             // Live-in inputargs stamp the same way; `FrameState.copy` inherits it.
             stamp_raw_u8_ccharp(&var, &local.ty, llbc);
+            stamp_cell_pointer(&var, &local.ty, llbc);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
@@ -1901,37 +1910,43 @@ impl<'a> Lowering<'a> {
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
                     // `char` is the same Int bank (`getkind` of UniChar);
                     // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
-                    _ => tyref_niche_option_gc_payload_spelling(
-                        &local.ty,
-                        llbc,
-                        gc_struct_ids,
-                        raw_alloc_flavor_structs,
-                    )
-                    .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
-                    .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
-                    .or_else(|| tyref_char_class_root(&local.ty, llbc))
-                    .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
-                    .or_else(|| {
-                        tyref_rust_vec_item_kind(&local.ty, llbc)
-                            .map(|_| tyref_to_ast_string(&local.ty, llbc))
-                    })
-                    .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
-                    .or_else(|| {
-                        niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
-                    })
-                    .or_else(|| {
-                        if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
-                            None
-                        } else {
-                            raw_address_owner_root(
+                    // A one-level bool / GCREF cell pointer is Int-banked
+                    // (`CArrayPtr(T)`); carry `"*mut bool"` / `"*mut GCREF"`
+                    // so `derive_subject_inputcells` seeds `SomePtr`.
+                    _ => tyref_cell_pointer_class_root(&local.ty, llbc)
+                        .or_else(|| {
+                            tyref_niche_option_gc_payload_spelling(
                                 &local.ty,
                                 llbc,
-                                tombstoned_leaves,
                                 gc_struct_ids,
                                 raw_alloc_flavor_structs,
                             )
-                        }
-                    }),
+                        })
+                        .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                        .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
+                        .or_else(|| tyref_char_class_root(&local.ty, llbc))
+                        .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
+                        .or_else(|| {
+                            tyref_rust_vec_item_kind(&local.ty, llbc)
+                                .map(|_| tyref_to_ast_string(&local.ty, llbc))
+                        })
+                        .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                        .or_else(|| {
+                            niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                        })
+                        .or_else(|| {
+                            if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
+                                None
+                            } else {
+                                raw_address_owner_root(
+                                    &local.ty,
+                                    llbc,
+                                    tombstoned_leaves,
+                                    gc_struct_ids,
+                                    raw_alloc_flavor_structs,
+                                )
+                            }
+                        }),
                 }
             };
             if let Some((root, _)) = cell_stamp {

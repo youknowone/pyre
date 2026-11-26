@@ -778,16 +778,7 @@ pub trait GcArrayType {
 pub unsafe fn malloc_varsize_clear<T: GcArrayType>(n: i64) -> *mut T {
     match T::payload_layout(n) {
         Some(payload) => {
-            let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
-            let mut needs_write_barrier = true;
-            let raw = unsafe {
-                crate::gc_hook::try_gc_alloc_collecting_rooted(
-                    T::type_id(),
-                    payload.size(),
-                    &mut allocation_root,
-                    &mut needs_write_barrier,
-                )
-            };
+            let raw = crate::gc_hook::try_gc_alloc_collecting(T::type_id(), payload.size());
             match crate::gc_hook::GcAllocOutcome::from_hook(raw).allocated_or_raise() {
                 Some(raw) => unsafe {
                     // IncrementalMiniMark does not zero-fill. Publish

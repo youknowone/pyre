@@ -7655,7 +7655,7 @@ fn type_create_new_type(
         // `_create_new_type` keeps `name = space.text_w(w_name)` as a
         // livevar across `allocate_instance`. The utf8 view is a borrow of
         // the unicode payload, so own the bytes before `w_type_new`
-        // (`try_gc_alloc_collecting_rooted`).
+        // (`try_gc_alloc_collecting`).
         let name = crate::baseobjspace::str_utf8_w(name_obj())?.to_string();
         let backing_root = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(unsafe {

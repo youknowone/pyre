@@ -1075,6 +1075,23 @@ fn raw_ptr_annotation_incoming(result: &Variable, kind: &OpKind) -> Option<Incom
         {
             Some(someptr_from_voidp_concretetype(result))
         }
+        OpKind::Input {
+            ty: ValueType::Int,
+            class_root: Some(root),
+            ..
+        } if crate::annotator::bookkeeper::fn_ptr_cell_pointer_lltype(root).is_some() => {
+            let llty = crate::annotator::bookkeeper::fn_ptr_cell_pointer_lltype(root)
+                .expect("match guard");
+            result.set_concretetype(Some(llty.clone()));
+            Some(Incoming::Annotation(Rc::new(
+                crate::translator::rtyper::llannotation::lltype_to_annotation(llty),
+            )))
+        }
+        OpKind::Call { .. } | OpKind::FieldRead { .. } | OpKind::Input { .. }
+            if var_concretetype_is_cell_pointer(result) =>
+        {
+            Some(someptr_from_cell_pointer_concretetype(result))
+        }
         OpKind::FieldRead {
             field,
             ty: ValueType::Unsigned,
@@ -1185,6 +1202,28 @@ fn var_concretetype_is_voidp_family(var: &Variable) -> bool {
         var.concretetype().as_ref(),
         Some(ct) if *ct == *VOIDP || *ct == *CONST_VOIDP || *ct == *VOIDPP
     )
+}
+
+/// `CArrayPtr(Bool)` / `CArrayPtr(GCREF)` stamped on a one-level cell
+/// pointer (`stamp_cell_pointer` / `emit_cast_int_to_carray_ptr`).
+fn var_concretetype_is_cell_pointer(var: &Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+    matches!(
+        var.concretetype().as_ref(),
+        Some(ct) if *ct == CArrayPtr(LowLevelType::Bool) || *ct == CArrayPtr(GCREF.clone())
+    )
+}
+
+/// Rebuild `SomePtr` from a stamped `CArrayPtr(Bool)` / `CArrayPtr(GCREF)`.
+fn someptr_from_cell_pointer_concretetype(var: &Variable) -> Incoming {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match var.concretetype() {
+        Some(LowLevelType::Ptr(ptr_ty)) if var_concretetype_is_cell_pointer(var) => {
+            Incoming::Annotation(Rc::new(SomeValue::Ptr(SomePtr::new(*ptr_ty))))
+        }
+        _ => ccharp_someptr_incoming(),
+    }
 }
 
 /// Rebuild `SomePtr` from a stamped VOIDP / VOIDPP cell.

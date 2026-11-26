@@ -309,31 +309,32 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
     // collect_and_reserve, so invalidate_young_weakrefs always sees the
     // new WEAKREF. The no-collect allocator is not a fallback: its spill
     // would birth an old weakref that invalidate_young_weakrefs never visits.
-    let mut rooted_target = target;
-    // `weakptr` is a weak slot, so the store below deliberately runs no
-    // creation barrier; the flag exists only to satisfy the allocator's
-    // out-parameter and carries the same default as the other call sites.
-    let mut needs_write_barrier = true;
-    let payload = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            WEAKREF_GC_TYPE_ID,
-            SIZEOF_WEAKREF,
-            &mut rooted_target as *mut PyObjectRef as *mut crate::gc_hook::GCREF,
-            &mut needs_write_barrier,
-        )
-    };
+    //
+    // `framework.py` `gct_fv_gc_malloc`: `push_roots`, `malloc_fixedsize`,
+    // `pop_roots` (`shadowstack.py`). `target` is a live GC reference across
+    // that malloc, so it sits on the shadow stack rather than in a raw local.
+    let roots = crate::gc_roots::push_roots();
+    let target_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(target);
+    let payload = crate::gc_hook::try_gc_alloc_collecting(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF);
     if let Some(payload) = crate::gc_hook::GcAllocOutcome::from_hook(payload).allocated_or_raise() {
         let wref = payload as *mut Weakref;
-        unsafe { (*wref).weakptr = rooted_target };
+        // `weakptr` is a weak slot, so the store runs no creation barrier.
+        unsafe { (*wref).weakptr = roots.get(target_slot) };
         return wref;
     }
     if crate::gc_hook::gc_alloc_failed_pending() {
         return std::ptr::null_mut();
     }
 
-    crate::lltype::malloc_typed(Weakref {
-        weakptr: rooted_target,
-    })
+    w_weakref_new_immortal(roots.get(target_slot))
+}
+
+/// Pre-GC bootstrap: the Box-immortal `Weakref` described on [`w_weakref_new`]. Upstream has no such path
+/// (`gct_weakref_create` always runs `malloc_fixedsize`); it is opaque to the JIT like any `not_rpython` helper.
+#[majit_macros::dont_look_inside]
+fn w_weakref_new_immortal(target: PyObjectRef) -> *mut Weakref {
+    crate::lltype::malloc_typed(Weakref { weakptr: target })
 }
 
 /// `ll_weakref_deref(wref)` (gctypelayout.py). Reads the
@@ -412,10 +413,15 @@ pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
     if target.is_null() {
         return std::ptr::null_mut();
     }
+    // `framework.py` `gct_fv_gc_malloc` / `shadowstack.py` `push_roots`:
+    // `inner` is a live GC reference across the collecting malloc below.
+    let roots = crate::gc_roots::push_roots();
     let inner = unsafe { w_weakref_new(target) };
     if inner.is_null() {
         return std::ptr::null_mut();
     }
+    let inner_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(inner as PyObjectRef);
     let mut value = GcWeakrefBox {
         ob_header: PyObject {
             ob_type: &GC_WEAKREF_BOX_TYPE as *const PyType,
@@ -423,16 +429,12 @@ pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
         },
         inner,
     };
-    let inner_slot = (&mut value.inner as *mut *mut Weakref).cast::<crate::gc_hook::GCREF>();
     let mut needs_write_barrier = true;
-    let raw = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            GC_WEAKREF_BOX_GC_TYPE_ID,
-            GC_WEAKREF_BOX_OBJECT_SIZE,
-            inner_slot,
-            &mut needs_write_barrier,
-        )
-    };
+    let raw = crate::gc_hook::try_gc_alloc_collecting(
+        GC_WEAKREF_BOX_GC_TYPE_ID,
+        GC_WEAKREF_BOX_OBJECT_SIZE,
+    );
+    value.inner = roots.get(inner_slot) as *mut Weakref;
     if let Some(raw) = raw {
         if raw.is_null() {
             return std::ptr::null_mut();
@@ -441,9 +443,7 @@ pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
         // A nursery-full allocation may spill the box to old-gen.  Its
         // freshly-written strong `inner` field then needs the creation
         // barrier so the next minor collection sees a young Weakref.
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw);
-        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
 
