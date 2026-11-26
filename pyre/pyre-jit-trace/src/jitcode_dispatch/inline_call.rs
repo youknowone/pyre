@@ -9680,6 +9680,10 @@ struct ResolvedCallTailState<'sess> {
     require_str_result: bool,
     require_exact_int_result: bool,
     attribute_error_context: Option<AttributeErrorInlineContext>,
+    /// Roots `enrich_attribute_error` obj/name across the callee walk
+    /// (`finishframe_exception`).
+    attr_obj_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    attr_name_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     entry_is_call_boundary: bool,
     executed_effects_before: usize,
     exc_before: Option<OpRef>,
@@ -10762,7 +10766,9 @@ fn finish_resolved_user_call_after_walk<'sess, Sym: WalkSym>(
             // `getattr_str` enriches as the error leaves the attribute
             // dispatch, before the caller frame's `handle_exception` records a
             // node for the opcode that made the call.
-            if let Some(attr) = state.attribute_error_context.as_ref() {
+            if let Some(attr) = state.attribute_error_context.as_mut() {
+                attr.obj_concrete = pinned_obj(&state.attr_obj_pin, attr.obj_concrete);
+                attr.name_concrete = pinned_obj(&state.attr_name_pin, attr.name_concrete);
                 if let Some(pin) = &exc_pin
                     && let ConcreteValue::Ref(ptr) = &mut exc_concrete
                 {
@@ -10912,6 +10918,13 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
     // BinopLast passes the `(lhs, rhs, w_op_tag)` operand tuple the same way.
     operator_tail_receiver: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // A parked protocol decline re-enters this opcode (`do_residual_call`
+    // after `finishframe` / `make_result_of_lastop`). The replayed opcode
+    // reaches the inliner again and declines, so the route records the
+    // generic residual call.
+    if take_operator_residual_decline::<Sym>(op.pc) {
+        return Ok(None);
+    }
     // Callers read these copies before guards of their own, which append to
     // `opencoder.py Trace._ops` and can minor-collect.  A box that carries its
     // object is authoritative (`history.py *FrontendOp.value`).
@@ -10967,6 +10980,12 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
     let inline_code_slot = inline_base + 1;
     let callable_pin = residual_call::owner_root_if_gc(callable as usize);
     let live_callable = || pinned_obj(&callable_pin, callable);
+    let attr_obj_pin = attribute_error_context
+        .as_ref()
+        .and_then(|attr| residual_call::owner_root_if_gc(attr.obj_concrete as usize));
+    let attr_name_pin = attribute_error_context
+        .as_ref()
+        .and_then(|attr| residual_call::owner_root_if_gc(attr.name_concrete as usize));
     let guard_value_pin = residual_call::owner_root_if_gc(callable_guard_value as usize);
     let bound_pins = bound_method.as_ref().map(|bound| {
         (
@@ -13359,14 +13378,145 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
             generator_resume: None,
             ..ctx.fbw_mode.clone()
         };
+        concrete_callee_frame =
+            live_callee_frame(ctx.trace_ctx, ca_callee_frame, concrete_callee_frame);
+        // Seed the callee's per-slot concrete-locals shadow from the param
+        // boxes.  Two distinct consumers, gated differently:
+        //
+        // 1. Scalar setfield fold (`!try_multiframe` only): `fold_frame_reg`
+        //    lets `setfield_vable_*` elide `last_instr` / `valuestackdepth`
+        //    writes on a branchless leaf. Array LOAD_FAST / STORE_FAST do
+        //    not consult it — `_opimpl_getarrayitem_vable` /
+        //    `_opimpl_setarrayitem_vable` record `getfield_gc_r` +
+        //    `getarrayitem_gc` / `setarrayitem_gc` for a non-standard
+        //    (inlined) frame (`pyjitpl.py _nonstandard_virtualizable`), and
+        //    `heapcache.py getarrayitem` answers the next read.
+        //
+        // 2. Concrete-locals fallback (BOTH paths): the `getarrayitem_vable`
+        //    read fallback and the `setarrayitem_vable` re-seed
+        //    (`getarrayitem_vable_via_metainterp` / `setarrayitem_vable`) supply
+        //    the local's recording-time concrete when the heapcache holds no
+        //    entry.  A `try_multiframe` callee's param reads forward through the
+        //    heapcache only until an in-callee may-force op runs
+        //    `reset_keep_likely_virtuals` (heapcache.py) and clears the array
+        //    cache; the post-call LOAD_FAST re-read then misses and the branch
+        //    value goes non-concrete (`GotoIfNotValueNotConcrete`).  Seeding the
+        //    shadow for `try_multiframe` too gives that re-read a fallback — the
+        //    analog of the callee MIFrame register box RPython reads
+        //    `box.getint()` off (registers survive a residual call; the heapcache
+        //    does not).  STORE_FAST keeps both maps current (the
+        //    `setarrayitem_vable` handler re-seeds `set_opref` + `set_concrete`
+        //    on every store).
+        //
+        //    `set_opref` is seeded on BOTH paths (not just the fold): the read
+        //    fallback re-resolves the slot's concrete through `concrete_of_opref`
+        //    on this OpRef — a GC-forwarded, rooted channel — in preference to
+        //    the raw `Value` copy in `concrete`, which the trace-ref walker does
+        //    not visit and so dangles if a minor collection moves a nursery Ref
+        //    across the may-force residual.  The fold consumer stays gated by
+        //    `fold_frame_reg` (kept `!try_multiframe`), so seeding `opref` here is
+        //    inert for folding on the multiframe path.
+        //
+        // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
+        // unresolved).
+        if callee_portal_frame_reg != u16::MAX {
+            {
+                let mut state = callee_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
+                shadow.concrete_frame = concrete_callee_frame as usize;
+                shadow.frame_box = callee_regs_r
+                    .get(callee_portal_frame_reg as usize)
+                    .expect("ref register in range");
+            }
+            {
+                let mut state = callee_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
+                if !try_multiframe {
+                    shadow.fold_frame_reg = callee_portal_frame_reg;
+                }
+                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
+                // that it writes away from an UNSEEDED portal frame — a pure
+                // SSA mirror with no heap array behind it.  The seed block
+                // above may have materialized a real callee `PyFrame`, whose
+                // `NewArrayClear` locals array is stored into only for the
+                // parameters and freevar cells; folding away the in-callee
+                // STORE_FASTs would leave every other local holding the
+                // zero-fill, and a frame reachable afterwards through a
+                // traceback, `f_locals` or `sys._getframe` reads them as
+                // unbound.  Record that here so the store handler demotes just
+                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
+                // what `_opimpl_setarrayitem_vable` does for a
+                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
+                // those stores also emits the promote guard in
+                // `vable_getfield_*` (`pyjitpl.py`), whose resume
+                // image must include the paused caller frame
+                // (`opencoder.py capture_resumedata`). Every admitted inline
+                // now carries one, so the remaining question is only whether
+                // the callee's own frame reds were seeded; an unseeded callee
+                // keeps folding.
+                // A `try_multiframe` level seeds the same real `PyFrame`; its
+                // flag arms the post-residual live-array read in
+                // `getarrayitem_vable_via_metainterp`, the nonstandard
+                // `_opimpl_getarrayitem_vable` executing against the frame the
+                // residual wrote (`pyjitpl.py`).
+                shadow.frame_materialized = callee_frame_materialized_has_resume;
+            }
+            // `MIFrame.setup_call` copies argument boxes that already carry
+            // values. Look each box up, then seed only when every SOME
+            // argument is reconstructable; otherwise decline before any
+            // shadow slot is written.
+            let concretes: Vec<majit_ir::Value> = (0..seeded_locals)
+                .map(|i| {
+                    ctx.trace_ctx
+                        .concrete_of_opref(callee_args[i])
+                        .unwrap_or(majit_ir::Value::Void)
+                })
+                .collect();
+            {
+                let mut state = callee_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
+                seed_inline_param_shadows(
+                    shadow,
+                    concrete_callee_frame as usize,
+                    &callee_args[..seeded_locals],
+                    &concretes,
+                    op.pc,
+                )?;
+            }
+            // `MIFrame.registers_r` retains cell/freevar slots across a
+            // may-force call just like ordinary locals.  The heapcache entry
+            // installed by `emit_new_pyframe_inline_with_params` is only a
+            // forwarding optimization and is invalidated by that call; seed
+            // the frame-local shadow too so a later LOAD_DEREF re-reads the
+            // same live cell instead of manufacturing an unstamped
+            // GetarrayitemGcR result.  The freevar band follows the varnames
+            // and the pure cellvars (`finish_for_call_with_globals_obj`), so a
+            // callee with a fresh cell of its own puts its first freevar past
+            // that cell, not at the first non-varname slot.
+            let freevar_base =
+                callee_code.varnames.len() + pyre_interpreter::npure_cellvars(callee_code);
+            for (i, (&cell, &value)) in live_freevar_cells()
+                .iter()
+                .zip(&freevar_cell_ops)
+                .enumerate()
+            {
+                let slot = (freevar_base + i) as i64;
+                let mut state = callee_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
+                shadow.set_opref(slot, value);
+                shadow.set_concrete(
+                    concrete_callee_frame as usize,
+                    slot,
+                    majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+                );
+            }
+        }
         // `perform_call` / `newframe` / `ChangeFrame`: any inlined user
         // call under an active driver is a framestack frame, including a
         // constructor called from a parked protocol dunder. A nested
         // helper then parks as that frame's child so dest-write lands in
         // the dunder, not in the caller's helper.
         if subwalk_driver_is_active() {
-            let concrete_callee_frame =
-                live_callee_frame(ctx.trace_ctx, ca_callee_frame, concrete_callee_frame);
             let _ = enter_portal_level(
                 ctx,
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
@@ -13431,6 +13581,8 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
                 require_str_result,
                 require_exact_int_result,
                 attribute_error_context,
+                attr_obj_pin,
+                attr_name_pin,
                 entry_is_call_boundary,
                 executed_effects_before,
                 exc_before: exc_before_subwalk,
@@ -13548,142 +13700,7 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
             .filter(|owner| *owner != caller_inflight_owner);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
-        concrete_callee_frame =
-            live_callee_frame(sub_wc.trace_ctx, ca_callee_frame, concrete_callee_frame);
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
-        // Seed the callee's per-slot concrete-locals shadow from the param
-        // boxes.  Two distinct consumers, gated differently:
-        //
-        // 1. Scalar setfield fold (`!try_multiframe` only): `fold_frame_reg`
-        //    lets `setfield_vable_*` elide `last_instr` / `valuestackdepth`
-        //    writes on a branchless leaf. Array LOAD_FAST / STORE_FAST do
-        //    not consult it — `_opimpl_getarrayitem_vable` /
-        //    `_opimpl_setarrayitem_vable` record `getfield_gc_r` +
-        //    `getarrayitem_gc` / `setarrayitem_gc` for a non-standard
-        //    (inlined) frame (`pyjitpl.py _nonstandard_virtualizable`), and
-        //    `heapcache.py getarrayitem` answers the next read.
-        //
-        // 2. Concrete-locals fallback (BOTH paths): the `getarrayitem_vable`
-        //    read fallback and the `setarrayitem_vable` re-seed
-        //    (`getarrayitem_vable_via_metainterp` / `setarrayitem_vable`) supply
-        //    the local's recording-time concrete when the heapcache holds no
-        //    entry.  A `try_multiframe` callee's param reads forward through the
-        //    heapcache only until an in-callee may-force op runs
-        //    `reset_keep_likely_virtuals` (heapcache.py) and clears the array
-        //    cache; the post-call LOAD_FAST re-read then misses and the branch
-        //    value goes non-concrete (`GotoIfNotValueNotConcrete`).  Seeding the
-        //    shadow for `try_multiframe` too gives that re-read a fallback — the
-        //    analog of the callee MIFrame register box RPython reads
-        //    `box.getint()` off (registers survive a residual call; the heapcache
-        //    does not).  STORE_FAST keeps both maps current (the
-        //    `setarrayitem_vable` handler re-seeds `set_opref` + `set_concrete`
-        //    on every store).
-        //
-        //    `set_opref` is seeded on BOTH paths (not just the fold): the read
-        //    fallback re-resolves the slot's concrete through `concrete_of_opref`
-        //    on this OpRef — a GC-forwarded, rooted channel — in preference to
-        //    the raw `Value` copy in `concrete`, which the trace-ref walker does
-        //    not visit and so dangles if a minor collection moves a nursery Ref
-        //    across the may-force residual.  The fold consumer stays gated by
-        //    `fold_frame_reg` (kept `!try_multiframe`), so seeding `opref` here is
-        //    inert for folding on the multiframe path.
-        //
-        // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
-        // unresolved).
-        if callee_portal_frame_reg != u16::MAX {
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.concrete_frame = concrete_callee_frame as usize;
-                shadow.frame_box = sub_wc
-                    .registers_r
-                    .get(callee_portal_frame_reg as usize)
-                    .expect("ref register in range");
-            }
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                if !try_multiframe {
-                    shadow.fold_frame_reg = callee_portal_frame_reg;
-                }
-                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
-                // that it writes away from an UNSEEDED portal frame — a pure
-                // SSA mirror with no heap array behind it.  The seed block
-                // above may have materialized a real callee `PyFrame`, whose
-                // `NewArrayClear` locals array is stored into only for the
-                // parameters and freevar cells; folding away the in-callee
-                // STORE_FASTs would leave every other local holding the
-                // zero-fill, and a frame reachable afterwards through a
-                // traceback, `f_locals` or `sys._getframe` reads them as
-                // unbound.  Record that here so the store handler demotes just
-                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
-                // what `_opimpl_setarrayitem_vable` does for a
-                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
-                // those stores also emits the promote guard in
-                // `vable_getfield_*` (`pyjitpl.py`), whose resume
-                // image must include the paused caller frame
-                // (`opencoder.py capture_resumedata`). Every admitted inline
-                // now carries one, so the remaining question is only whether
-                // the callee's own frame reds were seeded; an unseeded callee
-                // keeps folding.
-                // A `try_multiframe` level seeds the same real `PyFrame`; its
-                // flag arms the post-residual live-array read in
-                // `getarrayitem_vable_via_metainterp`, the nonstandard
-                // `_opimpl_getarrayitem_vable` executing against the frame the
-                // residual wrote (`pyjitpl.py`).
-                shadow.frame_materialized = callee_frame_materialized_has_resume;
-            }
-            // `MIFrame.setup_call` copies argument boxes that already carry
-            // values. Look each box up, then seed only when every SOME
-            // argument is reconstructable; otherwise decline before any
-            // shadow slot is written.
-            let concretes: Vec<majit_ir::Value> = (0..seeded_locals)
-                .map(|i| {
-                    sub_wc
-                        .trace_ctx
-                        .concrete_of_opref(callee_args[i])
-                        .unwrap_or(majit_ir::Value::Void)
-                })
-                .collect();
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                seed_inline_param_shadows(
-                    shadow,
-                    concrete_callee_frame as usize,
-                    &callee_args[..seeded_locals],
-                    &concretes,
-                    op.pc,
-                )?;
-            }
-            // `MIFrame.registers_r` retains cell/freevar slots across a
-            // may-force call just like ordinary locals.  The heapcache entry
-            // installed by `emit_new_pyframe_inline_with_params` is only a
-            // forwarding optimization and is invalidated by that call; seed
-            // the frame-local shadow too so a later LOAD_DEREF re-reads the
-            // same live cell instead of manufacturing an unstamped
-            // GetarrayitemGcR result.  The freevar band follows the varnames
-            // and the pure cellvars (`finish_for_call_with_globals_obj`), so a
-            // callee with a fresh cell of its own puts its first freevar past
-            // that cell, not at the first non-varname slot.
-            let freevar_base =
-                callee_code.varnames.len() + pyre_interpreter::npure_cellvars(callee_code);
-            for (i, (&cell, &value)) in live_freevar_cells()
-                .iter()
-                .zip(&freevar_cell_ops)
-                .enumerate()
-            {
-                let slot = (freevar_base + i) as i64;
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.set_opref(slot, value);
-                shadow.set_concrete(
-                    concrete_callee_frame as usize,
-                    slot,
-                    majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
-                );
-            }
-        }
         // Capture a depth-1 live callee before these guards drop. This is the
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
         // `_copy_data_from_miframe` preserves the callee's own position and
@@ -13805,6 +13822,8 @@ fn try_walker_inline_resolved_user_call_inner<'sess, Sym: WalkSym>(
             require_str_result,
             require_exact_int_result,
             attribute_error_context,
+            attr_obj_pin,
+            attr_name_pin,
             entry_is_call_boundary,
             executed_effects_before,
             exc_before: exc_before_subwalk,
@@ -16997,10 +17016,14 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
     ];
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     let mut result = None;
-    if subwalk_driver_is_active() {
-        park_protocol_cont::<Sym>(ParkedProtocolCont::IndexHandoff { park_pc: op.pc });
-    }
-    let inlined = match try_walker_inline_resolved_user_call_inner(
+    // `prepare_walker_inline_index` declines when `fbw_mode.inline_subwalk`;
+    // a SubWalkDriver only steps those frames, so no IndexInlineCandidate
+    // exists while the driver is active.
+    debug_assert!(
+        !subwalk_driver_is_active(),
+        "prepare_walker_inline_index declines inline_subwalk; driver frames are inline_subwalk"
+    );
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -17032,18 +17055,12 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         Vec::new(),
         None,
         None,
-    ) {
-        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
-        other => {
-            let _ = take_protocol_cont::<Sym>();
-            other
-        }
-    };
+    );
     finish_index_after_inline(op, inlined, result)
 }
 
 /// After `__index__` returns an exact machine int, hand the box to the
-/// enclosing builtin. Shared by the recursive route and park pop.
+/// enclosing builtin.
 fn finish_index_after_inline(
     op: &DecodedOp,
     inlined: Result<Option<(DispatchOutcome, usize)>, DispatchError>,
@@ -19671,9 +19688,6 @@ enum ParkedProtocolCont<'a> {
         name_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
         pre_fold_pos: majit_metainterp::recorder::TracePosition,
     },
-    IndexHandoff {
-        park_pc: usize,
-    },
     HashNormalize {
         park_pc: usize,
         dst: usize,
@@ -19708,7 +19722,6 @@ impl ParkedProtocolCont<'_> {
             | Self::Next { park_pc, .. }
             | Self::Binop { park_pc, .. }
             | Self::ThroughGet { park_pc, .. }
-            | Self::IndexHandoff { park_pc }
             | Self::HashNormalize { park_pc, .. }
             | Self::ExceptionStrGuard { park_pc, .. }
             | Self::ContainsBool { park_pc, .. }
@@ -21604,13 +21617,12 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
         return Ok(None);
     }
-    if take_operator_residual_decline::<Sym>(op.pc) {
-        return Ok(None);
-    }
-
     let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
         return Ok(None);
     };
+    if take_operator_residual_decline::<Sym>(op.pc) {
+        return Ok(None);
+    }
     // Forward rich-compare dunder only; a proper-subclass rhs declines below so
     // its reflected dunder (__lt__/__gt__, __le__/__ge__, __eq__/__ne__ self)
     // keeps priority, matching try_compare_override's forward-first dispatch.
@@ -22077,15 +22089,25 @@ struct ProtocolBoolRewind {
     effects_before: usize,
     unjournaled_before: bool,
     journal_mark: FbwEffectJournalMark,
+    /// CONTAINS_OP dest aliases the needle register. `make_result_of_lastop`
+    /// dest-writes the dunder box; a later `do_residual_call` replay must
+    /// see the operands the opimpl held before that write.
+    dst: usize,
+    dst_box: OpRef,
 }
 
-fn protocol_bool_rewind<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) -> ProtocolBoolRewind {
+fn protocol_bool_rewind<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    dst: usize,
+) -> ProtocolBoolRewind {
     ProtocolBoolRewind {
         pre_fold_pos: ctx.trace_ctx.get_trace_position(),
         virtualrefs: ctx.trace_ctx.snapshot_virtualref_boxes(),
         effects_before: fbw_executed_effect_count(),
         unjournaled_before: fbw_has_unjournaled_effect(),
         journal_mark: fbw_effect_journal_mark(),
+        dst,
+        dst_box: ctx.registers_r.get(dst).expect("ref register in range"),
     }
 }
 
@@ -22123,6 +22145,8 @@ fn finish_inlined_bool<Sym: WalkSym>(
                 fbw_effect_journal_rollback_since(rewind.journal_mark);
                 cut_declined_subwalk(ctx, rewind.pre_fold_pos);
                 ctx.trace_ctx.restore_virtualref_boxes(rewind.virtualrefs);
+                let restored = concrete_from_recorded_opref(ctx, rewind.dst_box);
+                write_ref_reg(ctx, op.pc, rewind.dst, rewind.dst_box, restored)?;
                 return Ok(None);
             }
             return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -22158,6 +22182,9 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
     }
     // `runtime_ops::compare_value` inverts the protocol result for `not in`.
     if op_tag != pyre_interpreter::runtime_ops::COMPARE_OP_CONTAINS {
+        return Ok(None);
+    }
+    if take_operator_residual_decline::<Sym>(op.pc) {
         return Ok(None);
     }
 
@@ -22214,7 +22241,7 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_haystack),
         ConcreteValue::Ref(concrete_needle),
     ];
-    let rewind = protocol_bool_rewind(ctx);
+    let rewind = protocol_bool_rewind(ctx, dst);
     if subwalk_driver_is_active() {
         park_protocol_cont::<Sym>(ParkedProtocolCont::ContainsBool {
             park_pc: op.pc,
@@ -22281,6 +22308,9 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 4 {
+        return Ok(None);
+    }
+    if take_operator_residual_decline::<Sym>(op.pc) {
         return Ok(None);
     }
 
@@ -22364,7 +22394,7 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_classinfo),
         ConcreteValue::Ref(concrete_obj),
     ];
-    let rewind = protocol_bool_rewind(ctx);
+    let rewind = protocol_bool_rewind(ctx, dst);
     if subwalk_driver_is_active() {
         park_protocol_cont::<Sym>(ParkedProtocolCont::ContainsBool {
             park_pc: op.pc,
@@ -23737,7 +23767,9 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
     fn abandon_parked_entered_frames(&mut self, trace_ctx: &mut TraceCtx) {
         let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
-        for frame in &mut self.frames {
+        // Frames are outer→inner and each abandon restores `topframeref` to
+        // that frame's `f_backref`, so the innermost goes first.
+        for frame in self.frames.iter_mut().rev() {
             let Some(state) = frame.resolved_tail.as_ref() else {
                 continue;
             };
@@ -23796,29 +23828,21 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
         {
             *concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
         }
-        let (needs_handoff, cont, residualize_operator) = {
+        let (needs_handoff, cont) = {
             let parent = self
                 .frames
                 .last_mut()
                 .expect("resolved user call lost its caller");
             match parent.protocol_cont.take() {
                 Some(cont) if cont.park_pc() == caller_pc => {
-                    let needs = matches!(
-                        &cont,
-                        ParkedProtocolCont::ThroughGet { .. }
-                            | ParkedProtocolCont::IndexHandoff { .. }
-                    );
-                    let residualize = matches!(
-                        &cont,
-                        ParkedProtocolCont::CompareopNi { .. } | ParkedProtocolCont::Binop { .. }
-                    );
-                    (needs, Some(cont), residualize)
+                    let needs = matches!(&cont, ParkedProtocolCont::ThroughGet { .. });
+                    (needs, Some(cont))
                 }
                 Some(cont) => {
                     parent.protocol_cont = Some(cont);
-                    (false, None, false)
+                    (false, None)
                 }
-                None => (false, None, false),
+                None => (false, None),
             }
         };
         let mut handed = None;
@@ -23898,23 +23922,14 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 Ok(())
             }
             Ok(None) => {
-                // `do_residual_call` for COMPARE_OP / BINARY_OP: the route
-                // declined the speculative dunder. Re-enter the opcode so
-                // the residual records; `take_operator_residual_decline`
-                // skips the dunder so it does not park again.
-                // Other routes' `Ok(None)` stay a decline.
-                if residualize_operator {
-                    if fbw_inline_diag_enabled() {
-                        eprintln!("[parked-resolved] caller_pc={caller_pc} after=None residualize");
-                    }
-                    self.replay_operator_residual(caller_pc);
-                    Ok(())
-                } else {
-                    if fbw_inline_diag_enabled() {
-                        eprintln!("[parked-resolved] caller_pc={caller_pc} after=None");
-                    }
-                    Err(DispatchError::callee_inline_unsupported(caller_pc))
+                // `do_residual_call`: after `finishframe` the still-running
+                // opimpl that declines records the operator residual. The
+                // replayed opcode reaches the inliner again and declines.
+                if fbw_inline_diag_enabled() {
+                    eprintln!("[parked-resolved] caller_pc={caller_pc} after=None residualize");
                 }
+                self.replay_operator_residual(caller_pc);
+                Ok(())
             }
             Err(DispatchError::SubWalkSuspended { .. }) => {
                 let parent = self
@@ -24328,12 +24343,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // `ABORT_FORCE_QUASIIMMUT` is the same unwind
                 // (`opimpl_jit_force_quasi_immutable`): splice ran in
                 // `prepare_force_quasi_immutable_abort`.
-                Err(error @ DispatchError::TraceTooLong { .. }) => {
+                Err(
+                    error @ (DispatchError::TraceTooLong { .. }
+                    | DispatchError::ForceQuasiImmutable { .. }),
+                ) => {
                     self.abandon_parked_entered_frames(trace_ctx);
-                    self.unwind_all_frames(false);
-                    return Err(error);
-                }
-                Err(error @ DispatchError::ForceQuasiImmutable { .. }) => {
                     self.unwind_all_frames(false);
                     return Err(error);
                 }
@@ -24409,6 +24423,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // staged the abort image; replaying this CALL would apply the
                 // residual a second time.
                 Err(error) if abort_blackhole_latched() => {
+                    self.abandon_parked_entered_frames(trace_ctx);
                     self.unwind_all_frames(false);
                     return Err(error);
                 }
@@ -25563,6 +25578,31 @@ struct BinopParkedNi<'a> {
     receiver_is_lhs: bool,
 }
 
+/// `descroperation.py` `_check_notimplemented` after `_invoke_binop`.
+/// GuardTrue keeps the live NI box on the reflected arm; GuardFalse is the
+/// non-NI fall-through.
+fn emit_binop_not_implemented_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    result: OpRef,
+    guard: OpCode,
+) -> Result<(), DispatchError> {
+    if result.is_constant() {
+        return Ok(());
+    }
+    let not_implemented = ctx
+        .trace_ctx
+        .const_ref(pyre_object::special::w_not_implemented() as i64);
+    let is_ni = ctx
+        .trace_ctx
+        .record_op(OpCode::PtrEq, &[result, not_implemented]);
+    ctx.trace_ctx.set_opref_concrete(
+        is_ni,
+        majit_ir::Value::Int(i64::from(guard == OpCode::GuardTrue)),
+    );
+    walker_emit_guard_with_snapshot(ctx, pc, guard, &[is_ni])
+}
+
 /// Post-descent of [`try_walker_inline_user_binop_dunder`]: refuse / decline /
 /// NotImplemented. Recursive and parked pop share this body.
 fn finish_user_binop_dunder_after_descent<Sym: WalkSym>(
@@ -25671,6 +25711,10 @@ fn finish_user_binop_dunder_after_descent<Sym: WalkSym>(
                     // Settled last arm of `_call_binop_impl`: the forward
                     // `_invoke_binop` produced NotImplemented, so `__r*__`
                     // is a real `get_and_call_function` (`perform_call`).
+                    // Guard the live NI box (`_check_notimplemented`) before
+                    // the reflected arm; fail keeps this box as the operator
+                    // result.
+                    emit_binop_not_implemented_guard(ctx, op.pc, result, OpCode::GuardTrue)?;
                     return match try_walker_inline_user_binop_reflected(
                         ctx,
                         op,
@@ -25721,15 +25765,7 @@ fn finish_user_binop_dunder_after_descent<Sym: WalkSym>(
             }
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
-        if !result.is_constant() {
-            let not_implemented = ctx
-                .trace_ctx
-                .const_ref(pyre_object::special::w_not_implemented() as i64);
-            let is_not_implemented = ctx
-                .trace_ctx
-                .record_op(OpCode::PtrEq, &[result, not_implemented]);
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardFalse, &[is_not_implemented])?;
-        }
+        emit_binop_not_implemented_guard(ctx, op.pc, result, OpCode::GuardFalse)?;
     }
     Ok(Some(inlined))
 }
@@ -25970,12 +26006,6 @@ fn finish_resolved_call_route_cont<Sym: WalkSym>(
                 after,
                 handed,
             )
-        }
-        ParkedProtocolCont::IndexHandoff { .. } => {
-            match finish_index_after_inline(op, after, handed)? {
-                Some(_) => Ok(Some((DispatchOutcome::Continue, op.next_pc))),
-                None => Ok(None),
-            }
         }
         ParkedProtocolCont::HashNormalize {
             dst, effect_free, ..
