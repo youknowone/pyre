@@ -36,7 +36,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v26";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v27";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × with/without `pyre-module`, across a few
@@ -1940,6 +1940,7 @@ fn real_main() {
             paths,
             alias_groups,
             reachable,
+            pipeline.inherited_trait_defaults.clone(),
         )
         .expect("encode JitCode archive");
         let jitcodes_index_bin = bincode::serialize(&index).unwrap();

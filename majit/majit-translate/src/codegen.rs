@@ -123,6 +123,7 @@ mod tests {
             symbolic_fnaddr_targets: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             jitcode_alias_paths: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             indirectcalltarget_indices: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),

@@ -271,6 +271,12 @@ pub struct ProgramPipelineResult {
     /// key.
     #[serde(skip)]
     pub jitcode_alias_paths: Vec<Vec<crate::parse::CallPath>>,
+    /// `(impl_key, trait_leaf, method)` whose rustc vtable slot is the
+    /// trait default body. Frozen into `JitCodeIndex` so
+    /// `bytecode_for_address` binds the base jitcode the way
+    /// `getfunctionptr(graph)` shares the base funcptr.
+    #[serde(default)]
+    pub inherited_trait_defaults: Vec<(String, String, String)>,
     /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
     /// table grown on-demand by `write_insn`. Persisted alongside the
     /// jitcodes so the runtime can map bytecode bytes back to opnames —
@@ -376,6 +382,7 @@ mod tests {
             indirectcalltarget_indices: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             jitcode_alias_paths: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),

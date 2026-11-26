@@ -18,8 +18,9 @@ pub use majit_jitcode::artifacts::{JitCodeIndex, ReachableSymbolicResidualTable}
 /// Version 3 moves `JitCode.calldescr` to the header (`jitcode.py`
 /// `__init__`), so a version-2 body blob is a different bincode layout.
 /// Version 4 freezes each jitcode's `CallPath` (segments + specialization)
-/// instead of its display name.
-const ARTIFACT_VERSION: u32 = 4;
+/// instead of its display name. Version 5 adds
+/// `JitCodeIndex.inherited_trait_defaults`.
+const ARTIFACT_VERSION: u32 = 5;
 
 /// Encoded bodies remain bytes until requested, so this envelope is Send+Sync
 /// without publishing translation-time graphs across threads.
@@ -47,8 +48,13 @@ impl EmbeddedArtifacts {
             Vec::new()
         };
         let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
-        let (index, bodies) =
-            JitCodeIndex::encode(&pipeline.jitcodes, paths, alias_groups, reachable)?;
+        let (index, bodies) = JitCodeIndex::encode(
+            &pipeline.jitcodes,
+            paths,
+            alias_groups,
+            reachable,
+            pipeline.inherited_trait_defaults.clone(),
+        )?;
         Ok(Self {
             version: ARTIFACT_VERSION,
             index,
@@ -237,6 +243,7 @@ mod tests {
             ]))],
             Vec::new(),
             reachable,
+            Vec::new(),
         )
         .unwrap();
         let mut original = EmbeddedArtifacts {
@@ -426,7 +433,7 @@ mod tests {
 
         let paths = vec![None; jitcodes.len()];
         let (index, bodies) =
-            JitCodeIndex::encode(&jitcodes, paths, Vec::new(), table.clone()).unwrap();
+            JitCodeIndex::encode(&jitcodes, paths, Vec::new(), table.clone(), Vec::new()).unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
         assert_eq!(
             decoded.reachable_symbolic_residuals,

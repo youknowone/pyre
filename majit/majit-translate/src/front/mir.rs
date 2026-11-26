@@ -740,6 +740,11 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     } else {
         publish_fnptr_field_families_across(llbcs)
     };
+    let inherited_trait_defaults = if function_filter.is_some() {
+        Vec::new()
+    } else {
+        inherited_dyn_impl_methods_across(llbcs)
+    };
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key is [`crate::model::graph_key_of`] when `funcobj_identity`
     // is present: `FunctionDesc.cachedgraph` keeps one graph per (desc,
@@ -789,6 +794,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             Some(&acc.struct_ids),
         );
         acc.fnptr_field_families = fnptr_field_families;
+        acc.inherited_trait_defaults = inherited_trait_defaults;
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -810,6 +816,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
             fnptr_field_families: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             struct_layouts: Default::default(),
         }),
     )
@@ -4604,6 +4611,7 @@ impl CrateLoweringState {
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
             fnptr_field_families: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             struct_layouts: self.struct_layouts.clone(),
         }
     }
@@ -9972,6 +9980,8 @@ use self::operation::*;
 use self::removeassert::*;
 use self::simplify::*;
 use self::strformat::*;
+pub use self::views::inherited_dyn_impl_methods;
+pub(crate) use self::views::inherited_dyn_impl_methods_across;
 use self::views::*;
 
 pub(crate) use self::consteval::{

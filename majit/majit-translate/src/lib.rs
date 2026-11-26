@@ -255,6 +255,7 @@ fn build_semantic_program_via_active_frontend(
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
             let mut fnptr_family_inputs = front::mir::FnPtrFamilyInputs::default();
+            let mut inherited_trait_defaults = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut repr_transparent = std::collections::HashSet::new();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
@@ -396,8 +397,11 @@ fn build_semantic_program_via_active_frontend(
                     }
                 }
                 fnptr_family_inputs.merge(front::mir::collect_fnptr_family_inputs(&llbc));
+                inherited_trait_defaults.extend(front::mir::inherited_dyn_impl_methods(&llbc));
                 prof.mark(&format!("    harvest {p}"));
             }
+            inherited_trait_defaults.sort();
+            inherited_trait_defaults.dedup();
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
             let foldable_cross = front::mir::register_foldable_const_lits(foldable_cross);
@@ -541,6 +545,7 @@ fn build_semantic_program_via_active_frontend(
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
                 fnptr_field_families: Vec::new(),
+                inherited_trait_defaults: Vec::new(),
                 struct_layouts: Default::default(),
             });
             front::mir::harden_duplicate_leaf_metadata(
@@ -555,6 +560,7 @@ fn build_semantic_program_via_active_frontend(
             program.fun_decl_identity_aliases = fun_decl_identity_aliases;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
+            program.inherited_trait_defaults = inherited_trait_defaults;
             return (
                 program,
                 gc_struct_ids,
@@ -4364,6 +4370,7 @@ fn analyze_pipeline_from_module_paths(
         indirectcalltarget_indices: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
         jitcode_alias_paths: Vec::new(),
+        inherited_trait_defaults: Vec::new(),
         insns: indexmap::IndexMap::new(),
         descrs: Vec::new(),
         all_liveness: Vec::new(),
@@ -4471,6 +4478,7 @@ fn analyze_pipeline_from_module_paths(
         }
         pipeline.jitcode_alias_paths = alias_groups;
     }
+    pipeline.inherited_trait_defaults = program.inherited_trait_defaults.clone();
     pipeline.insns = insns;
     pipeline.descrs = descrs;
     // Snapshotted in `make_jitcodes` from the assembler's shared `all_liveness`

@@ -1788,6 +1788,12 @@ pub struct SemanticProgram {
     /// `c_graphs` for an indirect call through that slot. Empty until the
     /// first-pass harvest fills it.
     pub fnptr_field_families: Vec<(String, String, String)>,
+    /// `(impl_key, trait_leaf, method)` whose rustc vtable slot is the
+    /// trait default body (`TraitDecl` provided method, not an override).
+    /// Frozen into `JitCodeIndex` so `bytecode_for_address` binds the
+    /// base jitcode the way `getfunctionptr(graph)` shares the base
+    /// funcptr.
+    pub inherited_trait_defaults: Vec<(String, String, String)>,
     /// Live assembler layout table for this translation (`descr.py`
     /// `get_size_descr` cache[STRUCT]). One `Rc` per translation, shared
     /// with every crate's lowering and with `CallControl`.

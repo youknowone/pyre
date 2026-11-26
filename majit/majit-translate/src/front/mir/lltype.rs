@@ -3825,6 +3825,12 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// equality (`rclass.py` `getvtable` / `OBJECT.typeptr`).
     pub(in crate::front::mir) registered_dyn_impl_vtables:
         std::sync::OnceLock<Vec<(String, String)>>,
+    /// `(impl_key, trait_leaf, method)` whose vtable slot is the trait
+    /// default body (`TraitDecl.methods[].default` / a `TraitImpl`
+    /// row that did not override). `CallControl.graphs_from` /
+    /// `getfunctionptr(graph)` share that graph across subclasses.
+    pub(in crate::front::mir) inherited_dyn_impl_methods:
+        std::sync::OnceLock<Vec<(String, String, String)>>,
     pub(in crate::front::mir) fnptr_field_families:
         std::sync::OnceLock<Vec<(String, String, String)>>,
     /// `(overrides, plain)` of the EvalFn family (`discover_eval_hook_families`).

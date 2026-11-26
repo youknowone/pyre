@@ -36,6 +36,11 @@ pub struct JitCodeIndex {
     /// index that predates this column (`serde` default).
     #[serde(default)]
     pub alias_groups: Vec<Vec<CallPath>>,
+    /// `(impl_key, trait_leaf, method)` whose rustc vtable slot is the
+    /// trait default body. `bytecode_for_address` binds the base jitcode
+    /// the way `getfunctionptr(graph)` shares the base funcptr.
+    #[serde(default)]
+    pub inherited_trait_defaults: Vec<(String, String, String)>,
 }
 
 /// Per-jitcode symbolic residual closure, flat so the index stays one bincode
@@ -54,6 +59,7 @@ impl JitCodeIndex {
         paths: Vec<Option<CallPath>>,
         alias_groups: Vec<Vec<CallPath>>,
         reachable: ReachableSymbolicResidualTable,
+        inherited_trait_defaults: Vec<(String, String, String)>,
     ) -> bincode::Result<(Self, Vec<u8>)> {
         assert_eq!(paths.len(), jitcodes.len());
         let alias_groups = if alias_groups.is_empty() {
@@ -71,6 +77,7 @@ impl JitCodeIndex {
             reachable_symbolic_offsets: reachable.offsets,
             reachable_symbolic_visited: reachable.visited,
             alias_groups,
+            inherited_trait_defaults,
         };
         for jitcode in jitcodes {
             index.names.push(jitcode.name.clone());
@@ -202,6 +209,7 @@ mod tests {
         residual_offsets: Vec<u32>,
         visited: Vec<u32>,
         alias_groups: Vec<Vec<CallPath>>,
+        inherited_trait_defaults: Vec<(String, String, String)>,
     ) -> Vec<u8> {
         bincode::serialize(&(
             names,
@@ -211,6 +219,7 @@ mod tests {
             residual_offsets,
             visited,
             alias_groups,
+            inherited_trait_defaults,
         ))
         .unwrap()
     }
@@ -237,6 +246,7 @@ mod tests {
             vec![0, 2, 2],
             vec![3, 1],
             vec![Vec::new(); 2],
+            Vec::new(),
         );
         let index = JitCodeIndex::decode(&old, &[0, 0]).unwrap();
         assert_eq!(index.paths, paths);
@@ -276,6 +286,7 @@ mod tests {
             vec![Some(regular.clone()), Some(access_direct.clone())],
             Vec::new(),
             empty_reachable(2),
+            Vec::new(),
         )
         .unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
@@ -296,11 +307,33 @@ mod tests {
             vec![Some(harvest.clone())],
             vec![vec![identity.clone()]],
             empty_reachable(1),
+            Vec::new(),
         )
         .unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
         assert_eq!(decoded.paths, [Some(harvest)]);
         assert_eq!(decoded.alias_groups, [vec![identity]]);
+    }
+
+    #[test]
+    fn encode_roundtrips_inherited_trait_defaults() {
+        let a = Arc::new(JitCode::new("f"));
+        a.set_index(0);
+        let inherited = vec![(
+            "owner::Impl".to_string(),
+            "Trait".to_string(),
+            "method".to_string(),
+        )];
+        let (index, bodies) = JitCodeIndex::encode(
+            &[a],
+            vec![Some(CallPath::from_segments(["owner", "f"]))],
+            Vec::new(),
+            empty_reachable(1),
+            inherited.clone(),
+        )
+        .unwrap();
+        let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
+        assert_eq!(decoded.inherited_trait_defaults, inherited);
     }
 
     #[test]
@@ -328,6 +361,7 @@ mod tests {
                 vec![0, 0],
                 vec![0],
                 Vec::new(),
+                Vec::new(),
             );
             assert!(JitCodeIndex::decode(&bytes, &[0, 0]).is_err());
         }
@@ -341,6 +375,7 @@ mod tests {
             vec![0, 1],
             vec![1],
             Vec::new(),
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&mismatched_len, &[]).is_err());
         // `last == values.len()`, but the span is not monotonic.
@@ -352,6 +387,7 @@ mod tests {
             vec![0, 2, 1],
             vec![1, 1],
             Vec::new(),
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&non_monotonic, &[]).is_err());
         let bad_origin = index_bytes(
@@ -362,6 +398,7 @@ mod tests {
             vec![1, 1],
             vec![1],
             Vec::new(),
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&bad_origin, &[]).is_err());
         let bad_visited = index_bytes(
@@ -370,6 +407,7 @@ mod tests {
             vec![0, 0],
             Vec::new(),
             vec![0, 0],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );

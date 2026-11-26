@@ -207,3 +207,32 @@ fn registered_dyn_impl_keys_equal_charon_name_path_of_their_type() {
         "registered impl_key must equal Charon name_path() of its type exactly: {mismatches:?}"
     );
 }
+
+/// `TraitImpl.methods[].fn_id == TraitDecl.methods[].default`: the impl
+/// did not override, so `CallControl.graphs_from` / `getfunctionptr(graph)`
+/// share the base graph.
+#[test]
+fn inherited_dyn_impl_methods_name_module_dict_hashed_not_unicode_override() {
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let mut rows = majit_translate::front::mir::inherited_dyn_impl_methods(&object);
+    rows.extend(majit_translate::front::mir::inherited_dyn_impl_methods(
+        &interpreter,
+    ));
+    rows.sort();
+    rows.dedup();
+    assert!(
+        rows.iter().any(|(impl_key, trait_leaf, method)| {
+            impl_key.ends_with("ModuleDictStrategy")
+                && trait_leaf == "DictStrategy"
+                && method == "getitem_str_hashed"
+        }),
+        "ModuleDictStrategy inherits getitem_str_hashed: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(impl_key, _, method)| {
+            !(impl_key.ends_with("UnicodeDictStrategy") && method == "getitem_str_hashed")
+        }),
+        "UnicodeDictStrategy overrides getitem_str_hashed: {rows:?}"
+    );
+}
