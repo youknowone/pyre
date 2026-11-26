@@ -17965,69 +17965,6 @@ pub(in crate::front::mir) fn field_row_lltype(
     None
 }
 
-/// `Ptr(GcStruct)` of a declared-GC class root.
-///
-/// `owner_ll_container` builds the container with `Struct::registry_fields`
-/// when the harvested layout's `_gckind` is Gc, and `pointer_field_lltype`
-/// wraps that container. `Struct::gc` is the same `_build` with
-/// `GcKind::Gc`; `gc_class_root_ptr_as_instance` recognizes that pointer
-/// (a `GcKind::Gc` struct whose `_name` is an exact `struct_fields` key
-/// `getuniqueclassdef_for_struct_root` accepts). This path has the
-/// registry and not the layout table. Interior rows stay off the struct:
-/// the field is the instance pointer, and a pointer back to the same
-/// root would re-enter through `visited`.
-fn class_root_gc_struct_ptr(
-    reg: &crate::front::StructFieldRegistry,
-    pointee: &str,
-) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
-
-    let name = class_root_struct_name(reg, pointee)?;
-    // `_name` is the key `getuniqueclassdef_for_struct_root` interns.
-    // The refusal sequence is `struct_root_has_no_classdef` (GCREF,
-    // `struct_root_refuses_classdef_new`, list family). A refused name
-    // does not read as an instance (`gc_class_root_ptr_as_instance`).
-    if crate::annotator::bookkeeper::struct_root_has_no_classdef(&name, Some(reg)).is_some() {
-        return None;
-    }
-    let body = Struct::gc(&name, Vec::<(String, LowLevelType)>::new());
-    let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
-    Some(LowLevelType::Ptr(Box::new(ptr)))
-}
-
-/// `ClassIdentity.spelling` when that string is the exact `struct_fields`
-/// key. Aliases of one declaration store the same spelling
-/// (`class_identity_spelling`).
-///
-/// Keys are the template, [`majit_ir::descr::canonical_struct_name`], and
-/// [`crate::front::StructFieldRegistry::resolved_owner_key`]. A bare leaf
-/// is not probed: [`crate::front::mir::harden_duplicate_leaf_metadata`]
-/// withdraws an ambiguous one, and `resolved_owner_key` is the one owner
-/// resolution.
-fn class_root_struct_name(
-    reg: &crate::front::StructFieldRegistry,
-    pointee: &str,
-) -> Option<String> {
-    let template = majit_ir::descr::strip_generic_args(pointee.trim());
-    let template = template.as_ref();
-    if template.is_empty() {
-        return None;
-    }
-    let canon = majit_ir::descr::canonical_struct_name(template);
-    let resolved = reg.resolved_owner_key(template);
-    for key in [template, canon.as_str()]
-        .into_iter()
-        .chain(resolved.as_deref())
-    {
-        if let Some(Some(ci)) = reg.class_identity.get(key)
-            && reg.fields.contains_key(&ci.spelling)
-        {
-            return Some(ci.spelling.clone());
-        }
-    }
-    None
-}
-
 /// `Ptr` of the harvested Raw struct for `pointee`.
 fn pointer_to_raw_struct_lltype(
     reg: &crate::front::StructFieldRegistry,

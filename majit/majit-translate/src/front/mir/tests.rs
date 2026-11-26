@@ -50934,16 +50934,18 @@ fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
 }
 
 /// `Entry<K, V>` (`rordereddict.py` `DICTENTRY`): a `#[repr(transparent)]`
-/// key whose unique non-ZST field is a `RawPtr` is that pointer
-/// (`rmodel.py` `externalvsinternal`, `gcref=False`). The item name keeps
-/// [`render_adt_type_args`]. A two-field key stays one inline
-/// `lltype.Struct`. The unsuffixed template is `??TypeVar`;
-/// `intern_field_rows` reads the monomorph
+/// key whose unique non-ZST field is a `RawPtr` keeps that pointer as
+/// the row spelling. A declared-GC class-root pointee's field lltype is
+/// `llmemory.GCREF` (`rmodel.py` `externalvsinternal`, `gcref=True`).
+/// A str-family pointee is
+/// `rstr.STRPTR`. A two-field key stays one inline `lltype.Struct`.
+/// The item name keeps [`render_adt_type_args`]. The unsuffixed template
+/// is `??TypeVar`; `intern_field_rows` reads the monomorph
 /// `register_ordereddict_entry_rows` published (`get_ll_dict` mints one
 /// `DICTENTRY` per key/value pair).
 #[test]
 fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
-    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget};
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
 
     let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
@@ -51127,15 +51129,11 @@ fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
         st
     };
     let ptr_st = item_struct(ptr_item);
-    let key = ptr_st.getattr_field_type("key").expect("class-root key");
-    let LowLevelType::Ptr(p) = &key else {
-        panic!("class-root key must be Ptr, got {key:?}");
-    };
-    let PtrTarget::Struct(root_st) = &p.TO else {
-        panic!("class-root key must point at a Struct, got {:?}", p.TO);
-    };
-    assert_eq!(root_st._gckind, GcKind::Gc);
-    assert_eq!(root_st._name, root);
+    assert_eq!(
+        ptr_st.getattr_field_type("key"),
+        Some((*GCREF).clone()),
+        "declared-GC class-root key is GCREF"
+    );
 
     let str_st = item_struct(str_item);
     assert_eq!(str_st.getattr_field_type("key"), Some(STRPTR.clone()));

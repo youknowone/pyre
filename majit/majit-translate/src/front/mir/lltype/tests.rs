@@ -25267,13 +25267,16 @@ fn field_row_declared_gc_and_classed_pointer_is_objectptr() {
     );
 }
 
-/// `Entry<i64, *mut class-root>` (`rordereddict.py` `DICTENTRY`): the
-/// value field is `Ptr(GcStruct)` of that root. A declared-GC pointee
-/// with no class identity, a `GCREF` spelling, and a `GcArray` wrapper
-/// stay `*GCREF`.
+/// A classed ITEM pointer field keeps `InstanceRepr`'s base pointer
+/// (`rmodel.py` `externalvsinternal`, `gcref=False`). The field-row
+/// mapper has no dict key/value role: `_setup_repr`'s value-only
+/// `gcref=True` selection belongs at the repr boundary, not in every
+/// declared-GC pointer field. Unclassed GC pointers stay GCREF.
 #[test]
-fn field_row_declared_gc_class_root_pointer_is_gcstruct_ptr() {
+fn field_row_declared_gc_class_root_pointer_is_objectptr() {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget};
+
+    use crate::translator::rtyper::rclass::OBJECTPTR;
 
     let root = "owner::GcClass";
     let mut reg = crate::front::StructFieldRegistry::default();
@@ -25297,7 +25300,22 @@ fn field_row_declared_gc_class_root_pointer_is_gcstruct_ptr() {
 
     let value = super::field_row_lltype(&reg, &format!("*mut {root}"), &mut field_row_visited())
         .expect("class-root pointer field");
-    assert_gc_class_root_ptr(&value, root);
+    assert_eq!(value, OBJECTPTR.clone());
+
+    let header_root = "pyobject::PyObject";
+    note_class_identity(&mut reg, header_root);
+    reg.note_declared_gc_name(header_root);
+    reg.fields.insert(
+        header_root.to_string(),
+        vec![("ob_type".to_string(), format!("*mut {header_root}"))],
+    );
+    let header_ptr = super::field_row_lltype(
+        &reg,
+        &format!("*mut {header_root}"),
+        &mut field_row_visited(),
+    )
+    .expect("declared-GC header pointer");
+    assert_eq!(header_ptr, OBJECTPTR.clone());
 
     let plain = super::field_row_lltype(&reg, "*mut owner::GcPlain", &mut field_row_visited())
         .expect("declared-GC pointer without a class identity");
@@ -25341,27 +25359,16 @@ fn field_row_declared_gc_class_root_pointer_is_gcstruct_ptr() {
     };
     assert_eq!(st._name, item);
     assert_eq!(st._gckind, GcKind::Raw, "ITEM stays a raw Struct");
-    assert_gc_class_root_ptr(&st.getattr_field_type("value").expect("value"), root);
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(OBJECTPTR.clone()),
+        "class-root field keeps the instance base pointer"
+    );
     assert_eq!(
         st.getattr_field_type("plain"),
         Some((*GCREF).clone()),
         "declared-GC pointee without a class identity stays GCREF"
     );
-}
-
-fn assert_gc_class_root_ptr(
-    got: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-    root: &str,
-) {
-    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
-    let LowLevelType::Ptr(p) = got else {
-        panic!("class-root field must be Ptr, got {got:?}");
-    };
-    let PtrTarget::Struct(st) = &p.TO else {
-        panic!("class-root field must point at a Struct, got {:?}", p.TO);
-    };
-    assert_eq!(st._gckind, GcKind::Gc);
-    assert_eq!(st._name, root);
 }
 
 #[test]
