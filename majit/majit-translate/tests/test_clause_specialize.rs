@@ -282,12 +282,13 @@ fn monomorphic_caller_specializes_by_value_type_only_generic() {
 }
 
 /// `dict_entries_value_set_at` is monomorphic (`ObjectDictStorage`) and
-/// calls type-only `set_slot_value<K,V,S>`. The call binds a spec copy
-/// so `entries_item_ptr` sees concrete `K, V` and recovers the items
-/// offset (`array_items_base`). The unsubstituted generic
-/// `entries_item_ptr` still LowerErrors (no offset guess).
+/// calls type-only `set_slot_value<K,V,S>`. The spec copy is
+/// `entry_at_mut(slot).value = value`: `setinteriorfield`
+/// (`rptr.py` `InteriorPtrRepr.rtype_setattr`,
+/// `jtransform.py` `rewrite_op_setinteriorfield`). `entry_at_mut` stays
+/// a call, so this graph does not call `entries_item_ptr`.
 #[test]
-fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
+fn dict_entries_value_set_at_setfield_keeps_entry_at_mut() {
     let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
@@ -313,24 +314,51 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
         op_kinds(setter.graph())
     );
 
-    let item_ptrs: Vec<_> = program
+    let setters: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("entries_item_ptr__spec_"))
+        .filter(|f| f.name.contains("set_slot_value__spec_"))
         .collect();
     assert!(
-        !item_ptrs.is_empty(),
-        "expected entries_item_ptr__spec_ graphs, got {:?}",
+        !setters.is_empty(),
+        "expected set_slot_value__spec_ graphs, got {:?}",
         program
             .functions
             .iter()
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
     );
-    for spec in &item_ptrs {
+    for spec in &setters {
         assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+            spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+                |op| matches!(&op.kind, OpKind::InteriorFieldWrite { field, .. }
+                if field.name == "value"),
+            ),
+            "{} must setinteriorfield value, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            spec.graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .all(|op| !matches!(&op.kind, OpKind::FieldWrite { field, .. }
+                if field.name == "value"),),
+            "{} must not setfield the item address, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            graph_calls_spec_leaf(spec.graph(), "entry_at_mut__spec_"),
+            "{} must keep entry_at_mut, ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            !graph_calls_leaf(spec.graph(), "entries_item_ptr")
+                && !graph_calls_spec_leaf(spec.graph(), "entries_item_ptr__spec_"),
+            "{} must not call entries_item_ptr, ops {:?}",
             spec.name,
             op_kinds(spec.graph())
         );
@@ -338,12 +366,14 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
 }
 
 /// `w_set` storage is `RDict<ObjectKey, ()>`. Its `entries_item_ptr`
-/// spec is still `direct_arrayitems` (`lltype.py`): the items offset as
-/// `cast_int_to_ptr`. A leftover `__cast_instance_intrinsic` onto
-/// unsuffixed `GcEntries` then getattr `items` is the annotator skip
-/// (`Array` has no named `items`).
+/// spec is `InteriorPtrRepr` (`rptr.py`): malloc of
+/// `GcStruct('Interior', ptr, index)` at index 0, not `cast_int_to_ptr`
+/// of the items address (`jtransform.py` `rewrite_op_direct_ptradd` is
+/// raw-only). A leftover `__cast_instance_intrinsic` onto unsuffixed
+/// `GcEntries` then getattr `items` is the annotator skip (`Array` has
+/// no named `items`).
 #[test]
-fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
+fn objectkey_unit_entries_item_ptr_is_interior_ptr() {
     let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(llbc),
@@ -365,8 +395,18 @@ fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
     );
     for spec in &unit_ptrs {
         assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+            spec.graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"),),
+            "{} must malloc Interior(array, 0), ops {:?}",
+            spec.name,
+            op_kinds(spec.graph())
+        );
+        assert!(
+            !graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
+            "{} must not box the item address, ops {:?}",
             spec.name,
             op_kinds(spec.graph())
         );
@@ -444,8 +484,11 @@ fn identitykey_get_slot_does_not_cast_objectkey_entry() {
 /// `rordereddict.py` `_ll_dict_setitem_lookup_done` binds
 /// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY` (`lltype.py`
 /// `Struct` in `GcArray`). A classdef recast onto `Entry<K, V>` is
-/// `mergeinputargs` UnionError of two monomorph ClassDefs at
-/// `RDict::entry_at`.
+/// `mergeinputargs` UnionError of two monomorph ClassDefs.
+/// IdentityKey `get_slot` calls `entry_at`, so the closure builds
+/// `entry_at__spec_IdentityKey`. That spec, `get_slot`, and
+/// `entries_item_ptr` (via `entry_valid` / `entry_ptr`) must not
+/// recast the ITEM.
 #[test]
 fn identitykey_entry_at_does_not_recast_monomorph_entry() {
     use majit_translate::model::cast_instance_root;
@@ -460,19 +503,26 @@ fn identitykey_entry_at_does_not_recast_monomorph_entry() {
     .expect("lower identitydict nth_item");
 
     let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names
+            .iter()
+            .any(|name| name.contains("entry_at__spec_IdentityKey")),
+        "get_slot calls entry_at, so the IdentityKey spec is built, got {names:?}"
+    );
     let specs: Vec<_> = program
         .functions
         .iter()
         .filter(|f| {
-            f.name.contains("entry_at__spec_IdentityKey")
+            f.name.contains("get_slot__spec_IdentityKey")
+                || f.name.contains("entry_at__spec_IdentityKey")
                 || f.name.contains("entries_item_ptr__spec_IdentityKey")
         })
         .collect();
     assert!(
         specs
             .iter()
-            .any(|f| f.name.contains("entry_at__spec_IdentityKey")),
-        "expected IdentityKey entry_at spec, got {names:?}"
+            .any(|f| f.name.contains("entries_item_ptr__spec_IdentityKey")),
+        "expected IdentityKey entries_item_ptr spec, got {names:?}"
     );
     for spec in &specs {
         let entry_casts: Vec<_> = spec
@@ -488,15 +538,18 @@ fn identitykey_entry_at_does_not_recast_monomorph_entry() {
             .collect();
         assert!(
             entry_casts.is_empty(),
-            "{} must keep InteriorPtr of DICTENTRY, recasts {entry_casts:?}, return_class_root {:?}, ops {:?}",
+            "{} must not recast onto the Entry monomorph, recasts {entry_casts:?}, return_class_root {:?}, ops {:?}",
             spec.name,
             spec.return_class_root,
             op_kinds(spec.graph())
         );
-        if spec.name.contains("entry_at__spec_IdentityKey") {
+        if spec.name.contains("entries_item_ptr__spec_IdentityKey") {
             assert!(
                 spec.return_class_root.as_deref().is_some_and(|root| {
-                    !root.contains('<') && !root.contains("*mut") && !root.contains("*const")
+                    !root.contains('<')
+                        && !root.contains("*mut")
+                        && !root.contains("*const")
+                        && !root.contains("FixedSizeArray")
                 }),
                 "{} return_class_root is the unsuffixed DICTENTRY ITEM, got {:?}",
                 spec.name,
@@ -719,6 +772,151 @@ fn rdict_hash_of_spec_copy_is_dont_look_inside() {
             f.name,
             f.hints
         );
+    }
+}
+
+/// `ll_dict_setitem_lookup_done_orig` for `ObjectKey` must rtype.
+///
+/// A `GcArray` item pointer is `InteriorPtrRepr` (`rptr.py`). Storing
+/// the entry by value reads the nested key through that pointer
+/// (`jtransform.py` `rewrite_op_setinteriorfield`). `malloc.py`
+/// scalar-replacement must retarget `prefix.rest` onto the stored
+/// substructure (`rewrite_op_getsubstruct`) before it drops the
+/// aggregate malloc. The Skip arm then clears annotations and runs
+/// `legacy_annotator::annotate` then `resolve_types`
+/// (`rtyper.py` `setconcretetype`).
+#[test]
+fn objectkey_setitem_lookup_done_orig_resolves_concretetype() {
+    use majit_translate::translator::rtyper::legacy_annotator::annotate;
+    use majit_translate::translator::rtyper::legacy_resolve::resolve_types;
+
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    // `dict_entries_insert_hashed` is the look-inside caller whose
+    // `_orig_` body does `entries.insert(ObjectKey { .. }, value)`.
+    // `FunctionDesc.cachedgraph` then builds
+    // `ll_dict_setitem_lookup_done_orig__spec_ObjectKey_…`. The
+    // display leaf of that copy is `SemanticFunction.name`.
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+        &[
+            "dict_entries_insert_hashed",
+            "_orig_dict_entries_insert_hashed",
+            "ll_dict_setitem_lookup_done_orig",
+        ],
+    )
+    .expect("lower object-key insert");
+    let graphs: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            let name = f.name.as_str();
+            name.contains("ll_dict_setitem_lookup_done_orig") && name.contains("ObjectKey")
+        })
+        .collect();
+    assert!(
+        !graphs.is_empty(),
+        "no ObjectKey orig graph, names {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| {
+                name.contains("setitem") || name.contains("ObjectKey") || name.contains("insert")
+            })
+            .collect::<Vec<_>>()
+    );
+    for f in graphs {
+        let graph = f.graph();
+        let dotted: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name.contains('.') => {
+                    Some(field.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dotted.is_empty(),
+            "{} still reads a dotted inlined field ({dotted:?}); rewrite_op_getsubstruct",
+            f.name
+        );
+        let interior = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+                )
+            })
+        });
+        assert!(
+            interior,
+            "{} has no getinteriorfield/setinteriorfield",
+            f.name
+        );
+        for var in graph.iter_variables() {
+            *var.annotation.borrow_mut() = None;
+        }
+        annotate(graph);
+        resolve_types(graph, &program.raw_alloc_flavor_structs);
+    }
+}
+
+/// Dict get/set jitcode must not still malloc `Interior`.
+///
+/// `LLTypeMallocRemover` runs before the codewriter. A helper that
+/// returns the pointer (`entries_item_ptr`) escapes that graph and is
+/// excluded. Every other `ll_dict_lookup` / `ll_dict_setitem` graph
+/// drops the word.
+#[test]
+fn dict_get_set_graphs_drop_interior_malloc() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+        &[
+            "ll_dict_lookup",
+            "ll_dict_lookup_orig",
+            "ll_dict_lookup_trampoline",
+            "ll_dict_setitem",
+            "ll_dict_setitem_lookup_done",
+            "ll_dict_setitem_lookup_done_orig",
+            "dict_entries_insert_hashed",
+            "_orig_dict_entries_insert_hashed",
+        ],
+    )
+    .expect("lower dict get/set");
+    let graphs: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            let name = f.name.as_str();
+            (name.contains("ll_dict_lookup") || name.contains("ll_dict_setitem"))
+                && !name.contains("entries_item_ptr")
+        })
+        .collect();
+    assert!(
+        !graphs.is_empty(),
+        "no dict get/set graph, names {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    for f in graphs {
+        let interior_new = f.graph().blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior"))
+        });
+        assert!(!interior_new, "{} still mallocs Interior", f.name);
     }
 }
 

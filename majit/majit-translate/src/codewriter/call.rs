@@ -5956,7 +5956,22 @@ impl StructLayout {
     /// are re-synthesised from `rows` at their exact offsets, so every
     /// field resolves through `fielddescrof`'s struct-layout lookup rather
     /// than a tag-unaware recompute. Per-field type/size/immutability
-    /// classification stays as computed from the type strings.
+    /// stays as `get_type_flag` computed it, with one correction: a
+    /// spelling that misses every arm (`get_type_flag_known` is `None`,
+    /// the unknown-name word-sized `FLAG_POINTER`) is a by-value
+    /// container when its Charon span is wider than a word.
+    /// `descr.py get_type_flag` banks `lltype.Struct` as `FLAG_STRUCT`.
+    /// `llinterp.py op_getfield` asserts the field is not a
+    /// `ContainerType`; `rptr.py PtrRepr.rtype_getattr` emits
+    /// `getsubstruct`; `jtransform.py rewrite_op_getsubstruct` raises
+    /// unless `_gckind == 'raw'`. Loading that container's first word and
+    /// using the word as the container address is the refused `getfield`.
+    /// A known by-value struct already carries `FLAG_STRUCT` from
+    /// `field_metadata` and keeps its declared size. A spelling the match
+    /// already classified keeps that flag and size when the next field
+    /// is aligned further out: that gap is padding, and an offset-0
+    /// `FLAG_STRUCT` wider than a word aliases the parent pointer
+    /// (`GcStruct._first_struct`).
     ///
     /// `heaptracker.py all_fielddescrs`: this re-synthesis keeps each
     /// `rows` entry as one leaf — the offset-by-name layout consumed by
@@ -6024,6 +6039,65 @@ impl StructLayout {
         if let Some(size) = exact_size {
             self.size = size as usize;
         }
+        // `get_type_flag`'s unknown-name arm is a word-sized Ref
+        // (`get_type_flag_known` is `None`). A Charon span wider than that
+        // word is the container `op_getfield` refuses (`llinterp.py`);
+        // `rewrite_op_getsubstruct` then raises for a GC owner instead of
+        // emitting `getfield_gc_r` of the first word. A spelling the match
+        // already classified is not that arm. A known by-value struct is
+        // already `FLAG_STRUCT` from `field_metadata`, so it does not hold
+        // the fallback triple and keeps its declared size.
+        let word = crate::layout::target_word_size();
+        for fl in &mut self.fields {
+            if fl.flag != majit_ir::descr::ArrayFlag::Pointer
+                || fl.field_type != majit_ir::value::Type::Ref
+                || fl.size != word
+            {
+                continue;
+            }
+            let Some(type_str) = rows
+                .iter()
+                .find(|(name, _)| name == &fl.name)
+                .map(|(_, ty)| ty.as_str())
+            else {
+                continue;
+            };
+            if get_type_flag_known(type_str, raw_alloc_flavor_structs).is_some() {
+                continue;
+            }
+            let Some(span) = field_exact_span(&fl.name, exact_offsets, exact_size) else {
+                continue;
+            };
+            if span <= word as u64 {
+                continue;
+            }
+            fl.flag = majit_ir::descr::ArrayFlag::Struct;
+            fl.field_type = majit_ir::value::Type::Ref;
+            fl.size = span as usize;
+        }
+    }
+}
+
+/// Bytes from this field's exact offset to the next strictly greater
+/// offset, or to the struct's exact size when the field is last.
+/// That is the Charon slot, including the container and its tail padding.
+fn field_exact_span(
+    name: &str,
+    exact_offsets: &std::collections::HashMap<String, u64>,
+    exact_size: Option<u64>,
+) -> Option<u64> {
+    let off = *exact_offsets.get(name)?;
+    // Two names at one byte do not own the bytes out to the struct size.
+    // `alloc::vec::Vec` records `buf` and `len` both at 0
+    // (`derive_program_metadata`). That size is the three-word header.
+    // `buf` has no exclusive span.
+    if exact_offsets.values().filter(|o| **o == off).count() > 1 {
+        return None;
+    }
+    let next = exact_offsets.values().copied().filter(|o| *o > off).min();
+    match next {
+        Some(n) => Some(n - off),
+        None => exact_size.filter(|size| *size > off).map(|size| size - off),
     }
 }
 
@@ -6683,6 +6757,65 @@ impl CallControl {
             .is_some_and(crate::codewriter::heaptracker::is_immutable_struct)
     }
 
+    /// `lltype.py` `Ptr._interior_ptr_type_with_index`:
+    /// `GcStruct("Interior", ('ptr', parentptr), ('index', Signed))`.
+    ///
+    /// One layout for that GcStruct. The array a particular pointer
+    /// addresses is the `ptr` field's concretetype, not a second
+    /// struct (`rptr.py` `InteriorPtrRepr`). A registered struct whose
+    /// canonical name is `Interior`, or a harvested field row that
+    /// `lookup_fields` suffix-matches, is that struct — this does not
+    /// overlay it.
+    fn synthesize_interior_ptr_layout(
+        &self,
+        sid: majit_ir::descr::StructId,
+        name: &str,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        if majit_ir::descr::canonical_struct_name(name) != "Interior" {
+            return None;
+        }
+        if majit_ir::descr::struct_id_for_name(name).is_some() {
+            return None;
+        }
+        if self.struct_field_entries(name).is_some() {
+            return None;
+        }
+        if sid != majit_ir::descr::StructId::from_canonical(name) {
+            return None;
+        }
+        let word = crate::layout::target_word_size();
+        let layout = std::rc::Rc::new(StructLayout {
+            size: word * 2,
+            align: word,
+            gckind: GcKind::Gc,
+            repr_transparent: false,
+            fields: vec![
+                StructFieldLayout {
+                    name: "ptr".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: Type::Ref,
+                    rank: None,
+                },
+                StructFieldLayout {
+                    name: "index".to_string(),
+                    offset: word,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: Type::Int,
+                    rank: None,
+                },
+            ],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        });
+        self.struct_layouts.borrow_mut().insert(sid, layout.clone());
+        Some(layout)
+    }
+
     /// The layout stored under `sid`, whose spelling is `name`. A
     /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) and an rtyper
     /// tuple (`tuple{n}<s0,s1,…>`, `rtuple.py` `TUPLE_TYPE`) have no
@@ -6699,6 +6832,9 @@ impl CallControl {
     ) -> Option<std::rc::Rc<StructLayout>> {
         if let Some(layout) = self.struct_layouts.borrow().get(&sid) {
             return Some(layout.clone());
+        }
+        if let Some(layout) = self.synthesize_interior_ptr_layout(sid, name) {
+            return Some(layout);
         }
         let mut_ref = name.starts_with("MutRef<");
         let ll_tuple = ll_tuple_shape_rows(name);
@@ -6810,10 +6946,9 @@ impl CallControl {
     /// suffix and the census cannot number `__pos_0`.
     ///
     /// [`StructFieldRegistry::lookup_fields`] (canonical leaf, then
-    /// crate-prefix suffix) is the fallback: FieldWrite `owner_root`
-    /// `pyobject::PyObject` still finds harvest
-    /// `pyre_object::pyobject::PyObject`. Same resolution
-    /// `field_type` / `field_name_at` use after the exact key.
+    /// crate-prefix suffix) is the fallback: a short FieldWrite
+    /// `owner_root` still finds the crate-prefixed harvest key. Same
+    /// resolution `field_type` / `field_name_at` use after the exact key.
     pub fn struct_field_entries(&self, owner: &str) -> Option<&[crate::front::semantic::FieldRow]> {
         if let Some(rows) = crate::front::mir::mut_ref_shape_rows(owner) {
             return Some(rows.as_slice());
@@ -7507,6 +7642,88 @@ impl CallControl {
     ///      analyzer-only path; runtime convergence skipped for
     ///      this `(STRUCT, fieldname)` pair (logged absence of a
     ///      runtime `build_object_descr_group` publish).
+    /// `fielddescrof` of `GcStruct("Interior")` (`lltype.py`
+    /// `Ptr._interior_ptr_type_with_index`). The struct is not a harvested
+    /// `FieldRow`. `ptr` is index 0 at offset 0; `index` is index 1 at one
+    /// word (`rptr.py` `InteriorPtrRepr`). `heaptracker.get_fielddescr_index_in`
+    /// is not asked: it numbers harvested fields only.
+    fn interior_ptr_fielddescrof(
+        &self,
+        owner_root: &str,
+        field_name: &str,
+    ) -> Option<(
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    )> {
+        use majit_ir::descr::LLType;
+        let canonical = majit_ir::descr::canonical_struct_name(owner_root);
+        if canonical != "Interior" {
+            return None;
+        }
+        if majit_ir::descr::struct_id_for_name(owner_root).is_some()
+            || majit_ir::descr::struct_id_for_name(&canonical).is_some()
+        {
+            return None;
+        }
+        if self.struct_field_entries(owner_root).is_some()
+            || self.struct_field_entries(&canonical).is_some()
+        {
+            return None;
+        }
+        let word = crate::layout::target_word_size();
+        let (offset, index_in_parent, flag, ir_type) = match field_name {
+            "ptr" => (0, 0usize, majit_ir::descr::ArrayFlag::Pointer, Type::Ref),
+            "index" => (word, 1usize, majit_ir::descr::ArrayFlag::Signed, Type::Int),
+            _ => return None,
+        };
+        let sid = majit_ir::descr::StructId::from_canonical(&canonical);
+        let (struct_size, struct_size_path) = compute_struct_size_with_path(self, &canonical);
+        let struct_key = LLType::Struct(sid.as_u64());
+        let member = majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: sid.as_u64(),
+            field_name: field_name.to_string(),
+        };
+        let _parent = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+        };
+        let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
+            struct_key,
+            field_name,
+            None,
+            offset,
+            word,
+            ir_type,
+            false,
+            false,
+            flag,
+            u32::MAX,
+            false,
+            Some(index_in_parent),
+            false,
+            false,
+        );
+        trace_field_ei_descr_mint("interior_ptr", owner_root, false, None, struct_size_path);
+        let spec = majit_ir::effectinfo::DescrMintSpec::Field {
+            struct_size,
+            offset,
+            field_size: word,
+            field_type: ir_type,
+            flag,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent,
+        };
+        self.field_footprint.borrow_mut().offset_source =
+            Some(majit_ir::descr::FieldOffsetSource::ConcreteHit);
+        majit_ir::descr::record_field_offset_source(
+            majit_ir::descr::FieldOffsetSource::ConcreteHit,
+        );
+        self.field_footprint.borrow_mut().mint = Some((member.clone(), spec.clone()));
+        majit_ir::descr::record_ei_descr_mint(member.clone(), spec);
+        Some((descr as majit_ir::descr::DescrRef, member))
+    }
+
     fn fielddescrof_concrete(
         &self,
         _idx: u32,
@@ -7518,6 +7735,9 @@ impl CallControl {
         majit_ir::effectinfo::DescrSetMember,
     )> {
         use majit_ir::descr::{LLType, path_hash};
+        if let Some(hit) = self.interior_ptr_fielddescrof(owner_root, field_name) {
+            return Some(hit);
+        }
         let fields = self.struct_fields.fields.get(owner_root).or_else(|| {
             // `Entry<K,V>` reuses the template rows. Other `<…>` owners
             // keep their own registration; falling back there numbers a
@@ -7982,7 +8202,6 @@ impl CallControl {
         majit_ir::descr::DescrRef,
         majit_ir::effectinfo::DescrSetMember,
     )> {
-        use majit_ir::descr::ArrayFlag;
         let intern_id = array.as_ref().map(|arr| self.intern_array(arr));
         let interned_of_struct =
             array
@@ -8071,11 +8290,10 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
+            // `heaptracker.py` `all_interiorfielddescrs` raises
+            // `UnsupportedFieldExc("unexpected array(struct(struct))")`
+            // for a nested struct inside an array item and never mints
+            // a descr for the containing name. Step past its bytes.
             if self.is_known_struct(fty) {
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
@@ -8177,116 +8395,251 @@ impl CallControl {
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
                 let field_descr = found?;
-                let item_size = compute_struct_size(self, &elem_name);
-                // `get_interiorfield_descr` (`descr.py`) builds on
-                // `get_array_descr`, so this mint and `arraydescrof_concrete`
-                // share one basesize: `symbolic.get_array_token`'s items
-                // offset. `array_items_base` is that offset. `GcEntries`
-                // places `[Entry; 0]` there, and `Entry.f_hash` (`u64`)
-                // rounds a 4-byte length word up to 8. `get_array_descr`
-                // keys the cache on the atid alone.
-                let base_size =
-                    self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
-                // Interned ARRAY.OF Struct is the ARRAY identity
-                // (`descr.py get_array_descr`). A pointer-item interned
-                // ARRAY must not publish InteriorField under that ARRAY's
-                // identity; the dump harvest path is the STRUCT ARRAY.
-                let interned_atid = if interned_of_struct.is_some() {
-                    if let Some(id) = intern_id {
-                        array_type_id_of_lltype(&self.interned_array(id))
-                    } else {
-                        array_str.to_string()
-                    }
-                } else {
-                    array_str.to_string()
-                };
-                let array_id = majit_ir::descr::path_hash(&interned_atid);
-                let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
-                    array_id,
-                    name: field_name.to_string(),
-                };
-                let array_key = majit_ir::descr::LLType::Array(array_id);
-                let cached: majit_ir::descr::DescrRef = {
-                    let mut gc = majit_ir::descr::gc_cache().lock();
-                    gc.get_array_descr(
-                        array_key.clone(),
-                        base_size,
-                        item_size,
-                        ArrayFlag::Struct,
-                        majit_ir::value::Type::Ref,
-                        false, // !nolength — length word at offset 0
-                        0,     // length_offset
-                        false, // is_pure
-                        '\x00',
-                    )
-                };
-                let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
-                    majit_ir::descr::descr_arc_as_array_descr(cached)
-                        .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
-                // `descr.py:429-436` builds an interior field out of the array
-                // descr and the element-struct field descr, so both halves
-                // travel — the runtime miss branch has to rebuild the same two.
-                majit_ir::descr::record_ei_descr_mint(
-                    member.clone(),
-                    majit_ir::effectinfo::DescrMintSpec::InteriorField {
-                        array: Box::new(majit_ir::effectinfo::DescrMintSpec::Array {
-                            base_size,
-                            item_size,
-                            flag: ArrayFlag::Struct,
-                            item_type: majit_ir::value::Type::Ref,
-                            nolength: false,
-                            length_offset: 0,
-                            is_pure: false,
-                            concrete_type: '\x00',
-                        }),
-                        field_struct_id: majit_ir::descr::path_hash(&elem_canonical),
-                        field_name: field_name.to_string(),
-                        field: Box::new(majit_ir::effectinfo::DescrMintSpec::Field {
-                            struct_size,
-                            offset: field_descr.offset(),
-                            field_size: field_descr.field_size(),
-                            field_type: field_descr.field_type(),
-                            flag: field_descr.field_flag(),
-                            is_immutable: field_descr.is_immutable(),
-                            is_quasi_immutable: field_descr.is_quasi_immutable(),
-                            index_in_parent: field_descr.index_in_parent(),
-                        }),
-                    },
-                );
-                let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
-                    array_key,
-                    field_name.to_string(),
-                    String::new(),
-                    array_descr.clone(),
-                    field_descr.clone(),
-                );
-                let already = self
-                    .interiorfield_descrs
-                    .borrow()
-                    .values()
-                    .any(|d| std::sync::Arc::ptr_eq(d, &descr_from_gc));
-                let descr: majit_ir::descr::DescrRef = if already {
-                    std::sync::Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
-                        idx,
-                        array_descr,
-                        field_descr,
-                    )) as majit_ir::descr::DescrRef
-                } else {
-                    descr_from_gc
-                };
-                descr.set_index(idx);
-                if interned_of_struct.is_some()
-                    && let Some(id) = intern_id
-                {
-                    self.interiorfield_descrs
-                        .borrow_mut()
-                        .insert((id, field_name.to_string()), descr.clone());
-                }
-                return Some((descr, member));
+                return Some(self.finish_interiorfield_descr(
+                    idx,
+                    array_str,
+                    intern_id,
+                    interned_of_struct.is_some(),
+                    field_name,
+                    &elem_name,
+                    &elem_canonical,
+                    field_descr,
+                    struct_size,
+                ));
             }
             offset = offset.saturating_add(field_size);
         }
+        // No direct field. A dotted `prefix.rest` is that path inside
+        // `ARRAY.OF` (`heaptracker.py` `get_fielddescr_index_in`). A
+        // miss is not a unique bare leaf. A bare name is the one scalar
+        // leaf of exactly one by-value nested struct
+        // (`all_interiorfielddescrs` refuses the containing name). The
+        // descr is minted on the item
+        // (`descr.py` `get_field_descr(REALARRAY.OF, name)`).
+        let nested = if field_name.contains('.') {
+            self.nested_struct_leaf(&elem_name, field_name)
+        } else {
+            self.unique_nested_interior_field(&elem_name, field_name)
+        };
+        if let Some((flag, ir_type, field_size, offset)) = nested {
+            let elem_canonical = majit_ir::descr::canonical_struct_name(&elem_name);
+            let struct_key =
+                majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(&elem_canonical));
+            let struct_size = compute_struct_size(self, &elem_name);
+            let rank = self.field_immutability(Some(&elem_name), field_name);
+            let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+            let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
+            let load_is_acquire =
+                is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
+            let store_is_release = load_is_acquire;
+            let field_descr = {
+                let mut gc = majit_ir::descr::gc_cache().lock();
+                gc.get_field_descr(
+                    struct_key,
+                    field_name,
+                    None,
+                    offset,
+                    field_size,
+                    ir_type,
+                    is_immutable,
+                    is_quasi_immutable,
+                    flag,
+                    u32::MAX,
+                    false,
+                    // Not a direct field of the item. `field_pos_in` numbers
+                    // harvested direct names and panics on a miss.
+                    None,
+                    load_is_acquire,
+                    store_is_release,
+                )
+            };
+            return Some(self.finish_interiorfield_descr(
+                idx,
+                array_str,
+                intern_id,
+                interned_of_struct.is_some(),
+                field_name,
+                &elem_name,
+                &elem_canonical,
+                field_descr,
+                struct_size,
+            ));
+        }
         None
+    }
+
+    /// One scalar `field_name` inside a single by-value nested struct of
+    /// `elem_name`. `nested_struct_leaf` is the direct-or-dotted walk
+    /// (`heaptracker.py` `get_fielddescr_index_in`). The offset is the
+    /// nested struct's layout offset plus the leaf offset inside it.
+    fn unique_nested_interior_field(
+        &self,
+        elem_name: &str,
+        field_name: &str,
+    ) -> Option<(
+        majit_ir::descr::ArrayFlag,
+        majit_ir::value::Type,
+        usize,
+        usize,
+    )> {
+        let rows: Vec<(String, String)> = self
+            .struct_field_entries(elem_name)?
+            .iter()
+            .map(|row| (row.name.clone(), row.ty.clone()))
+            .collect();
+        let sid = majit_ir::descr::struct_id_for_name(elem_name);
+        let mut running: usize = 0;
+        let mut hit = None;
+        let mut count = 0usize;
+        for (fname, fty) in &rows {
+            let (_flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
+                continue;
+            }
+            let at = self
+                .layout_field_offset(sid, elem_name, fname)
+                .unwrap_or(running);
+            if self.is_known_struct(fty) {
+                if let Some((flag, ir_type, field_size, inner)) =
+                    self.nested_struct_leaf(fty, field_name)
+                {
+                    count += 1;
+                    hit = Some((flag, ir_type, field_size, at.saturating_add(inner)));
+                }
+                running = at.saturating_add(compute_struct_size(self, fty));
+                continue;
+            }
+            running = at.saturating_add(field_size);
+        }
+        (count == 1).then_some(hit).flatten()
+    }
+
+    /// Publish `InteriorFieldDescr(arraydescr, fielddescr)` (`descr.py`
+    /// `get_interiorfield_descr`). Shared by a direct item field and a
+    /// unique nested scalar leaf.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "descr.py get_interiorfield_descr arguments stay positional so the direct field and the nested leaf call the same mint"
+    )]
+    fn finish_interiorfield_descr(
+        &self,
+        idx: u32,
+        array_str: &str,
+        intern_id: Option<u64>,
+        interned_struct: bool,
+        field_name: &str,
+        elem_name: &str,
+        elem_canonical: &str,
+        field_descr: std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+        struct_size: usize,
+    ) -> (
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    ) {
+        use majit_ir::descr::ArrayFlag;
+        let item_size = compute_struct_size(self, elem_name);
+        // `get_interiorfield_descr` (`descr.py`) builds on
+        // `get_array_descr`, so this mint and `arraydescrof_concrete`
+        // share one basesize: `symbolic.get_array_token`'s items
+        // offset. `array_items_base` is that offset. `GcEntries`
+        // places `[Entry; 0]` there, and `Entry.f_hash` (`u64`)
+        // rounds a 4-byte length word up to 8. `get_array_descr`
+        // keys the cache on the atid alone.
+        let base_size = self.array_items_base(self.array_header_size, Some(elem_name), item_size);
+        // Interned ARRAY.OF Struct is the ARRAY identity
+        // (`descr.py get_array_descr`). A pointer-item interned
+        // ARRAY must not publish InteriorField under that ARRAY's
+        // identity; the dump harvest path is the STRUCT ARRAY.
+        let interned_atid = if interned_struct {
+            if let Some(id) = intern_id {
+                array_type_id_of_lltype(&self.interned_array(id))
+            } else {
+                array_str.to_string()
+            }
+        } else {
+            array_str.to_string()
+        };
+        let array_id = majit_ir::descr::path_hash(&interned_atid);
+        let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
+            array_id,
+            name: field_name.to_string(),
+        };
+        let array_key = majit_ir::descr::LLType::Array(array_id);
+        let cached: majit_ir::descr::DescrRef = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_array_descr(
+                array_key.clone(),
+                base_size,
+                item_size,
+                ArrayFlag::Struct,
+                majit_ir::value::Type::Ref,
+                false, // !nolength — length word at offset 0
+                0,     // length_offset
+                false, // is_pure
+                '\x00',
+            )
+        };
+        let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+            majit_ir::descr::descr_arc_as_array_descr(cached)
+                .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+        // `get_interiorfield_descr` builds an `InteriorFieldDescr` from
+        // the array descr and the element-struct field descr, so both
+        // halves travel — the runtime miss branch has to rebuild the same two.
+        majit_ir::descr::record_ei_descr_mint(
+            member.clone(),
+            majit_ir::effectinfo::DescrMintSpec::InteriorField {
+                array: Box::new(majit_ir::effectinfo::DescrMintSpec::Array {
+                    base_size,
+                    item_size,
+                    flag: ArrayFlag::Struct,
+                    item_type: majit_ir::value::Type::Ref,
+                    nolength: false,
+                    length_offset: 0,
+                    is_pure: false,
+                    concrete_type: '\x00',
+                }),
+                field_struct_id: majit_ir::descr::path_hash(elem_canonical),
+                field_name: field_name.to_string(),
+                field: Box::new(majit_ir::effectinfo::DescrMintSpec::Field {
+                    struct_size,
+                    offset: field_descr.offset(),
+                    field_size: field_descr.field_size(),
+                    field_type: field_descr.field_type(),
+                    flag: field_descr.field_flag(),
+                    is_immutable: field_descr.is_immutable(),
+                    is_quasi_immutable: field_descr.is_quasi_immutable(),
+                    index_in_parent: field_descr.index_in_parent(),
+                }),
+            },
+        );
+        let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+            array_key,
+            field_name.to_string(),
+            String::new(),
+            array_descr.clone(),
+            field_descr.clone(),
+        );
+        let already = self
+            .interiorfield_descrs
+            .borrow()
+            .values()
+            .any(|d| std::sync::Arc::ptr_eq(d, &descr_from_gc));
+        let descr: majit_ir::descr::DescrRef = if already {
+            std::sync::Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                idx,
+                array_descr,
+                field_descr,
+            )) as majit_ir::descr::DescrRef
+        } else {
+            descr_from_gc
+        };
+        descr.set_index(idx);
+        if interned_struct && let Some(id) = intern_id {
+            self.interiorfield_descrs
+                .borrow_mut()
+                .insert((id, field_name.to_string()), descr.clone());
+        }
+        (descr, member)
     }
 
     /// Insert into `function_graphs`. All graph writes go through this
@@ -12383,8 +12736,8 @@ impl CallControl {
             }
         };
 
-        // A `__majit_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
-        // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
+        // A `__majit_wrap_*` wrapper takes a two-word shared slice and
+        // returns an sret `Result`, neither of which the
         // one-register-per-slot residual-call ABI can carry. The codewriter
         // gives every wrapper its own jitcode and inlines it, so refusing the
         // address here costs nothing and prevents a wrong-ABI call if inlining
@@ -17336,9 +17689,10 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
 /// `*const ` / `*mut ` pointer, `GCREF`, or a scalar name (`isize` `usize`
 /// `i64` `u64` `i32` `u32` `i16` `u16` `i8` `u8` `f64` `f32` `bool`
 /// `char`). After one `*mut ` prefix the same remainder is raw, except
-/// `*mut u8` stays on the Ref fallback because it is ambiguous between
-/// CCHARP / Ptr(STR) / GCREF; resolving that is a separate `*u8` spelling
-/// PR. Slices (`*const [u8]`) and `[T; N]` do not match.
+/// `*mut u8` is not this arm: it is ambiguous between CCHARP / Ptr(STR) /
+/// GCREF, and resolving that is a separate `*u8` spelling. The
+/// thin-pointer arm banks it as the Ref word. Slices (`*const [u8]`) and
+/// `[T; N]` do not match.
 fn raw_thin_pointer_spelling(s: &str) -> bool {
     const SCALARS: &[&str] = &[
         "isize", "usize", "i64", "u64", "i32", "u32", "i16", "u16", "i8", "u8", "f64", "f32",
@@ -17359,17 +17713,64 @@ fn raw_thin_pointer_spelling(s: &str) -> bool {
     }
 }
 
+/// A thin raw pointer: `*mut T` / `*const T` whose pointee is sized.
+///
+/// A thin pointer is one word whatever its pointee (`lltype.Ptr` size).
+/// `descr.py get_type_flag` returns FLAG_POINTER for a gc pointee, so a
+/// wider Charon slot is padding. `fat_ptr_layout::spelling_is_fat_ptr`
+/// is the unsized pointee (`dyn …`, `[T]`, `str`); those stay off this
+/// arm. `pointer_pointee` also peels `&` / `Box` / `Arc` / `Rc` /
+/// `NonNull` / `AtomicPtr`, which are not raw spellings.
+/// `spelling_is_dyn_fat_ptr` is a different predicate: it rejects every
+/// `*mut` / `*const`, so the raw `dyn` arm stays
+/// [`raw_dyn_fat_pointer_spelling`].
+fn thin_raw_pointer_spelling(s: &str) -> bool {
+    let s = s.trim();
+    if !(s.starts_with("*const ") || s.starts_with("*mut ")) {
+        return false;
+    }
+    crate::fat_ptr_layout::pointer_pointee(s).is_some()
+        && !crate::fat_ptr_layout::spelling_is_fat_ptr(s)
+}
+
+/// `*mut dyn Trait` / `*const dyn Trait`: the two-word raw fat pointer.
+fn raw_dyn_fat_pointer_spelling(s: &str) -> bool {
+    let Some(rest) = s
+        .strip_prefix("*mut ")
+        .or_else(|| s.strip_prefix("*const "))
+    else {
+        return false;
+    };
+    rest.starts_with("dyn ")
+}
+
 pub(crate) fn get_type_flag(
     type_str: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    get_type_flag_known(type_str, raw_alloc_flavor_structs).unwrap_or((
+        // Unknown type — treat as GC pointer (conservative).
+        majit_ir::descr::ArrayFlag::Pointer,
+        majit_ir::value::Type::Ref,
+        crate::layout::target_word_size(),
+    ))
+}
+
+/// `get_type_flag` except the unknown-name arm.
+///
+/// `None` is that arm. `get_type_flag` fills it with a word-sized
+/// `FLAG_POINTER`. Every other arm is the same match.
+pub(crate) fn get_type_flag_known(
+    type_str: &str,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
     use majit_ir::descr::ArrayFlag;
-    match type_str {
+    Some(match type_str {
         // descr.py get_type_flag: Ptr whose pointee has `_gckind == 'raw'` is an
         // unsigned, int-banked word.  Pyre's mapdict shape pointers are erased
         // to `*const u8`; they are immortal raw identities, not GC references.
-        // Keep `*mut PyObject` and other erased managed pointers on the
-        // conservative Ref fallback below.
+        // A thin raw pointer that is not this raw word is the Ref arm at
+        // the end of the match.
         "*const u8" => (
             ArrayFlag::Unsigned,
             majit_ir::value::Type::Int,
@@ -17394,12 +17795,23 @@ pub(crate) fn get_type_flag(
         }
         // descr.py get_type_flag: a Ptr whose TO._gckind == 'raw' is
         // FLAG_UNSIGNED. A thin `*const`/`*mut` spelling whose pointee is
-        // a scalar, a pointer word, or GCREF is raw. `*mut u8` stays on
-        // the Ref fallback.
+        // a scalar, a pointer word, or GCREF is raw. `*mut u8` is not raw;
+        // the thin-pointer arm banks it as the Ref word.
         s if raw_thin_pointer_spelling(s) => (
             ArrayFlag::Unsigned,
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
+        ),
+        // descr.py get_type_flag: a fat raw pointer is `lltype.Struct`
+        // (`two_word_fat_struct`: data Address + metadata Signed,
+        // GcKind::Raw), so the flag is FLAG_STRUCT and the width is two
+        // words. `spelling_is_dyn_fat_ptr` keeps `*mut dyn` / `*const dyn`
+        // off the FLAG_POINTER fat arm. Parent tail after
+        // `AsyncAction.actionflag` stays outside this two-word struct.
+        s if raw_dyn_fat_pointer_spelling(s) => (
+            ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            2 * crate::layout::target_word_size(),
         ),
         // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
         // is FLAG_UNSIGNED. A one-word-item Vec is
@@ -17532,13 +17944,21 @@ pub(crate) fn get_type_flag(
         s if let Some(flag) = crate::front::mir::type_flag_for_external_transparent_scalar(s) => {
             flag
         }
-        // Unknown type — treat as GC pointer (conservative)
-        _ => (
+        // A thin `*mut T` / `*const T` that missed every earlier arm.
+        // A thin pointer is one word whatever its pointee (`lltype.Ptr`
+        // size). `descr.py get_type_flag` returns FLAG_POINTER for a gc
+        // pointee, so a wider Charon slot is padding. The triple is the
+        // unknown-name fallback; classifying the spelling keeps that
+        // word. `raw_thin_pointer_spelling`, a raw alloc-flavor pointee,
+        // a one-word `Vec` header, and the fat-pointer arms stay first.
+        s if thin_raw_pointer_spelling(s) => (
             ArrayFlag::Pointer,
             majit_ir::value::Type::Ref,
             crate::layout::target_word_size(),
         ),
-    }
+        // Unknown name. `get_type_flag` supplies the word-sized Ref.
+        _ => return None,
+    })
 }
 
 /// Byte alignment of a type string.
@@ -20460,6 +20880,242 @@ mod tests {
         assert_eq!(layout.fields[1].size, 0);
     }
 
+    /// A by-value opaque aggregate misses every `get_type_flag` arm, so
+    /// the unknown-name word is replaced by the Charon span
+    /// (`FLAG_STRUCT`, here 40 and 48). `op_getfield` refuses a
+    /// `ContainerType`. A spelling the match already classifies
+    /// (`Option`, `String`) stays that one word when the next field is
+    /// aligned further out. A known one-word struct keeps its declared
+    /// size. A thin raw pointer is classified, so `*mut Foo` keeps one
+    /// word when the next field sits further out (`lltype.Ptr`; the gap
+    /// is padding). An `fn` and a qualified `Box` that the match does
+    /// not classify are that unknown arm: a span wider than a word is
+    /// re-banked, a one-word span stays the fallback pointer.
+    #[test]
+    fn apply_exact_layout_banks_a_wide_opaque_aggregate_as_struct() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let mutex = "lock_api::mutex::Mutex<parking_lot::raw_mutex::RawMutex, alloc::collections::vec_deque::VecDeque<ObjectRef>>";
+        let rows = [
+            ("header".into(), "Inner".into()),
+            ("raw_ptr".into(), "*mut Foo".into()),
+            ("names".into(), "Option<Vec<ObjectRef>>".into()),
+            ("storage".into(), "*mut ItemsBlock".into()),
+            ("queue".into(), mutex.into()),
+            ("label".into(), "String".into()),
+            ("callback".into(), "fn(usize) -> usize".into()),
+            (
+                "seen".into(),
+                "std::collections::hash::set::HashSet<usize>".into(),
+            ),
+            ("boxed".into(), "alloc::boxed::Box<u8, Global>".into()),
+            ("tail".into(), "u64".into()),
+        ];
+        let mut known = std::collections::HashSet::new();
+        known.insert("Inner".to_string());
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("Inner".to_string(), word);
+        let mut layout = StructLayout::from_type_strings(
+            &rows,
+            &known,
+            &sizes,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let queue_before = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "queue")
+            .expect("queue row");
+        assert_eq!(queue_before.flag, ArrayFlag::Pointer);
+        assert_eq!(queue_before.size, word);
+        assert_eq!(queue_before.field_type, majit_ir::value::Type::Ref);
+
+        layout.apply_exact_layout(
+            &rows,
+            &std::collections::HashMap::from([
+                ("header".to_string(), 0u64),
+                ("raw_ptr".to_string(), 16),
+                ("names".to_string(), 32),
+                ("storage".to_string(), 56),
+                ("queue".to_string(), 64),
+                ("label".to_string(), 104),
+                ("callback".to_string(), 128),
+                ("seen".to_string(), 144),
+                ("boxed".to_string(), 192),
+                ("tail".to_string(), 208),
+            ]),
+            Some(216),
+            &known,
+            &sizes,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+
+        let field = |name: &str| {
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let empty = HashSet::new();
+        assert!(get_type_flag_known(mutex, &empty).is_none());
+        assert!(
+            get_type_flag_known("std::collections::hash::set::HashSet<usize>", &empty).is_none()
+        );
+        assert!(get_type_flag_known("Option<Vec<ObjectRef>>", &empty).is_some());
+        assert!(get_type_flag_known("String", &empty).is_some());
+        let pointer = (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word);
+        assert_eq!(get_type_flag_known("*mut Foo", &empty), Some(pointer));
+        assert_eq!(
+            get_type_flag_known("*mut ItemsBlock", &empty),
+            Some(pointer)
+        );
+        assert!(get_type_flag_known("fn(usize) -> usize", &empty).is_none());
+        assert!(get_type_flag_known("alloc::boxed::Box<u8, Global>", &empty).is_none());
+
+        let header = field("header");
+        assert_eq!(header.offset, 0);
+        assert_eq!(header.flag, ArrayFlag::Struct);
+        assert_eq!(header.size, word);
+        // `*mut Foo` is a thin raw pointer. The gap to `names` is padding.
+        let raw_ptr = field("raw_ptr");
+        assert_eq!(raw_ptr.offset, 16);
+        assert_eq!(raw_ptr.flag, ArrayFlag::Pointer);
+        assert_eq!(raw_ptr.size, word);
+        assert_eq!(raw_ptr.field_type, majit_ir::value::Type::Ref);
+        let names = field("names");
+        assert_eq!(names.flag, ArrayFlag::Pointer);
+        assert_eq!(names.size, word);
+        // The gap to `queue` is one word, so the fallback pointer stays.
+        let storage = field("storage");
+        assert_eq!(storage.flag, ArrayFlag::Pointer);
+        assert_eq!(storage.size, word);
+        let queue = field("queue");
+        assert_eq!(queue.offset, 64);
+        assert_eq!(queue.flag, ArrayFlag::Struct);
+        assert_eq!(queue.size, 40);
+        assert_eq!(queue.field_type, majit_ir::value::Type::Ref);
+        let label = field("label");
+        assert_eq!(label.flag, ArrayFlag::Pointer);
+        assert_eq!(label.size, word);
+        let callback = field("callback");
+        assert_eq!(callback.flag, ArrayFlag::Struct);
+        assert_eq!(callback.size, 16);
+        assert_eq!(callback.field_type, majit_ir::value::Type::Ref);
+        let seen = field("seen");
+        assert_eq!(seen.offset, 144);
+        assert_eq!(seen.flag, ArrayFlag::Struct);
+        assert_eq!(seen.size, 48);
+        assert_eq!(seen.field_type, majit_ir::value::Type::Ref);
+        let boxed = field("boxed");
+        assert_eq!(boxed.flag, ArrayFlag::Struct);
+        assert_eq!(boxed.size, 16);
+        assert_eq!(boxed.field_type, majit_ir::value::Type::Ref);
+        let tail = field("tail");
+        assert_eq!(tail.flag, ArrayFlag::Unsigned);
+        assert_eq!(tail.size, 8);
+        assert_eq!(layout.size, 216);
+    }
+
+    /// Classified pointers keep the `get_type_flag` width when the next
+    /// field sits further out. A thin raw pointer is one word
+    /// (`lltype.Ptr`; `descr.py get_type_flag` FLAG_POINTER for a gc
+    /// pointee), so the gap is padding. `*mut dyn Trait` is the two-word
+    /// raw struct (`two_word_fat_struct`). Two names at one offset have
+    /// no exclusive span (`Vec` records `buf` and `len` both at 0).
+    #[test]
+    fn apply_exact_layout_keeps_classified_pointers_at_their_type_width() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let rows = [
+            ("w_obj".into(), "*mut pyobject::PyObject".into()),
+            ("actionflag".into(), "*mut dyn ActionFlagOps".into()),
+            ("tail".into(), "u64".into()),
+        ];
+        let empty_known = std::collections::HashSet::new();
+        let empty_sizes = std::collections::HashMap::new();
+        let mut layout = StructLayout::from_type_strings(
+            &rows,
+            &empty_known,
+            &empty_sizes,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        layout.apply_exact_layout(
+            &rows,
+            &std::collections::HashMap::from([
+                ("w_obj".to_string(), 8u64),
+                ("actionflag".to_string(), 40),
+                ("tail".to_string(), 80),
+            ]),
+            Some(88),
+            &empty_known,
+            &empty_sizes,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let field = |name: &str| {
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let w_obj = field("w_obj");
+        assert_eq!(w_obj.flag, ArrayFlag::Pointer);
+        assert_eq!(w_obj.field_type, majit_ir::value::Type::Ref);
+        assert_eq!(w_obj.size, word);
+        let actionflag = field("actionflag");
+        assert_eq!(actionflag.flag, ArrayFlag::Struct);
+        assert_eq!(actionflag.field_type, majit_ir::value::Type::Ref);
+        assert_eq!(actionflag.size, 2 * word);
+        let tail = field("tail");
+        assert_eq!(tail.flag, ArrayFlag::Unsigned);
+        assert_eq!(tail.size, 8);
+
+        let shared = [
+            ("buf".into(), "*mut u8".into()),
+            ("len".into(), "usize".into()),
+        ];
+        let mut vec_layout = StructLayout::from_type_strings(
+            &shared,
+            &empty_known,
+            &empty_sizes,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        vec_layout.apply_exact_layout(
+            &shared,
+            &std::collections::HashMap::from([("buf".to_string(), 0u64), ("len".to_string(), 0)]),
+            Some(3 * word as u64),
+            &empty_known,
+            &empty_sizes,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let buf = vec_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "buf")
+            .expect("buf");
+        assert_eq!(buf.flag, ArrayFlag::Pointer);
+        assert_eq!(buf.size, word);
+        let len = vec_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "len")
+            .expect("len");
+        assert_eq!(len.flag, ArrayFlag::Unsigned);
+        assert_eq!(len.size, word);
+    }
+
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
     /// The unknown-name fallback would bank it as a word-sized Ref.
     #[test]
@@ -21254,8 +21910,10 @@ mod tests {
     }
 
     /// `descr.py get_type_flag`: a Ptr whose TO._gckind == 'raw' is
-    /// FLAG_UNSIGNED, int-banked, one word. `*mut u8` and a named struct
-    /// pointee stay on the Ref fallback.
+    /// FLAG_UNSIGNED, int-banked, one word. Any other thin raw pointer
+    /// is the one-word Ref (`lltype.Ptr`), and the match classifies it
+    /// so a wider Charon slot stays padding. A fat pointee (`dyn`,
+    /// `[T]`, `str`) is not that word.
     #[test]
     fn raw_thin_pointer_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
@@ -21270,9 +21928,35 @@ mod tests {
         assert_eq!(get_type_flag("*mut f64", &empty), expected);
         assert_eq!(get_type_flag("*mut isize", &empty), expected);
         assert_eq!(get_type_flag("*mut *mut PyObject", &empty), expected);
+        assert_eq!(get_type_flag("*mut Vec<usize>", &empty), expected);
         assert_eq!(get_type_flag("*mut u8", &empty), fallback);
+        assert_eq!(get_type_flag_known("*mut u8", &empty), Some(fallback));
         assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
         assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
+        assert_eq!(get_type_flag_known("*mut PyObject", &empty), Some(fallback));
+        assert_eq!(
+            get_type_flag_known("*mut pyobject::PyObject", &empty),
+            Some(fallback)
+        );
+        assert_eq!(get_type_flag_known("*mut Foo", &empty), Some(fallback));
+        assert_eq!(
+            get_type_flag_known("*const path::Foo", &empty),
+            Some(fallback)
+        );
+        assert!(get_type_flag_known("*const str", &empty).is_none());
+        assert!(get_type_flag_known("*mut [u8]", &empty).is_none());
+        assert_eq!(
+            get_type_flag("*const [u8]", &empty),
+            (ArrayFlag::Struct, Type::Int, 2 * word)
+        );
+        let fat = (ArrayFlag::Struct, Type::Ref, 2 * word);
+        assert_eq!(get_type_flag("*mut dyn ActionFlagOps", &empty), fat);
+        assert_eq!(get_type_flag("*const dyn ActionFlagOps", &empty), fat);
+        assert!(get_type_flag_known("*mut dyn ActionFlagOps", &empty).is_some());
+        assert_ne!(
+            get_type_flag_known("*mut dyn ActionFlagOps", &empty),
+            Some(fallback)
+        );
     }
 
     /// A linked `repr(transparent)` wrapper uses the same table the
@@ -26172,7 +26856,7 @@ mod tests {
         cc.set_struct_layout(elem_sid, inst_layout);
 
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid), &None, "f_valid")
+            .interiorfielddescrof_keyed(1, &Some(atid.clone()), &None, "f_valid")
             .expect("dump interior field descr");
         let offset = descr
             .as_interior_field_descr()
@@ -26181,6 +26865,13 @@ mod tests {
             .offset();
         assert_eq!(offset, inst_valid);
         assert_ne!(offset, template_valid);
+        // Nested struct inside the array item: `all_interiorfielddescrs`
+        // refuses `array(struct(struct))`, so the containing name has no
+        // interior descr. The scalar `f_valid` above still resolves.
+        assert!(
+            cc.interiorfielddescrof_keyed(1, &Some(atid), &None, "key")
+                .is_none()
+        );
     }
 
     /// `get_ll_dict` one DICTENTRYARRAY per DICTKEY: interned ARRAY.OF
@@ -32964,9 +33655,12 @@ mod tests {
 
         assert_eq!(get_fielddescr_index_in(&cc, "Inner", "y", 0), 1);
         // Outer: hdr→{x,y} takes 0 and 1, a=2, `&Inner` pointer=3, b=4.
+        // `x` is the first leaf; `hdr` itself is not a slot.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "x", 0), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "p", 0), 3);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "hdr", 0), -6);
         // `heaptracker.py` `-cur_index - 1` over the 5 leaves above.
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
         // The dotted spelling names one flattened leaf of `hdr`.

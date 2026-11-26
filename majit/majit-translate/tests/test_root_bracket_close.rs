@@ -2509,6 +2509,50 @@ fn isinstance_bracket_is_scalar_replaced() {
     });
 }
 
+/// `dunder_import_inner` pins the import arguments and reads them back
+/// through closures over those slots. The closures are slot getters, so
+/// `push_roots` / `pop_roots` (`ShadowStackFrameworkGCTransformer`, after
+/// `make_jitcodes`) must not remain in the lowered graph.
+#[test]
+fn dunder_import_inner_bracket_is_scalar_replaced() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        let context = context_with_extras(interpreter, &[object]);
+        let outcome = majit_translate::front::mir::shadow_stack_erase_named(
+            interpreter,
+            "::importing::dunder_import_inner",
+        );
+        assert_eq!(
+            outcome, "erased",
+            "dunder_import_inner bracket must scalar-replace"
+        );
+        let graph = lower_fun(interpreter, &context, "importing::dunder_import_inner");
+        for leaf in [
+            "push_roots",
+            "pin_roots",
+            "pin_root",
+            "shadow_stack_get",
+            "shadow_stack_len",
+            "root_scope_close_word",
+        ] {
+            assert_eq!(
+                calls_to(&graph, leaf),
+                0,
+                "dunder_import_inner still calls {leaf} after the bracket was scalar-replaced"
+            );
+        }
+    });
+}
+
 /// `_check_not_duplicate_kwargs` copies the published existing-names
 /// slice into `existing_now`, a separately allocated buffer.
 /// `pop_roots` / `expand_pop_roots` (`gc_restore_root`) reloads
@@ -2535,4 +2579,34 @@ fn check_not_duplicate_kwargs_keeps_copy_into_existing_now() {
         erase.starts_with("copy-range-dest-not-published-slice"),
         "existing_now is a distinct buffer, erase={erase}"
     );
+}
+
+/// `rclass.py` `hook_setfield` passes the mutate field and the value slot
+/// by address. Neither argument is the pointer currently stored there.
+#[test]
+fn quasi_immutable_publication_borrows_both_field_addresses() {
+    use majit_translate::model::ValueType;
+    let graph = lower_named(object_llbc(), "notify_w_class_mutated_then");
+    for name in ["w_class_watchers", "w_class"] {
+        let fields: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == name => {
+                    Some((field.taken_by_address, ty))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!fields.is_empty(), "missing {name}: {}", graph.dump());
+        assert!(
+            fields
+                .iter()
+                .all(|(address, ty)| *address && **ty == ValueType::Int),
+            "{name} must be a raw slot address: {}",
+            graph.dump()
+        );
+    }
+    assert_eq!(calls_to(&graph, "publish_quasi_immut_ptr"), 1);
 }

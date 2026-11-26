@@ -688,7 +688,7 @@ impl<'a> Lowering<'a> {
         place: &Place,
     ) -> Result<Option<(Variable, Variable)>, LowerError> {
         let bb_id = self.emit_bb(mir_bb);
-        let ptr = self.resolve_place_as(mir_bb, place.clone(), true)?;
+        let ptr = self.resolve_place_as(mir_bb, place.clone(), true, true)?;
         let block = self.graph.block_mut(bb_id);
         let Some(SpaceOperation {
             result: Some(result),

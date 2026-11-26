@@ -14,7 +14,12 @@ pub type StringIterGetitemFn = fn(PyObjectRef, isize) -> crate::PyResult;
 /// `getitem_fn`); 3.15-visible as `bytes_iterator`.  `bytearray_iterator`
 /// shares this layout the way `str_ascii_iterator` shares
 /// `W_FastUnicodeIterObject`.
-#[crate::pyre_class("bytes_iterator", static_name = "BYTES_ITER")]
+// `no_allocate_stable`: born through `allocate`
+// (`malloc_typed_young_nonmoving`, `external_malloc(..., alloc_young=True)`).
+// `string_iter_descr_next` reloads this object from the shadow stack across
+// `getitem_fn`, so the address only has to stay put for that re-read.
+// Old-gen `allocate_stable` (`malloc_typed_stable`) is not that contract.
+#[crate::pyre_class("bytes_iterator", static_name = "BYTES_ITER", no_allocate_stable)]
 pub struct W_StringIterObject {
     pub seq: PyObjectRef,
     /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
@@ -42,7 +47,9 @@ pub static BYTEARRAY_ITER_TYPE: PyType = pyre_object::new_pytype("bytearray_iter
 pub fn w_bytes_iter_new(seq: PyObjectRef, getitem_fn: StringIterGetitemFn) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let seq = pyre_object::gc_roots::pin_root(seq);
-    W_StringIterObject::allocate_stable(W_StringIterObject {
+    // `allocate` stamps `BYTES_ITER_TYPE`. Young non-moving: see the
+    // `no_allocate_stable` note on `W_StringIterObject`.
+    W_StringIterObject::allocate(W_StringIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -67,7 +74,9 @@ pub fn w_bytearray_iter_new(seq: PyObjectRef, getitem_fn: StringIterGetitemFn) -
         index: 0,
         getitem_fn,
     };
-    pyre_object::lltype::malloc_typed_stable(value) as PyObjectRef
+    // `allocate` would stamp `BYTES_ITER_TYPE` over `BYTEARRAY_ITER_TYPE`.
+    // Same young non-moving birth as `allocate` (`malloc_typed_young_nonmoving`).
+    pyre_object::lltype::malloc_typed_young_nonmoving(value) as PyObjectRef
 }
 
 /// `bytes_iterator` / `bytearray_iterator` — `iterobject.py

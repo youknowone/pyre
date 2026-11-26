@@ -1204,11 +1204,22 @@ pub(crate) fn is_same_as_follow_unary(name: &str) -> bool {
 /// `jtransform.py rewrite_op_cast_pointer` → `rewrite_op_same_as`.
 pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
     is_identity_cast_path(segments)
+        || is_cast_instance_to_base_ptr_path(segments)
         || is_ptr_from_ref_path(segments)
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
         || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
         || crate::front::std_identity::is_manually_drop_new_path(segments)
+}
+
+/// `annlowlevel.cast_instance_to_base_ptr`
+/// (`CastObjectToPtrEntry.specialize_call`). That entry emits
+/// `cast_pointer`; `jtransform.py rewrite_op_cast_pointer` aliases the
+/// genop through `rewrite_op_same_as`. The surviving model call still
+/// names the helper, so the same alias applies here. A user function
+/// with that leaf is not this path.
+fn is_cast_instance_to_base_ptr_path(segments: &[String]) -> bool {
+    path_segments_end_with(segments, &["annlowlevel", "cast_instance_to_base_ptr"])
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -9971,18 +9982,35 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// True when `ty` is `CCHARP` or `Ptr(Array)`.
+    /// `concretetype.TO.OF` of `Ptr(Array)` or `Ptr(FixedSizeArray)`.
+    /// `rewrite_op_direct_ptradd` reads `llmemory.sizeof` of that item.
+    /// `direct_arrayitems` / `_subarray._makeptr` is the FixedSizeArray
+    /// pointer; `ann_direct_ptradd` returns it unchanged.
+    fn direct_ptradd_item_of(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let LowLevelType::Ptr(ptr) = ty else {
+            return None;
+        };
+        match &ptr.TO {
+            PtrTarget::Array(arr) => Some(&arr.OF),
+            PtrTarget::FixedSizeArray(arr) => Some(&arr.OF),
+            _ => None,
+        }
+    }
+
+    /// True when `ty` is `CCHARP`, `Ptr(Array)`, or `Ptr(FixedSizeArray)`.
     /// `rewrite_op_direct_ptradd` uses this to accept the item type
     /// `push_direct_ptradd` stamps on the result. Sizing still goes
     /// through `direct_ptradd_item_bytes` and the callcontrol layout.
     fn direct_ptradd_type_has_item(
         ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) -> bool {
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
         if ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP {
             return true;
         }
-        matches!(ty, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Array(_)))
+        Self::direct_ptradd_item_of(ty).is_some()
     }
 
     /// `llmemory.sizeof(concretetype.TO.OF)` as a byte count.
@@ -9993,15 +10021,9 @@ impl<'a> Transformer<'a> {
     ) -> Option<i64> {
         use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::llmemory;
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
 
-        let LowLevelType::Ptr(ptr) = ty else {
-            return None;
-        };
-        let PtrTarget::Array(arr) = &ptr.TO else {
-            return None;
-        };
-        let ConstValue::AddressOffset(addr) = llmemory::sizeof(&arr.OF, None).ok()? else {
+        let of = Self::direct_ptradd_item_of(ty)?;
+        let ConstValue::AddressOffset(addr) = llmemory::sizeof(of, None).ok()? else {
             return None;
         };
         addr.byte_size(layout).ok()
@@ -12360,6 +12382,19 @@ impl<'a> Transformer<'a> {
             if is_rffi_cast_path(segments) && args.len() == 1 {
                 let src = resolve_alias(&args[0], &self.aliases);
                 return self.rewrite_op_force_cast(&src, op.result.as_ref(), graph_name, graph);
+            }
+            // `CastObjectToPtrEntry.specialize_call` (`annlowlevel.py`):
+            // `NoneRepr` is `hop.inputconst(PTR, lltype.nullptr(PTR.TO))`.
+            // Any other argument is `cast_pointer`, aliased below
+            // (`rewrite_op_cast_pointer` → `rewrite_op_same_as`).
+            if is_cast_instance_to_base_ptr_path(segments)
+                && args.len() == 1
+                && operand_is_void_none(graph, &args[0])
+            {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ConstRefNull,
+                }]);
             }
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
@@ -32745,6 +32780,103 @@ mod tests {
         );
     }
 
+    /// `direct_arrayitems` / `_subarray._makeptr` is
+    /// `Ptr(FixedSizeArray(ITEM, 1))`. `rewrite_op_direct_ptradd` scales
+    /// by `llmemory.sizeof(concretetype.TO.OF)`, the same item size a
+    /// `Ptr(Array(ITEM))` uses.
+    #[test]
+    fn direct_ptradd_fixed_size_array_struct_scales_by_callcontrol_size() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use std::collections::HashMap;
+
+        let name = "direct_ptradd_fixture::FixedEntry";
+        let sid = majit_ir::descr::StructId::from_canonical(name);
+        let mut ids = HashMap::new();
+        ids.insert(name.to_string(), Some(sid));
+        let _registry = crate::test_support::register_struct_ids_serialized(ids);
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(Struct::new(name, vec![]))),
+                1,
+            )),
+        }));
+        let mut graph = FunctionGraph::new("direct_ptradd_fixed_size");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                    param: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                    param: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: Some(graph.alloc_value_var()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            crate::call::StructLayout {
+                size: 12,
+                align: 4,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "direct_ptradd_fixed_size",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("FixedSizeArray direct_ptradd must scale by the registered size");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(12))),
+            "ops={ops:?}"
+        );
+    }
+
     fn rewrite_direct_ptradd_of(
         ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
         result_ty: ValueType,
@@ -39049,6 +39181,97 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `cast_instance_to_base_ptr` is `cast_pointer`
+    /// (`CastObjectToPtrEntry.specialize_call`), so
+    /// `rewrite_op_cast_pointer` aliases the operand. A constant `None`
+    /// is `lltype.nullptr`, not an alias of the Void `None` value.
+    #[test]
+    fn cast_instance_to_base_ptr_call_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_instance_to_base_ptr");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "annlowlevel",
+            "cast_instance_to_base_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "cast_instance_to_base_ptr",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+
+        let user: Vec<String> = ["user", "cast_instance_to_base_ptr"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_same_as_identity_call_path(&user),
+            "a user function of this leaf is an ordinary call"
+        );
+    }
+
+    /// `NoneRepr` arm of `CastObjectToPtrEntry.specialize_call`.
+    #[test]
+    fn cast_instance_to_base_ptr_none_is_nullptr() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_instance_to_base_ptr_none");
+        let entry = graph.startblock;
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "annlowlevel",
+            "cast_instance_to_base_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![none.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&none),
+            &result_ty,
+            "cast_instance_to_base_ptr_none",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(ops[0].kind, OpKind::ConstRefNull));
+                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
+            }
+            _ => panic!("expected nullptr constant"),
         }
     }
 

@@ -5703,7 +5703,7 @@ pub fn walk<Sym: WalkSym>(
                 if fbw_state::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
-                         helper={} inline={} claimed={} callee_jc={:?}",
+                         helper={} inline={} claimed={} callee_jc={:?} walk_jc={:?}",
                         error,
                         error.stop_pc(),
                         opcode_position,
@@ -5711,6 +5711,9 @@ pub fn walk<Sym: WalkSym>(
                         ctx.fbw_mode.inline_subwalk,
                         coordinate_belongs_to_this_frame,
                         ctx.inline_callee_consts.map(|c| c.jitcode_index),
+                        ctx.walk_jitcode_index()
+                            .and_then(crate::jitcode_runtime::get_jitcode_ref_by_index)
+                            .map(|jc| jc.name.clone()),
                     );
                 }
                 // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`

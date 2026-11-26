@@ -16635,6 +16635,115 @@ fn entry_instantiation_splits_key_class() {
 }
 
 #[test]
+fn entry_and_gc_entries_suffix_on_void_value() {
+    // `get_ll_dict` one DICTENTRYARRAY per (K,V). `()` is Void and still
+    // an instantiation (`type_arg_is_concrete`); variant deferrals on
+    // `split_struct_instantiation_suffix` do not apply.
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            code_struct(0, &["pyre_object", "rordereddict_entries", "Entry"]),
+            code_struct(1, &["pyre_object", "rordereddict_entries", "GcEntries"]),
+            code_struct(2, &["pyre_object", "ObjectKey"]),
+        ],
+        vec![],
+    );
+    let object_key = named_adt(2, vec![]);
+    let unit = serde_json::json!({"Tuple": []});
+    let tomb = std::collections::HashSet::new();
+    let entry_node = named_adt(0, vec![object_key.clone(), unit.clone()]);
+    let entries_node = named_adt(1, vec![object_key, unit]);
+    assert_eq!(
+        super::adt_node_class_root_with(&entry_node, &llbc, &tomb).as_deref(),
+        Some("rordereddict_entries::Entry<ObjectKey,()>")
+    );
+    assert_eq!(
+        super::adt_node_class_root_with(&entries_node, &llbc, &tomb).as_deref(),
+        Some("rordereddict_entries::GcEntries<ObjectKey,()>")
+    );
+    let entry_adt = entry_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .expect("Adt");
+    assert_eq!(
+        super::entry_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::Entry",
+            entry_adt,
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
+    );
+    let entries_adt = entries_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .expect("Adt");
+    assert_eq!(
+        super::gc_entries_struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::GcEntries",
+            entries_adt,
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<ObjectKey,()>")
+    );
+}
+
+#[test]
+fn gcarray_of_set_entry_keeps_objectkey_struct_and_void_value() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+
+    let mut reg = crate::front::semantic::StructFieldRegistry::default();
+    reg.fields.insert(
+        "ObjectKey".to_string(),
+        vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("obj".to_string(), "*mut u8".to_string()),
+        ],
+    );
+    reg.fields.insert(
+        "rordereddict_entries::Entry".to_string(),
+        vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let item = "rordereddict_entries::Entry<ObjectKey,()>";
+    reg.fields.insert(
+        item.to_string(),
+        vec![
+            ("key".to_string(), "ObjectKey".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "()".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let arr = super::gcarray_of_bound_struct_item(&reg, item).expect("ARRAY");
+    assert_eq!(arr._gckind, GcKind::Gc);
+    let LowLevelType::Struct(st) = arr.OF else {
+        panic!("ARRAY.OF must be DICTENTRY, got {:?}", arr.OF);
+    };
+    assert_eq!(st._name, item);
+    let LowLevelType::Struct(key) = st._flds.get("key").expect("key") else {
+        panic!(
+            "set key is the by-value ObjectKey struct, got {:?}",
+            st._flds.get("key")
+        );
+    };
+    assert_eq!(key._name, "ObjectKey");
+    assert!(matches!(st._flds.get("value"), Some(LowLevelType::Void)));
+    assert!(matches!(st._flds.get("f_valid"), Some(LowLevelType::Bool)));
+    assert!(matches!(
+        st._flds.get("f_hash"),
+        Some(LowLevelType::Unsigned)
+    ));
+}
+
+#[test]
 fn gc_entries_instantiation_splits_key_class() {
     let llbc = llbc_with_types(
         "pyre_object",
@@ -16856,6 +16965,316 @@ fn entry_family_holder_instantiation_splits_key_class() {
         None,
         "an unsubstituted holder is not an instantiation"
     );
+}
+
+#[test]
+fn entry_family_holder_wrapper_splits_on_mir_and_registry() {
+    // `get_ll_dict` builds one DICT per key/value. A generic transparent
+    // wrapper around that holder is the same class object per
+    // instantiation (`bookkeeper.py` `getuniqueclassdef`). The MIR
+    // predicate sees the wrapper's field; harvested rows are the flattened
+    // inner holder. Both split. A field that names the holder at concrete
+    // arguments does not.
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let family = || named_adt(0, vec![tvar(0), tvar(1)]);
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let holder = named_adt(1, vec![tvar(0), tvar(1)]);
+    let mut wrapper = type_decl_struct(
+        2,
+        &["fixture", "W"],
+        vec![named_copy_field("inner", holder.clone())],
+    );
+    wrapper["layout"] = transparent_layout();
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "GcEntries"],
+                vec![],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "H"],
+                vec![
+                    named_copy_field("entries", raw_mut(family())),
+                    named_copy_field(
+                        "n",
+                        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}}),
+                    ),
+                ],
+            ),
+            wrapper,
+            type_decl_struct(
+                3,
+                &["fixture", "PtrW"],
+                vec![named_copy_field("inner", raw_mut(holder.clone()))],
+            ),
+            type_decl_struct(
+                4,
+                &["fixture", "FixedW"],
+                vec![named_copy_field(
+                    "inner",
+                    named_adt(1, vec![u64_ty.clone(), i64_ty.clone()]),
+                )],
+            ),
+        ],
+        vec![],
+    );
+    let tomb = std::collections::HashSet::new();
+    fn adt_of(node: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        node.get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .expect("Adt")
+    }
+    let suffix_of = |id: u64, leaf: &str| {
+        let node = named_adt(id, vec![u64_ty.clone(), i64_ty.clone()]);
+        assert_eq!(
+            super::entry_family_holder_struct_instantiation_suffix(
+                &format!("fixture::{leaf}"),
+                adt_of(&node),
+                &llbc,
+                &tomb,
+            )
+            .as_deref(),
+            Some("<u64,i64>"),
+            "{leaf}"
+        );
+        node
+    };
+    // `getuniqueclassdef` is one class per instantiation. A transparent
+    // wrapper stays that class: following the declared field would drop
+    // the use-site arguments and paint the unsuffixed inner template.
+    let h = suffix_of(1, "H");
+    let w = suffix_of(2, "W");
+    let ptr = suffix_of(3, "PtrW");
+    for (node, leaf) in [(&h, "H"), (&w, "W"), (&ptr, "PtrW")] {
+        let root = super::adt_node_class_root_with(node, &llbc, &tomb);
+        let spelling = root.as_deref().unwrap_or("");
+        assert!(
+            spelling.contains(leaf) && spelling.contains("<u64,i64>"),
+            "{leaf} got {root:?}"
+        );
+    }
+    let fixed = named_adt(4, vec![u64_ty.clone(), i64_ty.clone()]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::FixedW",
+            adt_of(&fixed),
+            &llbc,
+            &tomb,
+        ),
+        None,
+        "a holder instantiated at concrete arguments does not split the wrapper"
+    );
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "rordereddict_entries::GcEntries".to_string(),
+        vec![(
+            "items".to_string(),
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+        )],
+    );
+    reg.fields.insert(
+        "fixture::W".to_string(),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::W"));
+    assert!(reg.struct_root_rows_known("fixture::W<u64,i64>"));
+    reg.fields.insert(
+        "fixture::H".to_string(),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::H"));
+    assert!(reg.struct_root_rows_known("fixture::H<u64,i64>"));
+    // Registry follows the same nested holder the MIR predicate named
+    // above (`PtrW` → `*mut H<K,V>` → `GcEntries`). A row that names
+    // `H` at concrete arguments does not (`get_ll_dict`).
+    reg.fields.insert(
+        "fixture::PtrW".to_string(),
+        vec![(
+            "inner".to_string(),
+            "*mut fixture::H<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::PtrW"));
+    assert!(reg.struct_root_rows_known("fixture::PtrW<u64,i64>"));
+    reg.fields.insert(
+        "fixture::PtrW2".to_string(),
+        vec![("inner".to_string(), "*mut fixture::H<i64,i64>".to_string())],
+    );
+    assert!(!reg.template_holds_split_entry_family("fixture::PtrW2"));
+    assert!(!reg.struct_root_rows_known("fixture::PtrW2<u64,i64>"));
+}
+
+#[test]
+fn entry_family_holder_concrete_unit_and_f32_keep_suffix() {
+    // `rordereddict.py` `get_ll_dict`: one `DICT` per concrete
+    // `(DICTKEY, DICTVALUE)`, a Void key included. `()` and `f32` suffix.
+    // An unsubstituted parameter does not (`bookkeeper.py` `getuniqueclassdef`).
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let f32_ty = serde_json::json!({"Scalar": {"Float": "F32"}});
+    let unit = serde_json::json!({"Adt": {"builtin": "Tuple", "generics": {"types": []}}});
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let family = || named_adt(0, vec![tvar(0), tvar(1)]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "GcEntries"],
+                vec![],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "Holder"],
+                vec![named_copy_field("entries", raw_mut(family()))],
+            ),
+            type_decl_struct(2, &["pyobject", "PyObject"], vec![]),
+        ],
+        vec![],
+    );
+    let tomb = std::collections::HashSet::new();
+    let suffix = |args: Vec<serde_json::Value>| {
+        let node = named_adt(1, args);
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Holder",
+            node.get("Adt")
+                .and_then(serde_json::Value::as_object)
+                .expect("Adt"),
+            &llbc,
+            &tomb,
+        )
+    };
+    assert_eq!(
+        suffix(vec![unit, i64_ty.clone()]).as_deref(),
+        Some("<(),i64>")
+    );
+    assert_eq!(
+        suffix(vec![f32_ty, i64_ty.clone()]).as_deref(),
+        Some("<f32,i64>")
+    );
+    assert_eq!(
+        suffix(vec![i64_ty.clone(), raw_mut(named_adt(2, vec![]))]).as_deref(),
+        Some("<i64,*mut PyObject>")
+    );
+    assert_eq!(suffix(vec![tvar(0), i64_ty]), None);
+}
+
+#[test]
+fn entry_family_holder_finite_chain_splits_and_cycle_stops() {
+    // `bookkeeper.py` `getdesc` keys one descriptor per class object.
+    // A finite chain of holders still suffixes. A holder whose only
+    // field is itself, with no entry family, stops and does not.
+    const DEPTH: usize = 10;
+    const LEAVES: [&str; DEPTH] = ["D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9"];
+    let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let raw_mut = |ty: serde_json::Value| serde_json::json!({"RawPtr": [ty, "Mut"]});
+    let mut decls = Vec::with_capacity(DEPTH + 2);
+    decls.push(type_decl_struct(
+        0,
+        &["pyre_object", "rordereddict_entries", "GcEntries"],
+        vec![],
+    ));
+    for i in 0..DEPTH {
+        let field = if i + 1 == DEPTH {
+            raw_mut(named_adt(0, vec![tvar(0), tvar(1)]))
+        } else {
+            raw_mut(named_adt((i + 2) as u64, vec![tvar(0), tvar(1)]))
+        };
+        decls.push(type_decl_struct(
+            (i + 1) as u64,
+            &["fixture", LEAVES[i]],
+            vec![named_copy_field("inner", field)],
+        ));
+    }
+    let node_id = (DEPTH + 1) as u64;
+    decls.push(type_decl_struct(
+        node_id,
+        &["fixture", "Node"],
+        vec![named_copy_field(
+            "next",
+            raw_mut(named_adt(node_id, vec![tvar(0), tvar(1)])),
+        )],
+    ));
+    let llbc = llbc_with_types("fixture", decls, vec![]);
+    let tomb = std::collections::HashSet::new();
+    fn adt_of(node: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        node.get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .expect("Adt")
+    }
+    let concrete = named_adt(1, vec![u64_ty.clone(), i64_ty.clone()]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::D0",
+            adt_of(&concrete),
+            &llbc,
+            &tomb,
+        )
+        .as_deref(),
+        Some("<u64,i64>"),
+        "a 10-deep holder chain keeps the instantiation"
+    );
+    let cycle = named_adt(node_id, vec![u64_ty, i64_ty]);
+    assert_eq!(
+        super::entry_family_holder_struct_instantiation_suffix(
+            "fixture::Node",
+            adt_of(&cycle),
+            &llbc,
+            &tomb,
+        ),
+        None,
+        "a self-referential holder with no entry family does not split"
+    );
+
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "rordereddict_entries::GcEntries".to_string(),
+        vec![(
+            "items".to_string(),
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+        )],
+    );
+    for i in 0..(DEPTH - 1) {
+        reg.fields.insert(
+            format!("fixture::{}", LEAVES[i]),
+            vec![(
+                "inner".to_string(),
+                format!("*mut fixture::{}<??TypeVar#0,??TypeVar#1>", LEAVES[i + 1]),
+            )],
+        );
+    }
+    reg.fields.insert(
+        format!("fixture::{}", LEAVES[DEPTH - 1]),
+        vec![(
+            "entries".to_string(),
+            "*mut rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(reg.template_holds_split_entry_family("fixture::D0"));
+    assert!(reg.struct_root_rows_known("fixture::D0<u64,i64>"));
+    reg.fields.insert(
+        "fixture::Node".to_string(),
+        vec![(
+            "next".to_string(),
+            "*mut fixture::Node<??TypeVar#0,??TypeVar#1>".to_string(),
+        )],
+    );
+    assert!(!reg.template_holds_split_entry_family("fixture::Node"));
+    assert!(!reg.struct_root_rows_known("fixture::Node<u64,i64>"));
 }
 
 #[test]
@@ -24954,6 +25373,110 @@ fn field_row_declared_gc_and_classed_pointer_is_objectptr() {
         LowLevelType::from(p.ll_ptrtype.clone()),
         *OBJECTPTR,
         "OBJECTPTR ITEM field getattr stays SomePtr(OBJECTPTR), got {s_value:?}"
+    );
+}
+
+/// A classed ITEM pointer field keeps `InstanceRepr`'s base pointer
+/// (`rmodel.py` `externalvsinternal`, `gcref=False`). The field-row
+/// mapper has no dict key/value role: `_setup_repr`'s value-only
+/// `gcref=True` selection belongs at the repr boundary, not in every
+/// declared-GC pointer field. Unclassed GC pointers stay GCREF.
+#[test]
+fn field_row_declared_gc_class_root_pointer_is_objectptr() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget};
+
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let root = "owner::GcClass";
+    let mut reg = crate::front::StructFieldRegistry::default();
+    note_class_identity(&mut reg, root);
+    reg.note_declared_gc_name(root);
+    reg.fields.insert(
+        root.to_string(),
+        vec![("w_class".to_string(), format!("*mut {root}"))],
+    );
+    reg.note_declared_gc_name("owner::GcPlain");
+    reg.fields.insert(
+        "storage::Entry".to_string(),
+        vec![
+            ("key".to_string(), "i64".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), format!("*mut {root}")),
+            ("plain".to_string(), "*mut owner::GcPlain".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+
+    let value = super::field_row_lltype(&reg, &format!("*mut {root}"), &mut field_row_visited())
+        .expect("class-root pointer field");
+    assert_eq!(value, OBJECTPTR.clone());
+
+    let header_root = "pyobject::PyObject";
+    note_class_identity(&mut reg, header_root);
+    reg.note_declared_gc_name(header_root);
+    reg.fields.insert(
+        header_root.to_string(),
+        vec![("ob_type".to_string(), format!("*mut {header_root}"))],
+    );
+    let header_ptr = super::field_row_lltype(
+        &reg,
+        &format!("*mut {header_root}"),
+        &mut field_row_visited(),
+    )
+    .expect("declared-GC header pointer");
+    assert_eq!(header_ptr, OBJECTPTR.clone());
+
+    let plain = super::field_row_lltype(&reg, "*mut owner::GcPlain", &mut field_row_visited())
+        .expect("declared-GC pointer without a class identity");
+    assert_eq!(plain, (*GCREF).clone());
+
+    let gcref_name = "majit_gc::header::GCREFOpaque";
+    note_class_identity(&mut reg, gcref_name);
+    reg.note_declared_gc_name(gcref_name);
+    reg.fields.insert(
+        gcref_name.to_string(),
+        vec![("word".to_string(), "i64".to_string())],
+    );
+    let gcref = super::field_row_lltype(
+        &reg,
+        &format!("*mut {gcref_name}"),
+        &mut field_row_visited(),
+    )
+    .expect("GCREF spelling");
+    assert_eq!(gcref, (*GCREF).clone());
+
+    note_class_identity(&mut reg, "storage::Block");
+    reg.note_declared_gc_name("storage::Block");
+    reg.fields.insert(
+        "storage::Block".to_string(),
+        vec![
+            ("length".to_string(), "usize".to_string()),
+            ("items".to_string(), "[i64; 0]".to_string()),
+        ],
+    );
+    let block = super::field_row_lltype(&reg, "*mut storage::Block", &mut field_row_visited())
+        .expect("GcArray wrapper pointer");
+    assert_eq!(block, (*GCREF).clone());
+
+    let item = format!("storage::Entry<i64,*mut {root}>");
+    let ptr = super::gcarray_item_struct_ptr_lltype(&reg, &item).expect("item pointer");
+    let LowLevelType::Ptr(p) = &ptr else {
+        panic!("item pointer is Ptr, got {ptr:?}");
+    };
+    let PtrTarget::Struct(st) = &p.TO else {
+        panic!("item pointer targets a Struct, got {:?}", p.TO);
+    };
+    assert_eq!(st._name, item);
+    assert_eq!(st._gckind, GcKind::Raw, "ITEM stays a raw Struct");
+    assert_eq!(
+        st.getattr_field_type("value"),
+        Some(OBJECTPTR.clone()),
+        "class-root field keeps the instance base pointer"
+    );
+    assert_eq!(
+        st.getattr_field_type("plain"),
+        Some((*GCREF).clone()),
+        "declared-GC pointee without a class identity stays GCREF"
     );
 }
 

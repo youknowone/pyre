@@ -5081,14 +5081,15 @@ mod tests {
         });
         let args =
             super::super::argument::ArgumentsForTranslation::new(vec![Some(s_inst)], None, None);
-        let err = s_ptr
-            .call(&args)
-            .expect_err("SomePtr.call has no instance arm");
+        let err = s_ptr.call(&args).expect_err(
+            "classdef-less SomeInstance against OBJECTPTR ARGS[i] is annotation_to_lltype",
+        );
         assert!(
             err.msg
-                .unwrap_or_default()
+                .as_deref()
+                .unwrap_or("")
                 .contains("should return a low-level type"),
-            "annotation_to_lltype rejects a high-level instance"
+            "lltype.py SomePtr.call has no SomeInstance arm, got {err:?}"
         );
     }
 

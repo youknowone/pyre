@@ -1272,12 +1272,91 @@ jobs:
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --build=only
     - name: Run pyre/check.py
+      id: pyre-check
       # `--build=no` measures the artefacts the step above built and stamped.
       # Keep the `--backend` list identical to that step's.
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --build=no
+    - name: Trace failed native checks
+      if: ${{ failure() && steps.pyre-check.outcome == 'failure' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+        PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
+        PYRE_CHECK_PROFILE_BACKEND: ${{ matrix.backend }}
+      run: |
+        "${{ steps.cpython.outputs.python-path }}" - <<'PY'
+        import os
+        import platform
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, "pyre")
+        import check
+
+        print(platform.platform(), platform.machine(), platform.processor(), flush=True)
+        for backend in os.environ["PYRE_CHECK_PROFILE_BACKEND"].split(","):
+            binary = str(Path(check.default_binary(backend)).resolve())
+            for name in ("inline_gate_operand_provenance", "exception_residual_raise_caught_in_frame"):
+                print(f"::group::Trace diagnosis: {backend}/{name}", flush=True)
+                subprocess.run(
+                    [binary, f"pyre/bench/synth/{name}.py"],
+                    env={**check.pyre_env(), "PYRE_FBW_DEBUG_ABORT": "1", "MAJIT_GUARD_CENSUS": "1"},
+                    check=True,
+                )
+                print("::endgroup::", flush=True)
+        PY
+    - name: Profile failed Linux native checks
+      if: ${{ failure() && steps.pyre-check.outcome == 'failure' && runner.os == 'Linux' }}
+      continue-on-error: true
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+        PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
+        PYRE_CHECK_PROFILE_BACKEND: ${{ matrix.backend }}
+      run: |
+        # Keep the failed gate and collect evidence from its already-built
+        # binary. Software sampling also works without hardware PMU access.
+        lscpu
+        ${{ steps.cpython.outputs.python-path }} - <<'PY'
+        import glob
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, "pyre")
+        import check
+
+        backend = os.environ["PYRE_CHECK_PROFILE_BACKEND"]
+        binary = str(Path("target/release/pyre-" + backend).resolve())
+        subprocess.run(["sudo", "apt-get", "update", "-qq"], check=True)
+        subprocess.run(["sudo", "apt-get", "install", "-y", "linux-tools-generic"], check=True)
+        subprocess.run(["sudo", "sysctl", "-w", "kernel.perf_event_paranoid=-1"], check=True)
+        perf = sorted(glob.glob("/usr/lib/linux-tools/*/perf"))[-1]
+        for script in ("pyre/bench/fib_recursive.py", "pyre/bench/synth/dict_update_hot.py"):
+            print(f"::group::CPU profile: {script}", flush=True)
+            data = str(Path(os.environ["RUNNER_TEMP"]) / (Path(script).stem + ".perf.data"))
+            subprocess.run(
+                [perf, "record", "-q", "-e", "cpu-clock", "-F", "499", "-o", data,
+                 "--", binary, script],
+                env=check.pyre_env(), check=True,
+            )
+            subprocess.run(
+                [perf, "report", "--stdio", "--no-children", "--sort=symbol",
+                 "--percent-limit=1", "-i", data], check=True,
+            )
+            # Dump once per compilation, outside the sampled run, so an
+            # anonymous JIT hotspot can be matched to its IR and machine code.
+            subprocess.run(
+                [binary, script],
+                env={**check.pyre_env(), "MAJIT_DUMP_CLIF": "1"}, check=True,
+            )
+            print("::endgroup::", flush=True)
+        PY
     - name: Run pyre/extra_tests/parity_tests
       # Every script must exit 0 and print "OK" as its last line under CPython
       # AND under each pyre backend, so a divergence from CPython observable

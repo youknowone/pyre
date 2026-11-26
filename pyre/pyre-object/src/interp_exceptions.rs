@@ -135,7 +135,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
 
 /// Numeric tags for exception kinds — must stay in sync with PyErrorKind.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum ExcKind {
     BaseException = 0,
     Exception = 1,
@@ -1471,7 +1471,9 @@ fn allocate_exception(
     }
 }
 
-#[majit_macros::dont_look_inside]
+/// Residual `ExcKind` is the tag word (`tyref_to_value_type`).
+/// `FieldlessEnumArg` rebuilds it in the trampoline.
+#[majit_macros::dont_look_inside(word_enums(ExcKind))]
 fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     allocate_exception(kind, canonical_exc_class(kind), immortal, false, None)
 }

@@ -8,11 +8,16 @@ use super::*;
 use crate::front::std_identity::is_std_cell_module_path;
 
 impl<'a> Lowering<'a> {
-    /// Wrap class-backed arguments of a stored fn-ptr call the way
-    /// RPython source writes `cast_instance_to_base_ptr` at the call
-    /// site (`annlowlevel.py`). `None` of an instance is still that
-    /// call; `CastObjectToPtrEntry.specialize_call` turns a `NoneRepr`
-    /// argument into `lltype.nullptr(PTR.TO)`.
+    /// Wrap arguments of a stored fn-ptr call the way RPython source
+    /// writes the conversion at the call site (`annlowlevel.py`).
+    ///
+    /// `fn_ptr_tyref_to_lltype` is `FuncType.ARGS[i]` (`lltype.py`
+    /// `SomePtr.call`). `GCREF` is `cast_instance_to_gcref`. `OBJECTPTR`
+    /// of a class-backed pointer is `cast_instance_to_base_ptr`
+    /// (`CastObjectToPtrEntry.specialize_call` turns a `NoneRepr`
+    /// argument into `lltype.nullptr(PTR.TO)`). `STRPTR` is left as the
+    /// argument: `llstr` would cross a value `highlevel_of_ptr_field_annotation`
+    /// already turned into SomeString (`strptr_as_somestring`).
     pub(in crate::front::mir) fn wrap_stored_fn_ptr_call_args(
         &mut self,
         mir_bb: usize,
@@ -20,6 +25,9 @@ impl<'a> Lowering<'a> {
         arg_operands: &[Operand],
         call_arg_tys: &[Option<TyRef>],
     ) -> Vec<Variable> {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
         let bb_id = self.emit_bb(mir_bb);
         let mut wrapped = Vec::with_capacity(args.len());
         for (i, arg) in args.into_iter().enumerate() {
@@ -36,19 +44,40 @@ impl<'a> Lowering<'a> {
                 wrapped.push(arg);
                 continue;
             };
-            if !tyref_is_class_backed_fn_ptr_arg(&ty, self.llbc, self.tombstoned_leaves) {
+            let ll = fn_ptr_tyref_to_lltype(
+                &ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+                self.struct_fields,
+            );
+            if ll == *STRPTR {
                 wrapped.push(arg);
                 continue;
             }
-            wrapped.push(
-                self.graph
-                    .push_op_var(
-                        bb_id,
-                        crate::model::cast_instance_to_base_ptr_call(arg),
-                        true,
-                    )
-                    .expect("cast_instance_to_base_ptr defines a result"),
-            );
+            if ll == *GCREF {
+                let (kind, res) = self.recast_instance_to_gcref(&arg);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind,
+                });
+                wrapped.push(res);
+                continue;
+            }
+            if ll == *OBJECTPTR
+                && tyref_is_class_backed_fn_ptr_arg(&ty, self.llbc, self.tombstoned_leaves)
+            {
+                wrapped.push(
+                    self.graph
+                        .push_op_var(
+                            bb_id,
+                            crate::model::cast_instance_to_base_ptr_call(arg),
+                            true,
+                        )
+                        .expect("cast_instance_to_base_ptr defines a result"),
+                );
+                continue;
+            }
+            wrapped.push(arg);
         }
         wrapped
     }
@@ -2354,6 +2383,18 @@ impl<'a> Lowering<'a> {
                 // their own intercepts later in this match; do not steal
                 // those (the items-base collapse aliases to the header
                 // because the gcarray descr already folds `base_size`).
+                // A `GcArray` item pointer is `InteriorPtrRepr` even when
+                // `json_ty_byte_size` is missing: `rewrite_op_direct_ptradd`
+                // is raw-only and must not stay a residual `<*T>::add`.
+                if let Some(ty) = first_arg_ty.as_ref()
+                    && let Some(res) = self.emit_gcarray_item_ptr_offset(bb_id, &reg, &args, ty)
+                {
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 2
                     && let Some(pointee_size) =
                         self.ptr_add_pointee_size(&reg, first_arg_ty.as_ref())
@@ -2405,6 +2446,47 @@ impl<'a> Lowering<'a> {
                         push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
                     };
                     self.local_var[dest_local] = Some(LocalValue::One(offset));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::ptr::write` of a by-value struct through a `GcArray`
+                // item pointer is one `setinteriorfield` per leaf
+                // (`rptr.py` `InteriorPtrRepr.rtype_setattr`). The address
+                // is not boxed as `Ref` (`jtransform.py`
+                // `rewrite_op_direct_ptradd` is raw-only). A scalar write
+                // stays the `raw_store` arm below.
+                if args.len() == 2
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| self.ty_is_item_pointer(ty))
+                    && self.regular_call_is_ptr_write(&reg)
+                    && let Some(value_ty) = second_arg_ty.as_ref()
+                    && let Some(nested) = tyref_by_value_struct_decl(
+                        value_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
+                    )
+                {
+                    let owner = struct_copy_owner_keys(nested, self.tombstoned_leaves).0;
+                    let item_ty = first_arg_ty
+                        .as_ref()
+                        .expect("item pointer operand has a type");
+                    let words = self.unpack_item_interior(bb_id, args[0].clone(), item_ty);
+                    self.store_by_value_into_item(
+                        bb_id,
+                        &words,
+                        &args[1],
+                        nested,
+                        value_ty,
+                        Some(&owner),
+                        "",
+                    );
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3934,7 +4016,9 @@ impl<'a> Lowering<'a> {
                     // offset, then `cast_int_to_ptr`. An inlined non-GC
                     // item (`rordereddict.py` `DICTENTRY`, `lltype.py`
                     // `Struct`) is the 2-arg form whose constant is
-                    // `Ptr(ITEM)` (`ann_cast_int_to_ptr`). `direct_ptradd`
+                    // `Ptr(FixedSizeArray(ITEM, 1))` (`direct_arrayitems`,
+                    // `_subarray._makeptr`, `ann_cast_int_to_ptr`).
+                    // `direct_ptradd`
                     // is the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
@@ -3989,24 +4073,41 @@ impl<'a> Lowering<'a> {
                     } else if dest_is_ref
                         && let Some((base, offset)) =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
-                        && let Some(root) =
-                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                        && (self.ty_is_item_pointer(&call.dest.ty)
+                            || tyref_class_root_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            )
+                            .is_some())
                     {
                         // `addr_of_mut!((*header).items).cast()` is
-                        // `direct_arrayitems` (`lltype.py`). The inlined
-                        // ITEM (`rordereddict.py` `DICTENTRY`) is
-                        // `Ptr(ITEM)` via the 2-arg `ann_cast_int_to_ptr`,
-                        // even when `instance_narrow_for_type` declines
-                        // the classdef recast. A same-root `.cast()` used
-                        // to alias the FieldRead and leave getattr
-                        // `items` on the array pointer.
-                        let res = self.emit_array_tail_item_ptr(
-                            bb_id,
-                            base,
-                            offset,
-                            &root,
-                            &call.dest.ty,
-                        );
+                        // `direct_arrayitems` (`lltype.py`). A `GcArray`
+                        // item pointer is `InteriorPtrRepr.rtype_getitem`:
+                        // malloc of `GcStruct('Interior', ptr, index)` with
+                        // index 0 (`rptr.py`). `getinteriorfield` adds
+                        // `array_items_base` itself
+                        // (`jtransform.py` `rewrite_op_getinteriorfield`).
+                        // The items byte offset is not stored in the word.
+                        // Any other root stays `emit_array_tail_item_ptr`.
+                        let res = if self.ty_is_item_pointer(&call.dest.ty) {
+                            let zero = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(zero.clone()),
+                                kind: OpKind::ConstInt(0),
+                            });
+                            self.emit_item_interior(bb_id, base, zero, &call.dest.ty)
+                        } else {
+                            let root = tyref_class_root_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            )
+                            .expect("class root checked above");
+                            self.emit_array_tail_item_ptr(bb_id, base, offset, &root, &call.dest.ty)
+                        };
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
@@ -7296,12 +7397,21 @@ impl<'a> Lowering<'a> {
                     .or_else(|| fnptr_field_under_use(self.llbc, self.body, &dyn_operand))
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
+                let fnptr_field = self.fnptr_struct_field_target(&vtable_slot);
                 // A stored `Ptr(FuncType)` call site in RPython writes
-                // `cast_instance_to_base_ptr` in the source
-                // (`annlowlevel.py`), including for a null instance.
-                // Wrap here so `SomePtr.call` sees already-converted
-                // arguments.
-                if indirect.is_none() && (eval_hook_graphs.is_some() || fn_ptr_family.is_some()) {
+                // `cast_instance_to_base_ptr` or `cast_instance_to_gcref`
+                // in the source (`annlowlevel.py`), including for a null
+                // instance. Wrap here so `SomePtr.call` sees
+                // already-converted arguments. A dyn vtable slot
+                // (`indirect`) is `ClassRepr.getclsfield`, not that call.
+                // A harvested field family is SomePBC: rpbc.py
+                // FunctionReprBase.call takes the source-level annotations.
+                // Erasing its instance arguments to OBJECTPTR here would
+                // feed SomePtr into source graphs that accept SomeInstance.
+                if indirect.is_none()
+                    && fnptr_field.is_none()
+                    && (eval_hook_graphs.is_some() || fn_ptr_family.is_some())
+                {
                     args = self.wrap_stored_fn_ptr_call_args(
                         mir_bb,
                         args,
@@ -7404,9 +7514,7 @@ impl<'a> Lowering<'a> {
                         family_key: None,
                         result_ty,
                     }
-                } else if let Some((struct_path, field_name)) =
-                    self.fnptr_struct_field_target(&vtable_slot)
-                {
+                } else if let Some((struct_path, field_name)) = fnptr_field {
                     // `FunctionReprBase.call`: `descs = list(s_pbc.descriptions)`
                     // then `row_of_graphs = callfamily.calltables[shape][index]`;
                     // `vfn = hop.inputarg(self, arg=0)` is the already-loaded

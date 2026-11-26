@@ -1557,6 +1557,60 @@ fn substitute_field_type(
     tyref_to_ast_string(ty, llbc)
 }
 
+/// Entry-row spelling of one `DICTENTRY` field.
+///
+/// [`substitute_field_type`] renders the type argument. When that
+/// argument's `TypeDecl` is `#[repr(transparent)]` and its unique
+/// non-ZST field is a thin `RawPtr`, the field is that pointer
+/// ([`transparent_rawptr_field_spelling`]). `lltype.py` `Ptr` is one
+/// word. A `str` / `[T]` / `dyn` pointee stays the wrapper spelling.
+/// The struct's own name keeps [`render_adt_type_args`]. `rmodel.py`
+/// `externalvsinternal` (`gcref=False`): an instance key's internal
+/// repr is its object pointer. `rordereddict.py` `DICTENTRY` stores
+/// `key` as `DICTKEY`, one field.
+fn entry_substituted_field_type(
+    ty: &TyRef,
+    args: &[String],
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
+    if let Some(spelling) = entry_typevar_transparent_rawptr_spelling(ty, subst, llbc) {
+        return spelling;
+    }
+    substitute_field_type(
+        ty,
+        args,
+        llbc,
+        gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    )
+}
+
+/// `*mut` / `*const` spelling of a type-variable field whose argument is
+/// a transparent thin-`RawPtr` wrapper (`lltype.py` `Ptr`, one word).
+/// A fat pointee (`str`, `[T]`, `dyn`) stays with
+/// [`substitute_field_type`]. A type argument that is already a `RawPtr`
+/// (or an alias of one) stays there too.
+fn entry_typevar_transparent_rawptr_spelling(
+    ty: &TyRef,
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let (prefixes, inner) = pointer_wrapper_spelling_prefixes(node, llbc);
+    let idx = typevar_bound_index(inner)? as usize;
+    let arg = subst.get(idx)?;
+    let arg = strip_ty_indirections(arg, llbc)?;
+    let arg = type_node_peel_aliases(arg, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(arg)?)?;
+    let mut spelling = transparent_rawptr_field_spelling(decl, arg, llbc)?;
+    for prefix in prefixes.iter().rev() {
+        spelling = format!("{prefix}{spelling}");
+    }
+    Some(spelling)
+}
+
 /// Whether a rendered payload type is an unboxed scalar rather than a
 /// one-GC-word heap reference.  The textual descr path resolves a scalar's
 /// bank/width from the row type string via `type_flag_from_str`
@@ -2990,13 +3044,8 @@ fn register_ordereddict_entry_rows(
         let mut concrete = true;
         for (index, field) in fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            let concrete_ty = substitute_field_type(
-                &field.ty,
-                &args,
-                llbc,
-                gc_struct_ids,
-                &std::collections::HashSet::<String>::new(),
-            );
+            let concrete_ty =
+                entry_substituted_field_type(&field.ty, &args, &subst, llbc, gc_struct_ids);
             if concrete_ty.contains("??") {
                 concrete = false;
                 break;
@@ -4832,6 +4881,7 @@ pub(crate) struct SemanticFunctionHeader {
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
     return_is_str: bool,
+    return_interior_type: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     return_container_root: Option<String>,
     return_can_be_none: bool,
     self_ty_root: Option<String>,
@@ -5044,6 +5094,18 @@ impl SemanticFunctionHeader {
             raw_alloc_flavor_structs,
             struct_fields,
         );
+        let return_payload = crate::front::result_exc::result_exc_projected_ok(
+            &signature.output,
+            llbc,
+            error_carrier,
+        );
+        let return_interior_type = gcarray_item_pointer_concretetype(
+            return_payload.as_ref().unwrap_or(&signature.output),
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            struct_fields,
+        );
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
             llbc,
@@ -5077,6 +5139,7 @@ impl SemanticFunctionHeader {
             residual_return_type,
             return_class_root,
             return_is_str,
+            return_interior_type,
             return_container_root,
             return_can_be_none,
             self_ty_root,
@@ -5141,6 +5204,7 @@ impl SemanticFunctionHeader {
             residual_return_type: self.residual_return_type.clone(),
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
+            return_interior_type: self.return_interior_type.clone(),
             return_container_root: self.return_container_root.clone(),
             return_can_be_none: self.return_can_be_none,
         }
@@ -5232,6 +5296,7 @@ pub(crate) struct GraphStamp {
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
     return_is_str: bool,
+    return_interior_type: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     return_container_root: Option<String>,
     return_can_be_none: bool,
 }
@@ -5262,6 +5327,11 @@ impl GraphStamp {
         graph.residual_return_type = self.residual_return_type.clone();
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
+        if let Some(ty) = &self.return_interior_type
+            && let Some(var) = graph.block(graph.returnblock).inputargs.first()
+        {
+            var.set_concretetype(Some(ty.clone()));
+        }
         graph.return_container_root = self.return_container_root.clone();
         graph.return_can_be_none = self.return_can_be_none;
         graph
@@ -5758,6 +5828,13 @@ fn published_struct_field_layout(
         // `*mut u8` stays on the Ref fallback for GCREF / STR producers
         // (`raw_thin_pointer_spelling`).
         "*const u8".to_string()
+    } else if let Some(spelling) =
+        closure_env_shared_primitive_layout_spelling(owner_is_closure_env, field_ty, llbc)
+    {
+        // Shared `&P` capture. Same scalar [`adt_field_read_value_type`]
+        // reads (`getfield_gc_i`). `get_type_flag` of `&P` is FLAG_POINTER,
+        // which makes `do_setfield_gc` refuse the int store.
+        spelling
     } else {
         // `FloatArray.block` / `IntArray.block` stay `*mut TypedItemsBlock`.
         // That spelling projects as `SomePtr(GcArray(ITEM))` of the
@@ -9494,6 +9571,18 @@ pub struct LowerContext<'a> {
     /// Structs and enums declared Gc across this one artefact.
     /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// `record_struct_id` class objects. `StructFieldRegistry` keeps
+    /// `RefCell` query caches, so it is not `Sync`; the field rows live
+    /// in [`Self::struct_fields`] and this map is copied onto the
+    /// registry [`lower_fun_decl`] rebuilds. `spelling_has_class_identity`
+    /// and `struct_root_template_is_gcarray_item` read it (`lltype.py`
+    /// `GcArray` ITEM, `rclass.OBJECTPTR`).
+    class_identity:
+        std::collections::HashMap<String, Option<crate::front::semantic::ClassIdentity>>,
+    /// Declared-GC spellings after `note_declared_gc_owner` (harvest
+    /// seeds plus each declaration path). Same registry copy as
+    /// [`Self::class_identity`].
+    registry_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -9553,6 +9642,8 @@ impl<'a> LowerContext<'a> {
         // Same cell-instantiation pass [`CrateLoweringState::new`] runs
         // after the artefact's tombstone set is final.
         register_std_cell_instantiation_rows(llbc, &mut struct_fields, &tombstoned_leaves);
+        let class_identity = struct_fields.class_identity.clone();
+        let registry_gc_struct_ids = struct_fields.gc_struct_ids.clone();
         Self {
             llbc,
             struct_field_attrs,
@@ -9564,6 +9655,8 @@ impl<'a> LowerContext<'a> {
             )),
             tombstoned_leaves,
             gc_struct_ids,
+            class_identity,
+            registry_gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,
             gc_root_effects: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -9593,10 +9686,7 @@ impl<'a> LowerContext<'a> {
     /// `CallControl` so `fielddescrof` can `getattr` the names the
     /// lowering emitted (`descr.py get_field_descr`).
     pub fn struct_field_registry(&self) -> crate::front::semantic::StructFieldRegistry {
-        let mut registry =
-            struct_field_registry_from_rows(&self.struct_fields, &self.foreign_callables);
-        registry.gc_struct_ids = self.gc_struct_ids.clone();
-        registry
+        lowering_struct_field_registry(self)
     }
 
     /// Record body-carrying FunDecls from another loaded crate so an
@@ -9626,6 +9716,20 @@ fn struct_field_registry_from_rows(
         foreign_callables: foreign_callables.to_vec(),
         ..Default::default()
     }
+}
+
+/// Field rows plus the class-identity and declared-GC maps
+/// [`LowerContext`] kept off the `RefCell` registry. One copy per
+/// lowering, not per field (`struct_root_template_is_gcarray_item`,
+/// `spelling_has_class_identity`).
+fn lowering_struct_field_registry(
+    context: &LowerContext<'_>,
+) -> crate::front::semantic::StructFieldRegistry {
+    let mut registry =
+        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
+    registry.class_identity = context.class_identity.clone();
+    registry.gc_struct_ids = context.registry_gc_struct_ids.clone();
+    registry
 }
 
 pub fn lower_fun_decl_with_static_addrs(
@@ -9662,8 +9766,7 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
-    let struct_fields =
-        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
+    let struct_fields = lowering_struct_field_registry(context);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -10005,14 +10108,16 @@ pub use self::gcroot::{
     harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
     scope_owner_identity,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::gcarray_item_struct_ptr_lltype;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_fun_decl_identity_aliases,
     collect_policy_opaque_fn_stubs_from_llbc, entry_family_is_entry_path, entry_family_name_path,
-    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation,
-    gcarray_item_struct_ptr_lltype, host_rthread_threadlocalref_llop,
+    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_direct_arrayitems_ptr_lltype,
+    gcarray_item_struct_ptr_annotation, host_rthread_threadlocalref_llop,
     impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
     is_flattened_storage_leaf, is_mut_ref_cell_name, is_niche_option_gc_payload_spelling,
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
@@ -10021,8 +10126,8 @@ pub(crate) use self::lltype::{
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    struct_item_flexible_gcarray_block_annotation, type_arg_is_concrete, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -10297,6 +10402,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             raw_alloc_flavor_structs,
             Some(struct_fields),
         );
+        let return_payload = crate::front::result_exc::result_exc_projected_ok(
+            output,
+            llbc,
+            static_addrs.error_carrier,
+        );
+        if let Some(ty) = gcarray_item_pointer_concretetype(
+            return_payload.as_ref().unwrap_or(output),
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            Some(struct_fields),
+        ) && let Some(var) = lo.graph.block(lo.graph.returnblock).inputargs.first()
+        {
+            var.set_concretetype(Some(ty));
+        }
         lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
             output,
             llbc,

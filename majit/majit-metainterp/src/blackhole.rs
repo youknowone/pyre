@@ -14148,20 +14148,25 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`:
+/// `i = lltype.cast_ptr_to_int(a)` then `ll_assert((i & 1) == 1)`.
+/// After translation that `lltype` call is a C cast (`funcgen.py`
+/// `OP_CAST_PTR_TO_INT`) and `ll_assert` is `debug_assert`
+/// (`rtyper/debug.py`). `warmspot.py` `prejit_optimizations` translates
+/// the JIT with `really_remove_asserts=True`, so
+/// `removenoops.remove_debug_assert` drops the check. The compiled
+/// opcode is `_genop_same_as` (`assembler.py` `genop_cast_ptr_to_int`).
+/// The result is identity on the pointer word, including an even GCREF
+/// (`direct_arrayitems` as `cast_ptr_to_int` + add).
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`: `ll_assert` then
+/// `lltype.cast_int_to_ptr(llmemory.GCREF, i)`. Same
+/// `really_remove_asserts` / `_genop_same_as` identity as
+/// `bhimpl_cast_ptr_to_int`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

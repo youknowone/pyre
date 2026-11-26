@@ -4017,50 +4017,117 @@ pub fn make_builtin_type_with_metatype(
     )
 }
 
-/// `intobject.py W_IntObject.descr_new` → `_new_int` → `_new_baseint` for
-/// `int(x)` of the exact `int` type with no base.
+/// `intobject.py` `_new_baseint` for the shapes this trace records.
 ///
-/// The body is this leaf so `BuiltinCode.func` joins the wrapper family, as
-/// [`__majit_wrap_bool_descr_new`] does.  `_new_baseint`'s first arm returns
-/// an exact `int` argument itself; an exact `float` whose truncation fits a
-/// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
-/// `newint_from_float`).  An exact `str` takes the unicode arm
-/// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
-/// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
-/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
-/// arms are not graphs inside this one.
-pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[1].is_null() {
-        let int_type = gettypeobject(&pyre_object::INT_TYPE);
-        if std::ptr::eq(args[0], int_type) {
-            let w_value = args[1];
-            // intobject.py `_new_baseint`:
-            // `space.is_w(space.type(w_value), space.w_int)`.
-            let w_type = r#type(w_value);
-            if w_type.is_some() && w_type == gettypefor(&pyre_object::INT_TYPE) {
-                return Ok(w_value);
-            }
-            if unsafe { pyre_object::is_exact_builtin_instance_nonnull(w_value) }
-                && unsafe { pyre_object::is_float(w_value) }
-            {
-                // `ovfcheck_float_to_int`'s range: `2**63` is exact in a
-                // double while `i64::MAX` is not, so the upper bound is
-                // strict.  NaN fails both tests.
-                let x = unsafe { pyre_object::w_float_get_value(w_value) };
-                if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
-                    return crate::objspace::descroperation::_int_from_trunc(x);
-                }
-            }
-            // intobject.py `_new_baseint`:
-            // `space.isinstance_w(w_value, space.w_unicode)`, restricted
-            // here to the exact `str` type so a subclass `__int__` /
-            // `__index__` / `__repr__` is not skipped.
-            if w_type.is_some() && w_type == gettypefor(&pyre_object::STR_TYPE) {
-                return crate::builtins::_string_to_int_or_long_unicode(w_value);
-            }
+/// An exact `int` is returned as itself (`space.is_w(space.type(w_value),
+/// space.w_int)`). An exact `float` whose truncation fits a machine Signed
+/// takes `float.__int__` (`floatobject.py descr_trunc`, `newint_from_float`);
+/// `ovfcheck_float_to_int`'s range keeps the upper bound strict because
+/// `2**63` is exact in a double while `i64::MAX` is not, and NaN fails both
+/// tests. An exact `str` takes the unicode arm (`unicode_to_decimal_w` then
+/// `_string_to_int_or_long`), and not a `str` subclass, so that subclass's
+/// `__int__` / `__index__` / `__repr__` is not skipped.
+///
+/// `Ok(None)` is every other argument: the caller stays on [`int_descr_new`].
+/// `Err` is a bad literal and propagates.
+fn _new_baseint(w_value: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let w_type = r#type(w_value);
+    if w_type.is_some() && w_type == gettypefor(&pyre_object::INT_TYPE) {
+        return Ok(Some(w_value));
+    }
+    if unsafe { pyre_object::is_exact_builtin_instance_nonnull(w_value) }
+        && unsafe { pyre_object::is_float(w_value) }
+    {
+        let x = unsafe { pyre_object::w_float_get_value(w_value) };
+        if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+            return Ok(Some(crate::objspace::descroperation::_int_from_trunc(x)?));
         }
     }
-    int_descr_new(args)
+    if w_type.is_some() && w_type == gettypefor(&pyre_object::STR_TYPE) {
+        return Ok(Some(crate::builtins::_string_to_int_or_long_unicode(
+            w_value,
+        )?));
+    }
+    Ok(None)
+}
+
+/// `intobject.py` `_as_subint`.
+///
+/// `type(w_value) is W_IntObject` is `allocate_instance(W_IntObject,
+/// w_inttype)` plus `W_IntObject.__init__(w_obj, w_value.intval)`. A
+/// magnitude that does not fit a machine Signed is `type(w_value) is
+/// W_LongObject`: `newbigint(space, w_inttype, w_value.num)`, the
+/// `W_LongObjectUser` layout from `typedef.py` `_getusercls`, sharing the
+/// immutable rbigint payload. [`tag_subclass_instance`] is
+/// `allocate_instance`'s `user_setup` and the finalizer registration.
+///
+/// `cls` is still live for [`tag_subclass_instance`] after the nursery
+/// allocation (`w_int_subclass_new` / `w_long_subclass_from_raw`), which is
+/// `allocate_instance`'s `instantiate` before `user_setup`.
+fn _as_subint(
+    mut cls: PyObjectRef,
+    mut w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = pyre_object::with_roots!(cls, w_value => {
+        if unsafe { pyre_object::is_long(w_value) } {
+            unsafe {
+                pyre_object::longobject::w_long_subclass_from_raw(
+                    pyre_object::longobject::w_long_get_raw_value(w_value),
+                )
+            }
+        } else {
+            let int_val = unsafe { pyre_object::w_int_get_value(w_value) };
+            pyre_object::intobject::w_int_subclass_new(int_val)
+        }
+    });
+    // ExceptionTransformer.gen_exc_check: keep the allocation's null test
+    // in this leaf, before allocate_instance's user_setup writes fields.
+    if obj.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    Ok(tag_subclass_instance(obj, cls))
+}
+
+/// `intobject.py W_IntObject.descr_new` → `_new_int`.
+///
+/// The body is this leaf so `BuiltinCode.func` joins the wrapper family, as
+/// [`__majit_wrap_bool_descr_new`] does. `_new_int` returns [`_new_baseint`]
+/// when `w_inttype is space.w_int`. Otherwise, after the same
+/// [`check_user_subclass`] [`int_descr_new`] runs, it builds that temporary
+/// and returns [`_as_subint`]. No argument, a base, and every argument
+/// [`_new_baseint`] does not record stay on [`int_descr_new`], which is
+/// `dont_look_inside` so the `__int__` / `__index__` / `__repr__` arms are
+/// not graphs inside this one.
+pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Copy the two words off the slice before `_new_baseint`. That call
+    // reaches `_string_to_int_or_long` (`can collect`). Leaving `args` live
+    // for the [`int_descr_new`] fallthrough makes the exact-`int` arm an
+    // unbracketed collecting call and the subclass arm a bracket that pins
+    // `cls` but not the slice.
+    if args.len() != 2 || args[1].is_null() {
+        return int_descr_new(args);
+    }
+    let int_type = gettypeobject(&pyre_object::INT_TYPE);
+    let mut cls = args[0];
+    let mut w_value = args[1];
+    if std::ptr::eq(cls, int_type) {
+        let result = pyre_object::with_roots!(cls, w_value => _new_baseint(w_value))?;
+        if let Some(result) = result {
+            return Ok(result);
+        }
+    } else {
+        // `int_descr_new` refuses a non-subtype before `builtin_int`.
+        // Same check here, before `_new_baseint`, so a non-subtype does not
+        // reach the user-layout alloc. Both words stay live across it.
+        pyre_object::with_roots!(cls, w_value => check_user_subclass(int_type, cls))?;
+        // `cls` is live for `_as_subint`, and `w_value` is live for the
+        // fallthrough, across `_new_baseint`.
+        let w_tmp = pyre_object::with_roots!(cls, w_value => _new_baseint(w_value))?;
+        if let Some(w_tmp) = w_tmp {
+            return _as_subint(cls, w_tmp);
+        }
+    }
+    int_descr_new(&[cls, w_value])
 }
 
 crate::builtin_wrapper_descriptor!(
@@ -4080,29 +4147,12 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_int = gettypeobject(&pyre_object::INT_TYPE);
     check_user_subclass(w_int, cls)?;
     let value = pyre_object::with_roots!(cls => crate::builtins::builtin_int(&args[1..]))?;
-    // If cls is int itself, return a plain int.
+    // `_new_int`: `w_inttype is space.w_int` returns the base int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
-    // cls is a subclass of int. Create a unique instance (bypassing the
-    // small-int cache so each has its own identity). Set w_class = cls so
-    // type()/isinstance() see the subclass while preserving the underlying
-    // int/long storage layout for arithmetic. A magnitude that overflows
-    // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
-    // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
-    // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
-    let obj = if unsafe { pyre_object::is_long(value) } {
-        unsafe {
-            pyre_object::longobject::w_long_subclass_from_raw(
-                pyre_object::longobject::w_long_get_raw_value(value),
-            )
-        }
-    } else {
-        let int_val = unsafe { pyre_object::w_int_get_value(value) };
-        pyre_object::intobject::w_int_subclass_new(int_val)
-    };
-    Ok(tag_subclass_instance(obj, cls))
+    _as_subint(cls, value)
 }
 
 /// `float.__new__(cls, *args)` — PyPy: floatobject.py descr__new__.
@@ -7093,9 +7143,10 @@ pub(crate) fn check_new_subtype(
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());
     }
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub = !mro_ptr.is_null()
-        && unsafe { crate::baseobjspace::mro_contains((*mro_ptr).as_slice(), w_self) };
+    // `typeobject.py _issubtype` when `hasmro`: this check uses only the
+    // installed MRO. Keep the existing subtype scan boundary without
+    // admitting `_issubtype_slow_and_wrong` and its tuple re-boxing path.
+    let is_sub = unsafe { pyre_object::w_type_mro_contains(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
@@ -39716,6 +39767,39 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int_subclass_failed_allocation_propagates_memory_error_before_user_setup() {
+        let _ctx = crate::PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        fn occurred() -> bool {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get() != 0)
+        }
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                majit_gc::set_active_exception_occurred(None);
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+            }
+        }
+        let _restore = Restore;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls = super::gettypeobject(&pyre_object::INT_TYPE);
+        let small = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(17));
+        let large =
+            pyre_object::gc_roots::pin_root(pyre_object::longobject::w_long_from_i64(i64::MAX));
+        let singleton = pyre_object::interp_exceptions::memory_error_singleton();
+        for value in [small, large] {
+            // The failed GC allocation leaves its prebuilt exception pending;
+            // malloc_typed_managed must return NULL rather than use raw malloc.
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(singleton as i64));
+            majit_gc::set_active_exception_occurred(Some(occurred));
+            let error = super::_as_subint(cls, value)
+                .expect_err("a failed int or long subclass allocation must not run user_setup");
+            assert!(matches!(error.kind, crate::PyErrorKind::MemoryError));
+            assert!(!majit_gc::gc_alloc_failed_pending());
+        }
+    }
+
     #[test]
     fn object_user_layout_splits_exact_object_from_user_instances() {
         use pyre_object::*;

@@ -2850,6 +2850,18 @@ pub fn cast_instance_to_base_ptr_call(operand: crate::flowspace::model::Variable
     }
 }
 
+/// `llstr(s)` (`annlowlevel.py` `LLStrEntry`).
+///
+/// A store into a `STRPTR` item field emits this before `setfield`,
+/// so `SomePtr.setattr` sees `SomePtr(Ptr(STR))`.
+pub fn llstr_call(operand: crate::flowspace::model::Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::function_path(["rpython", "rtyper", "annlowlevel", "llstr"]),
+        args: call_args(vec![operand]),
+        result_ty: ValueType::Ref(None),
+    }
+}
+
 /// `cast_pointer(PTRTYPE, ptr)` marker (`lltype.py cast_pointer`).
 /// The target class is a trailing `ByteStr` Constant; the adapter
 /// interns it through the bookkeeper.

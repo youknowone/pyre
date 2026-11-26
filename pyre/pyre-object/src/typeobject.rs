@@ -1861,11 +1861,39 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::Fixe
     (*(obj as *const W_TypeObject)).mro_w
 }
 
-/// True when `cls` occurs in `w_type`'s MRO — the pointer-identity subtype
-/// membership scan `W_TypeObject.issubtype` / `_issubtype` performs
-/// (typeobject.py:603/1640).  The single home for the MRO subtype check;
-/// interpreter-level subtype guards and reflected-binop dispatch delegate
-/// here rather than each re-scanning the MRO.
+/// True when `cls` occurs in `w_type`'s installed MRO.
+///
+/// `typeobject.py` `_issubtype` when `hasmro` is true (`w_type in
+/// w_sub.mro_w`). A null `mro_w` is false. `_issubtype_slow_and_wrong`
+/// (`find_best_base`) stays in [`w_type_issubtype`] and is not this scan,
+/// so a caller that has already rejected a missing MRO does not reach that
+/// walk's tuple copy. `dont_look_inside`: `issubtype` runs the scan inside
+/// `_pure_issubtype` (`@elidable_promote`), and the trace residualises the
+/// call instead of walking the MRO.
+#[majit_macros::dont_look_inside]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_mro_contains(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    let mro_ptr = w_type_get_mro(w_type);
+    if mro_ptr.is_null() {
+        return false;
+    }
+    let items = (*mro_ptr).as_slice();
+    let mut i = 0;
+    while i < items.len() {
+        if std::ptr::eq(items[i], cls) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `cls` occurs in `w_type`'s MRO — `W_TypeObject.issubtype` /
+/// `_issubtype` (typeobject.py). The installed-MRO arm is
+/// [`w_type_mro_contains`]; a type whose MRO is not installed yet takes
+/// `_issubtype_slow_and_wrong`.
 ///
 /// Under the JIT `issubtype` runs this scan inside `_pure_issubtype`
 /// (`@elidable_promote`, typeobject.py:1657), so the MRO membership walk
@@ -1892,7 +1920,7 @@ pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
         }
         return false;
     }
-    (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls))
+    w_type_mro_contains(w_type, cls)
 }
 
 /// Whether a class pattern with one positional sub-pattern receives the

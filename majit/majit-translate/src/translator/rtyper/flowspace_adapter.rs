@@ -3844,6 +3844,30 @@ pub fn translate_op(
         // forces the struct's field rows to be projected so the trailing
         // payload `FieldWrite(result, …)` resolves.
         OpKind::New { owner, .. } | OpKind::NewWithVtable { owner, .. } => {
+            // `rptr.py` `InteriorPtrRepr.rtype_getitem` allocates a low-level
+            // GcStruct, not an instance of a shared class named Interior.
+            // Its parent pointer is part of the TYPE (`lltype.py`
+            // `Ptr._interior_ptr_type_with_index`). Keep ann_malloc's
+            // SomePtr so unrelated entry arrays cannot union at `ptr`.
+            if let Some(LowLevelType::Ptr(ptr)) = op.result.as_ref().and_then(|v| v.concretetype())
+                && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) =
+                    ptr.TO
+                && st._hints.get("interior_ptr_type") == Some(&ConstValue::Bool(true))
+            {
+                let ty = LowLevelType::Struct(Box::new(st));
+                let result = resolve_result_hlvalue(op, value_map)?;
+                seed_malloc_result_annotation(&result, ty.clone());
+                let mut flags = indexmap::IndexMap::new();
+                flags.insert(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"));
+                return Ok(vec![FlowspaceOp::new(
+                    "malloc",
+                    vec![
+                        Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(ty)))),
+                        Hlvalue::Constant(Constant::new(ConstValue::Dict(flags.into()))),
+                    ],
+                    result,
+                )]);
+            }
             let bk = call_registry.bookkeeper();
             bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
                 TyperError::message(format!(
@@ -4049,6 +4073,76 @@ pub fn translate_op(
         } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
+            if field.taken_by_address
+                && field.owner_declared_gc == Some(false)
+                && *ty == crate::model::ValueType::Int
+            {
+                // `llmemory.cast_ptr_to_adr` plus `offsetof`: a raw slot
+                // borrow names storage, not the current field value.
+                // The byte offset comes from the same layout as codewriter
+                // `rewrite_op_getsubstruct`, including a GC owner's raw cell.
+                let owner = field
+                    .owner_root
+                    .as_deref()
+                    .ok_or_else(|| TyperError::message("field address without an owner"))?;
+                let sid = field
+                    .owner_id
+                    .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(owner));
+                let offset = call_registry
+                    .bookkeeper()
+                    .struct_layouts
+                    .borrow()
+                    .as_ref()
+                    .and_then(|layouts| layouts.borrow().get(&sid).cloned())
+                    .and_then(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|f| f.name == field.name)
+                            .map(|f| f.offset)
+                    })
+                    .ok_or_else(|| {
+                        TyperError::message(format!(
+                            "field address missing layout: {owner}.{}",
+                            field.name
+                        ))
+                    })?;
+                let mut ops = Vec::new();
+                let address = if base
+                    .concretetype()
+                    .as_ref()
+                    .map(crate::model::getkind)
+                    .unwrap_or(crate::model::ConcreteType::GcRef)
+                    == crate::model::ConcreteType::GcRef
+                {
+                    let callable = HOST_ENV
+                        .import_module("rpython.rtyper.lltypesystem.lltype")
+                        .and_then(|m| m.module_get("cast_ptr_to_int"))
+                        .ok_or_else(|| TyperError::message("lltype.cast_ptr_to_int missing"))?;
+                    let address = Hlvalue::Variable(Variable::new());
+                    ops.push(FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable))),
+                            base_hl,
+                        ],
+                        address.clone(),
+                    ));
+                    address
+                } else {
+                    base_hl
+                };
+                seed_raw_item_annotation(&result, LowLevelType::Signed);
+                ops.push(FlowspaceOp::new(
+                    "add",
+                    vec![
+                        address,
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(offset as i64))),
+                    ],
+                    result,
+                ));
+                return Ok(ops);
+            }
             // `retarget_vec_operand` reuses this FieldRead's result as the
             // length word (`ValueType::Int`). A bare `getattr` of the Vec
             // field is the list pointer (`SomeList` → `Ptr(GcStruct)` →
@@ -6281,6 +6375,20 @@ pub(crate) fn derive_subject_inputcells(
         // richer `PyObjectRef`/W_Root class_root: that stale slot is an input
         // from the transitional walker, not an RPython annotation source.
         if let Some(&(ty, class_root)) = input_by_result.get(var) {
+            // The frontend has already lowered this source reference using
+            // rptr.py InteriorPtrRepr. Its per-parent TYPE is authoritative.
+            if let Some(LowLevelType::Ptr(ptr)) = var.concretetype()
+                && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) =
+                    &ptr.TO
+                && st._hints.get("interior_ptr_type") == Some(&ConstValue::Bool(true))
+            {
+                cells.push(
+                    crate::translator::rtyper::llannotation::lltype_to_annotation(
+                        LowLevelType::Ptr(ptr),
+                    ),
+                );
+                continue;
+            }
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -11454,6 +11562,136 @@ mod tests {
             Some(SomeValue::None_(_)) => {}
             other => panic!("RawStore must seed s_None, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_op_raw_field_borrow_uses_native_slot_offset() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind};
+        let registry = empty_call_registry();
+        let owner = "BorrowedCell";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "slot".into(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        registry
+            .bookkeeper()
+            .set_struct_layouts(cc.struct_layouts_handle());
+        let mut graph = LegacyGraph::new("borrow_slot");
+        let vars = mint_vars(&mut graph, 2);
+        vars[0].set_concretetype(Some(GCREF.clone()));
+        let mut value_map = HashMap::new();
+        for var in &vars {
+            value_map.insert(var.clone(), Hlvalue::Variable(Variable::new()));
+        }
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[0].clone(),
+                field: crate::model::FieldDescriptor::new("slot", Some(owner.into()))
+                    .with_owner_id(Some(sid))
+                    .with_owner_declared_gc(Some(false))
+                    .with_taken_by_address(true),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let lowered = translate_op(&op, &value_map, &registry).expect("slot address");
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|o| o.opname.as_str())
+                .collect::<Vec<_>>(),
+            ["simple_call", "add"]
+        );
+        assert!(
+            matches!(&lowered[1].args[1], Hlvalue::Constant(c) if c.value == ConstValue::Int(8))
+        );
+        let Hlvalue::Variable(result) = &lowered[1].result else {
+            panic!("address result")
+        };
+        assert!(matches!(
+            result.annotation.borrow().as_deref(),
+            Some(SomeValue::Integer(_))
+        ));
+    }
+
+    #[test]
+    fn translate_op_interior_malloc_keeps_each_parent_array_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget, Struct};
+        let registry = empty_call_registry();
+        let mut graph = LegacyGraph::new("interior_parents");
+        let vars = mint_vars(&mut graph, 2);
+        let mut value_map = HashMap::new();
+        let mut pointers = Vec::new();
+        for (var, name) in vars.iter().zip(["EntryA", "EntryB"]) {
+            let item = LowLevelType::Struct(Box::new(Struct::new(
+                name,
+                vec![("value".to_string(), LowLevelType::Signed)],
+            )));
+            let parent = Ptr {
+                TO: PtrTarget::Array(Array::gc(item.clone())),
+            };
+            let interior = parent._interior_ptr_type_with_index(&item);
+            var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(interior.clone()),
+            }))));
+            value_map.insert(var.clone(), Hlvalue::Variable(Variable::new()));
+            let op = SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::New {
+                    owner: "Interior".to_string(),
+                    owner_id: None,
+                },
+            };
+            let lowered = translate_op(&op, &value_map, &registry).expect("Interior malloc");
+            assert_eq!(lowered[0].opname, "malloc");
+            let Hlvalue::Variable(result) = &lowered[0].result else {
+                panic!("malloc result")
+            };
+            let Some(SomeValue::Ptr(ptr)) =
+                result.annotation.borrow().as_ref().map(|s| (**s).clone())
+            else {
+                panic!("Interior must be SomePtr, not a shared SomeInstance");
+            };
+            assert_eq!(ptr.ll_ptrtype.TO, PtrTarget::Struct(interior));
+            let mut signature = LegacyGraph::new("interior_input");
+            let start = signature.startblock;
+            signature.block_mut(start).inputargs.push(var.clone());
+            signature.block_mut(start).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Input {
+                    name: "item".into(),
+                    ty: crate::model::ValueType::Ref(None),
+                    class_root: None,
+                    param: None,
+                },
+            });
+            let cells = derive_subject_inputcells(&signature, None).expect("typed input");
+            assert_eq!(cells, vec![SomeValue::Ptr(ptr.clone())]);
+            pointers.push(ptr.ll_ptrtype);
+        }
+        assert_ne!(
+            pointers[0], pointers[1],
+            "each parent array owns its Interior type"
+        );
     }
 
     #[test]

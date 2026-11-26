@@ -25763,7 +25763,7 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
 /// Python `__buffer__` / C exporter without swallowing a real error (a
 /// released or strided memoryview).
 pub unsafe fn try_acquire_readbuf<'a>(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
 ) -> Result<Option<&'a [u8]>, crate::PyError> {
     unsafe {
         if let Some(hooks) = crate::importing::optional_module_hooks()
@@ -25787,8 +25787,13 @@ pub unsafe fn try_acquire_readbuf<'a>(
             return Ok(Some(pyre_object::interp_array::w_array_bytes(obj)));
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
-            memoryview_check_released(obj)?;
-            if !memoryview_contiguity(obj).0 {
+            // `memoryview_check_released` builds `PyError::value_error`
+            // (`make_pyerror`) and `BufferView::offset` is the same class of
+            // host allocator. `obj` is still live for the window below.
+            // `external_buffer_view` above is an unresolved fn-pointer call,
+            // so the bracket stays on the call that can allocate.
+            pyre_object::with_roots!(obj => memoryview_check_released(obj))?;
+            if !pyre_object::with_roots!(obj => memoryview_contiguity(obj)).0 {
                 // `PyBUF_SIMPLE` asks for the bytes in address order, and a
                 // strided view cannot hand them over without copying, so the
                 // request is refused rather than answered with the wrong ones.
@@ -25797,9 +25802,12 @@ pub unsafe fn try_acquire_readbuf<'a>(
                     "memoryview: underlying buffer is not C-contiguous",
                 ));
             }
+            let off = {
+                let view = pyre_object::memoryview::w_memoryview_view(obj);
+                pyre_object::with_roots!(obj => view.offset()) as usize
+            };
             let view = pyre_object::memoryview::w_memoryview_view(obj);
             let full = view.backing().as_bytes();
-            let off = view.offset() as usize;
             let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
             if off <= full.len() && len <= full.len() - off {
                 return Ok(Some(&full[off..off + len]));
@@ -25856,16 +25864,19 @@ unsafe fn is_c_or_ctypes_buffer_exporter(obj: PyObjectRef) -> bool {
 
 /// `check_buf_flags` / `W_BytesObject.buffer_w`: a writable request against
 /// read-only storage is `BufferError: Object is not writable.`
-unsafe fn native_buffer_readonly(obj: PyObjectRef) -> bool {
+unsafe fn native_buffer_readonly(mut obj: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
             return pyre_object::memoryview::w_memoryview_readonly(obj);
         }
+        // `isinstance_w` walks the MRO. `obj` is live for the exporter
+        // check below. `external_buffer_view` is an unresolved fn-pointer
+        // call, so this bracket is not a root around a closed leaf.
+        let mut bytes_type = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
         if pyre_object::bytesobject::is_bytes(obj)
-            || crate::baseobjspace::isinstance_w(
-                obj,
-                crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
-            )
+            || pyre_object::with_roots!(obj, bytes_type => {
+                crate::baseobjspace::isinstance_w(obj, bytes_type)
+            })
         {
             return true;
         }
@@ -25917,8 +25928,11 @@ impl ReadableBuffer {
         flags: i32,
     ) -> Result<Self, crate::PyError> {
         unsafe {
+            // The exporter is already pinned in `obj_slot`. Reload after
+            // `memoryview_check_released` (`make_pyerror` on the released
+            // path) instead of holding `r_obj` across it.
+            memoryview_check_released(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            memoryview_check_released(r_obj)?;
             if flags & BUF_WRITABLE == BUF_WRITABLE
                 && pyre_object::memoryview::w_memoryview_readonly(r_obj)
             {
@@ -25967,13 +25981,17 @@ impl ReadableBuffer {
             }
             let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if try_acquire_readbuf(r_obj)?.is_some() {
-                let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                if want_write && native_buffer_readonly(r_obj) {
+                // `native_buffer_readonly` calls `isinstance_w`. The pin is
+                // `obj_slot`; reload it afterwards for `buffer_export_incref`.
+                if want_write
+                    && native_buffer_readonly(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+                {
                     return Err(crate::PyError::new(
                         crate::PyErrorKind::BufferError,
                         "Object is not writable.",
                     ));
                 }
+                let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let held = buffer_export_incref(r_obj);
                 return Ok(Self {
                     owner_slot: obj_slot,
@@ -26037,9 +26055,10 @@ impl ReadableBuffer {
         let view = w_memoryview_new_with_flags(obj, flags)?;
         let _ = pyre_object::gc_roots::pin_root(view);
         let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
-        if !memoryview_contiguity(r_view).0 {
-            let mut view = r_view;
+        // `memoryview_contiguity` reads shape storage that can allocate.
+        // The view is pinned in `view_slot`; do not hold a copy across it.
+        if !memoryview_contiguity(pyre_object::gc_roots::shadow_stack_get(view_slot)).0 {
+            let mut view = pyre_object::gc_roots::shadow_stack_get(view_slot);
             if let Err(mut error) = pyre_object::with_roots!(view => memoryview_release(&[view])) {
                 error.write_unraisable_with_traceback(
                     pyre_object::w_none(),

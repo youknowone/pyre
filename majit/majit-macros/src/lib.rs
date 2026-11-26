@@ -1188,6 +1188,27 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
     if is_version_tag_type(ty) {
         return Some(quote! { #ty((#arg_ident) as u64) });
     }
+    // A by-value `Vec` of one-word items is one int: the header address
+    // (`RustVecRepr`, `header_words_match_the_host_vec`).
+    // `helper_return_to_i64` writes the `Vec` into a
+    // `raw_malloc_varsize_char` header. A move does not emit `ll_vec_free`
+    // (`emit_rust_vec_drop_if_allocated`); `ll_vec_free_buffer` would also
+    // free the buffer the `Vec` still owns. `ptr::read` is the inverse of
+    // that write, then `raw_free` releases only the shell. Null is an empty
+    // `Vec` (`jit_ll_list_str_from_rust_vec`).
+    if vec_one_word_item(ty).is_some() {
+        return Some(quote! {{
+            if (#arg_ident) == 0 {
+                <#ty>::new()
+            } else {
+                let __majit_vec = unsafe {
+                    ::core::ptr::read((#arg_ident) as usize as *const #ty)
+                };
+                ::majit_rlib::lltypesystem::rffi::raw_free((#arg_ident) as usize);
+                __majit_vec
+            }
+        }});
+    }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
         "i8" | "i16" | "i32" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
@@ -5794,6 +5815,20 @@ mod tests {
             None
         );
         assert_eq!(skip("fn f() -> Vec<GCREF> { Vec::new() }"), None);
+        assert_eq!(
+            skip("fn f(items: Vec<PyObjectRef>) -> PyObjectRef { loop {} }"),
+            None
+        );
+        assert_eq!(skip("fn f(items: Vec<GCREF>) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(items: Vec<i64>) -> i64 { 0 }"), None);
+        assert_eq!(
+            skip("fn f(items: Vec<u8>) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(items: Vec<String>) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
         assert_eq!(skip("fn f(xs: &mut [i64]) -> i64 { 0 }"), None);
         assert_eq!(
             skip("fn f(p: *const [PyObjectRef]) -> i64 { 0 }"),
@@ -6183,6 +6218,21 @@ mod tests {
             "{}",
             tokens
         );
+    }
+
+    #[test]
+    fn by_value_vec_argument_reads_the_header_and_frees_only_the_shell() {
+        let func = parse_fn("fn f(items: Vec<PyObjectRef>) -> PyObjectRef { loop {} }");
+        assert_eq!(trampoline_skip_reason(&func, "dont_look_inside", &[]), None);
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(text.contains("ptr :: read"), "{text}");
+        assert!(text.contains("raw_free"), "{text}");
+        assert!(!text.contains("ll_vec_free"), "{text}");
+        assert!(text.contains("< Vec < PyObjectRef > > :: new"), "{text}");
     }
 
     #[test]

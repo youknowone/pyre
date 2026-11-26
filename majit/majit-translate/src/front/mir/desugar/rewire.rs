@@ -436,6 +436,13 @@ pub(in crate::front::mir) struct AggregateField {
     /// address stored here is converted by `emit_cell_load`
     /// (`InstanceRepr.rtype_setattr` / `hop.inputargs`).
     pub(in crate::front::mir) peeled_shared_primitive: bool,
+    /// Class identity of a by-value `lltype.Struct` field.
+    ///
+    /// `LLTypeMallocRemover.flatten` reads `FIELDTYPE = S._flds[name]`
+    /// off the container. `flowin_op`'s `getsubstruct` arm then uses that
+    /// STRUCT, not the untyped `Ref` a missing positional row would
+    /// store. `None` is a scalar or a pointer word.
+    pub(in crate::front::mir) by_value_struct: Option<String>,
 }
 
 /// Owner of a constructor `setfield`.
@@ -707,6 +714,12 @@ fn ctor_ccharp_field_store(
         }
         None => value.clone(),
     };
+    // `S._flds[name]` is the inlined STRUCT (`flatten` / `getsubstruct`).
+    // The positional fallback is `Ref` with no class, which drops that
+    // identity before `flowin_op` can retarget `prefix.rest`.
+    if let Some(owner) = &field.by_value_struct {
+        return Ok((stored, ValueType::Ref(Some(owner.clone()))));
+    }
     Ok((
         stored,
         positional_ctor_field_value_type(&ctor.result_owner, &field.name),

@@ -981,35 +981,6 @@ use majit_ir::descr::DescrRef;
 use majit_ir::operand::Operand;
 use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
 
-/// The recording context's virtualizable frame, saved while a compiled entry
-/// runs another frame on the same `TraceCtx`.
-///
-/// Upstream the outer `MetaInterp` keeps that frame in
-/// `virtualizable_boxes[-1]`, a box the GC traces.  Here the compiled run can
-/// collect and move a nursery frame, so the saved address is held under an
-/// owner root and read back from it on restore.
-struct SavedTraceVablePtr {
-    ptr: *const u8,
-    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
-}
-
-impl SavedTraceVablePtr {
-    fn new(ptr: *const u8) -> Self {
-        let addr = ptr as usize;
-        let root = (addr != 0
-            && majit_gc::gc_owns_object(addr)
-            && majit_gc::shadow_stack::mutator_is_registered())
-        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)));
-        Self { ptr, root }
-    }
-
-    fn get(&self) -> *const u8 {
-        self.root
-            .as_ref()
-            .map_or(self.ptr, |root| root.get().0 as *const u8)
-    }
-}
-
 /// Bucket the variables of a given kind by IR `Type`, returning
 /// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
 /// upstream — `bhimpl_jit_merge_point` only encodes `i / R / F` slots.
@@ -2089,6 +2060,79 @@ struct ParkedDriverTrace<S: JitState> {
     resume_data_result: Option<crate::jit_state::ResumeDataResult>,
     last_bridge_is_exception_guard: bool,
     bridge_attempt_declined: bool,
+}
+
+/// The virtualizable `warmstate.py execute_assembler` holds in
+/// `virtualizable = args[index_of_virtualizable]` across
+/// `func_execute_token`.
+///
+/// That local is a GCREF, so the GC transformer rewrites it when the
+/// nursery moves. `sync_before` retargets the trace context's own root at
+/// the callee frame; this value is what still names the outer frame until
+/// `restore_trace_vable_ptr`. Absent (`present == false`) is "no recording
+/// context", and is distinct from a present null: only the absent value
+/// clears the array lengths.
+struct SavedVablePtr {
+    present: bool,
+    raw: *const u8,
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+}
+
+impl SavedVablePtr {
+    fn from_optional(ptr: Option<*const u8>) -> Self {
+        let Some(ptr) = ptr else {
+            return Self {
+                present: false,
+                raw: std::ptr::null(),
+                root: None,
+            };
+        };
+        if ptr.is_null() {
+            return Self {
+                present: true,
+                raw: std::ptr::null(),
+                root: None,
+            };
+        }
+        // Same snap `TraceCtx::set_virtualizable_heap_ptr` performs before
+        // it plants. A from-space stub that is still intact yields the
+        // forwarded object; the owner slot is what survives once the
+        // nursery reuses that address.
+        let addr = majit_gc::gc_current_object_address(ptr as usize);
+        let root =
+            if majit_gc::gc_owns_object(addr) && majit_gc::shadow_stack::mutator_is_registered() {
+                Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                    majit_ir::GcRef(addr),
+                ))
+            } else {
+                None
+            };
+        Self {
+            present: true,
+            raw: addr as *const u8,
+            root,
+        }
+    }
+
+    /// The address the guard holds now.
+    ///
+    /// Not inlined. `execute_assembler` reloads `virtualizable` after
+    /// `func_execute_token` because the GC transformer rewrote that local.
+    /// The word captured before the call is from-space once the nursery
+    /// has been reused, so this read stays on the far side of that call.
+    #[inline(never)]
+    fn current(&self) -> Option<*const u8> {
+        if !self.present {
+            return None;
+        }
+        if let Some(root) = &self.root {
+            return Some(root.get().0 as *const u8);
+        }
+        if self.raw.is_null() {
+            return Some(std::ptr::null());
+        }
+        Some(majit_gc::gc_current_object_address(self.raw as usize) as *const u8)
+    }
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -7411,7 +7455,7 @@ impl<S: JitState> JitDriver<S> {
                                 None,
                                 0,
                                 portal_rca_enabled(),
-                                None,
+                                &SavedVablePtr::from_optional(None),
                             )
                         }
                     };
@@ -7488,8 +7532,8 @@ impl<S: JitState> JitDriver<S> {
             // `pyjitpl.py synchronize_virtualizable` always targets that
             // MetaInterp's own `virtualizable_boxes[-1]`; every exit after
             // this capture puts the outer pointer back.
-            let saved_vable_root = self.save_trace_vable_ptr();
-            let saved_vable_ptr = saved_vable_root.as_ref();
+            let saved_vable_root = self.capture_saved_vable_ptr();
+            let saved_vable_ptr = &saved_vable_root;
             if !self.sync_before(state, compiled_meta, vable) {
                 self.entry_scratch_out(scratch);
                 return None;
@@ -7730,7 +7774,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
-        saved_vable_ptr: Option<&SavedTraceVablePtr>,
+        saved_vable_ptr: &SavedVablePtr,
     ) -> Option<PortalResume> {
         // `compile.py handle_fail(self, deadframe, ...)` is a method on
         // the descr reached through `jf_descr`. Borrow it off the
@@ -7920,7 +7964,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
-        saved_vable_ptr: Option<&SavedTraceVablePtr>,
+        saved_vable_ptr: &SavedVablePtr,
     ) -> Option<PortalResume> {
         // `execute_assembler` has already returned. Restore the caller's
         // saved recording-context virtualizable pointer (`None` when no
@@ -8989,8 +9033,8 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        let saved_vable_root = self.save_trace_vable_ptr();
-        let saved_vable_ptr = saved_vable_root.as_ref();
+        let saved_vable_root = self.capture_saved_vable_ptr();
+        let saved_vable_ptr = &saved_vable_root;
 
         if !self.sync_before(state, &meta, vable) {
             return;
@@ -9083,8 +9127,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_root = self.save_trace_vable_ptr();
-        let saved_vable_ptr = saved_vable_root.as_ref();
+        let saved_vable_root = self.capture_saved_vable_ptr();
+        let saved_vable_ptr = &saved_vable_root;
         if !self.sync_before(state, &meta, vable) {
             return;
         }
@@ -9336,8 +9380,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_root = self.save_trace_vable_ptr();
-        let saved_vable_ptr = saved_vable_root.as_ref();
+        let saved_vable_root = self.capture_saved_vable_ptr();
+        let saved_vable_ptr = &saved_vable_root;
         if !self.sync_before(state, &meta, vable) {
             crate::mc_diag_bump(62); // mst_sync_before_false
             return false;
@@ -9772,12 +9816,15 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
-    /// Saves the recording context's virtualizable frame before a compiled
-    /// entry, for [`Self::restore_trace_vable_ptr`].
-    fn save_trace_vable_ptr(&self) -> Option<SavedTraceVablePtr> {
-        self.meta.tracing.as_ref().map(|ctx| {
-            SavedTraceVablePtr::new(ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()))
-        })
+    /// `execute_assembler`'s `virtualizable` local, taken before `sync_before`
+    /// retargets the trace root at the callee. See [`SavedVablePtr`].
+    fn capture_saved_vable_ptr(&self) -> SavedVablePtr {
+        SavedVablePtr::from_optional(
+            self.meta
+                .tracing
+                .as_ref()
+                .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())),
+        )
     }
 
     /// Puts back the recording context's virtualizable frame saved before a
@@ -9787,12 +9834,18 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// `sync_before` also writes `pending_vable_ptr`. Upstream the
     /// virtualizable is a local of `warmstate.py maybe_compile_and_run`
-    /// `*args` / `bound_reached` / `compile_and_run_once`; a throwaway
-    /// MetaInterp would not outlive that portal entry. `saved` is `None`
+    /// `*args` / `bound_reached` / `execute_assembler`; a throwaway
+    /// MetaInterp would not outlive that portal entry. `saved` is absent
     /// when no attempt owns the seed — the pointer dies with the door.
     /// A parked outer attempt keeps its own copy and restores it here.
-    fn restore_trace_vable_ptr(&mut self, saved: Option<&SavedTraceVablePtr>) {
-        match saved.map(SavedTraceVablePtr::get) {
+    ///
+    /// The address written is the one the guard holds now.
+    /// `execute_assembler` keeps `virtualizable = args[index_of_virtualizable]`
+    /// live across `func_execute_token`, and the GC transformer updates that
+    /// local. `sync_before` retargets the trace's own root at the callee, so
+    /// the pre-call word is not that local unless this guard rooted it.
+    fn restore_trace_vable_ptr(&mut self, saved: &SavedVablePtr) {
+        match saved.current() {
             Some(ptr) => {
                 if let Some(ctx) = self.meta.tracing.as_mut() {
                     ctx.set_virtualizable_heap_ptr(ptr);
@@ -9814,7 +9867,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
-        saved_vable_ptr: Option<&SavedTraceVablePtr>,
+        saved_vable_ptr: &SavedVablePtr,
     ) {
         self.restore_trace_vable_ptr(saved_vable_ptr);
         let Some(virtualizable) = virtualizable else {
@@ -10113,8 +10166,8 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        let saved_vable_root = self.save_trace_vable_ptr();
-        let saved_vable_ptr = saved_vable_root.as_ref();
+        let saved_vable_root = self.capture_saved_vable_ptr();
+        let saved_vable_ptr = &saved_vable_root;
         if (!filled_without_meta && !state.is_compatible(meta))
             || !self.sync_before(state, meta, vable)
         {
@@ -10289,8 +10342,8 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let saved_vable_root = self.save_trace_vable_ptr();
-        let saved_vable_ptr = saved_vable_root.as_ref();
+        let saved_vable_root = self.capture_saved_vable_ptr();
+        let saved_vable_ptr = &saved_vable_root;
         if !self.sync_before(state, meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -11236,6 +11289,11 @@ impl<S: JitState> JitDriver<S> {
     ) -> SteadyCompiledEntry {
         self.entry_scratch_out(scratch);
         let live_meta = state.build_meta(target_pc, env);
+        // This entry did not capture a recording-context frame: the
+        // compiled call already returned, and the caller had no saved
+        // local. Absent, not a present null — restore clears lengths
+        // only in that case.
+        let saved_vable = SavedVablePtr::from_optional(None);
         SteadyCompiledEntry::Done(
             self.dispatch_handle_fail(
                 cell_key,
@@ -11247,7 +11305,7 @@ impl<S: JitState> JitDriver<S> {
                 None,
                 0,
                 portal_rca_enabled(),
-                None,
+                &saved_vable,
             )
             .and_then(|resume| self.resume_pc_recycling(resume)),
         )
@@ -13328,6 +13386,132 @@ mod tests {
         assert!(driver.meta.compile_tracing.is_some());
         assert!(driver.trace_attempt_in_progress());
         assert_eq!(driver.meta.pending_vable_ptr, 0x5eed as *const u8);
+    }
+
+    /// `execute_assembler` keeps `virtualizable` live across
+    /// `func_execute_token`. After the minor that promotes it, the from-space
+    /// stub is smashed the way a later nursery allocation reuses that address.
+    /// Restore must publish the promoted object, which is the word the owner
+    /// slot holds, and a present null must not clear array lengths the way an
+    /// absent capture does.
+    ///
+    /// `store_singleton` is process-global, so the body runs in a child of
+    /// this libtest process.
+    #[test]
+    fn saved_outer_vable_root_tracks_nursery_promotion() {
+        const CHILD: &str = "MAJIT_SAVED_VABLE_ROOT_CHILD";
+        const TEST_NAME: &str = "jitdriver::tests::saved_outer_vable_root_tracks_nursery_promotion";
+        if std::env::var_os(CHILD).is_none() {
+            let exe = std::env::current_exe().expect("test executable");
+            let out = std::process::Command::new(exe)
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("spawn saved-vable child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                out.status
+            );
+            return;
+        }
+
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                majit_gc::set_active_gc_owns_object(None);
+                majit_gc::shadow_stack::unregister_mutator();
+                majit_gc::gc_sync::unregister_thread();
+            }
+        }
+
+        assert!(
+            !majit_gc::gc_sync::is_initialized(),
+            "child process must start without a collector"
+        );
+        majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
+        majit_gc::shadow_stack::register_mutator();
+        majit_gc::gc_sync::register_thread();
+        let _guard = Guard;
+        majit_gc::set_active_gc_owns_object(Some(|addr| {
+            majit_gc::gc_sync::is_initialized()
+                && majit_gc::gc_sync::gc_query_reentrant(|gc| gc.is_managed_heap_object(addr))
+        }));
+
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.set_vable_array_lengths(vec![3]);
+        driver.restore_trace_vable_ptr(&SavedVablePtr::from_optional(None));
+        assert!(driver.meta.pending_vable_ptr.is_null());
+        assert!(
+            driver.meta.vable_array_lengths.is_empty(),
+            "absent capture clears array lengths"
+        );
+
+        driver.meta.set_vable_array_lengths(vec![4]);
+        driver.restore_trace_vable_ptr(&SavedVablePtr::from_optional(Some(std::ptr::null())));
+        assert!(driver.meta.pending_vable_ptr.is_null());
+        assert_eq!(
+            driver.meta.vable_array_lengths,
+            &[4],
+            "present null keeps array lengths"
+        );
+
+        let fake = SavedVablePtr::from_optional(Some(0x5eed as *const u8));
+        assert!(
+            fake.root.is_none(),
+            "a pointer the collector does not own is not planted"
+        );
+        assert_eq!(fake.current(), Some(0x5eed as *const u8));
+        driver.restore_trace_vable_ptr(&fake);
+        assert_eq!(driver.meta.pending_vable_ptr, 0x5eed as *const u8);
+        assert_eq!(driver.meta.vable_array_lengths, &[4]);
+
+        const MAGIC: u64 = 0x5A7E_D00D_11C0;
+        let obj = majit_gc::gc_sync::gc_op(|gc| {
+            let tid = gc.register_type(majit_gc::trace::TypeInfo::simple(16));
+            let obj = gc.alloc_with_type(tid, 16);
+            assert_ne!(obj.0, 0, "nursery allocation failed");
+            unsafe { std::ptr::write(obj.0 as *mut u64, MAGIC) };
+            obj
+        });
+        assert!(
+            majit_gc::gc_is_nursery_object(obj.0),
+            "fixture object must start in the nursery"
+        );
+        let saved = SavedVablePtr::from_optional(Some(obj.0 as *const u8));
+        assert!(saved.root.is_some(), "nursery object must be an owner root");
+
+        majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+        let promoted = saved.current().expect("present root") as usize;
+        assert_ne!(
+            promoted, obj.0,
+            "rooted nursery object must leave the nursery"
+        );
+        unsafe {
+            let hdr = majit_gc::header::header_of(obj.0);
+            if (*hdr).is_forwarded() {
+                assert_eq!(
+                    majit_gc::header::GcHeader::forwarding_address(hdr),
+                    promoted
+                );
+                // A later bump reuses this address and destroys the stub.
+                // Snapping the captured word can no longer find the object.
+                (hdr as *mut usize).write(0);
+                (obj.0 as *mut usize).write(0);
+            }
+        }
+        assert_eq!(
+            saved.current().expect("present root") as usize,
+            promoted,
+            "the owner slot, not the from-space stub, names the object"
+        );
+        assert_eq!(unsafe { std::ptr::read(promoted as *const u64) }, MAGIC);
+
+        driver.restore_trace_vable_ptr(&saved);
+        assert_eq!(driver.meta.pending_vable_ptr as usize, promoted);
+        assert_eq!(driver.meta.vable_array_lengths, &[4]);
     }
 
     fn dummy_abort_framestack() -> crate::pyjitpl::MIFrameStack {
