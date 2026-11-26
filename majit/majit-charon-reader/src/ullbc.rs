@@ -1790,6 +1790,26 @@ impl TypeLayout {
         }
     }
 
+    /// `true` when the branching tag is an unsigned width
+    /// [`Self::discriminant_int_type`] spells (`U8`/`U16`/`U32`/`U64`/`Usize`).
+    ///
+    /// The JSON key is `Unsigned`, not the first letter of the spelling.
+    /// `U128` is unsigned in the JSON and is not a spelled width, so it
+    /// stays `false` — the same decline as `discriminant_int_type`.
+    pub fn discriminant_tag_is_unsigned(&self) -> bool {
+        let Some(width) = self
+            .discriminator
+            .as_ref()
+            .and_then(|disc| disc.get("Branch"))
+            .and_then(|branch| branch.get("int_ty"))
+            .and_then(|int_ty| int_ty.get("Unsigned"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        matches!(width, "U8" | "U16" | "U32" | "U64" | "Usize")
+    }
+
     /// `true` iff a `Branch` discriminator is recorded, whatever its width.
     ///
     /// The question [`Self::discriminant_int_type`] cannot answer on its own:

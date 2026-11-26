@@ -110,6 +110,16 @@ pub(in crate::front::mir) struct InteriorFieldAlias {
     pub(in crate::front::mir) array_type_id: String,
 }
 
+/// `lltype.py` `InteriorPtr`: the parent item pointer plus the field
+/// offsets walked from it. `item_ty` is that pointer (`*mut ITEM` /
+/// `&mut ITEM`). `offsets` is outermost first (`InteriorPtr.offsets`).
+#[derive(Clone)]
+pub(in crate::front::mir) struct InteriorContainerAlias {
+    pub(in crate::front::mir) item_local: usize,
+    pub(in crate::front::mir) item_ty: TyRef,
+    pub(in crate::front::mir) offsets: Vec<String>,
+}
+
 /// `<[T]>::get` of a Copy struct fused to `i < len(s)` plus an interior
 /// field alias on the Some/Continue payload (`rewrite_op_getinteriorfield`).
 #[derive(Clone)]
@@ -383,6 +393,15 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// the resolving-block Variable plus the source MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
+    /// Exclusive borrow of a container field of a `GcArray` item.
+    ///
+    /// `rptr.py` `InteriorPtrRepr.rtype_getattr` of a `ContainerType`
+    /// returns the same interior word (`hop.inputarg(self, 0)`). The
+    /// path is `InteriorPtr.offsets`. A later store is
+    /// `InteriorPtrRepr.rtype_setattr`: `setinteriorfield` on the
+    /// parent array, at any nesting depth.
+    pub(in crate::front::mir) interior_container_alias:
+        std::collections::HashMap<usize, InteriorContainerAlias>,
     /// Option dest of a fused Copy-struct `<[T]>::get`, bound to `i < len`.
     pub(in crate::front::mir) fused_copy_struct_get:
         std::collections::HashMap<usize, FusedCopyStructGet>,
@@ -2460,6 +2479,7 @@ impl<'a> Lowering<'a> {
             accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
             interior_field_alias: std::collections::HashMap::new(),
+            interior_container_alias: std::collections::HashMap::new(),
             fused_copy_struct_get: std::collections::HashMap::new(),
             fused_copy_struct_get_cf: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),

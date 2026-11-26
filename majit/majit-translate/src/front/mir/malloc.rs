@@ -47,6 +47,13 @@ pub(in crate::front::mir) fn scalar_replace_named_struct_aggregates(
         }
         rewritten += 1;
     }
+    // `GcStruct('Interior', ('ptr', parent), ('index', Signed))`
+    // (`lltype.py` `Ptr._interior_ptr_type_with_index`,
+    // `rptr.py` `InteriorPtrRepr.rtype_getitem`) is a malloc between
+    // rtyping and `LLTypeMallocRemover`. `flatten` turns `ptr` and
+    // `index` into variables; `flowin_op` rewrites `getfield` /
+    // `setfield`. An escape keeps the `New`.
+    remove_nonescaping_interior_mallocs(graph);
     rewritten
 }
 
@@ -109,15 +116,8 @@ pub(in crate::front::mir) fn next_struct_aggregate_ctor(
             if owner.is_empty() {
                 continue;
             }
-            let layout_empty = struct_field_attrs
-                .get(owner)
-                .or_else(|| {
-                    owner
-                        .rsplit("::")
-                        .next()
-                        .and_then(|leaf| struct_field_attrs.get(leaf))
-                })
-                .is_some_and(|rows| rows.is_empty());
+            let layout_empty =
+                struct_field_rows(struct_field_attrs, owner).is_some_and(|rows| rows.is_empty());
             let discovered = struct_ctor_discovered_fields(graph, result);
             if discovered.is_empty() {
                 continue;
@@ -383,19 +383,297 @@ pub(in crate::front::mir) fn try_inline_malloc_lifetime(
     true
 }
 
+/// `ptr` and `index` of `GcStruct('Interior', …)`
+/// (`lltype.py` `Ptr._interior_ptr_type_with_index`).
+fn interior_ptr_flatnames() -> Vec<(String, ValueType)> {
+    vec![
+        ("ptr".to_string(), ValueType::Ref(None)),
+        ("index".to_string(), ValueType::Int),
+    ]
+}
+
+struct InteriorMallocSite {
+    block_idx: usize,
+    result: Variable,
+}
+
+/// Next `New { owner: "Interior" }` whose result is not in `skipped`.
+///
+/// Not a struct ctor: `next_struct_aggregate_ctor` only sees
+/// `SyntheticTransparentCtor`. Folding this `New` into that scan would
+/// restore it via `malloc_opkind` when removal fails.
+fn next_interior_malloc(graph: &FunctionGraph, skipped: &[Variable]) -> Option<InteriorMallocSite> {
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        for op in &block.operations {
+            let OpKind::New { owner } = &op.kind else {
+                continue;
+            };
+            if owner != "Interior" {
+                continue;
+            }
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if skipped.iter().any(|seen| seen == result) {
+                continue;
+            }
+            return Some(InteriorMallocSite {
+                block_idx,
+                result: result.clone(),
+            });
+        }
+    }
+    None
+}
+
+fn interior_malloc_remains(graph: &FunctionGraph, result: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(&op.kind, OpKind::New { owner } if owner == "Interior")
+                && op.result.as_ref() == Some(result)
+        })
+    })
+}
+
+/// `LLTypeMallocRemover` for `Interior`: every creation is
+/// `New { owner: "Interior" }`, and every use is `getfield` / `setfield`
+/// of `ptr` or `index` (`flowin_op`). A returned pointer, a store of the
+/// word, or a residual argument is `MallocUse::Other` or a non-field op
+/// and is not removable. Checked before any rewrite.
+fn interior_lifetime_is_removable(
+    graph: &FunctionGraph,
+    info: &MallocLifeTime,
+    flatnames: &[(String, ValueType)],
+) -> bool {
+    if info.creations.is_empty() {
+        return false;
+    }
+    for creation in &info.creations {
+        let MallocCreation::Op { block, op_idx } = creation else {
+            return false;
+        };
+        let Some(op) = graph
+            .blocks
+            .get(*block)
+            .and_then(|block| block.operations.get(*op_idx))
+        else {
+            return false;
+        };
+        if !matches!(&op.kind, OpKind::New { owner } if owner == "Interior") {
+            return false;
+        }
+    }
+    for use_point in &info.uses {
+        let MallocUse::Op {
+            block,
+            op_idx,
+            index,
+        } = use_point
+        else {
+            return false;
+        };
+        if *index != 0 {
+            return false;
+        }
+        let Some(op) = graph
+            .blocks
+            .get(*block)
+            .and_then(|block| block.operations.get(*op_idx))
+        else {
+            return false;
+        };
+        let field_name = match &op.kind {
+            OpKind::FieldRead { field, .. } => field.name.as_str(),
+            OpKind::FieldWrite {
+                field, value, ty, ..
+            } => {
+                if !field_value_aliasable(value, ty) {
+                    return false;
+                }
+                field.name.as_str()
+            }
+            _ => return false,
+        };
+        if !flatnames.iter().any(|(name, _)| name == field_name) {
+            return false;
+        }
+    }
+    let mut by_block: Vec<(usize, Vec<Variable>)> = Vec::new();
+    for (block, var) in &info.variables {
+        if let Some((_, vars)) = by_block.iter_mut().find(|(seen, _)| seen == block) {
+            if !vars.iter().any(|existing| existing == var) {
+                vars.push(var.clone());
+            }
+        } else {
+            by_block.push((*block, vec![var.clone()]));
+        }
+    }
+    for (block, mut vars) in by_block {
+        let mut ready = graph.blocks[block]
+            .inputargs
+            .iter()
+            .any(|var| vars.iter().any(|candidate| candidate == var));
+        for op in &graph.blocks[block].operations {
+            if let OpKind::UnaryOp {
+                op: name, operand, ..
+            } = &op.kind
+                && name == "same_as"
+                && vars.iter().any(|candidate| candidate == operand)
+                && let Some(produced) = &op.result
+            {
+                vars.push(produced.clone());
+                continue;
+            }
+            let refs = crate::inline::op_variable_refs(&op.kind);
+            let base_in = refs
+                .first()
+                .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+            let result_in = op
+                .result
+                .as_ref()
+                .is_some_and(|var| vars.iter().any(|candidate| candidate == var));
+            if base_in {
+                if !ready {
+                    return false;
+                }
+            } else if result_in {
+                ready = true;
+            }
+        }
+    }
+    true
+}
+
+/// `malloc.py` `_try_inline_malloc` for one `Interior` lifetime.
+///
+/// `false` leaves the graph untouched. A `true` result may still leave
+/// the `New` when `flowin` made no progress; the caller skips that
+/// variable instead of selecting it again.
+fn try_inline_interior_lifetime(
+    graph: &mut FunctionGraph,
+    block_idx: usize,
+    result: &Variable,
+) -> bool {
+    let flatnames = interior_ptr_flatnames();
+    let lifetimes = compute_lifetimes(graph);
+    let Some(info_idx) = lifetimes.index.get(&(block_idx, result.clone())).copied() else {
+        return false;
+    };
+    let info_idx = lifetimes.root_of(info_idx);
+    let info = &lifetimes.nodes[info_idx];
+    if !interior_lifetime_is_removable(graph, info, &flatnames) {
+        return false;
+    }
+    let mut by_block: Vec<(usize, Vec<Variable>)> = Vec::new();
+    for (block, var) in &info.variables {
+        if let Some((_, vars)) = by_block.iter_mut().find(|(seen, _)| seen == block) {
+            if !vars.iter().any(|existing| existing == var) {
+                vars.push(var.clone());
+            }
+        } else {
+            by_block.push((*block, vec![var.clone()]));
+        }
+    }
+    let zeros: Vec<FieldCur> = flatnames.iter().map(|(_, ty)| zero_field_cur(ty)).collect();
+    for (block, vars) in by_block {
+        let mut new_map: Option<Vec<FieldCur>> = None;
+        let mut new_inputargs: Vec<Variable> = Vec::new();
+        let mut inputvars: Vec<Variable> = Vec::new();
+        for var in graph.blocks[block].inputargs.clone() {
+            if vars.iter().any(|candidate| candidate == &var) {
+                inputvars.push(var);
+                if new_map.is_none() {
+                    let mut map = Vec::with_capacity(flatnames.len());
+                    for (_, ty) in &flatnames {
+                        let fresh = graph.alloc_value_var_with_type(concretetype_for_field(ty));
+                        map.push(FieldCur::Arg(LinkArg::Value(fresh.clone())));
+                        new_inputargs.push(fresh);
+                    }
+                    new_map = Some(map);
+                }
+            } else {
+                new_inputargs.push(var);
+            }
+        }
+        graph.blocks[block].inputargs = new_inputargs;
+        if !inputvars.is_empty() {
+            flowin_malloc_block(graph, block, inputvars, new_map, &flatnames, &zeros);
+        }
+        let created: Vec<Variable> = graph.blocks[block]
+            .operations
+            .iter()
+            .filter_map(|op| {
+                let produced = op.result.as_ref()?;
+                let still_malloc = matches!(&op.kind, OpKind::New { owner } if owner == "Interior");
+                if still_malloc && vars.iter().any(|candidate| candidate == produced) {
+                    Some(produced.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in created {
+            flowin_malloc_block(graph, block, vec![var], None, &flatnames, &zeros);
+        }
+    }
+    true
+}
+
+/// Remove every non-escaping `Interior` malloc (`LLTypeMallocRemover`).
+///
+/// A lifetime that fails the check is left as `New` — not rewritten to
+/// `malloc_opkind`, and not given the escaping-aggregate copies. A
+/// variable whose `New` is still present after the attempt is skipped,
+/// so the scan cannot select it again.
+fn remove_nonescaping_interior_mallocs(graph: &mut FunctionGraph) {
+    let mut skipped: Vec<Variable> = Vec::new();
+    loop {
+        let Some(site) = next_interior_malloc(graph, &skipped) else {
+            break;
+        };
+        if !try_inline_interior_lifetime(graph, site.block_idx, &site.result)
+            || interior_malloc_remains(graph, &site.result)
+        {
+            skipped.push(site.result);
+        }
+    }
+}
+
 pub(in crate::front::mir) fn struct_flatnames(
     owner: &str,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> Option<Vec<(String, ValueType)>> {
-    struct_field_attrs
-        .get(owner)
-        .or_else(|| {
-            owner
-                .rsplit("::")
-                .next()
-                .and_then(|leaf| struct_field_attrs.get(leaf))
-        })
-        .cloned()
+    struct_field_rows(struct_field_attrs, owner).map(<[_]>::to_vec)
+}
+
+/// `malloc.py` `flatten` keys `(S, name)` by the lltype object.
+/// Exact `struct_field_attrs` key first, then the one `StructId`
+/// (`struct_id_for_name`). Two keys for that id is not one struct.
+fn struct_field_rows<'a>(
+    struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    owner: &str,
+) -> Option<&'a [(String, ValueType)]> {
+    if let Some(rows) = struct_field_attrs.get(owner) {
+        return Some(rows.as_slice());
+    }
+    let sid = majit_ir::descr::struct_id_for_name(owner)?;
+    let mut hit: Option<&[(String, ValueType)]> = None;
+    for (key, rows) in struct_field_attrs {
+        if key == owner {
+            continue;
+        }
+        let Some(key_sid) = majit_ir::descr::struct_id_for_name(key) else {
+            continue;
+        };
+        if key_sid != sid {
+            continue;
+        }
+        if hit.is_some() {
+            return None;
+        }
+        hit = Some(rows.as_slice());
+    }
+    hit
 }
 
 pub(in crate::front::mir) fn concretetype_for_field(ty: &ValueType) -> crate::model::ConcreteType {
@@ -512,15 +790,8 @@ pub(in crate::front::mir) fn aggregate_ctor_owner(
     if owner.is_empty() {
         return None;
     }
-    let layout_empty = struct_field_attrs
-        .get(owner)
-        .or_else(|| {
-            owner
-                .rsplit("::")
-                .next()
-                .and_then(|leaf| struct_field_attrs.get(leaf))
-        })
-        .is_some_and(|rows| rows.is_empty());
+    let layout_empty =
+        struct_field_rows(struct_field_attrs, owner).is_some_and(|rows| rows.is_empty());
     let discovered = struct_ctor_discovered_fields(graph, result);
     if discovered.is_empty() {
         return None;
@@ -1021,6 +1292,10 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
     }
 
     let has_vtable = crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
+    // Rolled back when a field read of `result` cannot be retargeted.
+    // Dropping the malloc and leaving that read is a use with no def
+    // (`rtyper.py` `setconcretetype` / `bindingrepr`).
+    let original_ops = graph.blocks[block_idx].operations.clone();
     let ops = std::mem::take(&mut graph.blocks[block_idx].operations);
     let mut out: Vec<crate::model::SpaceOperation> = Vec::new();
     let mut fields: Vec<(
@@ -1069,6 +1344,22 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
                         });
                         continue;
                     }
+                } else if let Some(kind) = project_inlined_substruct_field_read(
+                    graph,
+                    block_idx,
+                    &out,
+                    &owner,
+                    &fields,
+                    &op,
+                    struct_field_attrs,
+                    &original_ops,
+                    &result,
+                ) {
+                    out.push(crate::model::SpaceOperation {
+                        result: op.result.clone(),
+                        kind,
+                    });
+                    continue;
                 }
             }
             _ => {}
@@ -1084,6 +1375,23 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         } else {
             out.push(op);
         }
+    }
+
+    let ctor_still_used = out.iter().any(|op| {
+        crate::inline::op_variable_refs(&op.kind)
+            .iter()
+            .any(|var| var == &result)
+    });
+    if ctor_still_used {
+        // The leaf is still a read of this aggregate. Keep the malloc
+        // (`rewrite_op_malloc`) so `setconcretetype` has a defining op.
+        graph.blocks[block_idx].operations = original_ops;
+        graph.blocks[block_idx].operations[op_idx].kind =
+            crate::model::malloc_opkind(owner.clone(), has_vtable);
+        materialize_whole_value_copies_in_block(
+            graph, block_idx, op_idx, &result, &owner, has_vtable,
+        );
+        return true;
     }
 
     let apply_alias = |var: &Variable| -> Variable {
@@ -1320,6 +1628,441 @@ fn struct_field_slot_eq(
     b: &crate::model::FieldDescriptor,
 ) -> bool {
     a.name == b.name && a.vec_part == b.vec_part
+}
+
+/// Read of an inlined by-value substructure (`malloc.py`
+/// `LLTypeMallocRemover` `getsubstruct` arm, `jtransform.py`
+/// `rewrite_op_getsubstruct`).
+///
+/// A dotted `prefix.rest` is the leaf of the value stored in `prefix`.
+/// An offset-0 hop keeps the inner descr (`nest_inline_leaf`,
+/// `Transformer.zero_contents`); that descr's owner is the nested
+/// struct, so the read moves onto the one stored value of that struct.
+fn project_inlined_substruct_field_read(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    emitted: &[SpaceOperation],
+    aggregate_owner: &str,
+    fields: &[(FieldDescriptor, LinkArg, ValueType)],
+    op: &SpaceOperation,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    original_ops: &[SpaceOperation],
+    aggregate: &Variable,
+) -> Option<OpKind> {
+    let OpKind::FieldRead {
+        field, ty, pure, ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    if let Some((prefix, rest)) = field.name.split_once('.')
+        && !prefix.is_empty()
+        && !rest.is_empty()
+    {
+        let (_, value, stored_ty) = fields
+            .iter()
+            .find(|(seen, _, _)| seen.name == prefix && seen.vec_part.is_none())?;
+        let LinkArg::Value(src) = value else {
+            return None;
+        };
+        // `flowin_op` reads `op.args[0].concretetype.TO`. The stored
+        // field type is that STRUCT when the write recorded `Ref(S)`.
+        // A phi of a residual call can carry the struct with no `New`
+        // (`newvarstype` never ran). The dotted leaves are `S._flds`
+        // (`flatten`). One struct with that field list is S. When two
+        // structs share the list, the container's instantiated type
+        // argument is `FIELDTYPE` (`substitute_spill_typevars`).
+        let owner = if let ValueType::Ref(Some(stored)) = stored_ty
+            && !stored.is_empty()
+        {
+            stored.clone()
+        } else {
+            match struct_value_owner(graph, block_idx, emitted, src) {
+                Some(owner) => owner,
+                None => {
+                    let leaves = dotted_prefix_leaves(original_ops, aggregate, prefix)?;
+                    unique_nested_struct_owner(struct_field_attrs, &leaves, aggregate_owner)?
+                }
+            }
+        };
+        let mut projected = field.clone();
+        projected.name = rest.to_string();
+        projected.owner_root = Some(owner);
+        // The container's StructId is not the nested value's.
+        projected.owner_id = None;
+        projected.owner_declared_gc = None;
+        return Some(OpKind::FieldRead {
+            base: src.clone(),
+            field: projected,
+            ty: ty.clone(),
+            pure: *pure,
+        });
+    }
+    let nested = field.owner_root.as_deref()?;
+    if struct_ids_equal(nested, aggregate_owner) {
+        return None;
+    }
+    let mut found: Option<&Variable> = None;
+    for (_, value, _) in fields {
+        let LinkArg::Value(src) = value else {
+            continue;
+        };
+        let Some(owner) = struct_value_owner(graph, block_idx, emitted, src) else {
+            continue;
+        };
+        if !struct_ids_equal(&owner, nested) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(src);
+    }
+    let src = match found {
+        Some(src) => src.clone(),
+        // Offset 0 keeps the inner descr (`nest_inline_leaf`,
+        // `Transformer.zero_contents`) and drops the container field
+        // name. The one stored value no same-named read consumed is
+        // that substructure (`flatten`: a ContainerType that is not a
+        // primitive flatname).
+        None => sole_unconsumed_stored_value(fields, original_ops, aggregate)
+            .filter(|_| {
+                struct_flatnames(nested, struct_field_attrs).is_some_and(|rows| {
+                    rows.iter()
+                        .any(|(name, fty)| name == &field.name && fty == ty)
+                })
+            })?
+            .clone(),
+    };
+    Some(OpKind::FieldRead {
+        base: src,
+        field: field.clone(),
+        ty: ty.clone(),
+        pure: *pure,
+    })
+}
+
+/// Dotted `prefix.rest` reads of `aggregate`, as `(rest, ty)`.
+///
+/// A deeper dot is not one field of a flat nested struct (`S._flds`
+/// keys are single names). Disagreeing types for one name are not one
+/// field either.
+fn dotted_prefix_leaves(
+    ops: &[SpaceOperation],
+    aggregate: &Variable,
+    prefix: &str,
+) -> Option<Vec<(String, ValueType)>> {
+    let mut leaves: Vec<(String, ValueType)> = Vec::new();
+    for op in ops {
+        let OpKind::FieldRead {
+            base, field, ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if base != aggregate {
+            continue;
+        }
+        let Some((seen_prefix, rest)) = field.name.split_once('.') else {
+            continue;
+        };
+        if seen_prefix != prefix || rest.is_empty() {
+            continue;
+        }
+        if rest.contains('.') {
+            return None;
+        }
+        if let Some((_, prev)) = leaves.iter().find(|(name, _)| name == rest) {
+            if prev != ty {
+                return None;
+            }
+            continue;
+        }
+        leaves.push((rest.to_string(), ty.clone()));
+    }
+    if leaves.is_empty() {
+        None
+    } else {
+        Some(leaves)
+    }
+}
+
+/// The one struct whose fields are exactly `leaves`.
+///
+/// `malloc.py` `flatten` takes `FIELDTYPE = S._flds[name]` off the
+/// value's concretetype and keys `(S, name)` by the lltype object
+/// (`StructId`). Several structs, or a struct with extra fields, is
+/// not that type. Spellings that share one `StructId` are one hit;
+/// the representative is the first sorted spelling.
+///
+/// Two different structs can share one field list. The container's
+/// instantiated spelling still names the substituted type variable
+/// (`collect_by_value_struct_leaves` / `substitute_spill_typevars`):
+/// that argument is `FIELDTYPE`. A hit has to be one of those
+/// arguments. Zero or several remaining hits is not a type.
+fn unique_nested_struct_owner(
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    leaves: &[(String, ValueType)],
+    container: &str,
+) -> Option<String> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut matched: Vec<&str> = Vec::new();
+    for (owner, fields) in struct_field_attrs {
+        if fields.len() != leaves.len() {
+            continue;
+        }
+        let same = leaves
+            .iter()
+            .all(|(name, ty)| fields.iter().any(|(fname, fty)| fname == name && fty == ty))
+            && fields
+                .iter()
+                .all(|(fname, fty)| leaves.iter().any(|(name, ty)| fname == name && fty == ty));
+        if same {
+            matched.push(owner.as_str());
+        }
+    }
+    matched.sort_unstable();
+    let mut groups: Vec<String> = Vec::new();
+    for owner in matched {
+        if groups.iter().any(|prev| struct_ids_equal(prev, owner)) {
+            continue;
+        }
+        groups.push(owner.to_string());
+    }
+    if groups.len() == 1 {
+        return groups.pop();
+    }
+    let args = top_level_generic_args(container);
+    if args.is_empty() {
+        return None;
+    }
+    groups.retain(|owner| args.iter().any(|arg| struct_ids_equal(owner, arg)));
+    if groups.len() == 1 {
+        groups.pop()
+    } else {
+        None
+    }
+}
+
+/// Top-level type arguments of an instantiated spelling
+/// (`Outer<Inner, *mut T>`). Nested `<>` stay inside one argument.
+/// No argument list is empty.
+fn top_level_generic_args(owner: &str) -> Vec<&str> {
+    let Some(open) = owner.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 1usize;
+    let mut start = open + 1;
+    let mut args = Vec::new();
+    for (i, ch) in owner[open + 1..].char_indices() {
+        let idx = open + 1 + i;
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    let arg = owner[start..idx].trim();
+                    if !arg.is_empty() {
+                        args.push(arg);
+                    }
+                    break;
+                }
+            }
+            ',' if depth == 1 => {
+                let arg = owner[start..idx].trim();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// Stored value no same-named field read of `aggregate` consumed.
+///
+/// `flowin_op` `getfield` of a primitive uses `newvarsmap[S, name]`
+/// directly. A by-value substructure keeps its own variable
+/// (`needsubmallocs` / the `getsubstruct` arm). Two such values, or a
+/// constant, are not one substructure.
+fn sole_unconsumed_stored_value<'a>(
+    fields: &'a [(FieldDescriptor, LinkArg, ValueType)],
+    ops: &[SpaceOperation],
+    aggregate: &Variable,
+) -> Option<&'a Variable> {
+    let mut found: Option<&Variable> = None;
+    for (field, value, _) in fields {
+        let consumed = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { base, field: read, .. }
+                    if base == aggregate && struct_field_slot_eq(field, read)
+            )
+        });
+        if consumed {
+            continue;
+        }
+        let LinkArg::Value(src) = value else {
+            return None;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(src);
+    }
+    found
+}
+
+/// How `var` is defined, for an inlined-substructure retarget.
+enum StructValueDef {
+    /// `malloc` of a named struct (`rewrite_op_malloc` / `New`).
+    Struct(String),
+    /// `same_as` of another value.
+    Alias(Variable),
+    /// Defined, and not a struct value.
+    Other,
+}
+
+/// `New` / struct-ctor owner of `var`.
+///
+/// A block input is the phi of its incoming link args (`malloc.py`
+/// `compute_lifetimes` flows one flattened value across the edge).
+/// Every incoming struct owner must agree. A `same_as` is not a
+/// second object (`remove_same_as`).
+fn struct_value_owner(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    emitted: &[SpaceOperation],
+    var: &Variable,
+) -> Option<String> {
+    struct_value_owner_rec(graph, block_idx, emitted, var, &mut Vec::new())
+}
+
+fn struct_value_owner_rec(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    emitted: &[SpaceOperation],
+    var: &Variable,
+    seen: &mut Vec<Variable>,
+) -> Option<String> {
+    if seen.iter().any(|item| item == var) {
+        return None;
+    }
+    seen.push(var.clone());
+    if let Some(def) = struct_value_def(emitted, var) {
+        return struct_def_owner(graph, block_idx, emitted, def, seen);
+    }
+    for (idx, block) in graph.blocks.iter().enumerate() {
+        if idx == block_idx {
+            continue;
+        }
+        if let Some(def) = struct_value_def(&block.operations, var) {
+            return struct_def_owner(graph, block_idx, emitted, def, seen);
+        }
+    }
+    phi_struct_owner(graph, block_idx, emitted, var, seen)
+}
+
+fn struct_def_owner(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    emitted: &[SpaceOperation],
+    def: StructValueDef,
+    seen: &mut Vec<Variable>,
+) -> Option<String> {
+    match def {
+        StructValueDef::Struct(owner) => Some(owner),
+        StructValueDef::Alias(next) => {
+            struct_value_owner_rec(graph, block_idx, emitted, &next, seen)
+        }
+        StructValueDef::Other => None,
+    }
+}
+
+fn phi_struct_owner(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    emitted: &[SpaceOperation],
+    var: &Variable,
+    seen: &mut Vec<Variable>,
+) -> Option<String> {
+    let mut incoming: Vec<Variable> = Vec::new();
+    for block in &graph.blocks {
+        let Some(slot) = block.inputargs.iter().position(|arg| arg == var) else {
+            continue;
+        };
+        let target = block.id;
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target != target {
+                    continue;
+                }
+                match link.args.get(slot) {
+                    Some(LinkArg::Value(src)) => incoming.push(src.clone()),
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let mut agreed: Option<String> = None;
+    for src in &incoming {
+        if seen.iter().any(|item| item == src) {
+            continue;
+        }
+        let owner = struct_value_owner_rec(graph, block_idx, emitted, src, seen)?;
+        match &agreed {
+            None => agreed = Some(owner),
+            Some(prev) if struct_ids_equal(prev, &owner) => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
+}
+
+fn struct_value_def(ops: &[SpaceOperation], var: &Variable) -> Option<StructValueDef> {
+    for op in ops {
+        if op.result.as_ref() != Some(var) {
+            continue;
+        }
+        return Some(match &op.kind {
+            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
+                StructValueDef::Struct(owner.clone())
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        is_struct: true, ..
+                    },
+                result_ty: ValueType::Ref(Some(owner)),
+                ..
+            } => StructValueDef::Struct(owner.clone()),
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                StructValueDef::Alias(operand.clone())
+            }
+            _ => StructValueDef::Other,
+        });
+    }
+    None
+}
+
+/// `malloc.py` `flatten` keys `(S, name)` by the lltype object.
+/// Unregistered spellings are equal only to themselves: two `None`
+/// lookups are not one struct.
+fn struct_ids_equal(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        majit_ir::descr::struct_id_for_name(a),
+        majit_ir::descr::struct_id_for_name(b),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub(in crate::front::mir) fn link_arg_as_alias_op(

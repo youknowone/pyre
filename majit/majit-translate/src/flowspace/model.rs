@@ -2165,10 +2165,16 @@ impl HostEnv {
         // calls `cast_object_to_ptr(OBJECTPTR, instance)`; pyre has
         // no graph for that helper, so HOST_ENV plus the analyser /
         // typer stand in for `CastObjectToPtrEntry`.
+        // `llstr` is `LLStrEntry` (`make_string_entries`): the
+        // NOT_RPYTHON body is replaced by the same registry.
         let annlowlevel = HostObject::new_module("rpython.rtyper.annlowlevel");
         annlowlevel.module_set(
             "cast_instance_to_base_ptr",
             HostObject::new_builtin_callable("annlowlevel.cast_instance_to_base_ptr"),
+        );
+        annlowlevel.module_set(
+            "llstr",
+            HostObject::new_builtin_callable("annlowlevel.llstr"),
         );
 
         // `rpython.rtyper.lltypesystem.llmemory` — address-arithmetic

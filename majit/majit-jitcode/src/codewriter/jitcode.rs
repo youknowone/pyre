@@ -963,6 +963,22 @@ impl JitCode {
         }
     }
 
+    /// The already-computed answer of [`Self::descent_blocker_summary_for_entry_len`],
+    /// or `None` when `entry_len` has no slot or nothing has filled it.
+    ///
+    /// Same contract as [`Self::descent_blocker_summary_if_computed`]: a caller
+    /// that is not yet entitled to commit an answer must not `get_or_init`.
+    pub fn descent_blocker_summary_for_entry_len_if_computed(
+        &self,
+        entry_len: usize,
+    ) -> Option<DescentBlockerSummary> {
+        self.derived
+            .descent_blocker_summary_by_entry_len
+            .get(entry_len)?
+            .get()
+            .copied()
+    }
+
     /// Commit the body once assembly has produced it. Panics on second
     /// call (RPython equivalent: `JitCode.setup` is also called once per
     /// jitcode lifetime).

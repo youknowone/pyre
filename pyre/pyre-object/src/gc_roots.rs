@@ -577,6 +577,20 @@ pub fn root_scope_close_word(save_point: usize) {
     shadow_stack_cell_truncate(cell, save_point);
 }
 
+/// Word form of [`push_roots`], as [`root_scope_close_word`] is the word
+/// form of [`root_scope_close`].
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` emits the `gc_push_roots`
+/// llop and `ShadowStackFrameworkGCTransformer.pop_roots` emits
+/// `gc_pop_roots` (`rpython/memory/gctransform/shadowstack.py`). This returns
+/// the save-point word and does not run `Drop`; the caller closes it with
+/// [`root_scope_close_word`].
+#[inline]
+pub fn push_roots_word() -> usize {
+    let scope = std::mem::ManuallyDrop::new(push_roots());
+    scope.save_point
+}
+
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
@@ -1641,12 +1655,24 @@ mod tests {
 
     /// `RootScope` carries only the saved top; the root-stack cell is
     /// re-resolved. Trap unintended growth beyond that one word.
+    /// [`push_roots_word`] returns that word and leaves the bracket open.
     #[test]
     fn root_scope_payload_is_one_word() {
         assert_eq!(
             std::mem::size_of::<RootScope>(),
             std::mem::size_of::<usize>()
         );
+        let before = shadow_stack_len();
+        let word = push_roots_word();
+        assert_eq!(word, before, "the word is the save point");
+        assert_eq!(
+            std::mem::size_of_val(&word),
+            std::mem::size_of::<RootScope>()
+        );
+        let _ = pin_root(dummy(0x1111));
+        assert_eq!(shadow_stack_len(), before + 1, "Drop did not run");
+        root_scope_close_word(word);
+        assert_eq!(shadow_stack_len(), before);
     }
 
     /// The naive form costs one frame per bracket: each `with_roots!` pushes

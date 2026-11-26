@@ -1607,6 +1607,94 @@ fn an_identity_trampoline_forwards_r0_array_length_into_the_callee() {
     assert_eq!(empty_forwarded, Some((7, Vec::new())));
 }
 
+fn cycle_pair(
+    left_name: &str,
+    right_name: &str,
+    left: Vec<u8>,
+    right: Vec<u8>,
+    symbolic: i64,
+) -> (
+    Vec<std::sync::Arc<majit_jitcode::jitcode::JitCode>>,
+    std::collections::HashMap<(usize, usize), usize>,
+) {
+    let make = |name: &str, code: Vec<u8>, constants_i: Vec<i64>| {
+        let jitcode = majit_jitcode::jitcode::JitCode::new(name);
+        jitcode.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code,
+            constants_i,
+            c_num_regs_i: 1,
+            ..Default::default()
+        });
+        std::sync::Arc::new(jitcode)
+    };
+    let jitcodes = vec![
+        make(left_name, left, Vec::new()),
+        make(right_name, right, vec![symbolic]),
+    ];
+    let mut callees = std::collections::HashMap::new();
+    callees.insert((0, 0), 1);
+    callees.insert((1, 0), 0);
+    (jitcodes, callees)
+}
+
+/// Two jitcodes call each other. The component is cached once, both members
+/// hold that same summary, and the residual in the second is visible from
+/// the first.
+#[test]
+fn mutual_recursion_shares_one_cached_summary_and_a_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut left = inline_call_with_descr(0);
+    left.extend(void_return());
+    let mut right = inline_call_with_descr(0);
+    right.extend(residual_call_with_funcbox(1));
+    right.extend(void_return());
+    let (jitcodes, callees) = cycle_pair("cycle-a", "cycle-b", left, right, symbolic);
+
+    let summary =
+        super::inline_call::descent_blocker_summary_for_test_table(0, None, &jitcodes, &callees);
+    assert_eq!(
+        jitcodes[0].descent_blocker_summary_if_computed(),
+        Some(summary)
+    );
+    assert_eq!(
+        jitcodes[1].descent_blocker_summary_if_computed(),
+        Some(summary)
+    );
+    assert!(summary.may_execute_effect);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    let from_right =
+        super::inline_call::descent_blocker_summary_for_test_table(1, None, &jitcodes, &callees);
+    assert_eq!(from_right, summary);
+}
+
+/// The same cycle through identity trampolines is the entry-length color.
+/// Both lengths share one cached summary, and the fact-free slot stays empty.
+#[test]
+fn mutual_identity_trampolines_cache_one_entry_len_summary() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut left = inline_call_r_r_with_r0(0, 1);
+    left.extend(void_return());
+    let mut right = inline_call_r_r_with_r0(0, 1);
+    right.extend(residual_call_with_funcbox(1));
+    right.extend(void_return());
+    let (jitcodes, callees) = cycle_pair("tramp-a", "tramp-b", left, right, symbolic);
+
+    let summary =
+        super::inline_call::descent_blocker_summary_for_test_table(0, Some(2), &jitcodes, &callees);
+    assert!(jitcodes[0].descent_blocker_summary_if_computed().is_none());
+    assert!(jitcodes[1].descent_blocker_summary_if_computed().is_none());
+    assert_eq!(
+        jitcodes[0].descent_blocker_summary_for_entry_len_if_computed(2),
+        Some(summary)
+    );
+    assert_eq!(
+        jitcodes[1].descent_blocker_summary_for_entry_len_if_computed(2),
+        Some(summary)
+    );
+    assert!(summary.may_execute_effect);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+}
+
 /// An executed residual call the effectinfo names effect-free -- elidable,
 /// loop-invariant, or a known-empty write set -- applies nothing a rollback would have
 /// to undo, so a blocker behind it stays on the rewind leg.  The scan asks
@@ -23454,6 +23542,211 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     }
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
+}
+
+thread_local! {
+    static GATEWAY_ARRAY_ALLOCS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+unsafe fn gateway_array_alloc_rooted(
+    type_id: u32,
+    payload_size: usize,
+    _root: *mut pyre_object::gc_hook::GCREF,
+    needs_write_barrier: *mut bool,
+) -> pyre_object::gc_hook::GCREF {
+    unsafe { *needs_write_barrier = false };
+    let header = majit_gc::header::GcHeader::SIZE;
+    let align = majit_gc::header::GcHeader::ALIGN.max(std::mem::align_of::<usize>());
+    let layout = std::alloc::Layout::from_size_align(header + payload_size.max(1), align)
+        .expect("gateway array layout");
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (raw as *mut majit_gc::header::GcHeader).write(majit_gc::header::GcHeader::new(type_id));
+    }
+    let payload = unsafe { raw.add(header) } as usize;
+    GATEWAY_ARRAY_ALLOCS.with(|slots| slots.borrow_mut().push(payload));
+    payload as pyre_object::gc_hook::GCREF
+}
+
+fn gateway_array_alloc_is_owned(addr: usize) -> bool {
+    GATEWAY_ARRAY_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+}
+
+struct ClearGatewayArrayHooks;
+
+impl Drop for ClearGatewayArrayHooks {
+    fn drop(&mut self) {
+        pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+        pyre_object::gc_hook::clear_gc_owns_object_hook();
+        GATEWAY_ARRAY_ALLOCS.with(|slots| slots.borrow_mut().clear());
+    }
+}
+
+/// `walk_translated_builtin_wrapper` records `NewArrayClear` for the
+/// gateway `&[PyObjectRef]`. `opimpl_new_array_clear` / `bh_new_array_clear`
+/// also execute it, and `execute_setarrayitem_gc` stores the operand.
+/// `pin_roots_jit_abi` reads that word (`gcarray_ref_items`).
+fn gateway_args_block(name: &str, item_concrete: ConcreteValue) -> Option<usize> {
+    let ref_ret = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in insns table");
+    let child_code: &'static [u8] = Box::leak(Box::new([ref_ret, 0]));
+    let child_index = install_named_helper_jitcode(name, child_code.to_vec(), [0_usize], 1, 1);
+    let child_body = SubJitCodeBody {
+        code: child_code,
+        num_regs_r: 1,
+        num_regs_i: 1,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: Some(child_index),
+    };
+    let jitcode = helper_jitcode_arc(child_index).expect("installed wrapper jitcode must resolve");
+    let parent_code: [u8; 4] = [0; 4];
+    let op = DecodedOp {
+        key: "inline_call_ir_r/dIR>r",
+        opname: "inline_call_ir_r",
+        argcodes: "dIR>r",
+        pc: 0,
+        next_pc: 4,
+    };
+    let mut tc = fresh_trace_ctx();
+    // A ref box for a live operand. An int box has no `Box.value` ref, which
+    // is the operand `walker_fill_materialized_array` cannot store.
+    let item = if matches!(item_concrete, ConcreteValue::Ref(_)) {
+        let src = tc.const_ref(0);
+        tc.record_op(majit_ir::OpCode::SameAsR, &[src])
+    } else {
+        dummy_int_add_box(&mut tc)
+    };
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let mut concrete_i = [ConcreteValue::Int(0)];
+    let regs_i = [dummy_int_add_box(&mut tc)];
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null; 4],
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(child_index),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &|_| None,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let pre_fold_pos = wc.trace_ctx.get_trace_position();
+    let site = super::inline_call::BuiltinWrapperCallSite {
+        helper_return: HelperReturn::Converted,
+        nested_helper_entry: None,
+        call_site_py_pc: 0,
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        call_site_marker: Some(0),
+        call_site_active: Vec::new(),
+    };
+    let result = super::inline_call::walk_translated_builtin_wrapper(
+        &mut wc,
+        &op,
+        &parent_code,
+        jitcode.as_ref(),
+        &child_body,
+        &[item],
+        &[item_concrete],
+        0,
+        pyre_object::w_none(),
+        pre_fold_pos,
+        site,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "gateway walk must finish so the args array stays recorded: {result:?}"
+    );
+    let array = {
+        let ops = wc.trace_ctx.ops();
+        ops.iter()
+            .find(|op| op.opcode == majit_ir::OpCode::NewArrayClear)
+            .map(|op| op.pos().get())
+            .expect("wrapper records NewArrayClear")
+    };
+    let block = match wc.trace_ctx.box_value(array) {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
+            Some(r.as_usize())
+        }
+        _ => None,
+    };
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    block
+}
+
+/// A live operand is stored into the executed `NewArrayClear` block.
+/// An operand with no `Box.value` does not leave a block of nulls for
+/// `pin_roots_jit_abi` to publish.
+#[test]
+fn wrapper_gateway_array_executes_new_array_clear() {
+    let real_collector =
+        majit_gc::gc_allocator_installed() || majit_gc::gc_owns_object_hook_installed();
+    let _guard = (!real_collector).then(pyre_object::gc_hook::hook_test_guard);
+    let _clear = (!real_collector).then(|| {
+        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(gateway_array_alloc_rooted);
+        pyre_object::gc_hook::register_gc_owns_object_hook(gateway_array_alloc_is_owned);
+        ClearGatewayArrayHooks
+    });
+    let live = 0x1800usize;
+    let block = gateway_args_block(
+        "gateway_array_live_item",
+        ConcreteValue::Ref(live as pyre_object::PyObjectRef),
+    );
+    if real_collector && block.is_none() {
+        // This thread has a collector but no pyre allocation hook, so
+        // `alloc_cleared_ref_items_block_gc` declines. The fake-hook arm
+        // is the regression; a product run has both.
+        return;
+    }
+    let block = block.expect("opimpl_new_array_clear stamps the gateway array");
+    let items = pyre_object::gc_roots::gcarray_ref_items(
+        block as *const pyre_object::object_array::GcTypedArray,
+    );
+    assert_eq!(items.len(), 1, "gateway array length is the operand count");
+    assert_eq!(
+        items[0] as usize, live,
+        "execute_setarrayitem_gc stores the live operand pin_roots reads"
+    );
+    let absent = gateway_args_block("gateway_array_unstamped_item", ConcreteValue::Null);
+    assert!(
+        absent.is_none(),
+        "an operand with no Box.value must not pin a null-filled block"
+    );
 }
 
 /// Void-bank `boxed_out` descent (`try_walker_orthodox_newutf8`) does not

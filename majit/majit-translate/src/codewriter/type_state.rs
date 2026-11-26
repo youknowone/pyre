@@ -248,6 +248,9 @@ pub(crate) fn authoritative_result_type_from_op(
         // Leaving this Unknown maps `getkind` to `'r'`, so a fused
         // `i < len` becomes `goto_if_not_int_lt/irL`.
         OpKind::ArrayLen { .. } | OpKind::VableArrayLen { .. } => Some(ConcreteType::Signed),
+        // `jtransform.py` `rewrite_op_malloc` keeps a GC `malloc` as `new`.
+        // The result kind is `'r'` (`history.getkind` of a `GcStruct`).
+        OpKind::New { .. } => Some(ConcreteType::GcRef),
         _ => None,
     }
 }

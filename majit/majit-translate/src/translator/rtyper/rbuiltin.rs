@@ -401,6 +401,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "cast_instance_to_base_ptr",
             rtype_cast_instance_to_base_ptr,
         ),
+        // `LLStrEntry.specialize_call` (`annlowlevel.py`) for `llstr`.
+        ("rpython.rtyper.annlowlevel", "llstr", rtype_llstr),
         // rbuiltin.py:471-477
         (
             "rpython.rtyper.lltypesystem.lltype",
@@ -3490,6 +3492,16 @@ pub fn rtype_cast_instance_to_base_ptr(
     }
     let v_arg = hop.inputarg(r_arg.as_ref(), 0)?;
     Ok(hop.genop("cast_pointer", vec![v_arg], GenopResult::LLType(lltype)))
+}
+
+/// `LLStrEntry.specialize_call` (`annlowlevel.py`) for `llstr`.
+/// `BuiltinFunctionRepr` has already popped the callable, so
+/// `hop.args_r[0]` is the string.
+pub fn rtype_llstr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    crate::translator::rtyper::annlowlevel::LLStrEntry {
+        helper: crate::translator::rtyper::annlowlevel::llstr,
+    }
+    .specialize_call(hop)
 }
 
 /// RPython `_cast_to_Signed` table (rbuiltin.py) — opname that
@@ -9283,6 +9295,98 @@ mod tests {
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
         assert_eq!(ops.ops.last().map(|op| op.result.clone()), Some(out));
+    }
+
+    /// `LLStrEntry.specialize_call` (`annlowlevel.py`): `llstr` of a
+    /// `SomeString` is `hop.inputarg(string_repr, 0)` then `same_as`.
+    /// `convertvar` is identity for the `string_repr` singleton, so the
+    /// `same_as` operand is that variable.
+    #[test]
+    fn rtype_llstr_string_repr_emits_same_as() {
+        use crate::annotator::model::s_str0;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let hop = dummy_hop();
+        let s_str = s_str0();
+        let r_from = hop.rtyper.getrepr(&s_str).expect("StringRepr");
+        let r_str = string_repr();
+        assert!(
+            Arc::ptr_eq(&(r_str.clone() as Arc<dyn Repr>), &r_from),
+            "SomeString rtypes as the string_repr singleton"
+        );
+        let v = Variable::new();
+        v.set_concretetype(Some(r_str.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v.clone()));
+        hop.args_s.borrow_mut().push(s_str);
+        hop.args_r.borrow_mut().push(Some(r_from));
+        let strptr = STRPTR.clone();
+        let LowLevelType::Ptr(ptr) = &strptr else {
+            panic!("STRPTR must be a Ptr");
+        };
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((**ptr).clone())) as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_llstr(&hop, &HashMap::new())
+            .expect("LLStrEntry.specialize_call")
+            .expect("same_as result");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1, "identity convertvar emits no extra op");
+        assert_eq!(ops.ops[0].opname, "same_as");
+        assert_eq!(
+            ops.ops[0].args.as_slice(),
+            &[Hlvalue::Variable(v)],
+            "same_as operand is the string_repr variable"
+        );
+        let Hlvalue::Variable(result) = &out else {
+            panic!("same_as result is a Variable, got {out:?}");
+        };
+        assert_eq!(result.concretetype(), Some(strptr));
+        assert_eq!(ops.ops[0].result, out);
+    }
+
+    /// `LLStrEntry.specialize_call` (`annlowlevel.py`) always
+    /// `inputarg(string_repr, 0)`. `pairtype(PtrRepr, StringRepr)` has no
+    /// `convert_from_to` (`rptr.py` defines it for `pairtype(PtrRepr, PtrRepr)`
+    /// only). `pairtype(Repr, Repr).convert_from_to` returns `NotImplemented`
+    /// (`rmodel.py`), so `llstr` of a `SomePtr(STRPTR)` is rejected.
+    #[test]
+    fn rtype_llstr_someptr_strptr_is_rejected() {
+        use crate::annotator::model::SomePtr;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        let hop = dummy_hop();
+        let strptr = STRPTR.clone();
+        let LowLevelType::Ptr(ptr) = strptr.clone() else {
+            panic!("STRPTR must be a Ptr");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new((*ptr).clone()));
+        let r_ptr = hop.rtyper.getrepr(&s_ptr).expect("PtrRepr(STRPTR)");
+        assert_eq!(r_ptr.class_name(), "PtrRepr");
+        assert_eq!(r_ptr.lowleveltype(), &strptr);
+        let v = Variable::new();
+        v.set_concretetype(Some(strptr));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
+        hop.args_s.borrow_mut().push(s_ptr);
+        hop.args_r.borrow_mut().push(Some(r_ptr));
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((*ptr).clone())) as Arc<dyn Repr>);
+
+        let err = rtype_llstr(&hop, &HashMap::new())
+            .expect_err("SomePtr(STRPTR) is not converted to string_repr");
+        let text = err.to_string();
+        assert!(
+            text.contains("don't know how to convert") && text.contains("PtrRepr"),
+            "pairtype(Repr, Repr).convert_from_to is NotImplemented, got {text}"
+        );
+        assert!(
+            hop.llops.borrow().ops.is_empty(),
+            "rejected llstr emits no same_as"
+        );
     }
 
     #[test]

@@ -219,6 +219,27 @@ extern "C" fn handle_alloc_error_word_jit_abi(layout: i64) {
     std::alloc::handle_alloc_error(layout);
 }
 
+/// Word ABI for `gc_roots::push_roots`.
+///
+/// `rlib/jit.py` `dont_look_inside` residualises the call, and
+/// `jtransform.py` `handle_residual_call` / `direct_funcptr_value` store
+/// that address in the jitcode. `RootScope` is one `usize`
+/// (`root_scope_payload_is_one_word`) but not a trampoline scalar, so
+/// `emit_helper_call_target_fn` publishes no `HELPER_FNADDRS` row
+/// (`HelperFnAddrSkip::Other`). `bh_call_i_dispatch` calls
+/// `extern "C" fn() -> i64` and reads the whole return register — the
+/// `pin_roots_jit_abi` shape, not the raw `fn() -> RootScope`.
+///
+/// The opener is [`pyre_object::gc_roots::push_roots_word`], the word form
+/// beside `root_scope_close_word`. This adapter only widens that `usize`
+/// to the `i64` the table publishes. `Drop` does not run there; the caller
+/// still holds the save-point word and closes it with
+/// `root_scope_close_word`.
+extern "C" fn push_roots_word() -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::push_roots_word");
+    pyre_object::gc_roots::push_roots_word() as i64
+}
+
 /// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
 /// interpreter's traced frame-enter paths call it beside the write barrier.
 extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
@@ -2618,9 +2639,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The drain's prologue (`w_list_new_object_with_sizehint`) wraps opaque
     // host plumbing and has a one-word return, so publish it as a
     // residual-call target. Keep `w_list_new_empty` registered for its other
-    // residual sites.
-    // `w_list_new_object` is residualized (`#[dont_look_inside]`) but was
-    // unregistered; bind it too so any direct residual site resolves.
+    // residual sites. `w_list_new_object`'s by-value `Vec` is one header word
+    // (`RustVecRepr`); `helper_arg_from_i64` publishes that trampoline, so
+    // the raw `fn(Vec) -> PyObjectRef` is not registered.
     pa0!(
         &mut entries,
         "pyre_object::listobject::w_list_new_empty",
@@ -2670,16 +2691,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::noneobject::w_none",
         "pyre_object::w_none",
         pyre_object::noneobject::w_none,
-    );
-    let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
-        pyre_object::listobject::w_list_new_object;
-    // ABI-UNSOUND: `Vec<PyObjectRef>` is three words by value; a residual argument slot is one.
-    push_abi_unsound_argument_alias_pair(
-        &mut entries,
-        &mut abi_unsound_arguments,
-        "pyre_object::listobject::w_list_new_object",
-        "pyre_object::w_list_new_object",
-        w_list_new_object as *const (),
     );
     // `drain_collect_items` deliberately remains unpublished: its multiword
     // `Vec<PyObjectRef>` return has no one-word residual-call ABI.
@@ -2960,6 +2971,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::shadow_stack_len",
         "pyre_object::shadow_stack_len",
         pyre_object::gc_roots::shadow_stack_len,
+    );
+    // Opens the bracket `root_scope_close_word` closes. The codewriter
+    // hashes `pyre_object::gc_roots::push_roots` (`direct_funcptr_value`);
+    // bind `push_roots_word` there, the `pin_roots_jit_abi` /
+    // `shadow_stack_push_word` shape.
+    cpa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        push_roots_word,
     );
     pa1!(
         &mut entries,
@@ -8017,10 +8038,10 @@ mod tests {
         ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
-        pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
-        pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs,
-        replace_value_word_jit_abi, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
+        push_roots_word, pyframe_get_w_globals_word, pyframe_load_global_value_word,
+        pyframe_load_name_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
+        pyre_class_typeidcell_addrs, replace_value_word_jit_abi, shadow_stack_get_word,
+        shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
         w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
         w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
@@ -8541,6 +8562,36 @@ mod tests {
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
         }
+    }
+
+    /// `push_roots` is `dont_look_inside` and returns `RootScope`, which
+    /// `emit_helper_call_target_fn` does not lower. The blackhole calls the
+    /// published address through `bh_call_i` (`bhimpl_residual_call_r_i`),
+    /// so both spellings must be `push_roots_word`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_push_roots() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let raw = push_roots_word as *const () as usize as i64;
+        let rust_fn = pyre_object::gc_roots::push_roots as *const () as usize as i64;
+        assert_ne!(raw, 0);
+        assert_ne!(
+            raw, rust_fn,
+            "must publish the extern \"C\" word wrapper, not fn() -> RootScope"
+        );
+        for path in [
+            "pyre_object::gc_roots::push_roots",
+            "pyre_object::push_roots",
+        ] {
+            assert_eq!(bindings.get(path).copied(), Some(raw), "missing {path}");
+        }
+        assert!(super::is_rewindable_root_bracket_residual(raw as usize));
+        let call: extern "C" fn() -> i64 = unsafe { std::mem::transmute(raw as usize) };
+        let before = pyre_object::gc_roots::shadow_stack_len();
+        let word = call();
+        assert_eq!(word as usize, before, "RootScope word is the save point");
+        assert_eq!(pyre_object::gc_roots::shadow_stack_len(), before);
+        pyre_object::gc_roots::root_scope_close_word(word as usize);
+        assert_eq!(pyre_object::gc_roots::shadow_stack_len(), before);
     }
 
     /// The three published addresses answer through the word ABI a residual

@@ -1561,12 +1561,13 @@ fn substitute_field_type(
 ///
 /// [`substitute_field_type`] renders the type argument. When that
 /// argument's `TypeDecl` is `#[repr(transparent)]` and its unique
-/// non-ZST field is a `RawPtr`, the field is that pointer
-/// ([`transparent_rawptr_field_spelling`]). The struct's own name keeps
-/// [`render_adt_type_args`]. `rmodel.py` `externalvsinternal`
-/// (`gcref=False`): an instance key's internal repr is its object
-/// pointer. `rordereddict.py` `DICTENTRY` stores `key` as `DICTKEY`,
-/// one field.
+/// non-ZST field is a thin `RawPtr`, the field is that pointer
+/// ([`transparent_rawptr_field_spelling`]). `lltype.py` `Ptr` is one
+/// word. A `str` / `[T]` / `dyn` pointee stays the wrapper spelling.
+/// The struct's own name keeps [`render_adt_type_args`]. `rmodel.py`
+/// `externalvsinternal` (`gcref=False`): an instance key's internal
+/// repr is its object pointer. `rordereddict.py` `DICTENTRY` stores
+/// `key` as `DICTKEY`, one field.
 fn entry_substituted_field_type(
     ty: &TyRef,
     args: &[String],
@@ -1587,8 +1588,10 @@ fn entry_substituted_field_type(
 }
 
 /// `*mut` / `*const` spelling of a type-variable field whose argument is
-/// a transparent single-`RawPtr` wrapper. A type argument that is already
-/// a `RawPtr` (or an alias of one) stays with [`substitute_field_type`].
+/// a transparent thin-`RawPtr` wrapper (`lltype.py` `Ptr`, one word).
+/// A fat pointee (`str`, `[T]`, `dyn`) stays with
+/// [`substitute_field_type`]. A type argument that is already a `RawPtr`
+/// (or an alias of one) stays there too.
 fn entry_typevar_transparent_rawptr_spelling(
     ty: &TyRef,
     subst: &[serde_json::Value],
@@ -5804,6 +5807,13 @@ fn published_struct_field_layout(
         // `*mut u8` stays on the Ref fallback for GCREF / STR producers
         // (`raw_thin_pointer_spelling`).
         "*const u8".to_string()
+    } else if let Some(spelling) =
+        closure_env_shared_primitive_layout_spelling(owner_is_closure_env, field_ty, llbc)
+    {
+        // Shared `&P` capture. Same scalar [`adt_field_read_value_type`]
+        // reads (`getfield_gc_i`). `get_type_flag` of `&P` is FLAG_POINTER,
+        // which makes `do_setfield_gc` refuse the int store.
+        spelling
     } else {
         // `FloatArray.block` / `IntArray.block` stay `*mut TypedItemsBlock`.
         // That spelling projects as `SomePtr(GcArray(ITEM))` of the
@@ -9540,6 +9550,18 @@ pub struct LowerContext<'a> {
     /// Structs and enums declared Gc across this one artefact.
     /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// `record_struct_id` class objects. `StructFieldRegistry` keeps
+    /// `RefCell` query caches, so it is not `Sync`; the field rows live
+    /// in [`Self::struct_fields`] and this map is copied onto the
+    /// registry [`lower_fun_decl`] rebuilds. `spelling_has_class_identity`
+    /// and `struct_root_template_is_gcarray_item` read it (`lltype.py`
+    /// `GcArray` ITEM, `rclass.OBJECTPTR`).
+    class_identity:
+        std::collections::HashMap<String, Option<crate::front::semantic::ClassIdentity>>,
+    /// Declared-GC spellings after `note_declared_gc_owner` (harvest
+    /// seeds plus each declaration path). Same registry copy as
+    /// [`Self::class_identity`].
+    registry_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -9599,6 +9621,8 @@ impl<'a> LowerContext<'a> {
         // Same cell-instantiation pass [`CrateLoweringState::new`] runs
         // after the artefact's tombstone set is final.
         register_std_cell_instantiation_rows(llbc, &mut struct_fields, &tombstoned_leaves);
+        let class_identity = struct_fields.class_identity.clone();
+        let registry_gc_struct_ids = struct_fields.gc_struct_ids.clone();
         Self {
             llbc,
             struct_field_attrs,
@@ -9610,6 +9634,8 @@ impl<'a> LowerContext<'a> {
             )),
             tombstoned_leaves,
             gc_struct_ids,
+            class_identity,
+            registry_gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,
             gc_root_effects: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -9639,10 +9665,7 @@ impl<'a> LowerContext<'a> {
     /// `CallControl` so `fielddescrof` can `getattr` the names the
     /// lowering emitted (`descr.py get_field_descr`).
     pub fn struct_field_registry(&self) -> crate::front::semantic::StructFieldRegistry {
-        let mut registry =
-            struct_field_registry_from_rows(&self.struct_fields, &self.foreign_callables);
-        registry.gc_struct_ids = self.gc_struct_ids.clone();
-        registry
+        lowering_struct_field_registry(self)
     }
 
     /// Record body-carrying FunDecls from another loaded crate so an
@@ -9672,6 +9695,20 @@ fn struct_field_registry_from_rows(
         foreign_callables: foreign_callables.to_vec(),
         ..Default::default()
     }
+}
+
+/// Field rows plus the class-identity and declared-GC maps
+/// [`LowerContext`] kept off the `RefCell` registry. One copy per
+/// lowering, not per field (`struct_root_template_is_gcarray_item`,
+/// `spelling_has_class_identity`).
+fn lowering_struct_field_registry(
+    context: &LowerContext<'_>,
+) -> crate::front::semantic::StructFieldRegistry {
+    let mut registry =
+        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
+    registry.class_identity = context.class_identity.clone();
+    registry.gc_struct_ids = context.registry_gc_struct_ids.clone();
+    registry
 }
 
 pub fn lower_fun_decl_with_static_addrs(
@@ -9708,8 +9745,7 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
-    let struct_fields =
-        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
+    let struct_fields = lowering_struct_field_registry(context);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();

@@ -477,16 +477,10 @@ fn get_fielddescr_index_in_from(
                 cur_index = -r - 1;
                 continue;
             }
-            // `get_fielddescr_index_in` recurses into a nested STRUCT and
-            // does not number it as a slot; `all_interiorfielddescrs`
-            // raises `array(struct(struct))`. `rdict.py` `recast_key`
-            // reads that ADT as one item field (`getinteriorfield` of
-            // `key`), so an exact name match is the interior descr of
-            // the nested struct. Leaf lookups still recurse, so later
-            // fields keep their flattened indices.
-            if name == fieldname {
-                return cur_index;
-            }
+            // `get_fielddescr_index_in` recurses into a nested STRUCT
+            // and numbers leaves only. The containing struct's name is
+            // not a slot (`heaptracker.py` `all_interiorfielddescrs`
+            // raises `UnsupportedFieldExc` for `array(struct(struct))`).
             if has_direct {
                 // Count inner leaves; do not return an inner name match.
                 let r = get_fielddescr_index_in_from(
@@ -972,7 +966,9 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "c", 0), 2);
-        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), 0);
+        // `inner` is the containing struct, not a leaf. The walk reports
+        // the not-found encoding over the three leaves (a, b, c).
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), -4);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -4);
     }
 
@@ -1005,7 +1001,9 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "x", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "y", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 3);
-        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), 1);
+        // `inner` has no slot. The not-found encoding covers the four
+        // leaves (a, x, y, b); `x` stays the first leaf of `Inner`.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), -5);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -5);
     }
 }

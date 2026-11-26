@@ -14,7 +14,7 @@
 //! `dispatch_inline_call_*` per-shape dispatchers. The `inline_call_*`
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
-use majit_jitcode::codewriter::jitcode::DescentBlockerSummary;
+use majit_jitcode::codewriter::jitcode::{DESCENT_ENTRY_LEN_SLOTS, DescentBlockerSummary};
 use pyre_interpreter::locals_w;
 use rustpython_wtf8::Wtf8;
 
@@ -688,7 +688,7 @@ enum FreshFrameGotoFold {
 /// `None` when a reachable instruction cannot be decoded. Walks the CFG from
 /// pc 0: fallthrough, `goto` targets, both successors of every other
 /// conditional, `switch` targets, and catch/landing edges
-/// ([`summarize_descent_blockers`]).
+/// ([`descent_blocker_summary`]).
 pub(crate) fn decoded_ops_on_fresh_frame(
     body_code: &[u8],
     descr_refs: &[DescrRef],
@@ -1746,7 +1746,7 @@ pub(crate) fn exception_string_override_straight_line(
 /// the formatting stays out of the wrapper's hot JitCode.  Declining on them
 /// refuses the wrapper for the shape of its error path.
 ///
-/// [`summarize_descent_blockers`] therefore walks the body's control-flow graph
+/// [`descent_blocker_summary`] therefore walks the body's control-flow graph
 /// carrying whether an effect has executed plus the Int/array-length facts it
 /// can prove.  A known condition follows one successor exactly; a red
 /// condition conservatively joins both.  It reports the two kinds of blocker
@@ -1758,11 +1758,15 @@ pub(crate) fn exception_string_override_straight_line(
 /// name.
 ///
 /// The scan follows `inline_call_*` into the callee bodies the descent would
-/// enter, because the abort propagates from any depth.  A body already on the
-/// scan stack is a cycle, and answers "executes an effect, names no blocker":
-/// the blockers behind the recursion belong to the occurrence that opened it,
-/// but reporting no effect there would let a blocker past the recursion read
-/// as effect-free, which is the one direction this scan may not err in.
+/// enter, because the abort propagates from any depth. A cycle is one
+/// strongly connected component of that graph. Every member is published
+/// with the same summary, the least fixpoint of [`DescentBlockerSummary::join`]
+/// (`graphanalyze.py` `join_two_results`). A back-edge during the solve
+/// answers "executes an effect, names no blocker" — reporting no effect
+/// there would let a blocker past the recursion read as effect-free, which
+/// is the one direction this scan may not err in — and the iteration carries
+/// blockers around the component. The answer is memoized on each member, so
+/// a callee is walked once per entry color.
 ///
 /// The answer names the blocker rather than merely reporting one, because a
 /// declined descent is a wall to be removed and the removal work is per
@@ -1771,11 +1775,10 @@ pub(crate) fn exception_string_override_straight_line(
 /// `jit_metadata.json` carries.
 ///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
-/// (body, entry argument-array length) rather than once per call site.  Only
-/// this entry point memoizes: the summary a cycle produces belongs to the
-/// occurrence that opened it, not to the body, so
-/// [`summarize_descent_blockers`] caches nothing, and a body entered with more
-/// than [`DESCENT_ENTRY_LEN_SLOTS`] arguments recomputes.
+/// (body, entry argument-array length) rather than once per call site. A
+/// body entered with more than [`DESCENT_ENTRY_LEN_SLOTS`] arguments has no
+/// slot on the jitcode; one solve still memoizes that color for the walk
+/// that asked.
 fn descent_decline(
     jitcode_index: usize,
     entry_array_lengths: &[(usize, usize)],
@@ -1783,11 +1786,7 @@ fn descent_decline(
     if !descent_unlowered_helper_scan_enabled() {
         return None;
     }
-    let summary = match entry_array_lengths {
-        [] => descent_blocker_summary(jitcode_index),
-        &[(0, entry_len)] => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
-        other => summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), other),
-    };
+    let summary = descent_blocker_summary_at(jitcode_index, entry_array_lengths);
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
     }
@@ -1806,12 +1805,16 @@ fn descent_decline(
 /// `ResumeDataDirectReader.consume_one_section` and is not a blocker.
 /// A helper section has no Python coordinate the interpreter could continue
 /// from, so a guard whose helper sections can reach a blocker cannot be
-/// numbered. The scan runs from the body's entry with the facts the descent
-/// scan proves there (`entry_array_len`, the length of a gateway's argument
-/// array), so an arm those facts exclude on every path to `pc` is not
-/// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary. An inline callee with a callable `fnaddr` contributes
-/// no body blockers: the blackhole calls it natively (`bhimpl_inline_call_*`).
+/// numbered. The scan serves `blackhole.py` `_resume_mainloop`
+/// executability: whether resuming this helper at `pc` can run a section
+/// the blackhole cannot finish. It runs from the body's entry with the
+/// facts the descent scan proves there (`entry_array_len`, the length of a
+/// gateway's argument array), so an arm those facts exclude on every path
+/// to `pc` is not counted. Callees named by `inline_call_*` past `pc` count
+/// with their whole-body summary. An inline callee with a callable `fnaddr`
+/// contributes no body blockers: the blackhole calls it natively
+/// (`bhimpl_inline_call_*`). Repeated `(jitcode, pc, entry_array_len)`
+/// inputs read [`PyJitCodePayload::helper_resume_blocker`].
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1874,20 +1877,9 @@ pub(crate) fn helper_resume_reaches_blocker(
             || summary.blocker_effect_free.is_some()
             || summary.blocker_after_effect.is_some()
     };
-    // Only the entry without argument-array facts is memoized per pc; a
-    // gateway's answer depends on the call site's argument count.
-    if entry_array_len.is_some() {
-        return scan();
-    }
-    let memo = pjc.helper_resume_blockers.get_or_init(|| {
-        (0..pjc.jitcode.code.len())
-            .map(|_| std::cell::OnceCell::new())
-            .collect()
-    });
-    match memo.get(pc) {
-        Some(slot) => *slot.get_or_init(scan),
-        None => true,
-    }
+    // `scan` holds `payload`. The memo lives on the same allocation through
+    // `pjc`, so the closure is not borrowing the receiver it is passed to.
+    pjc.helper_resume_blocker(pc, entry_array_len, scan)
 }
 
 /// Why a descent into a body is refused.
@@ -1999,7 +1991,7 @@ fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
 /// each paired with whether an effect had already been applied on some path to
 /// it — the `*` suffix in the `[builtin-inline-reachable]` line.
 ///
-/// [`summarize_descent_blockers`] answers the production question, "does this
+/// [`descent_blocker_summary`] answers the production question, "does this
 /// descent abort unrewindably", and so stops at the first blocker on each path
 /// and names one.  Removing a wall asks the other question: what stands behind
 /// that first blocker, because clearing it only moves the decline to the next.
@@ -2183,33 +2175,67 @@ fn body_not_walked() -> DescentBlockerSummary {
     }
 }
 
-/// Memoizing entry point for [`summarize_descent_blockers`] with the entry
+/// Memoizing entry point for [`descent_blocker_summary`] with the entry
 /// argument-array length a call site knows.
 fn descent_blocker_summary_for_entry_len(
     jitcode_index: usize,
     entry_len: usize,
 ) -> DescentBlockerSummary {
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+    if let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) {
+        if let Some(cached) = jitcode.descent_blocker_summary_for_entry_len_if_computed(entry_len) {
+            return cached;
+        }
+    } else {
         return body_not_walked();
-    };
-    jitcode.descent_blocker_summary_for_entry_len(entry_len, || {
-        summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), &[(0, entry_len)])
-    })
+    }
+    DescentSolver::production().eval(
+        DescentNode {
+            index: jitcode_index,
+            entry: EntryKey::from_pairs(&[(0, entry_len)]),
+        },
+        None,
+    )
 }
 
-/// Memoizing entry point for [`summarize_descent_blockers`].
+/// Memoizing entry point for the fact-free descent-blocker summary.
 pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
         // The same condition the descent answers `body_not_walked` for, one
         // level up and with nothing walked at all.  Unreachable from the gate,
-        // which holds the `JitCode` this index came off; see the note in
-        // `summarize_descent_blockers`.
+        // which holds the `JitCode` this index came off.
         return body_not_walked();
     };
-    jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
+    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
+        return cached;
+    }
+    DescentSolver::production().eval(
+        DescentNode {
+            index: jitcode_index,
+            entry: EntryKey::Free,
+        },
+        None,
+    )
 }
 
-/// One reachable point of [`summarize_descent_blockers`]'s dataflow.
+/// [`descent_blocker_summary`] at the entry facts `entry_array_lengths`.
+fn descent_blocker_summary_at(
+    jitcode_index: usize,
+    entry_array_lengths: &[(usize, usize)],
+) -> DescentBlockerSummary {
+    match EntryKey::from_pairs(entry_array_lengths) {
+        EntryKey::Free => descent_blocker_summary(jitcode_index),
+        EntryKey::Len(entry_len) => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
+        entry => DescentSolver::production().eval(
+            DescentNode {
+                index: jitcode_index,
+                entry,
+            },
+            None,
+        ),
+    }
+}
+
+/// One reachable point of [`descent_blocker_summary`]'s dataflow.
 ///
 /// The carried facts only lose information when two paths meet — `effect` goes
 /// false to true, disagreeing known-value slots go to `None`, freshness goes
@@ -2747,132 +2773,332 @@ fn known_goto_if_taken(
     Some(!predicate)
 }
 
-/// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
-/// jitcode indices currently being scanned.
-fn summarize_descent_blockers(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-) -> DescentBlockerSummary {
-    let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_hits)
-}
-
-/// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
-/// when the answer belongs to that body.
+/// Entry color of one inline-call edge.
 ///
-/// A callee is scanned with no entry facts, so what it computes is the same
-/// fact-free summary [`descent_blocker_summary`] holds — except under a cycle,
-/// where a body already on the stack answers "executes an effect, names no
-/// blocker" for the occurrence that opened the cycle rather than for the body.
-/// A subtree that took that arm nowhere did not read the stack at all and its
-/// answer is a property of the body alone.  Without the memo a callee shared by
-/// several paths is re-walked once per path, and the walk is transitive, so the
-/// scan a single gateway pays grows with the shape of the graph beneath it.
-fn summarize_descent_blockers_cached(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-    cycle_hits: &mut u64,
-) -> DescentBlockerSummary {
-    if seen.contains(&jitcode_index) {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    }
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    };
-    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
-        return cached;
-    }
-    let cycles_before = *cycle_hits;
-    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    if *cycle_hits == cycles_before {
-        jitcode.descent_blocker_summary(|| summary);
-    }
-    summary
+/// Fact-free and a known r0 length are different nodes, so a length-pruned
+/// walk is not joined into the fact-free summary unless a colored edge
+/// actually returns. Lengths below [`DESCENT_ENTRY_LEN_SLOTS`] have a slot
+/// on the jitcode; any other fact vector lives only in the solver that
+/// asked for it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EntryKey {
+    Free,
+    Len(usize),
+    Other(Vec<(usize, usize)>),
 }
 
-/// [`summarize_descent_blockers`] with concrete facts known at the entry of
-/// the top body.  An identity trampoline (`inline_call_*` whose R varlist is
-/// exactly `[0]`) forwards a known r0 array length into the callee; every
-/// other callee keeps the fact-free summary.
-fn summarize_descent_blockers_with_entry(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-    entry_array_lengths: &[(usize, usize)],
-) -> DescentBlockerSummary {
-    // This memoization fence belongs to this analysis stack, not to the
-    // executing thread. Every recursive callee shares it; an independent
-    // analysis (including a reentrant one) must not change its value.
-    let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(
-        jitcode_index,
-        seen,
-        entry_array_lengths,
-        &mut cycle_hits,
-    )
+impl EntryKey {
+    fn from_pairs(pairs: &[(usize, usize)]) -> Self {
+        match pairs {
+            [] => EntryKey::Free,
+            [(0, len)] if *len < DESCENT_ENTRY_LEN_SLOTS => EntryKey::Len(*len),
+            other => EntryKey::Other(other.to_vec()),
+        }
+    }
 }
 
-fn summarize_descent_blockers_with_entry_inner(
-    jitcode_index: usize,
-    seen: &mut Vec<usize>,
-    entry_array_lengths: &[(usize, usize)],
-    cycle_hits: &mut u64,
-) -> DescentBlockerSummary {
-    if seen.contains(&jitcode_index) {
-        *cycle_hits += 1;
-        return DescentBlockerSummary {
-            may_execute_effect: true,
-            ..DescentBlockerSummary::default()
-        };
+/// One node of the inline-call graph the descent summary solves.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DescentNode {
+    index: usize,
+    entry: EntryKey,
+}
+
+/// Tarjan state for one top-level solve. Dropped with the solver: the
+/// published answer lives on the jitcode, not in this map. Same role as
+/// the `points` map in [`summarize_body_blockers_from`].
+#[derive(Default)]
+struct DescentWalk {
+    stack: Vec<DescentNode>,
+    pos: std::collections::HashMap<DescentNode, usize>,
+    low: Vec<usize>,
+    self_loop: Vec<bool>,
+    local: std::collections::HashMap<DescentNode, DescentBlockerSummary>,
+    fixing: bool,
+    fix_set: std::collections::HashSet<DescentNode>,
+    fix_estimate: DescentBlockerSummary,
+}
+
+/// Back-edge seed. An effect-free answer here would let a blocker past the
+/// recursion read as rewindable.
+fn descent_cycle_seed() -> DescentBlockerSummary {
+    DescentBlockerSummary {
+        may_execute_effect: true,
+        ..DescentBlockerSummary::default()
     }
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        // A body the scan cannot obtain is a callee it holds nothing about, so
-        // it answers the same way as an `inline_call` whose descr names no
-        // JitCode.  Returning the default instead would say "executes no
-        // effect, holds no blocker" — the most permissive answer there is,
-        // reached by not looking — and would also let the blocker behind such a
-        // call read as effect-free, which asserts a rewind covers it.
-        //
-        // Unreachable in a consistent build, and not for the reason the entry
-        // point's own lookup suggests: `descent_blocker_summary` resolves the
-        // index before calling here, so at the top level this repeats a lookup
-        // that just succeeded and only the `inline_call` descent can arrive
-        // with an index of its own.  `get_jitcode_ref_by_index` answers `None`
-        // only past the end of the table — inside it, the cell is loaded on
-        // demand — and every `JitCode` descr names an index inside it: 2335 of
-        // 2335 in this build, over a table of 2905 whose indices are dense.
-        return body_not_walked();
-    };
-    seen.push(jitcode_index);
-    let descrs = crate::jitcode_runtime::descr_ref_table();
-    let summary = summarize_body_blockers_with(
-        jitcode.code.as_slice(),
-        jitcode.num_regs_i(),
-        jitcode.constants_i.as_slice(),
-        |descr_index, _caller_effect, entry_lens| {
-            let callee = descrs
-                .at(descr_index)
-                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
-            match entry_lens {
-                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
-                // Nested identity-trampoline facts stay on this `seen` path.
-                // The entry-length OnceLock starts an empty `seen`, so an
-                // A → B → A trampoline would reenter A's in-progress slot.
-                other => Some(summarize_descent_blockers_with_entry_inner(
-                    callee, seen, other, cycle_hits,
-                )),
+}
+
+struct DescentSolver<'a> {
+    table: Option<&'a [std::sync::Arc<majit_jitcode::jitcode::JitCode>]>,
+    callees: Option<&'a std::collections::HashMap<(usize, usize), usize>>,
+    walk: std::cell::RefCell<DescentWalk>,
+}
+
+impl<'a> DescentSolver<'a> {
+    fn production() -> Self {
+        Self {
+            table: None,
+            callees: None,
+            walk: std::cell::RefCell::new(DescentWalk::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        table: &'a [std::sync::Arc<majit_jitcode::jitcode::JitCode>],
+        callees: &'a std::collections::HashMap<(usize, usize), usize>,
+    ) -> Self {
+        Self {
+            table: Some(table),
+            callees: Some(callees),
+            walk: std::cell::RefCell::new(DescentWalk::default()),
+        }
+    }
+
+    fn load(&self, index: usize) -> Option<std::sync::Arc<majit_jitcode::jitcode::JitCode>> {
+        if let Some(table) = self.table {
+            return table.get(index).cloned();
+        }
+        crate::jitcode_runtime::get_jitcode_ref_by_index(index).map(std::sync::Arc::clone)
+    }
+
+    fn resolve(&self, caller: usize, descr: usize) -> Option<usize> {
+        if let Some(callees) = self.callees {
+            return callees.get(&(caller, descr)).copied();
+        }
+        crate::jitcode_runtime::descr_ref_table()
+            .at(descr)
+            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+    }
+
+    fn published(&self, node: &DescentNode) -> Option<DescentBlockerSummary> {
+        match &node.entry {
+            EntryKey::Other(_) => self.walk.borrow().local.get(node).copied(),
+            EntryKey::Free => self.load(node.index)?.descent_blocker_summary_if_computed(),
+            EntryKey::Len(len) => self
+                .load(node.index)?
+                .descent_blocker_summary_for_entry_len_if_computed(*len),
+        }
+    }
+
+    fn publish(&self, node: &DescentNode, summary: DescentBlockerSummary) -> DescentBlockerSummary {
+        match &node.entry {
+            EntryKey::Free => {
+                if let Some(jitcode) = self.load(node.index) {
+                    return jitcode.descent_blocker_summary(|| summary);
+                }
             }
-        },
-        &mut |_blocker, _effect| true,
-        &mut residual_call_is_effect_free,
-        &mut switch_descr_targets,
-        entry_array_lengths,
-        descr_refs_for_jitcode_index(jitcode_index),
-    );
-    seen.pop();
-    summary
+            EntryKey::Len(len) => {
+                if let Some(jitcode) = self.load(node.index) {
+                    return jitcode.descent_blocker_summary_for_entry_len(*len, || summary);
+                }
+            }
+            EntryKey::Other(_) => {
+                self.walk.borrow_mut().local.insert(node.clone(), summary);
+            }
+        }
+        summary
+    }
+
+    /// Strongly connected component of the inline-call graph, solved once.
+    ///
+    /// Acyclic nodes publish the one-shot walk. A component (a self-loop or
+    /// two or more members) iterates [`DescentBlockerSummary::join`]
+    /// (`graphanalyze.py` `join_two_results`) from [`descent_cycle_seed`]
+    /// and stores that one summary on every member. Intra-component calls
+    /// return the current estimate, so the body's own entry effect stays
+    /// false until a callee says otherwise.
+    fn eval(&self, node: DescentNode, caller: Option<usize>) -> DescentBlockerSummary {
+        if let Some(summary) = self.published(&node) {
+            return summary;
+        }
+        {
+            let mut walk = self.walk.borrow_mut();
+            if walk.fixing && walk.fix_set.contains(&node) {
+                return walk.fix_estimate;
+            }
+            if let Some(&target) = walk.pos.get(&node) {
+                if let Some(caller) = caller {
+                    if caller == target {
+                        walk.self_loop[caller] = true;
+                    }
+                    walk.low[caller] = walk.low[caller].min(target);
+                }
+                return descent_cycle_seed();
+            }
+        }
+        if self.load(node.index).is_none() {
+            // A body the scan cannot obtain is a callee it holds nothing
+            // about. The default would say "no effect, no blocker".
+            return body_not_walked();
+        }
+        let pos = {
+            let mut walk = self.walk.borrow_mut();
+            let pos = walk.stack.len();
+            walk.pos.insert(node.clone(), pos);
+            walk.stack.push(node.clone());
+            walk.low.push(pos);
+            walk.self_loop.push(false);
+            pos
+        };
+        let one_shot = self.walk_body(&node, Some(pos));
+        self.finish(pos, one_shot, caller)
+    }
+
+    fn finish(
+        &self,
+        pos: usize,
+        one_shot: DescentBlockerSummary,
+        caller: Option<usize>,
+    ) -> DescentBlockerSummary {
+        let rooted = {
+            let mut walk = self.walk.borrow_mut();
+            if walk.low[pos] != pos {
+                if let Some(caller) = caller {
+                    let child_low = walk.low[pos];
+                    walk.low[caller] = walk.low[caller].min(child_low);
+                }
+                return one_shot;
+            }
+            let looped = walk.self_loop[pos..].iter().copied().any(|flag| flag);
+            let members: Vec<DescentNode> = walk.stack.drain(pos..).collect();
+            for member in &members {
+                walk.pos.remove(member);
+            }
+            walk.low.truncate(pos);
+            walk.self_loop.truncate(pos);
+            (members, looped)
+        };
+        let (members, looped) = rooted;
+        if members.len() == 1 && !looped {
+            return self.publish(&members[0], one_shot);
+        }
+        let summary = self.fixpoint(&members);
+        let mut published = summary;
+        for member in &members {
+            published = self.publish(member, summary);
+        }
+        published
+    }
+
+    fn fixpoint(&self, members: &[DescentNode]) -> DescentBlockerSummary {
+        let saved = {
+            let mut walk = self.walk.borrow_mut();
+            let saved = (
+                walk.fixing,
+                std::mem::take(&mut walk.fix_set),
+                walk.fix_estimate,
+            );
+            walk.fixing = true;
+            walk.fix_set = members.iter().cloned().collect();
+            walk.fix_estimate = descent_cycle_seed();
+            saved
+        };
+        let mut estimate = descent_cycle_seed();
+        let mut converged = false;
+        for _ in 0..8 {
+            let mut joined = estimate;
+            for member in members {
+                self.walk.borrow_mut().fix_estimate = estimate;
+                joined = joined.join(self.walk_body(member, None));
+            }
+            if joined == estimate {
+                converged = true;
+                break;
+            }
+            estimate = joined;
+        }
+        {
+            let mut walk = self.walk.borrow_mut();
+            walk.fixing = saved.0;
+            walk.fix_set = saved.1;
+            walk.fix_estimate = saved.2;
+        }
+        if !converged {
+            // The lattice did not close. `body_not_walked` is the fail-closed
+            // answer; the join keeps every blocker the partial iteration saw.
+            estimate = estimate.join(body_not_walked());
+        }
+        estimate
+    }
+
+    fn walk_body(&self, node: &DescentNode, link_from: Option<usize>) -> DescentBlockerSummary {
+        let Some(jitcode) = self.load(node.index) else {
+            return body_not_walked();
+        };
+        let caller_index = node.index;
+        let len_pair = match &node.entry {
+            EntryKey::Len(len) => [(0, *len)],
+            _ => [(0, 0)],
+        };
+        let entry_pairs: &[(usize, usize)] = match &node.entry {
+            EntryKey::Free => &[],
+            EntryKey::Len(_) => &len_pair,
+            EntryKey::Other(pairs) => pairs.as_slice(),
+        };
+        let test_mode = self.table.is_some();
+        let descr_refs: &[DescrRef] = if test_mode {
+            &[]
+        } else {
+            descr_refs_for_jitcode_index(caller_index)
+        };
+        let mut call_effect_free =
+            |descr_index: usize| !test_mode && residual_call_is_effect_free(descr_index);
+        let mut switch_targets = |descr_index: usize| {
+            if test_mode {
+                None
+            } else {
+                switch_descr_targets(descr_index)
+            }
+        };
+        let mut callee_fnaddr = |descr_index: usize| {
+            if test_mode {
+                None
+            } else {
+                jitcode_fnaddr_for_descr(descr_index)
+            }
+        };
+        summarize_body_blockers_from(
+            None,
+            jitcode.code.as_slice(),
+            jitcode.num_regs_i(),
+            jitcode.constants_i.as_slice(),
+            |descr_index, _caller_effect, entry_lens| {
+                let callee = self.resolve(caller_index, descr_index)?;
+                Some(self.eval(
+                    DescentNode {
+                        index: callee,
+                        entry: EntryKey::from_pairs(entry_lens),
+                    },
+                    link_from,
+                ))
+            },
+            &mut |_blocker, _effect| true,
+            &mut call_effect_free,
+            &mut switch_targets,
+            entry_pairs,
+            &mut callee_fnaddr,
+            descr_refs,
+        )
+    }
 }
 
-/// The dataflow of [`summarize_descent_blockers`] over one body's bytes.
+/// Test entry: solve `index` against a local jitcode table.
+#[cfg(test)]
+pub(crate) fn descent_blocker_summary_for_test_table(
+    index: usize,
+    entry: Option<usize>,
+    jitcodes: &[std::sync::Arc<majit_jitcode::jitcode::JitCode>],
+    callees: &std::collections::HashMap<(usize, usize), usize>,
+) -> DescentBlockerSummary {
+    let entry = match entry {
+        None => EntryKey::Free,
+        Some(len) => EntryKey::from_pairs(&[(0, len)]),
+    };
+    DescentSolver::for_test(jitcodes, callees).eval(DescentNode { index, entry }, None)
+}
+
+/// The dataflow of [`descent_blocker_summary`] over one body's bytes.
 ///
 /// `callee_summary` answers an `inline_call`'s descr operand with the callee's
 /// own summary, or `None` when that operand names no JitCode.  Splitting it out
@@ -8630,6 +8856,63 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// Gateway `&[PyObjectRef]` the way `opimpl_new_array_clear` records it.
+///
+/// `execute_new_array_clear` runs `bh_new_array_clear` and attaches the
+/// pointer as `Op.value` before `history.record`; `execute_setarrayitem_gc`
+/// then stores each item. Recording `NewArrayClear` alone leaves the box
+/// unstamped, so `pin_roots_jit_abi` declines (`ValueUnavailable`) and the
+/// later `goto_if_not_ptr_iszero` cannot roll the descent back. The compiled
+/// ops stay `NewArrayClear` / `SetarrayitemGc` — the pointer is this
+/// iteration's value, and the compiled trace still allocates. The block is
+/// the one-word `GcTypedArray` `pin_roots_jit_abi` reads (length at 0, refs
+/// after it). No collector, or an item with no `Box.value`, leaves the
+/// result unstamped: `walker_fill_materialized_array` reverts, and the
+/// residual declines instead of pinning nulls.
+fn record_executed_gateway_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    wrapper_items: &[OpRef],
+) -> (OpRef, ConcreteValue) {
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    // `record_op_with_descr` can minor-collect. Allocate after it and stamp
+    // before the next record (`execute()` before the following `record()`).
+    if let Some(block) =
+        unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(wrapper_items.len()) }
+    {
+        ctx.trace_ctx.try_set_opref_concrete(
+            args_array,
+            majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+        );
+    }
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        // The wrapper reads its `&[PyObjectRef]` argument through this same
+        // ArrayDescr, so its getarrayitem returns the live CALL operand.
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+        super::heapcache_ops::walker_fill_materialized_array(ctx, args_array, index, item);
+    }
+    let concrete = match ctx.trace_ctx.box_value(args_array) {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
+            ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
+        }
+        _ => ConcreteValue::Null,
+    };
+    (args_array, concrete)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8681,26 +8964,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_concrete) = record_executed_gateway_args_array(ctx, wrapper_items);
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -8780,7 +9044,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -9219,24 +9483,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_concrete) = record_executed_gateway_args_array(ctx, &wrapper_items);
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
@@ -9274,7 +9521,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_concrete],
         &[],
     );
     drop(helper_frame);

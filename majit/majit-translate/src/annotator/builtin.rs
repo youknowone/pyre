@@ -315,6 +315,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "annlowlevel.cast_instance_to_base_ptr",
         cast_instance_to_base_ptr,
     );
+    // `LLStrEntry.compute_result_annotation` (`annlowlevel.py`):
+    // `llstr(s)` → `lltype_to_annotation(Ptr(STR))`.
+    analyzer_for(&mut reg, "annlowlevel.llstr", llstr);
     // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics.
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
     // (`flowspace/model.rs`); recognising it as a builtin keeps its body out
@@ -3484,6 +3487,25 @@ fn cast_instance_to_base_ptr(
     Ok(lltype_to_annotation(OBJECTPTR.clone()))
 }
 
+/// `LLStrEntry.compute_result_annotation` (`annlowlevel.py`) for
+/// `llstr(s)` → `SomePtr(Ptr(STR))`. The string argument is ignored.
+fn llstr(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "llstr() expects one positional argument",
+        ));
+    }
+    let s_str = arg_at(args_s, 0, "llstr");
+    Ok(crate::translator::rtyper::annlowlevel::LLStrEntry {
+        helper: crate::translator::rtyper::annlowlevel::llstr,
+    }
+    .compute_result_annotation(s_str))
+}
+
 /// Analyzer for `pyre_object::lltype::malloc[_typed]::<T>(value: T) -> *mut T`
 /// — the GC allocation intrinsics (`lltype.malloc(STRUCT, flavor='gc')`
 /// parity). Registered as builtins so their allocator implementations are
@@ -4028,6 +4050,22 @@ mod tests {
             matches!(out, SomeValue::Ptr(_)),
             "cast_instance_to_base_ptr(None) annotates as SomePtr(OBJECTPTR), got {out:?}"
         );
+    }
+
+    /// `LLStrEntry.compute_result_annotation` (`annlowlevel.py`):
+    /// `llstr` of a `SomeString` is `SomePtr(Ptr(STR))`.
+    #[test]
+    fn annlowlevel_llstr_annotates_ptr_str() {
+        use crate::annotator::model::s_str0;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        assert!(super::is_registered("annlowlevel.llstr"));
+        let out = super::llstr(&bk(), &[Some(s_str0())], &HashMap::new())
+            .expect("LLStrEntry.compute_result_annotation");
+        let SomeValue::Ptr(p) = &out else {
+            panic!("llstr annotates as SomePtr(Ptr(STR)), got {out:?}");
+        };
+        assert_eq!(LowLevelType::from(p.ll_ptrtype.clone()), STRPTR.clone());
     }
 
     /// `Option<fn>`'s null and a `fn` field read are one `SomePtr`.

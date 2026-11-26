@@ -33,10 +33,16 @@
 //!
 //! The items whose callable bodies are still scheduled as follow-ups:
 //!
-//! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
-//!   helper surfaces are present below, but their bodies still return
-//!   structured pending errors until the corresponding `rstr`, `llmemory`,
-//!   and cast specialization paths land.
+//! * `LLStrEntry.compute_result_annotation` / `specialize_call` for
+//!   `str` (`llstr`, `annlowlevel.py`) are ported. The interpreter-level
+//!   `llstr` body (`StringEntryHelper::call`, `mallocstr`) and the
+//!   unicode pair (`llunicode` / `hlunicode`) still return the pending
+//!   error. `hlstr` is not ported: a `STRPTR` field read is already
+//!   nullable `SomeString` (`strptr_as_somestring`).
+//! * The pointer-cast helper surfaces are present below, but their
+//!   interpreter-level bodies still return structured pending errors
+//!   until the corresponding `llmemory` and cast specialization paths
+//!   land.
 //! * `ADTInterface.__call__` (annlowlevel.py) — the type
 //!   surface is present; installing `_annenforceargs_` still lacks a
 //!   `ConstValue` carrier for method attributes.
@@ -1894,6 +1900,50 @@ pub struct HLStrEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LLStrEntry {
     pub helper: StringEntryHelper,
+}
+
+impl LLStrEntry {
+    /// `LLStrEntry.compute_result_annotation` (`annlowlevel.py`).
+    ///
+    /// `str` returns `lltype_to_annotation(Ptr(STR))`. `llunicode`
+    /// (`Ptr(UNICODE)`) has no store site and is not mirrored.
+    pub fn compute_result_annotation(&self, _s_str: &SomeValue) -> SomeValue {
+        debug_assert_eq!(self.helper.strtype, StringEntryType::Str);
+        lltype_to_annotation(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone())
+    }
+
+    /// `LLStrEntry.specialize_call` (`annlowlevel.py`).
+    ///
+    /// `hop.exception_cannot_occur()`; `v_ll_str = hop.inputarg(string_repr, 0)`;
+    /// `hop.genop('same_as', [v_ll_str], resulttype=hop.r_result.lowleveltype)`.
+    /// `inputarg` always asks `convertvar` for `string_repr`. Identity holds
+    /// only when `hop.args_r[0]` is that repr.
+    pub fn specialize_call(&self, hop: &HighLevelOp) -> RTypeResult {
+        hop.exception_cannot_occur()?;
+        if self.helper.strtype != StringEntryType::Str {
+            return Err(TyperError::message(
+                "annlowlevel.py:435 LLStrEntry.specialize_call: unicode (llunicode) has no store site"
+                    .to_string(),
+            ));
+        }
+        let r_str = super::rstr::string_repr();
+        let v_ll_str = hop.inputarg(r_str.as_ref(), 0)?;
+        let result_lltype = {
+            let r_result = hop.r_result.borrow();
+            r_result
+                .as_ref()
+                .ok_or_else(|| {
+                    TyperError::message("LLStrEntry.specialize_call: r_result missing".to_string())
+                })?
+                .lowleveltype()
+                .clone()
+        };
+        Ok(hop.genop(
+            "same_as",
+            vec![v_ll_str],
+            GenopResult::LLType(result_lltype),
+        ))
+    }
 }
 
 pub fn make_string_entries(strtype: StringEntryType) -> (StringEntryHelper, StringEntryHelper) {

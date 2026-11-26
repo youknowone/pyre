@@ -3175,10 +3175,11 @@ fn vec_extend_retargets_only_concrete_vec_sources() {
 /// `callable_w` — `lookup_in_type(t, "__call__").is_some()`.  The
 /// receiver is an owned `Option<PyObjectRef>` that Rust auto-refs to
 /// `&Option` at the call, so the receiver type arrives as `Ref(Option)`;
-/// the `_ref` guard + `tyref_ref_adt_def_id` peel it (the by-value
-/// `tyref_is_option` would see the `Ref` and miss).  After the fold no
-/// residual `is_some` Method call survives and a `__discriminant` read is
-/// present.  Ignored by default (loads the real LLBC).
+/// `tyref_shared_borrow_option_pointee` peels it.  After the fold no
+/// residual `is_some` call survives.  `Option<*mut PyObject>` is the
+/// one-word instance niche, so the predicate is `rnone.py`
+/// `rtype_is_None` (`is_(p, None)` / `bool(self)`), not a tagged
+/// `__discriminant` field.  Ignored by default (loads the real LLBC).
 #[test]
 #[ignore]
 fn is_some_fold_real_callable_w() {
@@ -3188,34 +3189,45 @@ fn is_some_fold_real_callable_w() {
     let llbc = crate::test_support::load_ullbc(path);
     let graph = crate::test_support::lower_function(llbc, "callable_w").expect("lower callable_w");
 
-    let method_calls = |leaf: &str| {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                        if name == leaf
-                )
-            })
-            .count()
-    };
+    let is_some_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "is_some" => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(|s| s.as_str()) == Some("is_some") => true,
+            _ => false,
+        })
+        .count();
     assert_eq!(
-        method_calls("is_some"),
-        0,
-        "residual &Option::is_some Method call removed by the fold"
+        is_some_calls, 0,
+        "residual Option::is_some call removed by the fold"
     );
-    let disc_reads = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
-            })
-            .count();
-    assert!(disc_reads >= 1, "the fold reads the Option __discriminant");
+    let null_tests = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "is_"
+            ) || matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "bool"
+            ) || matches!(&op.kind, OpKind::ConstNone)
+        })
+        .count();
+    assert!(
+        null_tests >= 1,
+        "the fold is rnone.py rtype_is_None (is_/bool/ConstNone); graph={}",
+        graph.dump()
+    );
 }
 
 /// Anchor `Option::or_else` to the real lowered IR of `space_int` —
@@ -40729,6 +40741,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             owner_root: None,
             cell_address: false,
             peeled_shared_primitive: false,
+            by_value_struct: None,
         }],
     })
 }
@@ -40783,6 +40796,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             owner_root: None,
             cell_address: false,
             peeled_shared_primitive: false,
+            by_value_struct: None,
         }],
     })
 }
@@ -41520,6 +41534,29 @@ pub(in crate::front::mir) fn interior_caller(
     serde_json::json!({
         "def_id": 0,
         "item_meta": interior_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {"arg_count": arg_count, "locals": locals},
+                "body": body
+            }
+        }
+    })
+}
+
+fn interior_fun(
+    def_id: u64,
+    path: &[&str],
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+    locals: Vec<serde_json::Value>,
+    body: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, true),
         "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
         "body": {
             "Unstructured": {
@@ -44027,6 +44064,213 @@ fn closure_env_cell_address_field_descr_is_int_kinded() {
             "cell-address field layout {layout} must be FLAG_UNSIGNED"
         );
     }
+}
+
+/// Captured `&usize` / `&u8` / `&bool` in a closure env intern as the
+/// scalar. `descr.py` `get_type_flag` of `&usize` is FLAG_POINTER; the
+/// read is already `getfield_gc_i` (`adt_field_read_value_type`). The
+/// row must be the scalar so `do_setfield_gc` writes the int. An
+/// ordinary struct's `&usize` stays a pointer. `&mut u8` stays the
+/// cell-address `*const u8` row.
+#[test]
+fn closure_env_shared_usize_capture_field_descr_is_unsigned() {
+    use majit_ir::descr::ArrayFlag;
+    use majit_ir::value::Type;
+    let usize_ty = interior_usize();
+    let u8_ty = interior_u8();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let shared_usize = interior_shared(usize_ty.clone());
+    let shared_u8 = interior_shared(u8_ty.clone());
+    let shared_bool = interior_shared(bool_ty);
+    let mut_u8 = serde_json::json!({"Ref": [null, u8_ty.clone(), "Mut"]});
+    let env_usize_ty = interior_adt(0);
+    let n_place = interior_place(1, &usize_ty);
+    let borrow_place = interior_place(2, &shared_usize);
+    let env_place = interior_place(0, &env_usize_ty);
+    let caller = interior_caller(
+        "capture_base",
+        0,
+        vec![],
+        env_usize_ty.clone(),
+        vec![
+            interior_local(0, None, &env_usize_ty),
+            interior_local(1, Some("n"), &usize_ty),
+            interior_local(2, Some("borrow"), &shared_usize),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    n_place.clone(),
+                    serde_json::json!({
+                        "Use": [interior_const_usize("62", &usize_ty), "No"]
+                    }),
+                ),
+                interior_assign(
+                    borrow_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": n_place,
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place,
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, null, null]},
+                            [{"Move": borrow_place}]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_usize = interior_closure_env(0, "EnvUsize", &[("base", shared_usize.clone())], 1);
+    let env_u8 = interior_closure_env(1, "EnvU8", &[("base", shared_u8.clone())], 2);
+    let env_bool = interior_closure_env(2, "EnvBool", &[("base", shared_bool.clone())], 3);
+    let env_mut = interior_closure_env(3, "EnvMut", &[("flag", mut_u8.clone())], 4);
+    let ordinary = interior_struct(
+        4,
+        &["fixture", "Ordinary"],
+        &[("base", shared_usize), ("byte", shared_u8)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![env_usize, env_u8, env_bool, env_mut, ordinary],
+        vec![caller],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "capture_base")
+        .expect("lower parent that captures &usize into a closure env");
+    let ops = graph_ops(&graph);
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER
+        )),
+        "a shared &usize capture is not a cell; ops={ops:?}"
+    );
+    let scalar = ops.iter().find_map(|op| match &op.kind {
+        OpKind::ConstUInt(62) | OpKind::ConstInt(62) => op.result.clone(),
+        _ => None,
+    });
+    let scalar = scalar.unwrap_or_else(|| panic!("parent must materialise the usize; ops={ops:?}"));
+    let stored = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(v),
+            ty,
+            ..
+        } if field.owner_root.as_deref() == Some("fixture::EnvUsize") && field.name == "base" => {
+            Some((v.clone(), ty.clone()))
+        }
+        _ => None,
+    });
+    let (stored, _stored_ty) =
+        stored.unwrap_or_else(|| panic!("closure env must store the capture; ops={ops:?}"));
+    assert_eq!(
+        stored, scalar,
+        "captured &usize must store the scalar, not a pointer; ops={ops:?}"
+    );
+    // The write's `ty` is the positional fallback. `fielddescrof` publishes
+    // the layout row (`get_type_flag`), and the assembler's `setfield_gc_*`
+    // bank is the stored value's kind. Those two are what `do_setfield_gc`
+    // compares.
+    let empty_ids = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let empty_names = std::collections::HashSet::<String>::new();
+    let expect = [
+        (0_u64, true, "usize", Type::Int, ArrayFlag::Unsigned, None),
+        (
+            1_u64,
+            true,
+            "u8",
+            Type::Int,
+            ArrayFlag::Unsigned,
+            Some(1_usize),
+        ),
+        (
+            2_u64,
+            true,
+            "bool",
+            Type::Int,
+            ArrayFlag::Unsigned,
+            Some(1_usize),
+        ),
+        (
+            3_u64,
+            true,
+            "*const u8",
+            Type::Int,
+            ArrayFlag::Unsigned,
+            None,
+        ),
+        (4_u64, false, "&usize", Type::Ref, ArrayFlag::Pointer, None),
+    ];
+    for (type_id, is_env, want_layout, want_ty, want_flag, want_size) in expect {
+        let td = llbc
+            .type_by_id(type_id)
+            .unwrap_or_else(|| panic!("type {type_id}"));
+        assert_eq!(
+            super::type_decl_is_closure_env(td),
+            is_env,
+            "type {type_id} closure-env bit"
+        );
+        let fields = super::type_decl_struct_fields(td, &llbc)
+            .unwrap_or_else(|| panic!("struct fields of type {type_id}"));
+        let field = fields
+            .first()
+            .unwrap_or_else(|| panic!("field of type {type_id}"));
+        let name = field.name.clone().unwrap_or_else(|| "base".to_string());
+        let layout = super::published_struct_field_layout(
+            td.item_meta.name_path_str(),
+            &name,
+            &field.ty,
+            is_env,
+            &llbc,
+            &empty_ids,
+            &empty_names,
+            &empty_names,
+            None,
+        );
+        assert_eq!(layout, want_layout, "type {type_id} layout");
+        let (flag, intern_ty, size) = crate::codewriter::call::get_type_flag(&layout, &empty_names);
+        assert_eq!(intern_ty, want_ty, "type {type_id} layout {layout}");
+        assert_eq!(flag, want_flag, "type {type_id} layout {layout}");
+        if let Some(want) = want_size {
+            assert_eq!(size, want, "type {type_id} layout {layout} size");
+        } else if want_ty == Type::Int && want_flag == ArrayFlag::Unsigned && want_layout == "usize"
+        {
+            assert_eq!(
+                size,
+                crate::layout::target_word_size(),
+                "usize capture is one machine word"
+            );
+        }
+    }
+    let ordinary_td = llbc.type_by_id(4).expect("ordinary struct");
+    let ordinary_fields = super::type_decl_struct_fields(ordinary_td, &llbc).expect("fields");
+    let byte = ordinary_fields.get(1).expect("byte field");
+    let byte_layout = super::published_struct_field_layout(
+        ordinary_td.item_meta.name_path_str(),
+        byte.name.as_deref().unwrap_or("byte"),
+        &byte.ty,
+        false,
+        &llbc,
+        &empty_ids,
+        &empty_names,
+        &empty_names,
+        None,
+    );
+    assert_eq!(byte_layout, "&u8");
+    let (byte_flag, byte_ty, _) =
+        crate::codewriter::call::get_type_flag(&byte_layout, &empty_names);
+    assert_eq!(byte_ty, Type::Ref);
+    assert_eq!(byte_flag, ArrayFlag::Pointer);
 }
 
 /// Nested closure capturing `&mut *(*outer_env).flag`. The reborrow is
@@ -50172,15 +50416,11 @@ fn assert_entry_owner(owner: Option<&str>) {
     );
 }
 
-/// `&entry_at(slot).key`, the reborrow of that reference, and
-/// `entry_at(slot).value` are `getinteriorfield`
-/// (`rewrite_op_getinteriorfield`) off `entries`. Offset zero of `key`
-/// is not `rewrite_op_getsubstruct`. The reference is not residual,
-/// and the field owner is `Entry`, not the `FixedSizeArray` wrapper
-/// `direct_arrayitems` returns. The reborrow is the field word, not
-/// `rewrite_op_raw_load`.
+/// `entry_at(slot).key` and `entry_at(slot).value` stay the call.
+/// The field uses are `getfield` on the returned `Ptr(ITEM)`
+/// (`PtrRepr.rtype_getattr`), not `getinteriorfield`.
 #[test]
-fn dictentry_entry_at_field_read_is_getinteriorfield() {
+fn dictentry_entry_at_field_read_is_getfield() {
     let lay = dictentry_layout();
     let key_ref = interior_shared(lay.i64_ty.clone());
     let caller = interior_caller(
@@ -50267,58 +50507,188 @@ fn dictentry_entry_at_field_read_is_getinteriorfield() {
     );
     let graph = lower_interior(&llbc, "read_entry_fields");
     let ops = graph_ops(&graph);
-    let block = interior_read_block(&graph);
-    let field_ops: Vec<_> = block
-        .operations
-        .iter()
-        .filter(|op| matches!(op.kind, OpKind::FieldRead { .. }))
-        .collect();
-    assert!(
-        field_ops.iter().all(|op| matches!(
-            &op.kind,
-            OpKind::FieldRead { field, .. } if field.name == "entries"
-        )),
-        "ops={ops:?}"
-    );
-    let names: Vec<&str> = block
-        .operations
+    let reads: Vec<_> = ops
         .iter()
         .filter_map(|op| match &op.kind {
-            OpKind::InteriorFieldRead {
-                field,
-                array_type_id,
-                array: _,
-                ..
-            } => {
-                assert_entry_owner(field.owner_root.as_deref());
-                assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
-                Some(field.name.as_str())
-            }
+            OpKind::FieldRead { field, .. } => Some(field),
             _ => None,
         })
         .collect();
-    assert_eq!(names, ["key", "value"]);
-    assert_eq!(
-        field_ops.len(),
-        names.len(),
-        "each interior read loads entries"
+    let names: Vec<&str> = reads.iter().map(|field| field.name.as_str()).collect();
+    assert!(names.contains(&"key"), "ops={ops:?}");
+    assert!(names.contains(&"value"), "ops={ops:?}");
+    assert!(!names.contains(&"entries"), "ops={ops:?}");
+    for field in &reads {
+        if field.name == "key" || field.name == "value" {
+            assert_entry_owner(field.owner_root.as_deref());
+        }
+    }
+    assert!(
+        ops.iter().all(|op| !matches!(
+            op.kind,
+            OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+        )),
+        "ops={ops:?}"
     );
     assert!(
-        !ops.iter()
-            .any(|op| matches!(op.kind, OpKind::RawLoad { .. })),
-        "reborrow of the key word is not raw_load; ops={ops:?}"
-    );
-    assert!(
-        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_at"),
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_at"),
         "ops={ops:?}"
     );
 }
 
-/// `entry_at_mut(slot).value = v` is `setinteriorfield`
-/// (`rewrite_op_setinteriorfield`). `gct_setinteriorfield` is
-/// `gct_setfield`.
+/// `entry_at(slot).key` of a by-value struct key is the leaf copy
+/// (`heaptracker.py` `all_interiorfielddescrs` refuses
+/// `array(struct(struct))`). The call returns `InteriorPtrRepr`
+/// (`rptr.py`): the caller unpacks `ptr`/`index` and each leaf is
+/// `getinteriorfield` (`jtransform.py` `rewrite_op_getinteriorfield`).
+/// `rewrite_op_direct_ptradd` does not run (raw-only).
 #[test]
-fn dictentry_entry_at_mut_field_write_is_setinteriorfield() {
+fn dictentry_entry_at_by_value_key_copies_indexed_item() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let raw_u8 = interior_raw_mut(interior_u8());
+    let key = interior_c_struct(
+        0,
+        &["fixture", "TwoFieldKey"],
+        &[("hash", i64_ty.clone()), ("obj", raw_u8)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let key_ty = interior_adt(0);
+    let entry = interior_c_struct(
+        1,
+        &["fixture", "Entry"],
+        &[("key", key_ty.clone()), ("value", i64_ty.clone())],
+        24,
+        &[0, 16],
+        false,
+    );
+    let entry_ty = interior_adt(1);
+    let items_ty = interior_array_zero(entry_ty.clone());
+    let header = interior_c_struct(
+        2,
+        &["fixture", "GcEntries"],
+        &[("length", usize_ty.clone()), ("items", items_ty)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let header_ty = interior_adt(2);
+    let header_ptr = interior_raw_mut(header_ty);
+    let dict = interior_c_struct(
+        3,
+        &["fixture", "Dict"],
+        &[("entries", header_ptr.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let dict_ty = interior_adt(3);
+    let dict_ref = interior_shared(dict_ty);
+    let entry_ref = interior_shared(entry_ty.clone());
+    let caller = interior_caller(
+        "read_entry_key",
+        2,
+        vec![dict_ref.clone(), usize_ty.clone()],
+        key_ty.clone(),
+        vec![
+            interior_local(0, None, &key_ty),
+            interior_local(1, Some("d"), &dict_ref),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("e"), &entry_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &dict_ref)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &entry_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &key_ty),
+                    interior_use(interior_field(3, &entry_ref, &entry_ty, &key_ty, 0)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let entry_at = interior_opaque(
+        1,
+        &["pyre_object", "rordereddict", "<Impl>", "entry_at"],
+        vec![dict_ref.clone(), usize_ty.clone()],
+        entry_ref.clone(),
+    );
+    // GcEntries is the declared-GC `{length, [Entry; 0]}` wrapper.
+    // Entry is the ITEM (`lltype.py` Struct in `GcArray`).
+    let llbc = llbc_with_declared_gc(
+        "fixture",
+        vec![key, entry, header, dict],
+        vec![caller, entry_at],
+        &[2],
+    );
+    let graph = lower_interior(&llbc, "read_entry_key");
+    let ops = graph_ops(&graph);
+    let names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let interior_names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::InteriorFieldRead { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|name| *name == "entries"),
+        "the caller does not reload the entries header; reads={names:?} ops={ops:?}"
+    );
+    assert!(
+        names.iter().any(|name| *name == "ptr") && names.iter().any(|name| *name == "index"),
+        "the returned word is Interior(ptr, index); reads={names:?} ops={ops:?}"
+    );
+    assert!(
+        interior_names.iter().any(|name| *name == "hash"),
+        "the key copy reads hash with getinteriorfield; interior={interior_names:?} ops={ops:?}"
+    );
+    assert!(
+        interior_names.iter().any(|name| *name == "obj"),
+        "the key copy reads obj with getinteriorfield; interior={interior_names:?} ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op_boxes_interior_address(op)),
+        "the item address is not boxed as Ref; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::New { owner } if owner == "TwoFieldKey" || owner.ends_with("::TwoFieldKey")
+        )),
+        "the key is rebuilt by value; ops={ops:?}"
+    );
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_at"),
+        "ops={ops:?}"
+    );
+}
+
+/// `entry_at_mut(slot).value = v` stays a call. The store is `setfield`
+/// (`PtrRepr.rtype_setattr`). `gct_setfield` is the gc write.
+#[test]
+fn dictentry_entry_at_mut_field_write_is_setfield() {
     let lay = dictentry_layout();
     let caller = interior_caller(
         "write_entry_field",
@@ -50376,42 +50746,45 @@ fn dictentry_entry_at_mut_field_write_is_setinteriorfield() {
     let ops = graph_ops(&graph);
     let writes: Vec<_> = ops
         .iter()
-        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
-        .copied()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field),
+            _ => None,
+        })
         .collect();
-    assert_eq!(writes.len(), 1, "ops={ops:?}");
-    let OpKind::InteriorFieldWrite {
-        field,
-        array_type_id,
-        array: _,
-        ..
-    } = &writes[0].kind
-    else {
-        unreachable!()
-    };
-    assert_eq!(field.name, "value");
-    assert_entry_owner(field.owner_root.as_deref());
-    assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
     assert!(
-        ops.iter().any(|op| matches!(
+        writes.iter().any(|field| field.name == "value"),
+        "ops={ops:?}"
+    );
+    for field in &writes {
+        if field.name == "value" {
+            assert_entry_owner(field.owner_root.as_deref());
+        }
+    }
+    assert!(
+        ops.iter().all(|op| !matches!(
+            op.kind,
+            OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+        )),
+        "ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
             &op.kind,
             OpKind::FieldRead { field, .. } if field.name == "entries"
         )),
         "ops={ops:?}"
     );
     assert!(
-        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_at_mut"),
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_at_mut"),
         "ops={ops:?}"
     );
 }
 
-/// `replace_value(&mut entry_at_mut(slot).value, v)` — the only field
-/// use is identity-word `&mut (*e).value` (`ll_dict_setitem` overwrite).
-/// `getinteriorfield` of `value` off `entries`; the header and index stay
-/// live as inputargs so the FieldRead base and InteriorFieldRead index
-/// are defined. `replace_value` stays residual (`dont_look_inside`).
+/// `replace_value(&mut entry_at_mut(slot).value, v)` keeps both calls.
+/// The address of `value` is not rewritten to `getinteriorfield`.
+/// `replace_value` stays residual (`dont_look_inside`).
 #[test]
-fn dictentry_entry_at_mut_replace_value_is_getinteriorfield() {
+fn dictentry_entry_at_mut_replace_value_keeps_call() {
     let lay = dictentry_layout();
     let value_mut = interior_mut_ref(lay.i64_ty.clone());
     let caller = interior_caller(
@@ -50508,85 +50881,19 @@ fn dictentry_entry_at_mut_replace_value_is_getinteriorfield() {
     );
     let graph = lower_interior(&llbc, "replace_entry_value");
     let ops = graph_ops(&graph);
-    let block = interior_read_block(&graph);
-    let field_ops: Vec<_> = block
-        .operations
-        .iter()
-        .filter(|op| matches!(op.kind, OpKind::FieldRead { .. }))
-        .collect();
-    // Identity-word `&mut (*e).value` loads the field, residual
-    // `replace_value` mutates a scratch cell, then the cell is stored
-    // back. Each interior op reloads `entries`.
-    assert_eq!(field_ops.len(), 2, "ops={ops:?}");
     assert!(
-        field_ops.iter().all(|op| matches!(
-            &op.kind,
-            OpKind::FieldRead { field, .. } if field.name == "entries"
-        )),
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_at_mut"),
         "ops={ops:?}"
     );
-    assert!(
-        block.inputargs.len() >= 2,
-        "header and index stay live; inputargs={:?}",
-        block.inputargs
-    );
-    for op in &field_ops {
-        let OpKind::FieldRead { base, .. } = &op.kind else {
-            unreachable!()
-        };
-        assert_eq!(base, &block.inputargs[0], "ops={ops:?}");
-    }
-    let OpKind::InteriorFieldRead {
-        base,
-        index,
-        field,
-        array_type_id,
-        array: _,
-        ..
-    } = block
-        .operations
-        .iter()
-        .find_map(|op| match &op.kind {
-            OpKind::InteriorFieldRead { .. } => Some(&op.kind),
-            _ => None,
-        })
-        .expect("InteriorFieldRead")
-    else {
-        unreachable!()
-    };
-    assert_eq!(field.name, "value");
-    assert_entry_owner(field.owner_root.as_deref());
-    assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
-    assert_eq!(index, &block.inputargs[1]);
-    assert_eq!(base, field_ops[0].result.as_ref().unwrap());
-    let writes: Vec<_> = block
-        .operations
-        .iter()
-        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
-        .collect();
-    assert_eq!(writes.len(), 1, "ops={ops:?}");
-    let OpKind::InteriorFieldWrite {
-        base: write_base,
-        index: write_index,
-        field: write_field,
-        array_type_id: write_array,
-        array: _,
-        ..
-    } = &writes[0].kind
-    else {
-        unreachable!()
-    };
-    assert_eq!(write_field.name, "value");
-    assert_entry_owner(write_field.owner_root.as_deref());
-    assert_eq!(write_array.as_deref(), Some("GcArray<Entry>"));
-    assert_eq!(write_index, &block.inputargs[1]);
-    assert_eq!(write_base, field_ops[1].result.as_ref().unwrap());
     assert!(
         call_leafs(&ops).iter().any(|leaf| leaf == "replace_value"),
         "ops={ops:?}"
     );
     assert!(
-        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_at_mut"),
+        ops.iter().all(|op| !matches!(
+            op.kind,
+            OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+        )),
         "ops={ops:?}"
     );
 }
@@ -50649,71 +50956,234 @@ fn dictentry_entry_at_copied_ref_stays_residual() {
     );
 }
 
-/// `entry_at` outside `rordereddict` is not the dict item accessor.
+/// `entry_at` is `&*entry_ptr().add(slot)`. The add dest is returned, so
+/// `try_lower_struct_field_ptr_add` declines and the add is
+/// `direct_ptradd` (`rewrite_op_direct_ptradd`). Index 0 of
+/// `Ptr(FixedSizeArray(ITEM, 1))` is `getarraysubstruct`
+/// (`PtrRepr.rtype_getitem`, `emit_getarraysubstruct_item0`); the
+/// frontend spells that expose as `same_as`
+/// (`rewrite_op_getarraysubstruct`, `emit_inlined_struct_substruct_ptr`)
+/// when a field projection asks for the item. This body returns the
+/// pointer.
 #[test]
-fn dictentry_foreign_entry_at_stays_residual() {
+fn dictentry_entry_at_body_is_direct_ptradd() {
     let lay = dictentry_layout();
-    let caller = interior_caller(
-        "read_foreign",
+    let entry_ptr_ty = interior_raw_mut(lay.entry.clone());
+    let entry_at = interior_fun(
+        0,
+        &["pyre_object", "rordereddict", "<Impl>", "entry_at"],
         2,
         vec![lay.dict_ref.clone(), lay.usize_ty.clone()],
-        lay.i64_ty.clone(),
+        lay.entry_ref.clone(),
         vec![
-            interior_local(0, None, &lay.i64_ty),
-            interior_local(1, Some("d"), &lay.dict_ref),
-            interior_local(2, Some("i"), &lay.usize_ty),
-            interior_local(3, Some("e"), &lay.entry_ref),
+            interior_local(0, None, &lay.entry_ref),
+            interior_local(1, Some("self"), &lay.dict_ref),
+            interior_local(2, Some("slot"), &lay.usize_ty),
+            interior_local(3, Some("ptr"), &entry_ptr_ty),
+            interior_local(4, Some("added"), &entry_ptr_ty),
         ],
         vec![
             interior_bb(
                 vec![],
                 interior_call(
                     1,
-                    vec![
-                        interior_copy(interior_place(1, &lay.dict_ref)),
-                        interior_copy(interior_place(2, &lay.usize_ty)),
-                    ],
-                    interior_place(3, &lay.entry_ref),
+                    vec![interior_copy(interior_place(1, &lay.dict_ref))],
+                    interior_place(3, &entry_ptr_ty),
                     2,
                     1,
                 ),
             ),
             interior_bb(vec![], interior_unwind()),
             interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(3, &entry_ptr_ty)),
+                        interior_copy(interior_place(2, &lay.usize_ty)),
+                    ],
+                    interior_place(4, &entry_ptr_ty),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(
                 vec![interior_assign(
-                    interior_place(0, &lay.i64_ty),
-                    interior_use(interior_field(
-                        3,
-                        &lay.entry_ref,
-                        &lay.entry,
-                        &lay.i64_ty,
-                        1,
-                    )),
+                    interior_place(0, &lay.entry_ref),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(4, &entry_ptr_ty, &lay.entry),
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
                 )],
                 interior_return(),
             ),
         ],
     );
-    let entry_at = interior_opaque(
+    let entry_ptr_fn = interior_opaque(
         1,
-        &["fixture", "entry_at"],
-        vec![lay.dict_ref.clone(), lay.usize_ty.clone()],
-        lay.entry_ref.clone(),
+        &["pyre_object", "rordereddict", "<Impl>", "entry_ptr"],
+        vec![lay.dict_ref.clone()],
+        entry_ptr_ty.clone(),
+    );
+    let add = interior_opaque(
+        2,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![entry_ptr_ty.clone(), lay.usize_ty.clone()],
+        entry_ptr_ty,
     );
     let llbc = llbc_with_types(
         "fixture",
         vec![lay.dict_decl, lay.entry_decl],
-        vec![caller, entry_at],
+        vec![entry_at, entry_ptr_fn, add],
     );
-    let graph = lower_interior(&llbc, "read_foreign");
+    let graph = lower_interior(&llbc, "entry_at");
     let ops = graph_ops(&graph);
     assert!(
-        call_leafs(&ops).iter().any(|leaf| leaf == "entry_at"),
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
         "ops={ops:?}"
     );
     assert!(
-        !ops.iter()
-            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "direct_ptradd")
+        )),
+        "ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
+        "ops={ops:?}"
+    );
+    assert!(
+        ops.iter().all(|op| !matches!(
+            op.kind,
+            OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+        )),
+        "ops={ops:?}"
+    );
+}
+
+/// `entry_at_mut` calls `barrier_entries` before
+/// `&mut *entry_ptr().add(slot)`. The barrier stays a call.
+#[test]
+fn dictentry_entry_at_mut_body_keeps_barrier_entries() {
+    let lay = dictentry_layout();
+    let entry_ptr_ty = interior_raw_mut(lay.entry.clone());
+    let unit = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+    });
+    let entry_at_mut = interior_fun(
+        0,
+        &["pyre_object", "rordereddict", "<Impl>", "entry_at_mut"],
+        2,
+        vec![lay.dict_ref.clone(), lay.usize_ty.clone()],
+        lay.entry_mut.clone(),
+        vec![
+            interior_local(0, None, &lay.entry_mut),
+            interior_local(1, Some("self"), &lay.dict_ref),
+            interior_local(2, Some("slot"), &lay.usize_ty),
+            interior_local(3, Some("barrier"), &unit),
+            interior_local(4, Some("ptr"), &entry_ptr_ty),
+            interior_local(5, Some("added"), &entry_ptr_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &lay.dict_ref))],
+                    interior_place(3, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(1, &lay.dict_ref))],
+                    interior_place(4, &entry_ptr_ty),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![
+                        interior_copy(interior_place(4, &entry_ptr_ty)),
+                        interior_copy(interior_place(2, &lay.usize_ty)),
+                    ],
+                    interior_place(5, &entry_ptr_ty),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &lay.entry_mut),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(5, &entry_ptr_ty, &lay.entry),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let barrier = interior_opaque(
+        1,
+        &["pyre_object", "rordereddict", "<Impl>", "barrier_entries"],
+        vec![lay.dict_ref.clone()],
+        unit,
+    );
+    let entry_ptr_fn = interior_opaque(
+        2,
+        &["pyre_object", "rordereddict", "<Impl>", "entry_ptr"],
+        vec![lay.dict_ref.clone()],
+        entry_ptr_ty.clone(),
+    );
+    let add = interior_opaque(
+        3,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![entry_ptr_ty.clone(), lay.usize_ty.clone()],
+        entry_ptr_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![lay.dict_decl, lay.entry_decl],
+        vec![entry_at_mut, barrier, entry_ptr_fn, add],
+    );
+    let graph = lower_interior(&llbc, "entry_at_mut");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "barrier_entries"),
+        "ops={ops:?}"
+    );
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
+        "ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "direct_ptradd")
+        )),
         "ops={ops:?}"
     );
 }
@@ -51324,16 +51794,139 @@ fn transparent_rawptr_by_value_struct_decl_is_none() {
     let raw = std::collections::HashSet::<String>::new();
     assert_eq!(super::tyref_to_value_type(&key_ty, &llbc), ValueType::Str);
     assert!(
-        !super::gc_ref_pointer(&key_ty, &llbc, tomb, &gc, 0, &raw),
+        !super::gc_ref_pointer(&key_ty, &llbc, tomb, &gc, 0, &raw, None),
         "a str pointer is not ValueType::Ref"
     );
+    assert_eq!(
+        {
+            let decl = llbc.type_by_id(0).expect("StrPtrKey");
+            let node = super::tyref_node(&key_ty, &llbc)
+                .and_then(|node| super::strip_ty_indirections(node, &llbc))
+                .expect("StrPtrKey node");
+            super::transparent_rawptr_field_spelling(decl, node, &llbc)
+        }
+        .as_deref(),
+        Some("*mut Utf8Str"),
+        "a thin RawPtr wrapper is one lltype.Ptr field"
+    );
     assert!(
-        super::tyref_by_value_struct_decl(&key_ty, &llbc, tomb, &gc, &raw).is_none(),
+        super::tyref_by_value_struct_decl(&key_ty, &llbc, tomb, &gc, &raw, None).is_none(),
         "a transparent single RawPtr is one field, not an inlined STRUCT"
     );
-    let pair_decl = super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc, &raw)
+    let pair_decl = super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc, &raw, None)
         .expect("a two-field struct stays an inlined STRUCT");
     assert_eq!(pair_decl.item_meta.name_path_str(), "fixture::Pair");
+}
+
+/// A `#[repr(transparent)]` wrapper of a fat `RawPtr` is not one
+/// `lltype.py` `Ptr` word. `*mut str` and `*mut [u8]` stay inlined
+/// structs: `heaptracker.py` `all_fielddescrs` walks `value`.
+/// `u8` is not a pair-slice item (`vec_item_kind_for_spelling`), so
+/// the slice wrapper has no `value.len` shadow. A thin
+/// `*mut Utf8Str` wrapper still spells one field. The entry row uses
+/// the same gate (`entry_substituted_field_type`).
+#[test]
+fn transparent_fat_rawptr_keeps_aggregate_copy() {
+    let str_ptr = interior_raw_mut(serde_json::json!({
+        "Adt": {
+            "builtin": "Str",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let slice_ptr = interior_raw_mut(serde_json::json!({
+        "Slice": [
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            null
+        ]
+    }));
+    let thin_ptr = interior_raw_mut(interior_adt(3));
+    let str_key = transparent_unique_field_decl(0, &["fixture", "StrFatKey"], str_ptr.clone());
+    let slice_key =
+        transparent_unique_field_decl(1, &["fixture", "SliceFatKey"], slice_ptr.clone());
+    let thin_key = transparent_unique_field_decl(2, &["fixture", "ThinKey"], thin_ptr);
+    let utf8 = interior_struct(3, &["Utf8Str"], &[("hash", interior_i64())], 8, &[0], false);
+    let llbc = llbc_with_types("fixture", vec![str_key, slice_key, thin_key, utf8], vec![]);
+    assert_eq!(
+        super::charon_type_value_to_ast_string(&str_ptr, &llbc, 0),
+        "*mut str"
+    );
+    assert_eq!(
+        super::charon_type_value_to_ast_string(&slice_ptr, &llbc, 0),
+        "*mut [u8]"
+    );
+    let tomb = no_tombstoned_leaves();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let str_ty = TyRef::Other(interior_adt(0).into());
+    let slice_ty = TyRef::Other(interior_adt(1).into());
+    let thin_ty = TyRef::Other(interior_adt(2).into());
+    let spelling = |ty: &TyRef, id: u64| {
+        let decl = llbc.type_by_id(id).expect("wrapper decl");
+        let node = super::tyref_node(ty, &llbc)
+            .and_then(|node| super::strip_ty_indirections(node, &llbc))
+            .expect("wrapper node");
+        super::transparent_rawptr_field_spelling(decl, node, &llbc)
+    };
+    assert_eq!(spelling(&str_ty, 0), None);
+    assert_eq!(spelling(&slice_ty, 1), None);
+    assert_eq!(spelling(&thin_ty, 2).as_deref(), Some("*mut Utf8Str"));
+    let copied_field = |ty: &TyRef, path: &str| {
+        let decl = super::tyref_by_value_struct_decl(ty, &llbc, tomb, &gc, &raw, None)
+            .expect("fat wrapper stays an inlined struct");
+        assert_eq!(decl.item_meta.name_path_str(), path);
+        super::collect_by_value_struct_leaves(decl, ty, &llbc, tomb, &gc, &raw, None)
+            .into_iter()
+            .map(|leaf| leaf.field.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        copied_field(&str_ty, "fixture::StrFatKey"),
+        vec!["value".to_string()]
+    );
+    assert_eq!(
+        copied_field(&slice_ty, "fixture::SliceFatKey"),
+        vec!["value".to_string()]
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&thin_ty, &llbc, tomb, &gc, &raw, None).is_none(),
+        "a thin RawPtr wrapper is still one field"
+    );
+    let key_field = TyRef::Other(serde_json::json!({"TypeVar": {"Bound": [0, 0]}}).into());
+    assert_eq!(
+        super::entry_substituted_field_type(
+            &key_field,
+            &["StrFatKey".to_string()],
+            &[interior_adt(0)],
+            &llbc,
+            &gc,
+        ),
+        "StrFatKey"
+    );
+    assert_eq!(
+        super::entry_substituted_field_type(
+            &key_field,
+            &["SliceFatKey".to_string()],
+            &[interior_adt(1)],
+            &llbc,
+            &gc,
+        ),
+        "SliceFatKey"
+    );
+    assert_eq!(
+        super::entry_substituted_field_type(
+            &key_field,
+            &["ThinKey".to_string()],
+            &[interior_adt(2)],
+            &llbc,
+            &gc,
+        ),
+        "*mut Utf8Str"
+    );
 }
 
 /// An outer struct whose field is a `repr(transparent)` generic wrapper
@@ -53532,6 +54125,1556 @@ fn typed_items_block_header_write_is_unsupported() {
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
+}
+
+fn gcarray_item_fn_ptr(input: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [input],
+                "output": {"Tuple": []},
+                "is_unsafe": false
+            }
+        }
+    })
+}
+
+fn gcarray_item_fn_def_use(fun_id: u64, fn_ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Use": [{
+            "Const": [{
+                "FnDef": {
+                    "kind": {"Fun": fun_id},
+                    "generics": empty_generics()
+                }
+            }, fn_ty]
+        }, "No"]
+    })
+}
+
+fn gcarray_item_with_def_id(mut fun: serde_json::Value, def_id: u64) -> serde_json::Value {
+    fun["def_id"] = serde_json::json!(def_id);
+    fun
+}
+
+fn gcarray_item_read_fn(
+    name: &str,
+    def_id: u64,
+    owner_ptr: &serde_json::Value,
+    owner_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+) -> serde_json::Value {
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            1,
+            vec![owner_ptr.clone()],
+            field_ty.clone(),
+            vec![
+                interior_local(0, None, field_ty),
+                interior_local(1, Some("p"), owner_ptr),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_place(0, field_ty),
+                    interior_use(interior_field(1, owner_ptr, owner_ty, field_ty, field_idx)),
+                )],
+                interior_return(),
+            )],
+        ),
+        def_id,
+    )
+}
+
+fn gcarray_item_write_fn(
+    name: &str,
+    def_id: u64,
+    owner_ptr: &serde_json::Value,
+    owner_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+) -> serde_json::Value {
+    let unit = interior_unit_ty();
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            2,
+            vec![owner_ptr.clone(), field_ty.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("p"), owner_ptr),
+                interior_local(2, Some("v"), field_ty),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_field(1, owner_ptr, owner_ty, field_ty, field_idx),
+                    interior_use(interior_place(2, field_ty)),
+                )],
+                interior_return(),
+            )],
+        ),
+        def_id,
+    )
+}
+
+fn gcarray_item_borrow_fn(
+    name: &str,
+    def_id: u64,
+    owner_ptr: &serde_json::Value,
+    owner_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+    borrow_kind: &str,
+) -> serde_json::Value {
+    let field_ref = serde_json::json!({"Ref": [null, field_ty.clone(), borrow_kind]});
+    let field = interior_field(1, owner_ptr, owner_ty, field_ty, field_idx);
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            1,
+            vec![owner_ptr.clone()],
+            field_ref.clone(),
+            vec![
+                interior_local(0, None, &field_ref),
+                interior_local(1, Some("p"), owner_ptr),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &field_ref),
+                    serde_json::json!({
+                        "Ref": {"place": field, "kind": borrow_kind, "ptr_metadata": null}
+                    }),
+                )],
+                interior_return(),
+            )],
+        ),
+        def_id,
+    )
+}
+
+fn gcarray_item_unit_fn(name: &str, def_id: u64, arg: &serde_json::Value) -> serde_json::Value {
+    let unit = interior_unit_ty();
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            1,
+            vec![arg.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("p"), arg),
+            ],
+            vec![interior_bb(vec![], interior_return())],
+        ),
+        def_id,
+    )
+}
+
+fn gcarray_item_install_fn(
+    name: &str,
+    def_id: u64,
+    hook_ptr: &serde_json::Value,
+    hook_ty: &serde_json::Value,
+    fn_ty: &serde_json::Value,
+    callee_id: u64,
+) -> serde_json::Value {
+    let unit = interior_unit_ty();
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            1,
+            vec![hook_ptr.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("hook"), hook_ptr),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_field(1, hook_ptr, hook_ty, fn_ty, 0),
+                    gcarray_item_fn_def_use(callee_id, fn_ty),
+                )],
+                interior_return(),
+            )],
+        ),
+        def_id,
+    )
+}
+
+fn gcarray_item_call_fn(
+    name: &str,
+    def_id: u64,
+    hook_ptr: &serde_json::Value,
+    hook_ty: &serde_json::Value,
+    fn_ty: &serde_json::Value,
+    arg_ty: &serde_json::Value,
+) -> serde_json::Value {
+    let unit = interior_unit_ty();
+    gcarray_item_with_def_id(
+        interior_caller(
+            name,
+            2,
+            vec![hook_ptr.clone(), arg_ty.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("hook"), hook_ptr),
+                interior_local(2, Some("arg"), arg_ty),
+                interior_local(3, Some("cb"), fn_ty),
+            ],
+            vec![
+                interior_bb(
+                    vec![interior_assign(
+                        interior_place(3, fn_ty),
+                        interior_use(interior_field(1, hook_ptr, hook_ty, fn_ty, 0)),
+                    )],
+                    serde_json::json!({
+                        "span": interior_span(),
+                        "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": [
+                                    {"Read": interior_place(3, fn_ty)},
+                                    {"regions": []}
+                                ]},
+                                "args": [{"Read": interior_place(2, arg_ty)}]
+                            },
+                            "dest": interior_place(0, &unit),
+                            "target": 1,
+                            "on_unwind": 2
+                        }}
+                    }),
+                ),
+                interior_bb(vec![], interior_return()),
+                interior_bb(vec![], interior_unwind()),
+            ],
+        ),
+        def_id,
+    )
+}
+
+/// `{usize, [Item; 0]}` GcArray whose ITEM has a declared-GC pointer, a
+/// class-identity pointer, and an integer. `Holder` is declared GC and is
+/// not that ITEM. The three `Hook*` structs store one `fn` each so a
+/// Dynamic call is `discover_fnptr_field_families`, not a name lookup.
+fn gcarray_item_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let obj = interior_adt(0);
+    let plain = interior_adt(1);
+    let item = interior_adt(2);
+    let obj_ptr = interior_raw_mut(obj.clone());
+    let plain_ptr = interior_raw_mut(plain.clone());
+    let item_ptr = interior_raw_mut(item.clone());
+    let holder = interior_adt(4);
+    let holder_ptr = interior_raw_mut(holder.clone());
+    let gcref = interior_adt(5);
+    let gcref_ptr = interior_raw_mut(gcref.clone());
+    let hook_plain = interior_adt(6);
+    let hook_obj = interior_adt(7);
+    let hook_gcref = interior_adt(8);
+    let hook_plain_ptr = interior_raw_mut(hook_plain.clone());
+    let hook_obj_ptr = interior_raw_mut(hook_obj.clone());
+    let hook_gcref_ptr = interior_raw_mut(hook_gcref.clone());
+    let plain_fn = gcarray_item_fn_ptr(plain_ptr.clone());
+    let obj_fn = gcarray_item_fn_ptr(obj_ptr.clone());
+    let gcref_fn = gcarray_item_fn_ptr(gcref_ptr.clone());
+    let id_key = interior_adt(9);
+    let plain_key = interior_adt(10);
+    let utf8 = interior_adt(11);
+    let utf8_ptr = interior_raw_mut(utf8.clone());
+    let str_key = interior_adt(12);
+    let pair_key = interior_adt(13);
+    let id_item = interior_adt(14);
+    let id_item_ptr = interior_raw_mut(id_item.clone());
+    let types = vec![
+        interior_struct(
+            0,
+            &["fixture", "Obj"],
+            &[("n", i64_ty.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            1,
+            &["fixture", "Plain"],
+            &[("n", i64_ty.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            2,
+            &["fixture", "Item"],
+            &[
+                ("value", obj_ptr.clone()),
+                ("plain", plain_ptr.clone()),
+                ("count", i64_ty.clone()),
+            ],
+            24,
+            &[0, 8, 16],
+            false,
+        ),
+        interior_struct(
+            3,
+            &["fixture", "Wrap"],
+            &[
+                ("length", usize_ty.clone()),
+                ("items", interior_array_zero(item.clone())),
+            ],
+            16,
+            &[0, 8],
+            false,
+        ),
+        interior_struct(
+            4,
+            &["fixture", "Holder"],
+            &[("value", obj_ptr.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            5,
+            &["majit_gc", "header", "GCREFOpaque"],
+            &[("n", i64_ty.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            6,
+            &["fixture", "HookPlain"],
+            &[("cb", plain_fn.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            7,
+            &["fixture", "HookObj"],
+            &[("cb", obj_fn.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        interior_struct(
+            8,
+            &["fixture", "HookGcref"],
+            &[("cb", gcref_fn.clone())],
+            8,
+            &[0],
+            false,
+        ),
+        // `#[repr(transparent)]` newtype over a declared-GC pointer.
+        // `DICTENTRY` stores the inner `RawPtr` (`externalvsinternal`).
+        interior_struct(
+            9,
+            &["fixture", "IdKey"],
+            &[("obj", obj_ptr.clone())],
+            8,
+            &[0],
+            true,
+        ),
+        interior_struct(
+            10,
+            &["fixture", "PlainKey"],
+            &[("obj", plain_ptr.clone())],
+            8,
+            &[0],
+            true,
+        ),
+        // Leaf spelling is the rstr `STR` layout (`STR_LAYOUT_LEAVES`).
+        interior_struct(11, &["Utf8Str"], &[("n", i64_ty.clone())], 8, &[0], false),
+        interior_struct(
+            12,
+            &["fixture", "StrKey"],
+            &[("ptr", utf8_ptr.clone())],
+            8,
+            &[0],
+            true,
+        ),
+        // Two non-ZST fields: not a transparent pointer word. A read is
+        // the sub-struct pointer plus its leaves (`PtrRepr.rtype_getattr`
+        // / `getsubstruct`), not one scalar field.
+        interior_struct(
+            13,
+            &["fixture", "PairKey"],
+            &[("hash", i64_ty.clone()), ("obj", plain_ptr.clone())],
+            16,
+            &[0, 8],
+            false,
+        ),
+        interior_struct(
+            14,
+            &["fixture", "IdItem"],
+            &[
+                ("key", id_key.clone()),
+                ("plain", plain_key.clone()),
+                ("text", str_key.clone()),
+                ("pair", pair_key.clone()),
+            ],
+            40,
+            &[0, 8, 16, 24],
+            false,
+        ),
+        interior_struct(
+            15,
+            &["fixture", "IdWrap"],
+            &[
+                ("length", usize_ty),
+                ("items", interior_array_zero(id_item.clone())),
+            ],
+            16,
+            &[0, 8],
+            false,
+        ),
+    ];
+    let funs = vec![
+        gcarray_item_read_fn("read_item_value", 20, &item_ptr, &item, &obj_ptr, 0),
+        gcarray_item_write_fn("write_item_value", 21, &item_ptr, &item, &obj_ptr, 0),
+        gcarray_item_read_fn("read_item_plain", 22, &item_ptr, &item, &plain_ptr, 1),
+        gcarray_item_write_fn("write_item_plain", 23, &item_ptr, &item, &plain_ptr, 1),
+        gcarray_item_read_fn("read_item_count", 24, &item_ptr, &item, &interior_i64(), 2),
+        gcarray_item_read_fn("read_holder_value", 25, &holder_ptr, &holder, &obj_ptr, 0),
+        gcarray_item_unit_fn("on_plain", 10, &plain_ptr),
+        gcarray_item_unit_fn("on_obj", 11, &obj_ptr),
+        gcarray_item_unit_fn("on_gcref", 12, &gcref_ptr),
+        gcarray_item_install_fn(
+            "install_plain",
+            13,
+            &hook_plain_ptr,
+            &hook_plain,
+            &plain_fn,
+            10,
+        ),
+        gcarray_item_install_fn("install_obj", 14, &hook_obj_ptr, &hook_obj, &obj_fn, 11),
+        gcarray_item_install_fn(
+            "install_gcref",
+            15,
+            &hook_gcref_ptr,
+            &hook_gcref,
+            &gcref_fn,
+            12,
+        ),
+        gcarray_item_call_fn(
+            "call_plain",
+            30,
+            &hook_plain_ptr,
+            &hook_plain,
+            &plain_fn,
+            &plain_ptr,
+        ),
+        gcarray_item_call_fn("call_obj", 31, &hook_obj_ptr, &hook_obj, &obj_fn, &obj_ptr),
+        gcarray_item_call_fn(
+            "call_gcref",
+            32,
+            &hook_gcref_ptr,
+            &hook_gcref,
+            &gcref_fn,
+            &gcref_ptr,
+        ),
+        gcarray_item_read_fn("read_id_key", 40, &id_item_ptr, &id_item, &id_key, 0),
+        gcarray_item_write_fn("write_id_key", 41, &id_item_ptr, &id_item, &id_key, 0),
+        gcarray_item_read_fn("read_plain_key", 42, &id_item_ptr, &id_item, &plain_key, 1),
+        gcarray_item_write_fn("write_plain_key", 43, &id_item_ptr, &id_item, &plain_key, 1),
+        gcarray_item_read_fn("read_str_key", 46, &id_item_ptr, &id_item, &str_key, 2),
+        gcarray_item_write_fn("write_str_key", 47, &id_item_ptr, &id_item, &str_key, 2),
+        gcarray_item_read_fn("read_pair_key", 44, &id_item_ptr, &id_item, &pair_key, 3),
+        gcarray_item_write_fn("write_pair_key", 45, &id_item_ptr, &id_item, &pair_key, 3),
+        gcarray_item_borrow_fn(
+            "borrow_pair_key_shared",
+            48,
+            &id_item_ptr,
+            &id_item,
+            &pair_key,
+            3,
+            "Shared",
+        ),
+        gcarray_item_borrow_fn(
+            "borrow_pair_key_mut",
+            49,
+            &id_item_ptr,
+            &id_item,
+            &pair_key,
+            3,
+            "Mut",
+        ),
+    ];
+    // Obj, Wrap, Holder, and IdWrap implement GcType. Item and IdItem
+    // do not: each is the non-GC struct inlined in `GcArray` (`lltype.py`).
+    llbc_with_declared_gc("fixture", types, funs, &[0, 3, 4, 15])
+}
+
+fn gcarray_item_ops(name: &str) -> Vec<SpaceOperation> {
+    let llbc = gcarray_item_llbc();
+    let graph = lower_interior(&llbc, name);
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter().cloned())
+        .collect()
+}
+
+fn gcarray_item_producing<'a>(ops: &'a [SpaceOperation], var: &Variable) -> &'a OpKind {
+    ops.iter()
+        .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
+        .unwrap_or_else(|| panic!("missing producer of {var:?}\nops={ops:?}"))
+}
+
+fn gcarray_item_field_result<'a>(ops: &'a [SpaceOperation], field: &str) -> &'a Variable {
+    ops.iter()
+        .find_map(|op| match (&op.result, &op.kind) {
+            (Some(result), OpKind::InteriorFieldRead { field: desc, .. }) if desc.name == field => {
+                Some(result)
+            }
+            (Some(result), OpKind::FieldRead { field: desc, .. }) if desc.name == field => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing field read {field}; ops={ops:?}"))
+}
+
+fn gcarray_item_cast_root_of_field_read(ops: &[SpaceOperation], field: &str) -> Option<String> {
+    let read = gcarray_item_field_result(ops, field);
+    ops.iter()
+        .find_map(|op| crate::model::cast_instance_of(&op.kind, read).map(str::to_string))
+}
+
+/// Stored word of `field`. A `GcArray` item pointer writes
+/// `setinteriorfield` (`InteriorFieldWrite.value`). A non-item owner
+/// still `setfield`s (`FieldWrite` `LinkArg::Value`).
+fn gcarray_item_stored_var<'a>(ops: &'a [SpaceOperation], field: &str) -> &'a Variable {
+    ops.iter()
+        .find_map(|op| match &op.kind {
+            OpKind::InteriorFieldWrite {
+                field: desc, value, ..
+            } if desc.name == field => Some(value),
+            OpKind::FieldWrite {
+                field: desc, value, ..
+            } if desc.name == field => value.as_variable(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing field store {field}; ops={ops:?}"))
+}
+
+fn gcarray_item_is_base_ptr(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice()
+            == ["rpython", "rtyper", "annlowlevel", "cast_instance_to_base_ptr"]
+    )
+}
+
+fn gcarray_item_is_llstr(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice() == ["rpython", "rtyper", "annlowlevel", "llstr"]
+    )
+}
+
+fn gcarray_item_class_leaf(root: &str) -> &str {
+    root.rsplit("::").next().unwrap_or(root)
+}
+
+/// `(*item).value` where `value` is a declared-GC pointer stored as
+/// `llmemory.GCREF` (`field_row_lltype`). Read is getfield then
+/// `cast_instance` of that class (`annlowlevel.py` `cast_gcref_to_instance`
+/// through `cast_instance`).
+#[test]
+fn gcarray_item_gcref_field_read_is_getfield_then_cast_instance() {
+    let ops = gcarray_item_ops("read_item_value");
+    let root = gcarray_item_cast_root_of_field_read(&ops, "value")
+        .unwrap_or_else(|| panic!("GCREF item read must cast the getfield; ops={ops:?}"));
+    assert_eq!(
+        gcarray_item_class_leaf(&root),
+        "Obj",
+        "cast_gcref_to_instance names the class; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
+        "a GCREF read is cast_instance, not cast_instance_to_base_ptr; ops={ops:?}"
+    );
+}
+
+/// Store of a high-level instance into the GCREF item field is
+/// `cast_instance_to_gcref` then setfield. The pointer narrow onto `Obj`
+/// may precede it; the stored word is the GCREF cast.
+#[test]
+fn gcarray_item_gcref_field_store_is_cast_then_setfield() {
+    let ops = gcarray_item_ops("write_item_value");
+    let var = gcarray_item_stored_var(&ops, "value");
+    let kind = gcarray_item_producing(&ops, var);
+    assert_eq!(
+        crate::model::cast_instance_root(kind),
+        Some("GCREF"),
+        "setfield value is cast_instance_to_gcref; ops={ops:?}"
+    );
+}
+
+/// Class-identity pointer that is not declared GC is `rclass.OBJECTPTR`.
+/// Read is getfield then `cast_base_ptr_to_instance` (`cast_instance`).
+#[test]
+fn gcarray_item_objectptr_field_read_is_cast_instance() {
+    let ops = gcarray_item_ops("read_item_plain");
+    let root = gcarray_item_cast_root_of_field_read(&ops, "plain")
+        .unwrap_or_else(|| panic!("OBJECTPTR item read must cast the getfield; ops={ops:?}"));
+    assert_eq!(
+        gcarray_item_class_leaf(&root),
+        "Plain",
+        "cast_base_ptr_to_instance names the class; ops={ops:?}"
+    );
+}
+
+/// OBJECTPTR store is `cast_instance_to_base_ptr` then setfield.
+#[test]
+fn gcarray_item_objectptr_field_store_is_cast_to_base_ptr() {
+    let ops = gcarray_item_ops("write_item_plain");
+    let var = gcarray_item_stored_var(&ops, "plain");
+    let kind = gcarray_item_producing(&ops, var);
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "setfield value is cast_instance_to_base_ptr; got {kind:?}\nops={ops:?}"
+    );
+}
+
+/// An integer ITEM field is not a pointer word. No cast.
+#[test]
+fn gcarray_item_scalar_field_read_has_no_cast() {
+    let ops = gcarray_item_ops("read_item_count");
+    assert!(
+        gcarray_item_cast_root_of_field_read(&ops, "count").is_none(),
+        "integer item field stays the getfield; ops={ops:?}"
+    );
+}
+
+/// A declared-GC owner that is not a `GcArray` ITEM keeps the raw GCREF
+/// word. The cast is only the ITEM external/internal boundary.
+#[test]
+fn gcarray_item_non_item_owner_gcref_field_read_has_no_cast() {
+    let ops = gcarray_item_ops("read_holder_value");
+    assert!(
+        gcarray_item_cast_root_of_field_read(&ops, "value").is_none(),
+        "non-item GC owner does not recast; ops={ops:?}"
+    );
+}
+
+fn gcarray_item_indirect_arg0(ops: &[SpaceOperation]) -> &Variable {
+    ops.iter()
+        .find_map(|op| match &op.kind {
+            OpKind::IndirectCall {
+                args, family_key, ..
+            } => {
+                assert!(
+                    family_key
+                        .as_ref()
+                        .is_some_and(crate::model::IndirectFamilyKey::is_fnptr_field),
+                    "stored fn-ptr call is the harvested field family; op={op:?}"
+                );
+                args.first()
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing IndirectCall; ops={ops:?}"))
+}
+
+/// `fn(*mut Plain)` ARGS[i] is OBJECTPTR. The call site writes
+/// `cast_instance_to_base_ptr` before the call (`annlowlevel.py`).
+#[test]
+fn gcarray_item_fn_ptr_call_casts_objectptr_arg() {
+    let ops = gcarray_item_ops("call_plain");
+    let arg = gcarray_item_indirect_arg0(&ops);
+    let kind = gcarray_item_producing(&ops, arg);
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "OBJECTPTR argument is cast_instance_to_base_ptr; got {kind:?}\nops={ops:?}"
+    );
+}
+
+/// A declared-GC class pointer is OBJECTPTR in `FuncType.ARGS`
+/// (`fn_ptr_tyref_to_lltype`) and GCREF in a struct row
+/// (`field_row_lltype`). The call writes `cast_instance_to_base_ptr`.
+#[test]
+fn gcarray_item_fn_ptr_call_casts_declared_gc_arg_as_objectptr() {
+    let ops = gcarray_item_ops("call_obj");
+    let arg = gcarray_item_indirect_arg0(&ops);
+    let kind = gcarray_item_producing(&ops, arg);
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "declared-GC call argument is OBJECTPTR; got {kind:?}\nops={ops:?}"
+    );
+    assert_ne!(
+        crate::model::cast_instance_root(kind),
+        Some("GCREF"),
+        "FUNC.ARGS is not the field-row GCREF; ops={ops:?}"
+    );
+}
+
+/// `*mut GCREFOpaque` is `llmemory.GCREF`. The call writes
+/// `cast_instance_to_gcref`.
+#[test]
+fn gcarray_item_fn_ptr_call_casts_gcref_arg() {
+    let ops = gcarray_item_ops("call_gcref");
+    let arg = gcarray_item_indirect_arg0(&ops);
+    let kind = gcarray_item_producing(&ops, arg);
+    assert_eq!(
+        crate::model::cast_instance_root(kind),
+        Some("GCREF"),
+        "GCREF argument is cast_instance_to_gcref; got {kind:?}\nops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
+        "GCREF call does not emit cast_instance_to_base_ptr; ops={ops:?}"
+    );
+}
+
+fn gcarray_item_ops_have_no_instance_cast(ops: &[SpaceOperation]) {
+    assert!(
+        ops.iter().all(|op| {
+            crate::model::cast_instance_root(&op.kind).is_none()
+                && !gcarray_item_is_base_ptr(&op.kind)
+        }),
+        "field is not an item pointer word; ops={ops:?}"
+    );
+}
+
+/// Transparent newtype over a declared-GC pointer. The `DICTENTRY` row
+/// is that `RawPtr` (`rmodel.py` `externalvsinternal`). Read is getfield
+/// then `cast_instance` of the pointee (`cast_gcref_to_instance`).
+#[test]
+fn gcarray_item_transparent_gcref_newtype_read_is_cast_instance() {
+    let ops = gcarray_item_ops("read_id_key");
+    let root = gcarray_item_cast_root_of_field_read(&ops, "key")
+        .unwrap_or_else(|| panic!("transparent GCREF newtype read must cast; ops={ops:?}"));
+    assert_eq!(
+        gcarray_item_class_leaf(&root),
+        "Obj",
+        "cast names the inner class; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| gcarray_item_is_base_ptr(&op.kind)),
+        "declared-GC inner word is cast_instance, not cast_instance_to_base_ptr; ops={ops:?}"
+    );
+}
+
+/// Store of the newtype is `cast_instance_to_gcref` then setfield.
+#[test]
+fn gcarray_item_transparent_gcref_newtype_store_is_cast_then_setfield() {
+    let ops = gcarray_item_ops("write_id_key");
+    let var = gcarray_item_stored_var(&ops, "key");
+    let kind = gcarray_item_producing(&ops, var);
+    assert_eq!(
+        crate::model::cast_instance_root(kind),
+        Some("GCREF"),
+        "setfield value is cast_instance_to_gcref; ops={ops:?}"
+    );
+}
+
+/// Transparent newtype over a class-identity pointer that is not
+/// declared GC. The row is `OBJECTPTR`. Read is `cast_instance` of
+/// that class (`cast_base_ptr_to_instance`).
+#[test]
+fn gcarray_item_transparent_objectptr_newtype_read_is_cast_instance() {
+    let ops = gcarray_item_ops("read_plain_key");
+    let root = gcarray_item_cast_root_of_field_read(&ops, "plain")
+        .unwrap_or_else(|| panic!("transparent OBJECTPTR newtype read must cast; ops={ops:?}"));
+    assert_eq!(
+        gcarray_item_class_leaf(&root),
+        "Plain",
+        "cast names the inner class; ops={ops:?}"
+    );
+}
+
+/// OBJECTPTR newtype store is `cast_instance_to_base_ptr` then setfield.
+#[test]
+fn gcarray_item_transparent_objectptr_newtype_store_is_cast_to_base_ptr() {
+    let ops = gcarray_item_ops("write_plain_key");
+    let var = gcarray_item_stored_var(&ops, "plain");
+    let kind = gcarray_item_producing(&ops, var);
+    assert!(
+        gcarray_item_is_base_ptr(kind),
+        "setfield value is cast_instance_to_base_ptr; got {kind:?}\nops={ops:?}"
+    );
+}
+
+/// Transparent newtype over an rstr `STR` pointer. The row is
+/// `STRPTR`. A read stays the getfield: `hlstr` is not emitted
+/// (`strptr_as_somestring` already returns nullable SomeString).
+#[test]
+fn gcarray_item_transparent_strptr_newtype_read_has_no_cast() {
+    let ops = gcarray_item_ops("read_str_key");
+    assert!(
+        gcarray_item_cast_root_of_field_read(&ops, "text").is_none(),
+        "STRPTR newtype read stays the getfield; ops={ops:?}"
+    );
+    gcarray_item_ops_have_no_instance_cast(&ops);
+    assert!(
+        !ops.iter().any(|op| gcarray_item_is_llstr(&op.kind)),
+        "STRPTR read does not emit llstr; ops={ops:?}"
+    );
+}
+
+/// Store of the newtype is `llstr` then setfield (`LLStrEntry`).
+#[test]
+fn gcarray_item_transparent_strptr_newtype_store_is_llstr_then_setfield() {
+    let ops = gcarray_item_ops("write_str_key");
+    let var = gcarray_item_stored_var(&ops, "text");
+    let kind = gcarray_item_producing(&ops, var);
+    assert!(
+        gcarray_item_is_llstr(kind),
+        "setfield value is llstr; got {kind:?}\nops={ops:?}"
+    );
+    assert!(
+        crate::model::cast_instance_root(kind).is_none() && !gcarray_item_is_base_ptr(kind),
+        "STRPTR store is llstr, not cast_instance; got {kind:?}\nops={ops:?}"
+    );
+}
+
+/// Two-field by-value key is not a pointer word. Its pointer leaf is
+/// `cast_base_ptr_to_instance` (`annlowlevel.py`) because the container
+/// is the `GcArray` ITEM (`rordereddict.py` `DICTENTRY`). The integer
+/// leaf is not cast. The item pointer is `(array, index)`
+/// (`rptr.py` `InteriorPtrRepr`); each leaf is `getinteriorfield`
+/// (`jtransform.py` `rewrite_op_getinteriorfield`), then the by-value
+/// constructor. A store into the item is `setinteriorfield` of the bare
+/// leaf (`rewrite_op_setinteriorfield`), not `pair.hash` on a byte
+/// address. The store's pointer-leaf cast is
+/// [`gcarray_item_by_value_key_store_recasts_pointer_leaf`].
+#[test]
+fn gcarray_item_by_value_struct_pointer_leaf_is_item_cast() {
+    fn rows(ops: &[SpaceOperation], write: bool) -> Vec<(String, Option<String>)> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead { field, .. } if !write => {
+                    Some((field.name.clone(), field.owner_root.clone()))
+                }
+                OpKind::FieldWrite { field, .. } | OpKind::InteriorFieldWrite { field, .. }
+                    if write =>
+                {
+                    Some((field.name.clone(), field.owner_root.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    fn is_item_address_cast(op: &SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "cast_ptr_to_int"
+                || leaf == "cast_int_to_ptr"
+                || leaf == "direct_ptradd")
+        ) || matches!(op.kind, OpKind::ConstInt(24))
+    }
+
+    let read = gcarray_item_ops("read_pair_key");
+    let read_fields = rows(&read, false);
+    let read_names: Vec<&str> = read_fields.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        !read_names.iter().any(|name| *name == "pair"),
+        "by-value key is not one scalar field; reads={read_fields:?}\nops={read:?}"
+    );
+    assert_eq!(
+        read_names,
+        ["hash", "obj"],
+        "known offset reads the inner leaves; reads={read_fields:?}\nops={read:?}"
+    );
+    for (name, owner) in &read_fields {
+        assert!(
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner.ends_with("PairKey")),
+            "{name} owner must be the key, got {owner:?}"
+        );
+    }
+    let obj_root = gcarray_item_cast_root_of_field_read(&read, "obj")
+        .unwrap_or_else(|| panic!("pointer leaf must cast the getfield; ops={read:?}"));
+    assert_eq!(
+        gcarray_item_class_leaf(&obj_root),
+        "Plain",
+        "cast_base_ptr_to_instance names the class; ops={read:?}"
+    );
+    assert!(
+        gcarray_item_cast_root_of_field_read(&read, "hash").is_none(),
+        "integer leaf stays the getfield; ops={read:?}"
+    );
+    let stored_obj = gcarray_item_stored_var(&read, "obj");
+    let stored_kind = gcarray_item_producing(&read, stored_obj);
+    assert_eq!(
+        gcarray_item_class_leaf(crate::model::cast_instance_root(stored_kind).unwrap_or("")),
+        "Plain",
+        "aggregate stores the cast, not the raw getfield; got {stored_kind:?}\nops={read:?}"
+    );
+    assert!(
+        !read.iter().any(is_item_address_cast),
+        "item pointer is not a byte address; ops={read:?}"
+    );
+    // `emit_span_aggregate` emits the empty struct ctor. The returned
+    // value escapes, so `scalar_replace_named_struct_aggregates` leaves
+    // `New` plus the leaf stores (`rewrite_op_malloc`).
+    assert!(
+        read.iter().any(
+            |op| matches!(&op.kind, OpKind::New { owner } if owner == "PairKey" || owner.ends_with("::PairKey"))
+        ),
+        "by-value key is the aggregate New; ops={read:?}"
+    );
+    let read_writes = rows(&read, true);
+    let write_names: Vec<&str> = read_writes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        write_names,
+        ["hash", "obj"],
+        "the rebuilt value stores the inner leaves; writes={read_writes:?}"
+    );
+    for (name, owner) in &read_writes {
+        assert!(
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner.ends_with("PairKey")),
+            "{name} store owner must be the key, got {owner:?}"
+        );
+    }
+
+    let write = gcarray_item_ops("write_pair_key");
+    let stored = rows(&write, true);
+    let stored_names: Vec<&str> = stored.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        !stored_names.iter().any(|name| *name == "pair"),
+        "the store is not one scalar field; writes={stored:?}\nops={write:?}"
+    );
+    assert_eq!(
+        stored_names,
+        ["hash", "obj"],
+        "setinteriorfield names the bare leaf; writes={stored:?}\nops={write:?}"
+    );
+    assert!(
+        !write.iter().any(is_item_address_cast),
+        "item store is not a byte address; ops={write:?}"
+    );
+}
+
+/// By-value store into an ITEM key recasts the pointer leaf before
+/// `setinteriorfield` of `obj` (`rdict.py` `recast_key`,
+/// `llops.convertvar`; `jtransform.py` `rewrite_op_setinteriorfield`).
+/// `Plain` is not declared GC, so the cast is `cast_instance_to_base_ptr`
+/// (`annlowlevel.py`). The `hash` leaf is the integer word and stays the
+/// `FieldRead` of the source struct.
+#[test]
+fn gcarray_item_by_value_key_store_recasts_pointer_leaf() {
+    let ops = gcarray_item_ops("write_pair_key");
+    let refs: Vec<&SpaceOperation> = ops.iter().collect();
+    let hash_read = field_read_of(&refs, "hash");
+    let obj_read = field_read_of(&refs, "obj");
+
+    let hash_var = gcarray_item_stored_var(&ops, "hash");
+    assert_eq!(
+        hash_var, hash_read,
+        "hash leaf is the FieldRead, unchanged; ops={ops:?}"
+    );
+    let hash_kind = gcarray_item_producing(&ops, hash_var);
+    assert!(
+        matches!(hash_kind, OpKind::FieldRead { field, .. } if field.name == "hash"),
+        "hash producer is the FieldRead; got {hash_kind:?}\nops={ops:?}"
+    );
+    assert!(
+        crate::model::cast_instance_root(hash_kind).is_none()
+            && !gcarray_item_is_base_ptr(hash_kind),
+        "hash leaf is not recast; got {hash_kind:?}\nops={ops:?}"
+    );
+
+    let obj_var = gcarray_item_stored_var(&ops, "obj");
+    let obj_kind = gcarray_item_producing(&ops, obj_var);
+    assert!(
+        gcarray_item_is_base_ptr(obj_kind),
+        "obj FieldWrite is cast_instance_to_base_ptr; got {obj_kind:?}\nops={ops:?}"
+    );
+    assert!(
+        crate::model::cast_instance_root(obj_kind).is_none(),
+        "store cast is cast_instance_to_base_ptr, not cast_instance; got {obj_kind:?}\nops={ops:?}"
+    );
+    let OpKind::Call { args, .. } = obj_kind else {
+        unreachable!("base-ptr cast is a call");
+    };
+    assert_eq!(
+        args.first().and_then(LinkArg::as_variable),
+        Some(obj_read),
+        "cast operand is the obj FieldRead; ops={ops:?}"
+    );
+    let cast_idx = ops
+        .iter()
+        .position(|op| op.result.as_ref() == Some(obj_var) && gcarray_item_is_base_ptr(&op.kind))
+        .expect("cast op");
+    let write_idx = ops
+        .iter()
+        .position(|op| {
+            matches!(
+                &op.kind,
+                OpKind::InteriorFieldWrite { field, .. } if field.name == "obj"
+            )
+        })
+        .expect("obj InteriorFieldWrite");
+    let obj_read_idx = ops
+        .iter()
+        .position(|op| {
+            matches!(
+                (&op.result, &op.kind),
+                (Some(result), OpKind::FieldRead { field, .. })
+                    if result == obj_read && field.name == "obj"
+            )
+        })
+        .expect("obj FieldRead");
+    assert!(
+        obj_read_idx < cast_idx && cast_idx < write_idx,
+        "FieldRead, then cast_instance_to_base_ptr, then setinteriorfield; ops={ops:?}"
+    );
+}
+
+/// Shared `&(*item).pair` is the same leaf copy as the value read
+/// (`ll_dict_lookup` reads the key as a value): `getinteriorfield` of
+/// each leaf (`rptr.py` `InteriorPtrRepr.rtype_getattr`). `&mut (*item).pair`
+/// is that same interior word (`rtype_getattr` of a container), not a
+/// byte address (`jtransform.py` `rewrite_op_direct_ptradd` is raw-only).
+/// A copy would drop a write through the referent.
+#[test]
+fn gcarray_item_shared_borrow_of_by_value_key_is_leaf_copy() {
+    fn read_names(ops: &[SpaceOperation]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead { field, .. } => Some(field.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn has_pair_new(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::New { owner } if owner == "PairKey" || owner.ends_with("::PairKey")
+            )
+        })
+    }
+
+    let shared = gcarray_item_ops("borrow_pair_key_shared");
+    let shared_names = read_names(&shared);
+    assert_eq!(
+        shared_names,
+        ["hash", "obj"],
+        "shared borrow reads the inner leaves; ops={shared:?}"
+    );
+    assert!(
+        has_pair_new(&shared),
+        "shared borrow rebuilds the key; ops={shared:?}"
+    );
+    assert!(
+        !shared_names.iter().any(|name| name == "pair"),
+        "shared borrow is not one getfield of pair; ops={shared:?}"
+    );
+
+    let mutable = gcarray_item_ops("borrow_pair_key_mut");
+    assert!(
+        !has_pair_new(&mutable),
+        "mutable borrow does not copy the key; ops={mutable:?}"
+    );
+    let mut_names = read_names(&mutable);
+    assert!(
+        !mut_names
+            .iter()
+            .any(|name| name == "hash" || name == "obj" || name.contains('.')),
+        "mutable borrow does not read the key leaves; reads={mut_names:?} ops={mutable:?}"
+    );
+    assert!(
+        !mutable.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| {
+                leaf == "cast_ptr_to_int" || leaf == "cast_int_to_ptr" || leaf == "direct_ptradd"
+            })
+        )),
+        "mutable borrow of a nested item field is the interior word; ops={mutable:?}"
+    );
+}
+
+fn gcarray_returned_item_pointer_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let entry = interior_adt(0);
+    let entry_ptr = interior_raw_mut(entry.clone());
+    let entry_ref = interior_shared(entry.clone());
+    let entry_decl = interior_struct(
+        0,
+        &["fixture", "Entry"],
+        &[("value", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let slots = interior_struct(
+        1,
+        &["fixture", "SlotArray"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(entry.clone())),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "read_slot_value",
+        2,
+        vec![entry_ptr.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("ptr"), &entry_ptr),
+            interior_local(2, Some("slot"), &usize_ty),
+            interior_local(3, Some("item"), &entry_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(1, &entry_ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &entry_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_field(3, &entry_ref, &entry, &i64_ty, 0)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![entry_ptr.clone(), usize_ty.clone()],
+        entry_ptr.clone(),
+    );
+    let slot_ref = interior_fun(
+        2,
+        &["fixture", "slot_ref"],
+        2,
+        vec![entry_ptr.clone(), usize_ty.clone()],
+        entry_ref.clone(),
+        vec![
+            interior_local(0, None, &entry_ref),
+            interior_local(1, Some("ptr"), &entry_ptr),
+            interior_local(2, Some("slot"), &usize_ty),
+            interior_local(3, Some("added"), &entry_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &entry_ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &entry_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &entry_ref),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(3, &entry_ptr, &entry),
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![entry_decl, slots],
+        vec![caller, add, slot_ref],
+        &[1],
+    )
+}
+
+fn op_boxes_interior_address(op: &SpaceOperation) -> bool {
+    matches!(
+        &op.kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.last().is_some_and(|leaf| {
+            leaf == "cast_int_to_ptr" || leaf == "cast_ptr_to_int" || leaf == "direct_ptradd"
+        })
+    )
+}
+
+/// A helper returns `&*ptr.add(slot)` where `ptr` is a `GcArray` item
+/// pointer. The caller reads `.value`. Both graphs carry `(array, index)`
+/// (`rptr.py` `InteriorPtrRepr`, `lltype.py` `Ptr._interior_ptr_type_with_index`).
+/// The field is `getinteriorfield` (`jtransform.py` `rewrite_op_getinteriorfield`).
+/// `rewrite_op_direct_ptradd` stays raw-only, so the address is not a `Ref`.
+#[test]
+fn gcarray_item_pointer_returned_from_helper_is_getinteriorfield() {
+    let llbc = gcarray_returned_item_pointer_llbc();
+    let helper = lower_interior(&llbc, "slot_ref");
+    let hops = graph_ops(&helper);
+    assert!(
+        hops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::New { owner } if owner == "Interior"
+        )),
+        "ptr::add mallocs Interior; ops={hops:?}"
+    );
+    assert!(
+        hops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.name == "ptr" && field.owner_root.as_deref() == Some("Interior")
+        )),
+        "Interior.ptr is the array; ops={hops:?}"
+    );
+    assert!(
+        hops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. }
+                if field.name == "index" && field.owner_root.as_deref() == Some("Interior")
+        )),
+        "Interior.index is the item index; ops={hops:?}"
+    );
+    assert!(
+        hops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+        "the index moves by the item count; ops={hops:?}"
+    );
+    assert!(
+        !hops.iter().any(|op| op_boxes_interior_address(op)),
+        "the item pointer is not an address; ops={hops:?}"
+    );
+    assert!(
+        !call_leafs(&hops).iter().any(|leaf| leaf == "add"),
+        "ptr::add is not residualised; ops={hops:?}"
+    );
+
+    let caller = lower_interior(&llbc, "read_slot_value");
+    let cops = graph_ops(&caller);
+    assert!(
+        cops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::InteriorFieldRead { field, .. } if field.name == "value"
+        )),
+        "caller .value is getinteriorfield; ops={cops:?}"
+    );
+    assert!(
+        !cops.iter().any(|op| op_boxes_interior_address(op)),
+        "caller does not box the item address; ops={cops:?}"
+    );
+}
+
+fn mut_container_ref_assign(
+    dest: u64,
+    dest_ty: &serde_json::Value,
+    src_local: u64,
+    src_ptr: &serde_json::Value,
+    src_pointee: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+) -> serde_json::Value {
+    interior_assign(
+        interior_place(dest, dest_ty),
+        serde_json::json!({
+            "Ref": {
+                "place": interior_field(src_local, src_ptr, src_pointee, field_ty, field_idx),
+                "kind": "Mut",
+                "ptr_metadata": null
+            }
+        }),
+    )
+}
+
+fn producer_is_interior_new(ops: &[&SpaceOperation], var: &Variable) -> bool {
+    let mut cur = var.clone();
+    for _ in 0..32 {
+        let Some(op) = ops.iter().find(|op| op.result.as_ref() == Some(&cur)) else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::New { owner } if owner == "Interior" => return true,
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => cur = operand.clone(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn assert_interior_container_store(graph: &FunctionGraph, path: &str) {
+    let ops = graph_ops(graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::InteriorFieldWrite { field, .. } if field.name == path
+        )),
+        "expected setinteriorfield {path}; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior")),
+        "non-escaping Interior malloc must be removed; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::FieldWrite { base, .. } => producer_is_interior_new(&ops, base),
+            _ => false,
+        }),
+        "FieldWrite must not use an Interior malloc as its base; ops={ops:?}"
+    );
+}
+
+/// `&mut (*item).sub` then `(*sub).n = v`.
+///
+/// `InteriorPtrRepr.rtype_getattr` of a container returns the interior
+/// word. `InteriorPtrRepr.rtype_setattr` stores with
+/// `setinteriorfield` on the parent array (`InteriorPtr.offsets`).
+/// `LLTypeMallocRemover` drops the word when it does not escape.
+fn gcarray_mut_sub_write_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let sub = interior_adt(0);
+    let item = interior_adt(1);
+    let item_ptr = interior_raw_mut(item.clone());
+    let sub_ref = interior_mut_ref(sub.clone());
+    let sub_decl = interior_struct(
+        0,
+        &["fixture", "Sub"],
+        &[("n", i64_ty.clone()), ("tag", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let item_decl = interior_struct(
+        1,
+        &["fixture", "Item"],
+        &[("sub", sub.clone())],
+        16,
+        &[0],
+        false,
+    );
+    let wrap = interior_struct(
+        2,
+        &["fixture", "Wrap"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(item.clone())),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let unit = interior_unit_ty();
+    let writer = interior_fun(
+        1,
+        &["fixture", "write_through_mut_sub"],
+        3,
+        vec![item_ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("ptr"), &item_ptr),
+            interior_local(2, Some("slot"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("added"), &item_ptr),
+            interior_local(5, Some("sub"), &sub_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &item_ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &item_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    mut_container_ref_assign(5, &sub_ref, 4, &item_ptr, &item, &sub, 0),
+                    interior_assign(
+                        interior_field(5, &sub_ref, &sub, &i64_ty, 0),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        0,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![item_ptr.clone(), usize_ty],
+        item_ptr,
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![sub_decl, item_decl, wrap],
+        vec![add, writer],
+        &[2],
+    )
+}
+
+#[test]
+fn gcarray_mut_sub_field_write_is_setinteriorfield() {
+    let llbc = gcarray_mut_sub_write_llbc();
+    let graph = lower_interior(&llbc, "write_through_mut_sub");
+    assert_interior_container_store(&graph, "sub.n");
+}
+
+/// `&mut (*item).sub` then `&mut (*sub).inner` then `(*inner).n = v`.
+///
+/// Each container borrow appends one `InteriorPtr.offsets` entry. The
+/// store names the whole path on the parent array.
+fn gcarray_mut_nested_write_llbc() -> Llbc {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let inner = interior_adt(0);
+    let sub = interior_adt(1);
+    let item = interior_adt(2);
+    let item_ptr = interior_raw_mut(item.clone());
+    let sub_ref = interior_mut_ref(sub.clone());
+    let inner_ref = interior_mut_ref(inner.clone());
+    let inner_decl = interior_struct(
+        0,
+        &["fixture", "Inner"],
+        &[("n", i64_ty.clone()), ("tag", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let sub_decl = interior_struct(
+        1,
+        &["fixture", "Sub"],
+        &[("inner", inner.clone()), ("tag", i64_ty.clone())],
+        24,
+        &[0, 16],
+        false,
+    );
+    let item_decl = interior_struct(
+        2,
+        &["fixture", "Item"],
+        &[("sub", sub.clone())],
+        24,
+        &[0],
+        false,
+    );
+    let wrap = interior_struct(
+        3,
+        &["fixture", "Wrap"],
+        &[
+            ("length", usize_ty.clone()),
+            ("items", interior_array_zero(item.clone())),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let unit = interior_unit_ty();
+    let writer = interior_fun(
+        1,
+        &["fixture", "write_through_mut_inner"],
+        3,
+        vec![item_ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("ptr"), &item_ptr),
+            interior_local(2, Some("slot"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("added"), &item_ptr),
+            interior_local(5, Some("sub"), &sub_ref),
+            interior_local(6, Some("inner"), &inner_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &item_ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &item_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    mut_container_ref_assign(5, &sub_ref, 4, &item_ptr, &item, &sub, 0),
+                    mut_container_ref_assign(6, &inner_ref, 5, &sub_ref, &sub, &inner, 0),
+                    interior_assign(
+                        interior_field(6, &inner_ref, &inner, &i64_ty, 0),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        0,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![item_ptr.clone(), usize_ty],
+        item_ptr,
+    );
+    llbc_with_declared_gc(
+        "fixture",
+        vec![inner_decl, sub_decl, item_decl, wrap],
+        vec![add, writer],
+        &[3],
+    )
+}
+
+#[test]
+fn gcarray_mut_nested_field_write_is_setinteriorfield() {
+    let llbc = gcarray_mut_nested_write_llbc();
+    let graph = lower_interior(&llbc, "write_through_mut_inner");
+    assert_interior_container_store(&graph, "sub.inner.n");
 }
 
 /// `{hash, length, chars:[u8;0]}` — a GcStruct with `_arrayfld`, not

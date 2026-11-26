@@ -404,11 +404,12 @@ fn resolve_types_inner(
         let names: Vec<String> = leftover.iter().map(|v| v.name()).take(12).collect();
         panic!(
             "setconcretetype: no binding for {} in graph {:?} ({} leftover \
-             Unknown Variable(s): {}; rtyper.py setconcretetype / bindingrepr)",
+             Unknown Variable(s): {}; {}; rtyper.py setconcretetype / bindingrepr)",
             var.name(),
             graph.name,
             leftover.len(),
             names.join(", "),
+            unbound_variable_site(graph, var),
         );
     }
 
@@ -441,6 +442,36 @@ pub(crate) fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
         }
     }
     live
+}
+
+/// Where an unbound `Variable` is born. `bindingrepr` is a `KeyError`
+/// without this site (`rtyper.py` `setconcretetype`).
+fn unbound_variable_site(graph: &FunctionGraph, var: &Variable) -> String {
+    let mut parts = Vec::new();
+    for block in &graph.blocks {
+        if block.inputargs.iter().any(|arg| arg == var) {
+            parts.push(format!("inputarg of {:?}", block.id));
+        }
+        for (op_index, op) in block.operations.iter().enumerate() {
+            if op.result.as_ref() == Some(var) {
+                let rendered = format!("{:?}", op.kind);
+                let rendered = if rendered.len() > 400 {
+                    format!("{}…", &rendered[..400])
+                } else {
+                    rendered
+                };
+                parts.push(format!(
+                    "result of {:?} op {op_index}: {rendered}",
+                    block.id
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "no defining op".to_string()
+    } else {
+        parts.join(" | ")
+    }
 }
 
 fn collect_block_variables(block: &crate::model::Block, into: &mut HashSet<Variable>) {

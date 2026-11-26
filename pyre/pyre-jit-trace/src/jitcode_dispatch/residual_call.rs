@@ -1921,11 +1921,19 @@ fn blackhole_level_starts(
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
     let code = &frame.jitcode.code;
+    let jitcode = frame.jitcode.as_ref();
     blackhole_scan_root_pcs(frame)
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts_with(
+                code,
+                start,
+                follow_callee,
+                |descr_index| {
+                    crate::jitcode_runtime::jitcode_switch_arm_targets(jitcode, descr_index)
+                },
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);

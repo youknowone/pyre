@@ -368,8 +368,9 @@ pub(crate) struct InlineBodyFacts {
 /// [`PyJitCodePayload::helper_resume_blockers`].
 #[derive(Clone, Copy)]
 pub(crate) struct BlackholeResumeFacts {
-    /// [`crate::jitcode_runtime::blackhole_resume_reachable_starts`] returned
-    /// `None` (`switch` or an undecodable instruction).
+    /// [`crate::jitcode_runtime::blackhole_resume_reachable_starts_with`]
+    /// returned `None`: a `switch` whose `SwitchDictDescr` did not resolve
+    /// (`jitcode_switch_arm_targets`), or an undecodable instruction.
     pub(crate) switch_or_undecodable: bool,
     /// Some reachable op's `bhimpl_*` may raise, or the scan failed.
     pub(crate) may_raise: bool,
@@ -398,10 +399,11 @@ pub(crate) fn compute_blackhole_resume_facts(
     pc: usize,
     in_flight_callee_may_raise: bool,
 ) -> BlackholeResumeFacts {
-    match crate::jitcode_runtime::blackhole_resume_reachable_starts(
+    match crate::jitcode_runtime::blackhole_resume_reachable_starts_with(
         jitcode.code.as_slice(),
         pc,
         in_flight_callee_may_raise,
+        |descr_index| crate::jitcode_runtime::jitcode_switch_arm_targets(jitcode, descr_index),
     ) {
         None => BlackholeResumeFacts {
             switch_or_undecodable: true,
@@ -492,6 +494,19 @@ impl LoopScanIndex {
     }
 }
 
+/// Per-pc answers of [`crate::jitcode_dispatch::helper_resume_reaches_blocker`].
+///
+/// The fact-free entry is one `OnceCell` per instruction byte. An entry that
+/// knows the gateway argument-array length is a different color of the same
+/// scan, keyed by `(pc, len)` in `by_pc_and_len`. The `RefCell` is touched
+/// only from the trace thread that owns `METAINTERP_SD`, the same window as
+/// the surrounding `OnceCell`s, and a borrow is never held across the scan
+/// that fills a slot.
+pub(crate) struct HelperResumeBlockerMemo {
+    by_pc: Box<[std::cell::OnceCell<bool>]>,
+    by_pc_and_len: std::cell::RefCell<Vec<(usize, usize, bool)>>,
+}
+
 /// Compiled JitCode plus pyre-only metadata.
 pub struct PyJitCodePayload {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
@@ -523,8 +538,9 @@ pub struct PyJitCodePayload {
     pub(crate) loop_scan: std::cell::OnceCell<LoopScanIndex>,
     /// Lazily-built per-pc answers of
     /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`], dropped
-    /// with the body by `replace_with`.
-    pub(crate) helper_resume_blockers: std::cell::OnceCell<Box<[std::cell::OnceCell<bool>]>>,
+    /// with the body by `replace_with`. The length-carrying entry shares
+    /// this cell; it is not a second table.
+    pub(crate) helper_resume_blockers: std::cell::OnceCell<HelperResumeBlockerMemo>,
     /// Lazily-built per-pc answers of [`Self::blackhole_resume_facts`],
     /// dropped with the body by `replace_with`.
     pub(crate) blackhole_resume_scans: std::cell::OnceCell<Box<[BlackholeResumePcScan]>>,
@@ -601,6 +617,54 @@ impl PyJitCodePayload {
         }
     }
 
+    /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`] for this
+    /// `(pc, entry_array_len)`, computed once.
+    ///
+    /// `entry_array_len` is part of the key: a gateway's answer depends on
+    /// the argument count (`blackhole.py` `_resume_mainloop` runs the helper
+    /// from the resumed pc under those entry facts). Out-of-range `pc` is
+    /// not a real instruction start and stays uncached. The `RefCell` borrow
+    /// ends before `compute`, which re-enters this payload's other scans.
+    pub(crate) fn helper_resume_blocker(
+        &self,
+        pc: usize,
+        entry_array_len: Option<usize>,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        if pc >= self.jitcode.code.len() {
+            return true;
+        }
+        let memo = self
+            .helper_resume_blockers
+            .get_or_init(|| HelperResumeBlockerMemo {
+                by_pc: (0..self.jitcode.code.len())
+                    .map(|_| std::cell::OnceCell::new())
+                    .collect(),
+                by_pc_and_len: std::cell::RefCell::new(Vec::new()),
+            });
+        let Some(len) = entry_array_len else {
+            return *memo.by_pc[pc].get_or_init(compute);
+        };
+        if let Some((_, _, value)) = memo
+            .by_pc_and_len
+            .borrow()
+            .iter()
+            .find(|(seen_pc, seen_len, _)| *seen_pc == pc && *seen_len == len)
+        {
+            return *value;
+        }
+        let value = compute();
+        let mut slots = memo.by_pc_and_len.borrow_mut();
+        if let Some((_, _, existing)) = slots
+            .iter()
+            .find(|(seen_pc, seen_len, _)| *seen_pc == pc && *seen_len == len)
+        {
+            return *existing;
+        }
+        slots.push((pc, len, value));
+        value
+    }
+
     /// [`Self::const_r_box_indexes`], sized to `constants_r` on first use.
     pub(crate) fn const_r_box_indexes(&self) -> &[std::sync::atomic::AtomicU32] {
         self.const_r_box_indexes.get_or_init(|| {
@@ -651,8 +715,9 @@ pub struct PyJitCode {
 // the populated object is handed to runtime readers. Runtime-visible index
 // stamping uses atomics on the inner `RuntimeJitCode`. The lazily-built
 // `sub_descr_pool` / `helper_resume_blockers` / `blackhole_resume_scans`
-// `OnceCell`s are initialized only from the trace-side walker, which runs
-// on the single thread owning the thread-local `METAINTERP_SD` store.
+// `OnceCell`s, and the `RefCell` inside `helper_resume_blockers`, are
+// initialized only from the trace-side walker, which runs on the single
+// thread owning the thread-local `METAINTERP_SD` store.
 unsafe impl Sync for PyJitCode {}
 
 impl Deref for PyJitCode {

@@ -23140,22 +23140,26 @@ mod tests {
 
     /// `rordereddict.py` `_ll_dict_setitem_lookup_done` binds
     /// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY`
-    /// (`lltype.py` `Struct` in `GcArray`); `entry.key` is
-    /// `SomePtr.getattr` (`lltype.py`) / `getinteriorfield`. IdentityKey
-    /// `LiveIter::entry_at` getattr `"key"` reads the CAST dest of
-    /// `entries_item_ptr` (`direct_arrayitems` /
-    /// `instantiated_struct_item_spelling`), not the unsuffixed residual
-    /// return of the graph. `direct_arrayitems` returns a FixedSizeArray
-    /// pointer; `entry_at` returns the ITEM struct pointer. Residual `"ref"` with no class root shells
-    /// classdef-less (`valuetype_to_someshell`); official skip is
-    /// `SomeInstance.setattr("__pos_0")` of that getattr.
+    /// (`lltype.py` `Struct` in `GcArray`). IdentityKey `get_slot` calls
+    /// `entry_at` and reads `entry.key` with `getinteriorfield`
+    /// (`rptr.py` `InteriorPtrRepr.rtype_getattr`,
+    /// `jtransform.py` `rewrite_op_getinteriorfield`). `entry_at` is
+    /// `&*entry_ptr().add(slot)`. The add dest is returned, so
+    /// `try_lower_struct_field_ptr_add` declines. The item pointer is
+    /// `GcStruct('Interior', ptr, index)` (`rtype_getitem`); the add
+    /// moves `index` and does not residualise `<*T>::add`
+    /// (`rewrite_op_direct_ptradd` is raw-only). `entries_item_ptr` is
+    /// that malloc at index 0, not `cast_int_to_ptr` of an interior
+    /// address. Residual `"ref"` with no class root shells classdef-less
+    /// (`valuetype_to_someshell`); official skip is
+    /// `SomeInstance.getattr("key")` on that dest.
     #[test]
     fn identitykey_entry_at_dest_interns_someptr_getattr_key() {
         use std::rc::Rc;
 
         use crate::annotator::model::{SomeString, SomeValue};
         use crate::flowspace::model::{ConstValue, Constant};
-        use crate::model::OpKind;
+        use crate::model::{CallTarget, OpKind};
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
         let Some(object) = crate::test_support::load_ullbc_if_present(
@@ -23167,7 +23171,7 @@ mod tests {
             &[object],
             crate::HostStaticAddrs::default(),
             &["identitydict", "rordereddict", "rordereddict_entries"],
-            &["nth_item", "entry_at"],
+            &["nth_item", "entry_at", "entry_at_mut"],
         )
         .expect("lower identitydict nth_item");
 
@@ -23212,30 +23216,141 @@ mod tests {
             .iter()
             .find(|f| f.name.contains("get_slot__spec_IdentityKey"))
             .unwrap_or_else(|| panic!("expected IdentityKey get_slot spec, got {names:?}"));
-        assert!(
-            get_slot
-                .graph()
+        let call_leaves = |f: &crate::front::semantic::SemanticFunction| -> Vec<String> {
+            f.graph()
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(|op| matches!(
-                    &op.kind,
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call { target, .. } => match target {
+                        CallTarget::FunctionPath { segments, .. } => segments.last().cloned(),
+                        CallTarget::Method { name, .. } => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        let field_names = |f: &crate::front::semantic::SemanticFunction| -> Vec<String> {
+            f.graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. } => {
+                        Some(field.name.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let interior_names = |f: &crate::front::semantic::SemanticFunction| -> Vec<String> {
+            f.graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
                     OpKind::InteriorFieldRead { field, .. }
-                        if field.name == "key"
-                            && field.owner_root.as_deref().is_some_and(|owner| {
-                                owner.rsplit("::").next().is_some_and(|leaf| {
-                                    leaf == "Entry" || leaf.starts_with("Entry<")
-                                })
-                            })
-                )),
-            "IdentityKey get_slot must getinteriorfield key, ops {:?}",
-            get_slot
-                .graph()
+                    | OpKind::InteriorFieldWrite { field, .. } => Some(field.name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let has_interior_malloc = |f: &crate::front::semantic::SemanticFunction| {
+            f.graph()
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .map(|op| format!("{:?}", op.kind))
-                .collect::<Vec<_>>()
+                .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Interior"))
+        };
+        let calls_leaf = |f: &crate::front::semantic::SemanticFunction, leaf: &str| {
+            call_leaves(f).iter().any(|name| name == leaf)
+        };
+        let slot_leaves = call_leaves(get_slot);
+        assert!(
+            slot_leaves.iter().any(|leaf| leaf.contains("entry_at")),
+            "IdentityKey get_slot keeps the entry_at call, leaves {slot_leaves:?}"
+        );
+        let slot_interior = interior_names(get_slot);
+        assert!(
+            slot_interior.iter().any(|name| name == "key"),
+            "get_slot reads key with getinteriorfield, interior {slot_interior:?}"
+        );
+        assert!(
+            slot_interior.iter().any(|name| name == "value"),
+            "get_slot reads value with getinteriorfield, interior {slot_interior:?}"
+        );
+        let slot_fields = field_names(get_slot);
+        assert!(
+            slot_fields.iter().any(|name| name == "ptr")
+                && slot_fields.iter().any(|name| name == "index"),
+            "get_slot unpacks Interior(ptr, index), fields {slot_fields:?}"
+        );
+        assert!(
+            !calls_leaf(get_slot, "cast_int_to_ptr") && !calls_leaf(get_slot, "direct_ptradd"),
+            "get_slot does not box the item address, leaves {slot_leaves:?}"
+        );
+        let body_leaves = call_leaves(entry_at);
+        assert!(
+            body_leaves.iter().any(|leaf| leaf.contains("entry_ptr")),
+            "entry_at calls entry_ptr, leaves {body_leaves:?}"
+        );
+        assert!(
+            !calls_leaf(entry_at, "add"),
+            "entry_at does not residualise <*T>::add, leaves {body_leaves:?}"
+        );
+        assert!(
+            has_interior_malloc(entry_at),
+            "entry_at returns InteriorPtrRepr's GcStruct"
+        );
+        assert!(
+            interior_names(entry_at).is_empty(),
+            "entry_at returns the interior word; the caller reads the field"
+        );
+        let item_ptr = program
+            .functions
+            .iter()
+            .find(|f| f.name.contains("entries_item_ptr__spec_IdentityKey"))
+            .unwrap_or_else(|| panic!("expected IdentityKey entries_item_ptr spec, got {names:?}"));
+        assert!(
+            has_interior_malloc(item_ptr),
+            "entries_item_ptr is Interior(array, 0), not cast_int_to_ptr"
+        );
+        assert!(
+            !calls_leaf(item_ptr, "cast_int_to_ptr"),
+            "entries_item_ptr does not box an interior address, leaves {:?}",
+            call_leaves(item_ptr)
+        );
+        let entry_at_mut = program
+            .functions
+            .iter()
+            .find(|f| {
+                f.name.contains("entry_at_mut")
+                    && entry_root(f)
+                        .as_deref()
+                        .is_some_and(|root| root.contains("Entry"))
+            })
+            .unwrap_or_else(|| {
+                let sketches: Vec<_> = program
+                    .functions
+                    .iter()
+                    .filter(|f| f.name.contains("entry_at_mut"))
+                    .map(|f| format!("{} root={:?}", f.name, entry_root(f)))
+                    .collect();
+                panic!("expected entry_at_mut of Entry, sketches={sketches:?} names={names:?}")
+            });
+        let mut_leaves = call_leaves(entry_at_mut);
+        assert!(
+            mut_leaves.iter().any(|leaf| leaf == "barrier_entries"),
+            "entry_at_mut keeps barrier_entries, leaves {mut_leaves:?}"
+        );
+        assert!(
+            !mut_leaves.iter().any(|leaf| leaf == "add"),
+            "entry_at_mut does not residualise <*T>::add, leaves {mut_leaves:?}"
+        );
+        assert!(
+            has_interior_malloc(entry_at_mut),
+            "entry_at_mut returns InteriorPtrRepr's GcStruct"
         );
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);

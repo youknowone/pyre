@@ -271,8 +271,7 @@ impl SomePtr {
         // the raw ITEM (`PtrRepr.rtype_getitem` → `getarraysubstruct`).
         // `FixedSizeArray._first_struct` is `(None, None)`, so the field
         // is `SomePtr.getattr` of `Ptr(ITEM)`, including that Struct's
-        // own `_first_struct` walk, keyed on the ITEM `_name`
-        // (`declared_row_external`), not on the array.
+        // own `_first_struct` walk.
         let item_ptr = fixed_size_array_struct_item_ptr(&self.ll_ptrtype)
             .filter(|item_ptr| struct_ptr_sees_field(item_ptr, attr));
         if let Some(item_ptr) = item_ptr {
@@ -290,14 +289,10 @@ impl SomePtr {
                 }
                 match example.getattr(attr) {
                     Ok(v) => {
-                        let item_name = ptr_container_struct_name(&self.ll_ptrtype);
-                        let field_t = ptr_struct_field_lltype(&self.ll_ptrtype, attr);
-                        Ok(item_field_read_annotation(
-                            item_name.as_deref(),
-                            attr,
-                            field_t.as_ref(),
-                            v,
-                        ))
+                        // `lltype.py` `SomePtr.getattr`: `_ptr._expose` of an
+                        // inlined `Struct` is a sub-struct pointer, and the
+                        // annotation is `ll_to_annotation` of that pointer.
+                        Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
                     }
                     // A raw-pointer `p.is_null()` whose receiver keeps its
                     // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
@@ -332,19 +327,6 @@ impl SomePtr {
                     }
                     Err(e) => {
                         if let Some(parent) = self.ll_ptrtype.first_struct_ptr() {
-                            // `Struct._first_struct`: the offset-0 inlined
-                            // struct's fields are read on this pointer.
-                            // The item name stays the outer struct
-                            // (`rdict.py` `recast_key`).
-                            let item_name = ptr_container_struct_name(&self.ll_ptrtype);
-                            let field_t = ptr_struct_field_lltype(&parent, attr);
-                            if let (Some(item_name), Some(field_t)) =
-                                (item_name.as_deref(), field_t.as_ref())
-                                && let Some(projected) =
-                                    declared_row_external(item_name, attr, field_t)
-                            {
-                                return Ok(projected);
-                            }
                             return SomePtr::new(parent).getattr(s_attr);
                         }
                         Err(AnnotatorError::new(e))
@@ -369,10 +351,6 @@ impl SomePtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        let func_args = match &self.ll_ptrtype.TO {
-            lltype::PtrTarget::Func(ft) => Some(ft.args.as_slice()),
-            _ => None,
-        };
         // `lltype.py SomePtr.call`: `[annotation_to_lltype(
         // s_arg, info)._defl() for s_arg in args_s]` — touches every
         // slot once via the list comprehension; `annotation_to_lltype`
@@ -383,21 +361,6 @@ impl SomePtr {
         let llargs = (0..args_s_opt.len())
             .map(|i| {
                 let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomePtr.call");
-                // Rust fn-pointer adaptation of
-                // `annlowlevel.cast_instance_to_base_ptr` at an
-                // `llhelper` call site (`lltype.py` `SomePtr.call`).
-                // `annotation_to_lltype` has no `SomeInstance` case
-                // (`llannotation.py`); a `SomeInstance` argument whose
-                // FUNC `ARGS[i]` is a GC instance pointer
-                // (`rclass.OBJECTPTR`, or a class's instance pointer)
-                // is taken as that pointer. An instance against a
-                // non-instance-pointer `ARGS[i]` still raises.
-                if matches!(s_arg, SomeValue::Instance(_))
-                    && let Some(arg_ty) = func_args.and_then(|args| args.get(i))
-                    && func_arg_is_gc_instance_pointer(arg_ty)
-                {
-                    return Ok(arg_ty.clone()._defl());
-                }
                 annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -449,58 +412,20 @@ impl SomePtr {
         match example.getattr(attr) {
             Ok(v) => {
                 if v != lltype::LowLevelValue::Void {
-                    let item_name = ptr_container_struct_name(&self.ll_ptrtype);
-                    let field_t = ptr_struct_field_lltype(&self.ll_ptrtype, attr);
-                    let stored = stored_llvalue_for_item_field(
-                        item_name.as_deref(),
-                        attr,
-                        field_t.as_ref(),
-                        s_value,
-                    )?;
-                    example.setattr(attr, stored).map_err(AnnotatorError::new)?;
+                    let v_lltype = annotation_to_lltype(s_value, None)?;
+                    example
+                        .setattr(attr, v_lltype._defl())
+                        .map_err(AnnotatorError::new)?;
                 }
                 Ok(SomeValue::Impossible)
             }
             Err(_) => {
                 if let Some(parent) = self.ll_ptrtype.first_struct_ptr() {
-                    // Same offset-0 leaf as the getattr arm. The store
-                    // writes the inner struct; the external annotation
-                    // is still the item's declared row.
-                    let item_name = ptr_container_struct_name(&self.ll_ptrtype);
-                    let field_t = ptr_struct_field_lltype(&parent, attr);
-                    if let (Some(item_name), Some(field_t)) =
-                        (item_name.as_deref(), field_t.as_ref())
-                        && item_pointer_word_lltype(field_t)
-                        && let Some(external) = declared_row_external(item_name, attr, field_t)
-                        && external.contains(s_value)
-                    {
-                        let mut inner = parent._example();
-                        inner
-                            .setattr(attr, field_t._defl())
-                            .map_err(AnnotatorError::new)?;
-                        return Ok(SomeValue::Impossible);
-                    }
                     return SomePtr::new(parent).setattr(s_attr, s_value);
                 }
                 Err(AnnotatorError::new(self.ll_ptrtype._nofield(attr)))
             }
         }
-    }
-}
-
-/// FUNC.ARGS[i] is a GC instance pointer: `rclass.OBJECTPTR`, or a
-/// class's `InstanceRepr.lowleveltype` (`Ptr(object_type)`, `rclass.py`).
-fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
-    if ty == &*crate::translator::rtyper::rclass::OBJECTPTR {
-        return true;
-    }
-    let lltype::LowLevelType::Ptr(p) = ty else {
-        return false;
-    };
-    match &p.TO {
-        lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
-        lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
-        _ => false,
     }
 }
 
@@ -515,146 +440,6 @@ fn ptr_struct_field_lltype(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowL
         },
         _ => None,
     }
-}
-
-/// Declared lltype of `attr` when an interior pointer's `TO` is a struct.
-fn interior_struct_field_lltype(
-    ptr: &lltype::InteriorPtr,
-    attr: &str,
-) -> Option<lltype::LowLevelType> {
-    match ptr.TO.as_ref() {
-        lltype::LowLevelType::Struct(st) => st.getattr_field_type(attr),
-        _ => None,
-    }
-}
-
-fn ptr_container_struct_name(ptr: &lltype::Ptr) -> Option<String> {
-    match &ptr.TO {
-        lltype::PtrTarget::Struct(st) => Some(st._name.clone()),
-        lltype::PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
-            Some(lltype::LowLevelType::Struct(st)) => Some(st._name),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn interior_container_struct_name(ptr: &lltype::InteriorPtr) -> Option<String> {
-    match ptr.TO.as_ref() {
-        lltype::LowLevelType::Struct(st) => Some(st._name.clone()),
-        _ => None,
-    }
-}
-
-/// Internal lowleveltype of a dict item field is `GCREF`, `OBJECTPTR`,
-/// or `STRPTR` (`rmodel.py` `externalvsinternal`; `rordereddict.py`
-/// `_setup_repr` stores it on `DICTENTRY`). `Address` is not one of
-/// those words.
-fn item_pointer_word_lltype(ty: &lltype::LowLevelType) -> bool {
-    ty == &*lltype::GCREF
-        || ty == &*crate::translator::rtyper::rclass::OBJECTPTR
-        || lltype_is_strptr(ty)
-}
-
-/// Declared spelling of `field_name` on an item struct.
-///
-/// Direct rows come from `StructFieldRegistry::intern_field_rows` of
-/// the item `Struct`'s `_name`. `lltype.py` `Struct._first_struct` is
-/// the offset-0 inlined struct (`heaptracker.py` `all_fielddescrs`
-/// numbers that struct's fields on the outer object). A field that is
-/// not one of the item's own rows is that inlined struct's row, still
-/// reached through the item. Only an item struct
-/// (`struct_root_template_is_gcarray_item`) has either spelling.
-fn item_field_declared_spelling(
-    reg: &crate::front::StructFieldRegistry,
-    item_name: &str,
-    field_name: &str,
-) -> Option<String> {
-    if !bookkeeper::struct_root_template_is_gcarray_item(reg, item_name) {
-        return None;
-    }
-    let rows = reg.intern_field_rows(item_name)?;
-    if let Some(row) = rows.iter().find(|row| row.name == field_name) {
-        return Some(row.ty.clone());
-    }
-    let first = rows.first()?;
-    if crate::front::typestr::peel_pointer_prefix(first.ty.trim()).is_some() {
-        return None;
-    }
-    let inner = reg.intern_field_rows(&first.ty)?;
-    let row = inner.iter().find(|row| row.name == field_name)?;
-    Some(row.ty.clone())
-}
-
-/// External annotation of one item-struct field.
-///
-/// `rdict.py` `AbstractDictRepr.recast_key` / `recast_value` is
-/// `llops.convertvar` between the internal word and this annotation.
-/// `AbstractDictIteratorRepr.variant_keys` reads the field, then
-/// recasts. The external repr is
-/// [`Bookkeeper::project_struct_field_type`](crate::annotator::bookkeeper::Bookkeeper::project_struct_field_type)
-/// of the spelling [`item_field_declared_spelling`] published for the
-/// item. A pointer word and an inlined `Struct` are the fields that
-/// conversion covers. `Impossible` is not an external repr. Any other
-/// `SomePtr` field stays on `lltype.py` `SomePtr.getattr`.
-fn declared_row_external(
-    item_name: &str,
-    field_name: &str,
-    field_t: &lltype::LowLevelType,
-) -> Option<SomeValue> {
-    if !item_pointer_word_lltype(field_t) && !matches!(field_t, lltype::LowLevelType::Struct(_)) {
-        return None;
-    }
-    let bk = bookkeeper::getbookkeeper()?;
-    let spelling = {
-        let borrowed = bk.struct_fields.borrow();
-        let reg = borrowed.as_ref()?;
-        item_field_declared_spelling(reg, item_name, field_name)?
-    };
-    let projected = bk.project_struct_field_type(&spelling);
-    if matches!(projected, SomeValue::Impossible) {
-        None
-    } else {
-        Some(projected)
-    }
-}
-
-fn item_field_read_annotation(
-    item_name: Option<&str>,
-    field_name: &str,
-    field_t: Option<&lltype::LowLevelType>,
-    exposed: lltype::LowLevelValue,
-) -> SomeValue {
-    if let (Some(item_name), Some(field_t)) = (item_name, field_t)
-        && let Some(projected) = declared_row_external(item_name, field_name, field_t)
-    {
-        return projected;
-    }
-    highlevel_of_ptr_field_annotation(ll_to_annotation(exposed))
-}
-
-/// Store half of [`declared_row_external`].
-///
-/// `rdict.py` `rtype_setitem` takes `hop.inputarg` of the external
-/// repr, then `recast_value` (`llops.convertvar`) to the internal
-/// word. A value contained in that external annotation
-/// (`annotator` `contains`) is the internal word. Anything else,
-/// and every field that is not a pointer word, still goes through
-/// `annotation_to_lltype` (`lltype.py` `SomePtr.setattr`).
-fn stored_llvalue_for_item_field(
-    item_name: Option<&str>,
-    field_name: &str,
-    field_t: Option<&lltype::LowLevelType>,
-    s_value: &SomeValue,
-) -> Result<lltype::LowLevelValue, AnnotatorError> {
-    if let (Some(item_name), Some(field_t)) = (item_name, field_t)
-        && item_pointer_word_lltype(field_t)
-        && let Some(external) = declared_row_external(item_name, field_name, field_t)
-        && external.contains(s_value)
-    {
-        return Ok(field_t._defl());
-    }
-    Ok(annotation_to_lltype(s_value, None)?._defl())
 }
 
 /// `ll_to_annotation` of a pointer field, then the high-level annotation
@@ -742,8 +527,9 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
 /// True when `attr` is a field of this struct pointer or of a
 /// `Struct._first_struct` parent. `SomePtr.getattr` walks that chain
 /// after the pointer's own fields miss. `direct_arrayitems` delegates
-/// those names to `Ptr(ITEM)` so `declared_row_external` still keys on
-/// the ITEM Struct's `_name`.
+/// those names to `Ptr(ITEM)` so the walk is `SomePtr.getattr` of the
+/// item. An inlined `Struct` field is `ll_to_annotation` of the
+/// sub-struct pointer `_ptr._expose` returns.
 fn struct_ptr_sees_field(ptr: &lltype::Ptr, attr: &str) -> bool {
     let mut current = ptr.clone();
     loop {
@@ -991,14 +777,9 @@ impl SomeInteriorPtr {
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => {
                 let v = example.getattr(attr).map_err(AnnotatorError::new)?;
-                let item_name = interior_container_struct_name(&self.ll_ptrtype);
-                let field_t = interior_struct_field_lltype(&self.ll_ptrtype, attr);
-                Ok(item_field_read_annotation(
-                    item_name.as_deref(),
-                    attr,
-                    field_t.as_ref(),
-                    v,
-                ))
+                // `_interior_ptr._expose` of an inlined `Struct` is an
+                // interior sub-struct pointer (`lltype.py`).
+                Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
             }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
@@ -1053,17 +834,11 @@ impl SomeInteriorPtr {
             );
         };
         let mut example = self.ll_ptrtype._example();
-        let field = example.getattr(attr).map_err(AnnotatorError::new)?;
-        if field != lltype::LowLevelValue::Void {
-            let item_name = interior_container_struct_name(&self.ll_ptrtype);
-            let field_t = interior_struct_field_lltype(&self.ll_ptrtype, attr);
-            let stored = stored_llvalue_for_item_field(
-                item_name.as_deref(),
-                attr,
-                field_t.as_ref(),
-                s_value,
-            )?;
-            example.setattr(attr, stored).map_err(AnnotatorError::new)?;
+        if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
+            let v_lltype = annotation_to_lltype(s_value, None)?;
+            example
+                .setattr(attr, v_lltype._defl())
+                .map_err(AnnotatorError::new)?;
         }
         Ok(SomeValue::Impossible)
     }
@@ -1603,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn someptr_call_accepts_matching_instance_as_fn_ptr_arg() {
+    fn someptr_call_rejects_instance_as_objectptr_fn_ptr_arg() {
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::model::SomeInstance;
         let (_ann, classdef) = classdef_for_fn_ptr_call_test("MatchingFnPtrInst");
@@ -1616,9 +1391,16 @@ mod tests {
             }),
         });
         let args = ArgumentsForTranslation::new(vec![Some(inst)], None, None);
-        s_ptr
+        let err = s_ptr
             .call(&args)
-            .expect("SomeInstance against OBJECTPTR is the instance pointer");
+            .expect_err("SomeInstance against OBJECTPTR ARGS[i] is annotation_to_lltype");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("should return a low-level type"),
+            "lltype.py SomePtr.call has no SomeInstance arm, got {err:?}"
+        );
     }
 
     #[test]
@@ -2071,6 +1853,26 @@ mod tests {
         );
     }
 
+    fn assert_no_lltype(err: &AnnotatorError) {
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("should return a low-level type"),
+            "annotation_to_lltype rejects a high-level value, got {err:?}"
+        );
+    }
+
+    fn assert_item_gcref_ptr(got: &SomeValue) {
+        let SomeValue::Ptr(p) = got else {
+            panic!("item GCREF field is SomePtr(GCREF), got {got:?}");
+        };
+        assert_eq!(
+            lltype::LowLevelType::from(p.ll_ptrtype.clone()),
+            (*crate::translator::rtyper::lltypesystem::lltype::GCREF).clone()
+        );
+    }
+
     fn note_entry_item_wrapper(reg: &mut crate::front::StructFieldRegistry) {
         reg.fields.insert(
             "storage::Entries".to_string(),
@@ -2082,14 +1884,15 @@ mod tests {
         reg.note_declared_gc_name("storage::Entries");
     }
 
-    /// Storing the external string of a `STRPTR` item field succeeds
-    /// (`rdict.py` `AbstractDictRepr.recast_key`). The external annotation
-    /// is `project_struct_field_type` of the declared row
-    /// (`*mut unicodeobject::Utf8Str`): nullable `s_Str0`
-    /// (`no_nul` true). `s_Str0` and that nullable string are contained.
-    /// `SomeString(no_nul=False)` is not. A `SomeInteger` is not.
+    /// Reading a `STRPTR` item field is nullable SomeString
+    /// (`highlevel_of_ptr_field_annotation` / `strptr_as_somestring`,
+    /// `no_nul` true). `annotation_to_lltype` has no `SomeString` case
+    /// (`llannotation.py`), so a store of `s_Str0`, that nullable
+    /// string, `SomeString(no_nul=False)`, or a `SomeInteger` fails.
+    /// The crossing store is `annlowlevel.py` `llstr` at the writer,
+    /// not `SomePtr.setattr`.
     #[test]
-    fn strptr_field_setattr_accepts_somestring() {
+    fn strptr_field_setattr_rejects_somestring() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::model::SomeString;
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -2142,19 +1945,39 @@ mod tests {
         assert!(read.inner.can_be_none);
         assert!(read.inner.no_nul);
 
-        assert!(entry.setattr(&key, &s_str0()).is_ok());
+        let bare = entry.setattr(&key, &s_str0()).unwrap_err();
+        assert_no_lltype(&bare);
         let nullable = s_str0().noneify().expect("nullable SomeString");
-        assert!(entry.setattr(&key, &nullable).is_ok());
-        let widened = entry.setattr(&key, &SomeValue::String(SomeString::new(false, false)));
-        assert!(
-            widened.is_err(),
-            "SomeString(no_nul=False) is not the external s_Str0, got {widened:?}"
-        );
+        let nullable_err = entry.setattr(&key, &nullable).unwrap_err();
+        assert_no_lltype(&nullable_err);
+        let widened = entry
+            .setattr(&key, &SomeValue::String(SomeString::new(false, false)))
+            .unwrap_err();
+        assert_no_lltype(&widened);
         assert!(
             entry
                 .setattr(&key, &SomeValue::Integer(SomeInteger::new(false, false)),)
                 .is_err()
         );
+
+        // The writer crosses with `llstr` (`LLStrEntry`). Its annotation
+        // is `SomePtr(Ptr(STR))`, which `SomePtr.setattr` accepts.
+        let nullable = s_str0().noneify().expect("nullable SomeString");
+        let s_ll = crate::translator::rtyper::annlowlevel::LLStrEntry {
+            helper: crate::translator::rtyper::annlowlevel::llstr,
+        }
+        .compute_result_annotation(&nullable);
+        let SomeValue::Ptr(p) = &s_ll else {
+            panic!("llstr annotates as SomePtr(Ptr(STR)), got {s_ll:?}");
+        };
+        assert_eq!(
+            LowLevelType::from(p.ll_ptrtype.clone()),
+            STRPTR.clone(),
+            "llstr result is Ptr(STR)"
+        );
+        entry
+            .setattr(&key, &s_ll)
+            .expect("STRPTR item field accepts llstr's SomePtr");
     }
 
     /// A struct that is not a gcarray item keeps `lltype.py`
@@ -2264,13 +2087,13 @@ mod tests {
 
     /// `Entry<i64, *mut class-root>` (`rordereddict.py` `DICTENTRY`):
     /// the value field's internal lltype is `llmemory.GCREF`
-    /// (`rmodel.py` `externalvsinternal`, `gcref=True`). The read is
-    /// `project_struct_field_type` of the declared row, a nullable
-    /// instance (`rdict.py` `AbstractDictRepr.recast_value`). Storing
-    /// that class or a subclass succeeds. An unrelated class still has
-    /// no low-level type (`annotation_to_lltype`).
+    /// (`rmodel.py` `externalvsinternal`, `gcref=True`).
+    /// `lltype.py` `SomePtr.getattr` is `SomePtr(GCREF)`. A
+    /// `SomeInstance` store fails in `annotation_to_lltype`
+    /// (`lltype.py` `SomePtr.setattr`); `rdict.py` `recast_value` is
+    /// the separate `llops.convertvar`.
     #[test]
-    fn gcarray_item_class_root_value_getattr_is_instance_setattr_accepts_it() {
+    fn gcarray_item_class_root_value_getattr_is_gcref_setattr_rejects_instance() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::classdesc::ClassDef;
         use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, PtrTarget};
@@ -2329,31 +2152,16 @@ mod tests {
             crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
         };
 
-        let SomeValue::Instance(value) = entry.getattr(&attr("value")).unwrap() else {
-            panic!(
-                "class-root value must read as SomeInstance, got {:?}",
-                entry.getattr(&attr("value"))
-            );
-        };
-        assert!(value.can_be_none);
+        assert_item_gcref_ptr(&entry.getattr(&attr("value")).unwrap());
         let root = bk
             .getuniqueclassdef_for_struct_root(root_name)
             .expect("class root");
-        assert!(
-            value
-                .classdef
-                .as_ref()
-                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
-        );
-
         let same = SomeValue::Instance(SomeInstance::new(
             Some(Rc::clone(&root)),
             true,
             std::collections::BTreeMap::new(),
         ));
-        entry
-            .setattr(&attr("value"), &same)
-            .expect("store the class root");
+        assert_no_lltype(&entry.setattr(&attr("value"), &same).unwrap_err());
 
         let sub = ClassDef::new_standalone("owner::Sub", Some(&root));
         let sub_value = SomeValue::Instance(SomeInstance::new(
@@ -2361,9 +2169,7 @@ mod tests {
             true,
             std::collections::BTreeMap::new(),
         ));
-        entry
-            .setattr(&attr("value"), &sub_value)
-            .expect("store a subclass");
+        assert_no_lltype(&entry.setattr(&attr("value"), &sub_value).unwrap_err());
 
         let other = bk
             .getuniqueclassdef_for_struct_root("owner::Other")
@@ -2373,14 +2179,7 @@ mod tests {
             true,
             std::collections::BTreeMap::new(),
         ));
-        let err = entry.setattr(&attr("value"), &other_value).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("should return a low-level type"),
-            "unrelated instance must still fail, got {err:?}"
-        );
+        assert_no_lltype(&entry.setattr(&attr("value"), &other_value).unwrap_err());
 
         let PtrTarget::Struct(st) = &entry.ll_ptrtype.TO else {
             panic!("item pointer targets a Struct");
@@ -2390,26 +2189,19 @@ mod tests {
             TO: Box::new(LowLevelType::Struct(Box::new(st.clone()))),
             offsets: vec![],
         });
-        interior
-            .setattr(&attr("value"), &same)
-            .expect("interior store of the class root");
-        let err = interior.setattr(&attr("value"), &other_value).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("should return a low-level type"),
-            "interior store of an unrelated instance must still fail, got {err:?}"
-        );
+        assert_item_gcref_ptr(&interior.getattr(&attr("value")).unwrap());
+        assert_no_lltype(&interior.setattr(&attr("value"), &same).unwrap_err());
+        assert_no_lltype(&interior.setattr(&attr("value"), &other_value).unwrap_err());
     }
 
     /// An item struct's inlined two-field key reads as
-    /// `project_struct_field_type` of the declared row, that key's
-    /// `SomeInstance`, including `can_be_None`. A scalar field stays an
-    /// integer. A declared-GC class-root field is `GCREF` internally
-    /// and still reads as that class's nullable instance
-    /// (`rdict.py` `AbstractDictRepr.recast_value`).
-    /// `SomeInteriorPtr.getattr` is the same three reads.
+    /// `ll_to_annotation` of the sub-struct pointer `_ptr._expose`
+    /// returns (`lltype.py` `SomePtr.getattr`). The item pointer is
+    /// raw, so that is `SomePtr` of the key struct. A scalar field
+    /// stays an integer. A declared-GC class-root field is `GCREF`
+    /// internally and stays `SomePtr(GCREF)`. `SomeInteriorPtr.getattr`
+    /// exposes the same key as `SomeInteriorPtr`
+    /// (`_interior_ptr._expose`).
     #[test]
     fn gcarray_item_inlined_by_value_key_getattr_is_instance() {
         use crate::annotator::bookkeeper::Bookkeeper;
@@ -2483,30 +2275,18 @@ mod tests {
             Some((*GCREF).clone()),
             "declared-GC class-root value is GCREF"
         );
-        let projected = match bk.project_struct_field_type(key_name) {
-            SomeValue::Instance(inst) => inst,
-            other => panic!("declared-row key projection must be SomeInstance, got {other:?}"),
-        };
         let entry = SomePtr::new(*built);
         let attr = |name: &str| {
             crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
         };
-        let assert_key = |got: SomeValue| {
-            let SomeValue::Instance(inst) = got else {
-                panic!("inlined key must read as SomeInstance, got {got:?}");
-            };
-            assert_eq!(inst.can_be_none, projected.can_be_none);
-            assert!(
-                inst.classdef.as_ref().is_some_and(|cd| {
-                    projected
-                        .classdef
-                        .as_ref()
-                        .is_some_and(|want| Rc::ptr_eq(cd, want))
-                }),
-                "key classdef must be the projection's ClassDef"
-            );
+        let got_key = entry.getattr(&attr("key")).unwrap();
+        let SomeValue::Ptr(key_ptr) = &got_key else {
+            panic!("inlined key must read as SomePtr of the sub-struct, got {got_key:?}");
         };
-        assert_key(entry.getattr(&attr("key")).unwrap());
+        match &key_ptr.ll_ptrtype.TO {
+            PtrTarget::Struct(st) => assert_eq!(st._name, key_name),
+            other => panic!("sub-struct pointer must target the key Struct, got {other:?}"),
+        }
 
         let count = entry.getattr(&attr("count")).unwrap();
         assert!(
@@ -2514,66 +2294,36 @@ mod tests {
             "scalar field stays an integer, got {count:?}"
         );
 
-        let SomeValue::Instance(value) = entry.getattr(&attr("value")).unwrap() else {
-            panic!(
-                "class-root value must read as SomeInstance, got {:?}",
-                entry.getattr(&attr("value"))
-            );
-        };
-        assert!(value.can_be_none);
-        let root = bk
-            .getuniqueclassdef_for_struct_root(root_name)
-            .expect("class root");
-        assert!(
-            value
-                .classdef
-                .as_ref()
-                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
-        );
-        assert!(
-            projected
-                .classdef
-                .as_ref()
-                .is_some_and(|cd| !Rc::ptr_eq(cd, &root)),
-            "the key ClassDef is not the value's class root"
-        );
+        assert_item_gcref_ptr(&entry.getattr(&attr("value")).unwrap());
 
         let interior = SomeInteriorPtr::new(lltype::InteriorPtr {
             PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(item_struct.clone()))),
             TO: Box::new(LowLevelType::Struct(Box::new(item_struct))),
             offsets: vec![],
         });
-        assert_key(interior.getattr(&attr("key")).unwrap());
+        let got_interior_key = interior.getattr(&attr("key")).unwrap();
+        let SomeValue::InteriorPtr(key_interior) = &got_interior_key else {
+            panic!("interior inlined key must read as SomeInteriorPtr, got {got_interior_key:?}");
+        };
+        match key_interior.ll_ptrtype.TO.as_ref() {
+            LowLevelType::Struct(st) => assert_eq!(st._name, key_name),
+            other => panic!("interior sub-struct must target the key Struct, got {other:?}"),
+        }
         let interior_count = interior.getattr(&attr("count")).unwrap();
         assert!(
             matches!(interior_count, SomeValue::Integer(_)),
             "interior scalar field stays an integer, got {interior_count:?}"
         );
-        let SomeValue::Instance(interior_value) = interior.getattr(&attr("value")).unwrap() else {
-            panic!(
-                "interior class-root value must read as SomeInstance, got {:?}",
-                interior.getattr(&attr("value"))
-            );
-        };
-        assert!(interior_value.can_be_none);
-        assert!(
-            interior_value
-                .classdef
-                .as_ref()
-                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
-        );
+        assert_item_gcref_ptr(&interior.getattr(&attr("value")).unwrap());
     }
 
     /// Offset-0 inlined struct (`lltype.py` `Struct._first_struct`):
-    /// `mark_deleted` stores the dummy key by writing that struct's
-    /// pointer field on the item pointer. The field lltype is `GCREF`.
-    /// The read is the declared row's nullable instance, and the store
-    /// accepts that class or a subclass (`rdict.py`
-    /// `AbstractDictRepr.recast_key`). An unrelated class fails
-    /// `annotation_to_lltype`. A struct that is not an item, with the
-    /// same inlined field, keeps `SomePtr.setattr`.
+    /// the pointer leaf's lltype is `GCREF`. `SomePtr.getattr` of the
+    /// parent is `SomePtr(GCREF)` for an item and for a non-item shell.
+    /// A `SomeInstance` store fails `annotation_to_lltype`. The scalar
+    /// `hash` leaf stays `SomeInteger` and accepts an integer.
     #[test]
-    fn gcarray_item_offset0_inlined_pointer_leaf_recasts() {
+    fn gcarray_item_offset0_inlined_pointer_leaf_stays_someptr() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::annotator::classdesc::ClassDef;
         use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
@@ -2650,21 +2400,10 @@ mod tests {
         let attr = |name: &str| {
             crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
         };
-        let SomeValue::Instance(read) = entry.getattr(&attr("obj")).unwrap() else {
-            panic!(
-                "offset-0 pointer leaf must read as SomeInstance, got {:?}",
-                entry.getattr(&attr("obj"))
-            );
-        };
-        assert!(read.can_be_none);
+        assert_item_gcref_ptr(&entry.getattr(&attr("obj")).unwrap());
         let root = bk
             .getuniqueclassdef_for_struct_root(root_name)
             .expect("class root");
-        assert!(
-            read.classdef
-                .as_ref()
-                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
-        );
         let hash = entry.getattr(&attr("hash")).unwrap();
         assert!(
             matches!(hash, SomeValue::Integer(_)),
@@ -2682,18 +2421,14 @@ mod tests {
             true,
             std::collections::BTreeMap::new(),
         ));
-        entry
-            .setattr(&attr("obj"), &same)
-            .expect("store the class root into the offset-0 leaf");
+        assert_no_lltype(&entry.setattr(&attr("obj"), &same).unwrap_err());
         let sub = ClassDef::new_standalone("owner::Sub", Some(&root));
         let sub_value = SomeValue::Instance(SomeInstance::new(
             Some(sub),
             true,
             std::collections::BTreeMap::new(),
         ));
-        entry
-            .setattr(&attr("obj"), &sub_value)
-            .expect("store a subclass into the offset-0 leaf");
+        assert_no_lltype(&entry.setattr(&attr("obj"), &sub_value).unwrap_err());
         let other = bk
             .getuniqueclassdef_for_struct_root("owner::Other")
             .expect("unrelated class");
@@ -2702,14 +2437,7 @@ mod tests {
             true,
             std::collections::BTreeMap::new(),
         ));
-        let err = entry.setattr(&attr("obj"), &other_value).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("should return a low-level type"),
-            "unrelated instance must still fail, got {err:?}"
-        );
+        assert_no_lltype(&entry.setattr(&attr("obj"), &other_value).unwrap_err());
 
         let shell_ty =
             crate::front::mir::gcarray_item_struct_ptr_lltype(reg.as_ref(), "host::Shell")
@@ -2718,18 +2446,7 @@ mod tests {
             panic!("shell pointer is Ptr");
         };
         let shell = SomePtr::new(*shell_built);
-        let shell_read = shell.getattr(&attr("obj")).unwrap();
-        assert!(
-            matches!(shell_read, SomeValue::Ptr(_)),
-            "non-item offset-0 GCREF leaf stays SomePtr, got {shell_read:?}"
-        );
-        let err = shell.setattr(&attr("obj"), &same).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("should return a low-level type"),
-            "non-item offset-0 leaf rejects SomeInstance, got {err:?}"
-        );
+        assert_item_gcref_ptr(&shell.getattr(&attr("obj")).unwrap());
+        assert_no_lltype(&shell.setattr(&attr("obj"), &same).unwrap_err());
     }
 }

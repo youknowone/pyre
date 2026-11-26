@@ -1204,11 +1204,22 @@ pub(crate) fn is_same_as_follow_unary(name: &str) -> bool {
 /// `jtransform.py rewrite_op_cast_pointer` → `rewrite_op_same_as`.
 pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
     is_identity_cast_path(segments)
+        || is_cast_instance_to_base_ptr_path(segments)
         || is_ptr_from_ref_path(segments)
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
         || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
         || crate::front::std_identity::is_manually_drop_new_path(segments)
+}
+
+/// `annlowlevel.cast_instance_to_base_ptr`
+/// (`CastObjectToPtrEntry.specialize_call`). That entry emits
+/// `cast_pointer`; `jtransform.py rewrite_op_cast_pointer` aliases the
+/// genop through `rewrite_op_same_as`. The surviving model call still
+/// names the helper, so the same alias applies here. A user function
+/// with that leaf is not this path.
+fn is_cast_instance_to_base_ptr_path(segments: &[String]) -> bool {
+    path_segments_end_with(segments, &["annlowlevel", "cast_instance_to_base_ptr"])
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -12371,6 +12382,19 @@ impl<'a> Transformer<'a> {
             if is_rffi_cast_path(segments) && args.len() == 1 {
                 let src = resolve_alias(&args[0], &self.aliases);
                 return self.rewrite_op_force_cast(&src, op.result.as_ref(), graph_name, graph);
+            }
+            // `CastObjectToPtrEntry.specialize_call` (`annlowlevel.py`):
+            // `NoneRepr` is `hop.inputconst(PTR, lltype.nullptr(PTR.TO))`.
+            // Any other argument is `cast_pointer`, aliased below
+            // (`rewrite_op_cast_pointer` → `rewrite_op_same_as`).
+            if is_cast_instance_to_base_ptr_path(segments)
+                && args.len() == 1
+                && operand_is_void_none(graph, &args[0])
+            {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ConstRefNull,
+                }]);
             }
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
@@ -39155,6 +39179,97 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `cast_instance_to_base_ptr` is `cast_pointer`
+    /// (`CastObjectToPtrEntry.specialize_call`), so
+    /// `rewrite_op_cast_pointer` aliases the operand. A constant `None`
+    /// is `lltype.nullptr`, not an alias of the Void `None` value.
+    #[test]
+    fn cast_instance_to_base_ptr_call_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_instance_to_base_ptr");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "annlowlevel",
+            "cast_instance_to_base_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "cast_instance_to_base_ptr",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+
+        let user: Vec<String> = ["user", "cast_instance_to_base_ptr"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_same_as_identity_call_path(&user),
+            "a user function of this leaf is an ordinary call"
+        );
+    }
+
+    /// `NoneRepr` arm of `CastObjectToPtrEntry.specialize_call`.
+    #[test]
+    fn cast_instance_to_base_ptr_none_is_nullptr() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_instance_to_base_ptr_none");
+        let entry = graph.startblock;
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "annlowlevel",
+            "cast_instance_to_base_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![none.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&none),
+            &result_ty,
+            "cast_instance_to_base_ptr_none",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(ops[0].kind, OpKind::ConstRefNull));
+                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
+            }
+            _ => panic!("expected nullptr constant"),
         }
     }
 

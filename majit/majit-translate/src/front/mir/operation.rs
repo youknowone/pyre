@@ -1,6 +1,28 @@
 //! Statement / rvalue / place → SpaceOperation (`rpython/flowspace/operation.py`).
 
+use super::desugar::std_call::ItemInteriorWords;
+use super::flowcontext::InteriorContainerAlias;
 use super::*;
+
+/// Low-level word of one `GcArray` ITEM field (`rordereddict.py`
+/// `DICTENTRY`; `lltype.py` `Struct` inlined in `GcArray`).
+///
+/// `field_row_lltype` stores the internal word. `rdict.py` `recast_key`
+/// / `recast_value` (`llops.convertvar`) is written at the read or the
+/// store (`annlowlevel.py`).
+pub(in crate::front::mir) enum ItemFieldWord {
+    /// `rstr.STRPTR`. A read returns the field unchanged (`hlstr` is
+    /// not emitted: `highlevel_of_ptr_field_annotation`
+    /// (`strptr_as_somestring`) already returns nullable SomeString).
+    /// A store is `llstr` then `setfield` (`LLStrEntry`).
+    Str,
+    /// `llmemory.GCREF`. Read is `cast_gcref_to_instance` through
+    /// `cast_instance`; store is `cast_instance_to_gcref`.
+    GcRef { class_root: String },
+    /// `rclass.OBJECTPTR`. Read is `cast_base_ptr_to_instance`; store
+    /// is `cast_instance_to_base_ptr`.
+    ObjectPtr { class_root: String },
+}
 
 /// Whether `&place` / `&raw place` is the field's address, and whether
 /// the FieldRead must restamp as a raw-enum address (`Int`).
@@ -121,96 +143,6 @@ impl<'a> Lowering<'a> {
             },
         );
         self.alias_dest_to_arg0_inherit(dest_local, base, arg_locals);
-        let bb_id = self.emit_bb(mir_bb);
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(true)
-    }
-
-    /// `entry_at` / `entry_at_mut` consumed only as `(*dest).field`.
-    ///
-    /// Records the receiver's `entries` header and the index. The field
-    /// use emits `getinteriorfield` / `setinteriorfield`
-    /// (`rewrite_op_getinteriorfield`). The reference binding is the
-    /// receiver word so `edge_args` has a defined local; the interior
-    /// read does not use that word. A miss returns `Ok(false)` and the
-    /// call stays, so an escaped `&mut Entry` still runs the callee.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::front::mir) fn try_lower_struct_field_entry_at(
-        &mut self,
-        mir_bb: usize,
-        reg: &RegularCall,
-        args: &[Variable],
-        arg_locals: &[Option<usize>],
-        first_arg_ty: Option<&TyRef>,
-        dest_local: usize,
-        dest_ty: &TyRef,
-        target: usize,
-    ) -> Result<bool, LowerError> {
-        let Some(traced) = struct_field_entry_at_trace(
-            reg,
-            args.len(),
-            arg_locals.first().copied().flatten(),
-            first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
-            dest_local,
-            Some(dest_ty),
-            self.body,
-            self.llbc,
-            self.tombstoned_leaves,
-        ) else {
-            return Ok(false);
-        };
-        let TracedPtrAddHeader::EntryPtr {
-            recv_local,
-            recv_ty,
-        } = traced.header
-        else {
-            return Ok(false);
-        };
-        if locals_assigned_reachable(
-            self.body,
-            self.llbc,
-            target,
-            &[recv_local, traced.index_local],
-        ) {
-            return Ok(false);
-        }
-        let Some(var) = self.local_var.get(recv_local).cloned().flatten() else {
-            return Ok(false);
-        };
-        let Some((field, ty)) = self.entries_field_descriptor(&recv_ty) else {
-            return Ok(false);
-        };
-        let index_var = args.get(1).cloned().ok_or_else(|| {
-            LowerError::Unsupported(format!(
-                "bb{mir_bb}: struct-field entry_at lost its index operand"
-            ))
-        })?;
-        let recv = args.first().cloned().ok_or_else(|| {
-            LowerError::Unsupported(format!(
-                "bb{mir_bb}: struct-field entry_at lost its receiver operand"
-            ))
-        })?;
-        self.interior_field_alias.insert(
-            dest_local,
-            InteriorFieldAlias {
-                header: InteriorHeader::Entries {
-                    recv_local,
-                    recv_var: var.one()?,
-                    field,
-                    ty,
-                },
-                index_local: traced.index_local,
-                index_var,
-                array_type_id: traced.array_type_id,
-            },
-        );
-        // Live until the field use. Not an item pointer: `args[0]` is the
-        // dict. `try_emit_interior_field_read` ignores this binding and
-        // emits `FieldRead entries`.
-        self.alias_dest_to_arg0_inherit(dest_local, recv, arg_locals);
         let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -674,7 +606,7 @@ impl<'a> Lowering<'a> {
 
     /// Concrete `GcArray(DICTENTRY)` for `alias.array_type_id`
     /// (`get_ll_dict` one DICTENTRYARRAY per instantiation).
-    fn interior_alias_array(
+    pub(in crate::front::mir) fn interior_alias_array(
         &self,
         alias: &InteriorFieldAlias,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
@@ -740,6 +672,168 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Item pointer a struct-field `ptr::add` names.
+    ///
+    /// The intercept aliases the destination to the unindexed pointer
+    /// (`alias_dest_to_arg0_inherit`). A nested struct field has no
+    /// interior descr (`interiorfielddescrof` skips `is_known_struct`).
+    /// The leaf copy reads the indexed item: `direct_arrayitems`
+    /// (`Ptr(FixedSizeArray(ITEM, 1))`, `_subarray._makeptr`) then
+    /// `direct_ptradd`. `SomePtr.getattr` walks `Struct._first_struct`
+    /// on that item.
+    fn interior_alias_item_ptr(
+        &mut self,
+        mir_bb: usize,
+        inner: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let PlaceKind::Projection(pre, ProjectionElem::Atom(atom)) = &inner.kind else {
+            return Ok(None);
+        };
+        if atom != "Deref" {
+            return Ok(None);
+        }
+        let PlaceKind::Local(local) = pre.kind else {
+            return Ok(None);
+        };
+        let local = local as usize;
+        let Some(alias) = self.interior_field_alias.get(&local).cloned() else {
+            return Ok(None);
+        };
+        let item_ty = clone_tyref(&inner.ty);
+        // `rptr.py` `InteriorPtrRepr.rtype_getitem`: the indexed item is
+        // `(array, index)`, not `direct_arrayitems` plus
+        // `direct_ptradd`. `getinteriorfield` adds `array_items_base`.
+        // A registry hit that the scan misses keeps the address path.
+        if self.ty_scan_is_item(&item_ty) {
+            let bb_id = self.emit_bb(mir_bb);
+            let array = self.interior_alias_array(&alias);
+            let header = self.interior_header_base(bb_id, &alias, array.as_ref())?;
+            let index = self.realias_operand(Some(alias.index_local), alias.index_var.clone());
+            return Ok(Some(self.emit_item_interior(bb_id, header, index)));
+        }
+        let item_ll = self.direct_ptradd_item_lltype(&item_ty);
+        let entries_recv = match &alias.header {
+            InteriorHeader::Local { .. } => None,
+            InteriorHeader::Entries { recv_local, .. } => Some(*recv_local),
+        };
+        let entries_item0 = if let Some(recv_local) = entries_recv {
+            let recv_ty = self.mir_local_ty(recv_local).ok_or_else(|| {
+                LowerError::Unsupported(format!("bb{mir_bb}: entry_ptr receiver local has no type"))
+            })?;
+            let field_ty = self.entries_field_ty(&recv_ty).ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: entry_ptr item pointer lost its entries field"
+                ))
+            })?;
+            let (owner, field_name, offset) = self
+                .gcarray_items_tail_offset(&field_ty, &item_ty)
+                .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: direct_arrayitems items offset of the entries header is unknown"
+                ))
+            })?;
+            let offset = Self::array_field_items_offset(Some(offset), &owner, &field_name)?;
+            let root = tyref_class_root_with(&item_ty, self.llbc, self.tombstoned_leaves)
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: direct_arrayitems item has no struct root"
+                    ))
+                })?;
+            Some((offset, root))
+        } else {
+            None
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let index = self.realias_operand(Some(alias.index_local), alias.index_var.clone());
+        let item0 = if let Some((offset, root)) = entries_item0 {
+            let array = self.interior_alias_array(&alias);
+            let header = self.interior_header_base(bb_id, &alias, array.as_ref())?;
+            self.emit_array_tail_item_ptr(bb_id, header, offset, &root, &item_ty)
+        } else {
+            // `ptr::add`'s pointer operand is already `entries_item_ptr`
+            // (`direct_arrayitems`). The index was not applied: the
+            // intercept replaced the add.
+            self.local_var
+                .get(local)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: struct-field ptr::add lost its item pointer"
+                    ))
+                })?
+        };
+        Ok(Some(push_direct_ptradd(
+            &mut self.graph,
+            bb_id,
+            item0,
+            index,
+            &item_ll,
+        )))
+    }
+
+    /// `*mut GcEntries` field of an `entry_ptr` receiver.
+    fn entries_field_ty(&self, recv_ty: &TyRef) -> Option<TyRef> {
+        let index = struct_field_index_named(recv_ty, self.llbc, "entries")?;
+        let payload = serde_json::json!([null, index]);
+        let (_, _, field_ty, _, _) = self.resolve_adt_field(recv_ty, &payload)?;
+        Some(field_ty)
+    }
+
+    /// Items-tail offset of the array field on `entries_ptr_ty`'s pointee.
+    ///
+    /// The field is the `[T; N]` tail (`array_field_tail_offset`), not a
+    /// fixed name. `item_ty` supplies the element alignment when the
+    /// generic declaration has no layout.
+    fn gcarray_items_tail_offset(
+        &self,
+        entries_ptr_ty: &TyRef,
+        item_ty: &TyRef,
+    ) -> Option<(String, String, u64)> {
+        let node = strip_ty_wrappers(tyref_node(entries_ptr_ty, self.llbc)?, self.llbc)?;
+        let pointee = one_level_pointer_pointee(node, self.llbc)?;
+        let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+        let td = self.llbc.type_by_id(adt_node_def_id(pointee)?)?;
+        let fields = type_decl_struct_fields(td, self.llbc)?;
+        let field_name = fields.iter().find_map(|field| {
+            let name = field.name.as_deref()?;
+            let fnode = strip_ty_wrappers(tyref_node(&field.ty, self.llbc)?, self.llbc)?;
+            fnode.get("Array").is_some().then(|| name.to_string())
+        })?;
+        let owner = tyref_class_root_with(entries_ptr_ty, self.llbc, self.tombstoned_leaves)?;
+        let align = self.instantiated_elem_align_from_tyref(item_ty, &field_name);
+        let offset = self.array_field_tail_offset(&owner, &field_name, align)?;
+        Some((owner, field_name, offset))
+    }
+
+    /// `TO.OF` for `direct_ptradd` of one `GcArray` item.
+    ///
+    /// A registered item is the struct `direct_arrayitems` built
+    /// (`gcarray_item_direct_arrayitems_ptr_lltype`). Otherwise the
+    /// byte size is enough for `rewrite_op_direct_ptradd` to scale.
+    fn direct_ptradd_item_lltype(
+        &self,
+        item_ty: &TyRef,
+    ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        if let Some(reg) = self.struct_fields
+            && let Some(spelling) =
+                instantiated_struct_item_spelling(item_ty, self.llbc, self.tombstoned_leaves)
+            && let Some(LowLevelType::Ptr(ptr)) =
+                gcarray_item_direct_arrayitems_ptr_lltype(reg, &spelling)
+            && let PtrTarget::FixedSizeArray(arr) = ptr.TO
+        {
+            return arr.OF;
+        }
+        let bytes = mem_size_align(self.llbc, &tyref_json(item_ty), &[], 0)
+            .map(|(size, _)| size)
+            .filter(|size| *size > 0)
+            .unwrap_or(crate::layout::target_word_size() as u64);
+        item_lltype_for_size(
+            i64::try_from(bytes).unwrap_or(crate::layout::target_word_size() as i64),
+        )
+    }
+
     /// `(*add).field` when `add` is a recorded struct-field `ptr::add`.
     ///
     /// Returns `Ok(None)` when `inner` is not exactly `*Local` of such a
@@ -792,9 +886,8 @@ impl<'a> Lowering<'a> {
         } else {
             None
         };
-        let enum_tag_unsigned = enum_ty
-            .and_then(|ty| fieldless_enum_field_layout_spelling(ty, self.llbc))
-            .is_some_and(|spelling| spelling.starts_with('u'));
+        let enum_tag_unsigned =
+            enum_ty.is_some_and(|ty| fieldless_enum_tag_is_unsigned(ty, self.llbc));
         let item_ty = if enum_tag_unsigned {
             ValueType::Unsigned
         } else {
@@ -855,6 +948,114 @@ impl<'a> Lowering<'a> {
             return Ok(Some(narrowed));
         }
         Ok(Some(res))
+    }
+
+    /// `getinteriorfield` of one scalar field through an unpacked item
+    /// pointer (`rptr.py` `InteriorPtrRepr.rtype_getattr`,
+    /// `jtransform.py` `rewrite_op_getinteriorfield`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the field read already resolved owner, type, and enum-tag inputs; folding them would hide the getinteriorfield arguments"
+    )]
+    fn emit_unpacked_item_field_read(
+        &mut self,
+        mir_bb: usize,
+        words: &ItemInteriorWords,
+        owner_root: &str,
+        field_name: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+        host_index: Option<(u32, u32)>,
+        field_ty: &TyRef,
+        place_ty: &TyRef,
+        container_ty: &TyRef,
+        container_is_enum: bool,
+        owner_is_closure_env: bool,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let owner_declared_gc = container_declared_gc(
+            container_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
+        );
+        let enum_ty = if tyref_is_fieldless_enum_free(field_ty, self.llbc) {
+            Some(field_ty)
+        } else if tyref_is_fieldless_enum_free(place_ty, self.llbc) {
+            Some(place_ty)
+        } else {
+            None
+        };
+        let enum_tag_unsigned =
+            enum_ty.is_some_and(|ty| fieldless_enum_tag_is_unsigned(ty, self.llbc));
+        let item_ty = if enum_tag_unsigned {
+            ValueType::Unsigned
+        } else {
+            adt_field_read_value_type(
+                place_ty,
+                field_ty,
+                container_is_enum,
+                owner_is_closure_env,
+                owner_declared_gc,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+                self.struct_fields,
+            )
+        };
+        let field = FieldDescriptor::new(field_name, Some(owner_root.to_string()))
+            .with_owner_id(owner_id)
+            .with_base_is_deref(true)
+            .with_host_index(host_index)
+            .with_owner_declared_gc(owner_declared_gc)
+            .with_inline_vec(
+                field_ty_is_inline_vec(field_ty, self.llbc)
+                    || field_ty_is_inline_vec(place_ty, self.llbc),
+            );
+        let res = self.push_item_interior_field_read(bb_id, words, field, item_ty);
+        let res = if enum_tag_unsigned {
+            let (kind, signed) = signedness_retype_op(&mut self.graph, res, true);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(signed.clone()),
+                kind,
+            });
+            signed
+        } else {
+            res
+        };
+        self.cast_gcarray_item_field_read(bb_id, owner_root, &[place_ty, field_ty], res.clone())
+            .unwrap_or(res)
+    }
+
+    /// `InteriorFieldWrite.value` is a [`Variable`]. A pooled constant is
+    /// materialised the way [`Self::emit_interior_field_write`] does.
+    fn materialize_interior_store(
+        &mut self,
+        mir_bb: usize,
+        bb_id: BlockId,
+        value: &LinkArg,
+        item_ty: &ValueType,
+    ) -> Result<Variable, LowerError> {
+        match value {
+            LinkArg::Value(var) => Ok(var.clone()),
+            LinkArg::Const(_) => {
+                let op = link_arg_as_alias_op(value, item_ty).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: interior field write constant is not a pooled \
+                         int, bool, or float"
+                    ))
+                })?;
+                let var = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(var.clone()),
+                    kind: op,
+                });
+                Ok(var)
+            }
+        }
     }
 
     /// `(*add).field = value` for a recorded struct-field `ptr::add`.
@@ -1157,6 +1358,134 @@ impl<'a> Lowering<'a> {
                 _ => return None,
             }
         }
+    }
+
+    /// `(*item).field` whose container is a `GcArray` ITEM and whose
+    /// value is an inlined `lltype.Struct`.
+    ///
+    /// This is the only decision for the leaf copy. The copy arm in
+    /// [`Self::resolve_place_as`] and a shared [`Rvalue::Ref`] both call
+    /// it. `heaptracker.py` `all_interiorfielddescrs` raises
+    /// `UnsupportedFieldExc` for `array(struct(struct))`, so the value
+    /// is the leaves ([`Self::emit_inlined_struct_value_read`],
+    /// `rordereddict.py` `DICTENTRY`). Every other container is a field
+    /// read. An exclusive borrow and `Rvalue::RawPtr` do not call it:
+    /// `&mut` / `&raw` stay the address
+    /// ([`Self::lower_inline_substruct_address`]).
+    fn place_is_gcarray_item_inlined_struct(&self, place: &Place) -> bool {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return false;
+        };
+        if !inner.is_deref_projection() {
+            return false;
+        }
+        let Some(field_payload) = elem.field_payload() else {
+            return false;
+        };
+        if indexed_field_parts(field_payload).is_some_and(|(variant_idx, _)| variant_idx.is_some())
+        {
+            return false;
+        }
+        if tyref_is_enum_free(&inner.ty, self.llbc) {
+            return false;
+        }
+        // Registry (`struct_root_template_is_gcarray_item`) or the scanned
+        // two-field `GcArray` wrapper (`lltype.py` `GcArray` of `Struct`).
+        // Either one copies the inlined struct as leaves.
+        if !self.container_ty_is_gcarray_item(&inner.ty) && !self.ty_scan_is_item(&inner.ty) {
+            return false;
+        }
+        let place_ty = tyref_subst_bound_typevar(&place.ty, &inner.ty, self.llbc);
+        tyref_by_value_struct_decl(
+            &place_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.struct_fields,
+        )
+        .is_some()
+    }
+
+    /// Base of a further projection off an inlined struct field of a
+    /// `GcArray` ITEM.
+    ///
+    /// `(*entry).key.hash` must not copy `key` and then read `hash` off
+    /// that value. The address is `getarraysubstruct` then, when the
+    /// field offset is nonzero, `direct_ptradd` (`rordereddict.py`
+    /// `DICTENTRY`, `lltype.py` `direct_arrayitems`). Offset 0 is that
+    /// pointer (`Transformer.zero_contents`). An unknown offset returns
+    /// `None`. A container that is not the ITEM returns `None`: the
+    /// caller reads the field the way it did before the item copy.
+    /// The by-value copy is the value use and a shared borrow of the
+    /// field itself, not this further projection
+    /// ([`Self::emit_inlined_struct_value_read`]).
+    fn try_inlined_struct_substruct_base(
+        &mut self,
+        mir_bb: usize,
+        inner: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let PlaceKind::Projection(container, elem) = &inner.kind else {
+            return Ok(None);
+        };
+        if !container.is_deref_projection() {
+            return Ok(None);
+        }
+        let Some(field_payload) = elem.field_payload() else {
+            return Ok(None);
+        };
+        if indexed_field_parts(field_payload).is_some_and(|(variant_idx, _)| variant_idx.is_some())
+        {
+            return Ok(None);
+        }
+        if tyref_is_enum_free(&container.ty, self.llbc) {
+            return Ok(None);
+        }
+        if self
+            .resolve_adt_field(&container.ty, field_payload)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // A scanned item is already the interior word
+        // (`rptr.py` `InteriorPtrRepr.rtype_getattr` of a container).
+        // A byte add would be `jtransform.py` `rewrite_op_direct_ptradd`,
+        // which is raw-only. The scalar arm emits `getinteriorfield`.
+        if self.ty_scan_is_item(&container.ty) {
+            return Ok(None);
+        }
+        let place_ty = tyref_subst_bound_typevar(&inner.ty, &container.ty, self.llbc);
+        if !self.container_ty_is_gcarray_item(&container.ty) {
+            return Ok(None);
+        }
+        if tyref_by_value_struct_decl(
+            &place_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.struct_fields,
+        )
+        .is_none()
+        {
+            return Ok(None);
+        }
+        // Unknown offset has no `getsubstruct`
+        // (`struct_field_offset_from_payload`). The caller reads the
+        // leaf off the field.
+        if self
+            .struct_field_offset_from_payload(&container.ty, field_payload)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let container_ty = clone_tyref(&container.ty);
+        let payload = field_payload.clone();
+        let container_place = clone_place(container);
+        let base = self.resolve_place(mir_bb, container_place)?;
+        let (sub, _) =
+            self.emit_inlined_struct_substruct_ptr(mir_bb, base, &container_ty, &payload);
+        Ok(Some(sub))
     }
 
     /// The GC pointer a `p as usize` chain produced, if `var` is that
@@ -1767,9 +2096,9 @@ impl<'a> Lowering<'a> {
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
                             ))
                         })?;
-                        let at_offset_zero = self
-                            .struct_field_offset_from_payload(&field_base_ty, field_payload)
-                            == Some(0);
+                        let field_offset =
+                            self.struct_field_offset_from_payload(&field_base_ty, field_payload);
+                        let at_offset_zero = field_offset == Some(0);
                         let container_field = match self
                             .resolve_adt_field(&field_base_ty, field_payload)
                         {
@@ -1791,6 +2120,41 @@ impl<'a> Lowering<'a> {
                                     .with_base_is_deref(base_is_deref)
                             }
                         };
+                        // Scanned item: leaves are `setinteriorfield`, not
+                        // `setfield` of a byte address
+                        // (`rptr.py` `InteriorPtrRepr.rtype_setattr`).
+                        // A by-value local of the same struct has no item
+                        // pointer and keeps the leaf copy.
+                        if self.ty_scan_is_item(&field_base_ty)
+                            && let Some(slot) = write_field_inner.as_ref()
+                        {
+                            if let Some((path, words)) =
+                                self.container_alias_access(mir_bb, slot, &container_field.name)?
+                            {
+                                self.store_by_value_into_item(
+                                    bb_id,
+                                    &words,
+                                    &src,
+                                    nested,
+                                    dest_ty,
+                                    container_field.owner_root.as_deref(),
+                                    &path,
+                                );
+                                return Ok(());
+                            }
+                            if let Some(words) = self.item_interior_words(mir_bb, slot)? {
+                                self.store_by_value_into_item(
+                                    bb_id,
+                                    &words,
+                                    &src,
+                                    nested,
+                                    dest_ty,
+                                    container_field.owner_root.as_deref(),
+                                    "",
+                                );
+                                return Ok(());
+                            }
+                        }
                         self.emit_inlined_struct_leaf_copy(
                             mir_bb,
                             &base,
@@ -1799,6 +2163,7 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             &container_field,
                             at_offset_zero,
+                            field_offset.is_some(),
                         );
                         return Ok(());
                     }
@@ -2467,6 +2832,202 @@ impl<'a> Lowering<'a> {
                 ..
             } if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) => Some(root.clone()),
             _ => None,
+        }
+    }
+
+    /// `GcArray` ITEM field word (`field_row_lltype`), keyed on the
+    /// place type and then the declared field type. `None` when
+    /// `owner_root` is not an ITEM template
+    /// (`struct_root_template_is_gcarray_item`), the type is not a
+    /// one-level pointer (a by-value inlined struct stays the struct;
+    /// a `#[repr(transparent)]` thin `RawPtr` newtype is that pointer,
+    /// `transparent_rawptr_field_ty`), or a bare `GCREF` word has no
+    /// class to name.
+    pub(in crate::front::mir) fn gcarray_item_field_word(
+        &self,
+        owner_root: &str,
+        tys: &[&TyRef],
+    ) -> Option<ItemFieldWord> {
+        let is_item = self.struct_fields.is_some_and(|reg| {
+            crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, owner_root)
+        });
+        if !is_item {
+            return None;
+        }
+        tys.iter().find_map(|ty| self.item_pointer_word(ty))
+    }
+
+    /// One candidate type of [`Self::gcarray_item_field_word`].
+    ///
+    /// Order matches `field_row_lltype`: `rstr.STRPTR`, then a
+    /// declared-GC class pointer (`llmemory.GCREF`,
+    /// `registered_gc_ptr_class_root_with`), then a class-identity
+    /// pointer that is not declared-GC (`rclass.OBJECTPTR`,
+    /// `spelling_has_class_identity`). A by-value struct is not a
+    /// pointer. A `#[repr(transparent)]` newtype whose unique non-ZST
+    /// field is a thin `RawPtr` is that pointer
+    /// ([`transparent_rawptr_field_ty`], `lltype.py` `Ptr`, one word;
+    /// `rmodel.py` `externalvsinternal`): the place type is the newtype
+    /// and the `DICTENTRY` row is the inner word. A fat pointee stays
+    /// the newtype. A raw-storage pointee stays
+    /// `Ptr` of that struct (`raw_word_owner_contains` before the
+    /// class-identity arm).
+    fn item_pointer_word(&self, ty: &TyRef) -> Option<ItemFieldWord> {
+        let peeled = transparent_rawptr_field_ty(ty, self.llbc);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        let node = tyref_node(ty, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))?;
+        let Some(pointee) = one_level_pointer_pointee(node, self.llbc)
+            .and_then(|pointee| type_node_peel_aliases(pointee, self.llbc))
+        else {
+            return self
+                .ty_node_is_str_layout(node)
+                .then_some(ItemFieldWord::Str);
+        };
+        if self.ty_node_is_str_layout(pointee) {
+            return Some(ItemFieldWord::Str);
+        }
+        if let Some(root) = registered_gc_ptr_class_root_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+                return None;
+            }
+            return Some(ItemFieldWord::GcRef { class_root: root });
+        }
+        if tyref_is_gcref_spelling(ty, self.llbc) {
+            return None;
+        }
+        let reg = self.struct_fields?;
+        let root = adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves)?;
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
+            || reg.raw_word_owner_contains(&root)
+        {
+            return None;
+        }
+        if self.pointee_declared_gc(reg, pointee, &root) {
+            return Some(ItemFieldWord::GcRef { class_root: root });
+        }
+        spelling_has_class_identity(reg, &root)
+            .then_some(ItemFieldWord::ObjectPtr { class_root: root })
+    }
+
+    /// `field_row_lltype`'s str-family / rstr-layout test on a type node.
+    fn ty_node_is_str_layout(&self, node: &serde_json::Value) -> bool {
+        if node_is_string_value(node, self.llbc) {
+            return true;
+        }
+        if let Some(root) = adt_node_class_root_with(node, self.llbc, self.tombstoned_leaves)
+            && (is_str_family_class_root(&root) || is_rstr_str_layout_declaration(&root))
+        {
+            return true;
+        }
+        adt_node_def_id(node)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| {
+                let path = td.item_meta.name_path_str();
+                is_str_family_class_root(&path) || is_rstr_str_layout_declaration(&path)
+            })
+    }
+
+    /// `field_row_lltype`'s declared-GC test (`spelling_is_declared_gc`)
+    /// on the class root and on the declaration path.
+    fn pointee_declared_gc(
+        &self,
+        reg: &crate::front::StructFieldRegistry,
+        pointee: &serde_json::Value,
+        root: &str,
+    ) -> bool {
+        if spelling_is_declared_gc(&reg.gc_struct_ids, root) {
+            return true;
+        }
+        adt_node_def_id(pointee)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| {
+                let path = td.item_meta.name_path_str();
+                spelling_is_declared_gc(&reg.gc_struct_ids, &path)
+                    || spelling_path_is_declared_gc(&reg.gc_struct_ids, &path)
+            })
+    }
+
+    /// Read of a `GcArray` ITEM pointer field: `getfield` /
+    /// `getinteriorfield`, then `cast_gcref_to_instance` or
+    /// `cast_base_ptr_to_instance` (`annlowlevel.py`). Both are
+    /// `cast_instance` and annotate `SomeInstance(C)`.
+    ///
+    /// `Some(value)` for `STRPTR` returns the field unchanged (`hlstr`
+    /// is not emitted). `None` is not an ITEM pointer word.
+    pub(in crate::front::mir) fn cast_gcarray_item_field_read(
+        &mut self,
+        bb_id: BlockId,
+        owner_root: &str,
+        tys: &[&TyRef],
+        value: Variable,
+    ) -> Option<Variable> {
+        let class_root = match self.gcarray_item_field_word(owner_root, tys)? {
+            ItemFieldWord::Str => return Some(value),
+            ItemFieldWord::GcRef { class_root } | ItemFieldWord::ObjectPtr { class_root } => {
+                class_root
+            }
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call(class_root, value),
+        });
+        Some(narrowed)
+    }
+
+    /// Store into a `GcArray` ITEM pointer field.
+    /// `GCREF` is `cast_instance_to_gcref` then `setfield`.
+    /// `OBJECTPTR` is `cast_instance_to_base_ptr` then `setfield`.
+    /// `STRPTR` is `llstr` then `setfield` (`annlowlevel.py`
+    /// `LLStrEntry`). A constant stays inline.
+    pub(in crate::front::mir) fn recast_gcarray_item_field_store(
+        &mut self,
+        bb_id: BlockId,
+        owner_root: &str,
+        tys: &[&TyRef],
+        value: LinkArg,
+    ) -> LinkArg {
+        let Some(word) = self.gcarray_item_field_word(owner_root, tys) else {
+            return value;
+        };
+        let LinkArg::Value(var) = &value else {
+            return value;
+        };
+        match word {
+            ItemFieldWord::Str => {
+                let res = self
+                    .graph
+                    .push_op_var(bb_id, crate::model::llstr_call(var.clone()), true)
+                    .expect("llstr defines a result");
+                LinkArg::Value(res)
+            }
+            ItemFieldWord::GcRef { .. } => {
+                let (kind, res) = self.recast_instance_to_gcref(var);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind,
+                });
+                LinkArg::Value(res)
+            }
+            ItemFieldWord::ObjectPtr { .. } => {
+                let res = self
+                    .graph
+                    .push_op_var(
+                        bb_id,
+                        crate::model::cast_instance_to_base_ptr_call(var.clone()),
+                        true,
+                    )
+                    .expect("cast_instance_to_base_ptr defines a result");
+                LinkArg::Value(res)
+            }
         }
     }
 
@@ -3674,8 +4235,22 @@ impl<'a> Lowering<'a> {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
-                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
-                    return Ok((None, address));
+                // A shared borrow of an inlined struct field of a `GcArray`
+                // ITEM is the value, not a sub-struct pointer.
+                // `ll_dict_lookup` reads `entries[index - VALID_OFFSET].key`
+                // as a value (`rordereddict.py`). The decision is
+                // [`Self::place_is_gcarray_item_inlined_struct`], the same
+                // one the copy arm uses. An exclusive borrow stays the
+                // address: copying it would drop a write through the
+                // referent. Address lowering runs only when this copy
+                // does not.
+                let shared_struct = borrow_kind_is_shared(&kind)
+                    && self.place_is_gcarray_item_inlined_struct(&place);
+                if !shared_struct {
+                    if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                        self.note_interior_container_alias(dest_local, &place);
+                        return Ok((None, address));
+                    }
                 }
                 // Field-only `InteriorPtrRepr`: `PtrRepr.rtype_getattr` of an
                 // interior result returns the parent (`hop.inputarg(self, 0)`).
@@ -3694,7 +4269,11 @@ impl<'a> Lowering<'a> {
                 // `&mut self._s` is the `getfield` of that reference, not the
                 // address of an inline substructure. A transparent scalar
                 // (`CodeFlags`) borrow is the word, not an address.
-                let address = self.place_borrow_takes_address(&place, dest_ty);
+                let address = if shared_struct {
+                    BorrowAddress::None
+                } else {
+                    self.place_borrow_takes_address(&place, dest_ty)
+                };
                 let address = if !tyref_is_string_builder(&place.ty, self.llbc) {
                     address
                 } else {
@@ -3702,7 +4281,11 @@ impl<'a> Lowering<'a> {
                 };
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
-                let v = self.resolve_place(mir_bb, place)?;
+                // Not a by-value copy: the borrow aliases the field
+                // (`PtrRepr.rtype_getattr` `getsubstruct`). The shared
+                // inlined-struct case above is the exception: it is the
+                // leaf copy, and `taken_by_address` stays unset.
+                let v = self.resolve_place_as(mir_bb, place, false, shared_struct)?;
                 self.mark_place_address_of(mir_bb, address, before, &v);
                 // Remaining-pointer `&mut *mut T` of a field is the slot
                 // address (`rdict.py` `ll_get` / `jtransform.py`
@@ -3738,6 +4321,7 @@ impl<'a> Lowering<'a> {
                     return Ok((None, v));
                 }
                 if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    self.note_interior_container_alias(dest_local, &place);
                     return Ok((None, address));
                 }
                 // Owner representation is `Rvalue::Ref` only
@@ -3745,7 +4329,8 @@ impl<'a> Lowering<'a> {
                 // an address). RawPtr of a GC field keeps the field value.
                 let address = self.place_borrow_takes_address(&place, dest_ty);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
-                let v = self.resolve_place(mir_bb, place)?;
+                // Same as `Rvalue::Ref`: the raw borrow aliases the field.
+                let v = self.resolve_place_as(mir_bb, place, false, false)?;
                 self.mark_place_address_of(mir_bb, address, before, &v);
                 Ok((None, v))
             }
@@ -7124,7 +7709,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Data or length word of a fat `Box<[T]>` field read. `None` when
-    /// `var` is not one of those reads (or a one-hop copy of one).
+    /// `var` is not one of those reads (or a copy of one).
     pub(in crate::front::mir) fn fat_component(
         &mut self,
         bb_id: BlockId,
@@ -7574,13 +8159,159 @@ impl<'a> Lowering<'a> {
         self.interior_field_alias.contains_key(&(local as usize))
     }
 
+    /// Record `dest` as an exclusive borrow of a container field.
+    ///
+    /// `InteriorPtrRepr.rtype_getattr` of a `ContainerType` returns the
+    /// same interior word. `InteriorPtr.offsets` is outermost first.
+    /// A scalar field is not a container and is not recorded.
+    fn note_interior_container_alias(&mut self, dest_local: Option<usize>, place: &Place) {
+        let Some(dest) = dest_local else {
+            return;
+        };
+        if !self.inline_substruct_field_is_address(&place.ty) {
+            return;
+        }
+        let Some(alias) = self.interior_container_borrow(place) else {
+            return;
+        };
+        self.interior_container_alias.insert(dest, alias);
+    }
+
+    /// `Field*` then `Deref` of one local. Field names are outermost
+    /// first (`InteriorPtr.offsets`). The pointer type is the deref
+    /// local's type (`*mut ITEM` / `&mut SUB`).
+    fn container_deref_fields(&self, place: &Place) -> Option<(usize, TyRef, Vec<String>)> {
+        let mut names_outside_in = Vec::new();
+        let mut owned = clone_place(place);
+        loop {
+            let PlaceKind::Projection(pre, elem) = owned.kind else {
+                return None;
+            };
+            if let Some(payload) = elem.field_payload() {
+                let name = self
+                    .resolve_adt_field(&pre.ty, payload)
+                    .map(|(_, name, _, _, _)| name)
+                    .unwrap_or_else(|| field_label_from_payload(payload));
+                names_outside_in.push(name);
+                owned = *pre;
+                continue;
+            }
+            let is_deref = matches!(elem, ProjectionElem::Atom(ref atom) if atom == "Deref");
+            if !is_deref {
+                return None;
+            }
+            let PlaceKind::Local(local) = pre.kind else {
+                return None;
+            };
+            names_outside_in.reverse();
+            return Some((local as usize, clone_tyref(&pre.ty), names_outside_in));
+        }
+    }
+
+    /// Parent item pointer plus the container offsets walked from it
+    /// (`InteriorPtr`). Empty offsets are a bare item pointer and are
+    /// not an alias. A local already recorded appends the new names
+    /// and keeps the original item.
+    fn interior_container_borrow(&self, place: &Place) -> Option<InteriorContainerAlias> {
+        let (local, ptr_ty, names) = self.container_deref_fields(place)?;
+        if names.is_empty() {
+            return None;
+        }
+        if self.ty_is_item_pointer(&ptr_ty) {
+            return Some(InteriorContainerAlias {
+                item_local: local,
+                item_ty: ptr_ty,
+                offsets: names,
+            });
+        }
+        let prev = self.interior_container_alias.get(&local)?;
+        let mut offsets = prev.offsets.clone();
+        offsets.extend(names);
+        Some(InteriorContainerAlias {
+            item_local: prev.item_local,
+            item_ty: clone_tyref(&prev.item_ty),
+            offsets,
+        })
+    }
+
+    /// Dotted `setinteriorfield` / `getinteriorfield` through an
+    /// exclusive container borrow (`InteriorPtrRepr.rtype_setattr`).
+    ///
+    /// The slot must already be in `interior_container_alias`. A direct
+    /// `*item` misses and stays on `item_interior_words`. The path is
+    /// `InteriorPtr.offsets`, then any fields still on the slot, then
+    /// `leaf`.
+    fn container_alias_access(
+        &mut self,
+        mir_bb: usize,
+        slot: &Place,
+        leaf: &str,
+    ) -> Result<Option<(String, ItemInteriorWords)>, LowerError> {
+        let Some((local, _, extra)) = self.container_deref_fields(slot) else {
+            return Ok(None);
+        };
+        let Some(alias) = self.interior_container_alias.get(&local).cloned() else {
+            return Ok(None);
+        };
+        let mut parts = alias.offsets;
+        parts.extend(extra);
+        parts.push(leaf.to_string());
+        let words =
+            self.interior_container_alias_words(mir_bb, alias.item_local, &alias.item_ty)?;
+        Ok(Some((parts.join("."), words)))
+    }
+
+    /// `&(*item).nested` / `&mut (*sub).inner` is the item word.
+    ///
+    /// `InteriorPtrRepr.rtype_getattr` of a `ContainerType` returns that
+    /// word at every nesting depth. `rewrite_op_direct_ptradd` is
+    /// raw-only, so a missing layout offset does not decline. A scalar
+    /// field is not a container address and stays on `getinteriorfield`.
+    fn interior_container_borrow_word(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return Ok(None);
+        };
+        if elem.field_payload().is_none() || !self.inline_substruct_field_is_address(&place.ty) {
+            return Ok(None);
+        }
+        let PlaceKind::Projection(ptr_place, ProjectionElem::Atom(name)) = &inner.kind else {
+            return Ok(None);
+        };
+        if name != "Deref" {
+            return Ok(None);
+        }
+        let PlaceKind::Local(local) = ptr_place.kind else {
+            return Ok(None);
+        };
+        let local = local as usize;
+        let is_item = self.ty_is_item_pointer(&ptr_place.ty);
+        let ptr = clone_place(ptr_place);
+        if is_item {
+            return Ok(Some(self.resolve_place(mir_bb, ptr)?));
+        }
+        let item_local = self
+            .interior_container_alias
+            .get(&local)
+            .map(|alias| alias.item_local);
+        if let Some(item_local) = item_local {
+            return Ok(Some(self.defined_local(mir_bb, item_local)?));
+        }
+        Ok(None)
+    }
+
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
-    /// `jtransform.py rewrite_op_getsubstruct` does. Offset zero is `p`
-    /// itself. A nonzero offset on a classdef-less `repr(C)` pointee is
+    /// `rewrite_op_getsubstruct` does. Offset zero is `p` itself. A
+    /// nonzero offset on a classdef-less `repr(C)` pointee is
     /// `int_add(p, offsetof)` (`_gckind == 'raw'`). A GC interior address
     /// still takes the deferred `RawAddr` refusal: it cannot enter the
-    /// Ref bank. A field of a recorded interior alias declines: the
-    /// generic arm emits `rewrite_op_getinteriorfield`.
+    /// Ref bank. A container field of a `GcArray` item is the interior
+    /// word (`InteriorPtrRepr.rtype_getattr`). A scalar field of a
+    /// recorded `ptr::add` alias declines: the generic arm emits
+    /// `rewrite_op_getinteriorfield`.
     pub(in crate::front::mir) fn lower_inline_substruct_address(
         &mut self,
         mir_bb: usize,
@@ -7591,6 +8322,12 @@ impl<'a> Lowering<'a> {
         // by-value struct.
         if self.place_is_raw_owned_exception_field(place) {
             return Ok(None);
+        }
+        // Before the layout offset. A `[null, i]` field of a classed
+        // item has no `rewrite_op_getsubstruct` offset, and the word
+        // is still the item (`InteriorPtrRepr.rtype_getattr`).
+        if let Some(word) = self.interior_container_borrow_word(mir_bb, place)? {
+            return Ok(Some(word));
         }
         // Identity-word `&(*alias).field` is the field value
         // (`rewrite_op_getinteriorfield`). `rewrite_op_getsubstruct` at
@@ -7604,6 +8341,26 @@ impl<'a> Lowering<'a> {
         let PlaceKind::Projection(inner, _) = &place.kind else {
             unreachable!("inline_substruct_field_offset matched a projection");
         };
+        // `&(*item).nested` of a `GcArray` item is the same interior word
+        // (`rptr.py` `InteriorPtrRepr.rtype_getattr` of a container).
+        // `jtransform.py` `rewrite_op_direct_ptradd` is raw-only.
+        if let PlaceKind::Projection(ptr_place, ProjectionElem::Atom(name)) = &inner.kind
+            && name == "Deref"
+        {
+            if self.ty_is_item_pointer(&ptr_place.ty) {
+                return Ok(Some(self.resolve_place(mir_bb, clone_place(ptr_place))?));
+            }
+            // `&mut (*sub).inner` of a container borrow is still the item
+            // word (`InteriorPtrRepr.rtype_getattr` of a `ContainerType`).
+            if let PlaceKind::Local(local) = ptr_place.kind
+                && let Some(item_local) = self
+                    .interior_container_alias
+                    .get(&(local as usize))
+                    .map(|alias| alias.item_local)
+            {
+                return Ok(Some(self.defined_local(mir_bb, item_local)?));
+            }
+        }
         let base = self.resolve_place(mir_bb, clone_place(inner))?;
         if offset == 0 {
             return Ok(Some(base));
@@ -8257,6 +9014,9 @@ impl<'a> Lowering<'a> {
                 || owner_root.ends_with("::DictStrategyRef"))
             && (tyref_is_dyn_pointer(&field_ty, self.llbc)
                 || tyref_is_dyn_pointer(&place_ty, self.llbc));
+        // The ITEM recast and the general harvested-field recast use
+        // the same declared owner (`rdict.py recast_key/recast_value`).
+        let item_owner = owner_root.clone();
         let mut field = FieldDescriptor::new(field_name, Some(owner_root.clone()))
             .with_owner_id(owner_id)
             .with_owner_declared_gc(owner_declared_gc)
@@ -8386,6 +9146,21 @@ impl<'a> Lowering<'a> {
             }
             return Ok(res);
         }
+        // `GcArray` ITEM pointer field (`rordereddict.py` `DICTENTRY`,
+        // `lltype.py` Struct in `GcArray`). `rdict.py` `recast_key` /
+        // `recast_value` is this op: `cast_gcref_to_instance` or
+        // `cast_base_ptr_to_instance` (`annlowlevel.py`, both
+        // `cast_instance`). `STRPTR` returns the getfield unchanged:
+        // `hlstr` would see the SomeString `strptr_as_somestring` already
+        // produced, and the raw-owner recast below must not run.
+        if let Some(out) = self.cast_gcarray_item_field_read(
+            bb_id,
+            &item_owner,
+            &[&place_ty, &field_ty],
+            res.clone(),
+        ) {
+            return Ok(out);
+        }
         // Mix-level load: harvested `OBJECTPTR` field stays
         // SomePtr (`lltype.py` `SomePtr.getattr`); recast onto
         // the dest instance (`annlowlevel.py`
@@ -8488,8 +9263,8 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 &self.raw_alloc_flavor_structs,
             );
-        let (field, ty) = match self.resolve_adt_field(&field_base_ty, field_payload) {
-            Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
+        let (mut field, ty) = match self.resolve_adt_field(&field_base_ty, field_payload) {
+            Some((owner_root, field_name, field_ty, owner_id, host_index)) => {
                 // Rust type-checks every assignment against the
                 // projected place's substituted field type.  A
                 // reference or raw pointer to a named ADT is
@@ -8523,6 +9298,19 @@ impl<'a> Lowering<'a> {
                 // on that same inner class, or setattr unions
                 // `PyObject ∪ PyErrorObject`.
                 value = self.recast_error_carrier_field_store(bb_id, &field_base_ty, value);
+                // `GcArray` ITEM store (`rordereddict.py` `DICTENTRY`).
+                // `rdict.py` `recast_key` / `recast_value`
+                // (`llops.convertvar`): `cast_instance_to_gcref`,
+                // `cast_instance_to_base_ptr`, or `llstr` (`annlowlevel.py`
+                // `LLStrEntry`) before `setfield` / `setinteriorfield`. Runs
+                // before the interior-write return so both stores see the
+                // cast.
+                value = self.recast_gcarray_item_field_store(
+                    bb_id,
+                    &owner_root,
+                    &[dest_ty, &field_ty],
+                    value,
+                );
                 let owner_declared_gc = container_declared_gc(
                     &field_base_ty,
                     self.llbc,
@@ -8583,6 +9371,32 @@ impl<'a> Lowering<'a> {
                     )?;
                     return Ok(());
                 }
+                // `(*item).field = value` when the pointer is an interior
+                // word rather than a same-function alias
+                // (`rptr.py` `InteriorPtrRepr.rtype_setattr`,
+                // `jtransform.py` `rewrite_op_setinteriorfield`).
+                // A by-value struct store is the leaf copy above this
+                // function.
+                if tyref_by_value_struct_decl(
+                    dest_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
+                )
+                .is_none()
+                    && let Some(words) = self.item_interior_words(mir_bb, inner)?
+                {
+                    let field = FieldDescriptor::new(field_name, Some(owner_root))
+                        .with_owner_id(owner_id)
+                        .with_owner_declared_gc(owner_declared_gc)
+                        .with_base_is_deref(true)
+                        .with_host_index(host_index);
+                    let value_var = self.materialize_interior_store(mir_bb, bb_id, &value, &ty)?;
+                    self.push_item_interior_field_write(bb_id, &words, field, value_var, ty);
+                    return Ok(());
+                }
                 (
                     FieldDescriptor::new(field_name, Some(owner_root))
                         .with_owner_id(owner_id)
@@ -8614,6 +9428,30 @@ impl<'a> Lowering<'a> {
             value = self.coerce_gcref_null_store(bb_id, owner, &field.name, value);
         }
         value = self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
+
+        // `(*sub).field = value` through an exclusive container borrow.
+        // The word is still the item pointer
+        // (`InteriorPtrRepr.rtype_getattr`); the store is
+        // `setinteriorfield` on the parent array
+        // (`InteriorPtrRepr.rtype_setattr`), with `InteriorPtr.offsets`
+        // in the field name.
+        if tyref_by_value_struct_decl(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.struct_fields,
+        )
+        .is_none()
+            && let Some((path, words)) = self.container_alias_access(mir_bb, inner, &field.name)?
+        {
+            field.name = path;
+            field.base_is_deref = Some(true);
+            let value_var = self.materialize_interior_store(mir_bb, bb_id, &value, &ty)?;
+            self.push_item_interior_field_write(bb_id, &words, field, value_var, ty);
+            return Ok(());
+        }
 
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: None,
@@ -8899,19 +9737,35 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: Place,
     ) -> Result<Variable, LowerError> {
-        self.resolve_place_as(mir_bb, place, false)
+        self.resolve_place_as(mir_bb, place, false, true)
     }
 
     /// [`Self::resolve_place`].  A projection whose value is a pair slice
     /// is two words, so it resolves only for `pair_field`, the pointer-word
     /// read [`Self::pair_field_parts`] builds on.
+    ///
+    /// `copy_inlined_struct` asks for the leaf copy of an inlined struct
+    /// field. The copy runs only when the container is a `GcArray` ITEM
+    /// ([`Self::place_is_gcarray_item_inlined_struct`]): `heaptracker.py`
+    /// `all_interiorfielddescrs` refuses `array(struct(struct))`. A value
+    /// use and a shared `Rvalue::Ref` of that item field both pass it.
+    /// An exclusive borrow and `Rvalue::RawPtr` pass `false`: `&mut` /
+    /// `&raw` stay the address (`PtrRepr.rtype_getattr` `getsubstruct`,
+    /// [`Self::lower_inline_substruct_address`]). Copying an exclusive
+    /// borrow would drop a write through the referent.
     pub(in crate::front::mir) fn resolve_place_as(
         &mut self,
         mir_bb: usize,
         place: Place,
         pair_field: bool,
+        copy_inlined_struct: bool,
     ) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
+        // Decided once, before `place` is moved. The copy arm below and
+        // a shared `Rvalue::Ref` both use
+        // [`Self::place_is_gcarray_item_inlined_struct`].
+        let copy_item_struct =
+            copy_inlined_struct && self.place_is_gcarray_item_inlined_struct(&place);
         // A pair slice's `PtrMetadata` is its length word. A window's is
         // the same length word (`FatLen`). A fat `&dyn Trait` pair's is
         // the vtable word (`FatMeta`).
@@ -9191,7 +10045,7 @@ impl<'a> Lowering<'a> {
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, field_ty, owner_id, _host_index)) =
+                    && let Some((owner_root, field_name, field_ty, owner_id, host_index)) =
                         self.resolve_adt_field(&inner.ty, field_payload)
                 {
                     // Decl field / Charon Field `place.ty` stay the binder
@@ -9465,6 +10319,60 @@ impl<'a> Lowering<'a> {
                     // `src: Closure` origin, not from the `closure` name
                     // leaf.  Needed before `resolve_place` consumes `inner`.
                     let owner_is_closure_env = tyref_is_closure_env(&inner.ty, self.llbc);
+                    // `(*entry).key` copied out of the `GcArray` ITEM. The
+                    // value is the leaves (`heaptracker.py`
+                    // `all_interiorfielddescrs` refuses
+                    // `array(struct(struct))`), not one `getfield` of
+                    // `key`. [`Self::place_is_gcarray_item_inlined_struct`]
+                    // is that decision; a shared borrow passes
+                    // `copy_inlined_struct` only when it is true. A
+                    // further `.hash` does not take this arm: its field
+                    // is the leaf. A `ptr::add` interior alias bound the
+                    // dest to the unindexed pointer
+                    // (`alias_dest_to_arg0_inherit`); the leaves are read
+                    // off the indexed item (`direct_arrayitems`, then
+                    // `direct_ptradd`). A base that is already `Ptr(ITEM)`
+                    // resolves that pointer.
+                    if copy_item_struct
+                        && let Some(nested) = tyref_by_value_struct_decl(
+                            &place_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
+                        )
+                    {
+                        let base =
+                            if let Some(item) = self.interior_alias_item_ptr(mir_bb, &inner)? {
+                                item
+                            } else {
+                                self.resolve_place(mir_bb, clone_place(&inner))?
+                            };
+                        let container_field =
+                            FieldDescriptor::new(field_name.clone(), Some(owner_root.clone()))
+                                .with_owner_id(owner_id)
+                                .with_owner_declared_gc(container_declared_gc(
+                                    &inner.ty,
+                                    self.llbc,
+                                    self.gc_struct_ids,
+                                    self.immutable_fields,
+                                    &self.raw_alloc_flavor_structs,
+                                ))
+                                .with_base_is_deref(true)
+                                .with_host_index(host_index);
+                        let container_ty = clone_tyref(&inner.ty);
+                        let instantiated = clone_tyref(&place_ty);
+                        return Ok(self.emit_inlined_struct_value_read(
+                            mir_bb,
+                            &base,
+                            nested,
+                            &instantiated,
+                            &container_ty,
+                            field_payload,
+                            &container_field,
+                        ));
+                    }
                     if let Some(res) = self.try_emit_interior_field_read(
                         mir_bb,
                         &inner,
@@ -9476,7 +10384,70 @@ impl<'a> Lowering<'a> {
                         container_is_enum,
                         owner_is_closure_env,
                     )? {
-                        return Ok(res);
+                        // `getinteriorfield` of a `GcArray` ITEM pointer
+                        // field (`rordereddict.py` `DICTENTRY`), then
+                        // `cast_gcref_to_instance` / `cast_base_ptr_to_instance`
+                        // (`annlowlevel.py`, both `cast_instance`). `STRPTR`
+                        // stays the field: `hlstr` would see the SomeString
+                        // `strptr_as_somestring` already returned.
+                        let bb_id = self.emit_bb(mir_bb);
+                        return Ok(self
+                            .cast_gcarray_item_field_read(
+                                bb_id,
+                                &owner_root,
+                                &[&place_ty, &field_ty],
+                                res.clone(),
+                            )
+                            .unwrap_or(res));
+                    }
+                    // Scalar `(*item).field` of a `GcArray` item pointer
+                    // that was not a same-function `ptr::add` alias.
+                    // `rptr.py` `InteriorPtrRepr.rtype_getattr` emits
+                    // `getinteriorfield`. A by-value struct field is the
+                    // leaf copy above (`all_interiorfielddescrs` refuses
+                    // `array(struct(struct))`).
+                    if tyref_by_value_struct_decl(
+                        &place_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
+                    )
+                    .is_none()
+                    {
+                        if let Some((path, words)) =
+                            self.container_alias_access(mir_bb, &inner, &field_name)?
+                        {
+                            return Ok(self.emit_unpacked_item_field_read(
+                                mir_bb,
+                                &words,
+                                &owner_root,
+                                &path,
+                                owner_id,
+                                host_index,
+                                &field_ty,
+                                &place_ty,
+                                &inner.ty,
+                                container_is_enum,
+                                owner_is_closure_env,
+                            ));
+                        }
+                        if let Some(words) = self.item_interior_words(mir_bb, &inner)? {
+                            return Ok(self.emit_unpacked_item_field_read(
+                                mir_bb,
+                                &words,
+                                &owner_root,
+                                &field_name,
+                                owner_id,
+                                host_index,
+                                &field_ty,
+                                &place_ty,
+                                &inner.ty,
+                                container_is_enum,
+                                owner_is_closure_env,
+                            ));
+                        }
                     }
                     if let Some((owner, flat_name, owner_id)) =
                         self.flatten_list_storage_field(&inner, &elem)
@@ -9502,7 +10473,22 @@ impl<'a> Lowering<'a> {
                         return Ok(res);
                     }
                     let inner_place = clone_place(&inner);
-                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let substruct_base = self.try_inlined_struct_substruct_base(mir_bb, &inner)?;
+                    let base = match substruct_base {
+                        Some(sub) => sub,
+                        // A further projection is `getfield` of this leaf
+                        // (`PtrRepr.rtype_getattr`), not a by-value copy of
+                        // the container field.
+                        // [`Self::try_inlined_struct_substruct_base`] returns
+                        // the sub-struct pointer only for a `GcArray` ITEM
+                        // whose offset is known. Every other container is
+                        // the field read it was before the item copy.
+                        // Copying the container
+                        // (`emit_inlined_struct_value_read`) would rebuild
+                        // it, and `scalar_replace_named_struct_aggregates`
+                        // would forward this leaf onto that fresh value.
+                        None => self.resolve_place_as(mir_bb, *inner, false, false)?,
+                    };
                     return self.emit_resolved_adt_field_read(
                         mir_bb,
                         base,
@@ -11160,6 +12146,21 @@ impl<'a> Lowering<'a> {
                                 self.struct_fields,
                             )
                             .is_some()
+                    }),
+                    // `FIELDTYPE = S._flds[name]` (`LLTypeMallocRemover.flatten`).
+                    // A by-value struct keeps its class identity on the
+                    // `setfield` so `flowin_op` `getsubstruct` can retarget
+                    // `prefix.rest` onto that stored value.
+                    by_value_struct: declared_ty.and_then(|ty| {
+                        tyref_by_value_struct_decl(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
+                        )
+                        .map(|nested| struct_copy_owner_keys(nested, self.tombstoned_leaves).0)
                     }),
                 }
             })

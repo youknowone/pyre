@@ -2833,7 +2833,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
         "&(*dest).field of a copy scalar is a value read"
     );
     let mut extra_live_dests = bit_set::BitSet::new();
-    super::struct_field_value_dests_in_block(&llbc, &address_word.body[0], &mut extra_live_dests);
+    super::struct_field_value_dests_in_block(&llbc, &address_word.body()[0], &mut extra_live_dests);
     assert!(
         extra_live_dests.contains(1),
         "identity-word &(*dest).field is a dest use for extra-live"

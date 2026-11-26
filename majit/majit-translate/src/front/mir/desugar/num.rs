@@ -1643,6 +1643,7 @@ impl<'a> Lowering<'a> {
                     owner_root: None,
                     cell_address: false,
                     peeled_shared_primitive: false,
+                    by_value_struct: None,
                 })
                 .collect(),
         };
