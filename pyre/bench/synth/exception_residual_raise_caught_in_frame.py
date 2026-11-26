@@ -12,7 +12,13 @@
 #
 # The raise sites are builtin containers, so each one is a residual call rather
 # than an inlined callee.
-N = 145455
+# Stay below a major-collection boundary: at 145455 iterations the same
+# Cranelift trace recorded 600 guards locally, 610 on macOS CI and 612 on
+# Linux CI. Changing only PYPY_GC_MIN from 1 GiB to 512 MiB reproduces a
+# guard-count change locally; at 50000 both native backends retain the
+# existing 4 loops / 2 bridges / 600 guards at 512 MiB, 1 GiB and 8 GiB.
+# The hot exception handlers and traceback walks still run 50000 times.
+N = 50000
 
 
 def names(traceback):
