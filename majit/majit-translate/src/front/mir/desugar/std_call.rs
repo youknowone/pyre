@@ -1812,7 +1812,22 @@ impl<'a> Lowering<'a> {
         }
         let type_id = type_decl_ref_adt_id(self.field_base_adt(base_ty)?)?;
         let td = self.llbc.type_by_id(type_id)?;
-        type_decl_struct_field_offset(td, self.llbc, field_idx)
+        if let Some(off) = type_decl_struct_field_offset(td, self.llbc, field_idx) {
+            return Some(off);
+        }
+        // A generic `repr(C)` decl can leave every field offset
+        // unresolved (`TypeDecl::layout_for_target` has no row for the
+        // field). `llmemory.offsetof` of that instantiation is
+        // [`repr_c_struct_field_offset`] with the place's type arguments
+        // ([`adt_node_type_subst`]), the same walk
+        // [`Lowering::inline_substruct_field_offset`] uses for a
+        // classdef-less `repr(C)` pointee. A decl that is not `repr(C)`
+        // stays `None`.
+        let node = tyref_node(base_ty, self.llbc)?;
+        let node = strip_ty_wrappers(node, self.llbc)?;
+        let node = type_node_peel_aliases(node, self.llbc).unwrap_or(node);
+        let subst = adt_node_type_subst(node, self.llbc);
+        repr_c_struct_field_offset(self.llbc, td, &subst, field_idx)
     }
 
     /// Whole-enum move: switch on `__discriminant`, then copy that

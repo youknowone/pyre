@@ -51151,6 +51151,119 @@ fn dictentry_transparent_rawptr_key_row_is_inner_pointer() {
     assert!(wide.getattr_field_type("obj").is_some());
 }
 
+/// `(*entry).key = move key` of `Entry<TwoFieldKey, *mut u8>`.
+///
+/// `TwoFieldKey` is a two-field by-value struct. The generic `Entry`
+/// decl records no field offset. `repr(C)` makes
+/// `struct_field_offset_from_payload` `Some(0)`, so
+/// `emit_inlined_struct_leaf_copy` / `nest_inline_leaf` keep the
+/// inner leaf names (`hash`, `obj`) and the key's owner. A decl that
+/// is not `repr(C)` still spells `key.hash` / `key.obj`.
+#[test]
+fn dictentry_repr_c_by_value_key_store_keeps_inline_leaves() {
+    fn lower_key_store(repr_algo: &str) -> FunctionGraph {
+        let i64_ty = interior_i64();
+        let raw_u8 = interior_raw_mut(interior_u8());
+        // `type_by_id` indexes `type_decls` by position, so these
+        // `def_id`s are the vector slots.
+        let key = interior_struct(
+            0,
+            &["fixture", "TwoFieldKey"],
+            &[("hash", i64_ty), ("obj", raw_u8.clone())],
+            16,
+            &[0, 8],
+            false,
+        );
+        let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let tv1 = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+        let entry = serde_json::json!({
+            "def_id": 1,
+            "item_meta": interior_meta(&["fixture", "Entry"], true),
+            "kind": {"Struct": [
+                {"name": "key", "ty": tv0, "attr_info": null},
+                {"name": "value", "ty": tv1, "attr_info": null}
+            ]},
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "repr": {
+                        "repr_algo": repr_algo,
+                        "align_modif": null,
+                        "transparent": false
+                    },
+                    "variant_layouts": []
+                }
+            }]
+        });
+        let key_ty = interior_adt(0);
+        let entry_ty = named_adt(1, vec![key_ty.clone(), raw_u8]);
+        let entry_ref = serde_json::json!({"Ref": [null, entry_ty.clone(), "Mut"]});
+        let unit = serde_json::json!({
+            "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+        });
+        let caller = interior_caller(
+            "store_key",
+            2,
+            vec![entry_ref.clone(), key_ty.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("entry"), &entry_ref),
+                interior_local(2, Some("key"), &key_ty),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_field(1, &entry_ref, &entry_ty, &key_ty, 0),
+                    serde_json::json!({
+                        "Use": [{"Move": interior_place(2, &key_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            )],
+        );
+        let llbc = llbc_with_types("fixture", vec![key, entry], vec![caller]);
+        lower_interior(&llbc, "store_key")
+    }
+
+    let writes = |graph: &FunctionGraph| -> Vec<(String, Option<String>)> {
+        graph_ops(graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => {
+                    Some((field.name.clone(), field.owner_root.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let c_graph = lower_key_store("C");
+    let c_writes = writes(&c_graph);
+    let c_names: Vec<&str> = c_writes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        c_names,
+        ["hash", "obj"],
+        "offset 0 keeps the inner leaf names; writes={c_writes:?}"
+    );
+    for (name, owner) in &c_writes {
+        assert!(
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner.ends_with("TwoFieldKey")),
+            "{name} owner must be the key, got {owner:?}"
+        );
+    }
+
+    let rust_graph = lower_key_store("Rust");
+    let rust_writes = writes(&rust_graph);
+    let rust_names: Vec<&str> = rust_writes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        rust_names,
+        ["key.hash", "key.obj"],
+        "unknown layout still dots the container field; writes={rust_writes:?}"
+    );
+}
+
 /// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.
 /// `Align` does not change field offsets (`llmemory.offsetof`).
 fn generic_repr_c_inner_decl(payload_ty: serde_json::Value) -> serde_json::Value {
