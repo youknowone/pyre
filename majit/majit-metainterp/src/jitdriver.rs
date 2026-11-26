@@ -8521,10 +8521,8 @@ impl<S: JitState> JitDriver<S> {
                         // across the restore below, which can collect.
                         let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
                         unsafe {
-                            majit_gc::shadow_stack::push_resume_ref_roots(
+                            majit_gc::shadow_stack::push_resume_ref_roots_pair(
                                 args.green_ref.as_mut_slice(),
-                            );
-                            majit_gc::shadow_stack::push_resume_ref_roots(
                                 args.red_ref.as_mut_slice(),
                             );
                         }

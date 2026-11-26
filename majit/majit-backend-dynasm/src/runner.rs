@@ -465,8 +465,10 @@ struct RanFrame {
 /// Unrooted `func` return of a raw finish entry.
 ///
 /// `get_latest_descr` reads `jf_descr` off `returned`. The success path
-/// loads slot 0 and parks or frees; any other descr takes
-/// [`ran_frame_from_func_return`] before handler work.
+/// loads slot 0 and parks or frees. A collector fail roots `returned`
+/// once (`llmodel.py execute_token` `ll_frame = func(...)`) and mints
+/// the deadframe from that slot; a host fail still takes
+/// [`ran_frame_from_func_return`].
 struct DoneRawEntry {
     head: *mut JitFrame,
     returned: *mut JitFrame,
@@ -3167,6 +3169,26 @@ impl DynasmBackend {
         self.deadframe_from_run(token, ran)
     }
 
+    /// Collector raw fail: the owner slot already names `ll_frame`.
+    ///
+    /// `llmodel.py execute_token` returns that object; `execute_assembler`
+    /// reads `get_latest_descr` off it and hands the same object to
+    /// `handle_fail`. One [`ShadowRoot`] covers the jitframe until the
+    /// [`DeadFrame`] drops.
+    #[cold]
+    #[inline(never)]
+    fn raw_entry_deadframe_from_root(
+        &self,
+        _token: &JitCellToken,
+        _head: *mut JitFrame,
+        root: ShadowRoot,
+    ) -> DeadFrame {
+        let tip = root.get().0 as *mut JitFrame;
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
+        let descr = self.find_descr_by_ptr(jf_descr_raw);
+        DeadFrame::JitFrame(JitFrameDeadFrame::from_shadow_root(root, descr, None))
+    }
+
     /// `jf_descr` equals the `DoneWithThisFrameDescrInt` cell
     /// `set_done_with_this_frame_descr_int` published.
     ///
@@ -3914,8 +3936,14 @@ impl Backend for DynasmBackend {
             park_or_free_done_entry_frame(token, raw.head, raw.returned, raw.gc_object);
             return Ok(value);
         }
-        let ran = ran_frame_from_func_return(raw.head, raw.returned, self.jitframe_facts);
-        Err(self.raw_entry_deadframe(token, ran))
+        if raw.gc_object {
+            let root = ShadowRoot::new(GcRef(raw.returned as usize));
+            debug_assert_eq!(root.get().0, raw.returned as usize);
+            Err(self.raw_entry_deadframe_from_root(token, raw.head, root))
+        } else {
+            let ran = ran_frame_from_func_return(raw.head, raw.returned, self.jitframe_facts);
+            Err(self.raw_entry_deadframe(token, ran))
+        }
     }
 
     /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
@@ -5295,6 +5323,97 @@ mod tests {
         drop(frame);
         assert_eq!(walked_root_count(), baseline);
         assert_eq!(majit_gc::shadow_stack::depth(), depth0);
+    }
+
+    /// Raw collector fail mints the DeadFrame from one owner slot, with
+    /// no `RanFrame` live after the call. A host fail still uses
+    /// `LibcJitFrame`.
+    #[test]
+    fn raw_fail_path_mints_deadframe_from_owner_root_without_ranframe() {
+        fn failing_guard_ops() -> (Vec<InputArgRc>, Vec<OpRc>) {
+            let inputargs = vec![InputArg::new_int_rc(0)];
+            let guard = mk_op(
+                OpCode::GuardTrue,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            );
+            guard.set_fail_arg_types(vec![Type::Int]);
+            guard.setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
+            let ops = vec![
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+                guard,
+                mk_op(OpCode::Finish, &[OpRef::const_int(1)], OpRef::NONE.raw()),
+            ];
+            rebind_trace_arg_boxes(&inputargs, &ops);
+            (inputargs, ops)
+        }
+
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::new();
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        register_jitframe_type(&mut gc);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let (inputargs, ops) = failing_guard_ops();
+        let token = JitCellToken::new(1625);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let baseline = walked_root_count();
+        let frame = match backend.execute_token_done_int_raw(&token, &[0]) {
+            Err(frame) => frame,
+            Ok(value) => panic!("expected guard exit, got done {value}"),
+        };
+        assert_eq!(walked_root_count(), baseline + 1);
+        {
+            let jf = frame
+                .as_jitframe()
+                .expect("collector raw fail is a JitFrame deadframe");
+            let original = jf.jf_gcref();
+            let descr_raw =
+                unsafe { majit_backend::llmodel::get_latest_descr(original.0 as *const JitFrame) };
+            let cell = unsafe { majit_ir::FailDescrCell::from_thin_ptr(descr_raw) };
+            let descr_arc = backend.get_latest_descr_arc(&frame);
+            assert!(std::sync::Arc::ptr_eq(&cell.descr, &descr_arc));
+            assert!(!backend.get_latest_descr(&frame).is_finish());
+
+            let forwarded = GcRef(original.0.wrapping_add(0x1000));
+            majit_gc::shadow_stack::walk_roots(|root| {
+                if *root == original {
+                    *root = forwarded;
+                }
+            });
+            assert_eq!(jf.jf_gcref(), forwarded);
+            assert!(!backend.get_latest_descr(&frame).is_finish());
+
+            majit_gc::shadow_stack::walk_roots(|root| {
+                if *root == forwarded {
+                    *root = original;
+                }
+            });
+        }
+        drop(frame);
+        assert_eq!(walked_root_count(), baseline);
+
+        let mut host = DynasmBackend::new();
+        host.attach_default_test_descrs();
+        let (inputargs, ops) = failing_guard_ops();
+        let host_token = JitCellToken::new(1626);
+        host.compile_loop(&inputargs, &ops, &host_token).unwrap();
+        let host_baseline = walked_root_count();
+        let host_frame = match host.execute_token_done_int_raw(&host_token, &[0]) {
+            Err(frame) => frame,
+            Ok(value) => panic!("expected host guard exit, got done {value}"),
+        };
+        assert!(
+            host_frame.as_libc_jitframe().is_some(),
+            "host raw fail keeps LibcJitFrame"
+        );
+        assert!(host_frame.as_jitframe().is_none());
+        assert_eq!(walked_root_count(), host_baseline);
+        assert!(!host.get_latest_descr(&host_frame).is_finish());
+        drop(host_frame);
+        assert_eq!(walked_root_count(), host_baseline);
     }
 
     #[test]
