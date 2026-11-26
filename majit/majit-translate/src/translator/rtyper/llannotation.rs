@@ -469,44 +469,6 @@ impl SomePtr {
     }
 }
 
-/// Implicit `annlowlevel.cast_base_ptr_to_instance` of the same Rust
-/// fn-pointer adaptation as [`SomePtr::call`]'s instance-argument
-/// conversion (`annlowlevel.cast_instance_to_base_ptr`).
-/// `ll_to_annotation(FUNC.RESULT)` for a `Ptr(FuncType)` call: a GC
-/// instance pointer is the instance annotation (`llannotation.py`
-/// `ll_to_annotation` of `Ptr(GcStruct)` of a class); `rclass.OBJECTPTR`
-/// is the root instance. `GCREF` stays `SomePtr`.
-fn ll_fn_ptr_result_annotation(s: SomeValue) -> SomeValue {
-    let s = highlevel_of_ptr_field_annotation(s);
-    if let SomeValue::Ptr(p) = &s {
-        let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
-        if ty == *crate::translator::rtyper::rclass::OBJECTPTR {
-            return SomeValue::Instance(SomeInstance::new(
-                None,
-                true,
-                std::collections::BTreeMap::new(),
-            ));
-        }
-    }
-    s
-}
-
-/// FUNC.ARGS[i] is a GC instance pointer: `rclass.OBJECTPTR`, or a
-/// class's `InstanceRepr.lowleveltype` (`Ptr(object_type)`, `rclass.py`).
-fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
-    if ty == &*crate::translator::rtyper::rclass::OBJECTPTR {
-        return true;
-    }
-    let lltype::LowLevelType::Ptr(p) = ty else {
-        return false;
-    };
-    match &p.TO {
-        lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
-        lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
-        _ => false,
-    }
-}
-
 /// Declared lltype of `attr` on a struct pointer, before `_ptr._expose`
 /// rewraps a nested container.
 fn ptr_struct_field_lltype(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowLevelType> {
