@@ -50405,6 +50405,192 @@ fn dictentry_entry_at_mut_field_write_is_setinteriorfield() {
     );
 }
 
+/// `replace_value(&mut entry_at_mut(slot).value, v)` — the only field
+/// use is identity-word `&mut (*e).value` (`ll_dict_setitem` overwrite).
+/// `getinteriorfield` of `value` off `entries`; the header and index stay
+/// live as inputargs so the FieldRead base and InteriorFieldRead index
+/// are defined. `replace_value` stays residual (`dont_look_inside`).
+#[test]
+fn dictentry_entry_at_mut_replace_value_is_getinteriorfield() {
+    let lay = dictentry_layout();
+    let value_mut = interior_mut_ref(lay.i64_ty.clone());
+    let caller = interior_caller(
+        "replace_entry_value",
+        3,
+        vec![
+            lay.dict_ref.clone(),
+            lay.usize_ty.clone(),
+            lay.i64_ty.clone(),
+        ],
+        lay.i64_ty.clone(),
+        vec![
+            interior_local(0, None, &lay.i64_ty),
+            interior_local(1, Some("d"), &lay.dict_ref),
+            interior_local(2, Some("i"), &lay.usize_ty),
+            interior_local(3, Some("v"), &lay.i64_ty),
+            interior_local(4, Some("e"), &lay.entry_mut),
+            interior_local(5, Some("slot"), &value_mut),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &lay.dict_ref)),
+                        interior_copy(interior_place(2, &lay.usize_ty)),
+                    ],
+                    interior_place(4, &lay.entry_mut),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Read": interior_place(3, &lay.i64_ty)},
+                        "targets": {"SwitchInt": [
+                            lay.i64_ty,
+                            [[{"Scalar": {"Signed": ["I64", "0"]}}, 3]],
+                            4
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &lay.i64_ty),
+                    interior_use(interior_place(3, &lay.i64_ty)),
+                )],
+                interior_return(),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(5, &value_mut),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_field(
+                                4, &lay.entry_mut, &lay.entry, &lay.i64_ty, 1
+                            ),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(5, &value_mut)),
+                        interior_copy(interior_place(3, &lay.i64_ty)),
+                    ],
+                    interior_place(0, &lay.i64_ty),
+                    5,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let entry_at = dictentry_entry_at_fn("entry_at_mut", &lay.entry_mut, &lay);
+    let replace = interior_opaque(
+        2,
+        &["pyre_object", "rordereddict", "replace_value"],
+        vec![value_mut, lay.i64_ty.clone()],
+        lay.i64_ty.clone(),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![lay.dict_decl, lay.entry_decl],
+        vec![caller, entry_at, replace],
+    );
+    let graph = lower_interior(&llbc, "replace_entry_value");
+    let ops = graph_ops(&graph);
+    let block = interior_read_block(&graph);
+    let field_ops: Vec<_> = block
+        .operations
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::FieldRead { .. }))
+        .collect();
+    // Identity-word `&mut (*e).value` loads the field, residual
+    // `replace_value` mutates a scratch cell, then the cell is stored
+    // back. Each interior op reloads `entries`.
+    assert_eq!(field_ops.len(), 2, "ops={ops:?}");
+    assert!(
+        field_ops.iter().all(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "entries"
+        )),
+        "ops={ops:?}"
+    );
+    assert!(
+        block.inputargs.len() >= 2,
+        "header and index stay live; inputargs={:?}",
+        block.inputargs
+    );
+    for op in &field_ops {
+        let OpKind::FieldRead { base, .. } = &op.kind else {
+            unreachable!()
+        };
+        assert_eq!(base, &block.inputargs[0], "ops={ops:?}");
+    }
+    let OpKind::InteriorFieldRead {
+        base,
+        index,
+        field,
+        array_type_id,
+        array: _,
+        ..
+    } = block
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::InteriorFieldRead { .. } => Some(&op.kind),
+            _ => None,
+        })
+        .expect("InteriorFieldRead")
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "value");
+    assert_entry_owner(field.owner_root.as_deref());
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
+    assert_eq!(index, &block.inputargs[1]);
+    assert_eq!(base, field_ops[0].result.as_ref().unwrap());
+    let writes: Vec<_> = block
+        .operations
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        .collect();
+    assert_eq!(writes.len(), 1, "ops={ops:?}");
+    let OpKind::InteriorFieldWrite {
+        base: write_base,
+        index: write_index,
+        field: write_field,
+        array_type_id: write_array,
+        array: _,
+        ..
+    } = &writes[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(write_field.name, "value");
+    assert_entry_owner(write_field.owner_root.as_deref());
+    assert_eq!(write_array.as_deref(), Some("GcArray<Entry>"));
+    assert_eq!(write_index, &block.inputargs[1]);
+    assert_eq!(write_base, field_ops[1].result.as_ref().unwrap());
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| leaf == "replace_value"),
+        "ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_at_mut"),
+        "ops={ops:?}"
+    );
+}
+
 /// A copied `&Entry` escapes. `entry_at` stays a call.
 #[test]
 fn dictentry_entry_at_copied_ref_stays_residual() {

@@ -369,6 +369,10 @@ impl SomePtr {
             ));
         }
         let info = "argument to ll function pointer call";
+        let func_args = match &self.ll_ptrtype.TO {
+            lltype::PtrTarget::Func(ft) => Some(ft.args.as_slice()),
+            _ => None,
+        };
         // `lltype.py SomePtr.call`: `[annotation_to_lltype(
         // s_arg, info)._defl() for s_arg in args_s]` — touches every
         // slot once via the list comprehension; `annotation_to_lltype`
@@ -379,6 +383,21 @@ impl SomePtr {
         let llargs = (0..args_s_opt.len())
             .map(|i| {
                 let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomePtr.call");
+                // Rust fn-pointer adaptation of
+                // `annlowlevel.cast_instance_to_base_ptr` at an
+                // `llhelper` call site (`lltype.py` `SomePtr.call`).
+                // `annotation_to_lltype` has no `SomeInstance` case
+                // (`llannotation.py`); a `SomeInstance` argument whose
+                // FUNC `ARGS[i]` is a GC instance pointer
+                // (`rclass.OBJECTPTR`, or a class's instance pointer)
+                // is taken as that pointer. An instance against a
+                // non-instance-pointer `ARGS[i]` still raises.
+                if matches!(s_arg, SomeValue::Instance(_))
+                    && let Some(arg_ty) = func_args.and_then(|args| args.get(i))
+                    && func_arg_is_gc_instance_pointer(arg_ty)
+                {
+                    return Ok(arg_ty.clone()._defl());
+                }
                 annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -466,6 +485,22 @@ impl SomePtr {
                 Err(AnnotatorError::new(self.ll_ptrtype._nofield(attr)))
             }
         }
+    }
+}
+
+/// FUNC.ARGS[i] is a GC instance pointer: `rclass.OBJECTPTR`, or a
+/// class's `InstanceRepr.lowleveltype` (`Ptr(object_type)`, `rclass.py`).
+fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
+    if ty == &*crate::translator::rtyper::rclass::OBJECTPTR {
+        return true;
+    }
+    let lltype::LowLevelType::Ptr(p) = ty else {
+        return false;
+    };
+    match &p.TO {
+        lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
+        lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
+        _ => false,
     }
 }
 
@@ -1568,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn someptr_call_rejects_matching_instance_as_fn_ptr_arg() {
+    fn someptr_call_accepts_matching_instance_as_fn_ptr_arg() {
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::model::SomeInstance;
         let (_ann, classdef) = classdef_for_fn_ptr_call_test("MatchingFnPtrInst");
@@ -1581,15 +1616,9 @@ mod tests {
             }),
         });
         let args = ArgumentsForTranslation::new(vec![Some(inst)], None, None);
-        let err = s_ptr
+        s_ptr
             .call(&args)
-            .expect_err("SomePtr.call has no instance arm");
-        assert!(
-            err.msg
-                .unwrap_or_default()
-                .contains("should return a low-level type"),
-            "upstream annotation_to_lltype rejects a high-level instance"
-        );
+            .expect("SomeInstance against OBJECTPTR is the instance pointer");
     }
 
     #[test]
@@ -1600,7 +1629,7 @@ mod tests {
         let inst =
             SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
         let unrelated = lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
-            TO: lltype::PtrTarget::Struct(lltype::Struct::gc("UnrelatedFnPtrArg", vec![])),
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new("UnrelatedFnPtrArg", vec![])),
         }));
         let s_ptr = SomePtr::new(lltype::Ptr {
             TO: lltype::PtrTarget::Func(lltype::FuncType {

@@ -477,6 +477,16 @@ fn get_fielddescr_index_in_from(
                 cur_index = -r - 1;
                 continue;
             }
+            // `get_fielddescr_index_in` recurses into a nested STRUCT and
+            // does not number it as a slot; `all_interiorfielddescrs`
+            // raises `array(struct(struct))`. `rdict.py` `recast_key`
+            // reads that ADT as one item field (`getinteriorfield` of
+            // `key`), so an exact name match is the interior descr of
+            // the nested struct. Leaf lookups still recurse, so later
+            // fields keep their flattened indices.
+            if name == fieldname {
+                return cur_index;
+            }
             if has_direct {
                 // Count inner leaves; do not return an inner name match.
                 let r = get_fielddescr_index_in_from(
@@ -962,6 +972,7 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "c", 0), 2);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -4);
     }
 
@@ -994,6 +1005,7 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "x", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "y", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 3);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "inner", 0), 1);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -5);
     }
 }
