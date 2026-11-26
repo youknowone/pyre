@@ -13,6 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use majit_backend::{ExitPendingFieldLayout, ExitValueSourceLayout, FailArgSource};
+use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::operand::Operand;
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -6015,14 +6016,20 @@ pub struct ResumeDataDirectReader<'a> {
     /// resume.py `ResumeDataDirectReader.deadframe` — the jitframe GCREF
     /// `cpu.get_int_value(self.deadframe, num)` / `get_ref_value` load.
     /// Zero means the test-only dense-slice arm (`FailArgSource::Slice`).
+    /// A `FailArgSource::JitFrame` arm also holds `deadframe_owner`; TAGBOX
+    /// loads reread that slot (`live_deadframe`).
     pub deadframe: i64,
+    /// `FailArgSource::from_held_root`: the `DeadFrame` owner slot
+    /// `compile.py` `ResumeGuardDescr.handle_fail` keeps for
+    /// `resume.py` `blackhole_from_resumedata`. None on Slice / Libc.
+    deadframe_owner: Option<&'a ShadowRoot>,
     /// `llmodel.py _decode_pos`: `descr.rd_locs` already fetched off the
     /// failing guard. Empty on the Slice arm (identity index).
     deadframe_rd_locs: &'a [u16],
     /// Dense fail-arg list used only when `deadframe` is 0.
     deadframe_slice: &'a [i64],
-    /// GC jitframe: the GCREF field is a resume root so a collection
-    /// during decode forwards it in place (`self.deadframe` is traced).
+    /// GC jitframe. When `deadframe_owner` is set, that owner slot is
+    /// the only root for the jitframe; bind does not push a copy.
     deadframe_on_heap: bool,
     deadframe_root_base_depth: Option<usize>,
     // resume.py:1358 resume_after_guard_not_forced
@@ -6062,11 +6069,12 @@ pub struct ResumeDataDirectReader<'a> {
     decode_calls: Vec<ResumeDecodeCall>,
 }
 
-/// Holds `&mut ResumeDataDirectReader` while `self.deadframe` and
-/// `Reader.code` are resume GCREF roots. `resume.py`
+/// Holds `&mut ResumeDataDirectReader` while `Reader.code` (and, on the
+/// Slice/Libc path, `self.deadframe`) are resume GCREF roots. `resume.py`
 /// `ResumeDataDirectReader.__init__` traces those fields; the borrow
 /// keeps the reader from moving while the collector can rewrite them
-/// in place.
+/// in place. A `FailArgSource::JitFrame` jitframe is the `DeadFrame`
+/// owner slot, not a resume-ref copy.
 #[must_use]
 pub struct DeadframeRootGuard<'r, 'a> {
     reader: &'r mut ResumeDataDirectReader<'a>,
@@ -7231,17 +7239,23 @@ impl<'a> ResumeDataDirectReader<'a> {
         // then calls `cpu.get_int_value(self.deadframe, num)` on that GCREF
         // (`llmodel.py get_int_value` / `get_ref_value`). Unpack the
         // FailArgSource once here so each slot does not match Slice /
-        // JitFrame / LibcJitFrame.
-        let (deadframe_gcref, deadframe_rd_locs, deadframe_slice, deadframe_on_heap) =
-            match deadframe {
-                FailArgSource::Slice(s) => (0, &[][..], s, false),
-                FailArgSource::JitFrame { root, rd_locs, .. } => {
-                    (root.get().0 as i64, rd_locs, &[][..], true)
-                }
-                FailArgSource::LibcJitFrame { ptr, rd_locs, .. } => {
-                    (ptr as i64, rd_locs, &[][..], false)
-                }
-            };
+        // JitFrame / LibcJitFrame. The JitFrame arm keeps the owner
+        // `ShadowRoot` so every later load rereads `root.get()`.
+        let (
+            deadframe_gcref,
+            deadframe_rd_locs,
+            deadframe_slice,
+            deadframe_on_heap,
+            deadframe_owner,
+        ) = match deadframe {
+            FailArgSource::Slice(s) => (0, &[][..], s, false, None),
+            FailArgSource::JitFrame { root, rd_locs, .. } => {
+                (root.get().0 as i64, rd_locs, &[][..], true, Some(root))
+            }
+            FailArgSource::LibcJitFrame { ptr, rd_locs, .. } => {
+                (ptr as i64, rd_locs, &[][..], false, None)
+            }
+        };
 
         ResumeDataDirectReader {
             resumecodereader,
@@ -7249,6 +7263,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe: deadframe_gcref,
+            deadframe_owner,
             deadframe_rd_locs,
             deadframe_slice,
             deadframe_on_heap,
@@ -7265,17 +7280,20 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Root `self.deadframe` and `Reader.code` after the reader sits in
-    /// its final stack slot. `resume.py` `ResumeDataDirectReader.__init__`
-    /// traces those GCREF fields; a collection during `consume_one_section`
-    /// / virtual allocate forwards them in place. The returned guard holds
-    /// `&mut self` so the reader cannot move while registered. Off-heap
-    /// and Slice arms skip the deadframe push; a MiniMark numbering is
-    /// still pushed. Host blocks are not GCREFs.
+    /// Root `Reader.code` after the reader sits in its final stack slot
+    /// when that numbering is a MiniMark GCREF. `resume.py`
+    /// `ResumeDataDirectReader.__init__` traces `self.deadframe` and
+    /// `Reader.code`; MiniMark already traces those fields on the GC
+    /// reader, so there is no second jitframe copy. The jitframe here is
+    /// the `DeadFrame` owner `ShadowRoot`
+    /// (`FailArgSource::from_held_root`); bind does not push that GCREF
+    /// again. Off-heap and Slice arms skip the deadframe push; a MiniMark
+    /// numbering is still pushed. Host blocks are not GCREFs.
     #[must_use]
     pub fn bind_deadframe_root(&mut self) -> DeadframeRootGuard<'_, 'a> {
         if self.deadframe_root_base_depth.is_none() {
-            let root_deadframe = self.deadframe_on_heap && self.deadframe != 0;
+            let root_deadframe =
+                self.deadframe_owner.is_none() && self.deadframe_on_heap && self.deadframe != 0;
             let root_numbering = self.resumecodereader.has_gc_code();
             if root_deadframe || root_numbering {
                 self.deadframe_root_base_depth =
@@ -7297,12 +7315,21 @@ impl<'a> ResumeDataDirectReader<'a> {
         DeadframeRootGuard { reader: self }
     }
 
+    /// `resume.py` `cpu.get_int_value(self.deadframe, num)` reads the
+    /// GCREF field MiniMark traces. The owner `ShadowRoot` is that field.
+    #[inline(always)]
+    fn live_deadframe(&self) -> i64 {
+        self.deadframe_owner
+            .map(|root| root.get().0 as i64)
+            .unwrap_or(self.deadframe)
+    }
+
     /// `llmodel.py get_int_value` / `get_ref_value`: `_decode_pos` then
     /// `get_*_value_direct` on `self.deadframe`.
     #[inline(always)]
     fn cpu_get_value(&self, index: usize) -> i64 {
         let locs = self.deadframe_rd_locs;
-        self.cpu_get_value_at(self.deadframe, locs, locs.is_empty(), index)
+        self.cpu_get_value_at(self.live_deadframe(), locs, locs.is_empty(), index)
     }
 
     #[inline(always)]
@@ -7332,7 +7359,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             numb_len,
             cur_pos: self.resumecodereader.cur_pos,
             items_read: self.resumecodereader.items_read,
-            deadframe: self.deadframe,
+            deadframe: self.live_deadframe(),
             locs: self.deadframe_rd_locs,
             count: self.count,
             locs_empty: self.deadframe_rd_locs.is_empty(),
@@ -8277,7 +8304,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
             let value = self.getvirtual_int(idx);
-            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            cur.reload_bases(&self.resumecodereader, self.live_deadframe());
             value
         } else {
             debug_assert_eq!(tag, TAGBOX);
@@ -8315,7 +8342,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
             let value = self.getvirtual_ptr(idx);
-            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            cur.reload_bases(&self.resumecodereader, self.live_deadframe());
             value
         } else {
             if tag != TAGBOX {
@@ -9072,6 +9099,107 @@ mod pendingfields_tests {
     }
 }
 
+#[cfg(test)]
+mod deadframe_owner_tests {
+    use super::*;
+    use majit_backend::FailArgSource;
+    use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
+    use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
+    use majit_ir::descr::SimpleSizeDescr;
+    use majit_ir::{SimpleFailDescr, Type};
+
+    struct NoAlloc;
+
+    impl BlackholeAllocator for NoAlloc {}
+
+    fn walked_owner_count() -> usize {
+        let mut n = 0;
+        majit_gc::shadow_stack::walk_roots(|_| n += 1);
+        n
+    }
+
+    /// `FailArgSource::from_held_root` reuses the `DeadFrame` owner slot.
+    /// `bind_deadframe_root` must not register a second jitframe GCREF;
+    /// TAGBOX `decode_int` / `cpu_get_value` reread `ShadowRoot::get`
+    /// after a forwarding store.
+    #[test]
+    fn bind_deadframe_root_rereads_the_owner_slot_and_does_not_push_a_copy() {
+        let from = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
+        let to = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
+        assert!(!from.is_null() && !to.is_null());
+        unsafe {
+            JitFrame::init(from, std::ptr::null(), 4);
+            JitFrame::init(to, std::ptr::null(), 4);
+            majit_backend::llmodel::set_int_value(from, 0, 111);
+            majit_backend::llmodel::set_int_value(to, 0, 222);
+        }
+
+        let baseline_owners = walked_owner_count();
+        let baseline_resume = majit_gc::shadow_stack::resume_ref_roots_depth();
+        let descr = SimpleFailDescr::new(0, vec![Type::Int]);
+        let size: majit_ir::DescrRef = Arc::new(SimpleSizeDescr::new(0, 8, 0));
+        let deadframe = majit_backend::DeadFrame::JitFrame(JitFrameDeadFrame::from_shadow_root(
+            ShadowRoot::new(GcRef(from as usize)),
+            ExitDescr::owned(size),
+            None,
+        ));
+        assert_eq!(walked_owner_count(), baseline_owners + 1);
+
+        {
+            let root = deadframe
+                .as_jitframe()
+                .expect("JitFrame deadframe")
+                .shadow_root()
+                .expect("owner slot");
+            let source = FailArgSource::from_held_root(root, &descr, 1);
+            let alloc = NoAlloc;
+            let mut reader = ResumeDataDirectReader::new(&[0, 0], &[], &[], source, None, &alloc);
+            let mut bound = reader.bind_deadframe_root();
+            let mut saw_from = false;
+            majit_gc::shadow_stack::walk_resume_ref_roots(|slot| {
+                if slot.0 == from as usize {
+                    saw_from = true;
+                }
+            });
+            assert!(
+                !saw_from,
+                "the owner ShadowRoot already covers the jitframe"
+            );
+            assert_eq!(
+                majit_gc::shadow_stack::resume_ref_roots_depth(),
+                baseline_resume
+            );
+
+            majit_gc::shadow_stack::walk_roots(|slot| {
+                if slot.0 == from as usize {
+                    *slot = GcRef(to as usize);
+                }
+            });
+            let tagged = tag(0, TAGBOX).unwrap();
+            assert_eq!(
+                bound.decode_int(tagged),
+                222,
+                "TAGBOX decode_int must load through the forwarded owner slot"
+            );
+            drop(bound);
+            drop(reader);
+        }
+
+        assert_eq!(
+            majit_gc::shadow_stack::resume_ref_roots_depth(),
+            baseline_resume
+        );
+        assert_eq!(walked_owner_count(), baseline_owners + 1);
+        drop(deadframe);
+        assert_eq!(walked_owner_count(), baseline_owners);
+
+        unsafe {
+            free_off_gc_jitframe(from);
+            free_off_gc_jitframe(to);
+        }
+    }
+}
+
 /// resume.py blackhole_from_resumedata
 ///
 /// Build a chain of BlackholeInterpreters from encoded resume data.
@@ -9585,14 +9713,15 @@ where
     let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
     let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let skip_prepare = !resuming_after_guard_not_forced && empty_virtuals && empty_pending;
-    // `resume.py` traces `self.deadframe` and `Reader.code`; bind so a
-    // collection forwards those fields. The guard keeps the reader from
-    // moving. `numb_next_item` indexes `Reader.code` for the rest of
-    // this window (`ResumeGuardDescr.rd_numb` holds the numbering).
+    // `resume.py` traces `self.deadframe` and `Reader.code`. The jitframe
+    // is the `DeadFrame` owner slot; bind registers MiniMark numbering.
+    // The guard keeps the reader from moving. `numb_next_item` indexes
+    // `Reader.code` for the rest of this window (`ResumeGuardDescr.rd_numb`
+    // holds the numbering).
     let mut resumereader = resumereader.bind_deadframe_root();
     let _resume_roots = if resuming_after_guard_not_forced {
         // Virtuals already live in the cache; a collection during
-        // consume still forwards `self.deadframe`.
+        // consume still rereads the owner slot (`live_deadframe`).
         Some(prepare_resume_heap_with_roots(
             &mut *resumereader,
             None,

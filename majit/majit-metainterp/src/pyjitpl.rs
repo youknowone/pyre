@@ -2873,6 +2873,10 @@ pub struct MetaInterp<M: Clone> {
     /// opens later (`begin_trace_session`) and may be drained earlier
     /// (`take_trace_meta`) than the profiler event scope.
     pub(crate) profiler_tracing_active: bool,
+    /// Entries into `make_enter_function`. `must_compile_resume_guard`
+    /// reads `jd.warmstate` and must not increment this.
+    #[cfg(test)]
+    make_enter_function_calls: usize,
 }
 
 /// Per-attempt MetaInterp fields stacked while a nested
@@ -4837,6 +4841,8 @@ impl<M: Clone> MetaInterp<M> {
             active_trace_session: None,
             bridge_info: None,
             profiler_tracing_active: false,
+            #[cfg(test)]
+            make_enter_function_calls: 0,
         };
         // `pyjitpl.py` `make_and_attach_done_descrs([self, cpu])` —
         // now that both sides of the pair exist, publish the
@@ -5431,6 +5437,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `jd_no` are created so a driver index used without registration
     /// (tests) resolves too.
     pub(crate) fn make_enter_function(&mut self, jd_no: usize) {
+        #[cfg(test)]
+        {
+            self.make_enter_function_calls += 1;
+        }
         if self
             .staticdata
             .jitdrivers_sd
@@ -15685,9 +15695,12 @@ impl<M: Clone> MetaInterp<M> {
                     return (false, owning_key);
                 }
             };
-        let fired = self
-            .warm_state_for_driver(jitdriver_sd)
-            .tick_guard_failure(hash);
+        // compile.py AbstractResumeGuardDescr.must_compile: increment =
+        // jitdriver_sd.warmstate.increment_trace_eagerness, then
+        // warmrunnerdesc.jitcounter.tick. jitdriver_sd is the
+        // handle_fail argument, not rd_loop_token.outermost_jitdriver_sd.
+        // warmspot.py make_enter_function(jd) already installed the slot.
+        let fired = Self::jd_warmstate(&self.staticdata, jitdriver_sd).tick_guard_failure(hash);
         if fired {
             crate::mc_diag_bump(4);
         }
@@ -36589,6 +36602,62 @@ mod tests {
             "outermost_jitdriver_sd's timetable did not receive the owning-key ticks"
         );
         let _keep = token;
+    }
+
+    #[test]
+    fn must_compile_resume_guard_skips_make_enter_function() {
+        // warmspot.py make_enter_function(jd) runs at registration.
+        // compile.py AbstractResumeGuardDescr.must_compile reads
+        // jitdriver_sd.warmstate; it does not construct WarmEnterState.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(8);
+
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        let before = meta.make_enter_function_calls;
+        assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        assert_eq!(
+            meta.make_enter_function_calls, before,
+            "must_compile_resume_guard must not enter make_enter_function"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "make_enter_function has not run for this jitdriver_sd")]
+    fn must_compile_resume_guard_requires_installed_warmstate() {
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        std::sync::Arc::get_mut(&mut meta.staticdata)
+            .expect("staticdata uniquely owned")
+            .jitdrivers_sd[idx0]
+            .warmstate = None;
+        let _ = meta.must_compile_resume_guard(rgd, &[], None, 1, idx0);
     }
 
     #[test]
