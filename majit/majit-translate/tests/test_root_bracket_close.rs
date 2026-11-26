@@ -2536,3 +2536,33 @@ fn check_not_duplicate_kwargs_keeps_copy_into_existing_now() {
         "existing_now is a distinct buffer, erase={erase}"
     );
 }
+
+/// `rclass.py` `hook_setfield` passes the mutate field and the value slot
+/// by address. Neither argument is the pointer currently stored there.
+#[test]
+fn quasi_immutable_publication_borrows_both_field_addresses() {
+    use majit_translate::model::ValueType;
+    let graph = lower_named(object_llbc(), "notify_w_class_mutated_then");
+    for name in ["w_class_watchers", "w_class"] {
+        let fields: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == name => {
+                    Some((field.taken_by_address, ty))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!fields.is_empty(), "missing {name}: {}", graph.dump());
+        assert!(
+            fields
+                .iter()
+                .all(|(address, ty)| *address && **ty == ValueType::Int),
+            "{name} must be a raw slot address: {}",
+            graph.dump()
+        );
+    }
+    assert_eq!(calls_to(&graph, "publish_quasi_immut_ptr"), 1);
+}

@@ -45641,34 +45641,42 @@ fn raw_mut_deref_reborrow_of_transparent_wrapper_ptr_is_address() {
 /// its slot, even when the slot's current scalar/pointer word is zero.
 #[test]
 fn raw_borrow_of_transparent_field_is_slot_address() {
-    let word = interior_i64();
-    let wrap = interior_adt(0);
-    let owner = interior_adt(1);
-    let owner_ptr = interior_raw_mut(owner.clone());
-    let slot_ptr = interior_raw_mut(wrap.clone());
-    let slot = interior_field(1, &owner_ptr, &owner, &wrap, 1);
-    let caller = interior_caller(
-        "borrow_slot",
-        1,
-        vec![owner_ptr.clone()],
-        slot_ptr.clone(),
-        vec![
-            interior_local(0, None, &slot_ptr),
-            interior_local(1, Some("p"), &owner_ptr),
-        ],
-        vec![interior_bb(
-            vec![interior_assign(
-                interior_place(0, &slot_ptr),
-                serde_json::json!({"RawPtr": {
-                    "place": slot, "kind": "Mut", "ptr_metadata": null
-                }}),
+    for opaque_atomic in [false, true] {
+        let word = interior_i64();
+        let wrap = if opaque_atomic {
+            named_adt(0, vec![word.clone()])
+        } else {
+            interior_adt(0)
+        };
+        let owner = interior_adt(1);
+        let owner_ptr = interior_raw_mut(owner.clone());
+        let slot_ptr = interior_raw_mut(wrap.clone());
+        let slot = interior_field(1, &owner_ptr, &owner, &wrap, 1);
+        let caller = interior_caller(
+            "borrow_slot",
+            1,
+            vec![owner_ptr.clone()],
+            slot_ptr.clone(),
+            vec![
+                interior_local(0, None, &slot_ptr),
+                interior_local(1, Some("p"), &owner_ptr),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &slot_ptr),
+                    serde_json::json!({"RawPtr": {
+                        "place": slot, "kind": "Mut", "ptr_metadata": null
+                    }}),
+                )],
+                interior_return(),
             )],
-            interior_return(),
-        )],
-    );
-    let llbc = llbc_with_types(
-        "fixture",
-        vec![
+        );
+        let wrap_decl = if opaque_atomic {
+            let mut decl =
+                interior_struct(0, &["core", "sync", "atomic", "Atomic"], &[], 8, &[], false);
+            decl["kind"] = serde_json::json!("Opaque");
+            decl
+        } else {
             interior_struct(
                 0,
                 &["fixture", "Wrap"],
@@ -45676,31 +45684,37 @@ fn raw_borrow_of_transparent_field_is_slot_address() {
                 8,
                 &[0],
                 true,
-            ),
-            interior_struct(
-                1,
-                &["fixture", "Owner"],
-                &[("pad", word), ("slot", wrap)],
-                16,
-                &[0, 8],
-                false,
-            ),
-        ],
-        vec![caller],
-    );
-    let graph =
-        crate::test_support::lower_function(&llbc, "borrow_slot").expect("raw field borrow");
-    let returned = returned_word(&graph).expect("slot address returned");
-    let ops = graph_ops(&graph);
-    assert!(
-        ops.iter().any(|op| op.result.as_ref() == Some(returned)
-            && matches!(&op.kind,
+            )
+        };
+        let llbc = llbc_with_types(
+            "fixture",
+            vec![
+                wrap_decl,
+                interior_struct(
+                    1,
+                    &["fixture", "Owner"],
+                    &[("pad", word), ("slot", wrap)],
+                    16,
+                    &[0, 8],
+                    false,
+                ),
+            ],
+            vec![caller],
+        );
+        let graph =
+            crate::test_support::lower_function(&llbc, "borrow_slot").expect("raw field borrow");
+        let returned = returned_word(&graph).expect("slot address returned");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| op.result.as_ref() == Some(returned)
+                && matches!(&op.kind,
                 OpKind::FieldRead { field, ty, .. }
                 if field.name == "slot" && field.taken_by_address
                     && field.owner_declared_gc == Some(false) && *ty == ValueType::Int)),
-        "the result is the field's address, not its word; graph={}",
-        graph.dump()
-    );
+            "the result is the field's address, not its word; graph={}",
+            graph.dump()
+        );
+    }
 }
 
 /// `&mut *p` of `p: *mut Wrap(i64)`: returning `q` copies `q`, so `q` is

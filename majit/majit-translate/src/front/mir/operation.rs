@@ -4324,23 +4324,30 @@ impl<'a> Lowering<'a> {
                     self.note_interior_container_alias(dest_local, &place);
                     return Ok((None, address));
                 }
-                // Owner representation is `Rvalue::Ref` only
-                // (`ann_cast_ptr_to_adr` refuses an interior pointer as
-                // an address). RawPtr of a GC field keeps the field value.
-                // `lltype.direct_fieldptr` of a transparent word is the
-                // slot's address too. In particular, &raw of an AtomicPtr
+                // Raw borrows of pointer and transparent scalar fields
+                // are `lltype.direct_fieldptr`, a raw slot address.
+                // In particular, &raw of an AtomicPtr
                 // field must not pass its current (possibly null) payload
                 // to a residual expecting a pointer to that atomic cell.
                 let address = if Self::place_ref_is_address_of(&place)
-                    && tyref_transparent_inner_value_type(
-                        &place.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                        self.struct_fields,
-                    )
-                    .is_some()
+                    && (tyref_is_raw_pointer(&place.ty, self.llbc)
+                        || tyref_transparent_inner_value_type(
+                            &place.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
+                        )
+                        .or_else(|| {
+                            super::lltype::tyref_atomic_inner_value_type(
+                                &place.ty,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        })
+                        .is_some())
                 {
                     BorrowAddress::RawEnumField
                 } else {
@@ -4585,7 +4592,8 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
-                );
+                ) && !(graph_is_items_block_base_accessor(&self.graph.name)
+                    && is_object_ref_items_ptr(&ty, self.llbc));
                 if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                     && matches!(dst_kind, ValueType::Str)
                     && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)

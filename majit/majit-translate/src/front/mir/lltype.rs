@@ -3165,6 +3165,20 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     if raw_ptr_pointee_is_nonempty_gcarray_item(node, llbc, gc_struct_ids) {
         return false;
     }
+    // A raw pointer to a pointer/atomic cell names that cell, not the
+    // object stored in it (`lltype.direct_fieldptr` returns a raw
+    // FixedSizeArray(FIELD, 1) pointer; `history.getkind` is int).
+    if let Some(pointee) = node
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.first())
+        .and_then(|pointee| type_node_peel_aliases(pointee, llbc))
+        && (pointee.get("RawPtr").is_some()
+            || pointee.get("Ref").is_some()
+            || tyref_atomic_arg(&TyRef::Other(pointee.clone().into()), llbc).is_some())
+    {
+        return true;
+    }
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return true;
     }
