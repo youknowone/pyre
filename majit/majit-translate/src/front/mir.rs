@@ -1557,6 +1557,57 @@ fn substitute_field_type(
     tyref_to_ast_string(ty, llbc)
 }
 
+/// Entry-row spelling of one `DICTENTRY` field.
+///
+/// [`substitute_field_type`] renders the type argument. When that
+/// argument's `TypeDecl` is `#[repr(transparent)]` and its unique
+/// non-ZST field is a `RawPtr`, the field is that pointer
+/// ([`transparent_rawptr_field_spelling`]). The struct's own name keeps
+/// [`render_adt_type_args`]. `rmodel.py` `externalvsinternal`
+/// (`gcref=False`): an instance key's internal repr is its object
+/// pointer. `rordereddict.py` `DICTENTRY` stores `key` as `DICTKEY`,
+/// one field.
+fn entry_substituted_field_type(
+    ty: &TyRef,
+    args: &[String],
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
+    if let Some(spelling) = entry_typevar_transparent_rawptr_spelling(ty, subst, llbc) {
+        return spelling;
+    }
+    substitute_field_type(
+        ty,
+        args,
+        llbc,
+        gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    )
+}
+
+/// `*mut` / `*const` spelling of a type-variable field whose argument is
+/// a transparent single-`RawPtr` wrapper. A type argument that is already
+/// a `RawPtr` (or an alias of one) stays with [`substitute_field_type`].
+fn entry_typevar_transparent_rawptr_spelling(
+    ty: &TyRef,
+    subst: &[serde_json::Value],
+    llbc: &Llbc,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let (prefixes, inner) = pointer_wrapper_spelling_prefixes(node, llbc);
+    let idx = typevar_bound_index(inner)? as usize;
+    let arg = subst.get(idx)?;
+    let arg = strip_ty_indirections(arg, llbc)?;
+    let arg = type_node_peel_aliases(arg, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(arg)?)?;
+    let mut spelling = transparent_rawptr_field_spelling(decl, arg, llbc)?;
+    for prefix in prefixes.iter().rev() {
+        spelling = format!("{prefix}{spelling}");
+    }
+    Some(spelling)
+}
+
 /// Whether a rendered payload type is an unboxed scalar rather than a
 /// one-GC-word heap reference.  The textual descr path resolves a scalar's
 /// bank/width from the row type string via `type_flag_from_str`
@@ -2990,13 +3041,8 @@ fn register_ordereddict_entry_rows(
         let mut concrete = true;
         for (index, field) in fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            let concrete_ty = substitute_field_type(
-                &field.ty,
-                &args,
-                llbc,
-                gc_struct_ids,
-                &std::collections::HashSet::<String>::new(),
-            );
+            let concrete_ty =
+                entry_substituted_field_type(&field.ty, &args, &subst, llbc, gc_struct_ids);
             if concrete_ty.contains("??") {
                 concrete = false;
                 break;

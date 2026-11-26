@@ -7521,6 +7521,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ) {
         return None;
     }
+    // A pointer-shaped transparent field is one word even when
+    // `gc_ref_pointer` is false (`ValueType::Str`, `rstr.STRPTR`).
+    // `heaptracker.py` `all_fielddescrs` recurses only into
+    // `lltype.Struct`. `rordereddict.py` `_ll_dict_del_entry` stores
+    // `entry.key` as one field.
+    if transparent_rawptr_field_spelling(td, node, llbc).is_some() {
+        return None;
+    }
     // One integer word is not an inlined STRUCT. `getcalldescr` reads
     // that lltype off the value (`call.py`); leaf-copy would GETFIELD
     // `__pos_0` with the Int as the base (`VersionTag(u64)`).
@@ -8850,6 +8858,34 @@ pub(in crate::front::mir) fn transparent_nonzst_field(
         return None;
     }
     unique_nonzst_field(decl, llbc)
+}
+
+/// `*mut` / `*const` spelling when `decl` is `#[repr(transparent)]` and
+/// its unique non-ZST field is a `RawPtr`.
+///
+/// [`transparent_nonzst_field`] is that unique-field test.
+/// [`transparent_by_value_inner_fields`] returns None for the `RawPtr`,
+/// so the wrapper keeps one field. `rmodel.py` `externalvsinternal`
+/// (`gcref=False`): an instance key's internal repr is its object
+/// pointer. `rordereddict.py` `DICTENTRY` stores `key` as `DICTKEY`,
+/// one field. `heaptracker.py` `all_fielddescrs` recurses only into
+/// `lltype.Struct`.
+pub(in crate::front::mir) fn transparent_rawptr_field_spelling(
+    decl: &TypeDecl,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let (index, _) = transparent_nonzst_field(decl, llbc)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    let concrete =
+        substitute_spill_typevars(&field.ty, owner, llbc).unwrap_or_else(|| clone_tyref(&field.ty));
+    let node = tyref_node(&concrete, llbc)?;
+    let peeled = type_node_peel_aliases(node, llbc).unwrap_or(node);
+    type_node_raw_ptr_pointee(peeled, llbc)?;
+    Some(charon_type_value_to_ast_string(peeled, llbc, 0))
 }
 
 /// Payload field of a transparent-scalar ADT: the unique sized field, or
@@ -17779,11 +17815,20 @@ fn raw_struct_array_item_lltype_inner(
     // ARRAY.OF is the instantiation's own Struct: `get_ll_dict` mints one
     // `DICTENTRY` per `(DICTKEY, DICTVALUE)`. `cpu.interiorfielddescrof` /
     // `get_interiorfield_descr` / `get_field_descr` /
-    // `symbolic.get_field_token` read that Struct's offsets. Row lookup
-    // still uses the stripped template (`resolved_owner_key` /
-    // `field_rows`); interned `_name` keeps the balanced `<…>` span.
-    // A span that still names an unbound type variable (`??TypeVar#N`) is
-    // not an instantiation, so the Struct keeps the template name.
+    // `symbolic.get_field_token` read that Struct's offsets. Interned
+    // `_name` keeps the balanced `<…>` span on the template identity
+    // (`resolved_owner_key`). A span that still names an unbound type
+    // variable (`??TypeVar#N`) is not an instantiation, so the Struct
+    // keeps the template name.
+    //
+    // Rows are the monomorph `register_ordereddict_entry_rows` published
+    // under that suffixed key. `intern_field_rows` prefers the exact key,
+    // the same preference `project_struct_rows` uses. The template row is
+    // `??TypeVar`; substituting the struct name's arguments would put the
+    // external key spelling back into a field whose internal repr is the
+    // object pointer (`rmodel.py` `externalvsinternal`, `gcref=False`).
+    // `field_rows` strips `<…>` and is the fallback inside
+    // `intern_field_rows` when no suffixed key was published.
     let intern_name = match majit_ir::descr::generic_args_span(item) {
         Some(span) if !span.contains("??") => format!("{name}{span}"),
         _ => name.clone(),
@@ -17792,7 +17837,7 @@ fn raw_struct_array_item_lltype_inner(
         return None;
     }
     let out = (|| {
-        let rows = reg.field_rows(item)?;
+        let rows = reg.intern_field_rows(item)?;
         if rows.is_empty() {
             return None;
         }
