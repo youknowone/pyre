@@ -674,6 +674,18 @@ extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
     }
 }
 
+/// Installed-MRO arm of [`bh_w_type_issubtype`]. `typeobject.py` `_issubtype`
+/// when `hasmro` is true. Same word widening: the residual reads a Signed,
+/// and the raw `bool` leaves the upper result-register bits undefined.
+extern "C" fn bh_w_type_mro_contains(w_type: i64, cls: i64) -> i64 {
+    unsafe {
+        pyre_object::w_type_mro_contains(
+            w_type as usize as pyre_object::PyObjectRef,
+            cls as usize as pyre_object::PyObjectRef,
+        ) as i64
+    }
+}
+
 /// `w_type_is_cpython_immutabletype` returns `bool`. Same widening as
 /// [`bh_w_type_issubtype`]: the residual dispatcher reads a whole word.
 extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: i64) -> i64 {
@@ -3049,6 +3061,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::typeobject::w_type_issubtype",
         "pyre_object::w_type_issubtype",
         bh_w_type_issubtype,
+    );
+    // `_issubtype` when `hasmro` (`w_type in w_sub.mro_w`). `check_new_subtype`
+    // residualises this scan rather than `_issubtype_slow_and_wrong`. Same
+    // boolean widening as `w_type_issubtype`.
+    cpa2!(
+        &mut entries,
+        "pyre_object::typeobject::w_type_mro_contains",
+        "pyre_object::w_type_mro_contains",
+        bh_w_type_mro_contains,
     );
     // Same boolean widening. The raw function's result is one byte.
     cpa1!(
@@ -8958,6 +8979,23 @@ mod tests {
                 Some(occupied_published_addr(
                     path,
                     target as *const () as usize as i64
+                )),
+                "{path} must widen the bool before the residual reads a word",
+            );
+        }
+        let mro: extern "C" fn(i64, i64) -> i64 = super::bh_w_type_mro_contains;
+        for path in [
+            "pyre_object::typeobject::w_type_mro_contains",
+            "pyre_object::w_type_mro_contains",
+        ] {
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(name, _)| *name == path)
+                    .map(|(_, addr)| *addr),
+                Some(occupied_published_addr(
+                    path,
+                    mro as *const () as usize as i64
                 )),
                 "{path} must widen the bool before the residual reads a word",
             );

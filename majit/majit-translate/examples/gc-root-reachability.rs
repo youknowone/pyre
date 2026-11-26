@@ -404,6 +404,16 @@ fn main() {
                 cg.names.get(id).map_or("?", String::as_str)
             );
         }
+        if let Ok(path) = std::env::var("GC_UNJUSTIFIED_BRACKETS_JSON") {
+            let rows = unjustified
+                .iter()
+                .map(|id| serde_json::json!({"func": cg.names.get(id)}).to_string() + "\n")
+                .collect::<String>();
+            if let Err(e) = write_rows(&path, &rows, &mut opened) {
+                println!("       FAILED to write {path}: {e}");
+                write_failed = true;
+            }
+        }
         if unjustified.len() > 40 {
             println!("           … and {} more", unjustified.len() - 40);
         }
@@ -776,6 +786,24 @@ fn main() {
             found_host_malloc.len(),
             host_malloc_fns.len()
         );
+        if let Ok(path) = std::env::var("GC_HOST_MALLOC_JSON") {
+            let rows = found_host_malloc
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "file": f.file, "line": f.line, "func": f.func_name,
+                        "callee": f.callee_name, "live_non_arg": f.live_non_arg,
+                        "live_arg": f.live_arg, "movable": f.movable_use,
+                    })
+                    .to_string()
+                        + "\n"
+                })
+                .collect::<String>();
+            if let Err(e) = write_rows(&path, &rows, &mut opened) {
+                println!("       FAILED to write {path}: {e}");
+                write_failed = true;
+            }
+        }
         println!(
             "       counting unresolved dispatch as collecting too: {} in {} fn(s)",
             found_conservative.len(),

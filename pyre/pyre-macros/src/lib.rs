@@ -1708,11 +1708,16 @@ struct PyreClassAttrs {
     /// publish its byte offset on this class's PyType. Does not set the
     /// app-level weakrefable flag; `#[pyre_methods(weakrefable)]` does that.
     weakrefable: bool,
+    /// Do not emit `allocate_stable`. The class is born through [`allocate`]
+    /// (`malloc_typed_young_nonmoving`, `external_malloc(..., alloc_young=True)`).
+    /// An old-gen `malloc_typed_stable` constructor is the wrong birth when
+    /// the only raw `self` re-read reloads from the shadow stack.
+    no_allocate_stable: bool,
 }
 
 impl syn::parse::Parse for PyreClassAttrs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"][, user_layout][, weakrefable]`
+        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"][, user_layout][, weakrefable][, no_allocate_stable]`
         let name: syn::LitStr = input.parse()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
@@ -1722,6 +1727,7 @@ impl syn::parse::Parse for PyreClassAttrs {
         let mut cpython_heaptype = false;
         let mut cpython_mutable = false;
         let mut weakrefable = false;
+        let mut no_allocate_stable = false;
         while !input.is_empty() {
             input.parse::<syn::Token![,]>()?;
             if input.is_empty() {
@@ -1746,6 +1752,10 @@ impl syn::parse::Parse for PyreClassAttrs {
                     weakrefable = true;
                     continue;
                 }
+                "no_allocate_stable" => {
+                    no_allocate_stable = true;
+                    continue;
+                }
                 _ => {}
             }
             input.parse::<syn::Token![=]>()?;
@@ -1761,6 +1771,7 @@ impl syn::parse::Parse for PyreClassAttrs {
                             "unknown `#[pyre_class]` key `{other}` — \
                              expected `type_id` / `static_name` / `pytype_static` / \
                              `user_subclass` / `user_layout` / `weakrefable` / \
+                             `no_allocate_stable` / \
                              `cpython_heaptype` / `cpython_mutable`",
                         ),
                     ));
@@ -1777,6 +1788,7 @@ impl syn::parse::Parse for PyreClassAttrs {
             cpython_heaptype,
             cpython_mutable,
             weakrefable,
+            no_allocate_stable,
         })
     }
 }
@@ -1790,9 +1802,11 @@ impl syn::parse::Parse for PyreClassAttrs {
 /// every class in the module. This expander knows `#st_name` and emits
 /// one Ref-word trampoline per constructor (`std::ptr::read` of the
 /// payload, then the real allocate), the ABI residual_call_r_r uses.
-fn emit_pyre_class_allocate_word_fnaddrs(st_name: &syn::Ident) -> proc_macro2::TokenStream {
-    let methods = ["allocate", "allocate_stable"];
-    let parts = methods.map(|method| {
+fn emit_pyre_class_allocate_word_fnaddrs(
+    st_name: &syn::Ident,
+    methods: &[&str],
+) -> proc_macro2::TokenStream {
+    let parts = methods.iter().map(|method| {
         let trampoline = format_ident!("__majit_call_target_{st_name}_{method}");
         let ctor = format_ident!("__majit_register_helper_fnaddr_{st_name}_{method}");
         let method_ident = format_ident!("{method}");
@@ -1881,6 +1895,7 @@ fn expand_pyre_class(
     let has_mapdict_mixin = has_map && has_storage;
     let user_layout = attrs.user_layout;
     let weakrefable = attrs.weakrefable;
+    let no_allocate_stable = attrs.no_allocate_stable;
     if user_layout && attrs.user_subclass.is_some() {
         return Err(syn::Error::new(
             st.span(),
@@ -2419,7 +2434,42 @@ fn expand_pyre_class(
         (quote! {}, quote! {})
     };
 
-    let allocate_word_fnaddrs = emit_pyre_class_allocate_word_fnaddrs(&st_name);
+    let allocate_stable_fn = if no_allocate_stable {
+        quote! {}
+    } else {
+        quote! {
+            /// Stable-address variant of [`Self::allocate`]: allocates via
+            /// the non-moving `malloc_typed_stable`, so the object never
+            /// relocates.  Required for a self-mutating payload whose methods
+            /// re-derive `self` from a raw `PyObjectRef` across an allocating
+            /// call — a movable object would leave that raw pointer stale.
+            /// The allocation is nonmovable, which `jtransform.py
+            /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
+            /// function is `dont_look_inside` and its calls are residual
+            /// (`policy.py look_inside_graph`).
+            #[::majit_macros::dont_look_inside]
+            pub fn allocate_stable(#allocate_payload_binding: Self) -> ::pyre_object::PyObjectRef {
+                let _roots = ::pyre_object::gc_roots::push_roots();
+                #(#int_array_pin_lets)*
+                #(#int_array_payload_reloads_named)*
+                let full = Self {
+                    ob: ::pyre_object::PyObject {
+                        ob_type: &#pytype_static as *const ::pyre_object::PyType,
+                        w_class: ::pyre_object::pyobject::get_instantiate(&#pytype_static),
+                    },
+                    ..payload
+                };
+                #allocate_stable_return
+            }
+        }
+    };
+    let allocate_word_methods: &[&str] = if no_allocate_stable {
+        &["allocate"]
+    } else {
+        &["allocate", "allocate_stable"]
+    };
+    let allocate_word_fnaddrs =
+        emit_pyre_class_allocate_word_fnaddrs(&st_name, allocate_word_methods);
 
     Ok(quote! {
         #st
@@ -2567,29 +2617,7 @@ fn expand_pyre_class(
                 #allocate_return
             }
 
-            /// Stable-address variant of [`Self::allocate`]: allocates via
-            /// the non-moving `malloc_typed_stable`, so the object never
-            /// relocates.  Required for a self-mutating payload whose methods
-            /// re-derive `self` from a raw `PyObjectRef` across an allocating
-            /// call — a movable object would leave that raw pointer stale.
-            /// The allocation is nonmovable, which `jtransform.py
-            /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
-            /// function is `dont_look_inside` and its calls are residual
-            /// (`policy.py look_inside_graph`).
-            #[::majit_macros::dont_look_inside]
-            pub fn allocate_stable(#allocate_payload_binding: Self) -> ::pyre_object::PyObjectRef {
-                let _roots = ::pyre_object::gc_roots::push_roots();
-                #(#int_array_pin_lets)*
-                #(#int_array_payload_reloads_named)*
-                let full = Self {
-                    ob: ::pyre_object::PyObject {
-                        ob_type: &#pytype_static as *const ::pyre_object::PyType,
-                        w_class: ::pyre_object::pyobject::get_instantiate(&#pytype_static),
-                    },
-                    ..payload
-                };
-                #allocate_stable_return
-            }
+            #allocate_stable_fn
 
             #allocate_instance_fn
         }

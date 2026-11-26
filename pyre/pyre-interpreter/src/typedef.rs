@@ -7135,11 +7135,10 @@ pub(crate) fn check_new_subtype(
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());
     }
-    // `typeobject.py _issubtype`: only the installed-MRO arm is valid
-    // here. Reuse the existing issubtype boundary after the null check;
-    // a missing MRO must not take `_issubtype_slow_and_wrong`.
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub = !mro_ptr.is_null() && unsafe { pyre_object::w_type_issubtype(w_subtype, w_self) };
+    // `typeobject.py _issubtype` when `hasmro`: this check uses only the
+    // installed MRO. Keep the existing subtype scan boundary without
+    // admitting `_issubtype_slow_and_wrong` and its tuple re-boxing path.
+    let is_sub = unsafe { pyre_object::w_type_mro_contains(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
