@@ -4534,6 +4534,26 @@ fn residual_stub_result_shell(
     }
 }
 
+// rptr.py InteriorPtrRepr.lowleveltype is carried on the return variable.
+fn interior_return_lltype(graph: &LegacyGraph) -> Option<LowLevelType> {
+    let ty = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == graph.returnblock)?
+        .inputargs
+        .first()?
+        .concretetype()?;
+    if let LowLevelType::Ptr(ptr) = &ty
+        && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) = &ptr.TO
+        && st._hints.get("interior_ptr_type")
+            == Some(&crate::flowspace::model::ConstValue::Bool(true))
+    {
+        Some(ty)
+    } else {
+        None
+    }
+}
+
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
 /// a low-level `STR` pointer (`FunctionGraph::return_is_str`) or a
@@ -4561,6 +4581,9 @@ fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
 ) -> Option<crate::annotator::model::SomeValue> {
+    if let Some(ty) = interior_return_lltype(graph) {
+        return Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ty));
+    }
     if let Some(spelling) = graph.return_container_root.as_deref() {
         let projected = registry.bookkeeper().project_struct_field_type(spelling);
         if matches!(projected, crate::annotator::model::SomeValue::RustVec(_)) {
@@ -4976,7 +4999,9 @@ fn declared_funcptr_type_from_legacy(
     // A `STR`-pointer result rtypes as `SomeString` (`declared_return_annotation`),
     // so its function type returns `Ptr(STR)` like the callable's typed
     // return variable (`rtyper.py getcallable`), not the token's `OBJECTPTR`.
-    let result = if legacy.return_is_str && legacy.return_type.as_deref() == Some("ref") {
+    let result = if let Some(ty) = interior_return_lltype(legacy) {
+        ty
+    } else if legacy.return_is_str && legacy.return_type.as_deref() == Some("ref") {
         crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
     } else if legacy.return_container_root.as_deref().is_some_and(|s| {
         majit_ir::descr::is_shared_u8_slice_spelling(s)
@@ -23160,7 +23185,7 @@ mod tests {
         use crate::annotator::model::{SomeString, SomeValue};
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::model::{CallTarget, OpKind};
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
 
         let Some(object) = crate::test_support::load_ullbc_if_present(
             crate::runtime_names::artifacts::OBJECT_ULLBC,
@@ -23372,7 +23397,28 @@ mod tests {
         match &residual {
             SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
                 PtrTarget::Struct(st) => {
-                    assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+                    assert_eq!(
+                        st._gckind,
+                        GcKind::Gc,
+                        "the returned Interior retains its parent"
+                    );
+                    assert_eq!(
+                        st._hints.get("interior_ptr_type"),
+                        Some(&ConstValue::Bool(true))
+                    );
+                    assert!(matches!(
+                        st.getattr_field_type("index"),
+                        Some(LowLevelType::Signed)
+                    ));
+                    let signature = LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()));
+                    assert!(
+                        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                            matches!(&op.kind, OpKind::New { owner, .. } if owner == "Interior")
+                                && op.result.as_ref().and_then(|v| v.concretetype())
+                                    == Some(signature.clone())
+                        }),
+                        "return signature must name the same per-parent TYPE as the body malloc"
+                    );
                 }
                 other => panic!(
                     "IdentityKey entry_at residual SomePtr must point at STRUCT, got {other:?}"

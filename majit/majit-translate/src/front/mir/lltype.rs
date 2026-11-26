@@ -18072,8 +18072,30 @@ pub(crate) fn gcarray_item_struct_ptr_annotation(
     item: &str,
 ) -> Option<crate::annotator::model::SomeValue> {
     use crate::translator::rtyper::llannotation::lltype_to_annotation;
-
     gcarray_item_struct_ptr_lltype(reg, item).map(lltype_to_annotation)
+}
+
+/// `InteriorPtrRepr.lowleveltype` of a source-level reference to a scanned
+/// array element. The parent ARRAY belongs to its TYPE, not a ClassDef field.
+pub(in crate::front::mir) fn gcarray_item_pointer_concretetype(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    reg: Option<&crate::front::StructFieldRegistry>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    if !ty_is_gcarray_item_pointer(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return None;
+    }
+    let item = instantiated_struct_item_spelling(ty, llbc, no_tombstoned_leaves())?;
+    let array = gcarray_of_bound_struct_item(reg?, &item)?;
+    let parent = Ptr {
+        TO: PtrTarget::Array(array.clone()),
+    };
+    Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(parent._interior_ptr_type_with_index(&array.OF)),
+    })))
 }
 
 fn spelling_is_unsubstituted_typevar(ty: &str) -> bool {

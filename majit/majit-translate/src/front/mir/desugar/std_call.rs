@@ -1143,10 +1143,43 @@ impl<'a> Lowering<'a> {
         bb_id: BlockId,
         array_ptr: Variable,
         index: Variable,
+        item_ty: &TyRef,
     ) -> Variable {
+        if let Some(parent) = self.gcarray_item_array_binding(item_ty).2 {
+            array_ptr.set_concretetype(Some(parent));
+        }
+        // `Interior.index` is lltype.Signed, even when Rust spells the
+        // incoming array index usize (`rptr.py` InteriorPtrRepr).
+        let signed_index = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(signed_index.clone()),
+            kind: crate::front::mir::operation::rarithmetic_mask("intmask", index, ValueType::Int),
+        });
+        let index = signed_index;
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        // `Ptr._interior_ptr_type_with_index` keeps the parent ARRAY in
+        // the TYPE. Different entry families must never share one Python
+        // ClassDef whose `ptr` attribute unions their low-level pointers.
+        if let Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(parent)) =
+            array_ptr.concretetype()
+            && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Array(array) =
+                &parent.TO
+        {
+            let interior = parent._interior_ptr_type_with_index(&array.OF);
+            res.set_concretetype(Some(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(Box::new(
+                    crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                        TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(
+                            interior,
+                        ),
+                    },
+                )),
+            ));
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::New {
@@ -7763,7 +7796,17 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
-        let mut count = args[1].clone();
+        let mut count = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(count.clone()),
+            kind: crate::front::mir::operation::rarithmetic_mask(
+                "intmask",
+                args[1].clone(),
+                ValueType::Int,
+            ),
+        });
         if self.ptr_offset_is_sub(reg) {
             let neg = self
                 .graph
@@ -7791,7 +7834,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
-        Some(self.emit_item_interior(bb_id, words.array_ptr, index))
+        Some(self.emit_item_interior(bb_id, words.array_ptr, index, first_arg_ty))
     }
 
     /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a

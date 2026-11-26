@@ -859,6 +859,16 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     {
         let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
         let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        if let Some(ty) = gcarray_item_pointer_concretetype(
+            &local.ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            struct_fields,
+        ) {
+            var.set_concretetype(Some(ty));
+        }
+
         // Register a stable name so canonical comparison can spot
         // arg-renames.  Names live on the value via `name_value_var`
         // (mirrors the `parse.rs` arg-binding path).
@@ -1791,6 +1801,16 @@ impl<'a> Lowering<'a> {
         {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            if let Some(ty) = gcarray_item_pointer_concretetype(
+                &local.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                struct_fields,
+            ) {
+                var.set_concretetype(Some(ty));
+            }
+
             // `_handle_list_call` reads `args[0].concretetype`
             // (`jtransform.py` `LIST = deref(args[0].concretetype)`).
             // A one-word `Vec` parameter is `RustVecRepr.lowleveltype`.

@@ -4098,7 +4098,7 @@ impl<'a> Lowering<'a> {
                                 result: Some(zero.clone()),
                                 kind: OpKind::ConstInt(0),
                             });
-                            self.emit_item_interior(bb_id, base, zero)
+                            self.emit_item_interior(bb_id, base, zero, &call.dest.ty)
                         } else {
                             let root = tyref_class_root_with(
                                 &call.dest.ty,

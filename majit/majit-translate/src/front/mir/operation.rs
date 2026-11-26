@@ -709,7 +709,9 @@ impl<'a> Lowering<'a> {
             let array = self.interior_alias_array(&alias);
             let header = self.interior_header_base(bb_id, &alias, array.as_ref())?;
             let index = self.realias_operand(Some(alias.index_local), alias.index_var.clone());
-            return Ok(Some(self.emit_item_interior(bb_id, header, index)));
+            return Ok(Some(
+                self.emit_item_interior(bb_id, header, index, &item_ty),
+            ));
         }
         let item_ll = self.direct_ptradd_item_lltype(&item_ty);
         let entries_recv = match &alias.header {
@@ -8680,6 +8682,44 @@ impl<'a> Lowering<'a> {
         field_payload: &serde_json::Value,
         place_ty: &TyRef,
     ) -> Result<Variable, LowerError> {
+        // rptr.py InteriorPtrRepr.rtype_getattr: an element reference is
+        // the parent/index pair even when a reborrow bypasses the alias arm.
+        if self.ty_scan_is_item(&inner.ty)
+            && let Some((owner, name, field_ty, owner_id, host_index)) =
+                self.resolve_adt_field(&inner.ty, field_payload)
+            && let Some(words) = self.item_interior_words(mir_bb, inner)?
+        {
+            let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
+            let place_ty = tyref_subst_bound_typevar(place_ty, &inner.ty, self.llbc);
+            if let Some(nested) = tyref_by_value_struct_decl(
+                &place_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+                self.struct_fields,
+            ) {
+                let bb_id = self.emit_bb(mir_bb);
+                let base = self.emit_item_interior(bb_id, words.array_ptr, words.index, &inner.ty);
+                let field = FieldDescriptor::new(name, Some(owner))
+                    .with_owner_id(owner_id)
+                    .with_base_is_deref(true)
+                    .with_host_index(host_index);
+                return Ok(self.emit_inlined_struct_value_read(
+                    mir_bb,
+                    &base,
+                    nested,
+                    &place_ty,
+                    &inner.ty,
+                    field_payload,
+                    &field,
+                ));
+            }
+            return Ok(self.emit_unpacked_item_field_read(
+                mir_bb, &words, &owner, &name, owner_id, host_index, &field_ty, &place_ty,
+                &inner.ty, false, false,
+            ));
+        }
         // Length header of a declared two-field `GcArray`
         // wrapper (`lltype.py`): offset-0 integer immediately
         // before the `[T; 0]` tail. That word is `getarraysize`

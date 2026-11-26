@@ -4881,6 +4881,7 @@ pub(crate) struct SemanticFunctionHeader {
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
     return_is_str: bool,
+    return_interior_type: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     return_container_root: Option<String>,
     return_can_be_none: bool,
     self_ty_root: Option<String>,
@@ -5093,6 +5094,18 @@ impl SemanticFunctionHeader {
             raw_alloc_flavor_structs,
             struct_fields,
         );
+        let return_payload = crate::front::result_exc::result_exc_projected_ok(
+            &signature.output,
+            llbc,
+            error_carrier,
+        );
+        let return_interior_type = gcarray_item_pointer_concretetype(
+            return_payload.as_ref().unwrap_or(&signature.output),
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            struct_fields,
+        );
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
             llbc,
@@ -5126,6 +5139,7 @@ impl SemanticFunctionHeader {
             residual_return_type,
             return_class_root,
             return_is_str,
+            return_interior_type,
             return_container_root,
             return_can_be_none,
             self_ty_root,
@@ -5190,6 +5204,7 @@ impl SemanticFunctionHeader {
             residual_return_type: self.residual_return_type.clone(),
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
+            return_interior_type: self.return_interior_type.clone(),
             return_container_root: self.return_container_root.clone(),
             return_can_be_none: self.return_can_be_none,
         }
@@ -5281,6 +5296,7 @@ pub(crate) struct GraphStamp {
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
     return_is_str: bool,
+    return_interior_type: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     return_container_root: Option<String>,
     return_can_be_none: bool,
 }
@@ -5311,6 +5327,11 @@ impl GraphStamp {
         graph.residual_return_type = self.residual_return_type.clone();
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
+        if let Some(ty) = &self.return_interior_type
+            && let Some(var) = graph.block(graph.returnblock).inputargs.first()
+        {
+            var.set_concretetype(Some(ty.clone()));
+        }
         graph.return_container_root = self.return_container_root.clone();
         graph.return_can_be_none = self.return_can_be_none;
         graph
@@ -10381,6 +10402,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             raw_alloc_flavor_structs,
             Some(struct_fields),
         );
+        let return_payload = crate::front::result_exc::result_exc_projected_ok(
+            output,
+            llbc,
+            static_addrs.error_carrier,
+        );
+        if let Some(ty) = gcarray_item_pointer_concretetype(
+            return_payload.as_ref().unwrap_or(output),
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            Some(struct_fields),
+        ) && let Some(var) = lo.graph.block(lo.graph.returnblock).inputargs.first()
+        {
+            var.set_concretetype(Some(ty));
+        }
         lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
             output,
             llbc,
