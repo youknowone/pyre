@@ -5802,13 +5802,8 @@ pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef 
     // The header stays `layout_header_class` from the allocator
     // (`w_int_subclass_new` stamps `get_instantiate(&INT_TYPE)`); the
     // Python class lives on `terminator.w_cls`.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.pin_roots(&[obj, sub]);
-    let obj = _roots.get(base);
-    let sub = _roots.get(base + 1);
     if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
         unsafe { crate::objspace::std::mapdict::user_setup(obj, sub) };
-        let obj = _roots.get(base);
         debug_assert!(
             unsafe {
                 let map = crate::objspace::std::mapdict::instance_map_word(obj);
@@ -5820,12 +5815,10 @@ pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef 
     } else {
         unsafe { store_subclass_tag(obj, sub) };
     }
-    let obj = _roots.get(base);
-    let sub = _roots.get(base + 1);
     if unsafe { pyre_object::w_type_get_hasuserdel(sub) } {
         crate::executioncontext::register_finalizer(obj);
     }
-    _roots.get(base)
+    obj
 }
 
 /// Store `sub` into a builtin-layout instance's class slot, through the write
@@ -9605,11 +9598,21 @@ fn dict_fromkeys_impl(
                 if key_obj.is_null() {
                     break;
                 }
+                let _key_roots = pyre_object::gc_roots::push_roots();
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(key_obj);
+                let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
                 let key_hash = unsafe { pyre_object::w_set_iterkey_hash_at(iterable, slot) };
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                let key_obj = pyre_object::gc_roots::shadow_stack_get(key_slot);
                 unsafe { pyre_object::w_dict_store_hashed_checked(d, key_obj, value, key_hash) }
-                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key_obj))?;
+                    .map_err(|_| {
+                        crate::baseobjspace::take_pending_mapping_key_error(
+                            pyre_object::gc_roots::shadow_stack_get(sp),
+                            pyre_object::gc_roots::shadow_stack_get(key_slot),
+                        )
+                    })?;
                 index = slot + 1;
             }
             return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -33205,9 +33208,13 @@ fn set_intersect_update(
             if key_obj.is_null() {
                 break;
             }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
             let key = pyre_object::dictmultiobject::ObjectKey {
                 hash: pyre_object::w_set_iterkey_hash_at(keep, slot),
-                obj: key_obj,
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
@@ -33220,9 +33227,13 @@ fn set_intersect_update(
                 if key_obj.is_null() {
                     break;
                 }
+                let _key_roots = pyre_object::gc_roots::push_roots();
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(key_obj);
+                let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
                 let key = pyre_object::dictmultiobject::ObjectKey {
                     hash: pyre_object::w_set_iterkey_hash_at(keep, slot),
-                    obj: key_obj,
+                    obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
                 };
                 pyre_object::w_set_insert_key_checked(
                     pyre_object::gc_roots::shadow_stack_get(result_slot),
@@ -33570,9 +33581,13 @@ fn set_is_disjoint_from(
             if key_obj.is_null() {
                 break;
             }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
             let key = pyre_object::dictmultiobject::ObjectKey {
                 hash: pyre_object::w_set_iterkey_hash_at(walk, slot),
-                obj: key_obj,
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
@@ -33619,9 +33634,13 @@ pub(crate) fn set_is_subset_of(
             if key_obj.is_null() {
                 break;
             }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
             let key = pyre_object::dictmultiobject::ObjectKey {
                 hash: pyre_object::w_set_iterkey_hash_at(w_set, slot),
-                obj: key_obj,
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if !pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(other_slot),
