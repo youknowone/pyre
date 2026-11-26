@@ -14,6 +14,20 @@
 # than an inlined callee.
 N = 145455
 
+try:
+    import pypyjit
+except ImportError:
+    pypyjit = None
+
+if pypyjit is not None:
+    # JitCounter.__init__ decays warmup counters after 32 minor collections;
+    # its shared timetable also makes bridge warmup depend on heap layout.
+    # This fixture checks traceback frames, so use JitCounter.set_decay(0)
+    # and WarmEnterState.set_param_trace_eagerness(1): the first failure at
+    # each exception site compiles its bridge. Across nursery sizes and all
+    # three backends this gives four loops, three bridges and three failures.
+    pypyjit.set_param("decay=0,trace_eagerness=1")
+
 
 def names(traceback):
     out = []
