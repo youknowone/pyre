@@ -244,7 +244,8 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
 
         // `emit_array_tail_item_ptr` is `cast_ptr_to_int` + ConstInt(offset)
-        // + add + 2-arg `cast_int_to_ptr(Ptr(ITEM), sum)`. The address-taken
+        // + add + 2-arg `cast_int_to_ptr(Ptr(FixedSizeArray(ITEM, 1)), sum)`
+        // (`direct_arrayitems`, `_subarray._makeptr`). The address-taken
         // `items` FieldRead is unused after that rewrite and may be dropped.
         use crate::flowspace::model::ConstValue;
         use crate::model::LinkArg;
@@ -298,12 +299,19 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         let LowLevelType::Ptr(ptr) = &ptr_ty else {
             panic!("item pointer is Ptr, got {ptr_ty:?}");
         };
-        let PtrTarget::Struct(st) = &ptr.TO else {
-            panic!("item pointer targets a Struct, got {:?}", ptr.TO);
+        let PtrTarget::FixedSizeArray(arr) = &ptr.TO else {
+            panic!("direct_arrayitems is Ptr(FixedSizeArray), got {:?}", ptr.TO);
+        };
+        assert_eq!(
+            arr.length, 1,
+            "direct_arrayitems is FixedSizeArray(ITEM, 1)"
+        );
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("ITEM is a Struct, got {:?}", arr.OF);
         };
         assert_eq!(
             st._name, "rordereddict_entries::Entry<i64,*mut PyObject>",
-            "Ptr(ITEM) names the instantiated item"
+            "FixedSizeArray OF names the instantiated item"
         );
         assert_eq!(
             offset,
@@ -311,6 +319,102 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             "GcEntries items sit at the length word rounded up to Entry alignment"
         );
     });
+}
+
+/// `rewrite_op_direct_ptradd` scales `Ptr(FixedSizeArray(ITEM, 1))` by
+/// `llmemory.sizeof(TO.OF)`. A missing `CallControl` layout is `Keep`,
+/// and the host `lltype.direct_ptradd` arm then emits `abort`. Concrete
+/// `Entry<K,V>` rows from `register_ordereddict_entry_rows` must size.
+#[test]
+fn direct_arrayitems_entry_layouts_size_direct_ptradd() {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::llmemory;
+    use crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    let program = crate::test_support::with_shared_link_write(std::iter::once(llbc), || {
+        super::CrateLoweringState::new(
+            llbc,
+            &std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+            Default::default(),
+            &gc,
+            &std::collections::HashSet::new(),
+            None,
+            None,
+            Default::default(),
+        )
+        .finish(Vec::new())
+    });
+    let _registry = crate::test_support::register_struct_ids_serialized(program.struct_ids.clone());
+    let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+        program.struct_fields.fields.clone().into();
+    let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
+        &pair_fields,
+        &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    );
+    let mut cc = crate::codewriter::call::CallControl::with_struct_layouts(
+        crate::codewriter::call::StructLayoutTable::default(),
+    );
+    cc.set_struct_fields(program.struct_fields.clone());
+    for entry in crate::layout::program_struct_layouts(
+        &program.struct_fields,
+        &program.exact_layouts,
+        &provider,
+    ) {
+        cc.set_struct_layout(entry.sid, entry.layout);
+    }
+
+    let mut entry_keys: Vec<String> = pair_fields
+        .keys()
+        .filter(|key| {
+            key.split('<')
+                .next()
+                .and_then(|base| base.rsplit("::").next())
+                == Some("Entry")
+        })
+        .cloned()
+        .collect();
+    entry_keys.sort();
+    let mut missing_sizes = Vec::new();
+    for key in &entry_keys {
+        if key.contains("??") || !key.contains('<') {
+            continue;
+        }
+        if cc.struct_size(key).is_none() {
+            missing_sizes.push(key.clone());
+        }
+    }
+    let pinned = "rordereddict_entries::Entry<i64,*mut PyObject>";
+    let pinned_size = cc.struct_size(pinned);
+    let pinned_sid = majit_ir::descr::struct_id_for_name(pinned);
+    let exact = pinned_sid.and_then(|sid| program.exact_layouts.get(&sid));
+    let ptr =
+        super::super::gcarray_item_direct_arrayitems_ptr_lltype(&program.struct_fields, pinned);
+    let byte_size = (|| {
+        let LowLevelType::Ptr(p) = ptr.as_ref()? else {
+            return None;
+        };
+        let PtrTarget::FixedSizeArray(arr) = &p.TO else {
+            return None;
+        };
+        let ConstValue::AddressOffset(addr) = llmemory::sizeof(&arr.OF, None).ok()? else {
+            return None;
+        };
+        addr.byte_size(&cc).ok()
+    })();
+    assert!(
+        missing_sizes.is_empty() && pinned_size.is_some_and(|n| n > 0) && byte_size == pinned_size,
+        "concrete Entry instantiations without CallControl::struct_size: {missing_sizes:?}\n\
+         pinned {pinned} struct_size={pinned_size:?} sid={pinned_sid:?} \
+         exact_size={:?} byte_size={byte_size:?}\nentry_keys={entry_keys:?}",
+        exact.map(|layout| layout.size),
+    );
 }
 
 /// `inline_vec_field_part` emits the component read from the SSI

@@ -1523,6 +1523,40 @@ fn transduce_op(
                 result,
             );
         }
+        // `PtrRepr.rtype_getitem` (`rptr.py`) emits this when `ARRAY.OF`
+        // is a container. `op_getarraysubstruct` is `array[index]`
+        // (`opimpl.py`). Index 0 of `Ptr(FixedSizeArray(ITEM, 1))`
+        // (`direct_arrayitems` / `_subarray._makeptr`) is the same address;
+        // the result stays `Ptr(ITEM)` so `getfield` reads that STRUCT.
+        // `rewrite_op_getarraysubstruct` requires `nolength`, which
+        // `FixedSizeArray` does not set. A nonzero index is `direct_ptradd`.
+        "getarraysubstruct" => {
+            let base = expect_var(&op.args[0]);
+            let is_fixed = matches!(
+                base.concretetype(),
+                Some(LowLevelType::Ptr(ptr)) if matches!(ptr.TO, PtrTarget::FixedSizeArray(_))
+            );
+            let index_zero = matches!(
+                op.args.get(1),
+                Some(Hlvalue::Constant(c)) if matches!(&c.value, ConstValue::Int(0))
+            );
+            if !is_fixed || !index_zero {
+                panic!(
+                    "jtransform_opname::lower_graph: unsupported opname {:?}",
+                    op.opname
+                );
+            }
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: base,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
 }
@@ -7134,6 +7168,69 @@ mod tests {
                 .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
             "unhinted typeptr is not GuardClass: {ops:?}"
         );
+    }
+
+    /// Index 0 of `Ptr(FixedSizeArray(ITEM, 1))` (`direct_arrayitems` /
+    /// `_subarray._makeptr`) lowers to `same_as`. The following `getfield`
+    /// still names the ITEM Struct (`op_getarraysubstruct` result is
+    /// `Ptr(ITEM)`).
+    #[test]
+    fn getarraysubstruct_fixed_size_array_index_zero_keeps_item_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::FixedSizeArray;
+
+        let item_name = "direct_arrayitems_fixture::Entry";
+        let item = Struct::new(item_name, vec![("key".into(), LowLevelType::Signed)]);
+        let item_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(item.clone()),
+        }));
+        let arr_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        }));
+        let base = variable_with_lltype("p", arr_ptr);
+        let item_v = variable_with_lltype("item", item_ptr);
+        let key = variable_with_lltype("key", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(base.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "fixed_size_array_item_field",
+            startblock.clone(),
+            Hlvalue::Variable(key.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarraysubstruct",
+            vec![
+                Hlvalue::Variable(base.clone()),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(item_v.clone()),
+        ));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(item_v),
+                constant_with_lltype(ConstValue::byte_str("key"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(key.clone()),
+        ));
+        close_return(&startblock, &graph, key);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")),
+            "index 0 is same_as; ops={ops:?}"
+        );
+        let field = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field),
+                _ => None,
+            })
+            .expect("getfield of the item");
+        assert_eq!(field.name, "key");
+        assert_eq!(field.owner_root.as_deref(), Some(item_name));
     }
 
     /// `Ptr(ForwardReference(<resolved GcStruct m::W_X>))` with

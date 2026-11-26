@@ -23145,7 +23145,8 @@ mod tests {
     /// `LiveIter::entry_at` getattr `"key"` reads the CAST dest of
     /// `entries_item_ptr` (`direct_arrayitems` /
     /// `instantiated_struct_item_spelling`), not the unsuffixed residual
-    /// return of the graph. Residual `"ref"` with no class root shells
+    /// return of the graph. `direct_arrayitems` returns a FixedSizeArray
+    /// pointer; `entry_at` returns the ITEM struct pointer. Residual `"ref"` with no class root shells
     /// classdef-less (`valuetype_to_someshell`); official skip is
     /// `SomeInstance.setattr("__pos_0")` of that getattr.
     #[test]
@@ -23166,16 +23167,46 @@ mod tests {
             &[object],
             crate::HostStaticAddrs::default(),
             &["identitydict", "rordereddict", "rordereddict_entries"],
-            &["nth_item"],
+            &["nth_item", "entry_at"],
         )
         .expect("lower identitydict nth_item");
 
+        let entry_root = |f: &crate::front::semantic::SemanticFunction| {
+            f.graph()
+                .return_class_root
+                .clone()
+                .or_else(|| f.return_class_root.clone())
+        };
+        let is_item_entry_at = |f: &crate::front::semantic::SemanticFunction| {
+            !f.name.contains("entry_at_mut")
+                && (f.name == "entry_at" || f.name.contains("entry_at__spec_"))
+                && entry_root(f)
+                    .as_deref()
+                    .is_some_and(|root| root.contains("Entry"))
+        };
         let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
         let entry_at = program
             .functions
             .iter()
-            .find(|f| f.name.contains("entry_at__spec_IdentityKey"))
-            .unwrap_or_else(|| panic!("expected IdentityKey entry_at spec, got {names:?}"));
+            .find(|f| f.name.contains("entry_at__spec_IdentityKey") && is_item_entry_at(f))
+            .or_else(|| program.functions.iter().find(|f| is_item_entry_at(f)))
+            .unwrap_or_else(|| {
+                let sketches: Vec<_> = program
+                    .functions
+                    .iter()
+                    .filter(|f| f.name.contains("entry_at"))
+                    .map(|f| {
+                        format!(
+                            "{} module={} graph_root={:?} semantic_root={:?}",
+                            f.name,
+                            f.module_path,
+                            f.graph().return_class_root,
+                            f.return_class_root
+                        )
+                    })
+                    .collect();
+                panic!("expected entry_at of Entry, got {names:?} sketches={sketches:?}")
+            });
         let get_slot = program
             .functions
             .iter()
@@ -23187,10 +23218,17 @@ mod tests {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .any(
-                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "key")
-                ),
-            "IdentityKey get_slot must FieldRead key of the entry_at dest, ops {:?}",
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::InteriorFieldRead { field, .. }
+                        if field.name == "key"
+                            && field.owner_root.as_deref().is_some_and(|owner| {
+                                owner.rsplit("::").next().is_some_and(|leaf| {
+                                    leaf == "Entry" || leaf.starts_with("Entry<")
+                                })
+                            })
+                )),
+            "IdentityKey get_slot must getinteriorfield key, ops {:?}",
             get_slot
                 .graph()
                 .blocks

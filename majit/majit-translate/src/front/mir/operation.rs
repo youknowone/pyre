@@ -128,6 +128,96 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `entry_at` / `entry_at_mut` consumed only as `(*dest).field`.
+    ///
+    /// Records the receiver's `entries` header and the index. The field
+    /// use emits `getinteriorfield` / `setinteriorfield`
+    /// (`rewrite_op_getinteriorfield`). The reference binding is the
+    /// receiver word so `edge_args` has a defined local; the interior
+    /// read does not use that word. A miss returns `Ok(false)` and the
+    /// call stays, so an escaped `&mut Entry` still runs the callee.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_struct_field_entry_at(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(traced) = struct_field_entry_at_trace(
+            reg,
+            args.len(),
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            Some(dest_ty),
+            self.body,
+            self.llbc,
+            self.tombstoned_leaves,
+        ) else {
+            return Ok(false);
+        };
+        let TracedPtrAddHeader::EntryPtr {
+            recv_local,
+            recv_ty,
+        } = traced.header
+        else {
+            return Ok(false);
+        };
+        if locals_assigned_reachable(
+            self.body,
+            self.llbc,
+            target,
+            &[recv_local, traced.index_local],
+        ) {
+            return Ok(false);
+        }
+        let Some(var) = self.local_var.get(recv_local).cloned().flatten() else {
+            return Ok(false);
+        };
+        let Some((field, ty)) = self.entries_field_descriptor(&recv_ty) else {
+            return Ok(false);
+        };
+        let index_var = args.get(1).cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field entry_at lost its index operand"
+            ))
+        })?;
+        let recv = args.first().cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field entry_at lost its receiver operand"
+            ))
+        })?;
+        self.interior_field_alias.insert(
+            dest_local,
+            InteriorFieldAlias {
+                header: InteriorHeader::Entries {
+                    recv_local,
+                    recv_var: var.one()?,
+                    field,
+                    ty,
+                },
+                index_local: traced.index_local,
+                index_var,
+                array_type_id: traced.array_type_id,
+            },
+        );
+        // Live until the field use. Not an item pointer: `args[0]` is the
+        // dict. `try_emit_interior_field_read` ignores this binding and
+        // emits `FieldRead entries`.
+        self.alias_dest_to_arg0_inherit(dest_local, recv, arg_locals);
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// `<[T]>::get(s, i)` of a Copy struct used only as `get(i)?.field`.
     ///
     /// Bounds check `i < len(s)` (`ll_getitem_nonneg`); the Option dest is
@@ -7459,12 +7549,38 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| td.is_repr_transparent())
     }
 
+    /// `(*alias).field` is an identity-word field of a recorded interior
+    /// alias (`add_dest_used_only_as_struct_field`).
+    ///
+    /// That borrow is `rewrite_op_getinteriorfield`, not
+    /// `rewrite_op_getsubstruct`. Offset zero would return the pointer
+    /// `alias_dest_to_arg0_inherit` bound, which is the array header.
+    fn interior_alias_field_place(&self, place: &Place) -> bool {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return false;
+        };
+        if elem.field_payload().is_none() {
+            return false;
+        }
+        let PlaceKind::Projection(pre, ProjectionElem::Atom(name)) = &inner.kind else {
+            return false;
+        };
+        if name != "Deref" {
+            return false;
+        }
+        let PlaceKind::Local(local) = pre.kind else {
+            return false;
+        };
+        self.interior_field_alias.contains_key(&(local as usize))
+    }
+
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
     /// `jtransform.py rewrite_op_getsubstruct` does. Offset zero is `p`
     /// itself. A nonzero offset on a classdef-less `repr(C)` pointee is
     /// `int_add(p, offsetof)` (`_gckind == 'raw'`). A GC interior address
     /// still takes the deferred `RawAddr` refusal: it cannot enter the
-    /// Ref bank.
+    /// Ref bank. A field of a recorded interior alias declines: the
+    /// generic arm emits `rewrite_op_getinteriorfield`.
     pub(in crate::front::mir) fn lower_inline_substruct_address(
         &mut self,
         mir_bb: usize,
@@ -7474,6 +7590,12 @@ impl<'a> Lowering<'a> {
         // holds (`PyCode._signature`), not an interior address of the
         // by-value struct.
         if self.place_is_raw_owned_exception_field(place) {
+            return Ok(None);
+        }
+        // Identity-word `&(*alias).field` is the field value
+        // (`rewrite_op_getinteriorfield`). `rewrite_op_getsubstruct` at
+        // offset zero returns the header pointer.
+        if self.interior_alias_field_place(place) {
             return Ok(None);
         }
         let Some(offset) = self.inline_substruct_field_offset(place) else {
@@ -7516,7 +7638,8 @@ impl<'a> Lowering<'a> {
     /// [`Self::emit_array_tail_item_ptr`] emits for a class living at a
     /// byte offset. An inlined `GcArray` item (`lltype.py`
     /// `direct_arrayitems`, `rordereddict.py` `DICTENTRY`) is that
-    /// function's 2-arg `ann_cast_int_to_ptr` of `Ptr(ITEM)`. A
+    /// function's 2-arg `ann_cast_int_to_ptr` of
+    /// `Ptr(FixedSizeArray(ITEM, 1))` (`_subarray._makeptr`). A
     /// classdef-less field stays in the int bank
     /// (`rewrite_raw_substruct_address`,
     /// [`Self::items_block_item_address`]).
@@ -13934,13 +14057,22 @@ pub(in crate::front::mir) fn raw_array_ptr_item(
 }
 
 /// `CArrayPtr(item)`, or `CCHARP` when the item is a byte (`lltype.Char`).
-/// An existing `Ptr(Array)` is already that shape and is kept.
+/// An existing `Ptr(Array)` whose `OF` is `item` is already that shape
+/// and is kept. An existing `Ptr(FixedSizeArray)` is `direct_arrayitems`
+/// (`_subarray._makeptr`). `ann_direct_ptradd` returns that pointer, and
+/// `rewrite_op_direct_ptradd` sizes `concretetype.TO.OF`.
 pub(crate) fn lltype_for_direct_ptradd_pointer(
     existing: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
     use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+    if let Some(existing) = existing.as_ref()
+        && let LowLevelType::Ptr(ptr) = existing
+        && matches!(ptr.TO, PtrTarget::FixedSizeArray(_))
+    {
+        return existing.clone();
+    }
     if let Some(existing) = existing.as_ref()
         && is_raw_array_ptr(existing)
         && raw_array_ptr_item(existing).is_some_and(|of| of == item)

@@ -9971,18 +9971,35 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// True when `ty` is `CCHARP` or `Ptr(Array)`.
+    /// `concretetype.TO.OF` of `Ptr(Array)` or `Ptr(FixedSizeArray)`.
+    /// `rewrite_op_direct_ptradd` reads `llmemory.sizeof` of that item.
+    /// `direct_arrayitems` / `_subarray._makeptr` is the FixedSizeArray
+    /// pointer; `ann_direct_ptradd` returns it unchanged.
+    fn direct_ptradd_item_of(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let LowLevelType::Ptr(ptr) = ty else {
+            return None;
+        };
+        match &ptr.TO {
+            PtrTarget::Array(arr) => Some(&arr.OF),
+            PtrTarget::FixedSizeArray(arr) => Some(&arr.OF),
+            _ => None,
+        }
+    }
+
+    /// True when `ty` is `CCHARP`, `Ptr(Array)`, or `Ptr(FixedSizeArray)`.
     /// `rewrite_op_direct_ptradd` uses this to accept the item type
     /// `push_direct_ptradd` stamps on the result. Sizing still goes
     /// through `direct_ptradd_item_bytes` and the callcontrol layout.
     fn direct_ptradd_type_has_item(
         ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) -> bool {
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
         if ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP {
             return true;
         }
-        matches!(ty, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Array(_)))
+        Self::direct_ptradd_item_of(ty).is_some()
     }
 
     /// `llmemory.sizeof(concretetype.TO.OF)` as a byte count.
@@ -9993,15 +10010,9 @@ impl<'a> Transformer<'a> {
     ) -> Option<i64> {
         use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::llmemory;
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
 
-        let LowLevelType::Ptr(ptr) = ty else {
-            return None;
-        };
-        let PtrTarget::Array(arr) = &ptr.TO else {
-            return None;
-        };
-        let ConstValue::AddressOffset(addr) = llmemory::sizeof(&arr.OF, None).ok()? else {
+        let of = Self::direct_ptradd_item_of(ty)?;
+        let ConstValue::AddressOffset(addr) = llmemory::sizeof(of, None).ok()? else {
             return None;
         };
         addr.byte_size(layout).ok()
@@ -32738,6 +32749,101 @@ mod tests {
             );
         let RewriteResult::Replace(ops) = rewritten else {
             panic!("struct direct_ptradd must scale by the registered size");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(12))),
+            "ops={ops:?}"
+        );
+    }
+
+    /// `direct_arrayitems` / `_subarray._makeptr` is
+    /// `Ptr(FixedSizeArray(ITEM, 1))`. `rewrite_op_direct_ptradd` scales
+    /// by `llmemory.sizeof(concretetype.TO.OF)`, the same item size a
+    /// `Ptr(Array(ITEM))` uses.
+    #[test]
+    fn direct_ptradd_fixed_size_array_struct_scales_by_callcontrol_size() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use std::collections::HashMap;
+
+        let name = "direct_ptradd_fixture::FixedEntry";
+        let sid = majit_ir::descr::StructId::from_canonical(name);
+        let mut ids = HashMap::new();
+        ids.insert(name.to_string(), Some(sid));
+        let _registry = crate::test_support::register_struct_ids_serialized(ids);
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                LowLevelType::Struct(Box::new(Struct::new(name, vec![]))),
+                1,
+            )),
+        }));
+        let mut graph = FunctionGraph::new("direct_ptradd_fixed_size");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: Some(graph.alloc_value_var()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            crate::call::StructLayout {
+                size: 12,
+                align: 4,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "direct_ptradd_fixed_size",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("FixedSizeArray direct_ptradd must scale by the registered size");
         };
         assert!(
             ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(12))),

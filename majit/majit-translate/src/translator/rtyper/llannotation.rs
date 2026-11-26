@@ -266,6 +266,18 @@ impl SomePtr {
                 s_attr.const_()
             );
         };
+        // `direct_arrayitems` / `_subarray._makeptr` is
+        // `Ptr(FixedSizeArray(ITEM, 1))`. Index 0 is `_ptr._expose` of
+        // the raw ITEM (`PtrRepr.rtype_getitem` → `getarraysubstruct`).
+        // `FixedSizeArray._first_struct` is `(None, None)`, so the field
+        // is `SomePtr.getattr` of `Ptr(ITEM)`, including that Struct's
+        // own `_first_struct` walk, keyed on the ITEM `_name`
+        // (`declared_row_external`), not on the array.
+        let item_ptr = fixed_size_array_struct_item_ptr(&self.ll_ptrtype)
+            .filter(|item_ptr| struct_ptr_sees_field(item_ptr, attr));
+        if let Some(item_ptr) = item_ptr {
+            return SomePtr::new(item_ptr).getattr(s_attr);
+        }
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => {
@@ -392,6 +404,13 @@ impl SomePtr {
                 s_attr.const_()
             );
         };
+        // Same item pointer as `SomePtr.getattr`: `getarraysubstruct`
+        // then `setfield` on `Ptr(ITEM)`, including `Struct._first_struct`.
+        let item_ptr = fixed_size_array_struct_item_ptr(&self.ll_ptrtype)
+            .filter(|item_ptr| struct_ptr_sees_field(item_ptr, attr));
+        if let Some(item_ptr) = item_ptr {
+            return SomePtr::new(item_ptr).setattr(s_attr, s_value);
+        }
         if let Some((struct_t, field_t)) = carray_item_struct_field(&self.ll_ptrtype, attr) {
             if field_t != lltype::LowLevelType::Void
                 && !carray_item_struct_field_accepts(&field_t, s_value)
@@ -723,16 +742,51 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
     )))
 }
 
-/// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
+/// True when `attr` is a field of this struct pointer or of a
+/// `Struct._first_struct` parent. `SomePtr.getattr` walks that chain
+/// after the pointer's own fields miss. `direct_arrayitems` delegates
+/// those names to `Ptr(ITEM)` so `declared_row_external` still keys on
+/// the ITEM Struct's `_name`.
+fn struct_ptr_sees_field(ptr: &lltype::Ptr, attr: &str) -> bool {
+    let mut current = ptr.clone();
+    loop {
+        if ptr_struct_field_lltype(&current, attr).is_some() {
+            return true;
+        }
+        match current.first_struct_ptr() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
+/// `Ptr(ITEM)` that `_ptr._expose` returns for index 0 of
+/// `Ptr(FixedSizeArray(ITEM, 1))` when ITEM is a raw Struct.
+/// `direct_arrayitems` / `_subarray._makeptr` builds that array pointer.
+/// The parent `_gckind` is raw, so the exposed value is `_ptr(Ptr(ITEM))`,
+/// not an interior pointer. `FixedSizeArray._first_struct` is `(None, None)`.
+fn fixed_size_array_struct_item_ptr(ptr: &lltype::Ptr) -> Option<lltype::Ptr> {
+    let lltype::PtrTarget::FixedSizeArray(arr) = &ptr.TO else {
+        return None;
+    };
+    let lltype::LowLevelType::Struct(st) = &arr.OF else {
+        return None;
+    };
+    Some(lltype::Ptr {
+        TO: lltype::PtrTarget::Struct(st.as_ref().clone()),
+    })
+}
+
+/// Item struct of `CArrayPtr(Struct)`.
 /// `direct_ptradd` stamps the array wrapper so `rewrite_op_direct_ptradd`
 /// can scale `TO.OF`; field getattr/setattr reads that item layout.
+/// `Ptr(FixedSizeArray(Struct))` is `direct_arrayitems` and is handled
+/// by [`fixed_size_array_struct_item_ptr`], not this helper.
 fn carray_item_struct(ptr: &lltype::Ptr) -> Option<&lltype::Struct> {
-    let of = match &ptr.TO {
-        lltype::PtrTarget::Array(arr) => &arr.OF,
-        lltype::PtrTarget::FixedSizeArray(arr) => &arr.OF,
-        _ => return None,
+    let lltype::PtrTarget::Array(arr) = &ptr.TO else {
+        return None;
     };
-    match of {
+    match &arr.OF {
         lltype::LowLevelType::Struct(st) => Some(st.as_ref()),
         _ => None,
     }
@@ -1899,6 +1953,93 @@ mod tests {
             terminator.getattr(&attr("other")).unwrap(),
             SomeValue::Ptr(_)
         ));
+    }
+
+    /// `direct_arrayitems` / `_subarray._makeptr` is
+    /// `Ptr(FixedSizeArray(ITEM, 1))`. `getattr` of an item field is
+    /// `SomePtr.getattr` of `Ptr(ITEM)` (`_ptr._expose` / `getarraysubstruct`
+    /// index 0). A `STRPTR` field therefore reads as SomeString, the same
+    /// annotation as the ITEM pointer, not `lltype_to_annotation` of the array.
+    #[test]
+    fn direct_arrayitems_fixed_size_array_struct_getattr_matches_item() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _pos = bk.at_position(None);
+        let item = Struct::new(
+            "direct_arrayitems_fixture::Entry",
+            vec![("key".into(), STRPTR.clone())],
+        );
+        let item_ptr = Ptr {
+            TO: PtrTarget::Struct(item.clone()),
+        };
+        let arr_ptr = Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                lltype::LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        };
+        let attr = bookkeeper::immutablevalue(&ConstValue::byte_str("key")).unwrap();
+        let from_array = SomePtr::new(arr_ptr).getattr(&attr).unwrap();
+        let from_item = SomePtr::new(item_ptr).getattr(&attr).unwrap();
+        assert_eq!(from_array, from_item);
+        assert!(
+            matches!(from_array, SomeValue::String(_)),
+            "STRPTR key reads as SomeString, got {from_array:?}"
+        );
+    }
+
+    /// `hash` lives on the offset-0 inlined struct (`Struct._first_struct`),
+    /// not as a field of `Ptr(FixedSizeArray(ITEM, 1))`. `SomePtr.getattr` /
+    /// `setattr` of that name still match `Ptr(ITEM)`.
+    #[test]
+    fn direct_arrayitems_first_struct_field_matches_item() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeInteger;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, Ptr, PtrTarget, Struct,
+        };
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _pos = bk.at_position(None);
+        let key = Struct::new(
+            "direct_arrayitems_fixture::Key",
+            vec![("hash".into(), lltype::LowLevelType::Signed)],
+        );
+        let item = Struct::new(
+            "direct_arrayitems_fixture::Entry",
+            vec![("key".into(), lltype::LowLevelType::Struct(Box::new(key)))],
+        );
+        let item_ptr = Ptr {
+            TO: PtrTarget::Struct(item.clone()),
+        };
+        let arr_ptr = Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(
+                lltype::LowLevelType::Struct(Box::new(item)),
+                1,
+            )),
+        };
+        let attr = bookkeeper::immutablevalue(&ConstValue::byte_str("hash")).unwrap();
+        let from_array = SomePtr::new(arr_ptr.clone()).getattr(&attr).unwrap();
+        let from_item = SomePtr::new(item_ptr.clone()).getattr(&attr).unwrap();
+        assert_eq!(from_array, from_item);
+        assert!(
+            matches!(from_array, SomeValue::Integer(_)),
+            "first-struct hash reads as SomeInteger, got {from_array:?}"
+        );
+        let stored = SomeValue::Integer(SomeInteger::new(false, false));
+        SomePtr::new(arr_ptr)
+            .setattr(&attr, &stored)
+            .expect("setattr hash through direct_arrayitems");
+        SomePtr::new(item_ptr)
+            .setattr(&attr, &stored)
+            .expect("setattr hash through Ptr(ITEM)");
     }
 
     /// An ENTRY-shaped raw struct whose `key` field is `rstr.STRPTR`

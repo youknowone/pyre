@@ -9385,15 +9385,17 @@ mod tests {
     }
 
     /// `direct_arrayitems` of a non-GC struct inlined in `GcArray`
-    /// (`lltype.py` `direct_arrayitems` / `ann_cast_int_to_ptr`,
-    /// `rordereddict.py` `DICTENTRY`) is `Ptr(ITEM)`. `ann_direct_ptradd`
-    /// keeps that pointer, and `getattr` of a primitive field is the
-    /// field annotation.
+    /// (`lltype.py` `direct_arrayitems` / `_subarray._makeptr`,
+    /// `ann_cast_int_to_ptr`, `rordereddict.py` `DICTENTRY`) is
+    /// `Ptr(FixedSizeArray(ITEM, 1))`. `ann_direct_ptradd` keeps that
+    /// pointer. `getattr` of an item field is `SomePtr.getattr` of
+    /// `Ptr(ITEM)` (`getarraysubstruct` index 0), keyed on the ITEM
+    /// Struct's `_name`.
     #[test]
     fn ann_direct_ptradd_of_gcarray_item_ptr_getattr_is_field() {
         use crate::annotator::model::SomeString;
         use crate::flowspace::model::{ConstValue, Constant};
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, SomePtr};
 
         let mut reg = crate::front::StructFieldRegistry::default();
         reg.fields.insert(
@@ -9405,10 +9407,10 @@ mod tests {
             ],
         );
         let spelling = "storage::Slot<i64,*mut u8>";
-        let ptr_ty = crate::front::mir::gcarray_item_struct_ptr_lltype(&reg, spelling)
+        let item_ty = crate::front::mir::gcarray_item_struct_ptr_lltype(&reg, spelling)
             .expect("instantiated item is Ptr(Struct)");
-        let LowLevelType::Ptr(built) = &ptr_ty else {
-            panic!("item pointer is Ptr, got {ptr_ty:?}");
+        let LowLevelType::Ptr(built) = &item_ty else {
+            panic!("item pointer is Ptr, got {item_ty:?}");
         };
         let PtrTarget::Struct(st) = &built.TO else {
             panic!("item pointer targets a Struct, got {:?}", built.TO);
@@ -9420,21 +9422,32 @@ mod tests {
             st._name
         );
 
+        let ptr_ty = crate::front::mir::gcarray_item_direct_arrayitems_ptr_lltype(&reg, spelling)
+            .expect("direct_arrayitems is Ptr(FixedSizeArray)");
         let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
         s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(ptr_ty))));
         let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
         let cast = lltype_cast_int_to_ptr(&bk(), &[Some(s_ptrt), Some(s_int.clone())], &no_kwds())
-            .expect("2-arg ann_cast_int_to_ptr of Ptr(ITEM)");
+            .expect("2-arg ann_cast_int_to_ptr of Ptr(FixedSizeArray(ITEM, 1))");
         let SomeValue::Ptr(cast_ptr) = &cast else {
             panic!("typed cast is SomePtr, got {cast:?}");
         };
-        assert!(
-            matches!(
-                &cast_ptr.ll_ptrtype.TO,
-                PtrTarget::Struct(st) if st._name == spelling
-            ),
-            "cast keeps the instantiated struct, got {:?}",
-            cast_ptr.ll_ptrtype
+        let PtrTarget::FixedSizeArray(arr) = &cast_ptr.ll_ptrtype.TO else {
+            panic!(
+                "direct_arrayitems is Ptr(FixedSizeArray), got {:?}",
+                cast_ptr.ll_ptrtype
+            );
+        };
+        assert_eq!(
+            arr.length, 1,
+            "direct_arrayitems is FixedSizeArray(ITEM, 1)"
+        );
+        let LowLevelType::Struct(item) = &arr.OF else {
+            panic!("ITEM is a Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(
+            item._name, spelling,
+            "FixedSizeArray OF names the instantiated item"
         );
         let added = lltype_direct_ptradd(&bk(), &[Some(cast.clone()), Some(s_int)], &no_kwds())
             .expect("ann_direct_ptradd of the typed item pointer");
@@ -9442,14 +9455,25 @@ mod tests {
         let SomeValue::Ptr(p) = &added else {
             panic!("direct_ptradd keeps SomePtr, got {added:?}");
         };
-        let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f_valid")));
-        let field = p
-            .getattr(&SomeValue::String(s_attr))
-            .expect("getattr f_valid");
+        let attr = || {
+            let mut s_attr = SomeString::new(false, false);
+            s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f_valid")));
+            SomeValue::String(s_attr)
+        };
+        let field = p.getattr(&attr()).expect("getattr f_valid");
         assert!(
             matches!(field, SomeValue::Bool(_)),
             "f_valid annotates as SomeBool, got {field:?}"
+        );
+        let LowLevelType::Ptr(item_built) = &item_ty else {
+            panic!("item pointer is Ptr");
+        };
+        let item_field = SomePtr::new((**item_built).clone())
+            .getattr(&attr())
+            .expect("getattr of Ptr(ITEM)");
+        assert_eq!(
+            field, item_field,
+            "array-pointer getattr is SomePtr.getattr of Ptr(ITEM)"
         );
     }
 

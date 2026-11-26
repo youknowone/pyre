@@ -10051,14 +10051,16 @@ pub use self::gcroot::{
     harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
     scope_owner_identity,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::gcarray_item_struct_ptr_lltype;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_fun_decl_identity_aliases,
     collect_policy_opaque_fn_stubs_from_llbc, entry_family_is_entry_path, entry_family_name_path,
-    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation,
-    gcarray_item_struct_ptr_lltype, host_rthread_threadlocalref_llop,
+    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_direct_arrayitems_ptr_lltype,
+    gcarray_item_struct_ptr_annotation, host_rthread_threadlocalref_llop,
     impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
     is_flattened_storage_leaf, is_mut_ref_cell_name, is_niche_option_gc_payload_spelling,
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,

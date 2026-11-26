@@ -903,7 +903,8 @@ impl<'a> Lowering<'a> {
     /// `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
     ///
     /// A non-GC `Struct` inlined in `GcArray` (`rordereddict.py`
-    /// `DICTENTRY`, `lltype.py` `direct_arrayitems`) is `lltype.Ptr(ITEM)`.
+    /// `DICTENTRY`, `lltype.py` `direct_arrayitems`) is
+    /// `Ptr(FixedSizeArray(ITEM, 1))` (`_subarray._makeptr`).
     /// `ann_cast_int_to_ptr` answers `SomePtr(PtrT.const)` for that
     /// constant `Ptr` and `SomePtr(GCREF)` for the 1-arg form. The 2-arg
     /// cast names the instantiated item from `item_ty`; an unbound
@@ -948,9 +949,10 @@ impl<'a> Lowering<'a> {
         res
     }
 
-    /// `Ptr(ITEM)` for a gcarray item dest, or `None` when `root` is not
-    /// that item or the struct cannot be built. The bool is the item
-    /// test alone: a failed build keeps the 1-arg cast.
+    /// `Ptr(FixedSizeArray(ITEM, 1))` for a gcarray item dest
+    /// (`direct_arrayitems`, `_subarray._makeptr`), or `None` when
+    /// `root` is not that item or the struct cannot be built. The bool
+    /// is the item test alone: a failed build keeps the 1-arg cast.
     fn array_tail_gcarray_item_ptr_lltype(
         &self,
         root: &str,
@@ -967,8 +969,8 @@ impl<'a> Lowering<'a> {
         }
         let ptr_ty =
             match instantiated_struct_item_spelling(item_ty, self.llbc, self.tombstoned_leaves) {
-                Some(spelling) => gcarray_item_struct_ptr_lltype(reg, &spelling),
-                None => gcarray_item_struct_ptr_lltype(reg, root),
+                Some(spelling) => gcarray_item_direct_arrayitems_ptr_lltype(reg, &spelling),
+                None => gcarray_item_direct_arrayitems_ptr_lltype(reg, root),
             };
         (true, ptr_ty)
     }
