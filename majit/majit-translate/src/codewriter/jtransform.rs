@@ -32810,6 +32810,7 @@ mod tests {
                     name: "ptr".into(),
                     ty: ValueType::Ref(None),
                     class_root: None,
+                    param: None,
                 },
                 true,
             )
@@ -32822,6 +32823,7 @@ mod tests {
                     name: "n".into(),
                     ty: ValueType::Int,
                     class_root: None,
+                    param: None,
                 },
                 true,
             )

@@ -7455,7 +7455,7 @@ impl<S: JitState> JitDriver<S> {
                                 None,
                                 0,
                                 portal_rca_enabled(),
-                                None,
+                                &SavedVablePtr::from_optional(None),
                             )
                         }
                     };
