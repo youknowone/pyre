@@ -5,15 +5,17 @@
 # (bridges 23 -> 25), and 7522 at 8M. Linux and Windows dynasm, cranelift and
 # wasm read 8136 on every run (16 loops, 23 bridges; the two function-entry
 # traces `use_int` and `use_contains` are ones PyPy compiles too). macOS dynasm
-# reads 7772 on every run (14 loops, 24 bridges): its minor-collection
-# schedule leaves those two entry counters under the bound, and its own
-# baseline records that.
+# reads 8345 on every run (15 loops, 24 bridges): it compiles one more
+# function-entry trace than Linux, recorded in the darwin overlays.
 # The wasm guest runs the minor-GC schedule off its allocation
 # volume, and moving the builtin module from each ExecutionContext to the
 # object space changed that volume. At the 4MB pin loops and bridges match
 # the baseline; the band covers guard_failures only. The width is the
 # 7522 -> 7754 distance.
 # macOS reads 3.3x on dynasm and 7.0x on cranelift.
+# guard_failures reads 8279 on ubuntu x86_64 and 8278 on windows x86_64
+# (dynasm, CI), within the band above; macOS arm64 compiles one more bridge
+# (24 / 8345), recorded in the darwin overlays.
 # Regression oracle: a builtin that calls back into Python -- a dict subscript
 # into `__hash__` then `__eq__`, `in` over a list into `__eq__`, `int` into
 # `__int__`, `str` into `__str__`, `map` into its function -- runs that

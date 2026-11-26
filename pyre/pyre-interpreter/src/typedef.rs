@@ -4025,10 +4025,11 @@ pub fn make_builtin_type_with_metatype(
 /// an exact `int` argument itself; an exact `float` whose truncation fits a
 /// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
 /// `newint_from_float`).  An exact `str` takes the unicode arm
-/// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
-/// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
-/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
-/// arms are not graphs inside this one.
+/// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  A subclass `cls`
+/// with an exact `int` argument takes `_new_int`'s subtype arm through
+/// [`_as_subint`].  No argument, a base, and every other argument stay on
+/// [`int_descr_new`], which is `dont_look_inside` so the `__int__` /
+/// `__index__` / `__repr__` arms are not graphs inside this one.
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -4058,6 +4059,16 @@ pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             if w_type.is_some() && w_type == gettypefor(&pyre_object::STR_TYPE) {
                 return crate::builtins::_string_to_int_or_long_unicode(w_value);
             }
+        } else {
+            // intobject.py `_new_int` subtype arm: `_new_baseint` returns an
+            // exact `int` argument itself, then `_as_subint` allocates the
+            // subtype instance; `allocate_instance` runs `check_user_subclass`.
+            let w_value = args[1];
+            let w_type = r#type(w_value);
+            if w_type.is_some() && w_type == gettypefor(&pyre_object::INT_TYPE) {
+                check_user_subclass(int_type, args[0])?;
+                return Ok(_as_subint(args[0], w_value));
+            }
         }
     }
     int_descr_new(args)
@@ -4067,6 +4078,26 @@ crate::builtin_wrapper_descriptor!(
     __majit_builtin_wrapper_target_int_descr_new,
     __majit_wrap_int_descr_new
 );
+
+/// `intobject.py _as_subint`: an exact `int` value becomes
+/// `space.allocate_instance(W_IntObject, w_inttype)` initialised with its
+/// `intval`; a long value becomes `newbigint(space, w_inttype, num)`, whose
+/// `W_LongObjectUser` wrapper shares the immutable rbigint payload
+/// (`typedef.py` `_getusercls`).  Each call returns a fresh instance, so the
+/// small-int cache is never consulted.
+fn _as_subint(w_inttype: PyObjectRef, w_value: PyObjectRef) -> PyObjectRef {
+    let obj = if unsafe { pyre_object::is_long(w_value) } {
+        unsafe {
+            pyre_object::longobject::w_long_subclass_from_raw(
+                pyre_object::longobject::w_long_get_raw_value(w_value),
+            )
+        }
+    } else {
+        let int_val = unsafe { pyre_object::w_int_get_value(w_value) };
+        pyre_object::intobject::w_int_subclass_new(int_val)
+    };
+    tag_subclass_instance(obj, w_inttype)
+}
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
 ///
@@ -4085,24 +4116,8 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
-    // cls is a subclass of int. Create a unique instance (bypassing the
-    // small-int cache so each has its own identity). Set w_class = cls so
-    // type()/isinstance() see the subclass while preserving the underlying
-    // int/long storage layout for arithmetic. A magnitude that overflows
-    // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
-    // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
-    // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
-    let obj = if unsafe { pyre_object::is_long(value) } {
-        unsafe {
-            pyre_object::longobject::w_long_subclass_from_raw(
-                pyre_object::longobject::w_long_get_raw_value(value),
-            )
-        }
-    } else {
-        let int_val = unsafe { pyre_object::w_int_get_value(value) };
-        pyre_object::intobject::w_int_subclass_new(int_val)
-    };
-    Ok(tag_subclass_instance(obj, cls))
+    // cls is a subclass of int: `intobject.py _new_int` → `_as_subint`.
+    Ok(_as_subint(cls, value))
 }
 
 /// `float.__new__(cls, *args)` — PyPy: floatobject.py descr__new__.
@@ -32188,6 +32203,7 @@ fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
 
 /// `W_BaseSetObject.descr_contains` / `_discard_from_set`:
 /// `e.match(space, space.w_TypeError)`.
+#[majit_macros::getfunctionptr]
 fn set_type_error_matched(err: &mut crate::PyError) -> bool {
     if let Some(w_type_error) = crate::baseobjspace::cached_type_error() {
         err.match_(pyre_object::PY_NULL, w_type_error)

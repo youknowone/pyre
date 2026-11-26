@@ -1216,7 +1216,8 @@ two-phase-annotate-skipped	pyre_interpreter::type_methods::pad_to_width
 two-phase-annotate-skipped	pyre_interpreter::type_methods::pad_wtf8
 two-phase-annotate-skipped	pyre_interpreter::type_methods::reject_string_sign_align
 two-phase-annotate-skipped	pyre_interpreter::type_methods::set_contains_checked
-two-phase-annotate-skipped	pyre_interpreter::type_methods::set_lookup_checked
+two-phase-annotate-skipped	pyre_interpreter::type_methods::set_has_key_checked
+two-phase-annotate-skipped	pyre_interpreter::type_methods::set_remove_checked
 two-phase-annotate-skipped	pyre_interpreter::type_methods::spec_chars
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_getset_descr_property_set

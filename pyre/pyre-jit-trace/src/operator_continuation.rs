@@ -171,6 +171,22 @@ impl OperatorTail {
             ),
         }
     }
+
+    /// `call.py getcalldescr`: the effects of the tail's helper call. An
+    /// initializer is an arbitrary Python call, so the TypeCallNew tail gets
+    /// the most general effects (it may force frames, write any field and
+    /// invalidate quasi-immutables). The BinopLast tail only raises the
+    /// unsupported-operand TypeError. Len is the same CanRaise as BinopLast:
+    /// `index` / `_check_len_result`.
+    pub(crate) fn effect_info(self) -> majit_ir::EffectInfo {
+        match self {
+            OperatorTail::TypeCallNew => majit_ir::EffectInfo::MOST_GENERAL,
+            _ => majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CanRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        }
+    }
 }
 
 /// Where the inlined dunder's return lands when it leaves the blackhole
@@ -445,6 +461,7 @@ fn build(tail: OperatorTail) -> Option<(i32, usize, usize)> {
         // The result bank is the caller's own call-result register.
         arg_classes: arg_classes.to_string(),
         result_type,
+        extra_info: tail.effect_info(),
         ..Default::default()
     };
     let after_call_pc = match result_type {

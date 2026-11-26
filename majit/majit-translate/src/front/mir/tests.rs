@@ -8917,6 +8917,25 @@ fn std_extern_call_fixture(
     std_extern_call_fixture_with_types(caller_name, callee_name, arg_tys, dest_ty, vec![])
 }
 
+fn std_extern_call_fixture_with_const_arg(
+    caller_name: &str,
+    callee_name: &[&str],
+    arg_tys: &[serde_json::Value],
+    dest_ty: serde_json::Value,
+    const_arg: (usize, serde_json::Value),
+) -> Llbc {
+    std_extern_call_fixture_with_types_traits_and_const_args(
+        caller_name,
+        callee_name,
+        arg_tys,
+        dest_ty,
+        vec![],
+        Vec::new(),
+        Vec::new(),
+        &[const_arg],
+    )
+}
+
 pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
     caller_name: &str,
     callee_name: &[&str],
@@ -8961,6 +8980,28 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
     type_decls: Vec<serde_json::Value>,
     trait_decls: Vec<serde_json::Value>,
     trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
+    std_extern_call_fixture_with_types_traits_and_const_args(
+        caller_name,
+        callee_name,
+        arg_tys,
+        dest_ty,
+        type_decls,
+        trait_decls,
+        trait_impls,
+        &[],
+    )
+}
+
+fn std_extern_call_fixture_with_types_traits_and_const_args(
+    caller_name: &str,
+    callee_name: &[&str],
+    arg_tys: &[serde_json::Value],
+    dest_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    trait_decls: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+    const_args: &[(usize, serde_json::Value)],
 ) -> Llbc {
     let span = || {
         serde_json::json!({
@@ -9014,7 +9055,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
             "ty": ty
         }));
     }
-    let call_args: Vec<serde_json::Value> = arg_tys
+    let mut call_args: Vec<serde_json::Value> = arg_tys
         .iter()
         .enumerate()
         .map(|(i, ty)| {
@@ -9023,6 +9064,9 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
             })
         })
         .collect();
+    for (i, operand) in const_args {
+        call_args[*i] = operand.clone();
+    }
     let caller = serde_json::json!({
         "def_id": 0,
         "item_meta": item_meta(&["fixture", caller_name], true),
@@ -12416,6 +12460,51 @@ fn raw_scalar_ptr_cast_beside_mut_bool_spill_lowers() {
         call_arg(0),
         ptr,
         "the .cast() argument stays off the bool spill"
+    );
+}
+
+#[test]
+fn ptr_write_of_constant_usize_is_a_raw_store() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}
+    });
+    let zero = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            usize_ty.clone()
+        ]
+    });
+    let llbc = std_extern_call_fixture_with_const_arg(
+        "write_usize_zero",
+        &["core", "ptr", "write"],
+        &[ptr_ty, usize_ty],
+        unit,
+        (1, zero),
+    );
+    let graph = crate::test_support::lower_function(&llbc, "write_usize_zero")
+        .expect("lower ptr::write of 0usize");
+    let ops = graph_ops(&graph);
+    let word = crate::layout::target_word_size();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore {
+                itemsize,
+                is_item_signed: false,
+                ..
+            } if *itemsize == word
+        )),
+        "ptr::write of 0usize must become RawStore; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "write"),
+        "constant ptr::write must not residualize; ops={ops:?}"
     );
 }
 
