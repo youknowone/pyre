@@ -24781,6 +24781,26 @@ fn empty_dict_get_empty_storage_production_recasts_gcref() {
 /// Residual `ptr_null_constant` is a classdef-less Instance and must
 /// not remain; dest recast through `__cast_instance_intrinsic` is
 /// skipped when the Call dest already names that root.
+/// `mapdict.py MapdictStorageMixin._mapdict_read_storage` returns the
+/// object-item fixed-size list. Each Rust null storage arm must be narrowed
+/// onto the `ItemsBlock` list representation; a bare `ConstNone` would rtype
+/// as Void and a primitive GcArray pointer would be a different repr.
+#[test]
+fn mapdict_typed_load_storage_nulls_are_nullable_fixed_lists() {
+    let graph = lower_object_fn("pyre_object::mapdict::mapdict_typed_load_storage");
+    let ops = graph_ops(&graph);
+    let roots: Vec<_> = ops
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .filter(|root| *root == "object_array::ItemsBlock")
+        .collect();
+    assert_eq!(
+        roots.len(),
+        3,
+        "the three storage null arms must project onto ItemsBlock; ops={ops:?}"
+    );
+}
+
 #[test]
 fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
     use crate::model::{CallTarget, LinkArg, OpKind};
@@ -27048,6 +27068,96 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
                 } if array_type_id == "[i64]"
             )),
         "set_sizehint_state_value must setarrayitem the Signed cell"
+    );
+}
+
+/// `publish_physical_capacity` checks whether a physical `usize` capacity
+/// fits the signed strategy-size word. The generic core `TryFrom` shell must
+/// become one unsigned upper-bound test and one signed payload retype.
+#[test]
+fn publish_physical_capacity_lowers_usize_to_isize_try_from() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(
+        llbc,
+        "pyre_object::listobject::publish_physical_capacity",
+    )
+    .expect("lower listobject::publish_physical_capacity");
+
+    let residuals: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["core", "convert", "num", "<Impl>", "try_from"] => {
+                Some(segments.join("::"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residuals.is_empty(),
+        "usize-to-isize conversion must not leave an opaque core call: {residuals:?}"
+    );
+
+    let signed_max = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match (&op.result, &op.kind) {
+            (Some(result), OpKind::ConstUInt(value))
+                if *value == i32::MAX as u64 || *value == i64::MAX as u64 =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .expect("usize-to-isize lowering emits the target signed maximum");
+    let has_unsigned_bound = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp {
+                    op,
+                    rhs,
+                    result_ty: ValueType::Int,
+                    ..
+                } if op == "gt" && rhs == &signed_max
+            )
+        });
+    assert!(
+        has_unsigned_bound,
+        "usize-to-isize Result discriminant is the unsigned upper-bound test; graph={}",
+        graph.dump()
+    );
+
+    let has_intmask = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Int,
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        });
+    assert!(
+        has_intmask,
+        "the successful usize payload must be retyped to Signed; graph={}",
+        graph.dump()
     );
 }
 
@@ -38589,6 +38699,58 @@ fn iobase_writelines_ok_or_else_try_is_value_or_exception() {
             .iter()
             .any(|link| link.target == graph.exceptblock),
         "the None arm must raise through the native graph exception edge"
+    );
+}
+
+#[test]
+fn sre_get_code_option_payload_has_no_list_discriminant_getattr() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
+        "sre_scanner_step",
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..crate::HostStaticAddrs::default()
+        },
+    )
+    .expect("lower sre_scanner_step");
+
+    let mut saw_presence_test = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::BinOp { op, .. } if op == "is_" => {
+                saw_presence_test = true;
+            }
+            OpKind::FieldRead { field, .. }
+                if matches!(field.name.as_str(), "__discriminant" | "__pos_0")
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner == "core::option::Option<&[u32]>"
+                            || owner == "core::option::Option<&[u32]>::Some"
+                    }) =>
+            {
+                panic!(
+                    "get_code list payload read {}; graph={}",
+                    field.name,
+                    graph.dump()
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_presence_test,
+        "no list presence test; graph={}",
+        graph.dump()
     );
 }
 

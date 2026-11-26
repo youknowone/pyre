@@ -23387,6 +23387,77 @@ mod tests {
     }
 
     #[test]
+    fn copy_unwrapped_i64_to_vec_and_with_capacity_share_signed_rustvec_repr() {
+        use crate::model::{CallTarget, OpKind};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+
+        let Some(object) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
+        ) else {
+            return;
+        };
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object],
+            crate::HostStaticAddrs::default(),
+            &["listobject"],
+            &["w_list_getslice"],
+        )
+        .expect("lower copy_unwrapped_range");
+        let graph = program
+            .functions
+            .iter()
+            .find(|function| function.name.contains("copy_unwrapped_range__spec_i64_"))
+            .unwrap_or_else(|| panic!("missing i64 copy_unwrapped_range specialization"))
+            .graph();
+
+        let mut fast = None;
+        let mut stepped = None;
+        for operation in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } = &operation.kind
+            else {
+                continue;
+            };
+            match segments.last().map(String::as_str) {
+                Some("ll_slice_to_vec_signed_i") => fast = operation.result.clone(),
+                Some("ll_vec_newlist_hint_i") => stepped = operation.result.clone(),
+                _ => {}
+            }
+        }
+        let fast = fast.expect("unit-step slice copy producer");
+        let stepped = stepped.expect("stepped with_capacity producer");
+        let expected = rust_vec_lltype(&LowLevelType::Signed);
+        assert_eq!(fast.concretetype(), Some(expected.clone()));
+        assert_eq!(stepped.concretetype(), Some(expected));
+    }
+
+    #[test]
+    fn copy_unwrapped_u64_keeps_unsigned_rustvec_repr() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+
+        assert_eq!(
+            majit_ir::rvec::slice_to_vec_helper_path(majit_ir::rvec::VecItemKind::Int, false,),
+            majit_ir::rvec::slice_helper_path(
+                majit_ir::rvec::SliceOp::ToVec,
+                majit_ir::rvec::VecItemKind::Int,
+            ),
+        );
+        assert_ne!(
+            majit_ir::rvec::slice_to_vec_helper_path(majit_ir::rvec::VecItemKind::Int, false,),
+            majit_ir::rvec::SLICE_TO_VEC_SIGNED_I,
+        );
+        let expected = rust_vec_lltype(&LowLevelType::Unsigned);
+        assert_eq!(
+            crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&expected),
+            Some(&LowLevelType::Unsigned),
+        );
+    }
+
+    #[test]
     fn declared_funcptr_typed_items_block_is_gcarray_ptr() {
         use std::rc::Rc;
 

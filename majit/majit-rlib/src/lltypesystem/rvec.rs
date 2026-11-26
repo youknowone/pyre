@@ -722,6 +722,19 @@ pub fn ll_slice_to_vec_i(items: usize, length: usize) -> Vec<usize> {
     l
 }
 
+/// Signed-word specialization of `rlist.py` `ll_copy`.
+///
+/// The buffer copy is item-bit preserving; the distinct Rust return type is
+/// what keeps `lltype.Signed` distinct from `lltype.Unsigned` in annotation.
+pub fn ll_slice_to_vec_signed_i(items: usize, length: usize) -> Vec<i64> {
+    let mut l = Vec::<i64>::with_capacity(length);
+    unsafe {
+        l.set_len(length);
+    }
+    ll_slice_arraycopy_i(items, l.as_mut_ptr() as usize, 0, 0, length);
+    l
+}
+
 /// The item pointer of `&s[start..]` over the items at `items`: `start` is
 /// at most the slice's length.
 pub fn ll_slice_offset_i(items: usize, start: usize) -> usize {
@@ -1984,6 +1997,7 @@ mod tests {
         assert_eq!(ll_slice_load_or_i(second, 5), 9);
         assert_eq!(ll_slice_load_or_i(0, 5), 5);
         assert_eq!(ll_slice_to_vec_i(items, 3), vec![7, 9, 7]);
+        assert_eq!(ll_slice_to_vec_signed_i(items, 3), vec![7, 9, 7]);
         ll_slice_buffer_free(items);
 
         let floats = ll_slice_buffer_new_f(2);

@@ -3197,12 +3197,16 @@ impl<'a> Lowering<'a> {
                 "alloc::slice::<Impl>::to_vec" => {
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
-                    self.emit_path_call(
+                    let item = tyref_rust_vec_item_spelling(&dest_ty, self.llbc);
+                    let signed_word = matches!(item.as_deref(), Some("isize" | "i64"));
+                    let result = self.emit_path_call(
                         mir_bb,
-                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ToVec, kind),
+                        majit_ir::rvec::slice_to_vec_helper_path(kind, signed_word),
                         vec![args[0].clone(), len],
                         self.value_type_of(&dest_ty),
-                    )
+                    );
+                    stamp_rust_vec_header(&result, &dest_ty, self.llbc);
+                    result
                 }
                 "core::slice::<Impl>::first"
                 | "core::slice::<Impl>::last"
@@ -3339,6 +3343,23 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> Option<majit_ir::rvec::VecItemKind> {
         tyref_option_pair_slice_item_kind(ty, self.llbc)
+    }
+
+    /// `Option<&[T]>` / Charon `Option<[T]>` whose intern is the nullable
+    /// list (`project_struct_field_type` Option arm). Includes non-word
+    /// items such as `[u32]`; the payload must resolve to a slice behind
+    /// its reference (`tyref_strips_to_slice`). The u8 window and
+    /// `Vec`/`VecDeque` stay out.
+    pub(in crate::front::mir) fn option_nullable_list_slice(&self, ty: &TyRef) -> bool {
+        if tyref_is_option_of_shared_u8_slice(ty, self.llbc) {
+            return false;
+        }
+        let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, self.llbc) else {
+            return false;
+        };
+        !tyref_is_shared_u8_slice(&payload, self.llbc)
+            && !tyref_is_bare_u8_slice(&payload, self.llbc)
+            && tyref_strips_to_slice(&payload, self.llbc)
     }
 
     /// Item kind of `Result<&[T], PyError>` when the Ok payload is a pair.

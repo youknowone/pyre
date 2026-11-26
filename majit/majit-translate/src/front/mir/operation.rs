@@ -11539,6 +11539,40 @@ impl<'a> Lowering<'a> {
         crate::annotator::bookkeeper::flexible_gcarray_primitive_item(&last_spelling)
     }
 
+    /// Class root of pyre's source carrier for RPython's object-item
+    /// fixed-size list. Its live value is `SomeList`; this classification is
+    /// only for projecting a null onto the same list representation and must
+    /// not feed the primitive `GcArray` readers.
+    pub(in crate::front::mir) fn tyref_object_fixed_list_root(&self, ty: &TyRef) -> Option<String> {
+        let adt = self.flexible_gcarray_field_base_adt(ty)?;
+        let type_id = type_decl_ref_adt_id(adt)?;
+        let td = self.llbc.type_by_id(type_id)?;
+        if !self.type_decl_is_declared_gc(td) {
+            return None;
+        }
+        let fields = type_decl_struct_fields(td, self.llbc)?;
+        if fields.len() != 2 || !tyref_is_integer_scalar(&fields[0].ty, self.llbc) {
+            return None;
+        }
+        let last_spelling = tyref_to_field_layout_string(
+            &fields[1].ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.struct_fields,
+        );
+        let (item, 0) = shaped_array_parts(&last_spelling)? else {
+            return None;
+        };
+        if !(object_pointer_spelling(item)
+            || item == "PyObjectRef"
+            || item.ends_with("::PyObjectRef"))
+        {
+            return None;
+        }
+        Some(strip_crate_prefix(td.item_meta.name_path_str()))
+    }
+
     /// Two-field `{integer, scalar [T; 0]}` wrapper (`TypedItemsBlock`).
     /// The translated value is the GcArray itself (`ll_fixed_items`).
     /// Requires a declared `GcType`; the two-field shape is not enough.
