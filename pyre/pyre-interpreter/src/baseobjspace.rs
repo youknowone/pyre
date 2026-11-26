@@ -1159,10 +1159,9 @@ pub fn allocate_lock() -> *mut Lock {
 }
 
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
-/// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py:1640-1644
-/// _issubtype`: `w_type in w_sub.mro_w`); a type whose MRO is not yet
-/// installed (`mro_ptr` null / `not hasmro`) takes the
-/// [`issubtype_slow_and_wrong`] base-chain walk.
+/// `w_type.mro_w`. Routes through typeobject.py `W_TypeObject.issubtype`
+/// ([`type_issubtype`]); a type whose MRO is not yet installed
+/// (`not hasmro`) takes `_issubtype_slow_and_wrong`.
 pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() {
         return false;

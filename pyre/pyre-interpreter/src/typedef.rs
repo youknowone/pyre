@@ -4078,16 +4078,30 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // intobject.py _new_int → check_user_subclass
     let w_int = gettypeobject(&pyre_object::INT_TYPE);
     check_user_subclass(w_int, cls)?;
-    let value = pyre_object::with_roots!(cls => crate::builtins::builtin_int(&args[1..]))?;
+    // intobject.py `_new_int(space, w_inttype, w_x, w_base)` receives
+    // `w_x` / `w_base`, not a slice of remaining args.
+    let n = args.len() - 1;
+    if n > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "int expected at most 2 arguments, got {n}"
+        )));
+    }
+    let mut w_x = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut w_base = args.get(2).copied().unwrap_or(PY_NULL);
+    let value = pyre_object::with_roots!(
+        cls,
+        w_x,
+        w_base => crate::builtins::builtin_int_from(w_x, w_base)
+    )?;
     // If cls is int itself, return a plain int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     // cls is a subclass of int. Create a unique instance (bypassing the
-    // small-int cache so each has its own identity). Set w_class = cls so
-    // type()/isinstance() see the subclass while preserving the underlying
-    // int/long storage layout for arithmetic. A magnitude that overflows
+    // small-int cache so each has its own identity). `tag_subclass_instance`
+    // runs `user_setup` (`_mapdict_init_empty(w_subtype.terminator)`); the
+    // Python class lives on `terminator.w_cls`. A magnitude that overflows
     // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
     // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
     // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
@@ -5775,34 +5789,42 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// it is being constructed for, then enqueue it on the user-finalizer
 /// queue when that subclass defines `__del__`.
 ///
-/// `objspace.py:485-487 allocate_instance` performs both steps together —
+/// `objspace.py allocate_instance` performs both steps together —
 /// `instance.user_setup(self, w_subtype)` followed by
 /// `if w_subtype.hasuserdel: self.finalizer_queue.register_finalizer(instance)`.
-/// Order is load-bearing: the hook reads the object's `w_class` to find
-/// `hasuserdel`, so tagging must precede registration. Registering an
-/// instance whose type has no `__del__` is a no-op, the hook gates on
-/// `hasuserdel` exactly as upstream does.
+/// The `hasuserdel` gate is at this call site so a type without `__del__`
+/// does not residualize `register_finalizer`.
 pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
     // `objspace.py allocate_instance` runs `user_setup` then the finalizer
     // registration. `MapdictStorageMixin.user_setup` is
     // `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`): the
     // instance map is the owning type's terminator from construction.
-    // Leaving map at zero until first attribute access makes
-    // `jit.promote(self.map)` see a different word on the next iteration's
-    // fresh instance (`objectobject.rs` `alloc_instance_object`).
+    // The header stays `layout_header_class` from the allocator
+    // (`w_int_subclass_new` stamps `get_instantiate(&INT_TYPE)`); the
+    // Python class lives on `terminator.w_cls`.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(&[obj, sub]);
     let obj = _roots.get(base);
     let sub = _roots.get(base + 1);
-    unsafe { store_subclass_tag(obj, sub) };
-    let obj = _roots.get(base);
     if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
-        unsafe { crate::objspace::std::mapdict::ensure_mapdict_initialized(obj) };
+        unsafe { crate::objspace::std::mapdict::user_setup(obj, sub) };
         let obj = _roots.get(base);
-        unsafe { crate::objspace::std::mapdict::stamp_mapdict_layout_header(obj) };
+        debug_assert!(
+            unsafe {
+                let map = crate::objspace::std::mapdict::instance_map_word(obj);
+                (*obj).w_class
+                    == pyre_object::layout_header_class((*obj).ob_type, (*obj).w_class, map)
+            },
+            "allocator must stamp layout_header_class at allocation"
+        );
+    } else {
+        unsafe { store_subclass_tag(obj, sub) };
     }
     let obj = _roots.get(base);
-    pyre_object::gc_hook::maybe_register_finalizer(obj);
+    let sub = _roots.get(base + 1);
+    if unsafe { pyre_object::w_type_get_hasuserdel(sub) } {
+        crate::executioncontext::register_finalizer(obj);
+    }
     _roots.get(base)
 }
 
@@ -7093,7 +7115,7 @@ pub(crate) fn check_new_subtype(
         return Ok(());
     }
     // typeobject.py check_user_subclass: `w_subtype.issubtype(self)`.
-    let is_sub = unsafe { pyre_object::w_type_issubtype(w_subtype, w_self) };
+    let is_sub = unsafe { crate::baseobjspace::type_issubtype(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };

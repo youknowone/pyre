@@ -369,6 +369,19 @@ pub unsafe fn set_type_hasdict(w_type: PyObjectRef, v: bool) {
     unsafe { install_type_terminator(w_type) };
 }
 
+/// mapdict.py `MapdictStorageMixin.user_setup` —
+/// `_mapdict_init_empty(w_subtype.terminator)`.
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier. `w_subtype` must be a live
+/// `W_TypeObject` whose terminator is already installed.
+pub unsafe fn user_setup(obj: PyObjectRef, w_subtype: PyObjectRef) {
+    let term = unsafe { ensure_type_terminator(w_subtype) };
+    // mapdict.py `_mapdict_init_empty` → `_set_mapdict_map`.
+    let mut inst = unsafe { mapdict_carrier(obj) };
+    inst._set_mapdict_map(term);
+}
+
 /// `_mapdict_init_empty` for a carrier whose `map` is still null
 /// (`mapdict.py user_setup` copies `w_subtype.terminator` at construction;
 /// `typeobject.py W_TypeObject.__init__` stores that terminator after layout).
