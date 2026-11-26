@@ -11500,6 +11500,95 @@ fn ptr_add_of_i64_scales_count_then_direct_ptradd() {
     );
 }
 
+/// Generic `repr(C)` `Entry` whose TypeDecl layout is OffsetOf, plus a
+/// concrete 8-byte pointer-shaped `ObjectKey` (`json_ty_byte_size` /
+/// `instantiated_field_size_align`).
+fn generic_repr_c_entry_type_decls() -> Vec<serde_json::Value> {
+    let key_ty = interior_adt(1);
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let thin_ptr = serde_json::json!({"RawPtr": [{"Tuple": []}, "Mut"]});
+    let hash_ty = scalar_ty("U64");
+    let entry = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["rordereddict_entries", "Entry"], true),
+        "kind": {"Struct": [
+            {"name": "key", "ty": key_ty, "attr_info": null},
+            {"name": "f_valid", "ty": bool_ty, "attr_info": null},
+            {"name": "value", "ty": thin_ptr, "attr_info": null},
+            {"name": "f_hash", "ty": hash_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": null,
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let key = interior_c_struct(
+        1,
+        &["fixture", "ObjectKey"],
+        &[("ptr", serde_json::json!({"RawPtr": [{"Tuple": []}, "Mut"]}))],
+        8,
+        &[0],
+        false,
+    );
+    vec![entry, key]
+}
+
+fn generic_repr_c_entry_adt_node() -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": [{"Adt": {"id": 1}}]}}
+    })
+}
+
+#[test]
+fn json_ty_byte_size_generic_repr_c_entry_after_subst() {
+    let llbc = llbc_with_types("fixture", generic_repr_c_entry_type_decls(), vec![]);
+    let node = generic_repr_c_entry_adt_node();
+    assert_eq!(super::json_ty_byte_size(&node, &llbc), Some(32));
+}
+
+#[test]
+fn ptr_add_of_generic_repr_c_struct_is_direct_ptradd() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [generic_repr_c_entry_adt_node(), "Mut"]
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let llbc = std_extern_call_fixture_with_types(
+        "add_entry",
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        &[ptr_ty.clone(), usize_ty],
+        ptr_ty,
+        generic_repr_c_entry_type_decls(),
+    );
+    let graph =
+        crate::test_support::lower_function(&llbc, "add_entry").expect("lower *mut Entry::add");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "*mut Entry::add must become direct_ptradd; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
+        "*mut Entry::add must not residualize; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("add")
+        )),
+        "*mut Entry::add must not remain a Call to add; ops={ops:?}"
+    );
+}
+
 #[test]
 fn ptr_add_of_i64_emits_unscaled_count() {
     let ptr_ty = serde_json::json!({
@@ -20476,6 +20565,190 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
         int_rows.contains(&"__pos_0"),
         "ordinary payload stays; rows={int_rows:?}"
     );
+}
+
+/// `#[repr(transparent)]` one-word pointer wrappers are harvested from
+/// Charon `TypeDecl` identity (`bookkeeper.py` `getuniqueclassdef`).
+/// A declared-GC pointee is `GcObject`; a raw pointee is `Pointer`; an
+/// ordinary struct stays unrecognised; a unique harvested leaf resolves.
+#[test]
+fn transparent_pointer_wrapper_harvest_is_structural_and_qualified() {
+    use crate::front::semantic::TransparentPointerKind;
+
+    let root = struct_decl(
+        0,
+        ident_path(&["fixture", "gc", "Root"]),
+        serde_json::json!([]),
+        false,
+    );
+    let a_key = struct_decl(
+        1,
+        ident_path(&["fixture", "a", "Key"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [named_adt(0, vec![]), "Mut"]},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let b_key = struct_decl(
+        2,
+        ident_path(&["fixture", "b", "Key"]),
+        serde_json::json!([{
+            "name": "word",
+            "ty": usize_ty(),
+            "attr_info": null
+        }]),
+        false,
+    );
+    let c_key = struct_decl(
+        3,
+        ident_path(&["fixture", "c", "RawKey"]),
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        }]),
+        true,
+    );
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {
+                "types": [{"Value": [0, named_adt(0, vec![])]}]
+            }
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![root, a_key, b_key, c_key],
+        vec![],
+        vec![trait_decl],
+        vec![impl_row],
+    );
+    let (known, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("a::Key"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("c::RawKey"),
+        Some(TransparentPointerKind::Pointer)
+    );
+    assert_eq!(fields.transparent_pointer_kind("b::Key"), None);
+    assert_eq!(
+        fields.transparent_pointer_kind("Key"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert!(
+        !known.contains("a::Key") && !known.contains("fixture::a::Key"),
+        "transparent GC-object wrapper is omitted from known_struct_names; known={known:?}"
+    );
+    assert!(
+        !known.contains("c::RawKey") && !known.contains("fixture::c::RawKey"),
+        "transparent pointer wrapper is omitted from known_struct_names; known={known:?}"
+    );
+    assert!(
+        known.contains("b::Key") || known.contains("fixture::b::Key"),
+        "ordinary struct stays in known_struct_names; known={known:?}"
+    );
+}
+
+/// `Utf8Str` is the rstr `STR` GcStruct, so `Ptr(STR)` key wrappers are GC references.
+#[test]
+fn production_object_ullbc_transparent_pointer_wrapper_kinds() {
+    use crate::front::semantic::TransparentPointerKind;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
+    );
+    let kinds = &fields.transparent_pointer_kinds;
+    let kind_of = |suffix: &str| {
+        fields.transparent_pointer_kind(suffix).or_else(|| {
+            kinds.iter().find_map(|(path, kind)| {
+                (path == suffix || path.ends_with(&format!("::{suffix}"))).then_some(*kind)
+            })
+        })
+    };
+    assert_eq!(
+        kind_of("identitydict::IdentityKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("dictmultiobject::ObjectEntryKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("dictmultiobject::BytesKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    assert_eq!(
+        kind_of("celldict::StrKey"),
+        Some(TransparentPointerKind::GcObject),
+        "kinds={kinds:?}"
+    );
+    let extra_gc: Vec<&str> = kinds
+        .iter()
+        .filter(|(path, kind)| {
+            *kind == TransparentPointerKind::GcObject
+                && !path.ends_with("identitydict::IdentityKey")
+                && !path.ends_with("dictmultiobject::ObjectEntryKey")
+                && !path.ends_with("dictmultiobject::BytesKey")
+                && !path.ends_with("celldict::StrKey")
+        })
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        extra_gc.is_empty(),
+        "no other local type is GcObject; extra={extra_gc:?}; kinds={kinds:?}"
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("ObjectEntryKey"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("BytesKey"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    assert_eq!(
+        fields.transparent_pointer_kind("StrKey"),
+        Some(TransparentPointerKind::GcObject)
+    );
+    for leaf in ["ObjectEntryKey", "BytesKey", "StrKey"] {
+        assert!(
+            fields
+                .class_identity
+                .get(leaf)
+                .and_then(|slot| slot.as_ref())
+                .is_some(),
+            "bare {leaf} must resolve to one ClassIdentity; slot={:?}",
+            fields.class_identity.get(leaf)
+        );
+    }
 }
 
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
@@ -47071,8 +47344,8 @@ fn interior_field_entry_ptr_reads_entries_header() {
         block.inputargs
     );
     assert!(
-        call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
-        "ops={ops:?}"
+        !call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
+        "address-only entry_ptr must disappear; ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
@@ -47084,8 +47357,8 @@ fn interior_field_entry_ptr_reads_entries_header() {
     );
 }
 
-/// `entries_item_ptr(header).add(i)` uses `header` itself. The call
-/// stays residual; its result is not given a second length word.
+/// `entries_item_ptr(header).add(i)` uses `header` itself. The address-only
+/// producer disappears; its result is not given a second length word.
 #[test]
 fn interior_field_entries_item_ptr_reuses_header_arg() {
     let i64_ty = interior_i64();
@@ -47197,10 +47470,10 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         "entries_item_ptr's argument is already the header; ops={ops:?}"
     );
     assert!(
-        call_leafs(&ops)
+        !call_leafs(&ops)
             .iter()
             .any(|leaf| leaf == "entries_item_ptr"),
-        "ops={ops:?}"
+        "address-only entries_item_ptr must disappear; ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
@@ -47210,14 +47483,114 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
         "ops={ops:?}"
     );
-    // The callee stays residual (`interior_opaque`). The 2-arg
-    // `cast_int_to_ptr(Ptr(ITEM), …)` is asserted on the substituted
-    // body (`entries_item_ptr_gcentries_i64_gcref_items_offset_is_8`).
     assert!(
         !call_leafs(&ops)
             .iter()
             .any(|leaf| leaf == "cast_int_to_ptr"),
         "ops={ops:?}"
+    );
+}
+
+#[test]
+fn interior_pointer_producer_with_another_use_stays_residual() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let unit = interior_unit_ty();
+    let entry = interior_adt(0);
+    let entry_ptr_ty = interior_raw_mut(entry.clone());
+    let header_ty =
+        interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}));
+    let entry_decl = interior_struct(
+        0,
+        &["fixture", "Entry"],
+        &[("pad", i64_ty.clone()), ("value", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let caller = interior_caller(
+        "read_and_keep_entries_item",
+        2,
+        vec![header_ty.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("header"), &header_ty),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("item"), &entry_ptr_ty),
+            interior_local(4, Some("slot"), &entry_ptr_ty),
+            interior_local(5, Some("ignored"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &header_ty))],
+                    interior_place(3, &entry_ptr_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(3, &entry_ptr_ty)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &entry_ptr_ty),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(3, &entry_ptr_ty))],
+                    interior_place(5, &unit),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_field(4, &entry_ptr_ty, &entry, &i64_ty, 1)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let items = interior_opaque(
+        1,
+        &["fixture", "entries_item_ptr"],
+        vec![header_ty],
+        entry_ptr_ty.clone(),
+    );
+    let add = interior_opaque(
+        2,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![entry_ptr_ty.clone(), usize_ty],
+        entry_ptr_ty.clone(),
+    );
+    let keep = interior_opaque(3, &["fixture", "keep_pointer"], vec![entry_ptr_ty], unit);
+    let llbc = llbc_with_types("fixture", vec![entry_decl], vec![caller, items, add, keep]);
+    let graph = lower_interior(&llbc, "read_and_keep_entries_item");
+    let ops = graph_ops(&graph);
+    assert!(
+        call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "entries_item_ptr"),
+        "producer with a non-interior use must remain; ops={ops:?}",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "the independently proven interior read must still lower; ops={ops:?}",
     );
 }
 
@@ -48748,6 +49121,12 @@ fn interior_field_entry_valid_real() {
     let graph =
         crate::test_support::lower_function(llbc, "entry_valid").expect("lower entry_valid");
     let ops = graph_ops(&graph);
+    for forbidden in ["entry_ptr", "entries_item_ptr", "cast_ptr_to_int"] {
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| leaf == forbidden),
+            "{forbidden} must not remain in the interior-field accessor; ops={ops:?}"
+        );
+    }
     let read = ops.iter().find_map(|op| match &op.kind {
         OpKind::InteriorFieldRead {
             base,
@@ -48755,11 +49134,65 @@ fn interior_field_entry_valid_real() {
             array_type_id,
             array: _,
             ..
-        } if field.name == "f_valid" => Some((base, array_type_id)),
+        } if field.name == "f_valid" => Some((base, field, array_type_id)),
+        _ => None,
+    });
+    let Some((base, field, array_type_id)) = read else {
+        panic!("entry_valid must read f_valid via getinteriorfield; ops={ops:?}");
+    };
+    assert!(
+        array_type_id
+            .as_deref()
+            .is_some_and(|id| id.contains("Entry")),
+        "array id {array_type_id:?}"
+    );
+    // The generic `RDict<K, V>::entry_valid` template: ARRAY.OF is the
+    // `Entry` STRUCT (`rordereddict.py` `get_ll_dict` DICTENTRY); the
+    // per-(K, V) instantiation layout is picked at descr-mint time from
+    // the caller's owner (`interiorfielddescrof_keyed` tests in call.rs).
+    assert!(
+        field
+            .owner_root
+            .as_deref()
+            .is_some_and(|root| root.contains("Entry")),
+        "f_valid owner_root {:?}",
+        field.owner_root
+    );
+    let header = ops.iter().find(|op| op.result.as_ref() == Some(base));
+    match header.map(|op| &op.kind) {
+        Some(OpKind::FieldRead { field, .. }) => assert_eq!(field.name, "entries"),
+        other => panic!("f_valid base must be FieldRead entries, got {other:?}"),
+    }
+}
+
+/// `value_at` on a real artefact: `(*entry_ptr(self).add(slot)).value`
+/// (`RDict::value_at`). Ignored by default (loads the object ullbc).
+/// `cargo test -p majit-translate --lib interior_field_entry_value_real -- --ignored`
+#[test]
+#[ignore]
+fn interior_field_entry_value_real() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(llbc, "value_at").expect("lower value_at");
+    let ops = graph_ops(&graph);
+    for forbidden in ["entry_ptr", "entries_item_ptr", "cast_ptr_to_int"] {
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| leaf == forbidden),
+            "{forbidden} must not remain in the interior-field accessor; ops={ops:?}"
+        );
+    }
+    let read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::InteriorFieldRead {
+            base,
+            field,
+            array_type_id,
+            array: _,
+            ..
+        } if field.name == "value" => Some((base, array_type_id)),
         _ => None,
     });
     let Some((base, array_type_id)) = read else {
-        panic!("entry_valid must read f_valid via getinteriorfield; ops={ops:?}");
+        panic!("value_at must read value via getinteriorfield; ops={ops:?}");
     };
     assert!(
         array_type_id
@@ -48770,7 +49203,7 @@ fn interior_field_entry_valid_real() {
     let header = ops.iter().find(|op| op.result.as_ref() == Some(base));
     match header.map(|op| &op.kind) {
         Some(OpKind::FieldRead { field, .. }) => assert_eq!(field.name, "entries"),
-        other => panic!("f_valid base must be FieldRead entries, got {other:?}"),
+        other => panic!("value base must be FieldRead entries, got {other:?}"),
     }
 }
 

@@ -205,6 +205,39 @@ pub fn do_getarrayitem_gc_f(
     cpu.bh_getarrayitem_gc_f(arraybox, indexbox, arraydescr)
 }
 
+// blackhole.py bhimpl_getinteriorfield_gc_{i,r,f} / executor.py
+// make_execute_function wrapping cpu.bh_getinteriorfield_gc_*.
+// executor.py do_getinteriorfield_gc is dead; this is the live path.
+pub fn do_getinteriorfield_gc_i(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    descr: &majit_jitcode::jitcode::BhDescr,
+) -> i64 {
+    cpu.bh_getinteriorfield_gc_i(arraybox, indexbox, descr)
+}
+
+pub fn do_getinteriorfield_gc_r(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    descr: &majit_jitcode::jitcode::BhDescr,
+) -> majit_ir::GcRef {
+    cpu.bh_getinteriorfield_gc_r(arraybox, indexbox, descr)
+}
+
+pub fn do_getinteriorfield_gc_f(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    descr: &majit_jitcode::jitcode::BhDescr,
+) -> f64 {
+    cpu.bh_getinteriorfield_gc_f(arraybox, indexbox, descr)
+}
+
 // blackhole.py bhimpl_arraylen_gc(cpu, array, arraydescr): direct
 // `cpu.bh_arraylen_gc(array, arraydescr)`.  RPython has no explicit
 // `do_arraylen_gc` in executor.py; the dispatch goes through the

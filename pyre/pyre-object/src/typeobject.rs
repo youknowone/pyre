@@ -1861,17 +1861,12 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::Fixe
     (*(obj as *const W_TypeObject)).mro_w
 }
 
-/// True when `cls` occurs in `w_type`'s MRO — the pointer-identity subtype
-/// membership scan `W_TypeObject.issubtype` / `_issubtype` performs
-/// (typeobject.py:603/1640).  The single home for the MRO subtype check;
-/// interpreter-level subtype guards and reflected-binop dispatch delegate
-/// here rather than each re-scanning the MRO.
-///
-/// Under the JIT `issubtype` runs this scan inside `_pure_issubtype`
-/// (`@elidable_promote`, typeobject.py:1657), so the MRO membership walk
-/// is not traced — its result is promoted.  The `dont_look_inside` marker
-/// is the equivalent boundary: the JIT residualises the call instead of
-/// tracing the per-type MRO read the tracer cannot model.
+/// typeobject.py `_issubtype` — `cls` occurs in `w_type`'s MRO
+/// (`w_type in w_sub.mro_w`), or `_issubtype_slow_and_wrong` when
+/// `not hasmro`.  The `@elidable_promote` boundary is
+/// `baseobjspace::_pure_issubtype`; `W_TypeObject.issubtype` is
+/// `baseobjspace::type_issubtype`.  The MRO scan stays
+/// `dont_look_inside` (a loop without `unroll_safe`).
 #[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

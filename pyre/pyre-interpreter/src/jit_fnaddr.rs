@@ -77,6 +77,7 @@ impl<T> ResidualRet for *mut T {}
 /// One-word `repr(transparent)` dict keys. `ObjectKey` / `IdentitySetKey`
 /// are two words and stay off this trait.
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
+impl ResidualSlot for pyre_object::dictmultiobject::ObjectEntryKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
@@ -972,6 +973,16 @@ pub mod word_publish {
         }
     }
     impl WordAbi for pyre_object::identitydict::IdentityKey {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            Self(reg as usize as pyre_object::PyObjectRef)
+        }
+        fn into_reg(self) -> i64 {
+            self.0 as usize as i64
+        }
+    }
+    impl WordAbi for pyre_object::dictmultiobject::ObjectEntryKey {
         type Reg = i64;
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
@@ -2371,6 +2382,15 @@ pub fn dyn_impl_key_matches(impl_path: &str, impl_key: &str) -> bool {
         || impl_key.ends_with(&format!("::{impl_path}"))
 }
 
+/// Registered rustc vtable for `(impl_key, trait_leaf)`, if present.
+/// `CallControl.getfunctionptr` / `bytecode_for_address` key on this pointer.
+pub fn dyn_impl_vtable_for(impl_key: &str, trait_leaf: &str) -> Option<*const ()> {
+    dyn_impl_vtables().iter().find_map(|entry| {
+        (entry.trait_leaf == trait_leaf && dyn_impl_key_matches(impl_key, entry.impl_key))
+            .then_some(entry.vtable)
+    })
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -2393,14 +2413,31 @@ pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
     jit_trace_fnaddr_tables().1.contains(&(addr as i64))
 }
 
+/// Rows a later crate generates from the translator's symbolic targets
+/// (`getfunctionptr(graph)` for a graph whose function had no published
+/// address). Installed once, before the first `jit_trace_fnaddrs` call.
+/// `OnceLock` mirrors `OPTIONAL_MODULE_HOOKS` (`importing.rs`).
+static GENERATED_FNADDR_ROWS: std::sync::OnceLock<fn() -> Vec<(&'static str, i64)>> =
+    std::sync::OnceLock::new();
+
 /// [`build_jit_trace_fnaddrs`], built once per process.  Every input is fixed
 /// before `main` runs: function addresses, the macro registry (linked, or
-/// filled from constructors on wasm32) and the optional-module hooks, which
-/// `pyre-module` installs from its own constructor.
+/// filled from constructors on wasm32), the optional-module hooks, which
+/// `pyre-module` installs from its own constructor, and the generated
+/// fnaddr rows, which `pyre-jit-trace` installs from its own constructor.
+static JIT_TRACE_FNADDR_TABLES: std::sync::OnceLock<(Vec<(&'static str, i64)>, Vec<i64>)> =
+    std::sync::OnceLock::new();
+
+pub fn set_generated_fnaddr_rows(rows: fn() -> Vec<(&'static str, i64)>) {
+    assert!(
+        JIT_TRACE_FNADDR_TABLES.get().is_none(),
+        "set_generated_fnaddr_rows: jit_trace_fnaddrs already built; a late install would leave every predicate blind to the rows",
+    );
+    let _ = GENERATED_FNADDR_ROWS.set(rows);
+}
+
 fn jit_trace_fnaddr_tables() -> &'static (Vec<(&'static str, i64)>, Vec<i64>) {
-    use std::sync::OnceLock;
-    static TABLES: OnceLock<(Vec<(&'static str, i64)>, Vec<i64>)> = OnceLock::new();
-    TABLES.get_or_init(build_jit_trace_fnaddrs)
+    JIT_TRACE_FNADDR_TABLES.get_or_init(build_jit_trace_fnaddrs)
 }
 
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
@@ -5419,6 +5456,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         (hooks.publish_fnaddrs)(&mut entries);
     }
+    if let Some(rows) = GENERATED_FNADDR_ROWS.get() {
+        for (path, addr) in rows() {
+            if entries.iter().any(|(existing, _)| *existing == path) {
+                continue;
+            }
+            entries.push((path, addr));
+        }
+    }
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
     // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these
@@ -6615,7 +6660,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::dictmultiobject::IntKeyHash,
     >(&mut entries);
     register_rdict_dont_look_inside_inst::<
-        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::dictmultiobject::ObjectEntryKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        pyre_object::dictmultiobject::ObjectEntryKey,
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
@@ -6650,7 +6700,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::dictmultiobject::StrKeyBuildHasher,
     >(&mut entries);
     register_rdict_dont_look_inside_inst::<
-        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::dictmultiobject::ObjectEntryKey,
         (),
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
@@ -6734,11 +6784,10 @@ fn register_replace_value_inst(entries: &mut Vec<(&'static str, i64)>) {
 
 fn register_rdict_dont_look_inside_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
 where
-    K: std::hash::Hash
-        + Eq
-        + Copy
+    K: Copy
         + pyre_object::rordereddict::EntryDummy
-        + pyre_object::rordereddict::GcRefOffsets,
+        + pyre_object::rordereddict::GcRefOffsets
+        + pyre_object::rordereddict::DictKeyProbe,
     V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
     S: std::hash::BuildHasher,
     (K, V): pyre_object::rordereddict::GcEntriesType,
@@ -6752,7 +6801,7 @@ where
         std::any::type_name::<K>(),
         std::any::type_name::<V>(),
         std::any::type_name::<S>(),
-        std::any::type_name::<K>(),
+        std::any::type_name::<K::Probe>(),
     ];
     p1_inst!(
         entries,
@@ -6781,19 +6830,19 @@ where
     p3_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_lookup_trampoline",
-        pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K::Probe>,
         &kvsk,
     );
     p3_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_contains_trampoline",
-        pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K::Probe>,
         &kvsk,
     );
     p2_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_hash_of",
-        pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K>,
+        pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K::Probe>,
         &kvsk,
     );
 }
@@ -6802,8 +6851,6 @@ fn register_rdict_setitem_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
 where
     K: ResidualSlot
         + WasmWord
-        + std::hash::Hash
-        + Eq
         + Copy
         + pyre_object::rordereddict::EntryDummy
         + pyre_object::rordereddict::GcRefOffsets,
@@ -8005,13 +8052,14 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
-        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        finditem_str_named_word, handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word,
-        interned_residual_inst_path, is_abi_unsound_argument_residual, is_exact_type_word,
-        is_list_write_barrier, is_plain_int1_word, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word,
-        ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtable_for,
+        dyn_impl_vtables, finditem_str_named_word, handle_alloc_error_word_jit_abi,
+        hash_str_hooked_bytes_word, interned_residual_inst_path, is_abi_unsound_argument_residual,
+        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
+        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
+        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
+        ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
@@ -9811,6 +9859,66 @@ mod tests {
                 tables.iter().any(|e| e.impl_key.ends_with(leaf)),
                 "{leaf} not registered"
             );
+        }
+    }
+
+    #[test]
+    fn live_strategy_holder_vtable_matches_registered() {
+        let dict_cases: &[(&str, *const ())] = &[
+            (
+                "IdentityDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::identitydict::identity_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "ObjectDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::dictmultiobject::object_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "IntDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::dictmultiobject::int_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "MapDictStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    crate::objspace::std::mapdict::map_dict_strategy_ref().imp,
+                ),
+            ),
+            (
+                "ClassDictStrategySlot",
+                pyre_object::lltype::fat_vtable_word(
+                    crate::objspace::std::classdict::class_dict_strategy_ref().imp,
+                ),
+            ),
+        ];
+        for (leaf, live) in dict_cases {
+            let registered = dyn_impl_vtable_for(leaf, "DictStrategy")
+                .unwrap_or_else(|| panic!("{leaf} not registered"));
+            assert_eq!(*live, registered, "{leaf}");
+        }
+        let set_cases: &[(&str, *const ())] = &[
+            (
+                "ObjectSetStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::setobject::object_set_strategy_ref().imp,
+                ),
+            ),
+            (
+                "IntegerSetStrategy",
+                pyre_object::lltype::fat_vtable_word(
+                    pyre_object::setobject::integer_set_strategy_ref().imp,
+                ),
+            ),
+        ];
+        for (leaf, live) in set_cases {
+            let registered = dyn_impl_vtable_for(leaf, "SetStrategy")
+                .unwrap_or_else(|| panic!("{leaf} not registered"));
+            assert_eq!(*live, registered, "{leaf}");
         }
     }
 

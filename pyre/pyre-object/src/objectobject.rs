@@ -133,6 +133,49 @@ impl crate::lltype::GcType for W_ObjectObjectUser {
     const SIZE: usize = W_OBJECT_OBJECT_USER_SIZE;
 }
 
+/// Map and header `w_class` for a `_getusercls` allocation.
+///
+/// `objspace.py allocate_instance` / `rclass.py` `instantiate` fix the
+/// RPython class at malloc. `layout_header_class` with the map
+/// `mapdict.py` `user_setup` will install (`w_subtype.terminator`) is
+/// `get_instantiate(layout_base(layout))` when that is non-null, else
+/// `w_subtype` — the same stamp `w_int_subclass_new` writes, even while
+/// the instance map is still null. A fresh object takes both words as
+/// initializing stores.
+///
+/// # Safety
+/// `layout` is the user typeptr the instance will carry. `w_subtype` is
+/// null or a live object.
+#[inline]
+pub unsafe fn instantiate_user_layout(
+    layout: *const PyType,
+    w_subtype: PyObjectRef,
+) -> (crate::mapdict::MapRef, PyObjectRef) {
+    let map = if crate::typeobject::is_type(w_subtype) {
+        crate::typeobject::w_type_get_terminator(w_subtype)
+    } else {
+        std::ptr::null()
+    };
+    // `layout_header_class` gates on a live map. `user_setup` is about to
+    // install one, so stamp the header that call would return.
+    let header = if layout.is_null() {
+        w_subtype
+    } else {
+        let base = layout_base(layout);
+        if base.is_null() {
+            w_subtype
+        } else {
+            let stamped = get_instantiate(&*base);
+            if stamped.is_null() {
+                w_subtype
+            } else {
+                stamped
+            }
+        }
+    };
+    (map, header)
+}
+
 /// Allocate a new instance of a user-defined class.
 ///
 /// PyPy equivalent: object.__new__(space, w_type) → allocate_instance

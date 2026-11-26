@@ -11,6 +11,8 @@
 mod call_spec;
 #[path = "../src/codegen_cache.rs"]
 mod codegen_cache;
+#[path = "fnaddr_adapters.rs"]
+mod fnaddr_adapters;
 #[path = "../src/llbc_fingerprint.rs"]
 mod llbc_fingerprint;
 #[path = "../src/pypyjit_driver_layout.rs"]
@@ -34,7 +36,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v26";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v27";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × with/without `pyre-module`, across a few
@@ -67,6 +69,7 @@ const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "minted_exception_classes.rs",
+    "generated_fnaddr_adapters.rs",
     "jit_metadata.json",
     "jitcodes.bin",
     "jitcodes_index.bin",
@@ -1937,6 +1940,7 @@ fn real_main() {
             paths,
             alias_groups,
             reachable,
+            pipeline.inherited_trait_defaults.clone(),
         )
         .expect("encode JitCode archive");
         let jitcodes_index_bin = bincode::serialize(&index).unwrap();
@@ -2326,6 +2330,12 @@ fn real_main() {
             bincode::serialize(&pipeline.symbolic_fnaddr_paths).unwrap(),
         )
         .unwrap();
+        // `rtyper.py` `getfunctionptr(graph)`: one word-ABI adapter per
+        // nameable symbolic target. Runtime rebinding consults the table.
+        fnaddr_adapters::write_generated_fnaddr_adapters(
+            out_dir,
+            &pipeline.symbolic_fnaddr_targets,
+        );
 
         // Same ASLR hazard for the static-data addresses the codewriter baked
         // into `constants_i` (host `PyType` singletons and prebuilt refs supplied

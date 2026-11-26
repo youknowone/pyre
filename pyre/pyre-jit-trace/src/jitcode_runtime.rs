@@ -315,7 +315,8 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
         let paths = path_names.as_slice();
         let impls = pyre_interpreter::dyn_impl_vtables();
         let slot_offsets = vtable_method_slot_offsets();
-        for (index, build_fnaddr) in entries {
+        let inherited = jitcode_index().inherited_trait_defaults.as_slice();
+        for &(index, build_fnaddr) in &entries {
             let path = paths.get(index).map(|s| s.as_str()).unwrap_or("");
             let method = path.rsplit_once("::").map(|(_, m)| m).unwrap_or("");
             let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
@@ -418,8 +419,78 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
                 );
             }
         }
+        // Trait-default jitcode (`Trait::method`, no `<impl ...>`
+        // segment): `CallControl.graphs_from` / `getfunctionptr(graph)`
+        // share that graph, so `bytecode_for_address` finds the base
+        // jitcode. Bind after the per-impl pass so an override already
+        // in the map wins (`ict_insert_fnaddr` keep-first).
+        for &(index, build_fnaddr) in &entries {
+            let path = paths.get(index).map(|s| s.as_str()).unwrap_or("");
+            let Some(method) = ict_trait_default_method(path, impls) else {
+                continue;
+            };
+            let owner_leaf = path
+                .rsplit_once("::")
+                .map(|(impl_path, _)| {
+                    let (owner_path, _) = ict_split_impl_identity(impl_path);
+                    owner_path.rsplit("::").next().unwrap_or(owner_path)
+                })
+                .unwrap_or("");
+            for (impl_key, trait_leaf, inherited_method) in inherited {
+                if trait_leaf.as_str() != owner_leaf || inherited_method.as_str() != method {
+                    continue;
+                }
+                let Some(impl_entry) = impls.iter().find(|entry| {
+                    entry.trait_leaf == trait_leaf.as_str()
+                        && pyre_interpreter::dyn_impl_key_matches(impl_key, entry.impl_key)
+                }) else {
+                    continue;
+                };
+                let Some(offset) =
+                    slot_offsets
+                        .iter()
+                        .find_map(|(slot_trait, slot_method, off)| {
+                            (slot_trait == impl_entry.trait_leaf && slot_method == method)
+                                .then_some(*off)
+                        })
+                else {
+                    continue;
+                };
+                let slot = unsafe {
+                    let p = (impl_entry.vtable as *const u8).add(offset) as *const usize;
+                    *p
+                };
+                ict_insert_fnaddr(
+                    &mut by_fnaddr,
+                    &mut declined,
+                    slot,
+                    index,
+                    method,
+                    paths,
+                    build_fnaddr,
+                );
+            }
+        }
         by_fnaddr
     });
+
+/// A trait-default ICT jitcode: owner leaf is a registered `trait_leaf`
+/// and the path has no `<impl ...>` identity segment.
+fn ict_trait_default_method<'a>(
+    path: &'a str,
+    impls: &[pyre_interpreter::DynImplVtable],
+) -> Option<&'a str> {
+    let (impl_path, method) = path.rsplit_once("::")?;
+    let (owner_path, identity_trait) = ict_split_impl_identity(impl_path);
+    if identity_trait.is_some() {
+        return None;
+    }
+    let owner_leaf = owner_path.rsplit("::").next().unwrap_or(owner_path);
+    impls
+        .iter()
+        .any(|entry| entry.trait_leaf == owner_leaf)
+        .then_some(method)
+}
 
 fn ict_split_impl_identity(impl_path: &str) -> (&str, Option<&str>) {
     if !impl_path.ends_with('>') {
@@ -5829,6 +5900,115 @@ mod tests {
         assert!(
             indirectcalltarget_index_for_address(slot).is_some(),
             "ICT map must key the rustc vtable slot {slot:#x} for IntDictStrategy::length"
+        );
+    }
+
+    fn rustc_vtable_method_slot(impl_key_suffix: &str, method: &str) -> usize {
+        let vtables = pyre_interpreter::dyn_impl_vtables();
+        let impl_entry = vtables
+            .iter()
+            .find(|entry| entry.impl_key.ends_with(impl_key_suffix))
+            .unwrap_or_else(|| panic!("{impl_key_suffix} vtable"));
+        let offset = vtable_method_slot_offsets()
+            .into_iter()
+            .find(|(trait_leaf, slot_method, _)| {
+                trait_leaf == impl_entry.trait_leaf && slot_method == method
+            })
+            .map(|(_, _, off)| off)
+            .unwrap_or_else(|| {
+                panic!(
+                    "method_{method} FieldDescr on {} {{vtable}}",
+                    impl_entry.trait_leaf
+                )
+            });
+        unsafe { *((impl_entry.vtable as *const u8).add(offset) as *const usize) }
+    }
+
+    #[test]
+    fn inherited_trait_defaults_name_module_dict_hashed_not_unicode_override() {
+        let inherited = &jitcode_index().inherited_trait_defaults;
+        assert!(
+            inherited.iter().any(|(impl_key, trait_leaf, method)| {
+                impl_key.ends_with("ModuleDictStrategy")
+                    && trait_leaf == "DictStrategy"
+                    && method == "getitem_str_hashed"
+            }),
+            "ModuleDictStrategy inherits DictStrategy::getitem_str_hashed: {inherited:?}"
+        );
+        assert!(
+            inherited.iter().all(|(impl_key, _, method)| {
+                !(impl_key.ends_with("UnicodeDictStrategy") && method == "getitem_str_hashed")
+            }),
+            "UnicodeDictStrategy overrides getitem_str_hashed: {inherited:?}"
+        );
+    }
+
+    #[test]
+    fn ict_trait_default_method_accepts_trait_path_without_impl_segment() {
+        let impls = pyre_interpreter::dyn_impl_vtables();
+        assert_eq!(
+            ict_trait_default_method(
+                "pyre_object::dictmultiobject::DictStrategy::getitem_str_hashed",
+                impls,
+            ),
+            Some("getitem_str_hashed")
+        );
+        assert_eq!(
+            ict_trait_default_method(
+                "pyre_object::celldict::ModuleDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy>::getitem_str_hashed",
+                impls,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ict_map_keys_rustc_vtable_slot_for_module_dict_getitem_str_hashed() {
+        let slot = rustc_vtable_method_slot("ModuleDictStrategy", "getitem_str_hashed");
+        assert_ne!(
+            slot, 0,
+            "rustc vtable slot for getitem_str_hashed must be non-null"
+        );
+        let index = indirectcalltarget_index_for_address(slot).unwrap_or_else(|| {
+            panic!(
+                "ICT map must key the rustc vtable slot {slot:#x} for \
+                 ModuleDictStrategy::getitem_str_hashed"
+            )
+        });
+        let path = jitcode_index()
+            .paths
+            .get(index)
+            .and_then(|p| p.as_ref())
+            .map(|p| p.display_name())
+            .unwrap_or_default();
+        assert!(
+            path.ends_with("DictStrategy::getitem_str_hashed") && !path.contains("<impl "),
+            "inherited slot must bind the trait-default jitcode, got {path}"
+        );
+    }
+
+    #[test]
+    fn ict_map_keeps_unicode_dict_getitem_str_hashed_override() {
+        let slot = rustc_vtable_method_slot("UnicodeDictStrategy", "getitem_str_hashed");
+        assert_ne!(
+            slot, 0,
+            "rustc vtable slot for getitem_str_hashed must be non-null"
+        );
+        let index = indirectcalltarget_index_for_address(slot).unwrap_or_else(|| {
+            panic!(
+                "ICT map must key the rustc vtable slot {slot:#x} for \
+                 UnicodeDictStrategy::getitem_str_hashed"
+            )
+        });
+        let path = jitcode_index()
+            .paths
+            .get(index)
+            .and_then(|p| p.as_ref())
+            .map(|p| p.display_name())
+            .unwrap_or_default();
+        assert!(
+            path.contains("UnicodeDictStrategy"),
+            "override slot must keep the impl jitcode, got {path}"
         );
     }
 

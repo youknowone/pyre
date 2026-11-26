@@ -2128,6 +2128,8 @@ fn a_callable_callees_reachable_abort_is_not_a_resume_blocker() {
 /// the blackhole calls it natively (`bhimpl_inline_call_*`).
 #[test]
 fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
     fn install_inline_helper(name: &str, descr: u16) -> usize {
         let mut code = inline_call_with_descr(descr);
         code.extend(void_return());
@@ -2204,6 +2206,8 @@ fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
 /// scan must not treat that callee's reachable abort as a blocker.
 #[test]
 fn list_type_call_resume_levels_do_not_reach_a_blocker() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
     if let (Some(index), Some(resume_pc)) = (
         crate::ctor_continuation::jitcode_index(),
         crate::ctor_continuation::resume_pc(),
@@ -23311,11 +23315,80 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
     reset_single_frame_blackhole();
 }
 
+/// Test-local collecting-rooted / owns-object hooks for wrapper-args
+/// `alloc_cleared_ref_items_block_gc`. Shape of `headered_young_alloc_rooted`
+/// / `young_frame_alloc_is_owned` / `ClearYoungFrameHooks`.
+thread_local! {
+    static WRAPPER_ARGS_GC_ALLOCS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn headered_wrapper_args_alloc(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+    let header = majit_gc::header::GcHeader::SIZE;
+    let align = majit_gc::header::GcHeader::ALIGN
+        .max(std::mem::align_of::<pyre_object::object_array::ItemsBlock>());
+    let layout = std::alloc::Layout::from_size_align(header + payload_size.max(1), align)
+        .expect("wrapper args layout");
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (raw as *mut majit_gc::header::GcHeader).write(majit_gc::header::GcHeader::new(type_id));
+    }
+    let payload = unsafe { raw.add(header) };
+    WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow_mut().push(payload as usize));
+    payload as pyre_object::gc_hook::GCREF
+}
+
+unsafe fn headered_wrapper_args_alloc_rooted(
+    type_id: u32,
+    payload_size: usize,
+    _root: *mut pyre_object::gc_hook::GCREF,
+    needs_write_barrier: *mut bool,
+) -> pyre_object::gc_hook::GCREF {
+    unsafe { *needs_write_barrier = false };
+    headered_wrapper_args_alloc(type_id, payload_size)
+}
+
+fn wrapper_args_alloc_is_owned(addr: usize) -> bool {
+    WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+}
+
+struct WrapperArgsGcHooks {
+    _hook_lock: pyre_object::gc_hook::HookTestGuard,
+}
+
+impl WrapperArgsGcHooks {
+    fn install() -> Self {
+        let hook_lock = pyre_object::gc_hook::hook_test_guard();
+        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(
+            headered_wrapper_args_alloc_rooted,
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(wrapper_args_alloc_is_owned);
+        Self {
+            _hook_lock: hook_lock,
+        }
+    }
+}
+
+impl Drop for WrapperArgsGcHooks {
+    fn drop(&mut self) {
+        pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+        pyre_object::gc_hook::clear_gc_owns_object_hook();
+        WRAPPER_ARGS_GC_ALLOCS.with(|slots| slots.borrow_mut().clear());
+    }
+}
+
 /// No-driver `walk_translated_builtin_wrapper` dest-write is `finishframe`
 /// then `_interpret` / `blackhole_if_trace_too_long`. Parked-completed is
 /// false (the nested guard has dropped).
 #[test]
 fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
+    let _gc_hooks = WrapperArgsGcHooks::install();
+    let ref_guard = *insns_opname_to_byte()
+        .get("ref_guard_value/r")
+        .unwrap_or_else(|| panic!("`ref_guard_value/r` must be in insns table"));
     let int_add = *insns_opname_to_byte()
         .get("int_add/ii>i")
         .expect("`int_add/ii>i` must be in insns table");
@@ -23323,9 +23396,12 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
         .get("ref_return/r")
         .expect("`ref_return/r` must be in insns table");
     let constants_i: &'static [i64] = Box::leak(Box::new([1i64, 2]));
-    // i1/i2 are constants; i0 is the add dest. r0 is the wrapper args array.
+    // r0 is the wrapper args array; its ref_guard_value is the op that
+    // crosses the budget. The second ref_guard_value pads the 4-byte
+    // int_add slot so the remaining constant int_adds stay in place.
     let child_code: &'static [u8] = Box::leak(Box::new([
-        int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, ref_ret, 0,
+        ref_guard, 0, ref_guard, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, ref_ret,
+        0,
     ]));
     let child_index = install_named_helper_jitcode(
         "no_driver_wrapper_child_helper",
@@ -23360,7 +23436,8 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     let ops_at_entry = tc.num_recorded_ops();
     let mut concrete_i = [ConcreteValue::Int(0)];
     let regs_i = [dummy_int_add_box(&mut tc)];
-    tc.set_trace_limit(ops_at_entry + 1);
+    let wrapper_args_ops = 2; // NEW_ARRAY_CLEAR + one SETARRAYITEM_GC (record_wrapper_args_array)
+    tc.set_trace_limit(ops_at_entry + wrapper_args_ops + 1);
     assert!(
         !tc.is_too_long(),
         "the parent must enter under budget so the child ordinary steps cut"
@@ -28382,6 +28459,207 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
 }
 
 #[test]
+fn getinteriorfield_gc_i_cache_miss_records_op_and_writes_dst() {
+    // First `getinteriorfield_gc_i/rid>i` is a heapcache miss — record
+    // GetinteriorfieldGcI with [array, index] + descr; write recorder
+    // result into i-dst and update heapcache.
+    let byte = *insns_opname_to_byte()
+        .get("getinteriorfield_gc_i/rid>i")
+        .expect("`getinteriorfield_gc_i/rid>i` must be in insns table");
+    // Operand layout `rid>i`: 1B r-reg(2) + 1B i-reg(3) +
+    // 2B descr(LE 1) + 1B i-dst(5).
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
+    let array = regs_r[2];
+    let index = regs_i[3];
+    let dst_pre = regs_i[5];
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+    done_descr_ref_for_tests();
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getinteriorfield_gc_i must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "getinteriorfield_gc_i/rid>i operand layout = 5 bytes"
+    );
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
+    assert_ne!(dst_post, dst_pre);
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before + 1);
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::GetinteriorfieldGcI);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![array, index],
+        "GetinteriorfieldGcI args must be [array, index]",
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &last.getdescr().expect("must carry interior field descr"),
+        &descr,
+    ));
+    assert_eq!(dst_post, last.pos().get());
+}
+
+/// Immortal (non-GC) array-of-struct: `try_gc_owns` is false on this
+/// storage, matching `getarrayitem_gc_headerless_const_index_stamps_the_byte`.
+/// `interior_sanity_load` still stamps `bh_getinteriorfield_gc_i`.
+#[test]
+fn getinteriorfield_gc_i_immortal_array_stamps_the_byte() {
+    let byte = *insns_opname_to_byte()
+        .get("getinteriorfield_gc_i/rid>i")
+        .expect("`getinteriorfield_gc_i/rid>i` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let cpu = PureArrayTestCpu;
+    let mut storage = vec![0u8; 8 + 32];
+    storage[..std::mem::size_of::<usize>()].copy_from_slice(&1usize.to_ne_bytes());
+    storage[8 + 8] = 0x01;
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    regs_i[3] = tc.const_int(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("immortal getinteriorfield");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert!(
+        !dst.is_constant(),
+        "a getinteriorfield miss records the load"
+    );
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        Some(majit_ir::Value::Int(1))
+    );
+    assert_eq!(wc.trace_ctx.num_ops(), ops_before + 1);
+    drop(wc);
+    drop(storage);
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let mut storage = vec![0u8; 8 + 32];
+    storage[..std::mem::size_of::<usize>()].copy_from_slice(&1usize.to_ne_bytes());
+    storage[8 + 8] = 0x01;
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_interior_field_descr(1, 8, 32, 8, 1, 1, 2);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    let zero = tc.const_int(0);
+    let idx = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(idx, majit_ir::Value::Int(0));
+    regs_i[3] = idx;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(&code, 0, &mut wc).expect("non-const immortal getinteriorfield");
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        Some(majit_ir::Value::Int(1)),
+        "a non-constant index whose Box.value is Int(0) still stamps"
+    );
+    drop(wc);
+    drop(storage);
+}
+
+#[test]
 fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     // Pre-cache (array, index, descr) →
     // cached_box. Second invocation must return cached_box and
@@ -30176,6 +30454,96 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
             panic!("expected CloseLoop after resolving jdindex from the int bank, got {other:?}")
         }
     }
+}
+
+/// `generator.py generatorentry_driver` declares one Ref green (`pycode`)
+/// and two Ref reds (`gen`, `w_arg`). The dispatcher must select that schema
+/// by jdindex instead of requiring pypyjit's two Int greens.
+#[test]
+fn jit_merge_point_generatorentry_pycode_only_green_uses_driver_descriptor() {
+    crate::state::ensure_trace_test_driver();
+    {
+        let (driver, _) = crate::driver::driver_pair();
+        let meta = driver.meta_interp_mut();
+        let _ = meta.warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX);
+        let slot_ok = meta
+            .staticdata
+            .jitdrivers_sd
+            .get(crate::genentry_state::GENERATORENTRY_JD_INDEX)
+            .is_some_and(|jd| {
+                jd.green_kind_counts() == (0, 1, 0) && jd.red_kind_counts() == (0, 2, 0)
+            });
+        if !slot_ok {
+            let mut descriptor = crate::state::PyreJitState::generatorentry_driver_descriptor();
+            descriptor.index = Some(crate::genentry_state::GENERATORENTRY_JD_INDEX);
+            if let Some(slot) =
+                meta.jitdriver_sd_mut(crate::genentry_state::GENERATORENTRY_JD_INDEX)
+            {
+                descriptor.warmstate = slot.warmstate.clone();
+                *slot = descriptor;
+            }
+            meta.finish_setup_descrs_for_jitdrivers();
+        }
+        let descriptor =
+            &meta.staticdata.jitdrivers_sd[crate::genentry_state::GENERATORENTRY_JD_INDEX];
+        assert_eq!(descriptor.green_kind_counts(), (0, 1, 0));
+        assert_eq!(descriptor.red_kind_counts(), (0, 2, 0));
+    }
+
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte,
+        crate::genentry_state::GENERATORENTRY_JD_INDEX as u8,
+        0x00, // green Ints
+        0x01,
+        0x00, // green Refs: pycode=r0
+        0x00, // green Floats
+        0x00, // red Ints
+        0x02,
+        0x01,
+        0x02, // red Refs: gen=r1, w_arg=r2
+        0x00, // red Floats
+    ];
+    let mut tc = fresh_trace_ctx();
+    let pycode = tc.const_ref(test_pycode_ptr() as i64);
+    let generator = tc.const_ref(0x2_0000);
+    let w_arg = tc.const_ref(0x3_0000);
+    let regs_r = RegisterBank::new([pycode, generator, w_arg]);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let (outcome, next_pc) = step(&code, 0, &mut wc)
+        .expect("generatorentry merge point must not require portal Int greens");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
 }
 
 /// A green list with no concrete leading element cannot form the
@@ -32566,6 +32934,7 @@ fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
     use majit_ir::Value;
     use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
 
+    let _gc_hooks = WrapperArgsGcHooks::install();
     const NLOCALS: usize = 0;
     const BOX_VSD: i64 = 0;
     const BOX_LAST_INSTR: i64 = 174;

@@ -14873,13 +14873,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_accumulator_hlops_emit_inline_or_residual_call_r_v() {
-        // 2-Ref `set_add(set, value)` lowers to `inline_call_r_v(JitCode,
-        // ListR([set, value]))` of the bound `opcode_ops::set_add_value`
-        // body.  3-Ref `map_add(dict, key, value)` keeps
-        // `residual_call_r_v(ConstInt(fn_idx), ListR([...]), Descr)` (void,
-        // MayForce).  Confirms opname dispatch, the Ref-operand count, and
-        // the absence of a result Register.
+    fn lower_accumulator_hlops_emit_inline_call_r_v() {
+        // Both `set_add(set, value)` (2-Ref) and `map_add(dict, key, value)`
+        // (3-Ref) lower to `inline_call_r_v(JitCode, ListR([...]))` of their
+        // bound `opcode_ops::*_value` bodies.  Confirms opname dispatch, the
+        // Ref-operand count, and the absence of a result Register.
         let (ctx, _, _) = load_attr_lowering_fixture();
         let mut get_register = |var: Variable| match var.id {
             VariableId(1) => Register {
@@ -14933,7 +14931,7 @@ mod tests {
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }
 
-        // 3-Ref: map_add → fn_idx 123, ListR = [dict, key, value].
+        // 3-Ref: map_add → JitCode(map_add_value), ListR = [dict, key, value].
         let key = Variable::new(VariableId(3), Kind::Ref);
         let op3 = super::super::flow::SpaceOperation::new(
             "map_add",
@@ -14949,15 +14947,24 @@ mod tests {
         )
         .expect("map_add lowering must succeed");
         match insn3 {
-            Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "residual_call_r_v");
-                assert!(matches!(args[0], Operand::ConstInt(123)));
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "inline_call_r_v");
+                assert!(
+                    matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
+                    "map_add inline target, got {:?}",
+                    args[0]
+                );
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.content.len(), 3, "map_add is 3-Ref");
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }
+                assert_eq!(result, None, "map_add is void");
             }
             _ => panic!("expected Insn::Op, got {insn3:?}"),
         }

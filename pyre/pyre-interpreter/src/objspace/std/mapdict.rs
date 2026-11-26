@@ -369,6 +369,19 @@ pub unsafe fn set_type_hasdict(w_type: PyObjectRef, v: bool) {
     unsafe { install_type_terminator(w_type) };
 }
 
+/// mapdict.py `MapdictStorageMixin.user_setup` —
+/// `_mapdict_init_empty(w_subtype.terminator)`.
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier. `w_subtype` must be a live
+/// `W_TypeObject` whose terminator is already installed.
+pub unsafe fn user_setup(obj: PyObjectRef, w_subtype: PyObjectRef) {
+    let term = unsafe { ensure_type_terminator(w_subtype) };
+    // mapdict.py `_mapdict_init_empty` → `_set_mapdict_map`.
+    let mut inst = unsafe { mapdict_carrier(obj) };
+    inst._set_mapdict_map(term);
+}
+
 /// `_mapdict_init_empty` for a carrier whose `map` is still null
 /// (`mapdict.py user_setup` copies `w_subtype.terminator` at construction;
 /// `typeobject.py W_TypeObject.__init__` stores that terminator after layout).
@@ -6630,7 +6643,8 @@ pyre_object::define_prebuilt_dict_strategy_ref!(
     MAP_DICT_STRATEGY_REF,
     map_dict_strategy_ref,
     pyre_object::dictmultiobject::StrategyKind::Map,
-    &MAP_DICT_STRATEGY
+    &MAP_DICT_STRATEGY,
+    DYN_IMPL_MapDictStrategy_canonical_dyn
 );
 
 pyre_object::register_dyn_impl_vtable!(DYN_IMPL_MapDictStrategy, MapDictStrategy, DictStrategy);
@@ -6898,11 +6912,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py:1268-1276 iterator order.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> pyre_object::PyObjectRef {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
@@ -6911,11 +6921,25 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);
         let nodes = dict_nodes_in_order(&inst);
-        let node = *nodes.get(index)?;
-        Some((
-            pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name),
-            plain_direct_read(node, &inst),
-        ))
+        let Some(node) = nodes.get(index).copied() else {
+            return pyre_object::PY_NULL;
+        };
+        pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name)
+    }
+
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> pyre_object::PyObjectRef {
+        let w_obj = mapdict_strategy_unerase(w_dict);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        ensure_mapdict_initialized(w_obj);
+        let inst = mapdict_carrier(w_obj);
+        let nodes = dict_nodes_in_order(&inst);
+        let Some(node) = nodes.get(index).copied() else {
+            return pyre_object::PY_NULL;
+        };
+        plain_direct_read(node, &inst)
     }
 
     /// mapdict.py `MapDictKeyIteratorReversed`.

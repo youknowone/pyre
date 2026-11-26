@@ -22611,6 +22611,152 @@ mod tests {
         );
     }
 
+    /// `taken_by_address` of a FLAG_STRUCT at offset 0 of a GC owner
+    /// (`ObjectKey` at `Entry`+0). `jtransform.py`
+    /// `Transformer.rewrite_op_getsubstruct` refuses every owner whose
+    /// `_gckind != 'raw'`, so a GC wide-inline borrow aborts with
+    /// `RawAddr`.
+    #[test]
+    fn rewrite_op_getfield_gc_wide_inline_borrow_offset_zero_aborts() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "jtransform_entry::Entry";
+        let key = "jtransform_entry::ObjectKey";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let key_id = majit_ir::descr::StructId::from_canonical(key);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (key.to_string(), Some(key_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 3 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "key".into(),
+                        offset: 0,
+                        size: 2 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "value".into(),
+                        offset: 2 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            key_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "hash".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "obj".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::headerless(owner)]);
+
+        let mut graph = FunctionGraph::new("get_slot_key");
+        let entry = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "entry".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, entry.clone());
+        let key_ref = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: entry.clone(),
+                    field: FieldDescriptor::new("key", Some(owner.into()))
+                        .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        // Returned so `simplify.py transform_dead_op_vars` /
+        // `prune_dead_phis` keeps the read (`lloperation.py`
+        // `enum_ops_without_sideeffects` of `getfield`).
+        let hash_result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key_ref,
+                    field: FieldDescriptor::new("hash", Some(key.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(hash_result));
+
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a GC wide-inline borrow aborts; ops={ops:?}"
+        );
+    }
+
     /// GC struct whose first field is another GC struct
     /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
     /// a subsequent field read is `getfield_gc_*` on the same object.

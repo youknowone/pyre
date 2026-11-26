@@ -6390,6 +6390,136 @@ fn registered_dyn_impl_vtable_pairs(llbc: &Llbc) -> &[(String, String)] {
         .get_or_init(|| harvest_registered_dyn_impl_vtables(llbc))
 }
 
+/// `(impl_key, trait_leaf, method)` of each registered dyn-impl vtable
+/// slot that uses the trait's provided default body.
+///
+/// Charon `TraitImpl.methods` lists every slot, including provided
+/// methods the impl did not override: those rows keep
+/// `TraitDecl.methods[].default` as `fn_id`. An override's `fn_id` is a
+/// different FunDecl (`trait_impl_id_for_fundecl` is `Some`). RPython
+/// `CallControl.graphs_from` / `getfunctionptr(graph)` has no
+/// per-subclass copy of an inherited method, so
+/// `MetaInterpStaticData.bytecode_for_address` finds the base jitcode.
+pub fn inherited_dyn_impl_methods(llbc: &Llbc) -> Vec<(String, String, String)> {
+    llbc_derived(llbc)
+        .inherited_dyn_impl_methods
+        .get_or_init(|| harvest_inherited_dyn_impl_methods(llbc))
+        .clone()
+}
+
+pub(crate) fn inherited_dyn_impl_methods_across(llbcs: &[&Llbc]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for llbc in llbcs {
+        out.extend(inherited_dyn_impl_methods(llbc));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn harvest_inherited_dyn_impl_methods(llbc: &Llbc) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let registered = registered_dyn_impl_vtable_pairs(llbc);
+    if registered.is_empty() {
+        return out;
+    }
+    for (impl_key, trait_leaf) in registered {
+        for td in llbc.iter_trait_decls() {
+            let trait_path = td.item_meta.name_path_str();
+            let leaf = trait_path.rsplit("::").next().unwrap_or(trait_path);
+            if leaf != trait_leaf.as_str() {
+                continue;
+            }
+            for (row_index, row) in llbc.trait_impl_rows_of(td.def_id) {
+                let Some(self_ty) = row
+                    .get("impl_trait")
+                    .and_then(|impl_trait| impl_trait.get("generics"))
+                    .and_then(|generics| generics.get("types"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|types| types.first())
+                else {
+                    continue;
+                };
+                let Some(src_id) = json_ty_adt_def_id(llbc, self_ty) else {
+                    continue;
+                };
+                let Some(src_path) = llbc.type_by_id(src_id).map(|t| t.item_meta.name_path())
+                else {
+                    continue;
+                };
+                if src_path != *impl_key {
+                    continue;
+                }
+                let methods = llbc.trait_impl_methods(row_index);
+                let n = td.methods.len().max(methods.len());
+                for i in 0..n {
+                    let Some(name) = inherited_trait_method_name(llbc, td, i) else {
+                        continue;
+                    };
+                    if impl_method_is_inherited_default(llbc, td, methods, i, &name) {
+                        out.push((impl_key.clone(), trait_leaf.clone(), name));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn inherited_trait_method_name(
+    llbc: &Llbc,
+    td: &majit_charon_reader::TraitDecl,
+    i: usize,
+) -> Option<String> {
+    td.methods
+        .get(i)
+        .and_then(|method| method.name.clone())
+        .or_else(|| {
+            llbc.trait_method_name(td.def_id, i as u64)
+                .map(str::to_string)
+        })
+}
+
+fn impl_method_is_inherited_default(
+    llbc: &Llbc,
+    td: &majit_charon_reader::TraitDecl,
+    methods: &[Option<majit_charon_reader::ImplMethod>],
+    i: usize,
+    name: &str,
+) -> bool {
+    let default_id = td.methods.get(i).and_then(|method| method.default_id);
+    let impl_fn = impl_method_fn_id(llbc, td.def_id, methods, i, name);
+    match (impl_fn, default_id) {
+        (None, Some(_)) => true,
+        (None, None) => false,
+        (Some(fn_id), Some(default_id)) if fn_id == default_id => true,
+        (Some(fn_id), _) => llbc
+            .fn_by_id(fn_id)
+            .is_some_and(|fd| trait_impl_id_for_fundecl(fd).is_none()),
+    }
+}
+
+fn impl_method_fn_id(
+    llbc: &Llbc,
+    trait_id: u64,
+    methods: &[Option<majit_charon_reader::ImplMethod>],
+    i: usize,
+    name: &str,
+) -> Option<u64> {
+    if let Some(Some(method)) = methods.get(i)
+        && let Some(fn_id) = method.fn_id
+    {
+        return Some(fn_id);
+    }
+    methods.iter().flatten().find_map(|method| {
+        let idx = method.method_idx.unwrap_or(i as u64);
+        let method_name = llbc.trait_method_name(method.trait_id.unwrap_or(trait_id), idx)?;
+        (method_name == name).then_some(method.fn_id).flatten()
+    })
+}
+
 /// `(impl_key, trait_leaf)` of each static whose declared type is
 /// `pyre_object::lltype::DynImplVtableDesc` (`register_dyn_impl_vtable!`).
 /// The static ident is caller-chosen; selection is the ADT name path

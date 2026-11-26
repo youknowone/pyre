@@ -4051,11 +4051,11 @@ impl OptHeapState {
                 if seen.is_none() {
                     continue;
                 }
-                // serialize_optheap: box2 = box2.get_box_replacement(); keep
-                // the boxes. `available_boxes` is applied later in bridgeopt.
-                let obj = obj.get_box_replacement(false);
+                // serialize_optheap: `box1` stays the cached struct as stored;
+                // only `box2 = box2.get_box_replacement()`. `available_boxes`
+                // is applied later in bridgeopt.
                 let val = seen.get_box_replacement(false);
-                result.push((obj, descr.clone(), val));
+                result.push((obj.clone(), descr.clone(), val));
             }
         }
         result
@@ -4176,10 +4176,10 @@ impl OptHeapState {
                     if seen.is_none() {
                         continue;
                     }
-                    // serialize_optheap: box2 = box2.get_box_replacement(); keep
-                    // the boxes. `available_boxes` is applied later in bridgeopt.
+                    // serialize_optheap: `box1` stays the cached array as
+                    // stored; only `box2 = box2.get_box_replacement()`.
                     result.push((
-                        obj.get_box_replacement(false),
+                        obj.clone(),
                         index,
                         descr.clone(),
                         seen.get_box_replacement(false),

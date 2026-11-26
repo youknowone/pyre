@@ -1052,7 +1052,11 @@ mod tests {
             "Ref"
         } else if graph.return_is_str {
             "Ref"
-        } else if graph.return_type.as_deref() == Some("i64") {
+        } else if graph
+            .return_type
+            .as_deref()
+            .is_some_and(|t| crate::front::mir::int_result_token_kind(t) == Some(true))
+        {
             "Int"
         } else {
             "mixed"

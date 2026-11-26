@@ -151,6 +151,76 @@ pub struct PipelineResult {
 
 pub use majit_jitcode::artifacts::CompiledJitDriver;
 
+/// What the translator knows about a callee it could only give a symbolic
+/// address: the path the jitcodes record, the calldescr ABI that path's
+/// graph lowers to, and the LLBC signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolicFnaddrTarget {
+    /// `CallPath::canonical_key()`, exactly the string in `symbolic_fnaddr_paths`.
+    pub path: String,
+    /// `CallControl::calldescr_abi_for_path` (`"ww>w"`-style), `None` when it has none.
+    pub abi: Option<String>,
+    /// The graph's `exceptiontransformed`: its `Result<T, E>` return was peeled to `T`.
+    pub exception_transformed: bool,
+    /// The LLBC function declaration whose name path equals `path`,
+    /// or `<local crate>::<path>` for exactly one local crate root. `None` when there is none or more than one.
+    pub decl: Option<SymbolicTargetDecl>,
+    /// The declaration's own `item_meta.name_path()` when it differs from
+    /// `path` only by the local crate prefix `path` was stripped of; the
+    /// Rust spelling an adapter calls. `None` when `decl` is `None`.
+    #[serde(default)]
+    pub decl_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolicTargetDecl {
+    /// `item_meta.attr_info.public`.
+    pub public: bool,
+    /// `item_meta.is_local`.
+    pub is_local: bool,
+    /// `generics` declares type or const parameters, or trait clauses.
+    pub is_generic: bool,
+    /// The name's second-to-last segment is an `Impl` segment (an inherent or trait method).
+    pub is_method: bool,
+    /// `signature.is_unsafe`.
+    pub is_unsafe: bool,
+    pub inputs: Vec<TyShape>,
+    pub output: TyShape,
+}
+
+/// The shape of one LLBC type, enough to choose a word conversion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TyShape {
+    Unit,
+    Bool,
+    Char,
+    /// `signed`, width in bits (`isize`/`usize` report the target pointer width).
+    Int {
+        signed: bool,
+        bits: u32,
+    },
+    Float {
+        bits: u32,
+    },
+    /// `*const T` / `*mut T`; `sized` is false for `str`, slices, `dyn`.
+    RawPtr {
+        mutable: bool,
+        sized: bool,
+    },
+    /// `&T` / `&mut T`; `sized` is false for `str`, slices, `dyn`.
+    Ref {
+        mutable: bool,
+        sized: bool,
+    },
+    /// An ADT: its `name_path()` and the shapes of its type arguments.
+    Adt {
+        path: String,
+        args: Vec<TyShape>,
+    },
+    /// Anything else (tuple, array, fn pointer, never, type parameter, ...).
+    Other,
+}
+
 /// Result of running the pipeline on a full program.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgramPipelineResult {
@@ -168,6 +238,11 @@ pub struct ProgramPipelineResult {
     /// a description of the callee it stands for.  Lets a consumer resolve a
     /// symbolic funcbox constant back to the function it replaced.
     pub symbolic_fnaddr_paths: Vec<(i64, String)>,
+    /// Per-path facts for each row of [`Self::symbolic_fnaddr_paths`], same
+    /// order. A consumer that emits a word-ABI adapter (`rtyper.py`
+    /// `getfunctionptr`) reads the calldescr ABI and the LLBC signature here.
+    #[serde(default)]
+    pub symbolic_fnaddr_targets: Vec<SymbolicFnaddrTarget>,
     /// RPython `Assembler.indirectcalltargets`, encoded by identity as dense
     /// indices into `jitcodes`.
     #[serde(default)]
@@ -196,6 +271,12 @@ pub struct ProgramPipelineResult {
     /// key.
     #[serde(skip)]
     pub jitcode_alias_paths: Vec<Vec<crate::parse::CallPath>>,
+    /// `(impl_key, trait_leaf, method)` whose rustc vtable slot is the
+    /// trait default body. Frozen into `JitCodeIndex` so
+    /// `bytecode_for_address` binds the base jitcode the way
+    /// `getfunctionptr(graph)` shares the base funcptr.
+    #[serde(default)]
+    pub inherited_trait_defaults: Vec<(String, String, String)>,
     /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
     /// table grown on-demand by `write_insn`. Persisted alongside the
     /// jitcodes so the runtime can map bytecode bytes back to opnames —
@@ -297,9 +378,11 @@ mod tests {
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
             symbolic_fnaddr_paths: Vec::new(),
+            symbolic_fnaddr_targets: Vec::new(),
             indirectcalltarget_indices: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             jitcode_alias_paths: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),

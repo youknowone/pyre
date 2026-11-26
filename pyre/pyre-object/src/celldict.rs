@@ -1471,12 +1471,8 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// whole storage.  The trait default rebuilds `items()` per step, and this
     /// strategy's `items` wraps every name into a fresh immortal string, so the
     /// default makes a single view walk quadratic in unreclaimable allocations.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        crate::dictmultiobject::w_module_dict_nth_item_inner(w_dict, index)
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        crate::dictmultiobject::w_module_dict_nth_key_inner(w_dict, index)
     }
 
     /// A `values()` view needs no name at all, so it skips the wrap entirely
@@ -1487,21 +1483,22 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
 
     /// Both storage halves tombstone their deletes, so neither numbers its
     /// entries densely; the default would walk positions.
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
+    /// `_ll_dictnext` / `_ll_dictnext_reversed` Signed index.
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            return entries.next_valid_slot(from);
+            return crate::rordereddict::ll_dictnext(entries, from);
         }
-        self.next_entry_slot(
+        crate::rordereddict::ll_dictnext(
             crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             from,
         )
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            return entries.prev_valid_slot(before);
+            return crate::rordereddict::ll_dictprev(entries, before);
         }
-        self.prev_entry_slot(
+        crate::rordereddict::ll_dictprev(
             crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             before,
         )
@@ -1528,7 +1525,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             // stays valid until `version` is reassigned. `delitem` pairs the
             // two calls the same way on the object-storage arm.
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-            return Some((k.obj, v));
+            return Some((k.0, v));
         }
         let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
         let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
@@ -1546,7 +1543,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `:208 wrapvalue`.
     unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            return entries.iter().rev().map(|(k, &v)| (k.obj, v)).collect();
+            return entries.iter().rev().map(|(k, &v)| (k.0, v)).collect();
         }
         let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         storage

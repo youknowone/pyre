@@ -1158,18 +1158,10 @@ pub fn allocate_lock() -> *mut Lock {
     Box::into_raw(Box::new(Lock::new()))
 }
 
-/// Whether `needle` is pointer-identical to any entry of an installed MRO
-/// slice.  Shared by [`issubtype_w`] and
-/// [`crate::typedef::check_user_subclass`].
-pub(crate) fn mro_contains(mro: &[PyObjectRef], needle: PyObjectRef) -> bool {
-    mro.iter().any(|&t| std::ptr::eq(t, needle))
-}
-
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
-/// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py:1640-1644
-/// _issubtype`: `w_type in w_sub.mro_w`); a type whose MRO is not yet
-/// installed (`mro_ptr` null / `not hasmro`) takes the
-/// [`issubtype_slow_and_wrong`] base-chain walk.
+/// `w_type.mro_w`. Routes through typeobject.py `W_TypeObject.issubtype`
+/// ([`type_issubtype`]); a type whose MRO is not yet installed
+/// (`not hasmro`) takes `_issubtype_slow_and_wrong`.
 pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() {
         return false;
@@ -21017,19 +21009,19 @@ pub(crate) fn set_iter_descr_next(obj: PyObjectRef) -> PyResult {
             );
             return Err(PyError::stop_iteration());
         };
-        let Some(key) =
-            pyre_object::w_set_key_at(pyre_object::gc_roots::shadow_stack_get(base + 1), slot)
-        else {
+        let key =
+            pyre_object::w_set_key_at(pyre_object::gc_roots::shadow_stack_get(base + 1), slot);
+        if key.is_null() {
             pyre_object::w_set_iter_set_set(
                 pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::PY_NULL,
             );
             return Err(PyError::stop_iteration());
-        };
+        }
         // Pin the yielded key, then read the iterator back: `pin_roots`
         // normalizes, and that query is a safepoint when another mutator
         // exists. `try_hash_w` inside `w_set_key_at` has the same window.
-        let key_slot = pyre_object::gc_roots::pin_roots(&[key.obj]);
+        let key_slot = pyre_object::gc_roots::pin_roots(&[key]);
         let obj = pyre_object::gc_roots::shadow_stack_get(base);
         pyre_object::w_set_iter_set_index(obj, index + 1);
         pyre_object::w_set_iter_set_slot(obj, slot + 1);

@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=9.2
+# pyre-check: jitstats-band=guard_failures=2
+# Windows dynasm reads guard_failures 3994 (one more execution of an existing
+# guard; 3 loops / 17 bridges unchanged); every other host reads 3993.
 #
 # Floor is 9.2 / 4 = 2.3x (below the local dynasm minimum 2.6x). Local
 # macOS arm64 dynasm 2.6x-3.0x, cranelift 3.0x-3.7x. Estimated CI

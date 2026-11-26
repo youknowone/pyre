@@ -7518,6 +7518,28 @@ fn ref_result_from_call(
     Some(builder.inst_results(call)[0])
 }
 
+/// `callbuilder.py load_result`: a narrow integer FUNC.RESULT is sign- or
+/// zero-extended from `result_size` (x86 `CallBuilderX86.load_result`).
+fn extend_call_int_result(
+    builder: &mut FunctionBuilder,
+    value: CValue,
+    result_size: usize,
+    result_signed: bool,
+) -> CValue {
+    let narrow = match result_size {
+        1 => cl_types::I8,
+        2 => cl_types::I16,
+        4 => cl_types::I32,
+        _ => return value,
+    };
+    let reduced = builder.ins().ireduce(narrow, value);
+    if result_signed {
+        builder.ins().sextend(cl_types::I64, reduced)
+    } else {
+        builder.ins().uextend(cl_types::I64, reduced)
+    }
+}
+
 /// `callbuilder.py` `AbstractCallBuilder.emit` sequence: spill /
 /// `push_gcmap` / CALL / `pop_gcmap` / reload, gated on `can_collect`.
 /// `emit_no_collect` is the same CALL with that envelope skipped.
@@ -7650,7 +7672,19 @@ fn emit_indirect_call_from_parts(
         },
     );
 
-    ref_result_from_call(builder, call, result_type)
+    let result = ref_result_from_call(builder, call, result_type);
+    if result_type == Type::Int {
+        result.map(|value| {
+            extend_call_int_result(
+                builder,
+                value,
+                call_descr.result_size(),
+                call_descr.is_result_signed(),
+            )
+        })
+    } else {
+        result
+    }
 }
 
 /// x86/regalloc.py `consider_cond_call`: `assert 2 <= len(args) <= 4 + 2`
@@ -16501,6 +16535,18 @@ impl CraneliftBackend {
                     }
                     let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &args);
                     let result = ref_result_from_call(&mut builder, call, result_type);
+                    let result = if result_type == Type::Int {
+                        result.map(|value| {
+                            extend_call_int_result(
+                                &mut builder,
+                                value,
+                                call_descr.result_size(),
+                                call_descr.is_result_signed(),
+                            )
+                        })
+                    } else {
+                        result
+                    };
                     if save_err != 0 {
                         let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
                         let _ = emit_host_call(

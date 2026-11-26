@@ -14174,7 +14174,8 @@ pub fn call_and_check(
     Ok(result)
 }
 
-/// intobject.py _new_baseint
+/// intobject.py `_new_int` / `_new_baseint` — arity check on the
+/// `x`, `base` pair (`PY_NULL` omitted).
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Bound scope from `parse_obj` on `int.__new__`: `x`, `base`
     // (`PY_NULL` omitted). intobject.py `descr_new`.
@@ -14184,19 +14185,31 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             args.len()
         )));
     }
-    let w_base = if args.len() > 1 && !args[1].is_null() {
-        Some(args[1])
+    builtin_int_from(
+        args.first().copied().unwrap_or(PY_NULL),
+        args.get(1).copied().unwrap_or(PY_NULL),
+    )
+}
+
+/// intobject.py `_new_int(space, w_inttype, w_x, w_base)` / `_new_baseint`
+/// — `w_x` / `w_base` are the unwrapped arguments (`PY_NULL` omitted).
+pub(crate) fn builtin_int_from(
+    w_x: PyObjectRef,
+    w_base: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let w_base = if !w_base.is_null() {
+        Some(w_base)
     } else {
         None
     };
-    let mut obj = if args.is_empty() || args[0].is_null() {
+    let mut obj = if w_x.is_null() {
         // intobject.py descr_new — a base without a value is a missing source.
         if w_base.is_some() {
             return Err(crate::PyError::type_error("int() missing string argument"));
         }
         return Ok(w_int_new(0));
     } else {
-        args[0]
+        w_x
     };
 
     if w_base.is_none() {

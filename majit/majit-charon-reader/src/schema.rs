@@ -24,6 +24,9 @@ pub struct Translated {
     /// width instead of silently choosing a map winner.
     pub target_information: Vec<TargetInformationEntry>,
     pub fun_decls: Vec<Option<crate::ullbc::FunDecl>>,
+    /// Body-free declarations from the extraction target, never lowered as graphs.
+    pub target_fun_decls_version: Option<u32>,
+    pub target_fun_decls: Option<Vec<Option<crate::ullbc::FunDecl>>>,
     /// Static / const items the MIR references via `Place::Global` and
     /// `Operand::Const(Global { ... })`. Indexed by `def_id` (the same
     /// invariant `fun_decls` upholds; verified against extracted
@@ -92,6 +95,10 @@ struct TranslatedDe {
     target_information: Vec<TargetInformationEntry>,
     fun_decls: Vec<Option<crate::ullbc::FunDecl>>,
     #[serde(default)]
+    target_fun_decls_version: Option<u32>,
+    #[serde(default)]
+    target_fun_decls: Option<Vec<Option<crate::ullbc::FunDecl>>>,
+    #[serde(default)]
     global_decls: Vec<Option<crate::ullbc::GlobalDecl>>,
     #[serde(default)]
     type_decls: Vec<Option<crate::ullbc::TypeDecl>>,
@@ -120,6 +127,8 @@ impl<'de> Deserialize<'de> for Translated {
             crate_name: de.crate_name,
             target_information: de.target_information,
             fun_decls: de.fun_decls,
+            target_fun_decls_version: de.target_fun_decls_version,
+            target_fun_decls: de.target_fun_decls,
             global_decls: de.global_decls,
             type_decls: de.type_decls,
             trait_decls: de.trait_decls,

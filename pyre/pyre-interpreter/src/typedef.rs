@@ -4027,8 +4027,8 @@ pub fn make_builtin_type_with_metatype(
 /// `newint_from_float`).  An exact `str` takes the unicode arm
 /// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
 /// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
-/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
-/// arms are not graphs inside this one.
+/// and those cases continue through the ordinary [`int_descr_new`] graph
+/// (`intobject.py W_IntObject.descr_new` / `_new_int`).
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -4073,22 +4073,35 @@ crate::builtin_wrapper_descriptor!(
 /// If cls is the builtin int type, returns a plain W_IntObject.
 /// If cls is a subclass of int, returns a W_ObjectObject with the
 /// int value stored internally (for int subclasses like IntFlag).
-#[majit_macros::dont_look_inside]
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
     let w_int = gettypeobject(&pyre_object::INT_TYPE);
     check_user_subclass(w_int, cls)?;
-    let value = pyre_object::with_roots!(cls => crate::builtins::builtin_int(&args[1..]))?;
+    // intobject.py `_new_int(space, w_inttype, w_x, w_base)` receives
+    // `w_x` / `w_base`, not a slice of remaining args.
+    let n = args.len() - 1;
+    if n > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "int expected at most 2 arguments, got {n}"
+        )));
+    }
+    let mut w_x = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut w_base = args.get(2).copied().unwrap_or(PY_NULL);
+    let value = pyre_object::with_roots!(
+        cls,
+        w_x,
+        w_base => crate::builtins::builtin_int_from(w_x, w_base)
+    )?;
     // If cls is int itself, return a plain int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
     if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     // cls is a subclass of int. Create a unique instance (bypassing the
-    // small-int cache so each has its own identity). Set w_class = cls so
-    // type()/isinstance() see the subclass while preserving the underlying
-    // int/long storage layout for arithmetic. A magnitude that overflows
+    // small-int cache so each has its own identity). `tag_subclass_instance`
+    // runs `user_setup` (`_mapdict_init_empty(w_subtype.terminator)`); the
+    // Python class lives on `terminator.w_cls`. A magnitude that overflows
     // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
     // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
     // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
@@ -5776,35 +5789,36 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// it is being constructed for, then enqueue it on the user-finalizer
 /// queue when that subclass defines `__del__`.
 ///
-/// `objspace.py:485-487 allocate_instance` performs both steps together —
+/// `objspace.py allocate_instance` performs both steps together —
 /// `instance.user_setup(self, w_subtype)` followed by
 /// `if w_subtype.hasuserdel: self.finalizer_queue.register_finalizer(instance)`.
-/// Order is load-bearing: the hook reads the object's `w_class` to find
-/// `hasuserdel`, so tagging must precede registration. Registering an
-/// instance whose type has no `__del__` is a no-op, the hook gates on
-/// `hasuserdel` exactly as upstream does.
+/// The `hasuserdel` gate is at this call site so a type without `__del__`
+/// does not residualize `register_finalizer`.
 pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
     // `objspace.py allocate_instance` runs `user_setup` then the finalizer
     // registration. `MapdictStorageMixin.user_setup` is
     // `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`): the
     // instance map is the owning type's terminator from construction.
-    // Leaving map at zero until first attribute access makes
-    // `jit.promote(self.map)` see a different word on the next iteration's
-    // fresh instance (`objectobject.rs` `alloc_instance_object`).
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.pin_roots(&[obj, sub]);
-    let obj = _roots.get(base);
-    let sub = _roots.get(base + 1);
-    unsafe { store_subclass_tag(obj, sub) };
-    let obj = _roots.get(base);
+    // The header stays `layout_header_class` from the allocator
+    // (`w_int_subclass_new` stamps `get_instantiate(&INT_TYPE)`); the
+    // Python class lives on `terminator.w_cls`.
     if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
-        unsafe { crate::objspace::std::mapdict::ensure_mapdict_initialized(obj) };
-        let obj = _roots.get(base);
-        unsafe { crate::objspace::std::mapdict::stamp_mapdict_layout_header(obj) };
+        unsafe { crate::objspace::std::mapdict::user_setup(obj, sub) };
+        debug_assert!(
+            unsafe {
+                let map = crate::objspace::std::mapdict::instance_map_word(obj);
+                (*obj).w_class
+                    == pyre_object::layout_header_class((*obj).ob_type, (*obj).w_class, map)
+            },
+            "allocator must stamp layout_header_class at allocation"
+        );
+    } else {
+        unsafe { store_subclass_tag(obj, sub) };
     }
-    let obj = _roots.get(base);
-    pyre_object::gc_hook::maybe_register_finalizer(obj);
-    _roots.get(base)
+    if unsafe { pyre_object::w_type_get_hasuserdel(sub) } {
+        crate::executioncontext::register_finalizer(obj);
+    }
+    obj
 }
 
 /// Store `sub` into a builtin-layout instance's class slot, through the write
@@ -7093,9 +7107,8 @@ pub(crate) fn check_new_subtype(
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());
     }
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub = !mro_ptr.is_null()
-        && unsafe { crate::baseobjspace::mro_contains((*mro_ptr).as_slice(), w_self) };
+    // typeobject.py check_user_subclass: `w_subtype.issubtype(self)`.
+    let is_sub = unsafe { crate::baseobjspace::type_issubtype(w_subtype, w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
@@ -9581,13 +9594,25 @@ fn dict_fromkeys_impl(
                 let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) }) else {
                     break;
                 };
-                let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
+                let key_obj = unsafe { pyre_object::w_set_key_at(iterable, slot) };
+                if key_obj.is_null() {
                     break;
-                };
+                }
+                let _key_roots = pyre_object::gc_roots::push_roots();
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(key_obj);
+                let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                let key_hash = unsafe { pyre_object::w_set_iterkey_hash_at(iterable, slot) };
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
-                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key.obj))?;
+                let key_obj = pyre_object::gc_roots::shadow_stack_get(key_slot);
+                unsafe { pyre_object::w_dict_store_hashed_checked(d, key_obj, value, key_hash) }
+                    .map_err(|_| {
+                        crate::baseobjspace::take_pending_mapping_key_error(
+                            pyre_object::gc_roots::shadow_stack_get(sp),
+                            pyre_object::gc_roots::shadow_stack_get(key_slot),
+                        )
+                    })?;
                 index = slot + 1;
             }
             return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -33179,8 +33204,17 @@ fn set_intersect_update(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(keep_slot), i)
         {
             let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
-            let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
+            let key_obj = pyre_object::w_set_key_at(keep, slot);
+            if key_obj.is_null() {
                 break;
+            }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
+            let key = pyre_object::dictmultiobject::ObjectKey {
+                hash: pyre_object::w_set_iterkey_hash_at(keep, slot),
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
@@ -33189,8 +33223,17 @@ fn set_intersect_update(
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
                 let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
-                let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
+                let key_obj = pyre_object::w_set_key_at(keep, slot);
+                if key_obj.is_null() {
                     break;
+                }
+                let _key_roots = pyre_object::gc_roots::push_roots();
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(key_obj);
+                let keep = pyre_object::gc_roots::shadow_stack_get(keep_slot);
+                let key = pyre_object::dictmultiobject::ObjectKey {
+                    hash: pyre_object::w_set_iterkey_hash_at(keep, slot),
+                    obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
                 };
                 pyre_object::w_set_insert_key_checked(
                     pyre_object::gc_roots::shadow_stack_get(result_slot),
@@ -33534,8 +33577,17 @@ fn set_is_disjoint_from(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(walk_slot), i)
         {
             let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
-            let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
+            let key_obj = pyre_object::w_set_key_at(walk, slot);
+            if key_obj.is_null() {
                 break;
+            }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
+            let key = pyre_object::dictmultiobject::ObjectKey {
+                hash: pyre_object::w_set_iterkey_hash_at(walk, slot),
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(probe_slot),
@@ -33578,8 +33630,17 @@ pub(crate) fn set_is_subset_of(
             pyre_object::w_set_next_slot(pyre_object::gc_roots::shadow_stack_get(set_slot), i)
         {
             let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-            let Some(key) = pyre_object::w_set_key_at(w_set, slot) else {
+            let key_obj = pyre_object::w_set_key_at(w_set, slot);
+            if key_obj.is_null() {
                 break;
+            }
+            let _key_roots = pyre_object::gc_roots::push_roots();
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(key_obj);
+            let w_set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+            let key = pyre_object::dictmultiobject::ObjectKey {
+                hash: pyre_object::w_set_iterkey_hash_at(w_set, slot),
+                obj: pyre_object::gc_roots::shadow_stack_get(key_slot),
             };
             if !pyre_object::w_set_contains_key_checked(
                 pyre_object::gc_roots::shadow_stack_get(other_slot),
@@ -34356,8 +34417,9 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let mut remaining = Vec::new();
         let mut i = pyre_object::w_set_iter_get_slot(iter());
         while let Some(slot) = pyre_object::w_set_next_slot(w_set(), i) {
-            if let Some(key) = pyre_object::w_set_key_at(w_set(), slot) {
-                remaining.push(key.obj);
+            let key = pyre_object::w_set_key_at(w_set(), slot);
+            if !key.is_null() {
+                remaining.push(key);
             }
             i = slot + 1;
         }

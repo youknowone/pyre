@@ -132,7 +132,7 @@ pub unsafe fn w_dict_lookup_identity_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
-    identity_storage(obj).get(&IdentityKey(key)).copied()
+    identity_storage(obj).get_value(&IdentityKey(key))
 }
 
 /// `dictmultiobject.py delitem`'s identity-keyed remove — drop the
@@ -231,7 +231,13 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+        let probe = crate::dictmultiobject::ObjectKey { hash, obj };
+        new_map.insert_hashed(
+            hash as u64,
+            &probe,
+            crate::dictmultiobject::ObjectEntryKey(obj),
+            value,
+        );
     }
     crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }
@@ -278,7 +284,8 @@ crate::define_prebuilt_dict_strategy_ref!(
     IDENTITY_DICT_STRATEGY_REF,
     identity_dict_strategy_ref,
     crate::dictmultiobject::StrategyKind::Identity,
-    &IDENTITY_DICT_STRATEGY
+    &IDENTITY_DICT_STRATEGY,
+    DYN_IMPL_IdentityDictStrategy_canonical_dyn
 );
 
 impl IdentityDictStrategy {
@@ -406,14 +413,11 @@ impl DictStrategy for IdentityDictStrategy {
     /// one backs every dict keyed on ordinary instances.  `wrap` is identity
     /// here (`identitydict.py IdentityDictStrategy.wrap`), so the entry needs
     /// no allocation.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        identity_storage(w_dict)
-            .get_slot(index)
-            .map(|(k, &v)| (k.0, v))
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match identity_storage(w_dict).get_slot(index) {
+            Some((k, _)) => k.0,
+            None => PY_NULL,
+        }
     }
 
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
@@ -425,12 +429,13 @@ impl DictStrategy for IdentityDictStrategy {
 
     /// A delete leaves a tombstone rather than closing the hole, so the
     /// entries are not numbered densely and the default would walk positions.
-    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        identity_storage(w_dict).next_valid_slot(from)
+    /// `_ll_dictnext` / `_ll_dictnext_reversed` Signed index.
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> isize {
+        crate::rordereddict::ll_dictnext(identity_storage(w_dict), from)
     }
 
-    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
-        identity_storage(w_dict).prev_valid_slot(before)
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> isize {
+        crate::rordereddict::ll_dictprev(identity_storage(w_dict), before)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {

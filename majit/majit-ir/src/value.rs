@@ -65,6 +65,12 @@ impl GcRef {
         self.0 == 0
     }
 
+    /// Whether this word is an available runtime reference value.
+    /// Null and `NO_CONCRETE` do not name runtime objects.
+    pub fn is_concrete(self) -> bool {
+        !self.is_null() && self != Self::NO_CONCRETE
+    }
+
     pub fn as_usize(self) -> usize {
         self.0
     }

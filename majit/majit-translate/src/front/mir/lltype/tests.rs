@@ -7655,6 +7655,30 @@ fn a_scalar_element_names_its_width_and_a_thin_pointer_needs_no_name() {
     assert!(!thin(uint("U8")));
 }
 
+/// `dont_look_inside_return_token` stamps the precise integer FUNC.RESULT
+/// spelling (`getcalldescr` / `get_call_descr` `symbolic.get_size`).
+#[test]
+fn dont_look_inside_return_token_stamps_precise_integer_width() {
+    let llbc = empty_llbc();
+    let gc = std::collections::HashSet::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let token = |ty: serde_json::Value| {
+        dont_look_inside_return_token(
+            &fixture_ty(ty),
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &raw,
+            None,
+        )
+    };
+    let int = |w: &str| serde_json::json!({"Scalar": {"Integer": {"Signed": w}}});
+    let uint = |w: &str| serde_json::json!({"Scalar": {"Integer": {"Unsigned": w}}});
+    assert_eq!(token(int("I32")).as_deref(), Some("i32"));
+    assert_eq!(token(uint("U8")).as_deref(), Some("u8"));
+    assert_eq!(token(int("I64")).as_deref(), Some("i64"));
+}
+
 fn named_copy_field(name: &str, ty: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"name": name, "ty": ty, "attr_info": null})
 }

@@ -994,6 +994,27 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        // The whole-body interior-field proof recovered the GC array header from this
+        // address-only producer. PyPy's source has no call here: it carries the array
+        // object directly into `getinteriorfield` (`rewrite_op_getinteriorfield`).
+        if self
+            .interior_pointer_alias_calls
+            .get(dest_local)
+            .copied()
+            .unwrap_or(false)
+        {
+            let source = args.first().cloned().ok_or_else(|| {
+                LowerError::Schema(format!(
+                    "bb{mir_bb}: interior pointer alias call has no source operand"
+                ))
+            })?;
+            self.alias_dest_to_arg0_inherit(dest_local, source, &arg_locals);
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
+
         let op_kind = match (class, call.func) {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>

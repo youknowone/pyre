@@ -322,6 +322,24 @@ impl<Q: ?Sized + Eq, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
     }
 }
 
+/// Probe that hashes and equals a stored `K`.
+///
+/// `get_ll_dict` keeps `DICTKEY` separate from `fnkeyhash` / `fnkeyeq`.
+/// `ObjectDictStrategy.get_empty_storage` supplies `space.hash_w` /
+/// `space.eq_w` on [`crate::dictmultiobject::ObjectKey`], not an identity
+/// contract on the stored word.
+pub trait DictKeyProbe {
+    type Probe: Hash + Equivalent<Self>;
+}
+
+impl<K: Hash + Eq> DictKeyProbe for K {
+    type Probe = K;
+}
+
+impl DictKeyProbe for crate::dictmultiobject::ObjectEntryKey {
+    type Probe = crate::dictmultiobject::ObjectKey;
+}
+
 /// See the module docs.
 ///
 /// `dicttable` (`rordereddict.py` `get_ll_dict`) is a `GcStruct` whose field
@@ -786,6 +804,37 @@ impl<K, V, S> RDict<K, V, S> {
         unsafe { (*self.entry_ptr().add(slot)).f_valid }
     }
 
+    /// `ll_dict_getitem`'s `d.entries[index].value`: one interior-field read.
+    ///
+    /// # Safety
+    /// `slot` must be below `num_ever_used_items`, `entries` must be allocated
+    /// for it, and the slot must be live (`f_valid`).
+    #[inline]
+    pub(crate) unsafe fn value_at(&self, slot: usize) -> V
+    where
+        V: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).value }
+    }
+
+    /// `entries[i].f_hash`: one interior-field read of the entries array.
+    ///
+    /// `ll_dict_lookup` compares this cached digest before `keyeq`
+    /// (`rordereddict.py` `entry_hash`).
+    #[inline]
+    pub(crate) fn hash_at(&self, slot: usize) -> u64 {
+        unsafe { (*self.entry_ptr().add(slot)).f_hash }
+    }
+
+    /// `entries[i].key`: one interior-field read of the entries array.
+    #[inline]
+    fn key_at(&self, slot: usize) -> K
+    where
+        K: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).key }
+    }
+
     /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
     #[inline]
     fn entry_at(&self, slot: usize) -> &Entry<K, V> {
@@ -843,41 +892,23 @@ impl<K, V, S> RDict<K, V, S> {
     /// entries.valid(i)".  A cursor stays valid across an unrelated delete
     /// because nothing renumbers; it goes stale only when [`Self::generation`]
     /// moves.
+    ///
+    /// The scan is [`ll_dictnext`]'s.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        let mut i = from;
-        while i < self.num_ever_used_items {
-            if self.entry_valid(i) {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+        let slot = ll_dictnext(self, from);
+        if slot < 0 { None } else { Some(slot as usize) }
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
     /// `before`, which is `ll_dictiter_reversed`'s walk.  A fresh reverse walk
     /// starts at `usize::MAX`.
     ///
-    /// [3.15-spec] A cursor above `num_ever_used_items` is clamped and the walk
-    /// continues into whatever the table holds now; `_ll_dictnext_reversed`
-    /// (`rordereddict.py`, PyPy issue 5596) stops there instead.  The
-    /// observable difference: after `clear` and a refill below the cursor,
-    /// `dictreviter_iter_lock_held` keeps walking and raises "dictionary keys
-    /// changed during iteration" once its count runs out
-    /// (`test_dict.test_reversed_dict_keys_changed_during_iteration`), which
-    /// the clamp reproduces through the `startlen` check in
-    /// `dict_iter_descr_next`; stopping would end the iteration silently.
+    /// The scan is [`ll_dictprev`]'s.
     #[inline]
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
-        let mut i = before.min(self.num_ever_used_items);
-        while i > 0 {
-            i -= 1;
-            if self.entry_valid(i) {
-                return Some(i);
-            }
-        }
-        None
+        let slot = ll_dictprev(self, before);
+        if slot < 0 { None } else { Some(slot as usize) }
     }
 
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
@@ -1086,7 +1117,7 @@ fn rdict_isvirtual_mut<K, V, S>(d: &mut RDict<K, V, S>) -> bool {
 #[majit_macros::unroll_safe]
 pub fn ll_dict_lookup_orig<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1110,8 +1141,7 @@ where
         if index >= VALID_OFFSET {
             let slot = (index - VALID_OFFSET) as usize;
             if slot < d.num_ever_used_items && d.entry_valid(slot) {
-                let e = d.entry_at(slot);
-                if e.f_hash == hash && key.equivalent(&e.key) {
+                if d.hash_at(slot) == hash && key.equivalent(&d.key_at(slot)) {
                     return slot as isize;
                 }
             }
@@ -1126,7 +1156,7 @@ where
 #[majit_macros::oopspec("ordereddict.lookup")]
 pub fn ll_dict_lookup_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1137,7 +1167,7 @@ where
 
 pub fn ll_dict_lookup<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1168,11 +1198,18 @@ pub fn ll_dictnext<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
     }
 }
 
+/// `_ll_dictnext` (`rordereddict.py`). `look_inside_iff` (`jit.py`)
+/// applies `unroll_safe` on the orig.
+#[majit_macros::unroll_safe]
 fn ll_dictnext_orig<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
-    match d.next_valid_slot(from) {
-        Some(slot) => slot as isize,
-        None => -1,
+    let mut i = from;
+    while i < d.num_ever_used_items {
+        if d.entry_valid(i) {
+            return i as isize;
+        }
+        i += 1;
     }
+    -1
 }
 
 #[inline(never)]
@@ -1181,10 +1218,47 @@ pub fn ll_dictnext_trampoline<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize
     ll_dictnext_orig(d, from)
 }
 
+/// `_ll_dictnext_reversed` (`rordereddict.py`). Last live slot strictly
+/// below `before`, or `-1`. look_inside_iff(isvirtual(d)).
+pub fn ll_dictprev<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual(d) {
+        ll_dictprev_orig(d, before)
+    } else {
+        ll_dictprev_trampoline(d, before)
+    }
+}
+
+/// [3.15-spec] A cursor above `num_ever_used_items` is clamped and the walk
+/// continues into whatever the table holds now; `_ll_dictnext_reversed`
+/// (`rordereddict.py`, PyPy issue 5596) stops there instead.  The
+/// observable difference: after `clear` and a refill below the cursor,
+/// `dictreviter_iter_lock_held` keeps walking and raises "dictionary keys
+/// changed during iteration" once its count runs out
+/// (`test_dict.test_reversed_dict_keys_changed_during_iteration`), which
+/// the clamp reproduces through the `startlen` check in
+/// `dict_iter_descr_next`; stopping would end the iteration silently.
+#[majit_macros::unroll_safe]
+fn ll_dictprev_orig<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    let mut i = before.min(d.num_ever_used_items);
+    while i > 0 {
+        i -= 1;
+        if d.entry_valid(i) {
+            return i as isize;
+        }
+    }
+    -1
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn ll_dictprev_trampoline<K, V, S>(d: &RDict<K, V, S>, before: usize) -> isize {
+    ll_dictprev_orig(d, before)
+}
+
 /// `ll_dict_contains`. look_inside_iff(isvirtual(d)).
 pub fn ll_dict_contains<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1201,7 +1275,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_contains_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
+    K: Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1216,7 +1290,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_hash_of<K, V, S, Q>(d: &RDict<K, V, S>, key: &Q) -> u64
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1233,7 +1307,7 @@ where
 #[majit_macros::oopspec("odict.resize(d)")]
 pub fn ll_dict_resize<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1246,7 +1320,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_remove_deleted_items<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1257,7 +1331,7 @@ where
 /// `ll_dict_grow`. look_inside_iff(isvirtual(d)).
 pub fn ll_dict_grow<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1271,7 +1345,7 @@ where
 
 fn ll_dict_grow_orig<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1292,7 +1366,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_grow_trampoline<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1309,7 +1383,7 @@ pub fn ll_dict_setitem_lookup_done<K, V, S>(
     key: K,
     value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1328,7 +1402,7 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
     mut key: K,
     mut value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1408,7 +1482,7 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
     key: K,
     value: V,
 ) where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1419,7 +1493,7 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
 /// `_ll_dict_del`. look_inside_iff(isvirtual(d) and isconstant(i)).
 pub fn ll_dict_del<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1433,7 +1507,7 @@ where
 
 fn ll_dict_del_orig<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1458,7 +1532,7 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_del_trampoline<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1492,7 +1566,7 @@ fn reload_gcrefs<T: GcRefOffsets>(roots: &crate::gc_roots::RootScope, val: &mut 
 
 impl<K, V, S> RDict<K, V, S>
 where
-    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    K: Copy + EntryDummy + GcRefOffsets,
     V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
@@ -1572,8 +1646,7 @@ where
             } else {
                 let slot = (index - VALID_OFFSET) as usize;
                 if slot < self.num_ever_used_items && self.entry_valid(slot) {
-                    let e = self.entry_at(slot);
-                    if e.f_hash == hash && key.equivalent(&e.key) {
+                    if self.hash_at(slot) == hash && key.equivalent(&self.key_at(slot)) {
                         return Ok(slot);
                     }
                 }
@@ -1617,7 +1690,7 @@ where
         let mut slot = 0usize;
         while slot < self.num_ever_used_items {
             if self.entry_valid(slot) {
-                let hash = self.entry_at(slot).f_hash;
+                let hash = self.hash_at(slot);
                 self.insert_clean(hash, slot as u32);
             }
             slot += 1;
@@ -1734,6 +1807,23 @@ where
         Some(&self.entry_at(slot).value)
     }
 
+    /// `ll_dict_get`: the found entry's value, `d.entries[index].value`,
+    /// read as one interior field instead of a reference into the array.
+    pub fn get_value<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+        V: Copy,
+    {
+        let hash = self.hash_of(key);
+        let slot = self.lookup(hash, key)?;
+        // Same stale-slot bound as `get`.
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
+            return None;
+        }
+        // SAFETY: `slot` is below `num_ever_used_items` and `f_valid` holds.
+        Some(unsafe { self.value_at(slot) })
+    }
+
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -1780,9 +1870,10 @@ where
     /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V>
     where
-        K: GcRefOffsets,
+        K: Hash + Eq + GcRefOffsets,
         V: GcRefOffsets,
     {
+        // Root before hash_of: Hash may collect (gctransform framework.py gct_direct_call push_roots).
         let _roots = crate::gc_roots::push_roots();
         let mut key = key;
         let mut value = value;
@@ -1790,10 +1881,32 @@ where
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
         let hash = self.hash_of(&key);
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
+        self.insert_hashed(hash, &key, key, value)
+    }
+
+    /// `ll_dict_setitem_with_hash` when the digest is already known.
+    ///
+    /// Object-keyed tables store a one-word key and keep `hash_w` in
+    /// `f_hash`, so the probe (`eq_w`) is a different type from the stored
+    /// `K` (`rordereddict.py` `get_ll_dict`).
+    pub fn insert_hashed<Q>(&mut self, hash: u64, probe: &Q, key: K, value: V) -> Option<V>
+    where
+        K: GcRefOffsets,
+        V: GcRefOffsets,
+        Q: Equivalent<K> + ?Sized,
+    {
+        let _roots = crate::gc_roots::push_roots();
+        let mut key = key;
+        let mut value = value;
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        self.pin_table_and_entries();
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return None;
         }
-        let index_slot = match self.lookup_for_store(hash, &key) {
+        let index_slot = match self.lookup_for_store(hash, probe) {
             Ok(slot) => {
                 reload_gcrefs(&_roots, &mut value, value_slot);
                 assert!(self.entry_valid(slot), "valid slot");
@@ -1823,6 +1936,26 @@ where
     /// comparison able to re-enter it.
     pub fn insert_known_absent(&mut self, key: K, value: V)
     where
+        K: Hash + GcRefOffsets,
+        V: GcRefOffsets,
+    {
+        // Root before hash_of: Hash may collect (gctransform framework.py gct_direct_call push_roots).
+        let _roots = crate::gc_roots::push_roots();
+        let mut key = key;
+        let mut value = value;
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        self.pin_table_and_entries();
+        let hash = self.hash_of(&key);
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
+        self.insert_known_absent_hashed(hash, key, value);
+    }
+
+    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` with a digest the
+    /// caller already holds (`rordereddict.py` `ll_call_insert_clean_function`).
+    pub fn insert_known_absent_hashed(&mut self, hash: u64, key: K, value: V)
+    where
         K: GcRefOffsets,
         V: GcRefOffsets,
     {
@@ -1832,7 +1965,6 @@ where
         let value_slot = pin_gcrefs(&_roots, &value);
         let key_slot = pin_gcrefs(&_roots, &key);
         self.pin_table_and_entries();
-        let hash = self.hash_of(&key);
         if self.index_len() == 0 && !self.reindex(DICT_INITSIZE) {
             return;
         }
@@ -1912,7 +2044,7 @@ where
         if !self.entry_valid(slot) {
             return None;
         }
-        let hash = self.entry_at(slot).f_hash;
+        let hash = self.hash_at(slot);
         Some(self.take_slot(hash, slot))
     }
 
@@ -1921,8 +2053,9 @@ where
         K: EntryDummy,
         V: EntryDummy,
     {
-        let key = self.entry_at(slot).key;
-        let value = self.entry_at(slot).value;
+        let key = self.key_at(slot);
+        // SAFETY: the caller settled a live slot (`f_valid`) below `num_ever_used_items`.
+        let value = unsafe { self.value_at(slot) };
         ll_dict_del(self, hash, slot);
         (key, value)
     }
@@ -1965,7 +2098,7 @@ where
         if !self.entry_valid(slot) {
             return false;
         }
-        let hash = self.entry_at(slot).f_hash;
+        let hash = self.hash_at(slot);
         if last {
             if slot + 1 == self.num_ever_used_items {
                 return false;
@@ -1974,7 +2107,7 @@ where
             let (k, v) = self.take_slot(hash, slot);
             Self::pin_gcrefs_of(k);
             Self::pin_gcrefs_of(v);
-            self.insert(k, v);
+            self.insert_known_absent_hashed(hash, k, v);
         } else {
             if self.next_valid_slot(0) == Some(slot) {
                 return false;
@@ -1987,10 +2120,11 @@ where
             let mut rest = Vec::with_capacity(self.num_live_items);
             for i in 0..self.num_ever_used_items {
                 if self.entry_valid(i) {
-                    let e = self.entry_at(i);
-                    Self::pin_gcrefs_of(e.key);
-                    Self::pin_gcrefs_of(e.value);
-                    rest.push((e.key, e.value));
+                    // SAFETY: `entry_valid(i)` just established this slot is live.
+                    let (k, v) = (self.key_at(i), unsafe { self.value_at(i) });
+                    Self::pin_gcrefs_of(k);
+                    Self::pin_gcrefs_of(v);
+                    rest.push((self.hash_at(i), k, v));
                 }
             }
             // The old array is left to the collector, as `ll_dict_clear` does.
@@ -2000,9 +2134,9 @@ where
             self.num_live_items = 0;
             self.resize_counter = 0;
             self.generation = self.generation.wrapping_add(1);
-            self.insert(k, v);
-            for (k, v) in rest {
-                self.insert(k, v);
+            self.insert_known_absent_hashed(hash, k, v);
+            for (h, k, v) in rest {
+                self.insert_known_absent_hashed(h, k, v);
             }
         }
         true
@@ -2132,6 +2266,48 @@ where
         for key in keys {
             key_slots.push(pin_key_gc_refs(key));
         }
+        let mut hashes = vec![0u64; n];
+        let mut reloaded_keys = Vec::with_capacity(n);
+        {
+            let dst = Self::with_hasher(S::default());
+            for slot in 0..n {
+                let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
+                if live[slot] {
+                    hashes[slot] = dst.hash_of(&key);
+                }
+                reloaded_keys.push(key);
+            }
+        }
+        Self::from_preserved_slots_with_hashes(&reloaded_keys, &hashes, live, index_len)
+    }
+
+    /// [`Self::from_preserved_slots`] with the cached `f_hash` already known.
+    ///
+    /// Object-keyed tables cannot re-derive `hash_w` from the stored pointer
+    /// (`get_ll_dict` keeps that digest in `f_hash`).
+    pub fn from_preserved_slots_with_hashes(
+        keys: &[K],
+        hashes: &[u64],
+        live: &[bool],
+        index_len: usize,
+    ) -> Self
+    where
+        K: Copy + EntryDummy + GcRefOffsets,
+        V: Copy + EntryDummy,
+        S: BuildHasher + Default,
+        (K, V): GcEntriesType,
+    {
+        let n = keys.len();
+        debug_assert_eq!(live.len(), n);
+        debug_assert_eq!(hashes.len(), n);
+        if n == 0 {
+            return Self::with_hasher(S::default());
+        }
+        let _roots = crate::gc_roots::push_roots();
+        let mut key_slots = Vec::with_capacity(n);
+        for key in keys {
+            key_slots.push(pin_key_gc_refs(key));
+        }
         let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = Self::with_hasher(S::default());
         dst.entries = alloc_entries::<K, V>(n);
@@ -2147,7 +2323,7 @@ where
                 continue;
             }
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
-            let hash = dst.hash_of(&key);
+            let hash = hashes[slot];
             dst.barrier_entries();
             unsafe {
                 std::ptr::write(
@@ -2423,6 +2599,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl EntryDummy for usize {
+        fn dummy() -> Self {
+            0
+        }
+    }
+
+    impl GcRefOffsets for usize {
+        const GC_REF_OFFSETS: &'static [usize] = &[];
+    }
+
+    impl GcEntriesType for (crate::dictmultiobject::ObjectEntryKey, usize) {
+        fn entries_gc_type_id() -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn cached_hash_probe_api_does_not_require_stored_key_hash_or_eq() {
+        use crate::dictmultiobject::{ObjectEntryKey, ObjectKeyBuildHasher};
+
+        #[derive(Clone, Copy)]
+        struct PointerProbe {
+            hash: u64,
+            obj: crate::PyObjectRef,
+        }
+        impl std::hash::Hash for PointerProbe {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                state.write_u64(self.hash);
+            }
+        }
+        impl crate::rordereddict::Equivalent<ObjectEntryKey> for PointerProbe {
+            fn equivalent(&self, stored: &ObjectEntryKey) -> bool {
+                self.obj == stored.0
+            }
+        }
+
+        type D = RDict<ObjectEntryKey, usize, ObjectKeyBuildHasher>;
+        let mut d = D::with_hasher(ObjectKeyBuildHasher::default());
+        let obj = 0x1000usize as crate::PyObjectRef;
+        let stored = ObjectEntryKey(obj);
+        let probe = PointerProbe { hash: 37, obj };
+
+        assert_eq!(d.insert_hashed(37, &probe, stored, 11), None);
+        assert_eq!(d.get_value(&probe), Some(11));
+        assert_eq!(d.remove(&probe), Some(11));
+        assert!(d.is_empty());
+    }
 
     #[test]
     fn perturb_probes_can_revisit_slots_before_covering_the_table() {
@@ -3125,5 +3349,51 @@ mod tests {
             let want = if i == 50 { None } else { Some(i) };
             assert_eq!(d.get(&Nasty(i)).copied(), want, "colliding key {i}");
         }
+    }
+
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RootCheckedKey(crate::PyObjectRef);
+
+    impl Hash for RootCheckedKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            let rooted = (0..crate::gc_roots::shadow_stack_len())
+                .any(|slot| crate::gc_roots::shadow_stack_get(slot) == self.0);
+            assert!(rooted, "key GC word must be rooted before Hash::hash");
+            state.write_usize(self.0 as usize);
+        }
+    }
+
+    impl EntryDummy for RootCheckedKey {
+        fn dummy() -> Self {
+            Self(std::ptr::null_mut())
+        }
+    }
+
+    impl GcRefOffsets for RootCheckedKey {
+        const GC_REF_OFFSETS: &'static [usize] = &[0];
+    }
+
+    impl GcEntriesType for (RootCheckedKey, usize) {
+        fn entries_gc_type_id() -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn hashing_entry_points_root_gc_words_before_hash() {
+        type D = RDict<
+            RootCheckedKey,
+            usize,
+            std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>,
+        >;
+        let key1 = RootCheckedKey(0x1000usize as crate::PyObjectRef);
+        let key2 = RootCheckedKey(0x2000usize as crate::PyObjectRef);
+        let mut d = D::new();
+        assert_eq!(d.insert(key1, 1), None);
+        d.insert_known_absent(key2, 2);
+
+        let copied = D::from_preserved_slots(&[key1, key2], &[true, true], 8);
+        assert_eq!(copied.len(), 2);
     }
 }

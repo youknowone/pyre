@@ -2531,9 +2531,10 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
     // serializes the flattened row under the variant parent while a read of
     // that row can name the enum, so recover that one proven inheritance edge
-    // from the qualified owners.  Two *different* variants of one enum are not
-    // that edge -- their payloads are different fields sharing an address --
-    // and neither is a same-name/same-offset field from an arbitrary struct.
+    // from the qualified owners.  Two *different* variants of one enum share
+    // only the inherited tag; their payloads are different fields sharing an
+    // address, and neither is a same-name/same-offset field from an arbitrary
+    // struct.
     fn is_registered_std_shell(owner: &str) -> bool {
         // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
         // uses, plus the enum roots the inherited-tag edge names. A name
@@ -2560,18 +2561,22 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         })
     }
 
-    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
+    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str, field_name: &str) -> bool {
         let (Some((slot_enum, slot_variant)), Some((field_enum, field_variant))) = (
             shelled_sum_owner(slot_owner),
             shelled_sum_owner(field_owner),
         ) else {
             return false;
         };
-        if slot_enum != field_enum
-            || !(slot_variant == field_variant
-                || slot_variant.is_empty()
-                || field_variant.is_empty())
-        {
+        // Two variants of one sum share exactly one field, the tag inherited
+        // from the enum base: `heaptracker.all_fielddescrs` walks the embedded
+        // base first, so `Ok.__discriminant` and `Err.__discriminant` are the
+        // base's one FieldDescr. Their payloads are different fields that
+        // merely share an address.
+        let same_or_base =
+            slot_variant == field_variant || slot_variant.is_empty() || field_variant.is_empty();
+        let sibling_tag = field_name == "__discriminant";
+        if slot_enum != field_enum || !(same_or_base || sibling_tag) {
             return false;
         }
         // Spelling is not identity. When the StructId table is populated,
@@ -2633,7 +2638,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     }
 
     let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
-        explicit_sum_inherits(slot_owner, field_owner)
+        explicit_sum_inherits(slot_owner, field_owner, field.field_key())
             || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
     };
 
@@ -3762,6 +3767,114 @@ mod tests {
         )
         .with_parent_descr(template_parent, 1);
         assert!(!slot_holds_field(&ok, &err));
+    }
+
+    #[test]
+    fn sibling_result_variants_share_the_tag() {
+        let mut err_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        err_size.set_cache_key(0x71);
+        let err_parent = Arc::new(err_size) as DescrRef;
+        let mut ok_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        ok_size.set_cache_key(0x72);
+        let ok_parent = Arc::new(ok_size) as DescrRef;
+
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "core::result::Result::Err.__discriminant".to_string(),
+            "__discriminant",
+        )
+        .with_parent_descr(err_parent.clone(), 0);
+        let field = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "Result::Ok.__discriminant".to_string(),
+            "__discriminant",
+        )
+        .with_parent_descr(ok_parent.clone(), 0);
+        assert!(
+            slot_holds_field(&slot, &field),
+            "Ok.__discriminant and Err.__discriminant are the base's one FieldDescr"
+        );
+        let _keep = (err_parent, ok_parent);
+    }
+
+    #[test]
+    fn sibling_result_variants_do_not_share_payload() {
+        let mut err_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        err_size.set_cache_key(0x73);
+        let err_parent = Arc::new(err_size) as DescrRef;
+        let mut ok_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        ok_size.set_cache_key(0x74);
+        let ok_parent = Arc::new(ok_size) as DescrRef;
+
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "core::result::Result::Err.__pos_0".to_string(),
+            "__pos_0",
+        )
+        .with_parent_descr(err_parent.clone(), 1);
+        let field = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "Result::Ok.__pos_0".to_string(),
+            "__pos_0",
+        )
+        .with_parent_descr(ok_parent.clone(), 1);
+        assert!(!slot_holds_field(&slot, &field));
+        let _keep = (err_parent, ok_parent);
+    }
+
+    #[test]
+    fn unrelated_struct_same_offset_tag_stays_distinct() {
+        let mut err_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        err_size.set_cache_key(0x75);
+        let err_parent = Arc::new(err_size) as DescrRef;
+        let mut foo_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        foo_size.set_cache_key(0x76);
+        let foo_parent = Arc::new(foo_size) as DescrRef;
+
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "core::result::Result::Err.__discriminant".to_string(),
+            "__discriminant",
+        )
+        .with_parent_descr(err_parent.clone(), 0);
+        let field = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "mycrate::Foo::Bar.__discriminant".to_string(),
+            "__discriminant",
+        )
+        .with_parent_descr(foo_parent.clone(), 0);
+        assert!(!slot_holds_field(&slot, &field));
+        let _keep = (err_parent, foo_parent);
     }
 
     #[test]

@@ -101,7 +101,8 @@ pyre_object::define_prebuilt_dict_strategy_ref!(
     CLASS_DICT_STRATEGY_REF,
     class_dict_strategy_ref,
     pyre_object::dictmultiobject::StrategyKind::Class,
-    &CLASS_DICT_SLOT
+    &CLASS_DICT_SLOT,
+    DYN_IMPL_ClassDictStrategySlot_canonical_dyn
 );
 
 struct ClassDictMethods;

@@ -30,6 +30,7 @@ pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true, features = ["host_env"] }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
+ctor = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
@@ -84,6 +85,8 @@ insta = { workspace = true }
 # compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature
 # so the thread-local dict hash hook is installed on the test threads.
 pyre-interpreter = { workspace = true, features = ["host_env", "test-hooks"] }
+# Resolver 2 does not unify this feature into a normal or release build.
+pyre-object = { workspace = true, features = ["test-hooks"] }
 # `_random` lives in `pyre-module`, so the residual address its jitcodes call
 # is published by that crate's optional-module hooks rather than by the
 # interpreter's own table.

@@ -133,23 +133,9 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_COMPLEX_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_ComplexObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_ComplexObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    // `allocate_instance` -> `lltype.malloc(STRUCT)`: one managed malloc
+    // that the codewriter lowers to `new_with_vtable`.
+    crate::lltype::malloc_typed_managed(obj) as PyObjectRef
 }
 
 /// Extract the real component from a known W_ComplexObject pointer.

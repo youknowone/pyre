@@ -66,7 +66,8 @@ crate::define_prebuilt_dict_strategy_ref!(
     KWARGS_DICT_STRATEGY_REF,
     kwargs_dict_strategy_ref,
     crate::dictmultiobject::StrategyKind::Kwargs,
-    &KWARGS_DICT_STRATEGY
+    &KWARGS_DICT_STRATEGY,
+    DYN_IMPL_KwargsDictStrategy_canonical_dyn
 );
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays
@@ -136,7 +137,13 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(crate::dictmultiobject::ObjectKey { hash, obj }, value);
+        let probe = crate::dictmultiobject::ObjectKey { hash, obj };
+        new_map.insert_hashed(
+            hash as u64,
+            &probe,
+            crate::dictmultiobject::ObjectEntryKey(obj),
+            value,
+        );
     }
     crate::dictmultiobject::install_object_dict_storage(roots.get(dict_slot), new_storage);
 }
@@ -412,20 +419,16 @@ impl DictStrategy for KwargsDictStrategy {
     /// lists at the same cursor position.  Supplying the cursor operation
     /// directly avoids the trait fallback's `items().into_iter().nth(index)`,
     /// which rebuilt the complete kwargs list at every iterator step.
-    unsafe fn nth_item(
-        &self,
-        w_dict: PyObjectRef,
-        index: usize,
-    ) -> Option<(PyObjectRef, PyObjectRef)> {
-        let (keys_w, values_w) = kwargs_storage(w_dict);
-        if index < keys_w.len() && index < values_w.len() {
-            Some((kwargs_at(keys_w, index), kwargs_at(values_w, index)))
+    unsafe fn nth_key(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        let keys_w = &kwargs_storage(w_dict).0;
+        if index < keys_w.len() {
+            kwargs_at(keys_w, index)
         } else {
-            None
+            PY_NULL
         }
     }
 
-    /// Value-iterator twin of [`Self::nth_item`], matching
+    /// Value-iterator twin of [`Self::nth_key`], matching
     /// `kwargsdict.py itervalues`' direct values-list cursor.
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
         let values_w = &kwargs_storage(w_dict).1;
@@ -586,7 +589,9 @@ mod tests {
             let strategy = crate::dictmultiobject::w_dict_get_strategy(w_dict);
 
             for (index, (key, value)) in [("a", 10), ("b", 20), ("c", 30)].into_iter().enumerate() {
-                let (w_key, w_value) = strategy.nth_item(w_dict, index).unwrap();
+                let w_key = strategy.nth_key(w_dict, index);
+                let w_value = strategy.nth_value(w_dict, index);
+                assert!(!w_key.is_null());
                 assert_eq!(crate::w_str_get_wtf8(w_key), key);
                 assert_eq!(crate::w_int_get_value(w_value), value);
                 assert_eq!(
@@ -594,7 +599,7 @@ mod tests {
                     value
                 );
             }
-            assert!(strategy.nth_item(w_dict, 3).is_none());
+            assert!(strategy.nth_key(w_dict, 3).is_null());
             assert!(strategy.nth_value(w_dict, 3).is_null());
 
             let reversed = strategy.getiterreversed(w_dict);
@@ -617,7 +622,9 @@ mod tests {
                 crate::dictmultiobject::StrategyKind::Kwargs
             );
             assert_eq!(strategy.length(w_dict), 2);
-            let (w_key, w_value) = strategy.nth_item(w_dict, 0).unwrap();
+            let w_key = strategy.nth_key(w_dict, 0);
+            let w_value = strategy.nth_value(w_dict, 0);
+            assert!(!w_key.is_null());
             assert_eq!(crate::w_str_get_wtf8(w_key), "a");
             assert_eq!(crate::w_int_get_value(w_value), 9);
             assert_eq!(crate::w_int_get_value(strategy.nth_value(w_dict, 1)), 2);

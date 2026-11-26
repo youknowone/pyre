@@ -413,6 +413,35 @@ fn spelling_covering_exact<'a>(
     None
 }
 
+fn apply_transparent_pointer_field_kinds(
+    layout: &mut StructLayout,
+    rows: &[crate::front::semantic::FieldRow],
+    registry: &crate::front::semantic::StructFieldRegistry,
+) {
+    let word = target_word_size();
+    for field in &mut layout.fields {
+        let Some(row) = rows.iter().find(|row| row.name == field.name) else {
+            continue;
+        };
+        let Some(kind) = registry.transparent_pointer_kind(&row.ty) else {
+            continue;
+        };
+        // `descr.py` `get_type_flag`: a GC pointee is `FLAG_POINTER`;
+        // a raw pointee is a machine-word `FLAG_UNSIGNED` value.
+        match kind {
+            crate::front::semantic::TransparentPointerKind::GcObject => {
+                field.flag = majit_ir::descr::ArrayFlag::Pointer;
+                field.field_type = majit_ir::value::Type::Ref;
+            }
+            crate::front::semantic::TransparentPointerKind::Pointer => {
+                field.flag = majit_ir::descr::ArrayFlag::Unsigned;
+                field.field_type = majit_ir::value::Type::Int;
+            }
+        }
+        field.size = word;
+    }
+}
+
 /// Exact layouts by STRUCT identity, then heuristic layouts for names
 /// that still have no identity-keyed row.
 ///
@@ -439,11 +468,16 @@ pub(crate) fn program_struct_layouts(
         let Some(spelling) = spelling_covering_exact(*sid, exact, &by_struct_id) else {
             continue;
         };
-        let Some(layout) =
+        let Some(mut layout) =
             provider.get_struct_layout_exact(spelling, &exact.field_offsets, exact.size)
         else {
             continue;
         };
+        let rows = struct_fields
+            .fields
+            .get(spelling)
+            .expect("spelling_covering_exact returned registered rows");
+        apply_transparent_pointer_field_kinds(&mut layout, rows, struct_fields);
         installed.insert(*sid);
         out.push(ProgramStructLayout {
             spelling: spelling.to_string(),
@@ -469,9 +503,10 @@ pub(crate) fn program_struct_layouts(
             }
             _ => provider.get_struct_layout(struct_name),
         };
-        let Some(layout) = layout else {
+        let Some(mut layout) = layout else {
             continue;
         };
+        apply_transparent_pointer_field_kinds(&mut layout, rows, struct_fields);
         out.push(ProgramStructLayout {
             spelling: struct_name.clone(),
             sid,
@@ -762,5 +797,150 @@ mod tests {
             !installed.contains(&orphan),
             "orphan exact layout must not borrow OtherStruct rows"
         );
+    }
+
+    /// A harvested transparent pointer wrapper whose instantiated field
+    /// spelling is the bare leaf stays FLAG_POINTER after installation,
+    /// even when `known_struct_names` still contains that leaf.
+    #[test]
+    fn transparent_pointer_field_kinds_normalize_bare_wrapper_key_in_program_struct_layouts() {
+        use crate::front::semantic::{
+            ClassIdentity, ExactLayout, FieldRow, StructFieldRegistry, TransparentPointerKind,
+        };
+        use crate::test_support::register_struct_ids_serialized;
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = target_word_size();
+        let gc_qualified = "declared::GcKey";
+        let word_qualified = "declared::WordKey";
+        let gc_bare = "GcKey";
+        let word_bare = "WordKey";
+        let gc_entry = "ordered::Entry<GcKey,*mut Object>";
+        let word_entry = "ordered::Entry<WordKey,*mut Object>";
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_qualified);
+        let word_id = majit_ir::descr::StructId::from_canonical(word_qualified);
+        let gc_entry_id = majit_ir::descr::StructId::from_canonical(gc_entry);
+        let word_entry_id = majit_ir::descr::StructId::from_canonical(word_entry);
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (gc_qualified.to_string(), Some(gc_id)),
+            (word_qualified.to_string(), Some(word_id)),
+            (gc_entry.to_string(), Some(gc_entry_id)),
+            (word_entry.to_string(), Some(word_entry_id)),
+        ]));
+
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            gc_qualified.to_string(),
+            vec![FieldRow::named("__pos_0", "*mut Object")],
+        );
+        fields.fields.insert(
+            word_qualified.to_string(),
+            vec![FieldRow::named("__pos_0", "*mut Object")],
+        );
+        fields.fields.insert(
+            gc_entry.to_string(),
+            vec![
+                FieldRow::named("key", gc_bare),
+                FieldRow::named("value", "*mut Object"),
+            ],
+        );
+        fields.fields.insert(
+            word_entry.to_string(),
+            vec![
+                FieldRow::named("key", word_bare),
+                FieldRow::named("value", "*mut Object"),
+            ],
+        );
+        for (path, id, spelling) in [
+            (gc_qualified, gc_id, gc_qualified),
+            (gc_bare, gc_id, gc_qualified),
+            (word_qualified, word_id, word_qualified),
+            (word_bare, word_id, word_qualified),
+        ] {
+            fields.class_identity.insert(
+                path.to_string(),
+                Some(ClassIdentity {
+                    id,
+                    spelling: spelling.into(),
+                }),
+            );
+        }
+        fields.note_transparent_pointer_kind(gc_qualified.into(), TransparentPointerKind::GcObject);
+        fields
+            .note_transparent_pointer_kind(word_qualified.into(), TransparentPointerKind::Pointer);
+
+        let known = HashSet::from([
+            gc_bare.to_string(),
+            word_bare.to_string(),
+            gc_entry.to_string(),
+            word_entry.to_string(),
+        ]);
+        let pair_fields: HashMap<String, Vec<(String, String)>> = fields.fields.clone().into();
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &pair_fields,
+            &known,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let gc_before = provider.get_struct_layout(gc_entry).unwrap();
+        assert_eq!(
+            gc_before
+                .fields
+                .iter()
+                .find(|field| field.name == "key")
+                .expect("key")
+                .flag,
+            ArrayFlag::Struct
+        );
+        let word_before = provider.get_struct_layout(word_entry).unwrap();
+        assert_eq!(
+            word_before
+                .fields
+                .iter()
+                .find(|field| field.name == "key")
+                .expect("key")
+                .flag,
+            ArrayFlag::Struct
+        );
+
+        let mut field_offsets = HashMap::new();
+        field_offsets.insert("key".to_string(), 0u64);
+        field_offsets.insert("value".to_string(), word as u64);
+        let mut exact_layouts = HashMap::new();
+        exact_layouts.insert(
+            word_entry_id,
+            ExactLayout {
+                size: Some(2 * word as u64),
+                align: Some(word as u64),
+                field_offsets,
+                host: None,
+            },
+        );
+
+        let installed = program_struct_layouts(&fields, &exact_layouts, &provider);
+        let key_of = |sid: majit_ir::descr::StructId| {
+            installed
+                .iter()
+                .find(|entry| entry.sid == sid)
+                .expect("installed entry")
+                .layout
+                .fields
+                .iter()
+                .find(|field| field.name == "key")
+                .expect("key")
+                .clone()
+        };
+        let gc_key = key_of(gc_entry_id);
+        assert_eq!(gc_key.offset, 0);
+        assert_eq!(gc_key.size, word);
+        assert_eq!(gc_key.flag, ArrayFlag::Pointer);
+        assert_eq!(gc_key.field_type, Type::Ref);
+
+        let raw_key = key_of(word_entry_id);
+        assert_eq!(raw_key.offset, 0);
+        assert_eq!(raw_key.size, word);
+        assert_eq!(raw_key.flag, ArrayFlag::Unsigned);
+        assert_eq!(raw_key.field_type, Type::Int);
     }
 }

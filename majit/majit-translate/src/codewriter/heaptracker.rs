@@ -371,6 +371,8 @@ pub fn all_interiorfielddescrs(
                     &spelling,
                     &Some(array.clone()),
                     &field.name,
+                    None,
+                    None,
                 ) {
                     res.push(descr);
                 }
@@ -392,9 +394,14 @@ pub fn all_interiorfielddescrs(
         let idx = gccache
             .descr_indices
             .interiorfield_index(intern_id, &row.name);
-        if let Some(descr) =
-            gccache.interiorfielddescrof_with_array(idx, &spelling, &Some(array.clone()), &row.name)
-        {
+        if let Some(descr) = gccache.interiorfielddescrof_with_array(
+            idx,
+            &spelling,
+            &Some(array.clone()),
+            &row.name,
+            None,
+            None,
+        ) {
             res.push(descr);
         }
     }

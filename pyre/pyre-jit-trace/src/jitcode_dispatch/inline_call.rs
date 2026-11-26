@@ -41,66 +41,6 @@ struct AttributeErrorInlineContext {
     name_concrete: pyre_object::PyObjectRef,
 }
 
-/// Whether this concrete receiver takes PyPy's installed `__len__` shortcut
-/// straight to a builtin layout's length body.
-///
-/// `typedef.py use_special_method_shortcut('__len__')` replaces the generic
-/// lookup in `descroperation.py _len` for builtin implementations.  The
-/// generated walk is execution-driven and therefore follows just that body,
-/// while [`descent_blocker_summary`] deliberately joins the generic error and
-/// override arms too.  Those arms contain formatting helpers after apparent
-/// effects and make the static pre-scan reject a clean exact-builtin walk.
-///
-/// This predicate emits no IR and proves no later value.  It only admits the
-/// generated body; that body still records the payload-class and promoted
-/// `w_class` guards which keep the recording-time shortcut valid at runtime.
-unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    let ob_type = unsafe { (*obj).ob_type };
-    let exact_w_class = if std::ptr::eq(ob_type, &pyre_object::pyobject::LIST_TYPE) {
-        // The admitted set is the strategies whose length read the generated
-        // body already lowers.  `IntOrFloat` is `Integer`'s own read —
-        // `live_len` sends both to `ll_list_int_length` — so it is admitted on
-        // the same proof.  Bytes/Ascii and the range strategies read a
-        // differently shaped nested storage, and exact `list` alone does not
-        // prove that lowering.
-        if !(unsafe { pyre_object::w_list_uses_int_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_int_or_float_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_float_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_object_storage(obj) }
-            || unsafe { pyre_object::w_list_uses_empty_storage(obj) })
-        {
-            return false;
-        }
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE)
-    } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::pyobject::STR_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::bytesobject::BYTES_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::functional::RANGE_TYPE)
-        // `len_slot` forwards an exact dict and its views to `w_dict_len`
-        // (`W_DictMultiObject.length` → `get_strategy().length(self)`).
-        || std::ptr::eq(ob_type, &pyre_object::pyobject::DICT_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_KEYS_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_VALUES_TYPE)
-        || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_ITEMS_TYPE)
-    {
-        pyre_object::pyobject::get_instantiate(unsafe { &*ob_type })
-    } else if specialised_pair_kind(ob_type).is_some() {
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE)
-    } else {
-        return false;
-    };
-    std::ptr::eq(
-        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) },
-        exact_w_class,
-    )
-}
-
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
 /// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
@@ -979,6 +919,25 @@ fn helper_resume_descr_at(payload_descrs: Option<&[DescrRef]>, index: usize) -> 
     }
 }
 
+/// The callee `read_inline_call_jitcode` would execute for this `d`.
+///
+/// `JitCode.descr_at` reads per-jitcode `exec.descrs` then
+/// `GLOBAL_BUILD_DESCR_POOL`. `RuntimeBhDescr::as_jitcode_owned` is
+/// `blackhole.py` `isinstance(value, JitCode)` including a live back edge.
+/// Do not route this through `helper_resume_descr_at` /
+/// `as_jitcode_descr()`: a Python body's `d` is a per-code pool index, and
+/// `sub_descr_pool_for_payload` stamps `make_jitcode_descr(slot)` so the
+/// adapted table's `jitcode_index()` is the slot, not the callee.
+fn helper_resume_inline_callee(
+    payload: &crate::PyJitCode,
+    descr_index: usize,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    payload
+        .jitcode
+        .descr_at(descr_index)
+        .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_jitcode_owned)
+}
+
 /// The dispatch-loop `switch` on `next_instr` (`interp_jit.py
 /// PyFrame.dispatch`, recorded as `PyJitCodeMetadata.dispatch_switch_pc`).
 /// `dispatch_switch_id` takes the Const key at walk time, so a seeded
@@ -1838,30 +1797,31 @@ pub(crate) fn helper_resume_reaches_blocker(
             entry_array_len.map(|len| (0, len)).into_iter().collect();
         let mut call_effect_free = |index| residual_call_is_effect_free_in(payload_descrs, index);
         let mut switch_targets = |index| switch_descr_targets_in(payload_descrs, index);
-        let mut callee_fnaddr = |index| jitcode_fnaddr_for_descr_in(payload_descrs, index);
+        let mut callee_fnaddr =
+            |index| helper_resume_inline_callee(&payload, index).map(|jc| jc.fnaddr);
         let summary = summarize_body_blockers_from(
             Some(pc),
             jitcode.code.as_slice(),
             jitcode.num_regs_i(),
             jitcode.constants_i.as_slice(),
             |descr_index, _caller_effect, _entry_lens| {
-                helper_resume_descr_at(payload_descrs, descr_index)
-                    .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    .map(|callee_index| {
-                        // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
-                        // not interpret this body; the native call can still
-                        // allocate, raise or write the heap.
-                        let calls_native = jitcode_fnaddr_for_descr_in(payload_descrs, descr_index)
-                            .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
-                        if calls_native {
-                            DescentBlockerSummary {
-                                may_execute_effect: true,
-                                ..DescentBlockerSummary::default()
-                            }
-                        } else {
-                            descent_blocker_summary(callee_index)
+                helper_resume_inline_callee(&payload, descr_index).map(|callee| {
+                    // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
+                    // not interpret this body; the native call can still
+                    // allocate, raise or write the heap.
+                    let calls_native = !blackhole_interprets_inline_callee(callee.fnaddr);
+                    if calls_native {
+                        DescentBlockerSummary {
+                            may_execute_effect: true,
+                            ..DescentBlockerSummary::default()
                         }
-                    })
+                    } else {
+                        callee
+                            .try_index()
+                            .map(descent_blocker_summary)
+                            .unwrap_or_else(body_not_walked)
+                    }
+                })
             },
             &mut |_blocker, _effect| true,
             &mut call_effect_free,
@@ -8135,13 +8095,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     {
         return Ok(Some(inlined));
     }
-    let builtin_len_shortcut = builtin_len_call
-        && spec_gate(SpecFold::BuiltinLenDescent, || {
-            Ok::<Option<()>, DispatchError>(
-                unsafe { exact_builtin_len_shortcut_receiver(len_receiver) }.then_some(()),
-            )
-        })?
-        .is_some();
     let builtin_sig = if type_query || builtin_code.is_null() {
         None
     } else {
@@ -8156,21 +8109,10 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         usize::from(receiver.is_some()) + (r_args.len() - 2)
     };
-    // `W_CData.call` on a function pointer. The scan's red `kind` join
-    // reaches `allocate_stable` on an arm `W_CTypeFunc.call` does not take
-    // after it promotes the ctype. The generated descent records the call.
-    let cdata_func_descent =
-        receiver.is_some_and(pyre_interpreter::importing::cdata_is_function_pointer);
-    if !builtin_len_shortcut
-        && !cdata_func_descent
-        && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
-    {
-        if matches!(decline, DescentDecline::Helper(_)) {
-            log_descent_unlowered_helper_blockers(jitcode.index());
-        }
-        builtin_inline_decline!(decline, fnaddr);
-        return Ok(None);
-    }
+    // PyPy admits an MIFrame by executing its selected path.  This wrapper is
+    // `HelperReturn::CallResult`: an unexecutable helper reached on that path
+    // either leaves a clean attempt for the ordinary residual CALL, or the
+    // live helper stack is latched and continued without replaying the CALL.
     // `typeobject.py descr_call` runs `__init__` after `__new__` returns.
     // The `__new__` wrapper's return is delivered into
     // `OperatorTail::TypeCallNew` (`operator_continuation_parent_frame`),
@@ -8187,14 +8129,14 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // The descent scan above proved its facts for this argument count; a
-    // guard's resume scan proves them the same way.
+    // A numbered helper guard uses the entry argument count when checking
+    // whether each captured helper section is runnable.
     if let Some(level) = site.nested_helper_entry.as_mut() {
         level.entry_array_len = Some(wrapper_item_count);
     }
-    // Rewind point for the un-lowered-helper decline below.  Nothing above
-    // this line records IR or touches the heap cache, so cutting back to it
-    // leaves the caller's trace exactly as the ordinary residual call found it.
+    // Rewind point for a clean executed-path decline.  Nothing above this
+    // line records IR or touches the heap cache, so cutting back to it leaves
+    // the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // From here on the guards, the args array and the wrapper sub-walk append
     // to `opencoder.py Trace._ops` and can minor-collect.  Every concrete
@@ -8630,6 +8572,185 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// The gateway wrapper's `&[PyObjectRef]` argument array.
+///
+/// `opimpl_new_array_clear` executes the allocation and the box holds the
+/// array; `opimpl_setarrayitem_gc` stores into it. The block is stamped as
+/// the `NewArrayClear` op's value (GC-rooted through the op), and each store
+/// fills it through `walker_fill_materialized_array`.
+fn record_wrapper_args_array_with<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    wrapper_items: &[OpRef],
+    allocate: impl FnOnce(usize) -> Option<*mut pyre_object::object_array::ItemsBlock>,
+) -> Result<OpRef, DispatchError> {
+    // `MetaInterp.execute_and_record`: execute first.  The allocation result
+    // is an ordinary live GC value across `_record_helper`; pin it because
+    // appending the trace op may allocate and minor-collect.
+    let roots = pyre_object::gc_roots::push_roots();
+    let Some(block) = allocate(wrapper_items.len()) else {
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+    };
+    let block_slot = roots.base();
+    let _ = roots.pin_root(block as pyre_object::PyObjectRef);
+
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    let block = roots.get(block_slot) as *mut pyre_object::object_array::ItemsBlock;
+    ctx.trace_ctx.set_opref_concrete(
+        args_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+        walker_fill_materialized_array(ctx, args_array, index, item);
+    }
+    Ok(args_array)
+}
+
+fn record_wrapper_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    wrapper_items: &[OpRef],
+) -> Result<OpRef, DispatchError> {
+    record_wrapper_args_array_with(ctx, op_pc, wrapper_items, |len| unsafe {
+        pyre_object::object_array::alloc_cleared_ref_items_block_gc(len)
+    })
+}
+
+#[cfg(test)]
+mod record_wrapper_args_array_tests {
+    use super::*;
+
+    /// Existing WalkContext fixture shape from sibling dispatcher tests.
+    fn wrapper_args_test_context<R>(
+        run: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>, OpRef) -> R,
+    ) -> R {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let null = tc.const_null();
+        let item = tc.record_op(OpCode::PtrEq, &[null, null]);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs_r = RegisterBank::default();
+        let regs_i = RegisterBank::default();
+        let regs_f = RegisterBank::default();
+        let mut concrete_i: [ConcreteValue; 0] = [];
+        let mut ctx = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode::default(),
+            session: &session,
+            registers_r: &regs_r,
+            registers_i: &regs_i,
+            registers_f: &regs_f,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &|_| None,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        run(&mut ctx, item)
+    }
+
+    #[test]
+    fn wrapper_args_allocation_failure_records_nothing() {
+        wrapper_args_test_context(|ctx, item| {
+            let before = ctx.trace_ctx.get_trace_position();
+            let ops_before = ctx.trace_ctx.opcode_at_len();
+            let unescaped_before = ctx.trace_ctx.heap_cache().is_unescaped(item);
+            let saw_before = ctx.trace_ctx.heap_cache().saw_allocation(item);
+
+            let err = record_wrapper_args_array_with(ctx, 17, &[item], |_| None)
+                .expect_err("allocation failure aborts before recording");
+
+            assert!(matches!(
+                err,
+                DispatchError::ConcreteShadowAllocationFailed { pc: 17 }
+            ));
+            assert_eq!(ctx.trace_ctx.get_trace_position(), before);
+            assert_eq!(ctx.trace_ctx.opcode_at_len(), ops_before);
+            assert_eq!(
+                ctx.trace_ctx.heap_cache().is_unescaped(item),
+                unescaped_before
+            );
+            assert_eq!(ctx.trace_ctx.heap_cache().saw_allocation(item), saw_before);
+            assert!(
+                !(0..ctx.trace_ctx.opcode_at_len()).any(|i| matches!(
+                    ctx.trace_ctx.opcode_at(i),
+                    Some(OpCode::NewArrayClear | OpCode::SetarrayitemGc)
+                )),
+                "allocation failure must not append NEW_ARRAY_CLEAR or SETARRAYITEM_GC"
+            );
+        });
+    }
+
+    #[test]
+    fn wrapper_args_allocation_precedes_new_array_record() {
+        // Recorder has no append hook.  The allocation closure runs first:
+        // failure records nothing (sibling test); success stamps the
+        // allocated block onto NEW_ARRAY_CLEAR, which precedes every
+        // SETARRAYITEM_GC.
+        wrapper_args_test_context(|ctx, item| {
+            let mut events = Vec::new();
+            let block = 0x1000usize as *mut pyre_object::object_array::ItemsBlock;
+            let args_array = record_wrapper_args_array_with(ctx, 3, &[item], |_| {
+                events.push("allocate");
+                Some(block)
+            })
+            .expect("allocation succeeds");
+
+            assert_eq!(events, ["allocate"]);
+            assert_eq!(
+                ctx.trace_ctx.opcode_of(args_array),
+                Some(OpCode::NewArrayClear)
+            );
+            assert_eq!(
+                ctx.trace_ctx.box_value(args_array),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(block as usize)))
+            );
+
+            let mut new_pos = None;
+            let mut first_set_pos = None;
+            for i in 0..ctx.trace_ctx.opcode_at_len() {
+                match ctx.trace_ctx.opcode_at(i) {
+                    Some(OpCode::NewArrayClear) if new_pos.is_none() => new_pos = Some(i),
+                    Some(OpCode::SetarrayitemGc) if first_set_pos.is_none() => {
+                        first_set_pos = Some(i)
+                    }
+                    _ => {}
+                }
+            }
+            let new_pos = new_pos.expect("NEW_ARRAY_CLEAR recorded");
+            let first_set_pos = first_set_pos.expect("SETARRAYITEM_GC recorded");
+            assert!(
+                new_pos < first_set_pos,
+                "NEW_ARRAY_CLEAR must precede every SETARRAYITEM_GC"
+            );
+        });
+    }
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8681,26 +8802,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let args_array = record_wrapper_args_array(ctx, op.pc, wrapper_items)?;
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -8773,6 +8875,9 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
     let exc_before_subwalk = ctx.last_exc_value();
+    let args_array_concrete = walker_concrete_ref_object(ctx, args_array)
+        .map(ConcreteValue::Ref)
+        .unwrap_or(ConcreteValue::Null);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -8780,7 +8885,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -9219,24 +9324,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let args_array = record_wrapper_args_array(ctx, op.pc, &wrapper_items)?;
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
@@ -9267,6 +9355,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.helper_return = HelperReturn::CallResult;
     let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     let exc_before_subwalk = ctx.last_exc_value();
+    let args_array_concrete = walker_concrete_ref_object(ctx, args_array)
+        .map(ConcreteValue::Ref)
+        .unwrap_or(ConcreteValue::Null);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -9274,7 +9365,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     drop(helper_frame);
@@ -17193,9 +17284,9 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
 /// `space.len` wrapper, and the wrapper's generic lookup and error arms carry
 /// un-lowered helper calls, so the body-wide descent scan refuses the descent
 /// and every `len(obj)` over a user instance runs as a fresh interpreter frame
-/// behind a `CALL_MAY_FORCE`.  [`exact_builtin_len_shortcut_receiver`] walks
-/// the receivers whose length is a layout read past that same scan; this route
-/// is the other half, for the receivers whose length really is a call.
+/// behind a `CALL_MAY_FORCE`.
+/// The generated builtin wrapper is admitted by executing its selected
+/// path; this route is for receivers whose length really is a Python call.
 ///
 /// The gate is `len_fast_path`, which admits exactly the receivers `_len`
 /// dispatches a method for — a user instance, or a builtin subclass overriding

@@ -4804,12 +4804,16 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
             Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone())
         }
         Some("bool") => Some(LowLevelType::Bool),
-        Some("i64") => Some(LowLevelType::Signed),
+        Some(s) if crate::front::mir::int_result_token_kind(s) == Some(true) => {
+            Some(LowLevelType::Signed)
+        }
         // `raw:<owner>` is a pointer-to-Raw-T. The lltype here is only the
         // gate's admission shell (`getkind` Signed). The stub's annotation
         // is `SomePtr`, resolved once layouts are on the bookkeeper.
         Some(s) if raw_owner_return_root(s).is_some() => Some(LowLevelType::Signed),
-        Some("u64") => Some(LowLevelType::Unsigned),
+        Some(s) if crate::front::mir::int_result_token_kind(s) == Some(false) => {
+            Some(LowLevelType::Unsigned)
+        }
         Some("f32") => Some(LowLevelType::SingleFloat),
         Some("f64") => Some(LowLevelType::Float),
         _ => None,
@@ -9794,8 +9798,8 @@ fn reconcile_elided_phi_inputargs(
 /// also a registry key intern's that host — `ensure_session` already
 /// projected it; intern of the leaf would mint a FORCE-only ClassDef
 /// whose pass-2 is skipped. An unregistered alias (`PyObjectRef`,
-/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`) is resolved
-/// through `Bookkeeper::project_struct_field_type`. A registered
+/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`, `ObjectEntryKey`)
+/// is resolved through `Bookkeeper::project_struct_field_type`. A registered
 /// classdef is `getinstancerepr`; `Impossible` / a classdef-less
 /// instance is `llmemory.GCREF`, never `OBJECTPTR`.
 /// `getuniqueclassdef_for_struct_root` is not called on an unknown name
@@ -23084,9 +23088,9 @@ mod tests {
             &[object],
             crate::HostStaticAddrs::default(),
             &["identitydict", "rordereddict", "rordereddict_entries"],
-            &["nth_item"],
+            &["nth_key"],
         )
-        .expect("lower identitydict nth_item");
+        .expect("lower identitydict nth_key");
 
         let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
         let entry_at = program

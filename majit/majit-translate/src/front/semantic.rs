@@ -520,6 +520,12 @@ pub struct ClassIdentity {
     pub spelling: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TransparentPointerKind {
+    Pointer,
+    GcObject,
+}
+
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
 /// Maps struct_name → vec of field rows.
 /// `field_element_type` is the array element type when the field is an
@@ -575,6 +581,11 @@ pub struct StructFieldRegistry {
     /// the wrapper is not a C struct.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) transparent_scalar_kinds: HashMap<String, crate::model::ValueType>,
+    /// Qualified declarations of `#[repr(transparent)]` structs whose unique
+    /// non-ZST field is one pointer word.  Harvested from Charon `TypeDecl`
+    /// identity; bare leaves are intentionally absent because they collide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) transparent_pointer_kinds: Vec<(String, TransparentPointerKind)>,
     /// Crate roots of FunDecls that lowered a body and are not local
     /// alias roots. Intern and field lookup strip these prefixes
     /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
@@ -858,6 +869,114 @@ impl StructFieldRegistry {
             return Some(kind);
         }
         unique_transparent_scalar_kind(&self.transparent_scalar_kinds, lookup)
+    }
+
+    fn transparent_pointer_identity(&self, spelling: &str) -> Option<majit_ir::descr::StructId> {
+        let stripped = spelling
+            .trim()
+            .trim_start_matches("&mut ")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let lookup = stripped
+            .split_once('<')
+            .map(|(base, _)| base)
+            .unwrap_or(stripped);
+
+        for candidate in [stripped, lookup] {
+            if let Some(Some(identity)) = self.class_identity.get(candidate) {
+                return Some(identity.id);
+            }
+        }
+        let canonical = majit_ir::descr::canonical_struct_name(lookup);
+        if let Some(Some(identity)) = self.class_identity.get(canonical.as_str()) {
+            return Some(identity.id);
+        }
+
+        // Only harvested transparent-pointer declarations participate.  Dual
+        // publications of one declaration collapse by ClassIdentity.id; two
+        // different declarations with the same leaf fail closed.
+        if lookup.contains("::") {
+            return None;
+        }
+        let mut found = None;
+        for (path, _) in &self.transparent_pointer_kinds {
+            if path.rsplit("::").next() != Some(lookup) {
+                continue;
+            }
+            let Some(Some(identity)) = self.class_identity.get(path) else {
+                continue;
+            };
+            match found {
+                None => found = Some(identity.id),
+                Some(id) if id == identity.id => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    pub(crate) fn transparent_pointer_kind(
+        &self,
+        class_root: &str,
+    ) -> Option<TransparentPointerKind> {
+        if let Some(wanted) = self.transparent_pointer_identity(class_root) {
+            let mut found = None;
+            for (path, kind) in &self.transparent_pointer_kinds {
+                let Some(Some(identity)) = self.class_identity.get(path) else {
+                    continue;
+                };
+                if identity.id != wanted {
+                    continue;
+                }
+                match found {
+                    None => found = Some(*kind),
+                    Some(old) if old == *kind => {}
+                    Some(_) => return None,
+                }
+            }
+            return found;
+        }
+        // Hand-built registries may note wrapper paths without publishing
+        // `class_identity`. Keep exact/canonical spelling lookup so a
+        // qualified declaration path still resolves.
+        let stripped = class_root
+            .trim()
+            .trim_start_matches("&mut ")
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let lookup = stripped
+            .split_once('<')
+            .map(|(bare, _)| bare)
+            .unwrap_or(stripped);
+        let find = |wanted: &str| {
+            self.transparent_pointer_kinds
+                .iter()
+                .find_map(|(path, kind)| (path == wanted).then_some(*kind))
+        };
+        find(stripped).or_else(|| find(lookup)).or_else(|| {
+            let canonical = majit_ir::descr::canonical_struct_name(lookup);
+            (canonical.as_str() != lookup)
+                .then(|| find(canonical.as_str()))
+                .flatten()
+        })
+    }
+
+    pub(crate) fn note_transparent_pointer_kind(
+        &mut self,
+        path: String,
+        kind: TransparentPointerKind,
+    ) {
+        if let Some((_, old)) = self
+            .transparent_pointer_kinds
+            .iter_mut()
+            .find(|(known, _)| known == &path)
+        {
+            debug_assert_eq!(*old, kind, "one declaration path has one pointer kind");
+            return;
+        }
+        self.transparent_pointer_kinds.push((path, kind));
     }
 
     /// Look up a field's type.  For array-typed fields like
@@ -1669,6 +1788,12 @@ pub struct SemanticProgram {
     /// `c_graphs` for an indirect call through that slot. Empty until the
     /// first-pass harvest fills it.
     pub fnptr_field_families: Vec<(String, String, String)>,
+    /// `(impl_key, trait_leaf, method)` whose rustc vtable slot is the
+    /// trait default body (`TraitDecl` provided method, not an override).
+    /// Frozen into `JitCodeIndex` so `bytecode_for_address` binds the
+    /// base jitcode the way `getfunctionptr(graph)` shares the base
+    /// funcptr.
+    pub inherited_trait_defaults: Vec<(String, String, String)>,
     /// Live assembler layout table for this translation (`descr.py`
     /// `get_size_descr` cache[STRUCT]). One `Rc` per translation, shared
     /// with every crate's lowering and with `CallControl`.
@@ -1899,6 +2024,50 @@ mod tests {
             crate::model::ValueType::Int,
         );
         assert_eq!(reg.transparent_scalar_kind("InternalBitFlags"), None);
+    }
+
+    #[test]
+    fn transparent_pointer_kind_resolves_unique_leaf_by_identity_and_refuses_collision() {
+        let mut reg = StructFieldRegistry::default();
+        let first = majit_ir::descr::StructId::from_canonical("a::Key");
+        for path in ["crate_a::a::Key", "a::Key", "Key"] {
+            reg.class_identity.insert(
+                path.to_string(),
+                Some(ClassIdentity {
+                    id: first,
+                    spelling: "a::Key".into(),
+                }),
+            );
+        }
+        reg.note_transparent_pointer_kind(
+            "crate_a::a::Key".into(),
+            TransparentPointerKind::GcObject,
+        );
+        reg.note_transparent_pointer_kind("a::Key".into(), TransparentPointerKind::GcObject);
+        assert_eq!(
+            reg.transparent_pointer_kind("Key"),
+            Some(TransparentPointerKind::GcObject)
+        );
+
+        let second = majit_ir::descr::StructId::from_canonical("b::Key");
+        reg.class_identity.insert("Key".into(), None);
+        reg.class_identity.insert(
+            "b::Key".into(),
+            Some(ClassIdentity {
+                id: second,
+                spelling: "b::Key".into(),
+            }),
+        );
+        reg.note_transparent_pointer_kind("b::Key".into(), TransparentPointerKind::GcObject);
+        assert_eq!(reg.transparent_pointer_kind("Key"), None);
+        assert_eq!(
+            reg.transparent_pointer_kind("a::Key"),
+            Some(TransparentPointerKind::GcObject)
+        );
+        assert_eq!(
+            reg.transparent_pointer_kind("b::Key"),
+            Some(TransparentPointerKind::GcObject)
+        );
     }
 
     /// `remove` then `insert` of a different key restores `len`. The suffix

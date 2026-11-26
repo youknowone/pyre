@@ -3594,9 +3594,9 @@ fn entries_gcarray_descr_for_type_id(array_type_id: &str) -> Option<DescrRef> {
     if is_entry_kv(array_type_id, "i64", true) {
         return Some(entries_gcarray_descr::<i64, V>(array_type_id));
     }
-    if is_entry_kv(array_type_id, "ObjectKey", true) {
+    if is_entry_kv(array_type_id, "ObjectEntryKey", true) {
         return Some(entries_gcarray_descr::<
-            pyre_object::dictmultiobject::ObjectKey,
+            pyre_object::dictmultiobject::ObjectEntryKey,
             V,
         >(array_type_id));
     }
@@ -3617,9 +3617,9 @@ fn entries_gcarray_descr_for_type_id(array_type_id: &str) -> Option<DescrRef> {
             array_type_id,
         ));
     }
-    if is_entry_kv(array_type_id, "ObjectKey", false) {
+    if is_entry_kv(array_type_id, "ObjectEntryKey", false) {
         return Some(entries_gcarray_descr::<
-            pyre_object::dictmultiobject::ObjectKey,
+            pyre_object::dictmultiobject::ObjectEntryKey,
             (),
         >(array_type_id));
     }

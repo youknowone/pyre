@@ -523,6 +523,9 @@ pub(crate) fn absorb_semantic_program(
                     .entry(key)
                     .or_insert(kind);
             }
+            for (key, kind) in prog.struct_fields.transparent_pointer_kinds {
+                acc.struct_fields.note_transparent_pointer_kind(key, kind);
+            }
             acc.struct_fields
                 .option_struct_ids
                 .extend(prog.struct_fields.option_struct_ids);
@@ -737,6 +740,11 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     } else {
         publish_fnptr_field_families_across(llbcs)
     };
+    let inherited_trait_defaults = if function_filter.is_some() {
+        Vec::new()
+    } else {
+        inherited_dyn_impl_methods_across(llbcs)
+    };
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key is [`crate::model::graph_key_of`] when `funcobj_identity`
     // is present: `FunctionDesc.cachedgraph` keeps one graph per (desc,
@@ -786,6 +794,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             Some(&acc.struct_ids),
         );
         acc.fnptr_field_families = fnptr_field_families;
+        acc.inherited_trait_defaults = inherited_trait_defaults;
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -807,6 +816,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
             fnptr_field_families: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             struct_layouts: Default::default(),
         }),
     )
@@ -901,18 +911,22 @@ fn is_known_lowering_gap(msg: &str) -> bool {
 }
 
 /// A discovered reference-payload generic-enum instantiation: the enum's
-/// Charon def id and qualified name, the concrete type arguments in
-/// generic-parameter order (`["Tuple", "PyError"]`), and the `<…>` suffix
-/// the per-instantiation classdef carries (`<Tuple,PyError>`).
+/// Charon def id and qualified name, the intern payload rows in
+/// generic-parameter order (`["Tuple", "PyError"]`), the `<…>` suffix
+/// the per-instantiation classdef carries (`<Tuple,PyError>`), and the
+/// `render_adt_type_args` spellings [`concrete_adt_struct_id`] uses for
+/// the layout STRUCT.
 ///
-/// Ordered by `(name_path, suffix, args, def_id)` so intern registration
-/// walks one stable sequence; `{base}{suffix}::{variant}` is first-writer.
+/// Ordered by `(name_path, suffix, args, layout_args, def_id)` so intern
+/// registration walks one stable sequence; `{base}{suffix}::{variant}` is
+/// first-writer.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RefEnumInst {
     def_id: u64,
     name_path: String,
     args: Vec<String>,
     suffix: String,
+    layout_args: Vec<String>,
 }
 
 impl PartialOrd for RefEnumInst {
@@ -927,6 +941,7 @@ impl Ord for RefEnumInst {
             .cmp(&other.name_path)
             .then_with(|| self.suffix.cmp(&other.suffix))
             .then_with(|| self.args.cmp(&other.args))
+            .then_with(|| self.layout_args.cmp(&other.layout_args))
             .then_with(|| self.def_id.cmp(&other.def_id))
     }
 }
@@ -1029,11 +1044,17 @@ fn ref_enum_instantiation_of_adt(
         &std::collections::HashSet::<String>::new(),
         tombstoned,
     );
+    // Same type-arg spellings `resolve_adt_field` / `stamp_enum_variant_instance_layout`
+    // pass to `concrete_adt_struct_id`. Intern suffix keeps `&` on a scalar
+    // Ref (`charon_type_value_to_enum_arg`); the layout STRUCT does not
+    // (`render_adt_type_args` / `type_arg_referent_is_raw_storage`).
+    let layout_args = render_adt_type_args(adt, llbc, 0, tombstoned);
     Some(RefEnumInst {
         def_id,
         name_path,
         args,
         suffix,
+        layout_args,
     })
 }
 
@@ -1760,18 +1781,28 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
-            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
-            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
+            // `descr.py get_field_descr`: `parent_descr = get_size_descr(STRUCT)`.
+            // FieldRead `owner_id` is `concrete_adt_struct_id` of the variant
+            // template. NEW looks that STRUCT up through `struct_id_for_name`
+            // of `{base}{suffix}::{variant}`, so intern mints the same
+            // identity rather than `from_canonical_spelling` of the intern
+            // suffix (which keeps `&` on a scalar Ref).
+            let template =
+                majit_ir::descr::StructId::from_canonical(&format!("{canon_base}::{}", v.name));
+            let sid = if inst.layout_args.is_empty() {
+                template
+            } else {
+                template.instantiate(&format!("<{}>", inst.layout_args.join(",")))
+            };
             for base in &bases {
                 let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
-                // Layout id stays the crate-stripped spelling
-                // (`StructId::from_canonical_spelling`). Class identity
-                // is not published here: `Bookkeeper.getdesc` of a
-                // constructed generic is the template class object plus
+                // Layout id is the instance STRUCT (`concrete_adt_struct_id`).
+                // Class identity is not published here: `Bookkeeper.getdesc`
+                // of a constructed generic is the template class object plus
                 // its args (`intern_class_key_from_registry` reattaches
                 // them).
                 record_layout_struct_id(struct_ids, key, sid);
@@ -4580,6 +4611,7 @@ impl CrateLoweringState {
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
             fnptr_field_families: Vec::new(),
+            inherited_trait_defaults: Vec::new(),
             struct_layouts: self.struct_layouts.clone(),
         }
     }
@@ -7341,6 +7373,12 @@ fn derive_program_metadata(
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
                 );
+                let pointer_wrapper_kind = transparent_pointer_wrapper_kind(
+                    td,
+                    llbc,
+                    gc_struct_ids,
+                    handle_payload.is_some(),
+                );
                 let handle_field_index = handle_payload
                     .as_ref()
                     .and_then(|_| transparent_nonzst_field(td, llbc).map(|(i, _)| i));
@@ -7405,6 +7443,14 @@ fn derive_program_metadata(
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
+                if let Some(kind) = pointer_wrapper_kind {
+                    // Full and crate-stripped qualified declaration identities only.
+                    // Never publish `leaf`: unrelated crates may declare the same leaf.
+                    struct_fields.note_transparent_pointer_kind(name.clone(), kind);
+                    if canonical_name.contains("::") {
+                        struct_fields.note_transparent_pointer_kind(canonical_name.clone(), kind);
+                    }
+                }
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields
                     .fields
@@ -7494,9 +7540,11 @@ fn derive_program_metadata(
                         .map(|(i, f)| (field_decl_name(i, f), f.ty.clone()))
                         .collect(),
                 });
-                known_struct_names.insert(name);
-                known_struct_names.insert(canonical_name);
-                known_struct_names.insert(leaf);
+                if pointer_wrapper_kind.is_none() {
+                    known_struct_names.insert(name);
+                    known_struct_names.insert(canonical_name);
+                    known_struct_names.insert(leaf);
+                }
             }
             TypeDeclKind::Enum(variants) => {
                 // Enums register under their type name *and* under each
@@ -8534,6 +8582,39 @@ pub(crate) fn struct_id_is_field0_parent(
             .is_some_and(|template| ids.contains(&template))
 }
 
+fn transparent_pointer_wrapper_kind(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    is_transparent_handle: bool,
+) -> Option<crate::front::semantic::TransparentPointerKind> {
+    if !td.item_meta.is_local || !td.is_repr_transparent() || is_transparent_handle {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let (index, _) = transparent_nonzst_field(td, llbc)?;
+    let field = fields.get(index)?;
+    let node = tyref_node(&field.ty, llbc)?;
+    let pointee = one_word_pointer_pointee(node, llbc)?;
+    // Charon production nodes wrap the pointee as `Deduplicated` /
+    // `Value`; `adt_node_def_id` is the bare-`Adt` tail of that peel.
+    let kind = json_ty_adt_def_id(llbc, pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .filter(|pointee_decl| {
+            let spelling = strip_crate_prefix(pointee_decl.item_meta.name_path_str());
+            struct_id_is_declared_gc(
+                gc_struct_ids,
+                struct_id_for_type_decl(pointee_decl),
+                &spelling,
+            )
+        })
+        .map(|_| crate::front::semantic::TransparentPointerKind::GcObject)
+        .unwrap_or(crate::front::semantic::TransparentPointerKind::Pointer);
+    Some(kind)
+}
+
 /// StructIds whose LLBC declaration records `#[repr(transparent)]`.
 ///
 /// `TypeDecl::is_repr_transparent` is the Charon layout fact. Folded
@@ -8837,6 +8918,9 @@ impl DuplicateLeafFacts {
                 .transparent_scalar_kinds
                 .entry(key)
                 .or_insert(kind);
+        }
+        for (key, kind) in other.struct_fields.transparent_pointer_kinds {
+            self.struct_fields.note_transparent_pointer_kind(key, kind);
         }
         self.struct_fields
             .option_struct_ids
@@ -9896,6 +9980,8 @@ use self::operation::*;
 use self::removeassert::*;
 use self::simplify::*;
 use self::strformat::*;
+pub use self::views::inherited_dyn_impl_methods;
+pub(crate) use self::views::inherited_dyn_impl_methods_across;
 use self::views::*;
 
 pub(crate) use self::consteval::{
@@ -9937,16 +10023,17 @@ pub(crate) use self::lltype::{
     collect_policy_opaque_fn_stubs_from_llbc, entry_family_is_entry_path, entry_family_name_path,
     fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation,
     gcarray_item_struct_ptr_lltype, host_rthread_threadlocalref_llop,
-    impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
-    is_flattened_storage_leaf, is_mut_ref_cell_name, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    impl_method_owner_for_fundecl, impl_owner_from_item_meta, int_result_token_kind,
+    is_cow_str_family_class_root, is_flattened_storage_leaf, is_mut_ref_cell_name,
+    is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling, is_rstr_str_layout_declaration,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr,
+    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
+    stamp_fn_ptr_spelling, strip_crate_prefix, struct_item_flexible_gcarray_block_annotation,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

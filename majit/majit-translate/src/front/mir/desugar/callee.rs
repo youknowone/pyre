@@ -6716,6 +6716,9 @@ pub(in crate::front::mir) struct StructFieldPtrAdd {
     pub(in crate::front::mir) header: TracedPtrAddHeader,
     pub(in crate::front::mir) index_local: usize,
     pub(in crate::front::mir) array_type_id: String,
+    /// Call destinations erased only after the full ptr-add/use proof succeeds.
+    /// Dense MIR-local indices; this is flowspace work order, not semantic state.
+    pub(in crate::front::mir) pointer_call_locals: Vec<usize>,
 }
 
 pub(in crate::front::mir) fn path_leaf_is(path: &str, leaf: &str) -> bool {
@@ -6840,8 +6843,13 @@ pub(in crate::front::mir) enum HeaderProd {
 }
 
 pub(in crate::front::mir) enum HeaderStep {
-    Follow(usize),
-    Done(TracedPtrAddHeader),
+    Follow {
+        next: usize,
+    },
+    Done {
+        header: TracedPtrAddHeader,
+        pointer_call_local: Option<usize>,
+    },
 }
 
 pub(in crate::front::mir) fn copy_prod_if_raw_ptr(
@@ -7173,26 +7181,31 @@ pub(in crate::front::mir) fn header_producer(
     // No producer means the local is already the pointer that was
     // passed in. A struct-field `ptr::add` of that pointer is the header.
     if producers == 0 {
-        return Some(HeaderStep::Done(TracedPtrAddHeader::EntriesItem {
-            local: cur,
-        }));
+        return Some(HeaderStep::Done {
+            header: TracedPtrAddHeader::EntriesItem { local: cur },
+            pointer_call_local: None,
+        });
     }
     if producers != 1 {
         return None;
     }
     match kind {
-        HeaderProd::Copy(Some(src)) if src != cur => Some(HeaderStep::Follow(src)),
-        HeaderProd::EntriesItem(Some(local)) => {
-            Some(HeaderStep::Done(TracedPtrAddHeader::EntriesItem { local }))
-        }
+        HeaderProd::Copy(Some(src)) if src != cur => Some(HeaderStep::Follow { next: src }),
+        HeaderProd::EntriesItem(Some(local)) => Some(HeaderStep::Done {
+            header: TracedPtrAddHeader::EntriesItem { local },
+            pointer_call_local: Some(cur),
+        }),
         HeaderProd::EntryPtr {
             recv: Some(recv_local),
             recv_ty: Some(recv_ty),
         } if struct_field_index_named(&recv_ty, llbc, "entries").is_some() => {
-            Some(HeaderStep::Done(TracedPtrAddHeader::EntryPtr {
-                recv_local,
-                recv_ty,
-            }))
+            Some(HeaderStep::Done {
+                header: TracedPtrAddHeader::EntryPtr {
+                    recv_local,
+                    recv_ty,
+                },
+                pointer_call_local: Some(cur),
+            })
         }
         _ => None,
     }
@@ -7202,12 +7215,21 @@ pub(in crate::front::mir) fn trace_struct_ptr_add_header(
     body: &Unstructured,
     llbc: &Llbc,
     base: usize,
-) -> Option<TracedPtrAddHeader> {
+) -> Option<(TracedPtrAddHeader, Vec<usize>)> {
     let mut cur = base;
+    let mut pointer_call_locals = Vec::new();
     for _ in 0..32 {
         match header_producer(body, llbc, cur)? {
-            HeaderStep::Done(done) => return Some(done),
-            HeaderStep::Follow(next) => cur = next,
+            HeaderStep::Done {
+                header,
+                pointer_call_local,
+            } => {
+                if let Some(local) = pointer_call_local {
+                    pointer_call_locals.push(local);
+                }
+                return Some((header, pointer_call_locals));
+            }
+            HeaderStep::Follow { next } => cur = next,
         }
     }
     None
@@ -7246,7 +7268,7 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     if !add_dest_used_only_as_struct_field(llbc, body, dest_local) {
         return None;
     }
-    let header = trace_struct_ptr_add_header(body, llbc, base_local)?;
+    let (header, pointer_call_locals) = trace_struct_ptr_add_header(body, llbc, base_local)?;
     let header_local = match &header {
         TracedPtrAddHeader::EntriesItem { local } => *local,
         TracedPtrAddHeader::EntryPtr { recv_local, .. } => *recv_local,
@@ -7263,7 +7285,182 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
         header,
         index_local,
         array_type_id,
+        pointer_call_locals,
     })
+}
+
+/// True when every use of `local` is a raw-pointer copy/cast chain whose
+/// leaves are proven `struct_field_ptr_add_trace` calls. A switch,
+/// assertion, aggregate, arithmetic/address call, return path, projection,
+/// or unproven call keeps the producer.
+fn pointer_alias_uses_are_proven(
+    body: &Unstructured,
+    llbc: &Llbc,
+    local: usize,
+    tombstoned: &std::collections::HashSet<String>,
+    active: &mut Vec<usize>,
+) -> bool {
+    if active.contains(&local) {
+        return false;
+    }
+    active.push(local);
+    let ok = (|| {
+        let forward = forward_reachable_mask(llbc, body);
+        let mut uses = 0usize;
+        for (bb_idx, bb) in body.body().iter().enumerate() {
+            if !forward[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                match stmt.stmt_kind_ref() {
+                    Ok(StmtKind::Assign(place, rvalue)) => {
+                        if !matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+                            && place_references_local(place, local)
+                        {
+                            return false;
+                        }
+                        let mut derefs = 0;
+                        let mut other = 0;
+                        scan_rvalue_dest_ref(rvalue, local, &mut derefs, &mut other);
+                        if derefs == 0 && other == 0 {
+                            continue;
+                        }
+                        if derefs != 0 {
+                            return false;
+                        }
+                        let PlaceKind::Local(next) = place.kind else {
+                            return false;
+                        };
+                        let next = next as usize;
+                        let follows = match rvalue {
+                            Rvalue::Use(op, _) => operand_local(Some(op)) == Some(local),
+                            Rvalue::Cast(_, op, target_ty) => matches!(
+                                copy_prod_if_raw_ptr(op, operand_tyref(op), target_ty, llbc),
+                                HeaderProd::Copy(Some(source)) if source == local
+                            ),
+                            Rvalue::UnaryOp(kind, op) if unary_op_is_cast(kind) => matches!(
+                                copy_prod_if_raw_ptr(op, operand_tyref(op), &place.ty, llbc),
+                                HeaderProd::Copy(Some(source)) if source == local
+                            ),
+                            _ => false,
+                        };
+                        if !follows {
+                            return false;
+                        }
+                        uses += 1;
+                        if !pointer_alias_uses_are_proven(body, llbc, next, tombstoned, active) {
+                            return false;
+                        }
+                    }
+                    Ok(StmtKind::Assert(assert))
+                        if operand_place(&assert.cond)
+                            .is_some_and(|place| place_references_local(place, local)) =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            match bb.term_ref(llbc) {
+                Ok(TermKind::Call { call, .. }) => {
+                    for (arg_index, arg) in call.args.iter().enumerate() {
+                        if !operand_place(arg)
+                            .is_some_and(|place| place_references_local(place, local))
+                        {
+                            continue;
+                        }
+                        uses += 1;
+                        let CallFunc::Regular(reg) = &call.func else {
+                            return false;
+                        };
+                        let PlaceKind::Local(dest) = call.dest.kind else {
+                            return false;
+                        };
+                        if arg_index != 0
+                            || operand_local(Some(arg)) != Some(local)
+                            || struct_field_ptr_add_trace(
+                                reg,
+                                call.args.len(),
+                                operand_local(call.args.first()),
+                                call.args.first().and_then(operand_tyref),
+                                operand_local(call.args.get(1)),
+                                dest as usize,
+                                body,
+                                llbc,
+                                tombstoned,
+                            )
+                            .is_none()
+                        {
+                            return false;
+                        }
+                    }
+                }
+                Ok(TermKind::Switch { discr, .. })
+                    if operand_place(discr)
+                        .is_some_and(|place| place_references_local(place, local)) =>
+                {
+                    return false;
+                }
+                Ok(TermKind::Assert { assert, .. })
+                    if operand_place(&assert.cond)
+                        .is_some_and(|place| place_references_local(place, local)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        uses != 0
+    })();
+    active.pop();
+    ok
+}
+
+/// MIR call destinations that exist only to recover the base of a proven
+/// `getinteriorfield`/`setinteriorfield` access.
+pub(in crate::front::mir) fn interior_pointer_alias_calls(
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Vec<bool> {
+    let mut aliases = vec![false; body.locals.locals.len()];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        let Some(traced) = struct_field_ptr_add_trace(
+            reg,
+            call.args.len(),
+            operand_local(call.args.first()),
+            call.args.first().and_then(operand_tyref),
+            operand_local(call.args.get(1)),
+            dest as usize,
+            body,
+            llbc,
+            tombstoned,
+        ) else {
+            continue;
+        };
+        for local in traced.pointer_call_locals {
+            let mut active = Vec::new();
+            if pointer_alias_uses_are_proven(body, llbc, local, tombstoned, &mut active)
+                && let Some(alias) = aliases.get_mut(local)
+            {
+                *alias = true;
+            }
+        }
+    }
+    aliases
 }
 
 pub(in crate::front::mir) struct StructFieldVecIndex {
