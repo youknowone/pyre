@@ -5947,11 +5947,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
         || tyref_is_cow_str(ty, llbc)
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
+/// True when `ty` (after stripping `&` / `&mut` wrappers) resolves to the
 /// exact `majit_rlib::rbigint::RBigInt` ADT. Guards the
 /// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
 /// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
 /// a `jit_bigint_*` residual that would misread its non-RBigInt pointer.
+///
+/// [`strip_ty_wrappers`] peels `Ref` and leaves `RawPtr`. A `*mut RBigInt`
+/// payload is [`tyref_is_rbigint_gc_payload`].
 ///
 /// In `pyre-object.ullbc` the declaration is the local struct whose bodies
 /// stay available to source translation. In dependent-crate LLBCs Charon
@@ -5959,9 +5962,33 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
 /// qualified identity is therefore the invariant; requiring either storage
 /// kind would make the rewrite depend on which crate owns the caller.
 pub(in crate::front::mir) fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(adt_node_def_id)
+    rbigint_adt_node(
+        tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)),
+        llbc,
+    )
+}
+
+/// `RBigInt` by value, or one pointer word to it (`&RBigInt`, `*mut RBigInt`).
+///
+/// Host `descroperation::bigint_mod` returns `Result<*mut RBigInt, RBigIntError>`
+/// so an aliased remainder can be the dividend payload (`rbigint._divrem` /
+/// `_divmod_small`). The Ok type is a `RawPtr`, which [`tyref_is_rbigint`]
+/// does not peel.
+pub(in crate::front::mir) fn tyref_is_rbigint_gc_payload(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_rbigint(ty, llbc) {
+        return true;
+    }
+    rbigint_adt_node(
+        tyref_node(ty, llbc)
+            .and_then(|n| strip_ty_indirections(n, llbc))
+            .and_then(|n| one_level_pointer_pointee(n, llbc))
+            .and_then(|n| strip_ty_wrappers(n, llbc)),
+        llbc,
+    )
+}
+
+fn rbigint_adt_node(node: Option<&serde_json::Value>, llbc: &Llbc) -> bool {
+    node.and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
             let path = td.item_meta.name_path_str();
@@ -10373,8 +10400,9 @@ pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
     entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
 }
 
-/// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
-/// serves every monomorphization; the bare `Entry` class would union `key`.
+/// `<K,V>` suffix for `rordereddict_entries::Entry`. The suffix keeps `()`
+/// (a set's `DICTVALUE`) because `get_ll_dict` keys the entry on both key
+/// and value types, matching the registered `Entry<ObjectKey,()>` row.
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10384,12 +10412,13 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     if !entry_family_is_entry_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    enum_instantiation_suffix_from_args(&type_args)
 }
 
-/// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The entries array
-/// header is `DICTENTRYARRAY` of `get_ll_dict`, one per `(DICTKEY, DICTVALUE)`;
-/// the bare class would share one ARRAY across key types.
+/// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The suffix keeps
+/// `()` (a set's `DICTVALUE`) because `get_ll_dict` keys the entry on both
+/// key and value types, matching the registered `Entry<ObjectKey,()>` row.
 pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10399,7 +10428,8 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    enum_instantiation_suffix_from_args(&type_args)
 }
 
 /// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
@@ -10494,7 +10524,9 @@ pub(in crate::front::mir) fn foreign_body_generic_struct_instantiation_suffix(
 /// `get_ll_dict` builds one `DICT` per key/value, and that struct holds
 /// `("entries", Ptr(DICTENTRYARRAY))`. `bookkeeper.py` `getuniqueclassdef`
 /// is one class object per such struct. The predicate is those template
-/// field types, not the struct's name.
+/// field types, not the struct's name. The holder keeps `()` like
+/// `GcEntries`, because `get_ll_dict` keys the `DICT` on both `DICTKEY`
+/// and `DICTVALUE` (a set's value type included).
 pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -10512,7 +10544,8 @@ pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
     {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    enum_instantiation_suffix_from_args(&type_args)
 }
 
 /// Pointer / `Box` / `NonNull` / by-value field whose pointee ADT is the
@@ -11084,88 +11117,45 @@ fn fn_ptr_pointee_is_gcref(pointee: &serde_json::Value, llbc: &Llbc) -> bool {
     majit_ir::descr::class_root_leaf(&path) == "GcRef"
 }
 
-/// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
-fn retarget_pointer_wrapper(
-    wrapper: &serde_json::Value,
-    pointee: serde_json::Value,
-) -> serde_json::Value {
-    let mut obj = wrapper.clone();
-    let Some(map) = obj.as_object_mut() else {
-        return obj;
-    };
-    if let Some(r) = map.get_mut("Ref") {
-        if let Some(arr) = r.as_array_mut() {
-            if arr.len() > 1 {
-                arr[1] = pointee;
-            }
-        } else if let Some(inner) = r.as_object_mut() {
-            inner.insert("ty".to_string(), pointee);
-        }
-    } else if let Some(arr) = map.get_mut("RawPtr").and_then(|v| v.as_array_mut())
-        && !arr.is_empty()
-    {
-        arr[0] = pointee;
-    }
-    obj
+/// Container `Adt.generics.types` and `const_generics`, empty when a key
+/// is absent. `None` when `container` is not an ADT with generics.
+fn tyref_container_adt_generics(
+    container: &TyRef,
+    llbc: &Llbc,
+) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+    let adt = tyref_node(container, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))?
+        .as_object()?
+        .get("Adt")?
+        .as_object()?;
+    let generics = type_decl_ref_generics(adt, llbc)?;
+    let types = generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let const_generics = generics
+        .get("const_generics")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some((types, const_generics))
 }
 
-/// Bound TypeVar at `ty` replaced by `container`'s `Adt.generics.types`
-/// (`substitute_field_type`). A `Result<T,E>::Ok.0` decl is `T`; the
-/// use-site container carries `*mut u8`. `PtrRepr.rtype_getattr` keeps
-/// the field's declared pointer wrappers; only the type variable is
-/// replaced (`&T` with `T = i64` stays `&i64`).
+/// The container's `Adt.generics` (`types` and `const_generics`) are
+/// substituted through the whole declared field type (`substitute_field_type`).
+/// Declared pointer wrappers are kept (`&T` with `T = i64` stays `&i64`),
+/// and a nested ADT field (`*mut GcEntries<K,V>`) becomes its instantiation
+/// (`get_ll_dict` mints one DICTENTRY per `(DICTKEY, DICTVALUE)`).
 pub(in crate::front::mir) fn tyref_subst_bound_typevar(
     ty: &TyRef,
     container: &TyRef,
     llbc: &Llbc,
 ) -> TyRef {
-    let Some(mut cur) = tyref_node(ty, llbc) else {
+    let Some((types, const_generics)) = tyref_container_adt_generics(container, llbc) else {
         return clone_tyref(ty);
     };
-    let mut wrappers: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..24 {
-        let Some(peeled) = strip_ty_indirections(cur, llbc) else {
-            return clone_tyref(ty);
-        };
-        cur = peeled;
-        let Some(obj) = cur.as_object() else {
-            return clone_tyref(ty);
-        };
-        if let Some(r) = obj.get("Ref") {
-            wrappers.push(cur.clone());
-            let (inner, _) = ref_inner_and_kind(r);
-            let Some(inner) = inner else {
-                return clone_tyref(ty);
-            };
-            cur = inner;
-            continue;
-        }
-        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
-            wrappers.push(cur.clone());
-            let Some(inner) = arr.first() else {
-                return clone_tyref(ty);
-            };
-            cur = inner;
-            continue;
-        }
-        break;
-    }
-    let Some(idx) = typevar_bound_index(cur) else {
-        return clone_tyref(ty);
-    };
-    let Some(arg) = tyref_adt_generics_type_arg(container, idx as usize, llbc) else {
-        return clone_tyref(ty);
-    };
-    if wrappers.is_empty() {
-        return arg;
-    }
-    let Some(mut node) = tyref_node(&arg, llbc).cloned() else {
-        return clone_tyref(ty);
-    };
-    for wrapper in wrappers.iter().rev() {
-        node = retarget_pointer_wrapper(wrapper, node);
-    }
-    TyRef::Other(node.into())
+    crate::front::clause_spec::subst_tyref(ty, llbc, &types, &const_generics)
 }
 
 /// One `Adt.generics.types[index]` from `container`, peeling `Ref`.
@@ -11174,17 +11164,8 @@ pub(in crate::front::mir) fn tyref_adt_generics_type_arg(
     index: usize,
     llbc: &Llbc,
 ) -> Option<TyRef> {
-    let adt = tyref_node(container, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))?
-        .as_object()?
-        .get("Adt")?
-        .as_object()?;
-    let node = type_decl_ref_generics(adt, llbc)?
-        .as_object()?
-        .get("types")?
-        .as_array()?
-        .get(index)?;
-    serde_json::from_value(node.clone()).ok()
+    let (types, _) = tyref_container_adt_generics(container, llbc)?;
+    serde_json::from_value(types.get(index)?.clone()).ok()
 }
 
 /// A `u8` scalar (the host `&[u8]` pair item), including behind the
