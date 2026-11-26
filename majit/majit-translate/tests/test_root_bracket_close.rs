@@ -2509,6 +2509,50 @@ fn isinstance_bracket_is_scalar_replaced() {
     });
 }
 
+/// `dunder_import_inner` pins the import arguments and reads them back
+/// through closures over those slots. The closures are slot getters, so
+/// `push_roots` / `pop_roots` (`ShadowStackFrameworkGCTransformer`, after
+/// `make_jitcodes`) must not remain in the lowered graph.
+#[test]
+fn dunder_import_inner_bracket_is_scalar_replaced() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        let context = context_with_extras(interpreter, &[object]);
+        let outcome = majit_translate::front::mir::shadow_stack_erase_named(
+            interpreter,
+            "::importing::dunder_import_inner",
+        );
+        assert_eq!(
+            outcome, "erased",
+            "dunder_import_inner bracket must scalar-replace"
+        );
+        let graph = lower_fun(interpreter, &context, "importing::dunder_import_inner");
+        for leaf in [
+            "push_roots",
+            "pin_roots",
+            "pin_root",
+            "shadow_stack_get",
+            "shadow_stack_len",
+            "root_scope_close_word",
+        ] {
+            assert_eq!(
+                calls_to(&graph, leaf),
+                0,
+                "dunder_import_inner still calls {leaf} after the bracket was scalar-replaced"
+            );
+        }
+    });
+}
+
 /// `_check_not_duplicate_kwargs` copies the published existing-names
 /// slice into `existing_now`, a separately allocated buffer.
 /// `pop_roots` / `expand_pop_roots` (`gc_restore_root`) reloads

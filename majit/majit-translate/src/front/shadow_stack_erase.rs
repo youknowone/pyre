@@ -989,6 +989,28 @@ fn slot_getter_of(
     got
 }
 
+/// The call's body is a [`SlotGetter`]: `shadow_stack_get` of a captured
+/// slot, or of that slot plus the closure argument.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` / `pop_roots` run after
+/// `warmspot.py` `make_jitcodes`, so this read is a copy of the slot local
+/// and not a residual. The registered effect is still ParamSlots: the index
+/// is the closure's own parameter (`RootSlotGetter::Capture` /
+/// `CapturePlusArg`).
+fn call_is_root_slot_getter(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    cache: &mut HashMap<u64, Option<SlotGetter>>,
+) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    let Some(fun_id) = super::regular_call_fun_decl_id(&reg.kind) else {
+        return false;
+    };
+    slot_getter_of(llbc, fun_id, cache).is_some()
+}
+
 /// `classify_root_slot_getter_body` with a `Const` usize treated as an addend
 /// rather than an opaque leaf, so `|| shadow_stack_get(base + 1)` is a Get of
 /// slot `k + 1`.
@@ -2489,6 +2511,19 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
+                    // The getter did not peel to a slot. Keeping the call
+                    // after the bracket is gone would read a stack this
+                    // body no longer pushes (`push_roots` / `pop_roots`
+                    // are not in the jitcode).
+                    if call_is_root_slot_getter(call, llbc, cx.getter_cache) {
+                        if crate::decline::enabled() {
+                            eprintln!(
+                                "[erase] slot-getter-did-not-peel {}",
+                                callee_path(call, llbc).as_deref().unwrap_or("")
+                            );
+                        }
+                        return Err("calls-stack-sensitive-fn");
+                    }
                     if call_is_anchor_identity(call, llbc) {
                         cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
@@ -3137,7 +3172,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // A returned owned guard is that leftover packaged in the dest the
     // caller drops, so it is not this body's slots. ParamSlots methods
     // of that dest read the nested bracket.
+    //
+    // A slot getter is ParamSlots for the same reason — the captured index
+    // is its parameter — and the walk below replaces the call with a copy
+    // of that slot (`RootSlotGetter`). `push_roots` / `pop_roots` are not
+    // in the jitcode, so the registered effect must not keep the bracket.
     let owned_scope_locals = owned_scope_receiver_locals(body, llbc, &forward_blocks);
+    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
     for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -3149,6 +3190,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
             if effect.refuses_erase()
                 && !callee_leftover_is_owned_scope(call, llbc, &owned_scope_locals)
+                && !call_is_root_slot_getter(call, llbc, &mut getter_cache)
             {
                 if crate::decline::enabled() {
                     eprintln!(
@@ -3195,7 +3237,6 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     }
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
-    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
     if n_blocks == 0 {
         return Ok(None);
     }
@@ -8836,6 +8877,74 @@ mod tests {
             ]})],
             "|| shadow_stack_get(base + 1) is a copy of slot 1"
         );
+    }
+
+    /// The product registers a slot getter as ParamSlots (the captured
+    /// index is the closure parameter) before `analyze` runs.
+    /// `getter_llbc` alone leaves that table empty, so the early refuse
+    /// never sees the call. Registering it is what `ensure_stack_sensitive_fns`
+    /// does.
+    #[test]
+    fn analyze_erases_param_slots_registered_slot_getter() {
+        let llbc = getter_llbc();
+        let rows = ["capture::call", "plus_const::call"]
+            .map(|suffix| (stack_fn_identity(&llbc, suffix), vec![0u8]));
+        llbc.register_stack_param_slots_fns(rows);
+        let body = long_rshift_shape_body(false);
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        let n_locals = 32;
+        let slot0 = local_place_json(n_locals, &ty());
+        let slot1 = local_place_json(n_locals + 1, &ty());
+        let rewrite0 = plan.terms.get(&2).expect("capture get rewritten");
+        assert_eq!(
+            rewrite0.stmts,
+            vec![json!({"Assign": [
+                place(30),
+                {"Use": [{"Read": slot0}, "Yes"]}
+            ]})],
+            "a ParamSlots capture getter is still a copy of slot 0"
+        );
+        let rewrite1 = plan.terms.get(&3).expect("plus-const get rewritten");
+        assert_eq!(
+            rewrite1.stmts,
+            vec![json!({"Assign": [
+                place(31),
+                {"Use": [{"Read": slot1}, "Yes"]}
+            ]})],
+            "a ParamSlots plus-const getter is still a copy of slot 1"
+        );
+    }
+
+    /// A recognized getter that does not peel must keep the bracket.
+    /// Erasing the pins and leaving `shadow_stack_get` would read a stack
+    /// this body no longer pushes.
+    #[test]
+    fn analyze_refuses_unpeeled_slot_getter() {
+        let llbc = getter_llbc();
+        llbc.register_stack_param_slots_fns([(
+            stack_fn_identity(&llbc, "capture::call"),
+            vec![0u8],
+        )]);
+        let blocks = vec![
+            bb(call_fun(1, vec![], 1, 1)),
+            bb_stmts(
+                pin_two_array_stmts(),
+                call_fun(2, vec![move_local(7)], 4, 2),
+            ),
+            bb(call_fun(5, vec![copy_local(0), copy_local(0)], 30, 3)),
+            bb(drop_local(1, 4)),
+            bb(json!("Return")),
+        ];
+        match analyze(&body_of(32, blocks), &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
+        }
     }
 
     #[test]
