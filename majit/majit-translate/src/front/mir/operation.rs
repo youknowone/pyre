@@ -4327,7 +4327,25 @@ impl<'a> Lowering<'a> {
                 // Owner representation is `Rvalue::Ref` only
                 // (`ann_cast_ptr_to_adr` refuses an interior pointer as
                 // an address). RawPtr of a GC field keeps the field value.
-                let address = self.place_borrow_takes_address(&place, dest_ty);
+                // `lltype.direct_fieldptr` of a transparent word is the
+                // slot's address too. In particular, &raw of an AtomicPtr
+                // field must not pass its current (possibly null) payload
+                // to a residual expecting a pointer to that atomic cell.
+                let address = if Self::place_ref_is_address_of(&place)
+                    && tyref_transparent_inner_value_type(
+                        &place.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
+                    )
+                    .is_some()
+                {
+                    BorrowAddress::RawEnumField
+                } else {
+                    self.place_borrow_takes_address(&place, dest_ty)
+                };
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 // Same as `Rvalue::Ref`: the raw borrow aliases the field.
                 let v = self.resolve_place_as(mir_bb, place, false, false)?;
