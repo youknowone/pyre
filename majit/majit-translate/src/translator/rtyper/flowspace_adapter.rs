@@ -4049,6 +4049,76 @@ pub fn translate_op(
         } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
+            if field.taken_by_address
+                && field.owner_declared_gc == Some(false)
+                && *ty == crate::model::ValueType::Int
+            {
+                // `llmemory.cast_ptr_to_adr` plus `offsetof`: a raw slot
+                // borrow names storage, not the current field value.
+                // The byte offset comes from the same layout as codewriter
+                // `rewrite_op_getsubstruct`, including a GC owner's raw cell.
+                let owner = field
+                    .owner_root
+                    .as_deref()
+                    .ok_or_else(|| TyperError::message("field address without an owner"))?;
+                let sid = field
+                    .owner_id
+                    .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(owner));
+                let offset = call_registry
+                    .bookkeeper()
+                    .struct_layouts
+                    .borrow()
+                    .as_ref()
+                    .and_then(|layouts| layouts.borrow().get(&sid).cloned())
+                    .and_then(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|f| f.name == field.name)
+                            .map(|f| f.offset)
+                    })
+                    .ok_or_else(|| {
+                        TyperError::message(format!(
+                            "field address missing layout: {owner}.{}",
+                            field.name
+                        ))
+                    })?;
+                let mut ops = Vec::new();
+                let address = if base
+                    .concretetype()
+                    .as_ref()
+                    .map(crate::model::getkind)
+                    .unwrap_or(crate::model::ConcreteType::GcRef)
+                    == crate::model::ConcreteType::GcRef
+                {
+                    let callable = HOST_ENV
+                        .import_module("rpython.rtyper.lltypesystem.lltype")
+                        .and_then(|m| m.module_get("cast_ptr_to_int"))
+                        .ok_or_else(|| TyperError::message("lltype.cast_ptr_to_int missing"))?;
+                    let address = Hlvalue::Variable(Variable::new());
+                    ops.push(FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable))),
+                            base_hl,
+                        ],
+                        address.clone(),
+                    ));
+                    address
+                } else {
+                    base_hl
+                };
+                seed_raw_item_annotation(&result, LowLevelType::Signed);
+                ops.push(FlowspaceOp::new(
+                    "add",
+                    vec![
+                        address,
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(offset as i64))),
+                    ],
+                    result,
+                ));
+                return Ok(ops);
+            }
             // `retarget_vec_operand` reuses this FieldRead's result as the
             // length word (`ValueType::Int`). A bare `getattr` of the Vec
             // field is the list pointer (`SomeList` → `Ptr(GcStruct)` →
@@ -11454,6 +11524,75 @@ mod tests {
             Some(SomeValue::None_(_)) => {}
             other => panic!("RawStore must seed s_None, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_op_raw_field_borrow_uses_native_slot_offset() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind};
+        let registry = empty_call_registry();
+        let owner = "BorrowedCell";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "slot".into(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        registry
+            .bookkeeper()
+            .set_struct_layouts(cc.struct_layouts_handle());
+        let mut graph = LegacyGraph::new("borrow_slot");
+        let vars = mint_vars(&mut graph, 2);
+        vars[0].set_concretetype(Some(GCREF.clone()));
+        let mut value_map = HashMap::new();
+        for var in &vars {
+            value_map.insert(var.clone(), Hlvalue::Variable(Variable::new()));
+        }
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[0].clone(),
+                field: crate::model::FieldDescriptor::new("slot", Some(owner.into()))
+                    .with_owner_id(Some(sid))
+                    .with_owner_declared_gc(Some(false))
+                    .with_taken_by_address(true),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let lowered = translate_op(&op, &value_map, &registry).expect("slot address");
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|o| o.opname.as_str())
+                .collect::<Vec<_>>(),
+            ["simple_call", "add"]
+        );
+        assert!(
+            matches!(&lowered[1].args[1], Hlvalue::Constant(c) if c.value == ConstValue::Int(8))
+        );
+        let Hlvalue::Variable(result) = &lowered[1].result else {
+            panic!("address result")
+        };
+        assert!(matches!(
+            result.annotation.borrow().as_deref(),
+            Some(SomeValue::Integer(_))
+        ));
     }
 
     #[test]
