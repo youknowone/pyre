@@ -305,11 +305,7 @@ fn acquire(
         (
             (*view).buf as usize,
             (*view).len as i64,
-            if (*view).itemsize > 0 {
-                (*view).itemsize as i64
-            } else {
-                1
-            },
+            (*view).itemsize as i64,
             (*view).readonly != 0,
             (*view).ndim as i64,
         )

@@ -511,7 +511,11 @@ impl BufferView {
                     if *length == 0 {
                         vec![0]
                     } else {
-                        vec![*length / *itemsize]
+                        vec![if *itemsize > 0 {
+                            *length / *itemsize
+                        } else {
+                            0
+                        }]
                     }
                 }
                 // Dimension 0 takes the slice's element count; later
