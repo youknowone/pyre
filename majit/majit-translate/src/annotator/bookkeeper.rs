@@ -6800,15 +6800,13 @@ impl Bookkeeper {
         //
         // A struct whose template field names the split entry family
         // parametrized by its own type variables is one class per
-        // instantiation (`get_ll_dict` builds one `DICT` per key/value
-        // holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
-        // `getuniqueclassdef`). Keep the substituted spelling so the
-        // field resolves to that classdef. An entry-family holder keeps it
-        // only when every type argument passes
-        // `type_arg_splits_per_instantiation`, the same gate
-        // `split_struct_instantiation_suffix` uses for the constructor:
-        // `f32`, `()`, and an unresolved parameter stay the bare template,
-        // so field projection and construction name one class. A
+        // instantiation (`rordereddict.py` `get_ll_dict` builds one
+        // `DICT` per concrete `(DICTKEY, DICTVALUE)`, a Void key
+        // included, holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
+        // `getuniqueclassdef`). An entry-family holder keeps the
+        // substituted spelling when every type argument is fully
+        // substituted (`type_arg_is_concrete`), including `()` and `f32`;
+        // an unresolved parameter stays the bare template. A
         // layout-present std cell (`is_std_cell_wrapper_path` and a `value`
         // row that holds T inline; MutRef intern shape) keeps it too:
         // template rows name `??TypeVar`, and `project_struct_rows`
@@ -6817,7 +6815,7 @@ impl Bookkeeper {
         let keep_instantiation = stripped.contains('<')
             && self.struct_fields.borrow().as_ref().is_some_and(|reg| {
                 (reg.template_holds_split_entry_family(stripped)
-                    && instantiation_args_all_split(stripped))
+                    && instantiation_args_all_concrete(stripped))
                     || intern_rows_declare_value_field(Some(reg), stripped)
             });
         let class_spelling = if keep_instantiation {
@@ -8292,18 +8290,19 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
-/// Every type argument of `spelling` drives a per-instantiation class.
+/// Every type argument of `spelling` is fully substituted.
 ///
-/// Same gate as `split_struct_instantiation_suffix`:
-/// [`crate::front::mir::type_arg_splits_per_instantiation`]. An empty
-/// argument list is not an instantiation (`bookkeeper.py`
-/// `getuniqueclassdef`).
-fn instantiation_args_all_split(spelling: &str) -> bool {
+/// Same gate as `entry_family_holder_struct_instantiation_suffix`:
+/// [`crate::front::mir::type_arg_is_concrete`]. An empty argument list
+/// is not an instantiation (`bookkeeper.py` `getuniqueclassdef`).
+/// `()` and `f32` are concrete (`rordereddict.py` `get_ll_dict` keeps
+/// a Void key and a single-float value as their own `DICT`).
+fn instantiation_args_all_concrete(spelling: &str) -> bool {
     let args = crate::front::semantic::instantiation_type_args(spelling);
     !args.is_empty()
         && args
             .iter()
-            .all(|arg| crate::front::mir::type_arg_splits_per_instantiation(arg))
+            .all(|arg| crate::front::mir::type_arg_is_concrete(arg))
 }
 
 /// `lltype.GCREF` (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
@@ -13271,11 +13270,13 @@ mod tests {
     }
 
     #[test]
-    fn entry_family_holder_projection_suffix_follows_split_rule() {
-        // `getuniqueclassdef` is one class per class object.
-        // `type_arg_splits_per_instantiation` is the constructor gate
-        // (`split_struct_instantiation_suffix`). Field projection keeps
-        // the instantiated spelling only when every argument passes it.
+    fn entry_family_holder_projection_suffix_follows_concrete_args() {
+        // `rordereddict.py` `get_ll_dict` is one `DICT` per concrete
+        // `(DICTKEY, DICTVALUE)`, a Void key included.
+        // `bookkeeper.py` `getuniqueclassdef` is one class per class
+        // object. Field projection keeps the instantiated spelling when
+        // every argument is fully substituted (`type_arg_is_concrete`),
+        // including `()` and `f32`. An unresolved parameter stays bare.
         use crate::front::StructFieldRegistry;
 
         let bk = bk();
@@ -13307,33 +13308,47 @@ mod tests {
                 .unwrap_or_else(|| panic!("{spelling} has no classdef"))
         };
         let bare = classdef("fixture::Holder");
-        for spelling in [
+        let open = classdef("fixture::Holder<??TypeVar#0,X>");
+        assert!(
+            Rc::ptr_eq(&bare, &open),
+            "an unresolved parameter stays the unsuffixed class, got {}",
+            open.borrow().name
+        );
+        assert!(
+            !open.borrow().name.contains('<'),
+            "fixture::Holder<??TypeVar#0,X> got {}",
+            open.borrow().name
+        );
+        let kept = [
             "fixture::Holder<f32,i64>",
             "fixture::Holder<(),X>",
-            "fixture::Holder<??TypeVar#0,X>",
-        ] {
-            let projected = classdef(spelling);
+            "fixture::Holder<(),i64>",
+            "fixture::Holder<i64,*mut PyObject>",
+        ];
+        let projected: Vec<_> = kept.iter().copied().map(classdef).collect();
+        for (spelling, class) in kept.iter().zip(&projected) {
             assert!(
-                Rc::ptr_eq(&bare, &projected),
-                "{spelling} must be the unsuffixed class, got {}",
-                projected.borrow().name
+                !Rc::ptr_eq(&bare, class),
+                "{spelling} must keep a suffixed class, got {}",
+                class.borrow().name
             );
+            let suffix = spelling.trim_start_matches("fixture::Holder");
             assert!(
-                !projected.borrow().name.contains('<'),
+                class.borrow().name.contains(suffix),
                 "{spelling} got {}",
-                projected.borrow().name
+                class.borrow().name
             );
         }
-        let split = classdef("fixture::Holder<i64,*mut PyObject>");
-        assert!(
-            !Rc::ptr_eq(&bare, &split),
-            "every splitting argument keeps the instantiated class"
-        );
-        assert!(
-            split.borrow().name.contains("<i64,*mut PyObject>"),
-            "got {}",
-            split.borrow().name
-        );
+        for i in 0..projected.len() {
+            for j in (i + 1)..projected.len() {
+                assert!(
+                    !Rc::ptr_eq(&projected[i], &projected[j]),
+                    "{} and {} must not share one class",
+                    kept[i],
+                    kept[j]
+                );
+            }
+        }
     }
 
     #[test]

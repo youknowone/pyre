@@ -1037,26 +1037,47 @@ impl StructFieldRegistry {
             || self.template_holds_split_entry_family(stripped)
     }
 
-    /// Template field rows name the split entry family (`get_ll_dict`'s
-    /// `DICTENTRY` / `DICTENTRYARRAY`) with this struct's own type
-    /// variables. That struct is one class per instantiation
+    /// Template field rows name the split entry family (`rordereddict.py`
+    /// `get_ll_dict`'s `DICTENTRY` / `DICTENTRYARRAY`) with this struct's
+    /// own type variables, or a by-value / pointer field whose resolved
+    /// head's template does. That struct is one class per instantiation
     /// (`bookkeeper.py` `getuniqueclassdef`), the same rule as
     /// `entry_family_holder_struct_instantiation_suffix`. Rows stay on
-    /// the bare template; `??TypeVar` is substituted later.
+    /// the bare template; `??TypeVar` is substituted later. A resolved
+    /// key already on the path is not another class (`bookkeeper.py`
+    /// `getdesc`).
     pub(crate) fn template_holds_split_entry_family(&self, root: &str) -> bool {
+        self.template_holds_split_entry_family_along(root, &mut HashSet::new())
+    }
+
+    fn template_holds_split_entry_family_along(
+        &self,
+        root: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
         let template = majit_ir::descr::strip_instantiation_suffix(root);
+        if !visited.insert(template.to_string()) {
+            return false;
+        }
         let spellings: Vec<String> = {
             let Some(rows) = self.lookup_fields(template) else {
+                visited.remove(template);
                 return false;
             };
             rows.iter().map(|row| row.ty.clone()).collect()
         };
-        spellings
+        let holds = spellings
             .iter()
-            .any(|spelling| self.row_spelling_holds_split_entry_family(spelling))
+            .any(|spelling| self.row_spelling_holds_split_entry_family(spelling, visited));
+        visited.remove(template);
+        holds
     }
 
-    fn row_spelling_holds_split_entry_family(&self, spelling: &str) -> bool {
+    fn row_spelling_holds_split_entry_family(
+        &self,
+        spelling: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
         let peeled = peel_row_pointer_indirections(spelling);
         if peeled.starts_with('[') || peeled.starts_with('(') {
             return false;
@@ -1083,7 +1104,15 @@ impl StructFieldRegistry {
         let Some(path) = self.resolved_row_head_path(head) else {
             return false;
         };
-        entry_family_path_spelling(&path)
+        if entry_family_path_spelling(&path) {
+            return true;
+        }
+        // Nested holder: `PtrW<K,V> { inner: *mut H<K,V> }` where `H`
+        // holds `Ptr(DICTENTRYARRAY)` (`rordereddict.py` `get_ll_dict`).
+        // The arguments above name this struct's type variables, the
+        // registry-side analog of `adt_node_type_subst` mentioning a
+        // type variable. Arrays and slices were declined above.
+        self.template_holds_split_entry_family_along(&path, visited)
     }
 
     /// Qualified path of `head`'s one registered class identity.
