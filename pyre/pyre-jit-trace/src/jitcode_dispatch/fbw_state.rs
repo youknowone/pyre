@@ -4161,9 +4161,9 @@ pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
     }
     // A write into an object the region itself allocated is not a write the
     // cut has to undo — see [`WalkSession::binop_rewind_fresh_from`].  The
-    // position is the region's starting `_index`: value boxes use that
-    // sequence (`OpRef::RefOp` `raw()`), and `_count` would refuse a fresh
-    // allocation after any void op.  The heap cache answers the rest, since
+    // watermark is the region's starting box id (`Trace.next_box_id`):
+    // value boxes use that sequence (`OpRef::RefOp` `raw()`), and `_count`
+    // would refuse a fresh allocation after any void op.  The heap cache answers the rest, since
     // `new_object` raises `HF_IS_UNESCAPED` on the allocation and `escape_box`
     // lowers it, so an object since handed to something outside the region
     // stops answering here.  A constant or an input arg is neither; matching

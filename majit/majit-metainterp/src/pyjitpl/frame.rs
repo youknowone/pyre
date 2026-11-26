@@ -22,7 +22,7 @@ use crate::recorder::SnapshotTagged;
 /// `ConstPtr.getref_base` reads the intern table. Call this after any
 /// earlier `_encode` / `new_array` that may have minor-collected.
 #[inline]
-fn register_to_box(opref: OpRef) -> OpBox {
+fn register_to_box(opref: OpRef, box_position: &dyn Fn(OpRef) -> u32) -> OpBox {
     match opref.inline_const_to_value() {
         Some(majit_ir::Value::Int(v)) => OpBox::ConstInt(v),
         Some(majit_ir::Value::Float(f)) => OpBox::ConstFloat(f.to_bits()),
@@ -30,7 +30,7 @@ fn register_to_box(opref: OpRef) -> OpBox {
         Some(majit_ir::Value::Void) => {
             panic!("register_to_box: constant {opref:?} has Void type")
         }
-        None => OpBox::ResOp(opref.raw()),
+        None => OpBox::ResOp(box_position(opref)),
     }
 }
 
@@ -705,41 +705,56 @@ impl MIFrame {
     /// (`history.py` `ConstPtr.value`). Re-resolve that intern after
     /// `new_array` / an earlier `_encode`. A raw `constants_r` word is
     /// only the fallback when `copy_constants` did not fill the slot.
-    fn ref_liveness_to_box(&self, idx: usize, num_regs_r: usize) -> OpBox {
+    fn ref_liveness_to_box(
+        &self,
+        idx: usize,
+        num_regs_r: usize,
+        box_position: &dyn Fn(OpRef) -> u32,
+    ) -> OpBox {
         if idx < num_regs_r {
             return match self.ref_regs[idx] {
-                Some(opref) => register_to_box(opref),
+                Some(opref) => register_to_box(opref, box_position),
                 None => OpBox::ConstPtr(0),
             };
         }
         if let Some(opref) = self.ref_regs.get(idx).copied().flatten() {
-            return register_to_box(opref);
+            return register_to_box(opref, box_position);
         }
         OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r].get() as u64)
     }
 
     /// `pyjitpl.py` `self.registers_i[index]` after `copy_constants`.
-    fn int_liveness_to_box(&self, idx: usize, num_regs_i: usize) -> OpBox {
+    fn int_liveness_to_box(
+        &self,
+        idx: usize,
+        num_regs_i: usize,
+        box_position: &dyn Fn(OpRef) -> u32,
+    ) -> OpBox {
         if idx < num_regs_i {
             let opref =
                 self.int_regs[idx].expect("get_list_of_active_boxes: int register uninitialized");
-            return register_to_box(opref);
+            return register_to_box(opref, box_position);
         }
         if let Some(opref) = self.int_regs.get(idx).copied().flatten() {
-            return register_to_box(opref);
+            return register_to_box(opref, box_position);
         }
         OpBox::ConstInt(self.jitcode.constants_i[idx - num_regs_i])
     }
 
     /// `pyjitpl.py` `self.registers_f[index]` after `copy_constants`.
-    fn float_liveness_to_box(&self, idx: usize, num_regs_f: usize) -> OpBox {
+    fn float_liveness_to_box(
+        &self,
+        idx: usize,
+        num_regs_f: usize,
+        box_position: &dyn Fn(OpRef) -> u32,
+    ) -> OpBox {
         if idx < num_regs_f {
             let opref = self.float_regs[idx]
                 .expect("get_list_of_active_boxes: float register uninitialized");
-            return register_to_box(opref);
+            return register_to_box(opref, box_position);
         }
         if let Some(opref) = self.float_regs.get(idx).copied().flatten() {
-            return register_to_box(opref);
+            return register_to_box(opref, box_position);
         }
         OpBox::ConstFloat(self.jitcode.constants_f[idx - num_regs_f] as u64)
     }
@@ -961,6 +976,7 @@ impl MIFrame {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
+        box_position: &dyn Fn(OpRef) -> u32,
     ) -> i64 {
         const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
         use majit_jitcode::liveness::{LivenessIterator, decode_offset};
@@ -1080,7 +1096,7 @@ impl MIFrame {
                     // pyjitpl.py:184-185 history.CONST_FALSE clearing.
                     OpBox::ConstInt(0)
                 } else {
-                    self.int_liveness_to_box(idx, num_regs_i)
+                    self.int_liveness_to_box(idx, num_regs_i, box_position)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1099,7 +1115,7 @@ impl MIFrame {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
                     OpBox::ConstPtr(0)
                 } else {
-                    self.ref_liveness_to_box(idx, num_regs_r)
+                    self.ref_liveness_to_box(idx, num_regs_r, box_position)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1116,7 +1132,7 @@ impl MIFrame {
                     // pyjitpl.py:188-189 history.CONST_FZERO clearing.
                     OpBox::ConstFloat(0)
                 } else {
-                    self.float_liveness_to_box(idx, num_regs_f)
+                    self.float_liveness_to_box(idx, num_regs_f, box_position)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1699,6 +1715,7 @@ mod tests {
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
+            &|r: OpRef| r.raw(),
         );
 
         // Two boxes pushed → array length prefix + 2 varints.
@@ -1760,6 +1777,7 @@ mod tests {
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
+            &|r: OpRef| r.raw(),
         );
 
         let (length, consumed) =
@@ -1833,6 +1851,7 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
+            &|r: OpRef| r.raw(),
         );
 
         // pyjitpl.py:193 — `_result_argcode` flips to `b'?'` after
@@ -1887,6 +1906,7 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
+            &|r: OpRef| r.raw(),
         );
 
         // Register slot now holds the zero ConstInt inline-Const OpRef,
@@ -1939,6 +1959,7 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             false,
+            &|r: OpRef| r.raw(),
         );
         assert_eq!(frame._result_argcode, b'?');
 
@@ -1998,6 +2019,7 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             false,
+            &|r: OpRef| r.raw(),
         );
 
         let (length, consumed) =
@@ -2074,6 +2096,7 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             false,
+            &|r: OpRef| r.raw(),
         );
         assert_eq!(trace.current_ref(1), forwarded.0 as u64);
     }

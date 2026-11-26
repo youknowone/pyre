@@ -5496,7 +5496,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     // length directly rather than probing getarrayitem until a miss).  Empty
     // list → Empty strategy: decline (the residual reproduces it).
     let len = {
-        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+        let Some(len_op) = ctx.trace_ctx.heapcache_arraylen(arr) else {
             return Ok(None);
         };
         match len_op.inline_const_to_value() {
@@ -5779,7 +5779,7 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
     // `heapcache.arraylen`; a cleared array has every slot set, so read the
     // length directly rather than probing getarrayitem until a miss).
     let len = {
-        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+        let Some(len_op) = ctx.trace_ctx.heapcache_arraylen(arr) else {
             return Ok(None);
         };
         match len_op.inline_const_to_value() {
@@ -6935,7 +6935,7 @@ pub(crate) fn try_walker_orthodox_empty_newlist<Sym: WalkSym>(
         return Ok(None);
     }
     let arr = r_args[0];
-    let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+    let Some(len_op) = ctx.trace_ctx.heapcache_arraylen(arr) else {
         return Ok(None);
     };
     match len_op.inline_const_to_value() {

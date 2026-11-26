@@ -2412,9 +2412,9 @@ mod tests {
         use crate::recorder::Trace;
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
-        rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        rec.record_op(OpCode::IntSub, &[iop(1), i0]);
-        rec.close_loop(&[iop(2)]);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
+        rec.close_loop(&[sub]);
 
         let trace = rec.get_trace();
         let opcodes: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
@@ -2451,11 +2451,14 @@ mod tests {
         let ref2 = rec.record_op(OpCode::IntSub, &[ref1, ref0]);
 
         rec.close_loop(&[ref2, i1]);
+        let ref0_pos = rec.opref_for_optimizer(ref0);
+        let ref1_pos = rec.opref_for_optimizer(ref1);
+        let ref2_pos = rec.opref_for_optimizer(ref2);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].pos().get(), ref0);
-        assert_eq!(trace.ops[1].pos().get(), ref1);
-        assert_eq!(trace.ops[2].pos().get(), ref2);
+        assert_eq!(trace.ops[0].pos().get(), ref0_pos);
+        assert_eq!(trace.ops[1].pos().get(), ref1_pos);
+        assert_eq!(trace.ops[2].pos().get(), ref2_pos);
     }
 
     #[test]
@@ -2514,7 +2517,6 @@ impl TraceCtx {
     /// regresses bench (tested under ).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
-        self.heap_cache.drop_dead_frontend_ops(pos._index);
         if let Some(observer) = self.cut_observer {
             observer(&pos);
         }
@@ -2528,7 +2530,6 @@ impl TraceCtx {
     /// optimizer remaps every published snapshot.
     pub fn cut_trace_with_snapshots(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
-        self.heap_cache.drop_dead_frontend_ops(pos._index);
         if self.recorder.has_byte_buffer() {
             // `cut_at` does not rewind `_snapshot_data`. Live guards after
             // the cut no longer name the discarded captures.
@@ -2750,10 +2751,12 @@ impl TraceCtx {
         }
     }
 
-    /// Materialize then take the snapshot side table.
+    /// Materialize then take the snapshot side table, reminted into the
+    /// optimizer position namespace (`FrontendOp.get_position`).
     pub fn take_snapshots(&mut self) -> Vec<crate::recorder::Snapshot> {
         self.ensure_snapshots_materialized();
-        std::mem::take(&mut self.snapshots)
+        let snaps = std::mem::take(&mut self.snapshots);
+        self.recorder.snapshots_for_optimizer(&snaps)
     }
 
     /// Set `rd_resume_position` on the last recorded op to the snapshot
@@ -3230,10 +3233,12 @@ impl TraceCtx {
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(mut self) -> crate::history::TreeLoop {
         // `ops` is already `Vec<OpRc>`; `from_oprc` preserves the recorder's
-        // shared `Rc<Op>` identity.
+        // shared `Rc<Op>` identity. Snapshots remint TAGBOX to `_index`
+        // (`FrontendOp.get_position`) before they leave the front-end.
         self.ensure_snapshots_materialized();
+        let snapshots = self.recorder.snapshots_for_optimizer(&self.snapshots);
         let (inputargs, ops) = self.recorder.into_parts();
-        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots)
+        crate::history::TreeLoop::from_oprc(inputargs, ops, snapshots)
     }
 
     /// Non-consuming [`Self::into_tree_loop`]. The live recorder stays so
@@ -3241,8 +3246,9 @@ impl TraceCtx {
     /// `InvalidLoop` (`compile_retrace`) and keep tracing.
     pub fn snapshot_tree_loop(&mut self) -> crate::history::TreeLoop {
         self.ensure_snapshots_materialized();
+        let snapshots = self.recorder.snapshots_for_optimizer(&self.snapshots);
         let (inputargs, ops) = self.recorder.clone_materialized_parts();
-        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots.clone())
+        crate::history::TreeLoop::from_oprc(inputargs, ops, snapshots)
     }
 
     /// Snapshot slice accessor — Pyre-level parity with
@@ -3258,6 +3264,12 @@ impl TraceCtx {
     pub fn ops(&mut self) -> &[majit_ir::OpRc] {
         self.ensure_ops_materialized();
         self.recorder.ops()
+    }
+
+    /// Remint a front-end value box to the optimizer `_index`
+    /// (`FrontendOp.get_position`).
+    pub fn opref_for_optimizer(&self, r: majit_ir::OpRef) -> majit_ir::OpRef {
+        self.recorder.opref_for_optimizer(r)
     }
 
     /// Materialize `opencoder.Trace.get_iter` into `ops` so [`Self::ops`]
@@ -3891,7 +3903,6 @@ impl TraceCtx {
         if all_const {
             // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
-            self.heap_cache.drop_dead_frontend_ops(patch_pos._index);
             // history.py/268/314 — Const{Int,Float,Ptr}.value inline.
             let const_opref = match resbox_as_const {
                 Value::Int(v) => OpRef::const_int(v),
@@ -3917,7 +3928,6 @@ impl TraceCtx {
         };
         let pure_opcode = OpCode::call_pure_for_type(ret_type);
         self.recorder.cut(patch_pos);
-        self.heap_cache.drop_dead_frontend_ops(patch_pos._index);
         // pyjitpl.py MetaInterp.record_result_of_call_pure →
         // history.record_nospec(opnum, argboxes, resbox_as_const, descr)
         self.recorder.record_op_with_descr_value(
@@ -5037,8 +5047,14 @@ impl TraceCtx {
         );
         let descr_index = descr.index();
         let arg0_int = func_ptr as usize as i64;
-        self.heap_cache
-            .call_loopinvariant_known_result(descr_index, arg0_int)
+        let hit = self
+            .heap_cache
+            .call_loopinvariant_known_result(descr_index, arg0_int)?;
+        if self.recorder.frontend_value_box_is_live(hit.0) {
+            Some(hit)
+        } else {
+            None
+        }
     }
 
     /// `call_loopinvariant_impl` variant preserving the caller-supplied
